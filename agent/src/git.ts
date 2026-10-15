@@ -2007,9 +2007,20 @@ export class GitCache {
   private recoveryRemaining(operation: { signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }): number {
     operation.budget?.check();
     operation.signal.throwIfAborted();
-    const remaining = Math.min(operation.deadline - Date.now(), operation.budget?.remainingMs() ?? Infinity);
+    // Native execFile requires an unsigned integer timeout. Rounding down also
+    // keeps the per-operation cap within the absolute remaining budget.
+    const remaining = Math.floor(Math.min(operation.deadline - Date.now(), operation.budget?.remainingMs() ?? Infinity));
     if (remaining <= 0) throw new Error("recovery deadline exhausted");
     return remaining;
+  }
+  /** An awaited supervisor may hand back a root after the deadline. Stop and
+   * join it before giving any caller its streams or delivering stdin. */
+  private async checkRecoverySpawn(process: BoundaryProcessHandle): Promise<void> {
+    try { this.checkRecoveryInterruption(); }
+    catch (error) {
+      await Promise.allSettled([Promise.resolve().then(() => process.cancel()), process.completed]);
+      throw error;
+    }
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
@@ -10475,7 +10486,8 @@ export class GitCache {
    * `maxBytes`, a non-positive or non-finite `timeoutMs`, or an already-aborted `signal`.
    *
    * On the bound, the timeout and the abort, the stdout stream is abandoned (destroyed). What
-   * that does to the child depends on the spawn path ({@link spawnGit}):
+   * an active maintenance budget always cancels and joins the child before returning.
+   * Without that budget, behavior depends on the spawn path ({@link spawnGit}):
    * - Outside a boundary scope, abandoning the stream kills the child (SIGTERM) at once.
    * - Inside a boundary scope (withBoundaryProcessSpawner) this path does not call the handle's cancel(): abandoning
    *   the stream only unpipes and destroys its stdout, so a child that is still writing meets a
@@ -12180,6 +12192,7 @@ export class GitCache {
         await closed;
         if (killTimer) clearTimeout(killTimer);
         operationSignal?.removeEventListener("abort", abort);
+        this.checkRecoveryInterruption();
       }
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
@@ -12206,6 +12219,7 @@ export class GitCache {
     } catch (cause) {
       throw this.boundaryAbortError(cause) ?? cause;
     }
+    await this.checkRecoverySpawn(process);
     let cancellation: Promise<unknown> | undefined;
     const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
@@ -12429,6 +12443,7 @@ export class GitCache {
       } catch (cause) {
         throw this.boundaryAbortError(cause) ?? cause;
       }
+      await this.checkRecoverySpawn(process);
       if (!process.stdout) {
         await Promise.allSettled([process.cancel(), process.completed]);
         throw new Error("supervised git process has no stdout");
@@ -12703,6 +12718,7 @@ export class GitCache {
       const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command",
         ...(recovery ? { timeoutMs: this.recoveryRemaining(recovery) } : {}),
       });
+      await this.checkRecoverySpawn(process);
       let cancellation: Promise<unknown> | undefined;
       const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
@@ -13837,6 +13853,8 @@ export class GitCache {
       if (boundary?.beforeLockRelease) {
         await boundary.beforeLockRelease(key).catch(() => undefined);
       }
+      try { this.checkRecoveryInterruption(); }
+      catch (error) { outcome = { ok: false, error }; }
       settled = true;
       if (outcome.ok) resolveResult(outcome.value);
       else rejectResult(outcome.error);

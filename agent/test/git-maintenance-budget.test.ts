@@ -3,13 +3,70 @@ import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, Writable } from "node:stream";
+import type { BoundaryProcessHandle } from "../src/harness.js";
 import { GitCache } from "../src/git.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { nullLogger } from "./helpers.js";
 
 const cache = () => new GitCache("/unused-maintenance-test", nullLogger());
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+
+test("production monotonic clock runs native buffered Git with an integer timeout", async t => {
+  const budget = new MaintenanceBudget();
+  t.after(() => budget.dispose());
+  const output = await MaintenanceBudget.run(budget, () => cache()["runGit"](undefined, ["--version"]));
+  assert.match(output, /^git version /);
+});
+
+for (const path of ["buffered", "streaming", "runner stdin"] as const) {
+  test(`late supervised ${path} spawn stops and joins without delivering stdin`, async t => {
+    const git = cache();
+    let now = 0, inputs = 0, cancelled = 0, settled = false;
+    let close!: (result: { code: number }) => void;
+    const completed = new Promise<{ code: number }>(resolve => { close = resolve; });
+    const stdin = new Writable({ write(_chunk, _encoding, done) { inputs++; done(); } });
+    const budget = new MaintenanceBudget(600_000, () => now);
+    t.after(() => budget.dispose());
+    const spawner = async (): Promise<BoundaryProcessHandle> => {
+      now = 600_000; // Clock expires during the await, before its timer callback can run.
+      return { stdin, stdout: Readable.from([]), stderr: Readable.from([]), completed,
+        cancel: async () => { cancelled++; await completed; } };
+    };
+    const operation = MaintenanceBudget.run(budget, () => git.withBoundaryProcessSpawner(
+      spawner, new AbortController().signal, async () => {
+        if (path === "buffered") return git["execScoped"]("git", ["--version"],
+          { env: process.env, input: "review-input" });
+        if (path === "streaming") return git["spawnGit"]("/unused", ["version"], "review-input");
+        const producer = await git["spawnGitAsRunnerWithStdin"]("/unused", ["version"]);
+        producer.stdin.end("review-input");
+        return producer;
+      }));
+    const result = operation.then(() => { settled = true; return undefined; },
+      error => { settled = true; return error as unknown; });
+    await tick();
+    const beforeClose = { inputs, cancelled, settled };
+    close({ code: 0 });
+    const error = await result;
+    assert.equal(beforeClose.inputs, 0, "no stdin may be delivered after the monotonic deadline");
+    assert.equal(beforeClose.cancelled, 1, "the late handle is cancelled");
+    assert.equal(beforeClose.settled, false, "the late handle is joined before returning");
+    assert.match(String(error), /maintenance deadline/);
+  });
+}
+
+test("expiry during pre-release join cannot return lock result authority", async t => {
+  let now = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  t.after(() => budget.dispose());
+  const git = cache();
+  const action = MaintenanceBudget.run(budget, () => git.withBoundaryProcessSpawner(
+    async () => { throw new Error("no spawn expected"); }, new AbortController().signal,
+    () => git.withBareLock("repo", async () => "authority"),
+    { beforeLockRelease: async () => { now = 600_000; } }));
+  await assert.rejects(action, /maintenance deadline/);
+});
+
 
 test("queued ambient Git lock expires and never starts after holder releases", async t => {
   const git = cache();

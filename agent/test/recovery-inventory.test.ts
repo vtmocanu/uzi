@@ -166,6 +166,37 @@ for (const readback of ["created", "create_unknown", "refused", "pack_invalid", 
   });
 }
 
+for (const answer of ["refused", "invoked", "create_unknown", "503", "malformed"] as const) {
+  it(`B V2 initial create ${answer} preserves protocol-specific fallback`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      Object.assign(f.client, { publishHeld: async (run: string, gen: number, tip: string) => {
+        if (answer === "503") return { ok: false, httpStatus: 503, reason: "forge_unavailable" };
+        if (answer === "malformed") return { ok: false, reason: "malformed_response" };
+        return { ok: true, body: {
+          publication_id: "00000000-0000-4000-8000-000000000009",
+          ref: `refs/uzi-held/${run}/${gen}`, tip, state: answer,
+          ...(answer === "refused" ? { reason: "create_refused" } : {}),
+        } };
+      } });
+      await f.operate();
+      const saved = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.equal(saved.captureId, f.record.captureId);
+      assert.equal(saved.sourceSha, f.record.sourceSha);
+      assert.equal(saved.coverageDigest, f.record.coverageDigest);
+      assert.equal(f.state.produced, answer === "refused" ? 1 : 0);
+      assert.equal(saved.heldCreateUncertain, answer !== "refused");
+      if (answer === "refused") {
+        assert.equal(saved.finalAcknowledged, true, "the complete archive fallback has its own authoritative FINAL");
+        assert.equal((f.finals[0]?.[3] as RecoveryFinalDisposition)?.kind, "archive");
+      } else {
+        assert.notEqual(saved.finalAcknowledged, true);
+        assert.equal(f.finals.length, 0, "uncertain create cannot mint FINAL or ACK");
+      }
+    } finally { await f.close(); }
+  });
+}
+
 it("B throwing pack stream waits for controlled child exit", async () => {
   const f = await v2FrozenFixture();
   try {
@@ -175,7 +206,8 @@ it("B throwing pack stream waits for controlled child exit", async () => {
     const exited = new Promise<number>(resolve => { release = resolve; });
     const pack = new Readable({ read() { failed(); this.destroy(new Error("stream failed")); } });
     Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited }) });
-    let settled = false;
+    let settled = false, cancelled = 0;
+    Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited, cancel: () => { cancelled++; } }) });
     const preparing = prepareFrozenHeld({ git: f.git as unknown as HeldGit,
       barePath: f.context.barePath, branch: f.record.branch, sourceSha: H,
       policy: f.record.heldPolicy!, deadlineMs: 1000 });
@@ -184,8 +216,10 @@ it("B throwing pack stream waits for controlled child exit", async () => {
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(settled, false);
     assert.equal(pack.destroyed, true);
+    const stopRequested = cancelled;
     release(1);
     await checked;
+    assert.equal(stopRequested, 1, "abandonment requests cancellation before waiting for close");
   } finally { await f.close(); }
 });
 
@@ -256,8 +290,8 @@ for (const stop of ["running", "unknown source", "changed coverage", "CI", "clos
           const result = await legacy.coordinator.operateFrozenInventory({
             record, barePath: legacy.context.barePath, defaultBranch: "main",
           });
-          assert.equal(result.held, "kept");
-          assert.equal(legacy.state.produced, 0);
+          assert.equal(result.state, "uploaded", "missing held policy retains the existing guarded archive path");
+          assert.equal(legacy.state.produced, 1);
         } finally { await legacy.close(); }
         return;
       }

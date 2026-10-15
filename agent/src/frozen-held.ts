@@ -73,7 +73,10 @@ export async function prepareFrozenHeld(input: {
       }
     }
   } finally {
-    if (!packed.pack.readableEnded) packed.pack.destroy();
+    if (!packed.pack.readableEnded) {
+      packed.cancel?.();
+      packed.pack.destroy();
+    }
     code = await packed.exited;
   }
   if (packed.tipOid !== sourceSha) return { reason: "pack_tip_mismatch" };

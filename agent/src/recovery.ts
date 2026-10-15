@@ -1902,7 +1902,9 @@ export class RecoveryCoordinator {
       } catch { return outcome("kept"); }
     }
     const v2 = this.client.hasHeldPublicationV2?.() === true;
-    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return outcome("kept");
+    // Missing new held metadata cannot grant publication authority, but it must
+    // preserve the pre-existing guarded archive path for boot and legacy journals.
+    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return this.captureCycle({ ...input, record });
     let terminal = options.terminal;
     if (v2) {
       terminal = undefined;
@@ -1970,22 +1972,29 @@ export class RecoveryCoordinator {
       hold = await this.heldOperationState(record, input.signal);
       if (hold !== "open") { result = hold === "settled" ? "settled" : "kept"; return; }
       if (input.signal?.aborted || residueQuarantine() !== undefined) { result = "kept"; return; }
-      record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
-      // Persist before sending: a lost create answer must never cause another create.
-      result = "kept";
+      // V2 reconciles lost create answers before any retry. V1 retains its legacy
+      // archive fallback, whose FINAL supplies the generation settlement authority.
+      if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
+      result = v2 ? "kept" : "fallback";
       const response = await this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
         record.coverageDigest!, prepared.pack, input.signal);
       if (!response.ok) {
-        if (response.reason === "malformed_response" ||
-            (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500))) return;
-        record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
+        if (v2 && (response.reason === "malformed_response" ||
+            (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500)))) return;
+        if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
         result = "fallback";
         return;
       }
       const body = response.body;
-      if (body.state !== "created" || body.tip !== record.sourceSha ||
+      if (body.tip !== record.sourceSha ||
           body.ref !== `refs/uzi-held/${record.runId}/${record.generation}` ||
           !HELD_PUBLICATION_ID_RE.test(body.publication_id)) return;
+      if (body.state === "refused" && body.reason === "create_refused") {
+        if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
+        result = "fallback";
+        return;
+      }
+      if (body.state !== "created") return;
       publicationId = body.publication_id;
       // Save FINAL before leaving the source boundary, without recursively acquiring the cycle.
       record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
@@ -1998,7 +2007,7 @@ export class RecoveryCoordinator {
         const boundary = await this.inventorySourceBoundary({ ...record.coverageContext, generation: record.generation }, publish);
         if (boundary !== "passed") result = "kept";
       } else result = "kept";
-    } catch { result = "kept"; }
+    } catch { result = v2 ? "kept" : "fallback"; }
     if (publicationId) {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
       if (released !== "fallback") return outcome(released);
