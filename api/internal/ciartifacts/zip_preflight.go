@@ -11,7 +11,7 @@ import (
 // entry-sized structures. Each loop is bounded by 1000 entries or 65558 EOCD
 // candidate bytes; cancellation is checked on every iteration.
 func preflightZIP(ctx context.Context, b []byte) bool {
-	if len(b) < 22 {
+	if len(b) < 22 || len(b) > 64<<20 {
 		return false
 	}
 	u16 := func(p int) uint64 { return uint64(binary.LittleEndian.Uint16(b[p : p+2])) }
@@ -21,9 +21,10 @@ func preflightZIP(ctx context.Context, b []byte) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if bytes.Equal(b[p:p+4], []byte{'P', 'K', 5, 6}) && p+22+int(u16(p+20)) <= len(b) {
-			// Match archive/zip\'s last plausible EOCD, refusing trailing junk.
-			if p+22+int(u16(p+20)) != len(b) {
+		commentBytes := int(binary.LittleEndian.Uint16(b[p+20 : p+22]))
+		if bytes.Equal(b[p:p+4], []byte{'P', 'K', 5, 6}) && p+22+commentBytes <= len(b) {
+			// Match archive/zip's last plausible EOCD, refusing trailing junk.
+			if p+22+commentBytes != len(b) {
 				return false
 			}
 			end = p
@@ -49,7 +50,7 @@ func preflightZIP(ctx context.Context, b []byte) bool {
 	aggregate := uint64(0)
 	var spans [1000][2]uint64
 	for i := uint64(0); i < count; i++ {
-		if ctx.Err() != nil || pos+46 > uint64(end) {
+		if ctx.Err() != nil || pos > 64<<20 || pos+46 > uint64(end) {
 			return false
 		}
 		p := int(pos)
@@ -66,10 +67,14 @@ func preflightZIP(ctx context.Context, b []byte) bool {
 		if name > 4096 || aggregate > 1<<20 || next > uint64(end) {
 			return false
 		}
-		if !safeExtra(b[p+46+int(name) : p+46+int(name+extra)]) {
+		extraEnd := pos + 46 + name + extra
+		if extraEnd > 64<<20 {
 			return false
 		}
-		if local+30 > start {
+		if !safeExtra(b[p+46+int(name) : int(extraEnd)]) {
+			return false
+		}
+		if local > 64<<20 || local+30 > start {
 			return false
 		}
 		l := int(local)
@@ -78,19 +83,20 @@ func preflightZIP(ctx context.Context, b []byte) bool {
 		}
 		ln, le := u16(l+26), u16(l+28)
 		data := local + 30 + ln + le
-		if ln != name || le > 1<<20 || data > start || compressed > start-data {
+		if ln > 4096 || ln != name || le > 1<<20 || data > 64<<20 || data > start || compressed > start-data {
 			return false
 		}
 		if !bytes.Equal(b[l+30:l+30+int(ln)], b[p+46:p+46+int(name)]) || !safeExtra(b[l+30+int(ln):int(data)]) {
 			return false
 		}
-		// Without a data descriptor, both headers must agree on size and CRC.
-		if u16(p+8)&8 == 0 && (u32(l+14) != u32(p+16) || u32(l+18) != compressed || u32(l+22) != plain) {
+		// Size consistency protects entry boundaries. CRC disagreements are
+		// entry-local integrity failures checked by archive/zip during inflation.
+		if u16(p+8)&8 == 0 && (u32(l+18) != compressed || u32(l+22) != plain) {
 			return false
 		}
 		localEnd := data + compressed
 		if u16(p+8)&8 != 0 {
-			if localEnd+12 > start {
+			if localEnd > 64<<20 || localEnd+12 > start {
 				return false
 			}
 			d := int(localEnd)
@@ -98,7 +104,7 @@ func preflightZIP(ctx context.Context, b []byte) bool {
 				d += 4
 				localEnd += 4
 			}
-			if localEnd+12 > start || u32(d) != u32(p+16) || u32(d+4) != compressed || u32(d+8) != plain {
+			if localEnd+12 > start || u32(d+4) != compressed || u32(d+8) != plain {
 				return false
 			}
 			localEnd += 12

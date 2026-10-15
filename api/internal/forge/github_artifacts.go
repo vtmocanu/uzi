@@ -139,7 +139,7 @@ func (g *github) artifactRepoPath(ctx context.Context, projectID int64) (string,
 			return "", errArtifactResponse
 		}
 		for _, r := range component {
-			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' {
 				return "", errArtifactResponse
 			}
 		}

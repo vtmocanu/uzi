@@ -123,8 +123,15 @@ func TestCollectorCRCFileBudgetRatioAndDeadline(t *testing.T) {
 			c := NewCollector(tc.limits, nil)
 			c.Add(context.Background(), "a", "a", tc.data)
 			m, in := c.Result()
-			if tc.name == "ratio" && c.inflated > int64(m.Entries[0].CompressedSize*100)+1 {
-				t.Fatalf("unbounded ratio probe: %d", c.inflated)
+			if tc.name == "ratio" {
+				compressed := m.Entries[0].CompressedSize
+				if compressed > 64<<20 {
+					t.Fatal("fixture exceeds archive bound")
+					return
+				}
+				if c.inflated > int64(compressed)*100+1 {
+					t.Fatalf("unbounded ratio probe: %d", c.inflated)
+				}
 			}
 			if len(in) != 0 || len(m.Entries) != 1 || m.Entries[0].Reason != tc.reason {
 				t.Fatalf("%+v %+v", m, in)
@@ -169,7 +176,7 @@ func TestCollectorPreflight(t *testing.T) {
 		{"encrypted", func(b []byte) { b[central+8] |= 1 }},
 		{"zip64", func(b []byte) { binary.LittleEndian.PutUint32(b[central+24:], 0xffffffff) }},
 		{"length", func(b []byte) { binary.LittleEndian.PutUint16(b[central+28:], 4097) }},
-		{"local", func(b []byte) { binary.LittleEndian.PutUint32(b[central+42:], uint32(len(b))) }},
+		{"local", func(b []byte) { binary.LittleEndian.PutUint32(b[central+42:], fixtureZIPOffset(t, len(b))) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := bytes.Clone(good)
@@ -251,7 +258,7 @@ func TestCollectorPaddedCompressedSize(t *testing.T) {
 	central += 100
 	end += 100
 	binary.LittleEndian.PutUint32(padded[central+20:], compressed+100)
-	binary.LittleEndian.PutUint32(padded[end+16:], uint32(central))
+	binary.LittleEndian.PutUint32(padded[end+16:], fixtureZIPOffset(t, central))
 	// Descriptor size must agree too; actual deflate consumption still differs.
 	binary.LittleEndian.PutUint32(padded[dataEnd+100+8:], compressed+100)
 	c := NewCollector(Limits{}, nil)

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"io"
+	"math"
 	"path"
 	"strconv"
 	"strings"
@@ -280,11 +281,15 @@ func (c *Collector) record(e Entry) {
 // caller or exhausted collection stops all later inflation, including archives.
 func (c *Collector) inflate(ctx context.Context, f *zip.File) ([]byte, string) {
 	c.compressed = 0
+	if f.CompressedSize64 > 64<<20 || f.UncompressedSize64 > math.MaxInt64 {
+		return nil, "invalid_entry"
+	}
+	expectedCompressed, expectedPlain := int64(f.CompressedSize64), int64(f.UncompressedSize64)
 	r, err := f.Open()
 	if err != nil {
 		return nil, "invalid_entry"
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }() // size and CRC failures are reported by Read
 	var data bytes.Buffer
 	var total int64
 	buf := make([]byte, 32<<10)
@@ -303,7 +308,7 @@ func (c *Collector) inflate(ctx context.Context, f *zip.File) ([]byte, string) {
 			c.stopped = true
 			return nil, "inflated_budget"
 		}
-		if total > c.compressed*100 || uint64(total) > f.CompressedSize64*100 {
+		if total > c.compressed*100 || total > expectedCompressed*100 {
 			return nil, "compression_ratio"
 		}
 		if total <= c.limits.MaxFileBytes {
@@ -313,7 +318,7 @@ func (c *Collector) inflate(ctx context.Context, f *zip.File) ([]byte, string) {
 			if readErr != io.EOF {
 				return nil, "invalid_entry"
 			}
-			if uint64(total) != f.UncompressedSize64 || uint64(c.compressed) != f.CompressedSize64 {
+			if total != expectedPlain || c.compressed != expectedCompressed {
 				return nil, "invalid_entry"
 			}
 			if total > c.limits.MaxFileBytes {
