@@ -24,12 +24,13 @@ const captureLeaves = new Set([
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
+  const command = file === 'memory-command-real';
   const expected = [];
   const identities = new Set();
   let gates = 0;
   let suites = 0;
   const visit = (node, ancestors = [], targeted = false) => {
-    if (node.kind === SyntaxKind.CallExpression && ['it', 'describe'].includes(node.expression.text)) {
+    if (node.kind === SyntaxKind.CallExpression && ['it', 'test', 'describe'].includes(node.expression.text)) {
       const name = node.arguments[0];
       const options = node.arguments.length === 3 ? node.arguments[1] : undefined;
       const gate = !planning && options?.properties?.some(p => p.name?.text === 'skip' && (
@@ -37,7 +38,7 @@ export function inventoryForSource(source, file) {
         (file === 'codex-launcher' && source.text.slice(p.pos, p.end).includes('WORKER_UID'))
       ));
       if (gate) gates++;
-      const active = targeted || gate;
+      const active = targeted || gate || command;
       if (name?.kind !== SyntaxKind.StringLiteral) {
         if (active) throw new Error(`nonliteral targeted test title: ${file}`);
         // Unknown planning ancestry cannot establish an exact capture identity.
@@ -46,11 +47,11 @@ export function inventoryForSource(source, file) {
         const names = [...ancestors, name.text];
         if (planning && node.expression.text === 'describe' && ancestors.length === 0 && name.text === captureSuite) suites++;
         const capture = planning && ancestors.length === 1 && ancestors[0] === captureSuite && captureLeaves.has(name.text);
-        if (node.expression.text === 'it' && (active || capture)) {
+        if (['it', 'test'].includes(node.expression.text) && (active || capture)) {
           const identity = JSON.stringify(names);
           if (identities.has(identity)) throw new Error(`duplicate source leaf identity: ${file}: ${identity}`);
           identities.add(identity);
-          expected.push({ file: `agent/test/${file}.test.ts`, names });
+          expected.push({ file: command ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
           return;
         }
         const callback = node.arguments[node.arguments.length - 1];
@@ -66,6 +67,11 @@ export function inventoryForSource(source, file) {
     for (const leaf of captureLeaves) {
       if (!expected.some(test => test.names[1] === leaf)) throw new Error(`${file}: missing required literal capture leaf: ${leaf}`);
     }
+  } else if (command) {
+    const title = 'real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure';
+    if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
+      throw new Error(`${file}: missing required literal command proof`);
+    }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);
   }
@@ -75,10 +81,14 @@ export function inventoryForSource(source, file) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const api = new API({ cwd: path.join(repo, 'agent') });
   try {
-    const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'agent/tsconfig.json')] });
+    const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'e2e/worker-uid/tsconfig.json')] });
     const program = snapshot.getProjects()[0].program;
-    const expected = files.flatMap(file => {
-      const filename = path.join(repo, `agent/test/${file}.test.ts`);
+    const lane = process.argv[2] ?? 'worker';
+    if (!['worker', 'command'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
+    const selected = lane === 'command' ? ['memory-command-real'] : files;
+    const expected = selected.flatMap(file => {
+      const filename = path.join(repo, file === 'memory-command-real'
+        ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);
       if (program.getSyntacticDiagnostics(filename).length) throw new Error(`invalid test syntax: ${file}`);
       const source = program.getSourceFile(filename);
       if (!source) throw new Error(`missing source: ${file}`);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -36,6 +36,13 @@ test("real adopted detached tree: eligibility, identity refusal, concurrent clea
   assert.equal(process.platform, "linux", "prerequisite: Linux supervisor");
   assert.equal(process.getuid?.(), COMMAND_UID,
     "prerequisite: run this bounded command-only proof as cap-less command uid 10003");
+  const status = await readFile("/proc/self/status", "utf8");
+  for (const name of ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]) {
+    const value = status.match(new RegExp(`^${name}:\\s+([0-9a-f]+)$`, "m"))?.[1];
+    assert.ok(value, `prerequisite: ${name} is reported`);
+    assert.equal(BigInt(`0x${value}`), 0n, `prerequisite: ${name} must be empty`);
+  }
+  assert.match(status, /^NoNewPrivs:\s+1$/m, "prerequisite: no-new-privileges");
   const scratch = path.join(root, ".uzi/scratch");
   await mkdir(scratch, { recursive: true });
   const dir = await mkdtemp(path.join(scratch, "memory-real."));

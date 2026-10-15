@@ -20,6 +20,18 @@ class CheckerTest(unittest.TestCase):
     def test_pass(self):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
 
+    def test_command_identity_and_failures(self):
+        expected = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["real command"]}]
+        for file in ("/proof/e2e/worker-uid/memory-command-real.test.mts",
+                     "e2e/worker-uid/memory-command-real.test.mts"):
+            case = f'<testcase name="real command" file="{file}"/>'
+            self.assertEqual(check(expected, ET.fromstring(f"<testsuites>{case}</testsuites>")), [])
+            for tag in ("skipped", "failure", "error"):
+                failed = case.replace("/>", f'><{tag} message="timed out"/></testcase>')
+                self.assertIn("timed out", "\\n".join(check(expected, ET.fromstring(f"<testsuites>{failed}</testsuites>"))))
+            for body in ("", case + case, case.replace("/proof/e2e/", "/other/e2e/").replace("worker-uid", "other")):
+                self.assertTrue(check(expected, ET.fromstring(f"<testsuites>{body}</testsuites>")))
+
     def test_capture_identities_must_run_not_skip_or_disappear(self):
         titles = [
             "cancels while the object-store snapshot streams and leaves no temp tree",

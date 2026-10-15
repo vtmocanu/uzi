@@ -2686,6 +2686,8 @@ tasks:
       - python3 e2e/worker-uid/check_test.py
       - python3 e2e/worker-uid/run_test.py
       - python3 e2e/worker-uid/gate_test.py
+      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/inventory.test.mts
+      - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
 
   test:agent:worker-uid:
     desc: agent - require real worker UID ownership tests inside the base image

@@ -51,7 +51,12 @@ def check(expected, root):
         diagnostics = (*diagnostics, *local)
         if element.tag == "testcase":
             raw = element.get("file", "").replace("\\", "/")
-            file = "agent/test/" + raw.rsplit("/test/", 1)[-1] if "/test/" in raw else "agent/" + raw
+            if "/e2e/worker-uid/" in raw:
+                file = "e2e/worker-uid/" + raw.rsplit("/e2e/worker-uid/", 1)[-1]
+            elif raw.startswith("e2e/worker-uid/"):
+                file = raw
+            else:
+                file = "agent/test/" + raw.rsplit("/test/", 1)[-1] if "/test/" in raw else "agent/" + raw
             key = (file, (*names, element.get("name")))
             # Out-of-pattern leaves may appear as skipped on some Node versions.
             if key not in expected_keys:
