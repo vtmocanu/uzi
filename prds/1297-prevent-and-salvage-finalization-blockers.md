@@ -1,15 +1,15 @@
 # PRD #1297: Prevent and salvage finalization blockers
 
 **Issue**: [#1297](https://github.com/vtmocanu/uzi/issues/1297) · **Priority**: High
-**Status**: Reviewed; amended 2026-09-19 (D11, D12 and the post-baseline drift listed in the Decision log). Held until every dependency below is met. Implementation has not started.
-**Dependency**, all three before this run starts:
+**Status**: Not planned (2026-10-15, epic #2746); issue #1297 is closed. Optional blocker repair/partial draft delivery is not required for automatic source preservation and settlement. Implementation has not started; reopen before reactivating this historical design.
+**Historical dependencies**, to re-evaluate only if this feature is reopened:
 1. [PRD #1296](1296-durable-run-recovery.md) merged (done, PR #1316) AND its owed hosted-k8s plus browser/CLI acceptance discharged.
 2. [PRD #1349](1349-recovery-custody-hardening.md) merged (done, PR #1366) AND its maintainer-owned M8 acceptance discharged: it changed the custody contract D4 and D6 build on.
 3. [PRD #1359](1359-finalize-against-current-main.md) implemented and merged: it owns the finalize substrate this PRD consumes (D11).
 
 No dependency on enabling #1226/#1246's completion-interlock rollout: partial authority must be correct and tested with that interlock both OFF and ON.
 **Evidence baseline**: decisions written at `43f3fd61` (2026-09-12); amendment anchors verified at `c46d215e` (2026-09-19). Symbols are named, line numbers are not: recheck every named symbol on the implementation base, after #1359 lands.
-**Handoff**: User-selected Auto mode with MR rework enabled, once the three dependencies above are met. Not a label sweep.
+**Handoff**: Inactive. The earlier Auto-mode choice is historical; no dispatch or implementation unless the maintainer reopens and re-reviews the feature. Full-original preservation, secret quarantine and honest availability remain existing obligations.
 
 ## Problem and outcome
 
