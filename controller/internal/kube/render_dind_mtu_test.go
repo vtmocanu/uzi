@@ -45,9 +45,14 @@ type dindLaunch struct {
 	config     map[string]any
 }
 
+type dindLaunchOptions struct {
+	expectFallback bool
+	configFailure  string
+}
+
 // runRenderedDind executes the actual rendered Command and Args, replacing only
-// the sysfs positional argument. The fake daemon records arguments and config contents.
-func runRenderedDind(t *testing.T, dind corev1.Container, netDir string, failure ...string) (dindLaunch, string, error) {
+// the sysfs positional argument. Config capture is required unless fallback is expected.
+func runRenderedDind(t *testing.T, dind corev1.Container, netDir string, options ...dindLaunchOptions) (dindLaunch, string, error) {
 	t.Helper()
 	if len(dind.Command) != 5 || dind.Command[0] != "/bin/sh" || dind.Command[1] != "-c" ||
 		dind.Command[3] != "dind-mtu" || dind.Command[4] != "/sys/class/net" {
@@ -70,8 +75,18 @@ done
 (set -C; : > "$DIND_CONFIG_PATH") || exit 1
 printf '%s\n' "$DIND_CONFIG_PATH"
 `
-	if len(failure) > 0 {
-		switch failure[0] {
+	var opts dindLaunchOptions
+	if len(options) > 1 {
+		t.Fatal("at most one launch options value is allowed")
+	}
+	if len(options) == 1 {
+		opts = options[0]
+	}
+	if opts.expectFallback && opts.configFailure != "" {
+		t.Fatal("fallback and config failure expectations are mutually exclusive")
+	}
+	if opts.configFailure != "" {
+		switch opts.configFailure {
 		case "mktemp":
 			mktemp = "#!/bin/sh\nexit 1\n"
 		case "write":
@@ -80,7 +95,7 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 				t.Fatal(err)
 			}
 		default:
-			t.Fatalf("unknown fixture failure: %q", failure[0])
+			t.Fatalf("unknown fixture failure: %q", opts.configFailure)
 		}
 	}
 	if err := os.WriteFile(filepath.Join(binDir, "mktemp"), []byte(mktemp), 0o700); err != nil { //nolint:gosec // G306: executable mock under t.TempDir.
@@ -110,6 +125,15 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 	if len(data) == 0 || data[len(data)-1] != 0 {
 		t.Fatalf("invalid fake daemon argv capture: %q", data)
 	}
+	argv := strings.Split(string(data[:len(data)-1]), "\x00")
+	if opts.expectFallback {
+		for _, path := range []string{configPath, configCapture} {
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("fallback must not create config or capture %q: %v", path, statErr)
+			}
+		}
+		return dindLaunch{argv: argv}, stderr.String(), err
+	}
 	configData, readErr := os.ReadFile(configCapture) //nolint:gosec // G304: fake daemon capture under t.TempDir.
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -126,7 +150,7 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 		t.Fatalf("daemon config permissions = %o, want 600", info.Mode().Perm())
 	}
 	return dindLaunch{
-		argv:       strings.Split(string(data[:len(data)-1]), "\x00"),
+		argv:       argv,
 		configPath: configPath,
 		config:     config,
 	}, stderr.String(), err
@@ -156,14 +180,14 @@ func TestNonRootlessDindMTU(t *testing.T) {
 	}{
 		{"1400", []dindMTUInterface{{"ens5", "1400\n"}}, "1400"},
 		{"1500", []dindMTUInterface{{"ens5", "1500\n"}}, "1500"},
-		{"jumbo", []dindMTUInterface{{"ens5", "9000\n"}}, "9000"},
+		{"jumbo", []dindMTUInterface{{"ens5", "9000\n"}}, "1500"},
 		{"minimum-first", []dindMTUInterface{{"a", "1400\n"}, {"z", "9000\n"}}, "1400"},
 		{"minimum-last", []dindMTUInterface{{"a", "9000\n"}, {"z", "1400\n"}}, "1400"},
 		{"bounds-minimum-first", []dindMTUInterface{{"a", "1\n"}, {"z", "65535\n"}}, "1"},
 		{"bounds-minimum-last", []dindMTUInterface{{"a", "65535\n"}, {"z", "1\n"}}, "1"},
 		{"loopback-excluded", []dindMTUInterface{{"lo", "invalid\n"}, {"net1", "1500\n"}}, "1500"},
 		{"minimum-bound", []dindMTUInterface{{"veth0", "1\n"}}, "1"},
-		{"maximum-bound", []dindMTUInterface{{"veth0", "65535\n"}}, "65535"},
+		{"maximum-bound", []dindMTUInterface{{"veth0", "65535\n"}}, "1500"},
 		{"without-newline", []dindMTUInterface{{"ens5", "1400"}}, "1400"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -200,7 +224,7 @@ func TestNonRootlessDindMTUConfigFailClosed(t *testing.T) {
 	} {
 		t.Run(tt.failure, func(t *testing.T) {
 			netDir := dindMTUFixture(t, []dindMTUInterface{{"ens5", "1400\n"}})
-			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, tt.failure)
+			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, dindLaunchOptions{configFailure: tt.failure})
 			if err == nil {
 				t.Fatalf("config failure must stop startup; stderr=%q", stderr)
 			}
@@ -217,7 +241,7 @@ func TestNonRootlessDindMTUConfigFailClosed(t *testing.T) {
 	}
 }
 
-func TestNonRootlessDindMTUFailClosed(t *testing.T) {
+func TestNonRootlessDindMTUFallback(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		value string
@@ -242,16 +266,19 @@ func TestNonRootlessDindMTUFailClosed(t *testing.T) {
 		{"no-interfaces", ""},
 		{"only-loopback", ""},
 		{"missing-net-directory", ""},
+		{"invalid-before-valid", "abc\n"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var interfaces []dindMTUInterface
 			switch tt.name {
 			case "no-interfaces", "missing-net-directory":
+			case "invalid-before-valid":
+				interfaces = []dindMTUInterface{{"a-broken", tt.value}, {"z-valid", "1400\n"}}
 			case "only-loopback":
 				interfaces = []dindMTUInterface{{"lo", "65536\n"}}
 			default:
 				// A valid sibling must never mask a broken interface.
-				interfaces = []dindMTUInterface{{"a-valid", "1500\n"}, {"z-broken", tt.value}}
+				interfaces = []dindMTUInterface{{"a-valid", "1400\n"}, {"z-broken", tt.value}}
 			}
 			netDir := dindMTUFixture(t, interfaces)
 			mtuPath := filepath.Join(netDir, "z-broken", "mtu")
@@ -269,15 +296,33 @@ func TestNonRootlessDindMTUFailClosed(t *testing.T) {
 			case "missing-net-directory":
 				netDir = filepath.Join(netDir, "absent")
 			}
-			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir)
-			if err == nil {
-				t.Fatalf("invalid MTU must fail; argv=%q, stderr=%s", launch.argv, stderr)
+			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, dindLaunchOptions{expectFallback: true})
+			if err != nil {
+				t.Fatalf("fallback launch failed: %v; stderr=%q", err, stderr)
 			}
-			if launch.argv != nil {
-				t.Fatalf("daemon launched on failure: %q", launch.argv)
+			want := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
+			if !reflect.DeepEqual(launch.argv, want) {
+				t.Fatalf("fallback argv = %q, want %q", launch.argv, want)
 			}
-			if !strings.Contains(stderr, "dind MTU:") || !strings.Contains(stderr, netDir) {
-				t.Fatalf("missing actionable MTU diagnostic: %q", stderr)
+			if launch.config != nil || launch.configPath != "" {
+				t.Fatalf("fallback has config: %#v", launch)
+			}
+			reason := "invalid MTU (expected decimal 1..65535): " + mtuPath
+			switch tt.name {
+			case "invalid-before-valid":
+				reason = "invalid MTU (expected decimal 1..65535): " + filepath.Join(netDir, "a-broken", "mtu")
+			case "above-bound", "oversized":
+				reason = "MTU exceeds 65535: " + mtuPath
+			case "missing-mtu", "unreadable-mtu-directory":
+				reason = "cannot read MTU: " + mtuPath
+			case "no-interfaces", "only-loopback":
+				reason = "no non-loopback interface MTU in " + netDir
+			case "missing-net-directory":
+				reason = "network interface directory unavailable: " + netDir
+			}
+			wantWarning := "dind MTU: warning: " + reason + "; using original daemon launch\n"
+			if stderr != wantWarning {
+				t.Fatalf("fallback warning = %q, want %q", stderr, wantWarning)
 			}
 		})
 	}
