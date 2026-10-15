@@ -460,6 +460,49 @@ for (const readback of ["created", "create_unknown", "refused", "pack_invalid", 
   });
 }
 
+
+for (const hold of ["open", "discarded", "unknown"] as const) {
+  it(`M4 saved held FINAL definitive refusal keeps archive fallback with hold ${hold}`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      f.state.finalError = new Error("initial FINAL unavailable");
+      await f.operate();
+      const saved = (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === f.record.captureId)!;
+      assert.equal(saved.finalRequest?.disposition.kind, "held_publication");
+      assert.equal(f.order.filter(x => x === "held").length, 1);
+      f.state.finalError = undefined;
+      const release = f.client.releaseRecoveryCustody;
+      Object.assign(f.client, {
+        releaseRecoveryCustody: async (...args: Parameters<typeof release>) => {
+          if ((args[3] as RecoveryFinalDisposition | undefined)?.kind !== "held_publication") return release(...args);
+          f.setHold(hold);
+          return { run_id: args[0], generation: args[1], released: false, holds_released: 0,
+            retained: true, reason: "held_publication_ref_missing" };
+        },
+        publishHeld: async () => {
+          f.order.push("held");
+          throw new TypeError("held retry transport unavailable");
+        },
+      });
+      await f.make(true).resumePending(undefined, [saved]);
+      assert.equal(f.state.produced, hold === "open" ? 1 : 0,
+        "definitive FINAL refusal must reach archive fallback only while the exact hold is open");
+      assert.equal(f.order.filter(x => x === "held").length, 1, "saved FINAL fallback must not republish held work");
+      const after = (await f.coordinator.inspect(f.context.runId)).find(r => r.captureId === saved.captureId)!;
+      assert.equal(after.finalAcknowledged === true, hold === "open", "only the actual archive FINAL ACK grants release");
+      if (hold === "open") {
+        assert.equal(after.captureId, saved.captureId);
+        assert.equal(after.sourceSha, saved.sourceSha);
+        assert.equal(after.coverageDigest, saved.coverageDigest);
+        assert.equal((f.finals.at(-1)?.[3] as RecoveryFinalDisposition)?.kind, "archive");
+      } else {
+        assert.equal(f.state.uploads, 0);
+        assert.equal(f.state.pinDeletes, 0);
+      }
+    } finally { await f.close(); }
+  });
+}
+
 for (const answer of ["refused", "invoked", "create_unknown", "503", "malformed"] as const) {
   it(`B V2 initial create ${answer} preserves protocol-specific fallback`, async () => {
     const f = await v2FrozenFixture();

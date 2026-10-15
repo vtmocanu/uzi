@@ -2217,15 +2217,23 @@ export class RecoveryCoordinator {
         !(await this.inactiveInventory(record))) return;
     // A saved FINAL replays before resolving inputs needed only for a new capture.
     // In particular, a verified empty inventory has no bundle or bare to rebuild.
+    let archiveFallback = false;
     if (record.finalRequest) {
       const outcome = await this.finalizeInventory(record);
       const latest = await this.readLatest(record);
       if (latest.kind !== "ok" || latest.record.finalRequest || latest.record.finalAcknowledged) return outcome;
+      archiveFallback = outcome?.held === "fallback";
       record = latest.record;
     }
     const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
     if (!barePath) return;
-    return this.frozenOperationCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
+    const input = { record, barePath, defaultBranch: record.defaultBranch ?? "main", signal };
+    if (archiveFallback) {
+      const hold = await this.heldOperationState(record, signal);
+      if (hold !== "open") return this.heldStopped(record, hold);
+      return this.captureCycle(input);
+    }
+    return this.frozenOperationCycle(input);
   }
 
   /** Credential-free discovery precedes the journal snapshot; authentication is required
