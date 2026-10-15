@@ -5071,3 +5071,13 @@ export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
 }
+
+/** Explicit owner consent; null binds legacy runs with no completion contract. */
+export interface MilestoneResetOptions {
+  reconciliation: {
+    mode: "reset";
+    reason: string;
+    expected_completion_revision: number | null;
+  };
+  expected_reset_state_digest: string;
+}
