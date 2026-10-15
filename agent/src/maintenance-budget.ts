@@ -25,6 +25,7 @@ export class MaintenanceBudget {
 
   /** A shorter operation consumes this attempt's clock without renewing either bound. */
   cap(maxMs: number): () => number {
+    if (!Number.isFinite(maxMs) && maxMs !== Infinity) return () => 0;
     const start = this.remainingMs();
     const floor = start - Math.min(Math.max(0, maxMs), start);
     return () => this.signal.aborted ? 0 : Math.max(0, this.remainingMs() - floor);

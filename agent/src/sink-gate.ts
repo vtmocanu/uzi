@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 // issue #1597 M2 — the per-flight SINK GATE: an async mutex that serialises every path that moves a
 // run's durable state (the checkpoint closure, the pause/wall/completion parks and the credential-
 // switch give-up) against the MID-TURN checkpoint tick.
@@ -40,12 +41,22 @@ export class SinkGate {
   /** Run `fn` holding the gate, waiting (and preempting a holding tick) as needed. Re-entrant for
    *  the async call tree that already holds it. */
   async run<T>(fn: () => Promise<T>): Promise<T> {
+    const budget = MaintenanceBudget.current();
+    budget?.check();
     const store = owned.getStore() ?? [];
-    if (store.some((h) => h.gate === this && h.live)) return fn();
-    await this.lock();
+    if (store.some((h) => h.gate === this && h.live)) {
+      if (!budget) return fn();
+      const result = await fn();
+      budget?.check();
+      return result;
+    }
+    await this.lock(budget);
     const hold: Hold = { gate: this, live: true };
     try {
-      return await owned.run([...store.filter((h) => h.live), hold], fn);
+      budget?.check();
+      const result = await owned.run([...store.filter((h) => h.live), hold], fn);
+      budget?.check();
+      return result;
     } finally {
       hold.live = false;
       this.unlock();
@@ -72,7 +83,7 @@ export class SinkGate {
     };
   }
 
-  private async lock(): Promise<void> {
+  private async lock(budget?: MaintenanceBudget): Promise<void> {
     if (!this.locked) {
       this.locked = true;
       this.holderPreempt = undefined;
@@ -80,7 +91,21 @@ export class SinkGate {
     }
     // A tick holds it: ask it to stop. A gated holder has no preempt and is simply waited for.
     this.holderPreempt?.();
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    await new Promise<void>((resolve, reject) => {
+      const ready = () => {
+        budget?.signal.removeEventListener("abort", cancel);
+        resolve();
+      };
+      const cancel = () => {
+        const index = this.waiters.indexOf(ready);
+        if (index < 0) return;
+        this.waiters.splice(index, 1);
+        reject(budget!.signal.reason);
+      };
+      this.waiters.push(ready);
+      budget?.signal.addEventListener("abort", cancel, { once: true });
+      if (budget?.signal.aborted) cancel();
+    });
     this.holderPreempt = undefined;
   }
 

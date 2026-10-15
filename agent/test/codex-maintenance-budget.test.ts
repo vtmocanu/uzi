@@ -125,6 +125,16 @@ it("expired queued drain never acts after holder release and preserves FIFO", as
   } finally { holder.resolve(); await active; budget.dispose(); }
 });
 
+it("unknown operation duration cannot establish an empty registry proof", async () => {
+  const budget = new MaintenanceBudget();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  try {
+    await MaintenanceBudget.run(budget, async () => {
+      assert.equal((await registry.settleForCapture(Number.NaN)).kind, "incomplete");
+    });
+  } finally { budget.dispose(); }
+});
+
 it("no epoch cancel proof after summary expiry is incomplete; repeated attempts share object", async () => {
   let now = 0;
   const budget = new MaintenanceBudget(100, () => now);
