@@ -113,7 +113,7 @@ it("expiry keeps the source live; ordinary J replaces I and its publication atom
   }
 });
 
-it("at cap one expiry offers cancel/reject and a new run; one queued cancel ends the wait", async () => {
+it("an underclaimed cap cannot veto server-accepted J; one queued cancel ends the wait", async () => {
   enable();
   const claim = freshClaim(1, { config: { plan_max_revisions: 1 } });
   const id = claim.run_id;
@@ -125,13 +125,15 @@ it("at cap one expiry offers cancel/reject and a new run; one queued cancel ends
     const [i] = send(id, row("revise_plan", "I"));
     assert.ok(await until(() => feed(id).some(text => text.includes("retry allowance exhausted"))));
     const notice = feed(id).find(text => text.includes("retry allowance exhausted"))!;
-    assert.match(notice, /PLAN_MAX_REVISIONS is exhausted/);
     assert.match(notice, /Cancel and source-bound reject remain available/);
     assert.match(notice, /dispatch a new run/);
-    const [j, cancel] = send(id, row("revise_plan", "J beyond cap"), row("cancel"));
+    const [j] = send(id, row("revise_plan", "server accepted J"));
+    assert.ok(await until(() => driver.turns.length === 2));
+    assert.deepEqual(driver.turns, [i!.id, j!.id]);
+    assert.match(notice, /if the server's PLAN_MAX_REVISIONS permits/);
+    const [cancel] = send(id, row("cancel"));
+    driver.publish.release();
     await done;
-    assert.deepEqual(driver.turns, [i!.id]);
-    assert.equal(api.isApplied(id, j!.id), false);
     assert.ok(api.isAcked(id, cancel!.id));
     assert.equal(statuses(id).includes("completed"), false);
   } finally {

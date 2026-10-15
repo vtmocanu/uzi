@@ -26,7 +26,6 @@ interface Active { id: number; source: Source; used: number; redriveReady: boole
 
 interface Dependencies {
   generation: number;
-  maxRevisions: number;
   steering: Pick<SteeringChannel, "takeRevisionRecoveryControl" | "awaitRevisionRecoveryEvent" | "retirePersistedRevision" | "setGateRevision">;
   ownership: () => Promise<RunOwnershipResponse>;
   signal: () => AbortSignal;
@@ -46,7 +45,6 @@ export class PlanRevisionRecovery {
   private source?: Source;
   private active?: Active;
   private predecessors: number[] = [];
-  private humanRounds = 0;
   private readonly taken = new Set<number>();
   private readonly limit: number;
   private readonly sleep: NonNullable<PlanRevisionRetryPolicy["sleep"]>;
@@ -78,7 +76,6 @@ export class PlanRevisionRecovery {
     if (this.taken.has(verdict.inputId))
       throw new PlanRevisionRecoveryStoppedError("duplicate plan revision cannot restart its driver");
     this.taken.add(verdict.inputId);
-    this.humanRounds++;
     this.active = { id: verdict.inputId, source: this.source, used: 0, redriveReady: false };
   }
 
@@ -139,11 +136,9 @@ export class PlanRevisionRecovery {
     };
     await restoreSourceGate(await this.confirmSource(a));
     this.deps.steering.setGateRevision(a.source.revision);
-    const capped = this.humanRounds >= this.deps.maxRevisions;
     await this.deps.notice(
       `Plan revision retry allowance exhausted (generation ${this.deps.generation}, source gate ${a.source.revision}, pending revision ${a.id}, ${this.limit} automatic re-drives in this flight). Feedback remains pending; no revised plan answering it has persisted. ` +
-      (capped ? "PLAN_MAX_REVISIONS is exhausted: no further revise/retry is available on this run. " :
-        "Use an ordinary revise bound to this source gate for a new, normally charged revision, if PLAN_MAX_REVISIONS permits. If that cap is exhausted, no further revise/retry is available on this run. ") +
+      "Use an ordinary revise bound to this source gate for a new, normally charged revision, if the server's PLAN_MAX_REVISIONS permits. If that cap is exhausted, no further revise/retry is available on this run. " +
       "Cancel and source-bound reject remain available. Approval and follow-up cannot resume this wait. For further changes after the cap, cancel/reject and dispatch a new run. This live gate remains busy and can defer a worker image roll until it ends or existing drain/shutdown policy acts.",
     );
     for (;;) {
@@ -155,8 +150,8 @@ export class PlanRevisionRecovery {
       let verdict: PlanVerdict | undefined;
       try {
         verdict = await Promise.race([
-          this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, capped ? Number.MAX_SAFE_INTEGER : a.id, signal),
-          this.sleep(250, signal).then(() => undefined),
+          this.deps.steering.awaitRevisionRecoveryEvent(a.source.revision, a.id, signal),
+          this.sleep(30_000, signal).then(() => undefined),
         ]);
       } catch (err) {
         this.control(a);

@@ -10708,12 +10708,10 @@ export class RunRunner {
       flight.attempt = attempt;
       this.liveAttempts.add(attempt);
     }
-    const revisionCap = claim.config?.plan_max_revisions;
     const revisionRecovery = flight.planRevisionRetryNegotiated === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0
       ? new PlanRevisionRecovery({
         generation: flight.claimGeneration,
-        maxRevisions: typeof revisionCap === "number" && Number.isFinite(revisionCap) && revisionCap >= 0 ? Math.floor(revisionCap) : 3,
         steering,
         ownership: () => this.client.getRunOwnership(runId, {
           signal: AbortSignal.any([steering.lifecycleSignal(), this.shutdownSignal.signal, AbortSignal.timeout(3_000)]),

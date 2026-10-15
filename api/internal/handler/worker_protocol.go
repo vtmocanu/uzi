@@ -1502,8 +1502,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		ack["gate_revision"] = gateRevision
 	}
 	if result.Reconciliation != nil {
+		var supersededIDs *[]int64
+		if result.RevisionInputID != nil {
+			ids := append([]int64{}, result.SupersededRevisionInputIDs...)
+			supersededIDs = &ids
+		}
 		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
-			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: result.SupersededRevisionInputIDs,
+			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
 		})
