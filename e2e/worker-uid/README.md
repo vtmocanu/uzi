@@ -149,7 +149,9 @@ actual feedback and confirmed drain. The fixed plan uses 1 MiB chunks, 16/32
 rounds and four charge classes, with a 64 MiB overhead allowance and a total
 budget no greater than half the cgroup limit. Load is bounded at 30 seconds,
 owned cleanup at 30 seconds, and the fixture wall at 90 seconds including host
-cleanup. Sampling at 250 ms allows 268 records: six baseline reads, up to
+cleanup. Host capture owns 60 seconds including kill/reap grace, followed by at
+most 30 seconds of host cleanup. The checker also bounds the reported Node clock
+to that capture window. Sampling at 250 ms allows 268 records: six baseline reads, up to
 30 seconds load plus 30 seconds cleanup plus five seconds quiet dwell, and two
 boundary ticks. Raw samples are capped at 6,144 bytes; reports at 8 MiB. Evidence
 is refused on overflow, never truncated into acceptance.

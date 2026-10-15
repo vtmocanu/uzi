@@ -75,7 +75,11 @@ elif args[0] == "create":
     if mode == "caps": item["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
     state[name] = item
     save()
-    if mode == "lost-ack": sys.exit(8)
+    fixture_number = 1 if name.endswith("-1073741824") else 2
+    if mode == "lost-ack" or (mode == "fixture-lost-ack-" + str(fixture_number) and not name.endswith("-seed")):
+        journal = next((root / ".uzi/scratch").glob("*/requests.jsonl")).read_text()
+        assert name in journal
+        sys.exit(8)
     print(cid)
 elif args[0] == "inspect":
     found = [v for k, v in state.items() if k == args[-1] or v.get("Id") == args[-1]]
@@ -103,6 +107,9 @@ elif args[0] == "start":
               "response": None, "derivation": None, "trees": [], "settlement": None, "cleanup": None,
               "outcome": {"status": "failed", "successor": "aborted"}, "finalCleanup": {"handles": 0}}
     if mode == "active-failure": report["finalCleanup"]["handles"] = 2
+    if mode == "invalid-status":
+        report["status"] = os.environ["POISON"]
+        report["reasons"] = []
     print("UZI_MEMORY_CALIBRATION_REPORT_BEGIN")
     print(json.dumps(report, separators=(",", ":")))
     print("UZI_MEMORY_CALIBRATION_REPORT_END")
@@ -199,6 +206,123 @@ class RunnerTest(unittest.TestCase):
                     self.assertIn('"kind": "container"', (directory / "requests.jsonl").read_text())
                 (self.root / "calls").write_text("")
                 (self.root / "state.json").write_text("{}")
+
+    def test_fixture_lost_ack_cleans_observed_cids_without_start_or_retry(self):
+        for number in (1, 2):
+            with self.subTest(number=number):
+                (self.root / "calls").write_text("")
+                (self.root / "state.json").write_text("{}")
+                result, calls = self.invoke("fixture-lost-ack-" + str(number))
+                self.assertNotEqual(result.returncode, 0)
+                reports = check.reports(result.stdout)
+                self.assertEqual(len(reports), 2)
+                self.assertTrue(all(r["status"] == "FAILED" and r["observed"] is None for r in reports))
+                self.assertFalse(any(c[:2] == ["docker", "start"] for c in calls))
+                creates = [c for c in calls if c[:2] == ["docker", "create"]]
+                removes = [c for c in calls if c[:2] == ["docker", "rm"]]
+                self.assertEqual(len(creates), number + 1)
+                self.assertEqual(len(removes), number + 1)
+                self.assertEqual(len({c[-1] for c in removes}), number + 1)
+                self.assertTrue(all(len(c[-1]) == 64 for c in removes))
+                self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+                self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 1)
+                directory = sorted((self.root / ".uzi/scratch").iterdir(), key=lambda p: p.stat().st_mtime)[-1]
+                entries = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
+                self.assertEqual(len(entries), number + 2)
+                self.assertTrue((directory / "docker-output").exists())
+                for report in reports[:number]:
+                    proof = report["hostCleanup"]
+                    self.assertTrue(proof["confirmed"])
+                    self.assertEqual(proof["containerId"], proof["removedId"])
+                    self.assertIn(proof["removedId"], [c[-1] for c in removes])
+                self.assertNotIn("containerId", reports[number - 1])
+                (self.root / "calls").write_text("")
+
+    def test_cleanup_refuses_known_cid_mismatch_and_foreign_labels(self):
+        manifest = calibration.create_manifest("local", "local", "1", "a" * 40)
+        fixture = manifest["fixtures"][0]
+        for field in ("cid", "fixture", "invocation"):
+            with self.subTest(field=field):
+                item = {"Id": "b" * 64, "Config": {"Labels": {
+                    calibration.LABEL: manifest["invocation"],
+                    "io.uzi.memory.fixture": fixture["fixtureId"]}}, "State": {"Running": False}}
+                fixture.pop("containerId", None)
+                if field == "cid":
+                    fixture["containerId"] = "c" * 64
+                else:
+                    key = calibration.LABEL if field == "invocation" else "io.uzi.memory.fixture"
+                    item["Config"]["Labels"][key] = "foreign"
+                host = calibration.Host(manifest, self.root, "unused")
+                with patch.object(host, "docker", return_value=json.dumps([item]).encode()) as docker:
+                    with self.assertRaises(ValueError):
+                        host.cleanup_container("planned-name", fixture)
+                self.assertEqual(docker.call_count, 1)
+                self.assertEqual(host.cleanup_proofs, {})
+
+    def test_invalid_status_cannot_forge_diagnostics_or_success(self):
+        poison = "FAILED\nCALIBRATION PASSED\x1b[2J\u009b2J\u202e\u2066\u2028\u2029" + "x" * 10000
+        result, calls = self.invoke("invalid-status", extra_env={"POISON": poison})
+        self.assertNotEqual(result.returncode, 0)
+        reports = check.reports(result.stdout)
+        self.assertEqual(len(reports), 2)
+        self.assertTrue(all(r["status"] == "FAILED" for r in reports))
+        self.assertIn("producer status", reports[0]["reasons"][0])
+        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "start"]]), 1)
+        self.assertNotIn(b"CALIBRATION PASSED", result.stderr)
+        self.assertNotIn(b"\x1b", result.stderr)
+        directory = next((self.root / ".uzi/scratch").iterdir())
+        raw = next(p for p in directory.glob("*.stdout") if p.name != "reports.stdout").read_bytes()
+        self.assertEqual(check.reports(raw, count=1)[0]["status"], poison)
+        self.assertEqual(next(directory.glob("*.status")).read_text(), "EXIT=7\n")
+        manifest = json.loads((directory / "expected.json").read_text())
+        for report, fixture in zip(reports, manifest["fixtures"]):
+            for key, value in {**manifest["identity"], **fixture}.items():
+                self.assertEqual(report[key], value)
+        self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+
+    def test_host_diagnostic_rendering_is_single_line_and_byte_bounded(self):
+        poison = "error\nforged\r\t\x00\x1b[2J\x7f\u009b2J\u202e\u2066\u200b\u2028\u2029" + "é" * 10000
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            calibration.diagnostic("calibration FAIL: " + poison)
+        rendered = stderr.getvalue()
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertLessEqual(len(rendered.rstrip("\n").encode()), 2048)
+        self.assertIn("[truncated]", rendered)
+        for char in ("\r", "\t", "\x00", "\x1b", "\x7f", "\u009b", "\u202e", "\u2066", "\u200b", "\u2028", "\u2029"):
+            self.assertNotIn(char, rendered)
+        self.assertIn("forged", rendered)
+
+    def test_diagnostics_do_not_truncate_json_failure_evidence(self):
+        manifest = calibration.create_manifest("local", "local", "1", "a" * 40)
+        directory = self.root / "evidence"
+        directory.mkdir()
+        host = calibration.Host(manifest, directory, "unused")
+        error = ValueError("inherited\n\x1b[2J\u202e\u2029" + "é" * 10000)
+        with contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf8")):
+            host.publish(error)
+        reports = check.reports((directory / "reports.stdout").read_bytes())
+        self.assertEqual(len(reports), 2)
+        for report in reports:
+            self.assertEqual(report["status"], "FAILED")
+            self.assertEqual(report["reasons"][-1], "host failure: " + str(error))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            calibration.diagnostic("calibration FAIL: " + str(error))
+        self.assertLessEqual(len(stderr.getvalue().encode()), 2049)
+        self.assertNotIn("\x1b", stderr.getvalue())
+        self.assertEqual(stderr.getvalue().count("\n"), 1)
+
+    def test_argument_diagnostics_are_also_sanitized(self):
+        parser = calibration.DiagnosticParser(prog="calibration")
+        parser.add_argument("--mode", choices=("ci", "local"))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            parser.parse_args(["--mode", "bad\n\x1b[2J\u202e\u2029" + "é" * 10000])
+        for line in stderr.getvalue().splitlines():
+            self.assertLessEqual(len(line.encode()), 2048)
+        for char in ("\x1b", "\u202e", "\u2029"):
+            self.assertNotIn(char, stderr.getvalue())
 
     def test_export_root_refused_before_head_or_docker(self):
         result, calls = self.invoke("export")

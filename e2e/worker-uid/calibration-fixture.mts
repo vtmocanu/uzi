@@ -106,6 +106,38 @@ export function projectFailedEvidence(facts: {
     cleanup: { confirmed: null, startMs: facts.cleanupStart ?? null, endMs: facts.cleanupEnd ?? null },
   };
 }
+// Bounded by MAX_SAMPLES at the caller. Invalid evidence refuses completion;
+// a high sample resets dwell, while a gap rejects the remaining contiguous run.
+export function freshPostCleanupDwell(samples: Sample[], cleanupEnd: number, atMs: number, guard: {
+  reserveBytes: number; hysteresisBytes: number; sampleMs: number; responseBudgetMs: number; rearmMs: number;
+}, limitBytes: number): boolean {
+  const maximumGap = guard.sampleMs + guard.responseBudgetMs;
+  const quiet = limitBytes - guard.reserveBytes - guard.hysteresisBytes;
+  if (!Number.isFinite(cleanupEnd) || !Number.isFinite(atMs) || atMs < cleanupEnd
+    || !Number.isSafeInteger(limitBytes) || limitBytes <= 0 || quiet <= 0) return false;
+  let first: Sample | undefined, previous: Sample | undefined, count = 0;
+  let contiguous = true;
+  for (const value of samples) {
+    if (value.startedAtMs <= cleanupEnd) continue;
+    if (!value.available || value.limitBytes !== limitBytes
+      || !Number.isSafeInteger(value.currentBytes) || value.currentBytes < 0
+      || !Number.isSafeInteger(value.sampleId) || value.sampleId <= 0
+      || !Number.isFinite(value.startedAtMs) || !Number.isFinite(value.completedAtMs)
+      || value.completedAtMs < value.startedAtMs || value.completedAtMs > atMs
+      || value.completedAtMs - value.startedAtMs > maximumGap
+      || (previous && (value.sampleId <= previous.sampleId || value.startedAtMs < previous.completedAtMs))) return false;
+    if (value.currentBytes >= quiet) { first = undefined; count = 0; contiguous = true; }
+    else {
+      if (previous && first && value.startedAtMs - previous.completedAtMs > maximumGap) contiguous = false;
+      first ??= value;
+      count++;
+    }
+    previous = value;
+  }
+  return !!first && !!previous && contiguous && count >= 3
+    && previous.completedAtMs - first.completedAtMs >= guard.rearmMs
+    && atMs - previous.startedAtMs <= maximumGap;
+}
 export async function fixture(manifestFile: string, fixtureId: string) {
   const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
   const expected = manifest.fixtures.find((item: { fixtureId: string }) => item.fixtureId === fixtureId);
@@ -464,8 +496,12 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       cleanup: { binding, confirmed: true },
       oomBefore: before.oom!, oomAfter: after.oom!, oomKillsBefore: before.oom_kill!, oomKillsAfter: after.oom_kill!,
       oomGroupKillsBefore: before.oom_group_kill!, oomGroupKillsAfter: after.oom_group_kill! };
-    // Fresh low-pressure dwell is proven by the actual monitor state, with no retry/load.
-    await until(() => { if (fatal !== undefined) throw fatal; return monitor!.state.armed && !monitor!.state.pendingIntervention; }, 5000);
+    // Keep the existing interval until monitor state AND strictly post-cleanup evidence agree.
+    await until(() => {
+      if (fatal !== undefined) throw fatal;
+      return monitor!.state.armed && !monitor!.state.pendingIntervention
+        && freshPostCleanupDwell(samples, cleanupEnd!, now(), guard, plan.limitBytes);
+    }, 5000);
     clearInterval(interval); interval = undefined;
     const response = { provenance: "measured" as const, reportId: expected.reportId, legs: [leg] };
     const derivation = calibrationReport({ baseline, samples, reserveBytes: guard.reserveBytes, response });

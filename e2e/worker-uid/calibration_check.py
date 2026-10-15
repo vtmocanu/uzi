@@ -27,8 +27,41 @@ def number(value):
 
 def integer(value):
     number(value)
-    require(type(value) is int and value <= 2 ** 53 - 1, "invalid safe integer")
-    return value
+    require(value == math.floor(value) and value <= 2 ** 53 - 1, "invalid safe integer")
+    return int(value)
+
+
+def same(actual, expected):
+    """JSON equality: numbers share a type, but booleans never equal numbers."""
+    if type(expected) in (int, float):
+        return type(actual) in (int, float) and math.isfinite(actual) and actual == expected
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(same(actual[k], v) for k, v in expected.items())
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(same(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def numeric_fields(value):
+    """Validate owned numeric leaves even where correlation uses ordering/indexing."""
+    naturals = {"schemaVersion", "limitBytes", "uid", "diskType", "shmemType", "sampleId",
+                "currentBytes", "pid", "index", "step", "selectedIndex", "handles",
+                "claim_generation", "memory_episode", "oomBefore", "oomAfter",
+                "oomKillsBefore", "oomKillsAfter", "oomGroupKillsBefore", "oomGroupKillsAfter"}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in naturals:
+                integer(child)
+            elif ((key.endswith("Ms") and not isinstance(child, dict)) or
+                  key in ("timeOrigin", "hostMonotonicStart", "hostMonotonicEnd")):
+                # Container and host clocks remain separate; only validate their units here.
+                number(child)
+            numeric_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            numeric_fields(child)
 
 
 def exact_json(raw):
@@ -76,7 +109,14 @@ def reports(data, count=2):
 
 
 def manifest_check(manifest, synthetic=False):
-    require(type(manifest["schemaVersion"]) is int and manifest["schemaVersion"] == 1, "manifest version")
+    require(same(manifest["schemaVersion"], 1), "manifest version")
+    context = manifest["context"]
+    require(set(context) == {"run_id", "worker_id", "register_nonce", "claim_generation", "memory_episode"},
+            "host MemoryBinding fields")
+    require(all(isinstance(context[k], str) and context[k]
+                for k in ("run_id", "worker_id", "register_nonce")), "host MemoryBinding identity")
+    integer(context["claim_generation"])
+    integer(context["memory_episode"])
     identity = manifest["identity"]
     require(re.fullmatch("[0-9a-f]{40}", identity["sourceSha"]) is not None, "full host SHA required")
     require(identity["mode"] in ("ci", "local"), "invalid mode")
@@ -130,17 +170,18 @@ def psi(raw):
 
 
 def verify_report(report, manifest, expected, synthetic=False):
-    require(type(report["schemaVersion"]) is int and report["schemaVersion"] == 1, "unsupported schema")
+    numeric_fields(report)
+    require(same(report["schemaVersion"], 1), "unsupported schema")
     for key, value in {**manifest["identity"], **expected}.items():
-        require(report[key] == value, "wrong host identity " + key)
+        require(same(report[key], value), "wrong host identity " + key)
     require(report["provenance"] == ("synthetic" if synthetic else "measured"), "measurement provenance")
     require(report["status"] == "SUCCESS_COMPLETE" and report["reasons"] == [], "failed/incomplete report")
     require(report["clock"]["source"] == "node:performance" and report["clock"]["unit"] == "ms", "monotonic clock")
     number(report["clock"]["timeOrigin"])
     require(report["signalMeaning"] == "application supervisor disposal control write", "signal meaning")
     require(report["ackService"] == "LOCALFIXTURE", "ACK provenance")
-    require(report["bounds"] == {"maxSamples": 268, "rawSampleBytes": 6144, "reportBytes": CAP,
-                                "samplePeriodMs": 250, "loadMs": 30000, "cleanupMs": 30000}, "evidence bounds")
+    require(same(report["bounds"], {"maxSamples": 268, "rawSampleBytes": 6144, "reportBytes": CAP,
+                                "samplePeriodMs": 250, "loadMs": 30000, "cleanupMs": 30000}), "evidence bounds")
     observed = report["observed"]
     require(observed["uid"] == 10003 and observed["noNewPrivs"] is True and observed["capsZero"] is True,
             "capless identity")
@@ -174,11 +215,11 @@ def verify_report(report, manifest, expected, synthetic=False):
             integer(value)
         require(sample["currentBytes"] == int(current) and limit == int(maximum), "raw sample mismatch")
         stat = fields(raw["/sys/fs/cgroup/memory.stat"])
-        require(sample["stat"] == {key: stat[key] for key in
-                ("anon", "shmem", "slab_unreclaimable", "unevictable")}, "raw stat mismatch")
-        require(sample["pressure"] == psi(raw["/sys/fs/cgroup/memory.pressure"]), "raw PSI mismatch")
+        require(same(sample["stat"], {key: stat[key] for key in
+                ("anon", "shmem", "slab_unreclaimable", "unevictable")}), "raw stat mismatch")
+        require(same(sample["pressure"], psi(raw["/sys/fs/cgroup/memory.pressure"])), "raw PSI mismatch")
         events = fields(raw["/sys/fs/cgroup/memory.events"])
-        require(all(k in events for k in EVENTS) and record["events"] == events, "raw event mismatch")
+        require(all(k in events for k in EVENTS) and same(record["events"], events), "raw event mismatch")
         parsed[sid] = sample
         previous = sample
     baseline, samples = report["baseline"], report["samples"]
@@ -186,21 +227,21 @@ def verify_report(report, manifest, expected, synthetic=False):
         require(3 <= len(sequence) <= 256, "baseline/load sample minimum")
         previous = None
         for sample in sequence:
-            require(parsed[sample["sampleId"]] == sample, "sample missing raw evidence")
+            require(same(parsed[sample["sampleId"]], sample), "sample missing raw evidence")
             require(previous is None or sample["sampleId"] > previous["sampleId"], "sample sequence")
             previous = sample
     require(samples[0]["startedAtMs"] >= baseline[-1]["completedAtMs"], "baseline/load order")
     bmax = max(s["currentBytes"] for s in baseline)
     rounds = 16 if limit == 1024 ** 3 else 32
-    require(report["plan"] == {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": bmax,
+    require(same(report["plan"], {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": bmax,
             "allocationBytes": 8 * rounds * MIB, "overheadBytes": 64 * MIB, "chunkBytes": MIB,
-            "rounds": rounds, "windowMs": 30000}, "fixed allocation plan")
+            "rounds": rounds, "windowMs": 30000}), "fixed allocation plan")
     require(bmax + 8 * rounds * MIB + 64 * MIB <= limit // 2, "preload 50% budget")
     require(all(s["currentBytes"] + 64 * MIB <= limit // 2 for s in samples), "safety ceiling")
     guard = report["guard"]
     high = limit - integer(guard["reserveBytes"])
-    require(guard == {"enabled": True, "reserveBytes": limit - high, "hysteresisBytes": 8 * MIB,
-            "sampleMs": 250, "responseBudgetMs": 5000, "rearmMs": 500, "maxInterventions": 2}, "guard settings")
+    require(same(guard, {"enabled": True, "reserveBytes": limit - high, "hysteresisBytes": 8 * MIB,
+            "sampleMs": 250, "responseBudgetMs": 5000, "rearmMs": 500, "maxInterventions": 2}), "guard settings")
     require(high == bmax + 32 * MIB and 0 < high - 8 * MIB < high < limit, "H/Q/L thresholds")
     response = report["response"]
     require(response["provenance"] == report["provenance"] and response["reportId"] == expected["reportId"]
@@ -217,7 +258,7 @@ def verify_report(report, manifest, expected, synthetic=False):
     low, above = samples[index - 1:index + 1]
     bracket = {"lastBelowSampleId": low["sampleId"], "firstAtOrAboveSampleId": above["sampleId"],
                "lowerMs": low["startedAtMs"], "upperMs": above["completedAtMs"]}
-    require(leg["hardBracket"] == bracket and low["currentBytes"] < high, "adjacent hard bracket")
+    require(same(leg["hardBracket"], bracket) and low["currentBytes"] < high, "adjacent hard bracket")
     spans = leg["spans"]
     end = bracket["upperMs"]
     for kind in ("observe", "reservation", "signal", "drain", "cleanup"):
@@ -266,12 +307,12 @@ def verify_report(report, manifest, expected, synthetic=False):
                   "monotonicGrowth": all(b["currentBytes"] >= a["currentBytes"] for a, b in zip(samples, samples[1:])),
                   "responseMeasured": not synthetic, "accepted": not synthetic,
                   "reserveCheck": {"reserveBytes": guard["reserveBytes"], "requiredBytes": required, "satisfied": True}}
-    require(report["derivation"] == derivation, "recomputed derivation mismatch")
+    require(same(report["derivation"], derivation), "recomputed derivation mismatch")
     settlement = report["settlement"]
     trees = report["trees"]
     require(len(trees) == 2 and [t["treeId"] for t in trees] == expected["treeIds"], "two enrolled trees")
-    selected = settlement["selectedIndex"]
-    require(type(selected) is int and selected in (0, 1), "selected index")
+    selected = integer(settlement["selectedIndex"])
+    require(same(selected, 0) or same(selected, 1), "selected index")
     require(binding["treeId"] == trees[selected]["treeId"], "selected binding")
     for tree in trees:
         integer(tree["identity"]["pid"])
@@ -282,12 +323,12 @@ def verify_report(report, manifest, expected, synthetic=False):
                 tree["disposals"][0]["evidence"]["event"]["state"] == "drained", "actual disposal evidence")
         enrollment = tree["enrollment"]
         for key in ("run_id", "worker_id", "claim_generation", "memory_episode"):
-            require(enrollment[key] == manifest["context"][key], "enrollment context")
+            require(same(enrollment[key], manifest["context"][key]), "enrollment context")
     require(trees[0]["identity"]["pid"] != trees[1]["identity"]["pid"], "distinct primaries")
     pressure = settlement["feedback"]
     require(settlement["broker"]["ok"] is False and settlement["broker"]["code"] == "worker_memory_pressure"
-            and settlement["broker"]["memoryPressure"] == pressure, "exact broker feedback")
-    require(all(pressure[k] == v for k, v in trees[selected]["enrollment"].items()), "feedback enrollment")
+            and same(settlement["broker"]["memoryPressure"], pressure), "exact broker feedback")
+    require(all(same(pressure[k], v) for k, v in trees[selected]["enrollment"].items()), "feedback enrollment")
     require(pressure["intervention_id"] == binding["interventionId"] and pressure["tool_id"] == binding["toolId"]
             and pressure["limit_bytes"] == limit and pressure["code"] == "worker_memory_pressure"
             and pressure["outcome"] == "confirmed_drained" and pressure["cancellation_confirmed"] is True
@@ -295,7 +336,7 @@ def verify_report(report, manifest, expected, synthetic=False):
             "actual pressure result")
     integer(pressure["observed_total_bytes"]); integer(pressure["tree_rss_bytes_approx"])
     survival = settlement["survival"]
-    require(survival["index"] == 1 - selected and survival["identity"] == trees[1 - selected]["identity"],
+    require(survival["index"] == 1 - selected and same(survival["identity"], trees[1 - selected]["identity"]),
             "saved sibling identity")
     require(survival["atMs"] >= spans["drain"]["endMs"] and survival["atMs"] <= spans["cleanup"]["startMs"],
             "sibling survival before global cleanup")
@@ -327,33 +368,39 @@ def verify_report(report, manifest, expected, synthetic=False):
     require(all(b["startedAtMs"] - a["completedAtMs"] <= guard["sampleMs"] + guard["responseBudgetMs"]
                 for a, b in zip(low_dwell, low_dwell[1:])), "dwell sample gaps")
     state = settlement["monitorState"]
-    require(state == {"armed": True, "pendingIntervention": False, "unconfirmedDrain": False,
-                      "unresolvedOutcome": False, "interventions": 1}, "fresh low pressure dwell")
+    require(same(state, {"armed": True, "pendingIntervention": False, "unconfirmedDrain": False,
+                      "unresolvedOutcome": False, "interventions": 1}), "fresh low pressure dwell")
     records = settlement["acknowledgements"]
     require(len(records) == 2 and [r["path"] for r in records] == ["/reservation", "/outcome"], "ACK count/order")
     for n, ack in enumerate(records):
         require(ack["status"] == 200 and number(ack["endMs"]) > number(ack["startMs"]), "ACK status/timing")
         a = ack["ack"]
-        require(all(a[k] == manifest["context"][k] for k in
+        require(all(same(a[k], manifest["context"][k]) for k in
                     ("run_id", "worker_id", "register_nonce", "claim_generation", "memory_episode")), "ACK incarnation")
         require(a["intervention_id"] == binding["interventionId"] and a["admitted"] is True
-                and a["authorizing"] is (n == 0) and a["policy"] == {"version": 1, "max_interventions": 2}
-                and a["allowance"] == {"limit": 2, "used": 1, "remaining": 1}, "ACK contract")
+                and a["authorizing"] is (n == 0) and same(a["policy"], {"version": 1, "max_interventions": 2})
+                and same(a["allowance"], {"limit": 2, "used": 1, "remaining": 1}), "ACK contract")
         require(("outcome" not in a) if n == 0 else a["outcome"] == "confirmed_drained", "outcome ACK")
     require(records[0]["startMs"] == spans["reservation"]["startMs"] and
             records[0]["endMs"] == spans["reservation"]["endMs"], "reservation span binding")
     require(len(settlement["serviceRecords"]) == 2 and len(settlement["history"]) == 1
             and settlement["history"][0]["outcome"] == "confirmed_drained", "settlement records")
     for n, record in enumerate(settlement["serviceRecords"]):
-        require(record["ack"] == records[n]["ack"] and record["path"] == records[n]["path"],
+        require(same(record["ack"], records[n]["ack"]) and record["path"] == records[n]["path"],
                 "service ACK receipt")
         req = record["request"]
         base = dict(req)
         if n:
             require(base.pop("outcome") == "confirmed_drained", "service outcome request")
-        require(base == settlement["history"][0]["request"] and
+        expected_request = {**manifest["context"], "intervention_id": binding["interventionId"],
+                            "policy": {"version": 1, "max_interventions": 2}}
+        require(same(base, expected_request) and
+                all(same(base[k], records[n]["ack"][k]) for k in expected_request),
+                "request host/ACK contract")
+        require(same(base, settlement["history"][0]["request"]) and
                 base["intervention_id"] == binding["interventionId"], "idempotent request binding")
         require(records[n]["startMs"] <= record["atMs"] <= records[n]["endMs"], "service timing")
+    require(settlement["history"][0]["status"] == "admitted", "history admission")
     require(records[1]["startMs"] >= spans["drain"]["endMs"] and
             records[1]["endMs"] <= low_dwell[0]["startedAtMs"], "outcome timing before fresh dwell")
     schedule = settlement["schedule"]
@@ -369,7 +416,7 @@ def verify_report(report, manifest, expected, synthetic=False):
     cancelled = [s for s in schedule if s["index"] == selected and s["kind"] == "cancelled"]
     require(len(cancelled) == 1 and cancelled[0]["startMs"] <= bracket["upperMs"]
             and cancelled[0]["endMs"] >= spans["drain"]["endMs"], "selected in-flight step cancellation")
-    require(cancelled[0] == [s for s in schedule if s["index"] == selected][-1], "no step after cancellation")
+    require(same(cancelled[0], [s for s in schedule if s["index"] == selected][-1]), "no step after cancellation")
     observations = settlement["observations"]
     observed_spans = [o for o in observations if o["index"] == selected and o["startMs"] >= bracket["upperMs"]]
     require(observed_spans and observed_spans[0]["startMs"] == spans["observe"]["startMs"]
@@ -377,21 +424,72 @@ def verify_report(report, manifest, expected, synthetic=False):
     require(any(o["index"] == selected and o["startMs"] >= leg["ack"]["atMs"]
                 and o["endMs"] <= spans["signal"]["startMs"] for o in observations), "post-ACK revalidation")
     writes = [w for w in settlement["signalWrites"] if w["index"] == selected]
-    require(writes == [{"index": selected, "startMs": spans["signal"]["startMs"],
-                        "endMs": spans["signal"]["endMs"]}], "forwarded control write")
-    require(report["cleanup"] == {"confirmed": True, "startMs": spans["cleanup"]["startMs"],
-                                  "endMs": spans["cleanup"]["endMs"]}, "cleanup binding")
+    require(same(writes, [{"index": selected, "startMs": spans["signal"]["startMs"],
+                        "endMs": spans["signal"]["endMs"]}]), "forwarded control write")
+    require(same(report["cleanup"], {"confirmed": True, "startMs": spans["cleanup"]["startMs"],
+                                  "endMs": spans["cleanup"]["endMs"]}), "cleanup binding")
     require(spans["cleanup"]["endMs"] - spans["cleanup"]["startMs"] <= 30000, "cleanup window")
     final = report["finalCleanup"]
     require(final["handles"] == 2 and final["joined"] == ["fulfilled", "fulfilled"] and final["driverCompleted"] is True
             and len(final["clean"]) == 2 and all(r["clean"] is True for r in final["clean"]), "final joins")
     require(number(final["endMs"]) >= number(final["startMs"]) >= spans["cleanup"]["endMs"]
             and final["endMs"] - final["startMs"] <= 30000, "final cleanup times")
-    require(report["outcome"] == {"status": "failed", "reasons": ["worker_memory_pressure"], "successor": "aborted"},
+    # The interval stops before finalCleanup; the final raw-only read happens
+    # inside it. All timestamps use the declared node:performance clock.
+    fixture_end = number(final["endMs"])
+    # Host capture is 60s including its kill/reap grace; host removal owns a
+    # separate <=30s budget. Node performance.now starts at process startup.
+    require(fixture_end <= 60000, "60s captured fixture within 90s fixture wall")
+    require(all(s["completedAtMs"] <= final["startMs"] for s in samples),
+            "load/quiet samples before final cleanup")
+    require(all(s["completedAtMs"] <= fixture_end for s in parsed.values()),
+            "raw evidence after final cleanup")
+    raw_ids = [r["sample"]["sampleId"] for r in raw_samples]
+    baseline_offset = raw_ids.index(baseline[0]["sampleId"])
+    load_offset = baseline_offset + len(baseline)
+    require(same([s["sampleId"] for s in baseline],
+                 raw_ids[baseline_offset:load_offset]) and
+            same([s["sampleId"] for s in samples],
+                 raw_ids[load_offset:load_offset + len(samples)]),
+            "raw baseline/load phase correlation")
+    require(all(r["sample"]["startedAtMs"] >= final["startMs"]
+                for r in raw_samples[load_offset + len(samples):]),
+            "trailing raw reads inside final cleanup")
+    load_start = min(s["startMs"] for s in schedule)
+    load_end = max(cancelled[0]["endMs"], spans["drain"]["endMs"])
+    require(baseline[-1]["completedAtMs"] <= min(load_start, samples[0]["startedAtMs"]) and
+            load_start <= bracket["upperMs"] and load_end - load_start <= 30000,
+            "baseline then bounded load")
+    require(load_end <= survival["atMs"] <= spans["cleanup"]["startMs"] and
+            spans["cleanup"]["endMs"] - load_end <= 30000,
+            "load then bounded owned cleanup")
+    require(all(s["startMs"] >= baseline[-1]["completedAtMs"] and
+                s["endMs"] <= spans["cleanup"]["endMs"] for s in schedule),
+            "steps inside load/owned cleanup")
+    for index, tree in enumerate(trees):
+        disposal = tree["disposals"][0]
+        if index == selected:
+            require(leg["ack"]["atMs"] <= disposal["startMs"] <= spans["signal"]["startMs"],
+                    "authorized disposal contains control write")
+        else:
+            require(disposal["startMs"] >= spans["cleanup"]["startMs"], "sibling disposal phase")
+        require(disposal["startMs"] <= tree["exits"][0]["atMs"] <= disposal["endMs"]
+                <= spans["cleanup"]["endMs"], "disposal phase correlation")
+    for entries in (observations, settlement["signalWrites"]):
+        require(all(0 <= entry["startMs"] <= entry["endMs"]
+                    <= spans["cleanup"]["endMs"] for entry in entries),
+                "observation/control phase timing")
+    require(low_dwell[-1]["completedAtMs"] - spans["cleanup"]["endMs"] <= 5000 and
+            all(s["completedAtMs"] - s["startedAtMs"] <= guard["sampleMs"] + guard["responseBudgetMs"]
+                for s in low_dwell),
+            "bounded fresh quiet evidence")
+    require(same(report["outcome"], {"status": "failed", "reasons": ["worker_memory_pressure"], "successor": "aborted"}),
             "failed/aborted successor outcome")
 
 
 def verify(manifest, data, host_cleanup, synthetic=False):
+    numeric_fields(manifest)
+    numeric_fields(host_cleanup)
     manifest_check(manifest, synthetic)
     require(len({f["containerId"] for f in manifest["fixtures"]}) == 2 and
             all(re.fullmatch("[0-9a-f]{64}", f["containerId"]) for f in manifest["fixtures"]), "unique immutable CIDs")
@@ -400,7 +498,7 @@ def verify(manifest, data, host_cleanup, synthetic=False):
     for report, expected in zip(values, manifest["fixtures"]):
         verify_report(report, manifest, expected, synthetic)
         proof = host_cleanup[expected["fixtureId"]]
-        require(report["hostCleanup"] == proof, "complete stdout must carry host cleanup proof")
+        require(same(report["hostCleanup"], proof), "complete stdout must carry host cleanup proof")
         require(0 < number(proof["hostMonotonicEnd"]) - number(proof["hostMonotonicStart"]) <= 30,
                 "host cleanup budget")
         require(proof["confirmed"] is True and proof["containerId"] == expected["containerId"]

@@ -1,6 +1,6 @@
 // Trusted command primary: fixed file protocol, no model-supplied source or load settings.
 import { Worker } from "node:worker_threads";
-import { open, writeFile, statfs } from "node:fs/promises";
+import { open, rename, writeFile, statfs } from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
@@ -28,6 +28,13 @@ export async function readControl(control: string): Promise<unknown> {
     if (used > 64) throw new Error("oversized producer control");
     return JSON.parse(new TextDecoder("utf8", { fatal: true }).decode(bytes.subarray(0, used)));
   } finally { await file.close(); }
+}
+// One owned writer publishes each ACK; readers see the previous or next complete JSON.
+export async function publishAck(control: string, step: number, beforeRename?: () => Promise<void>) {
+  const ack = control + ".ack", temporary = ack + ".next";
+  await writeFile(temporary, JSON.stringify({ step }));
+  await beforeRename?.();
+  await rename(temporary, ack);
 }
 export async function runProducer(control: string, diskDir: string, shmemDir: string, rounds: number) {
   validatePaths(control, diskDir, shmemDir);
@@ -68,7 +75,7 @@ export async function runProducer(control: string, diskDir: string, shmemDir: st
             worker.postMessage("step");
           });
           previous = next;
-          await writeFile(control + ".ack", JSON.stringify({ step: previous }));
+          await publishAck(control, previous);
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 10));

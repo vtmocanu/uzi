@@ -111,7 +111,7 @@ def case():
                         "response": {"provenance": "synthetic", "reportId": expected["reportId"], "legs": [leg]},
                         "derivation": derivation, "trees": trees, "settlement": settlement,
                         "cleanup": {"confirmed": True, "startMs": 1512, "endMs": 1520},
-                        "finalCleanup": {"startMs": 1521, "endMs": 1522, "handles": 2, "joined": ["fulfilled", "fulfilled"], "driverCompleted": True,
+                        "finalCleanup": {"startMs": 2252, "endMs": 2253, "handles": 2, "joined": ["fulfilled", "fulfilled"], "driverCompleted": True,
                                          "clean": [{"clean": True}, {"clean": True}]},
                         "outcome": {"status": "failed", "reasons": ["worker_memory_pressure"], "successor": "aborted"}})
         cleanup[expected["fixtureId"]] = {"confirmed": True, "containerId": expected["containerId"],

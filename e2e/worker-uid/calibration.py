@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+import unicodedata
 
 import bounded
 import calibration_check as check
@@ -16,6 +17,33 @@ import calibration_check as check
 ROOT = Path(__file__).resolve().parents[2]
 SCRATCH = ROOT / ".uzi/scratch"
 LABEL = bounded.LABEL
+
+
+def diagnostic(message):
+    """Render one host diagnostic, capped at 2048 UTF-8 bytes including suffix."""
+    suffix = " [truncated]"
+    budget = 2048 - len(suffix.encode())
+    parts = []
+    size = 0
+    for char in str(message):
+        category = unicodedata.category(char)
+        piece = ascii(char)[1:-1] if category.startswith("C") or category in ("Zl", "Zp") else char
+        length = len(piece.encode("utf8"))
+        if size + length > budget:
+            parts.append(suffix)
+            break
+        parts.append(piece)
+        size += length
+    print("".join(parts), file=sys.stderr)
+
+
+class DiagnosticParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        if file is sys.stderr:
+            if message:
+                diagnostic(message)
+        else:
+            super()._print_message(message, file)
 
 
 def uuid4():
@@ -90,7 +118,12 @@ class Host:
         if expected_cid is not None:
             check.require(cid == expected_cid, "create ACK does not match immutable CID")
         if fixture:
-            check.require(cid == fixture["containerId"], "cleanup CID changed")
+            check.require(item["Config"]["Labels"].get("io.uzi.memory.fixture") == fixture["fixtureId"],
+                          "cleanup fixture label mismatch")
+            if "containerId" in fixture:
+                check.require(cid == fixture["containerId"], "cleanup CID changed")
+            # Lost create ACK permits only cleanup by the inspected owned CID.
+            # It never supplies containerId authority for a later start.
         if item["State"]["Running"]:
             self.docker(["stop", "--time", "1", cid], left())
         removed = self.docker(["rm", cid], left()).decode().strip()
@@ -211,6 +244,8 @@ class Host:
                               "producer version")
                 check.require(isinstance(report["reasons"], list) and
                               all(isinstance(reason, str) for reason in report["reasons"]), "producer reasons")
+                check.require(type(report["status"]) is str and
+                              report["status"] in ("SUCCESS_COMPLETE", "FAILED"), "producer status")
                 if report["status"] == "SUCCESS_COMPLETE":
                     check.verify_report(report, self.manifest, fixture)
                 self.results[fixture["fixtureId"]] = report
@@ -294,7 +329,7 @@ class Host:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = DiagnosticParser(description=__doc__)
     parser.add_argument("--image", required=True, help="provided, already local image; no pull/build")
     parser.add_argument("--mode", required=True, choices=("ci", "local"))
     parser.add_argument("--run-id")
@@ -325,7 +360,7 @@ def main():
         except (OSError, ValueError, KeyError, TypeError) as exc:
             error = ValueError(str(error) + "; cleanup: " + str(exc))
     host.publish(error)
-    print("calibration host evidence: " + str(directory), file=sys.stderr)
+    diagnostic("calibration host evidence: " + str(directory))
     if error is not None:
         raise ValueError(str(error))
 
@@ -334,5 +369,5 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-        print("calibration FAIL: " + str(exc), file=sys.stderr)
+        diagnostic("calibration FAIL: " + str(exc))
         sys.exit(1)

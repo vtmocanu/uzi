@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { type FileHandle, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { type FileHandle, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
-import { readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { fixture, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
+import { fixture, freshPostCleanupDwell, projectFailedEvidence } from "./calibration-fixture.mjs";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
 
@@ -12,6 +12,55 @@ test("imports expose entrypoints without starting fixture, worker or load", () =
   assert.equal(typeof fixture, "function");
   assert.equal(typeof runProducer, "function");
   assert.equal(process.getActiveResourcesInfo().includes("Worker"), false);
+});
+
+test("ACK publication keeps old JSON readable until the owned temporary file is renamed", async () => {
+  const directory = await mkdtemp(path.join(scratch, "ack-test."));
+  const control = path.join(directory, "control");
+  try {
+    await writeFile(control + ".ack", '{"step":1}');
+    let barrierReached = false;
+    await publishAck(control, 2, async () => {
+      barrierReached = true;
+      assert.deepEqual(JSON.parse(await readFile(control + ".ack.next", "utf8")), { step: 2 });
+      assert.deepEqual(JSON.parse(await readFile(control + ".ack", "utf8")), { step: 1 });
+    });
+    assert.equal(barrierReached, true);
+    assert.deepEqual(JSON.parse(await readFile(control + ".ack", "utf8")), { step: 2 });
+    await assert.rejects(readFile(control + ".ack.next"), { code: "ENOENT" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+const dwellGuard = { reserveBytes: 100, hysteresisBytes: 20, sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500 };
+const lowSample = (at: number, sampleId: number, currentBytes = 50): Parameters<typeof freshPostCleanupDwell>[0][number] => ({
+  available: true, sampleId, startedAtMs: at - 1, completedAtMs: at, currentBytes, limitBytes: 200,
+  stat: { anon: 0, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+  pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 }, full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } },
+});
+
+test("synthetic post-cleanup dwell waits beyond an already armed monitor", () => {
+  const samples = [1000, 1250, 1500, 1750].map((at, i) => lowSample(at, i + 1));
+  // The monitor may arm at 1500 using the pre-cleanup low at 1000.
+  assert.equal(freshPostCleanupDwell(samples.slice(0, 3), 1100, 1500, dwellGuard, 200), false);
+  assert.equal(freshPostCleanupDwell(samples, 1100, 1750, dwellGuard, 200), true);
+  assert.equal(freshPostCleanupDwell(samples, 1249, 1750, dwellGuard, 200), false, "start must be strictly after cleanup");
+  assert.equal(freshPostCleanupDwell(samples.slice(0, 2), 900, 1250, dwellGuard, 200), false);
+});
+
+test("synthetic post-cleanup dwell resets at Q and refuses gaps, stale or invalid evidence", () => {
+  const samples = [1250, 1500, 1750, 2000, 2250].map((at, i) => lowSample(at, i + 1, i === 1 ? 80 : 50));
+  assert.equal(freshPostCleanupDwell(samples.slice(0, 4), 1100, 2000, dwellGuard, 200), false);
+  assert.equal(freshPostCleanupDwell(samples, 1100, 2250, dwellGuard, 200), true);
+  const gap = [lowSample(1250, 1), lowSample(7000, 2), lowSample(7250, 3), lowSample(7500, 4)];
+  assert.equal(freshPostCleanupDwell(gap, 1100, 7500, dwellGuard, 200), false);
+  const valid = [1250, 1500, 1750].map((at, i) => lowSample(at, i + 1));
+  for (const change of [{ currentBytes: NaN }, { limitBytes: 201 }, { available: false, reason: "absent" },
+    { sampleId: 1 }, { completedAtMs: 1498 }, { startedAtMs: NaN }]) {
+    const invalid = valid.map((sample, i) => i === 1 ? { ...sample, ...change } : sample);
+    assert.equal(freshPostCleanupDwell(invalid as typeof valid, 1100, 1750, dwellGuard, 200), false);
+  }
+  assert.equal(freshPostCleanupDwell(valid, 1100, 1750 + 5251, dwellGuard, 200), false);
+  assert.equal(freshPostCleanupDwell(valid, 1100, 1749, dwellGuard, 200), false);
 });
 
 const emptyEvidence = (): Parameters<typeof projectFailedEvidence>[0] => ({
