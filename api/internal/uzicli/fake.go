@@ -175,7 +175,9 @@ type FakeClient struct {
 	LastInputExpectedGateRevision *int64
 	// SubmitRunInputErr fails SubmitRunInput alone (winning over Err), so a test can have the
 	// invocation-time GetRun succeed while only the write is refused (a PRD #1795 409).
-	SubmitRunInputErr error
+	SubmitRunInputErr  error
+	LastInputOptions   RunInputOptions
+	LastRunReadOptions RunReadOptions
 	// RunVerbCalls records the ORDERED sequence of GetRun / SetRunCredential /
 	// SubmitRunInput calls ("get_run", "set_run_credential", "submit_run_input"), so a
 	// test can pin the order a composed command (`uzi run approve --token`) issues them in,
