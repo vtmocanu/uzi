@@ -23,6 +23,13 @@ export class MaintenanceBudget {
 
   remainingMs(): number { return Math.max(0, this.deadline - this.now()); }
 
+  /** A shorter operation consumes this attempt's clock without renewing either bound. */
+  cap(maxMs: number): () => number {
+    const start = this.remainingMs();
+    const floor = start - Math.min(Math.max(0, maxMs), start);
+    return () => this.signal.aborted ? 0 : Math.max(0, this.remainingMs() - floor);
+  }
+
   check(): void {
     if (this.remainingMs() <= 0 && !this.signal.aborted) {
       this.controller.abort(new Error("maintenance deadline exhausted"));

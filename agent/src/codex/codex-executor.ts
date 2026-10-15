@@ -54,6 +54,7 @@
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
+import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
@@ -1971,27 +1972,33 @@ export class CodexExecutor implements Executor {
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const budget = MaintenanceBudget.current();
+    const remaining = budget?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
+    const expired = (): boolean => remaining() <= 0;
+    const timeout = (): CredentialFreeCaptureSettlement => ({ kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] });
     this.summaryLifecycleClosed = true;
     if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
-    await this.closeAndSettlePlanSummary(Math.max(0, deadlineAt - Date.now()));
+    await this.closeAndSettlePlanSummary(remaining());
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
       // Close admission and drain before joining the installer, then observe the drain again:
       // setup/installer completion may have registered work during the join.
       this.depsInstall?.abort.abort();
+      if (expired()) return timeout();
       const safety = this.safety;
       if (safety !== undefined && !(safety instanceof CodexExecutionSafetyImpl)) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
       }
       const first = safety instanceof CodexExecutionSafetyImpl
-        ? await safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        ? await safety.settleForCredentialFreeCapture(remaining())
         : undefined;
-      const joined = await this.settleDepsInstall(deadlineAt);
+      if (expired()) return first?.kind === "incomplete" ? first : timeout();
+      const joined = await this.settleDepsInstall(deadlineAt, budget?.signal, this.depsInstall, remaining);
       if (!joined) {
         return { kind: "incomplete", errors: [{ category: "timeout", message: "codex dependency install did not settle before cancel" }] };
       }
       if (first?.kind === "incomplete") return first;
-      if (Date.now() >= deadlineAt) {
+      if (expired()) {
         return { kind: "incomplete", errors: [{ category: "timeout", message: "codex cancel settle expired" }] };
       }
       const current = this.safety;
@@ -1999,17 +2006,19 @@ export class CodexExecutor implements Executor {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
       }
       const currentProof = current instanceof CodexExecutionSafetyImpl
-        ? await current.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        ? await current.settleForCredentialFreeCapture(remaining())
         : undefined;
+      if (expired()) return currentProof?.kind === "incomplete" ? currentProof : timeout();
       // One bounded settle per known registry, all sharing the absolute cancel deadline.
-      // A failed sibling does not skip the others; disposed/cleared tables refuse the proof.
+      // While time remains, a failed sibling does not skip others; cleared tables refuse proof.
       const outstanding = [...this.unverifiedEpochRegistries];
       const proofs = await Promise.all(outstanding.map(async registry => {
+        if (expired()) return timeout();
         if (!(registry instanceof ExecutionRegistry)) {
           return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: unsupported epoch registry" }] };
         }
         try {
-          return await registry.settleForCapture(Math.max(0, deadlineAt - Date.now()));
+          return await registry.settleForCapture(remaining());
         } catch {
           return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: epoch registry drain failed" }] };
         }
@@ -2017,14 +2026,19 @@ export class CodexExecutor implements Executor {
       if (currentProof?.kind === "incomplete") return currentProof;
       const incomplete = proofs.find(proof => proof.kind === "incomplete");
       if (incomplete) return incomplete;
+      if (expired()) return timeout();
       if ([...this.unverifiedEpochRegistries].some(registry => !outstanding.includes(registry))) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: epoch registry created during drain" }] };
       }
       return { kind: "observed_empty" };
     }
-    if (!await this.settleDepsInstall(deadlineAt, this.depsInstall?.cancellation)) {
+    this.depsInstall?.abort.abort();
+    if (expired()) return timeout();
+    const installSignal = budget ? (this.depsInstall?.cancellation ? AbortSignal.any([budget.signal, this.depsInstall.cancellation]) : budget.signal) : this.depsInstall?.cancellation;
+    if (!await this.settleDepsInstall(deadlineAt, installSignal, this.depsInstall, remaining)) {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "codex dependency install did not settle before capture" }] };
     }
+    if (expired()) return timeout();
     const safety = this.safety;
     if (safety === undefined) {
       const outstanding = this.unverifiedEpochRegistries.size;
@@ -2037,7 +2051,10 @@ export class CodexExecutor implements Executor {
         }],
       };
     }
-    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()));
+    if (safety instanceof CodexExecutionSafetyImpl) {
+      const proof = await safety.settleForCredentialFreeCapture(remaining());
+      return proof.kind === "incomplete" ? proof : expired() ? timeout() : proof;
+    }
     return {
       kind: "incomplete",
       errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
@@ -2063,22 +2080,23 @@ export class CodexExecutor implements Executor {
    * Each bounded wait has one deadline and removes its own timer/listener on every exit.
    * Expiry/cancellation blocks this boundary, leaving the run to actually join at terminal.
    */
-  private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall): Promise<boolean> {
+  private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall, remaining?: () => number): Promise<boolean> {
     state?.abort.abort();
     if (!state?.promise) return true;
     if (deadlineAt === undefined) {
       await state.promise;
       return true;
     }
-    if (signal?.aborted || Date.now() >= deadlineAt) return false;
+    const left = remaining ?? (() => Math.max(0, deadlineAt - Date.now()));
+    if (signal?.aborted || left() <= 0) return false;
     let timer: ReturnType<typeof chunkedTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     try {
       return await new Promise<boolean>((resolve) => {
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
-        timer = chunkedTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()), { now: this.deps.timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && Date.now() < deadlineAt));
+        timer = chunkedTimeout(() => resolve(false), left(), { now: this.deps.timeoutNow });
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
       });
     } finally {
       timer?.cancel();
@@ -2160,17 +2178,19 @@ export class CodexExecutor implements Executor {
     for (const flight of flights) { flight.closed = true; flight.ctrl.abort(); }
     const bound = Math.min(this.opts.summarySettleMs ?? 3_000, Math.max(0, deadlineMs ?? Infinity));
     const deadlineAt = Date.now() + bound;
+    const remaining = MaintenanceBudget.current()?.cap(bound) ?? (() => Math.max(0, deadlineAt - Date.now()));
     await Promise.all([
-      this.settleIntentSummary(deadlineAt),
+      this.settleIntentSummary(deadlineAt, remaining),
       ...flights.map(async flight => {
         if (flight.abandoned) return;
+        if (remaining() <= 0) { flight.abandoned = true; return; }
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           const settled = await Promise.race([
             flight.done.then(() => true, () => true),
-            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now())); }),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), remaining()); }),
           ]);
-          if (!settled) {
+          if (!settled || remaining() <= 0) {
             flight.abandoned = true;
             this.log.warn("plan summary did not settle within the bound");
           }
@@ -2182,20 +2202,21 @@ export class CodexExecutor implements Executor {
   private readonly summaryRunner: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
 
   /** Abort once and join within one bound; abandonment drops all late results and usage. */
-  private async settleIntentSummary(deadlineAt?: number): Promise<void> {
+  private async settleIntentSummary(deadlineAt?: number, remaining?: () => number): Promise<void> {
     const flight = this.intentFlight;
     if (!flight) return;
     flight.ctrl.abort();
     if (flight.abandoned) return;
     const bound = Math.min(this.opts.summarySettleMs ?? 3_000,
-      deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+      remaining ? remaining() : deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+    if (bound <= 0) { flight.abandoned = true; return; }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const settled = await Promise.race([
         flight.done.then(() => true),
         new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), bound); }),
       ]);
-      if (!settled) {
+      if (!settled || (remaining && remaining() <= 0)) {
         flight.abandoned = true;
         this.log.warn("intent summary did not settle within the bound");
       }

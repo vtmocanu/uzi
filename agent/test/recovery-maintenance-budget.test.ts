@@ -22,10 +22,15 @@ it("capture tail expiry preserves FIFO and never starts the expired action", asy
   const entered = deferred(), release = deferred();
   let actions = 0, now = 0;
   const coordinator = new RecoveryCoordinator({ recoveryRoot: root, workerToken: "fixture", log: nullLogger(),
-    client: {} as never, git: {} as never, testHooks: { afterPinObserve: async () => {
+    client: { hasFeature: () => true, listRecoveryHolds: async () => ({ run_id: "run", holds: [{
+      hold_id: "00000000-0000-4000-8000-000000000001", generation: 1, inventory_guarded: true,
+    }] }) } as never, git: {} as never, testHooks: { afterPinObserve: async () => {
       actions++; if (actions === 1) { entered.resolve(); await release.promise; }
     } } });
-  const input = { runId: "run", generation: 1, kind: "issue" as const, branch: "task", sourceSha: tip };
+  let observations = 0;
+  const find = coordinator["findRecord"].bind(coordinator);
+  Object.assign(coordinator, { findRecord: (...args: Parameters<typeof find>) => { observations++; return find(...args); } });
+  const input = { runId: "run", inventoryGuarded: true, generation: 1, kind: "issue" as const, branch: "task", sourceSha: tip };
   const budget = new MaintenanceBudget(100, () => now);
   try {
     const holder = coordinator.pin(input);
@@ -37,9 +42,11 @@ it("capture tail expiry preserves FIFO and never starts the expired action", asy
     await assert.rejects(waiter, /maintenance deadline/);
     const later = coordinator.pin(input);
     await new Promise<void>(r => setImmediate(r));
+    assert.equal(observations, 1, "later capture must not begin even its journal read before the holder releases");
     assert.equal(actions, 1);
     release.resolve(); await holder; await later;
     assert.equal(actions, 2);
+    assert.equal(observations, 2);
   } finally { release.resolve(); budget.dispose(); await fs.rm(root, { recursive: true, force: true }); }
 });
 
