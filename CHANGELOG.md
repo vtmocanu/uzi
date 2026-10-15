@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
+  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
