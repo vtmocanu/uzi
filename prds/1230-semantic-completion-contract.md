@@ -2,9 +2,9 @@
 
 **Issue:** [#1230](https://github.com/vtmocanu/uzi/issues/1230)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned, blocked on #1226 through #1229 in the one-at-a-time sequence.
+**Status:** Planned, blocked on #1226 through #1228 in the one-at-a-time sequence (#1229 is not planned).
 **Priority:** High.
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1229 merges and main CI is green.
+**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1228 merges and main CI is green.
 
 This child makes arbitrary issue/PRD requirements explicit at planning time. It does not yet make semantic verdicts a completion-permit requirement; #1231 owns that enforcement. No implementation or validation may modify `.github/workflows/**`.
 
