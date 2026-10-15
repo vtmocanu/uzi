@@ -11,7 +11,7 @@ import {
 
 installHarness();
 
-for (const scenario of ["identical", "dirty", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
+for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
   it(`V2 owner cancellation preserves frozen inventory: ${scenario}`, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(30310, { claim_generation: 71, inventory_guarded: true });
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
@@ -28,6 +28,7 @@ for (const scenario of ["identical", "dirty", "unknown", "wrong-custodian", "wro
     t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       if (!String(input).endsWith(`/runs/${claim.run_id}/recovery-holds?generation=71`))
         return fetch(input, init);
+      const closed = scenario === "closed" && server.failedAcked();
       // Exercise the real client's authentication/binding validation, including refusals.
       return new Response(JSON.stringify({ run_id: claim.run_id,
         exact_hold: scenario === "unknown" ? undefined : {
@@ -35,8 +36,10 @@ for (const scenario of ["identical", "dirty", "unknown", "wrong-custodian", "wro
           repo_id: scenario === "wrong-repo" ? holdId : claim.repo.id, inventory_guarded: true,
           original_worker_id: scenario === "wrong-custodian" ? holdId : registration.worker_id,
           original_worker_identity: "original",
-          live_worker_id: registration.worker_id, live_run_id: scenario === "wrong-live-run" ? holdId : claim.run_id,
-          state: "open", run_status: server.failedAcked() && scenario !== "live" ? "cancelled" : "running",
+          ...(closed ? { state: "discarded", release_evidence: "owner_discard" }
+            : { state: "open", live_worker_id: registration.worker_id,
+              live_run_id: scenario === "wrong-live-run" ? holdId : claim.run_id }),
+          run_status: server.failedAcked() && scenario !== "live" ? "cancelled" : "running",
           current_claim_generation: 71, claim_released: server.failedAcked(),
         },
       }), { status: 200 });
@@ -107,6 +110,12 @@ for (const scenario of ["identical", "dirty", "unknown", "wrong-custodian", "wro
     } else {
       assert.ok(fs.existsSync(clone), "refused cancellation keeps the source");
       assert.equal(server.finals.length, 0);
+      if (scenario === "closed") {
+        const records = await frozenRecords(claim);
+        assert.equal(records.length, 1);
+        assert.equal(records[0]!.holdSettlement?.state, "discarded");
+        assert.notEqual(records[0]!.finalAcknowledged, true, "a known settlement is not a fabricated ACK");
+      }
     }
   });
 }

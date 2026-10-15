@@ -5360,12 +5360,11 @@ export class RunRunner {
     this.terminalDiskInterruption(flight);
     let own: RunOwnershipResponse;
     try {
-      own = await this.client.getRunOwnership(flight.runId);
+      own = await this.getObservedRunOwnership(flight);
     } catch {
       this.terminalDiskInterruption(flight);
       return false;
     }
-    this.terminalDiskInterruption(flight);
     const movedGeneration = own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration;
     if (movedGeneration || TERMINAL_RUN_STATUSES.has(own.status)) {
       // issue #1786: a successor generation or a terminal status owns the run, but it cannot see this
@@ -5383,6 +5382,7 @@ export class RunRunner {
       await flight.batcher.close().catch(() => undefined);
       return true;
     }
+    this.terminalDiskInterruption(flight);
     if (own.status !== "running" || own.claim_generation === undefined) return false;
     const occupancy = await guard.currentOccupancy(flight.worktreePath, flight.runHome);
     this.terminalDiskInterruption(flight);
@@ -5885,7 +5885,7 @@ export class RunRunner {
       }
       let probe;
       try {
-        probe = await this.client.getRunOwnership(flight.runId);
+        probe = await this.getObservedRunOwnership(flight);
       } catch (probeErr) {
         if (probeErr instanceof RequestError && probeErr.status === 404) {
           // Not owned / reclaimed = stale_claim. Stop; do NOT clean a possibly-parked session.
@@ -11286,7 +11286,7 @@ export class RunRunner {
           // introduce a new spurious-failure mode, so a transient probe error is not one.
           let ownershipStatus: string | undefined;
           try {
-            ownershipStatus = (await this.client.getRunOwnership(runId)).status;
+            ownershipStatus = (await this.getObservedRunOwnership(flight)).status;
           } catch (err) {
             if (err instanceof RequestError && err.status === 404) {
               throw new TrustedExecutionRefusal(
@@ -11611,7 +11611,7 @@ export class RunRunner {
             // Keep the same probe across interruptions, including an unknown transport result.
             let ownership: RunOwnershipResponse;
             try {
-              parkOwnershipProbe ??= this.client.getRunOwnership(runId, {
+              parkOwnershipProbe ??= this.getObservedRunOwnership(flight, {
                 signal: AbortSignal.any([steering.lifecycleSignal(), AbortSignal.timeout(5000)]),
                 deadline: Date.now() + 5000,
               });
@@ -12031,10 +12031,28 @@ export class RunRunner {
   private observeCancellation(flight: RunFlight): MaintenanceBudget {
     try { return flight.cancellationBudget ??= MaintenanceBudget.current() ?? this.cancellationBudgetFactory(); }
     finally {
-      flight.steering.markCancelled();
-      try { if (!flight.cancel.signal.aborted) flight.cancel.abort(); }
-      finally { flight.steering.abortLifecycle(); }
+      try { flight.steering.markCancelled(); }
+      finally {
+        try { if (!flight.cancel.signal.aborted) flight.cancel.abort(); }
+        finally { flight.steering.abortLifecycle(); }
+      }
     }
+  }
+
+  private async getObservedRunOwnership(
+    flight: RunFlight, options?: Parameters<WorkerClient["getRunOwnership"]>[1],
+  ): Promise<RunOwnershipResponse> {
+    const own = await this.client.getRunOwnership(flight.runId, options);
+    if (own.status === "cancelled") {
+      // Stop observation never grants this source authority over another generation.
+      if (own.claim_generation === undefined || own.claim_generation !== flight.claimGeneration) {
+        flight.keepGuardedInventoryOpen = true;
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+      }
+      this.observeCancellation(flight);
+    }
+    return own;
   }
 
   private cancellationExpired(flight: RunFlight): boolean {
@@ -12366,15 +12384,16 @@ export class RunRunner {
     try {
       const options = await this.owedOptions(flight, barePath, branch);
       if (options.context.generation === null) return;
+      const context = options.context;
       // Before any clone/anchor retirement, retain the current positively owned head.
       const retained = await this.git.retainCurrentOwedCandidate(barePath, options);
       if (retained.kind === "updated") this.announceOwedHeads(flight, retained.retainedShas);
       else flight.preserveRecoveryClone = true;
-      let own;
+      let own: RunOwnershipResponse | undefined;
       // A reaped accepted park/terminal can freeze without a current-owner probe.
       // Publication still requires positive exact-generation completed evidence.
       if (!locallyQuiescent || completedBody) {
-        try { own = await this.client.getRunOwnership(claim.run_id); }
+        try { own = await this.getObservedRunOwnership(flight); }
         catch (err) {
           if (!isRunOwnershipLost(err, claim.run_id)) throw err;
         }
@@ -12383,42 +12402,50 @@ export class RunRunner {
           !(own.claim_generation > claim.claim_generation ||
             (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
              ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status))))) return;
-      // Publication can classify an authoritative empty inventory, never clear owed pins.
-      const publication = completedBody && own?.status === "completed" &&
-        own.claim_generation === claim.claim_generation && flight.successfulPushedSha &&
-        !completedBody.report_only && !!completedBody.branch;
-      const candidates = await this.git.enumerateOwedCandidates(barePath, claim.run_id);
-      // A supplied transfer source is current; earlier adoption evidence is only a coverage root.
-      let currentSha = originalSourceSha;
-      // Only an exact-generation authenticated disposition source may augment coverage.
-      originalSourceSha ??= (await this.recovery.inspect(claim.run_id)).find(r =>
-        r.generation === claim.claim_generation && !r.coverageDigest)?.sourceSha;
-      if (!currentSha && retained.kind === "updated") {
-        const owned = await this.git.committedTrackingOwnership(barePath, branch, claim.run_id, retained.candidateSha, claim.claim_generation);
-        if (owned.kind === "owned" && owned.context.generation === claim.claim_generation) currentSha = retained.candidateSha;
-      }
-      // A matching owned pin can recover independently of a partially failed shared-ref write.
-      currentSha ??= candidates.find(c => c.contexts.some(ctx =>
-        ctx.runId === claim.run_id && ctx.generation === claim.claim_generation))?.sha;
-      currentSha ??= originalSourceSha;
-      if (!currentSha) { flight.preserveRecoveryClone = true; return; }
-      const record = await this.recovery.freezeInventory({
-        context: options.context, currentSha, originalSourceSha, locallyQuiescent, repoId: claim.repo.id,
-        heldPolicy: this.frozenHeldPolicy(flight),
-        defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath) || "main",
-        ...(publication && retained.kind === "updated" && !flight.preserveRecoveryClone && !candidates.length
-          ? { settledEvidence: "publication" as const } : {}),
-      });
-      MaintenanceBudget.current()?.check();
-      if (!record) { flight.preserveRecoveryClone = true; return; }
-      if (opts.deferCapture === true) {
-        flight.heldDeferredCapture = record.captureId;
-        flight.runLog.info("recovery: archive capture deferred for held publication", {
-          generation: claim.claim_generation, capture_id: record.captureId,
+      if (flight.keepGuardedInventoryOpen) return;
+      const settleRemaining = async () => {
+        MaintenanceBudget.current()?.check();
+        // Publication can classify an authoritative empty inventory, never clear owed pins.
+        const publication = completedBody && own?.status === "completed" &&
+          own.claim_generation === claim.claim_generation && flight.successfulPushedSha &&
+          !completedBody.report_only && !!completedBody.branch;
+        const candidates = await this.git.enumerateOwedCandidates(barePath, claim.run_id);
+        // A supplied transfer source is current; earlier adoption evidence is only a coverage root.
+        let currentSha = originalSourceSha;
+        // Only an exact-generation authenticated disposition source may augment coverage.
+        originalSourceSha ??= (await this.recovery.inspect(claim.run_id)).find(r =>
+          r.generation === claim.claim_generation && !r.coverageDigest)?.sourceSha;
+        if (!currentSha && retained.kind === "updated") {
+          const owned = await this.git.committedTrackingOwnership(barePath, branch, claim.run_id, retained.candidateSha, claim.claim_generation);
+          if (owned.kind === "owned" && owned.context.generation === claim.claim_generation) currentSha = retained.candidateSha;
+        }
+        // A matching owned pin can recover independently of a partially failed shared-ref write.
+        currentSha ??= candidates.find(c => c.contexts.some(ctx =>
+          ctx.runId === claim.run_id && ctx.generation === claim.claim_generation))?.sha;
+        currentSha ??= originalSourceSha;
+        if (!currentSha) { flight.preserveRecoveryClone = true; return; }
+        const record = await this.recovery.freezeInventory({
+          context, currentSha, originalSourceSha, locallyQuiescent, repoId: claim.repo.id,
+          heldPolicy: this.frozenHeldPolicy(flight),
+          onCancellationObserved: () => this.observeCancellation(flight),
+          defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath) || "main",
+          ...(publication && retained.kind === "updated" && !flight.preserveRecoveryClone && !candidates.length
+            ? { settledEvidence: "publication" as const } : {}),
         });
-        return;
-      }
-      await this.captureFrozenInventory(claim, flight, record, signal);
+        MaintenanceBudget.current()?.check();
+        if (!record) { flight.preserveRecoveryClone = true; return; }
+        if (opts.deferCapture === true) {
+          flight.heldDeferredCapture = record.captureId;
+          flight.runLog.info("recovery: archive capture deferred for held publication", {
+            generation: claim.claim_generation, capture_id: record.captureId,
+          });
+          return;
+        }
+        await this.captureFrozenInventory(claim, flight, record, signal);
+      };
+      if (!MaintenanceBudget.current() && flight.cancellationBudget) {
+        await this.runCancellationMaintenance(flight, settleRemaining);
+      } else await settleRemaining();
     } catch (err) {
       flight.preserveRecoveryClone = true;
       flight.runLog.warn("recovery: guarded inventory retained; reporting unaffected", { error: errMessage(err) });
@@ -12518,11 +12545,14 @@ export class RunRunner {
       if (record.finalAcknowledged) { flight.heldAcked = true; return; }
       if (this.isCredentialFreeOwnerCancel(claim, flight) && this.client.hasHeldPublicationV2()) {
         // Unknown, live, or unbound evidence cannot turn a freeze into archive fallback.
-        if (!record.exactHoldBinding || residueQuarantine() !== undefined ||
-            flight.steering.claimFence() !== undefined) return;
-        const exact = await this.client.getExactRecoveryHold(claim.run_id, generation!, record.exactHoldBinding, signal);
-        if (!exact || exact.state !== "open" ||
-            !["failed", "cancelled", "completed"].includes(exact.run_status)) return;
+        if (residueQuarantine() !== undefined) return;
+        if (!record.finalRequest && !(record.state === "uploaded" && record.selfContained === true &&
+            Array.isArray(record.prerequisiteShas) && record.prerequisiteShas.length === 0)) {
+          if (!record.exactHoldBinding || flight.steering.claimFence() !== undefined) return;
+          const exact = await this.client.getExactRecoveryHold(claim.run_id, generation!, record.exactHoldBinding, signal);
+          if (!exact || (exact.state === "open" &&
+              !["failed", "cancelled", "completed"].includes(exact.run_status))) return;
+        }
       }
       await this.captureFrozenInventory(claim, flight, record, signal);
       // The archive FINAL cannot be sent while this run still executes, so a fallback keeps the clone
@@ -14657,7 +14687,7 @@ export class RunRunner {
     }
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    if (flight.retainedEpisode || flight.retainedEpisodeCustody || flight.retainedLocalCustody || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
+    if (flight.keepGuardedInventoryOpen || flight.retainedEpisode || flight.retainedEpisodeCustody || flight.retainedLocalCustody || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
     const gen = claim.claim_generation;
     const guardedV2 = claim.inventory_guarded === true && this.client.hasHeldPublicationV2();
     const fenced = () => flight.steering.claimFence() !== undefined;
@@ -14785,14 +14815,33 @@ export class RunRunner {
       return;
     }
     if (claim.inventory_guarded === true) {
-      // The reaped caller may still be registered locally. Require server disposition before
-      // using that quiescence proof; a refused park keeps its inventory unsealed.
+      // Deferred immutable identity precedes any current-owner observation.
+      if (flight.heldDeferredCapture !== undefined) {
+        await this.settleHeldDeferred(claim, flight, signal);
+        return;
+      }
       try {
-        const own = await this.client.getRunOwnership(claim.run_id);
-        if (own.claim_generation === undefined || claim.claim_generation === undefined ||
-            !(own.claim_generation > claim.claim_generation ||
-              (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
-               ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status)))) return;
+        if (this.client.hasHeldPublicationV2()) {
+          const generation = claim.claim_generation;
+          if (!generation || flight.keepGuardedInventoryOpen) return;
+          const response = await this.client.listRecoveryHolds(claim.run_id);
+          const holds = response.run_id === claim.run_id
+            ? response.holds.filter(h => h.generation === generation && h.inventory_guarded === true) : [];
+          if (holds.length !== 1) return;
+          const exact = await this.client.getExactRecoveryHold(claim.run_id, generation,
+            { holdId: holds[0]!.hold_id, repoId: claim.repo.id }, signal);
+          if (!exact || exact.state !== "open") return;
+          if (exact.run_status === "cancelled") this.observeCancellation(flight);
+          if (!(exact.current_claim_generation > generation ||
+              (exact.current_claim_generation === generation &&
+               ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(exact.run_status)))) return;
+        } else {
+          const own = await this.getObservedRunOwnership(flight);
+          if (own.claim_generation === undefined || claim.claim_generation === undefined ||
+              !(own.claim_generation > claim.claim_generation ||
+                (own.claim_generation === claim.claim_generation && own.inventory_guarded === true &&
+                 ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status)))) return;
+        }
         await this.settleGuardedInventory(claim, flight, undefined, undefined, signal, true);
       } catch (err) {
         flight.preserveRecoveryClone = true;
@@ -15011,7 +15060,7 @@ export class RunRunner {
     if (ack?.status) return { kind: "held" };
     let own: RunOwnershipResponse;
     try {
-      own = await this.client.getRunOwnership(flight.runId);
+      own = await this.getObservedRunOwnership(flight);
     } catch (probeError) {
       if (probeError instanceof RequestError && probeError.status === 404) return { kind: "gone" };
       return { kind: "unknown" };
@@ -15361,7 +15410,7 @@ export class RunRunner {
         let status: string;
         let holdReason: string | undefined;
         try {
-          const own = await this.client.getRunOwnership(flight.runId);
+          const own = await this.getObservedRunOwnership(flight);
           status = own.status;
           holdReason = own.hold_reason ?? undefined;
           if (status === "cancelled" && own.claim_generation === flight.claimGeneration && own.claim_released !== true) this.observeCancellation(flight);
@@ -15637,18 +15686,18 @@ export class RunRunner {
           this.terminalDiskInterruption(flight);
           let own: RunOwnershipResponse;
           try {
-            own = await this.client.getRunOwnership(flight.runId);
+            own = await this.getObservedRunOwnership(flight);
           } catch {
             await retryWait();
             continue;
           }
-          this.terminalDiskInterruption(flight);
           const movedGeneration = own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration;
           if (movedGeneration || TERMINAL_RUN_STATUSES.has(own.status)) {
             markReleaseEligible("terminal_disk_recheck", { stale: movedGeneration, record: movedGeneration ? "stopped" : "none" });
             flight.preserveSession = false;
             return false;
           }
+          this.terminalDiskInterruption(flight);
           if (own.status !== "running" || own.claim_generation === undefined) {
             await retryWait();
             continue;
@@ -16445,6 +16494,7 @@ export class RunRunner {
         claimGeneration: flight.claimGeneration,
       });
       status = ack?.status;
+      if (status === "cancelled") this.observeCancellation(flight);
     } catch (holdError) {
       runLog.warn("completion hold request ambiguous; retaining artifacts for ownership reconciliation", {
         run_id: flight.runId,
@@ -16468,7 +16518,7 @@ export class RunRunner {
       // One read, bounded by an absolute production deadline. Errors (including 404) are
       // ambiguous; active snapshots cannot fence a POST that may still arrive later.
       try {
-        const ownership = await this.client.getRunOwnership(flight.runId, {
+        const ownership = await this.getObservedRunOwnership(flight, {
           deadline: Date.now() + this.completionHoldReconcileTimeoutMs,
         });
         const exactGeneration = typeof ownership?.claim_generation === "number" &&
@@ -16632,7 +16682,8 @@ export class RunRunner {
     if (!confirmedPark && ack?.status !== "cancelled") {
       let provedRunning = false;
       try {
-        const ownership = await this.client.getRunOwnership(flight.runId);
+        const ownership = await this.getObservedRunOwnership(flight);
+        if (ownership.status === "cancelled") return "cancelled";
         provedRunning = ownership.status === "running" && ownership.claim_generation === flight.claimGeneration;
       } catch (err) {
         runLog.warn("wall park ownership probe failed; retaining local work", {
@@ -17270,7 +17321,7 @@ export class RunRunner {
         };
         const check = async () => {
           guard();
-          const own = await withForgeRetry(() => this.client.getRunOwnership(flight.runId, signal), {
+          const own = await withForgeRetry(() => this.getObservedRunOwnership(flight, signal), {
             signal, log: runLog, schedule: [],
           });
           guard();
@@ -17385,7 +17436,7 @@ export class RunRunner {
     const boundedSignal = AbortSignal.any([signal, timeout.signal]);
     let own;
     try {
-      own = await withForgeRetry(() => this.client.getRunOwnership(flight.runId, boundedSignal), {
+      own = await withForgeRetry(() => this.getObservedRunOwnership(flight, boundedSignal), {
         signal: boundedSignal, log: flight.runLog, schedule: [],
       });
     } catch (error) {
@@ -17543,6 +17594,7 @@ export class RunRunner {
             await check();
             const record = await this.recovery.freezeInventory({
               context: options.context, currentSha: tip, originalSourceSha: tip, locallyQuiescent: true,
+              onCancellationObserved: () => this.observeCancellation(flight),
               defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(bare) || "main",
             });
             await check();

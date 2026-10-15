@@ -77,6 +77,37 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
   return { ...f, order, record, operate, setHold: (state: typeof hold) => { hold = state; } };
 }
 
+it("first cancellation inside freeze shares the flight budget through later maintenance", async () => {
+  const f = await v2FrozenFixture();
+  let mono = 0, observations = 0, builds = 0;
+  const budget = new MaintenanceBudget(600_000, () => mono);
+  const build = f.git.buildRecoveryCoverage!;
+  Object.assign(f.client, { getRunOwnership: async () => ({
+    status: "running", claim_generation: 8, inventory_guarded: true,
+  }) });
+  Object.assign(f.git, { buildRecoveryCoverage: async (...args: Parameters<typeof build>) => {
+    assert.equal(MaintenanceBudget.current(), budget);
+    builds++; mono += 200_000;
+    return build(...args);
+  } });
+  f.state.status = "cancelled";
+  try {
+    const record = await f.coordinator.freezeInventory({
+      context: f.context, currentSha: H, defaultBranch: "main", repoId: f.record.exactHoldBinding!.repoId,
+      onCancellationObserved: () => { observations++; return budget; },
+    });
+    assert.ok(record);
+    assert.equal(observations, 1);
+    assert.equal(builds, 1);
+    assert.equal(budget.remainingMs(), 400_000);
+    mono = 600_000;
+    assert.throws(() => MaintenanceBudget.run(budget, () => f.coordinator.operateFrozenInventory({
+      record, barePath: f.context.barePath, defaultBranch: "main",
+    })), /maintenance deadline/);
+    assert.equal(f.order.includes("pack"), false);
+    assert.equal(f.finals.length, 0);
+  } finally { budget.dispose(); await f.close(); }
+});
 
 for (const mode of ["boot", "live"] as const) {
   it(`cancellation entry ${mode} reuses one exact attempt through Git and FINAL despite worker drift`, async () => {

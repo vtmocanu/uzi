@@ -1009,6 +1009,8 @@ export class RecoveryCoordinator {
     heldPolicy?: FrozenHeldPolicy;
     /** Caller proved the local process reaped; permits freezing before the terminal RPC. */
     locallyQuiescent?: boolean;
+    /** Foreground cancellation budget belongs to the flight, including later FINAL work. */
+    onCancellationObserved?: () => MaintenanceBudget;
   }): Promise<RecoveryRecord | undefined> {
     if (!this.enabled) return undefined;
     const { context } = input;
@@ -1020,6 +1022,7 @@ export class RecoveryCoordinator {
       if (!input.locallyQuiescent && !(await this.inactiveInventory(probe))) return undefined;
       if (!(await this.openInventoryHold(probe))) return undefined;
       let exactHoldBinding: RecoveryRecord["exactHoldBinding"];
+      let observedCancelled = false;
       if (input.repoId && this.client.getExactRecoveryHold) {
         const response = await recoveryRPC(() => this.client.listRecoveryHolds(context.runId));
         const holds = response.run_id === context.runId && Array.isArray(response.holds)
@@ -1027,73 +1030,84 @@ export class RecoveryCoordinator {
         if (holds.length === 1 && HELD_PUBLICATION_ID_RE.test(holds[0]!.hold_id) && HELD_PUBLICATION_ID_RE.test(input.repoId)) {
           const binding = { holdId: holds[0]!.hold_id, repoId: input.repoId };
           const exact = await recoveryRPC(() => this.client.getExactRecoveryHold!(context.runId, context.generation, binding, ...maintenanceSignalArgs()));
-          if (exact?.state === "open") exactHoldBinding = binding;
-        }
-      }
-      if (input.settledEvidence === "publication") {
-        try {
-          const own = await recoveryRPC(() => this.client.getRunOwnership!(context.runId));
-          if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
-        } catch { MaintenanceBudget.current()?.check(); return undefined; }
-      }
-      if (!validInventoryContext(context, context.runId) ||
-          candidates.some(c => !/^[0-9a-f]{40}$/.test(c.sha) || !c.contexts.length ||
-            c.contexts.some(producer => !validInventoryContext(producer, context.runId, context.barePath)))) {
-        throw new Error("inventory producer context malformed");
-      }
-      const roots = snapshotRoots(candidates);
-      const originalSourceSha = input.originalSourceSha ?? input.currentSha;
-      const aggregateRoots = [...new Set([...roots.map(r => r.sha), originalSourceSha])].sort();
-      let sourceSha: string, digest: string;
-      if (!roots.length && input.settledEvidence) {
-        digest = EMPTY_INVENTORY_DIGEST;
-        sourceSha = input.currentSha;
-      } else {
-        const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(context.barePath, context, aggregateRoots, input.currentSha));
-        sourceSha = coverage.sha;
-        digest = coverage.fingerprint;
-      }
-      return this.withJournalLock(context.runId, async () => {
-        const records = await this.listRecords(context.runId);
-        const matching = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
-          r.coverageDigest === digest && r.sourceSha === sourceSha &&
-          r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
-          canonicalJson(r.coverageContext) === canonicalJson(context) &&
-          canonicalJson(r.originalRoots) === canonicalJson(roots));
-        if (matching) {
-          if (exactHoldBinding && !matching.exactHoldBinding) {
-            const bound = { ...matching, exactHoldBinding };
-            await this.writeRecordUnlocked(bound);
-            return bound;
+          if (exact?.state === "open") {
+            exactHoldBinding = binding;
+            if (exact.run_status === "cancelled") {
+              observedCancelled = true;
+            }
           }
-          return matching;
         }
-        const pending = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
-          r.finalRequest && !r.finalAcknowledged);
-        if (pending) {
-          this.log.warn("recovery: inventory_quiescence_breach; pending identity retained", {
-            run_id: context.runId, generation: context.generation,
-          });
-          return undefined;
+      }
+      const freezeRemaining = async (): Promise<RecoveryRecord | undefined> => {
+        MaintenanceBudget.current()?.check();
+        if (input.settledEvidence === "publication") {
+          try {
+            const own = await recoveryRPC(() => this.client.getRunOwnership!(context.runId));
+            if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
+          } catch { MaintenanceBudget.current()?.check(); return undefined; }
         }
-        const record: RecoveryRecord = {
-          version: JOURNAL_VERSION, runId: context.runId, captureId: randomUUID(),
-          generation: context.generation, inventoryGuarded: true, sourceSha,
-          originalSourceSha, originalRoots: roots, inventoryCurrentSha: input.currentSha,
-          coverageDigest: digest, coverageContext: context,
-          ...(exactHoldBinding ? { exactHoldBinding } : {}),
-          ...(input.heldPolicy && validFrozenHeldPolicy(input.heldPolicy) ? { heldPolicy: input.heldPolicy } : {}),
-          branch: context.branch, kind: context.kind, createdAt: this.now(), state: "pinned",
-          bareDir: path.basename(context.barePath), defaultBranch: input.defaultBranch,
-          finalizationPin: true,
-          ...(!roots.length && input.settledEvidence ? {
-            finalRequest: { disposition: { kind: "settled" as const, coverage_digest: digest }, evidence: input.settledEvidence },
-          } : {}),
-        };
-        await this.writeRecordUnlocked(record);
-        return record;
-      });
-    }));
+        if (!validInventoryContext(context, context.runId) ||
+            candidates.some(c => !/^[0-9a-f]{40}$/.test(c.sha) || !c.contexts.length ||
+              c.contexts.some(producer => !validInventoryContext(producer, context.runId, context.barePath)))) {
+          throw new Error("inventory producer context malformed");
+        }
+        const roots = snapshotRoots(candidates);
+        const originalSourceSha = input.originalSourceSha ?? input.currentSha;
+        const aggregateRoots = [...new Set([...roots.map(r => r.sha), originalSourceSha])].sort();
+        let sourceSha: string, digest: string;
+        if (!roots.length && input.settledEvidence) {
+          digest = EMPTY_INVENTORY_DIGEST;
+          sourceSha = input.currentSha;
+        } else {
+          const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(context.barePath, context, aggregateRoots, input.currentSha));
+          sourceSha = coverage.sha;
+          digest = coverage.fingerprint;
+        }
+        return this.withJournalLock(context.runId, async () => {
+          const records = await this.listRecords(context.runId);
+          const matching = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
+            r.coverageDigest === digest && r.sourceSha === sourceSha &&
+            r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
+            canonicalJson(r.coverageContext) === canonicalJson(context) &&
+            canonicalJson(r.originalRoots) === canonicalJson(roots));
+          if (matching) {
+            if (exactHoldBinding && !matching.exactHoldBinding) {
+              const bound = { ...matching, exactHoldBinding };
+              await this.writeRecordUnlocked(bound);
+              return bound;
+            }
+            return matching;
+          }
+          const pending = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
+            r.finalRequest && !r.finalAcknowledged);
+          if (pending) {
+            this.log.warn("recovery: inventory_quiescence_breach; pending identity retained", {
+              run_id: context.runId, generation: context.generation,
+            });
+            return undefined;
+          }
+          const record: RecoveryRecord = {
+            version: JOURNAL_VERSION, runId: context.runId, captureId: randomUUID(),
+            generation: context.generation, inventoryGuarded: true, sourceSha,
+            originalSourceSha, originalRoots: roots, inventoryCurrentSha: input.currentSha,
+            coverageDigest: digest, coverageContext: context,
+            ...(exactHoldBinding ? { exactHoldBinding } : {}),
+            ...(input.heldPolicy && validFrozenHeldPolicy(input.heldPolicy) ? { heldPolicy: input.heldPolicy } : {}),
+            branch: context.branch, kind: context.kind, createdAt: this.now(), state: "pinned",
+            bareDir: path.basename(context.barePath), defaultBranch: input.defaultBranch,
+            finalizationPin: true,
+            ...(!roots.length && input.settledEvidence ? {
+              finalRequest: { disposition: { kind: "settled" as const, coverage_digest: digest }, evidence: input.settledEvidence },
+            } : {}),
+          };
+          await this.writeRecordUnlocked(record);
+          return record;
+        });
+      };
+      return observedCancelled && !MaintenanceBudget.current()
+        ? this.withCancellationAttempt(probe, freezeRemaining, undefined, true, input.onCancellationObserved)
+        : freezeRemaining();
+    }), undefined, false, input.onCancellationObserved);
   }
 
   /**
@@ -1898,7 +1912,7 @@ export class RecoveryCoordinator {
 
   /** One probe per entry, before queueing. Unknown custody grants no new authority.
    * Nested work keeps even an expired ambient object; only its creator disposes it. */
-  private async withCancellationAttempt<T>(record: RecoveryRecord, action: () => Promise<T>, attempts?: Map<string, MaintenanceBudget>, knownCancelled = false): Promise<T> {
+  private async withCancellationAttempt<T>(record: RecoveryRecord, action: () => Promise<T>, attempts?: Map<string, MaintenanceBudget>, knownCancelled = false, onCancellationObserved?: () => MaintenanceBudget): Promise<T> {
     const inherited = MaintenanceBudget.current();
     const key = `${record.runId}:${record.generation}`;
     let budget = inherited ?? attempts?.get(key);
@@ -1926,7 +1940,7 @@ export class RecoveryCoordinator {
         }
       } catch { /* An unavailable status never authorizes cancellation maintenance. */ }
       if (cancelled) {
-        budget = this.testHooks?.maintenanceBudget?.() ?? new MaintenanceBudget();
+        budget = onCancellationObserved?.() ?? this.testHooks?.maintenanceBudget?.() ?? new MaintenanceBudget();
         attempts?.set(key, budget);
       }
     }
@@ -1948,7 +1962,7 @@ export class RecoveryCoordinator {
         return result;
       });
     } finally {
-      if (!inherited && !attempts) attempt.dispose();
+      if (!inherited && !attempts && !onCancellationObserved) attempt.dispose();
     }
   }
 

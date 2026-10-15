@@ -117,3 +117,21 @@ for (const expired of [false, true]) {
     assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.status === "failed"));
   });
 }
+
+it("sticky cancellation metadata failure still stops model and lifecycle", () => {
+  const cancel = new AbortController();
+  let lifecycle = false;
+  const observe = RunRunner.prototype["observeCancellation"];
+  const budget = new MaintenanceBudget();
+  const flight = { cancel, steering: {
+    markCancelled() { throw new Error("metadata fixture"); },
+    abortLifecycle() { lifecycle = true; },
+  } } as unknown as Parameters<typeof observe>[0];
+  const receiver = { cancellationBudgetFactory: () => budget } as unknown as RunRunner;
+  try {
+    assert.throws(() => observe.call(receiver, flight), /metadata fixture/);
+    assert.equal(cancel.signal.aborted, true);
+    assert.equal(lifecycle, true);
+    assert.equal(flight.cancellationBudget, budget);
+  } finally { budget.dispose(); }
+});
