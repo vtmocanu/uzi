@@ -2673,11 +2673,7 @@ export class RunRunner {
    *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
    *  Best-effort; never throws to the caller. */
   async resumePendingRecoveries(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
-    const discovered = await this.recovery.materializeBootInventory(signal).catch(err => {
-      this.log.warn("recovery: boot materialization failed; independent journals still retried", { error: errMessage(err) });
-      return [];
-    });
-    await this.recovery.resumePending(signal, [...(snapshot ?? await this.recovery.snapshotBootRecords()), ...discovered]).catch((err) => {
+    await this.recovery.resumePending(signal, snapshot, true).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
     });
   }
@@ -8740,7 +8736,9 @@ export class RunRunner {
         // Owner cancellation has one stronger producer. A refusal there must never fall
         // through to the ordinary terminal snapshot, which lacks registry drainage.
         if (this.isCredentialFreeOwnerCancel(claim, flight)) {
-          await this.disposeCredentialFreeOwnerCancel(claim, flight);
+          // V1 already completed its legacy disposition before this reporting hook.
+          if (claim.inventory_guarded === true && this.client.hasHeldPublicationV2())
+            await this.disposeCredentialFreeOwnerCancel(claim, flight);
           return;
         }
         if (flight.retainedLocalCustody) return;

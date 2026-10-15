@@ -78,6 +78,155 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
 }
 
 
+for (const mode of ["boot", "live"] as const) {
+  it(`cancellation entry ${mode} reuses one exact attempt through Git and FINAL despite worker drift`, async () => {
+    const f = await v2FrozenFixture();
+    let mono = 0, factories = 0;
+    const budget = new MaintenanceBudget(600_000, () => mono);
+    const seen: string[] = [];
+    const stage = (name: string) => {
+      assert.equal(MaintenanceBudget.current(), budget);
+      seen.push(name);
+      mono += 50_000;
+      f.state.now += seen.length % 2 ? 9_000_000 : -18_000_000;
+    };
+    const release = f.client.releaseRecoveryCustody;
+    const pack = (f.git as unknown as HeldGit).checkpointPack!;
+    Object.assign(f.git, {
+      discoverOwedCandidates: async () => [],
+      withRecoveryOperation: async (signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
+        assert.equal(signal, budget.signal); assert.equal(deadline, Infinity);
+        stage("operation"); return action();
+      },
+      checkpointPack: async (...args: Parameters<typeof pack>) => { stage("pack"); return pack(...args); },
+    });
+    Object.assign(f.client, {
+      getRunOwnership: async () => { throw ownershipLost(); },
+      releaseRecoveryCustody: async (...args: unknown[]) => {
+        stage("FINAL"); assert.equal(args[4], budget.signal); return release(...args);
+      },
+    });
+    f.state.status = "cancelled";
+    if (mode === "boot") f.state.ownGeneration = 7;
+    const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => { factories++; return budget; } });
+    try {
+      if (mode === "boot") await coordinator.resumePending(undefined, [f.record]);
+      else await coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: 1000 });
+      assert.equal(factories, 1);
+      assert.ok(seen.includes("pack")); assert.ok(seen.includes("FINAL"));
+      assert.equal(f.order.includes("held"), true);
+    } finally { budget.dispose(); await f.close(); }
+  });
+}
+
+it("cancellation entry expired boot queue is inert and a later pass gets a fresh attempt", async () => {
+  const f = await v2FrozenFixture();
+  let unblock!: () => void, entered!: () => void, scoped!: () => void;
+  const blocked = new Promise<void>(resolve => { unblock = resolve; });
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  const active = new Promise<void>(resolve => { scoped = resolve; });
+  let mono = 0, factories = 0;
+  const budgets: MaintenanceBudget[] = [];
+  const enumerate = f.git.enumerateOwedCandidates;
+  Object.assign(f.git, {
+    enumerateOwedCandidates: async () => { entered(); await blocked; return enumerate(); },
+    withRecoveryOperation: async (_signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
+      assert.equal(deadline, Infinity); scoped(); return action();
+    },
+  });
+  const holder = f.coordinator.freezeInventory({ context: f.context, currentSha: H, defaultBranch: "main" });
+  await ready;
+  f.state.status = "cancelled";
+  const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+    factories++; const b = new MaintenanceBudget(600_000, () => mono); budgets.push(b); return b;
+  } });
+  try {
+    const pending = coordinator.resumePending(undefined, [f.record]);
+    await active;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    mono = 600_000;
+    assert.throws(() => budgets[0]!.check(), /maintenance deadline/);
+    await assert.rejects(pending, /maintenance deadline/);
+    assert.equal(f.order.includes("held"), false);
+    assert.equal(f.finals.length, 0); assert.equal(f.state.pinDeletes, 0);
+    unblock(); await holder;
+    await coordinator.resumePending(undefined, [f.record]);
+    assert.equal(factories, 2);
+    assert.equal(f.order.includes("held"), true);
+  } finally { unblock(); await holder; for (const b of budgets) b.dispose(); await f.close(); }
+});
+
+it("cancellation entry does not renew an expired inherited attempt", async () => {
+  const f = await v2FrozenFixture();
+  let mono = 0, factories = 0;
+  const budget = new MaintenanceBudget(1, () => mono);
+  const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => { factories++; return new MaintenanceBudget(); } });
+  try {
+    await MaintenanceBudget.run(budget, async () => {
+      mono = 1;
+      await assert.rejects(coordinator.resumePending(undefined, [f.record]), /maintenance deadline/);
+    });
+    assert.equal(factories, 0); assert.equal(f.order.length, 0);
+  } finally { budget.dispose(); await f.close(); }
+});
+
+for (const mode of ["boot", "live"] as const) {
+  it(`cancellation handoff ${mode} keeps cumulative expiry across materialization and repeated records`, async () => {
+    const f = await v2FrozenFixture();
+    let mono = 0, factories = 0;
+    f.state.status = "cancelled";
+    const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+      factories++;
+      return new MaintenanceBudget(600_000, () => mono);
+    } });
+    const materialize = coordinator.materializeBootInventory.bind(coordinator);
+    Object.assign(coordinator, {
+      materializeBootInventory: async (...args: Parameters<typeof materialize>) => {
+        const records = await materialize(...args);
+        mono = 600_000;
+        return [...records, f.record];
+      },
+    });
+    try {
+      await coordinator.snapshotOwedInventory();
+      if (mode === "boot") await assert.rejects(coordinator.resumePending(undefined, [f.record, f.record], true), /maintenance deadline/);
+      else await coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: 1000 });
+      assert.equal(factories, 1);
+      assert.equal(f.order.includes("pack"), false);
+      assert.equal(f.finals.length, 0);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
+it("cancellation transition from running entry to exact terminal starts budget before new pack or FINAL", async () => {
+  const f = await v2FrozenFixture();
+  let mono = 0, factories = 0, reads = 0;
+  const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+  Object.assign(f.client, {
+    getExactRecoveryHold: async () => {
+      f.state.status = ++reads === 1 ? "running" : "cancelled";
+      return exact("run-1", 7, f.record.exactHoldBinding!);
+    },
+  });
+  Object.assign(f.git, {
+    withRecoveryOperation: async (_signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
+      assert.equal(deadline, Infinity);
+      mono = 600_000;
+      return action();
+    },
+  });
+  const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+    factories++; return new MaintenanceBudget(600_000, () => mono);
+  } });
+  try {
+    await assert.rejects(coordinator.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" }), /maintenance deadline/);
+    assert.equal(factories, 1);
+    assert.equal(f.order.includes("pack"), false);
+    assert.equal(f.finals.length, 0);
+  } finally { await f.close(); }
+});
+
 it("maintenance expiry after held ACK journal completion cannot notify release or delete pins", async () => {
   const f = await v2FrozenFixture();
   let now = 0, released = 0;
@@ -1294,12 +1443,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   };
   const make = (sourceBoundary: boolean | "runner" = false,
     pendingGenerationReport?: (runId: string, generation: number) => boolean,
-    onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void) => {
+    onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void,
+    testHooks?: { maintenanceBudget: () => MaintenanceBudget }) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
     const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
-    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased,
+    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased, testHooks,
     withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
       physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
       if (state.sourceRefused) {
