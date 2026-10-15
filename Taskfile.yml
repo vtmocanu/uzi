@@ -312,7 +312,7 @@ tasks:
       # liveness canary is required.
       - task: test:api-v1-compat-check
       # Hermetic exit-code contract for the sqlc-drift gate (scripts/sqlc-drift-gate.sh):
-      # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
+      # fixture wrappers + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
       - task: test:sqlc-drift-gate
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
@@ -488,9 +488,9 @@ tasks:
       # sqlc drift AFTER build (the tree compiles) and BEFORE the -race test:api:
       # cheapest-first + fail-fast, mirroring CI's validate-api sqlc step so a stale
       # committed codegen is caught locally instead of on the first PR pipeline. The
-      # pinned sqlc version is read from ci.yml so local `go run` stays in lockstep
-      # with CI's release binary (scripts/sqlc-drift-gate.sh). NOT in gate:repo: it
-      # needs the Go toolchain + a warm module cache, unlike gate:repo's offline
+      # pinned sqlc version is read from ci.yml so the local release wrapper stays
+      # in lockstep with CI (scripts/sqlc-drift-gate.sh). NOT in gate:repo: a cold
+      # wrapper cache needs a network download, unlike gate:repo's offline
       # sub-second checks, and CI's lint-repo runs gate:repo (validate-api already
       # runs this drift check), so gate:repo would only duplicate it at cold cost.
       - task: check:sqlc-drift
@@ -1034,8 +1034,9 @@ tasks:
       - ./scripts/assert-web-nginx.test.sh
 
   test:sqlc-drift-gate:
-    desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
+    desc: hermetic sqlc release acquisition and drift-gate contracts (fixture archives, no network)
     cmds:
+      - ./scripts/sqlc.test.sh
       - ./scripts/sqlc-drift-gate.test.sh
 
   test:renovate-go-toolchain:
@@ -1284,10 +1285,10 @@ tasks:
   check:sqlc-drift:
     desc: sqlc regeneration is a no-op (committed api/internal/store codegen matches its source)
     cmds:
-      # The local mirror of CI's validate-api "sqlc drift" step (not offline: `go run`
-      # fetches sqlc on a cold module cache). Regenerates with the
-      # pinned sqlc (version read from .github/workflows/ci.yml, so local `go run` never
-      # drifts from CI's release binary) and fails if the committed codegen moved. Wired
+      # The local mirror of CI's validate-api "sqlc drift" step (a cold wrapper
+      # cache downloads a sha256-verified release archive). Regenerates with the
+      # pinned sqlc (version read from .github/workflows/ci.yml, so the local wrapper
+      # stays in lockstep with CI) and fails if the committed codegen moved. Wired
       # into gate:api. Exit 2 = sqlc could not run (never a silent green), 1 = drift,
       # 0 = clean -- see the script header.
       - ./scripts/sqlc-drift-gate.sh

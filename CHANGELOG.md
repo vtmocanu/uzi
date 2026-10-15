@@ -30,6 +30,10 @@ through `[0.52.0]`.)
 - **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
   Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
 
+### Changed
+
+- **sqlc regeneration uses verified release binaries.**
+  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
 
 ## [0.86.0] - 2026-10-06
 

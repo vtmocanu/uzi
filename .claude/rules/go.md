@@ -25,7 +25,7 @@ task build:api                             # or vet:api, individually
 cd api && go test ./internal/forge -run TestName   # single test — no target, not a gate recipe
 # after editing internal/store/migrations/ or internal/store/queries/ (CI asserts
 # the regenerate is a no-op in validate:api; no target):
-cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
+cd api && ../scripts/sqlc.sh v1.31.1 generate
 ```
 
 ## `-count=1` and the test cache
@@ -131,7 +131,7 @@ Compare("v0.11.8", "v0.14.0") = -1   IsValid true/true     <- what a fixture "na
 
 ## sqlc
 
-- `task check:sqlc-drift` (a member of `gate:api`) is the local mirror of CI's `validate-api` "sqlc drift" step (it is NOT offline: `go run` fetches sqlc on a cold module cache): it regenerates and fails when the committed `internal/store` codegen is stale, so an edited query or migration whose `*.sql.go` was never regenerated reddens locally instead of on the first PR pipeline. It reads the pinned sqlc version from `.github/workflows/ci.yml`, so the local `go run` cannot drift from CI's release binary. Exit 2 = sqlc could not run (never a silent green), 1 = drift, 0 = clean.
+- `task check:sqlc-drift` (a member of `gate:api`) mirrors CI's `validate-api` sqlc drift step: it regenerates and fails when committed `internal/store` codegen is stale. It reads the version from `.github/workflows/ci.yml` and calls `scripts/sqlc.sh`, which downloads a sha256-verified release archive on a cold cache without compiling sqlc into Go's caches. The wrapper supports Linux amd64 and macOS arm64, rechecks cached archives on every invocation, and caches them under `${XDG_CACHE_HOME:-$HOME/.cache}/uzi-sqlc` (override with `UZI_SQLC_DIR`). Exit 2 = sqlc could not run (including acquisition failure), 1 = drift, 0 = clean.
 - Cast any expression you intend to consume as a typed Go value; sqlc's inference is weaker on expressions than on columns. `(m.user_id IS NOT NULL)` types as `interface{}`, `(m.user_id IS NOT NULL)::boolean` gives a usable `bool`.
 - A green `sqlc generate` is not evidence the query runs; sqlc's type deduction is not Postgres's. A `CASE WHEN … THEN @observed_at ELSE NULL END` whose sibling arm is a bare `NULL` generated clean Go, passed `go build` and `go vet`, and drew `inconsistent types deduced for parameter $10` (SQLSTATE 42P08) at prepare time.
 - A new or edited query is not verified until a live-DB test has executed it. Never write "sqlc regenerated cleanly" in a report as though it were a measurement.

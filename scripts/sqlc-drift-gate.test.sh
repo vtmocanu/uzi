@@ -1,18 +1,20 @@
 #!/bin/sh
-# Hermetic contract tests for scripts/sqlc-drift-gate.sh.
-#
-# No real sqlc, no network, no touching this repo: each case builds a throwaway git
-# repo (its own `.github/workflows/ci.yml` pin + `api/internal/store` corpus) and puts
-# a FAKE `go` on PATH that simulates `go run ...sqlc@<ver> generate`. That proves the
-# gate's exit-code discipline (2 = instrument broken, 1 = drift, 0 = clean) fires as
-# designed, so a future edit that guts the check reddens here instead of shipping a
-# gate that reports green on drift.
+# Hermetic gate contracts; --case NAME selects an independent scenario.
 set -eu
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
-GATE="$ROOT/scripts/sqlc-drift-gate.sh"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+SOURCE_GATE="${UZI_SQLC_DRIFT_GATE:-$ROOT/scripts/sqlc-drift-gate.sh}"
+CASE="${2:-all}"
+[ "${1:---case}" = --case ] || exit 2
+TMPDIR="$ROOT/.uzi/scratch"
+export TMPDIR
+TMP="$(mktemp -d "$TMPDIR/sqlc-drift-tests.XXXXXX")"
+printf 'ARTIFACTS=%s\n' "$TMP"
+mkdir -p "$TMP/scripts"
+GATE="$TMP/scripts/sqlc-drift-gate.sh"
+cp "$SOURCE_GATE" "$GATE"
+chmod +x "$GATE"
+
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
@@ -29,31 +31,28 @@ assert_contains() {
   grep -Fq -- "$2" "$1" || fail "$1 does not contain: $2"
 }
 
-# A fake `go` shared by every case. On `go run <pkg>@<ver> generate` (invoked by the
-# gate from inside api/) it acts on FAKE_SQLC_MODE; any other invocation is a contract
-# breach (the gate changed how it calls go) and exits 3 so the test notices.
+# A Go sentinel fails and logs every invocation, including fallback attempts.
 FAKE_BIN="$TMP/bin"
 mkdir -p "$FAKE_BIN"
 cat > "$FAKE_BIN/go" <<'EOF'
 #!/bin/sh
-# Expect: run github.com/sqlc-dev/sqlc/cmd/sqlc@vX.Y.Z generate
-[ "${1:-}" = "run" ] || { echo "fake go: unexpected subcommand '${1:-}'" >&2; exit 3; }
-case "${2:-}" in
-  github.com/sqlc-dev/sqlc/cmd/sqlc@v*) : ;;
-  *) echo "fake go: unexpected package '${2:-}'" >&2; exit 3 ;;
-esac
-[ "${3:-}" = "generate" ] || { echo "fake go: expected 'generate', got '${3:-}'" >&2; exit 3; }
-case "${FAKE_SQLC_MODE:-clean}" in
-  clean)  exit 0 ;;                                            # regenerate == committed
-  drift)  printf 'regenerated\n' > internal/store/models.go   # cwd is api/
-          exit 0 ;;
-  newfile) printf 'package store\n' > internal/store/new_query.sql.go  # cwd is api/; untracked
-          exit 0 ;;
-  broken) echo "fake sqlc: config error" >&2; exit 1 ;;       # tool failed to run
-  *) echo "fake go: unknown FAKE_SQLC_MODE" >&2; exit 3 ;;
+printf 'forbidden\n' >> "$GO_LOG"
+exit 97
+EOF
+cat > "$TMP/scripts/sqlc.sh" <<'EOF'
+#!/bin/sh
+printf 'called\n' >> "$WRAPPER_LOG"
+[ "$#" -eq 2 ] && [ "$1" = v1.31.1 ] && [ "$2" = generate ] && [ "$PWD" = "$EXPECTED_API" ] || exit 3
+case "$FAKE_SQLC_MODE" in
+  clean) exit 0 ;;
+  drift) printf 'regenerated\n' > internal/store/models.go ;;
+  newfile) printf 'package store\n' > internal/store/new_query.sql.go ;;
+  broken) echo 'fake sqlc: config error' >&2; exit 1 ;;
+  acquisition) echo 'sqlc.sh: bounded download failed' >&2; exit 2 ;;
+  *) exit 3 ;;
 esac
 EOF
-chmod +x "$FAKE_BIN/go"
+chmod +x "$FAKE_BIN/go" "$TMP/scripts/sqlc.sh"
 
 # Build a throwaway repo with a committed api/internal/store corpus and a ci.yml pin.
 # $1 = whether ci.yml carries the SQLC_VERSION line ("with-version" | "no-version").
@@ -69,44 +68,64 @@ make_repo() {
     printf 'jobs:\n  validate-api:\n    steps: []\n' > "$repo/.github/workflows/ci.yml"
   fi
   git -C "$repo" -c init.defaultBranch=main init -q
-  git -C "$repo" -c user.email=t@example.com -c user.name=test add -A
+  git -C "$repo" add -- api/internal/store/models.go api/go.mod .github/workflows/ci.yml
   git -C "$repo" -c user.email=t@example.com -c user.name=test commit -qm init
   printf '%s\n' "$repo"
 }
 
-# Run the real gate inside a repo with the fake go on PATH; capture rc and output.
+# Copy the gate beside the wrapper, never use the source repo as the fixture.
 GATE_RC=0
+NO_PIN_REPO=""
 run_gate() {
   GATE_RC=0
-  ( cd "$1" && env PATH="$FAKE_BIN:$PATH" FAKE_SQLC_MODE="$2" "$GATE" ) \
+  rm -f "$TMP/wrapper.log"
+  ( cd "$1" && env PATH="$FAKE_BIN:$PATH" FAKE_SQLC_MODE="$2" EXPECTED_API="$1/api" WRAPPER_LOG="$TMP/wrapper.log" GO_LOG="$TMP/go.log" "$GATE" ) \
     > "$3" 2>&1 || GATE_RC=$?
+  [ ! -s "$TMP/go.log" ] || fail 'Go was invoked'
+  if [ "$1" != "$NO_PIN_REPO" ] && [ ! -f "$FAKE_BIN/curl" ]; then
+    [ -s "$TMP/wrapper.log" ] || fail 'wrapper was not called'
+  fi
 }
 
+if [ "$CASE" = all ] || [ "$CASE" = clean ]; then
 # 1. Clean: regenerate reproduces the committed tree -> exit 0.
 repo="$(make_repo with-version)"
 run_gate "$repo" clean "$TMP/clean.out"
 assert_eq 0 "$GATE_RC" "clean run exit code"
 assert_contains "$TMP/clean.out" "clean"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = drift ]; then
 # 2. Drift: regenerate changes a committed file -> exit 1, names the regenerate command.
 repo="$(make_repo with-version)"
 run_gate "$repo" drift "$TMP/drift.out"
 assert_eq 1 "$GATE_RC" "drift run exit code"
 assert_contains "$TMP/drift.out" "DRIFT"
-assert_contains "$TMP/drift.out" "go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate"
+assert_contains "$TMP/drift.out" "../scripts/sqlc.sh v1.31.1 generate"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = broken ]; then
 # 3. Instrument broken: sqlc itself fails -> exit 2, never a silent green.
 repo="$(make_repo with-version)"
 run_gate "$repo" broken "$TMP/broken.out"
 assert_eq 2 "$GATE_RC" "broken tool exit code"
 assert_contains "$TMP/broken.out" "INSTRUMENT failure"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = missing-pin ]; then
 # 4. Version unreadable from ci.yml -> exit 2 (fail closed, never a wrong sqlc).
 repo="$(make_repo no-version)"
+NO_PIN_REPO="$repo"
 run_gate "$repo" clean "$TMP/noversion.out"
 assert_eq 2 "$GATE_RC" "missing version exit code"
 assert_contains "$TMP/noversion.out" "could not read SQLC_VERSION"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = newfile ]; then
 # 5. New untracked file: regenerate creates an uncommitted *.sql.go under the codegen
 #    dir -> exit 1. `git diff` alone reads clean (tracked-only); the untracked-file check
 #    is what catches a generated file missing from the commit.
@@ -115,6 +134,9 @@ run_gate "$repo" newfile "$TMP/newfile.out"
 assert_eq 1 "$GATE_RC" "new untracked file exit code"
 assert_contains "$TMP/newfile.out" "untracked"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = orphan ]; then
 # 6. Generated file already on disk but never `git add`ed (produced in an earlier run,
 #    forgotten at commit) while regeneration is a no-op -> exit 1. `git diff` reads clean
 #    and a before/after snapshot would cancel it; scoping to the *.sql.go suffix catches it.
@@ -124,6 +146,9 @@ run_gate "$repo" clean "$TMP/orphan.out"
 assert_eq 1 "$GATE_RC" "pre-existing untracked generated file exit code"
 assert_contains "$TMP/orphan.out" "untracked"
 
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = unrelated ]; then
 # 7. Untracked NON-generated files under the codegen dir (a WIP test, a new query source)
 #    are NOT drift -- only the generated *.sql.go suffix is scoped, since that dir also
 #    holds hand-written *_test.go and the queries/ + migrations/ sources. Clean -> exit 0.
@@ -134,5 +159,38 @@ printf '%s\n' '-- name: Wip :one' 'SELECT 1;' > "$repo/api/internal/store/querie
 run_gate "$repo" clean "$TMP/wip.out"
 assert_eq 0 "$GATE_RC" "untracked non-generated files are not drift"
 assert_contains "$TMP/wip.out" "clean"
+
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = acquisition ]; then
+  repo="$(make_repo with-version)"
+  run_gate "$repo" acquisition "$TMP/acquisition.out"
+  assert_eq 2 "$GATE_RC" 'acquisition failure'
+  assert_contains "$TMP/acquisition.out" 'sqlc.sh: bounded download failed'
+  assert_contains "$TMP/acquisition.out" 'INSTRUMENT failure'
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = real-transport ]; then
+  repo="$(make_repo with-version)"
+  cp "$ROOT/scripts/sqlc.sh" "$TMP/scripts/sqlc.sh"
+  cat > "$FAKE_BIN/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$TRANSPORT_LOG"
+exit 7
+EOF
+  cat > "$FAKE_BIN/uname" <<'EOF'
+#!/bin/sh
+case "$1" in -s) echo Linux;; -m) echo x86_64;; esac
+EOF
+  chmod +x "$FAKE_BIN/curl" "$FAKE_BIN/uname"
+  UZI_SQLC_DIR="$TMP/cache"
+  TRANSPORT_LOG="$TMP/transport.log"
+  export UZI_SQLC_DIR TRANSPORT_LOG
+  run_gate "$repo" clean "$TMP/real-transport.out"
+  assert_eq 2 "$GATE_RC" 'real wrapper acquisition failure'
+  assert_contains "$TMP/real-transport.out" 'sqlc.sh: bounded download failed'
+  assert_contains "$TMP/real-transport.out" 'INSTRUMENT failure'
+  assert_contains "$TMP/transport.log" 'sqlc_1.31.1_linux_amd64.tar.gz'
+fi
 
 printf 'sqlc-drift-gate tests: PASS\n'
