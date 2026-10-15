@@ -59,15 +59,18 @@ func TestCIConfigGuardClaimClauseCountPinned(t *testing.T) {
 			t.Errorf("%s mirrors completion_interlock_v1 %d times but ci_config_guard_v1 %d times", name, n, got[name])
 		}
 	}
-	// The only other mention is the health count, which is not a claim clause.
-	if strays["CountOnlineWorkersSatisfyingCIConfigGuard"] != 1 {
-		t.Errorf("health count query mentions ci_config_guard_v1 %d times, want 1", strays["CountOnlineWorkersSatisfyingCIConfigGuard"])
+	// Both health counts require the guard; the artifact count requires it on
+	// the same worker as ci_artifacts_v1. Neither is a claim clause.
+	for _, name := range []string{"CountOnlineWorkersSatisfyingCIConfigGuard", "CountOnlineWorkersSatisfyingCIArtifacts"} {
+		if strays[name] != 1 {
+			t.Errorf("health count %s mentions ci_config_guard_v1 %d times, want 1", name, strays[name])
+		}
 	}
 	total := 0
 	for _, n := range strays {
 		total += n
 	}
-	if total != 7 {
-		t.Errorf("ci_config_guard_v1 appears in %d ANY() tests across runtime.sql, want 7 (6 claim clauses + 1 health count): %v", total, strays)
+	if total != 8 {
+		t.Errorf("ci_config_guard_v1 appears in %d ANY() tests across runtime.sql, want 8 (6 claim clauses + 2 health counts): %v", total, strays)
 	}
 }
