@@ -20,7 +20,7 @@ Successful and cancelled runs require no routine cleanup. Failed work is preserv
 | 2026-10-15 | Unbound first-gate reject: option a adopted; authority exists only at the proven atomic closure of awaiting_approval R > 0 in G with no incoming-transfer veto. | Approve-wins, moved-on, R=0/legacy and transfer-veto cases preserve; no reconstruction from diagnostic stamps. |
 | 2026-10-15 | Completed-without-receipt inventory stays archive-first; held publication only after a thin capture or a typed oversize/quota refusal. Failed and cancelled stay held-first. | Maintainer choice (a) over a uniform held-first order: successful work is not published by default. |
 
-Quotes recorded by the lead: "i dont want manual discard ... it should happen automatically"; cancelled publication: "do publish pls, the repo is public anyway"; plan rejection: "discard pls". The earlier scope refinement was subsequently superseded by the maintainer's S1 decision recorded above.
+The maintainer's direction, as recorded by the lead: hold settlement is automatic with no routine manual discard; cancelled work is published to held refs that follow the repository's visibility; rejected plan work is discarded. The earlier scope refinement was subsequently superseded by the maintainer's S1 decision recorded above.
 
 ### Programme recommendations, not additional maintainer decisions
 
