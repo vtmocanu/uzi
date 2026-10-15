@@ -62,6 +62,19 @@ class CheckerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "60s captured fixture"):
             self.verify()
 
+    def test_unexpected_primary_exit_is_not_cancelled_step_evidence(self):
+        for index in (0, 1):
+            for code in (False, True, 0, 1, -9, 137.5, None, "137"):
+                with self.subTest(index=index, code=code):
+                    self.setUp()
+                    self.reports[0]["trees"][index]["exits"][0]["code"] = code
+                    with self.assertRaises((ValueError, TypeError)):
+                        self.verify()
+            self.setUp()
+            self.reports[0]["trees"][index]["exits"][0].pop("code")
+            with self.assertRaises(KeyError):
+                self.verify()
+
     def test_independent_phase_and_window_refusals(self):
         mutations = [
             ("final before quiet", lambda r: r["finalCleanup"].update(startMs=1521, endMs=1522)),

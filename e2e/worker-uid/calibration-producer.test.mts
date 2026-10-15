@@ -4,9 +4,17 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { fixture, freshPostCleanupDwell, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { expectedPrimaryExit, fixture, freshPostCleanupDwell, projectFailedEvidence } from "./calibration-fixture.mjs";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+
+test("only an expected owned SIGKILL exit can settle a fixed producer", () => {
+  assert.equal(expectedPrimaryExit(true, 137), true);
+  assert.equal(expectedPrimaryExit(false, 137), false);
+  for (const code of [0, 1, -9, 137.5, false, true, null, undefined, "137"]) {
+    assert.equal(expectedPrimaryExit(true, code), false);
+  }
+});
 
 test("imports expose entrypoints without starting fixture, worker or load", () => {
   assert.equal(typeof fixture, "function");

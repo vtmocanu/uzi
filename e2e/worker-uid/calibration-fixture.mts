@@ -25,6 +25,11 @@ const root = "/proof", scratch = root + "/.uzi/scratch", disk = "/calibration-di
 const now = () => performance.now();
 type Sample = ReturnType<WorkerMemoryReader["sample"]>;
 type Available = Extract<Sample, { available: true }>;
+// These fixed primaries never exit normally. The real supervisor disposes them
+// with SIGKILL and reports 128 + signal; an error exit is not pressure cancellation.
+export function expectedPrimaryExit(disposalRequested: boolean, code: unknown): boolean {
+  return disposalRequested && code === 137;
+}
 function deferred<T>() {
   let resolve!: (v: T) => void, reject!: (e: unknown) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
@@ -300,7 +305,9 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       const exit = handle.waitChild(70000);
       void exit.then((value) => {
         exits.push({ index, atMs: now(), code: value.code });
-        if (!expectedExit[index]) failures[index]!.reject(new Error("unexpected command primary exit"));
+        if (!expectedPrimaryExit(expectedExit[index]!, value.code)) {
+          failures[index]!.reject(new Error("unexpected command primary exit"));
+        }
       }, (error) => failures[index]!.reject(error));
       return { ...handle, get failed() { return handle.failed; },
         observe: async (ms?: number) => {

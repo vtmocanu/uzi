@@ -345,6 +345,7 @@ def verify_report(report, manifest, expected, synthetic=False):
                 for p in survival["observation"]["processes"]), "live sibling observation")
     for index, tree in enumerate(trees):
         exit_record = tree["exits"][0]
+        require(integer(exit_record["code"]) == 137, "unexpected producer exit status")
         disposal = tree["disposals"][0]
         require(exit_record["index"] == index and disposal["index"] == index, "exit tree correlation")
         require(disposal["evidence"]["event"]["authority"] == "ECHILD+__WALL", "supervisor drain authority")
