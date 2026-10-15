@@ -135,6 +135,44 @@ func TestResetApprovalRefusalsNeverRetry(t *testing.T) {
 	}
 }
 
+func TestReconciliationReviewExactBindings(t *testing.T) {
+	revision := 3
+	for _, tc := range []struct {
+		name     string
+		revision *int
+		want     string
+	}{
+		{"legacy", nil, "null"},
+		{"structural", &revision, "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			digest := strings.Repeat("b", 64)
+			r := apitypes.RunDTO{ID: "r1", ResetStateDigest: digest, GateRevision: 7, CompletionRevision: tc.revision}
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr)
+			}
+			for label, value := range map[string]string{
+				"GATE_REVISION":       "7",
+				"COMPLETION_REVISION": tc.want,
+				"RESET_STATE_DIGEST":  digest,
+			} {
+				found := false
+				for _, line := range strings.Split(out, "\n") {
+					if strings.Join(strings.Fields(line), " ") == label+" "+value {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("missing exact binding %s=%s in %s", label, value, out)
+				}
+			}
+		})
+	}
+}
+
 func TestReconciliationGetPagingAndSafeOutput(t *testing.T) {
 	hostile := "evil\x1b[2J\u202etext"
 	cursor := int64(9)

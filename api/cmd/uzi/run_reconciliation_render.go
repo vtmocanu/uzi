@@ -111,9 +111,6 @@ func reviewValue(value any) string {
 	if string(raw) == "null" {
 		return "null"
 	}
-	if string(raw) == "null" {
-		return "null"
-	}
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
 		return cellText(text)
