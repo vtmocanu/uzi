@@ -147,7 +147,9 @@ func TestReconciliationReviewExactBindings(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			digest := strings.Repeat("b", 64)
-			r := apitypes.RunDTO{ID: "r1", ResetStateDigest: digest, GateRevision: 7, CompletionRevision: tc.revision}
+			r := apitypes.RunDTO{ID: "r1", Status: "awaiting_approval", ResetStateDigest: digest, GateRevision: 7, CompletionRevision: tc.revision,
+				Milestones:          []apitypes.Milestone{{ID: "m1", Title: "Original"}},
+				MilestonesCandidate: []apitypes.Milestone{{ID: "m1", Title: "Replacement"}}}
 			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
 			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
 			if code != 0 {
@@ -173,10 +175,102 @@ func TestReconciliationReviewExactBindings(t *testing.T) {
 	}
 }
 
+func TestReconciliationReviewChangedGate(t *testing.T) {
+	original := []apitypes.Milestone{{ID: "m1", Title: "First"}, {ID: "m2", Title: "Second"}}
+	for _, tc := range []struct {
+		name      string
+		status    string
+		frozen    []apitypes.Milestone
+		candidate []apitypes.Milestone
+		wantReset bool
+	}{
+		{"unchanged", "awaiting_approval", original, append([]apitypes.Milestone(nil), original...), false},
+		{"no frozen", "awaiting_approval", nil, original, false},
+		{"both absent", "awaiting_approval", nil, nil, false},
+		{"no frozen explicit candidate", "awaiting_approval", nil, []apitypes.Milestone{}, false},
+		{"both empty", "awaiting_approval", []apitypes.Milestone{}, []apitypes.Milestone{}, false},
+		{"running changed", "running", original, []apitypes.Milestone{}, false},
+		{"completed changed", "completed", original, []apitypes.Milestone{}, false},
+		{"empty replacement", "awaiting_approval", original, []apitypes.Milestone{}, true},
+		{"title changed same IDs", "awaiting_approval", original, []apitypes.Milestone{{ID: "m1", Title: "Revised"}, {ID: "m2", Title: "Second"}}, true},
+		{"order changed", "awaiting_approval", original, []apitypes.Milestone{original[1], original[0]}, true},
+		{"absent candidate", "awaiting_approval", original, nil, true},
+		{"empty frozen absent candidate", "awaiting_approval", []apitypes.Milestone{}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := apitypes.RunDTO{ID: "r1", Status: tc.status, ResetStateDigest: strings.Repeat("b", 64),
+				GateRevision: 7, Milestones: tc.frozen, MilestonesCandidate: tc.candidate}
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr)
+			}
+			for _, label := range []string{"RESET_WARNING", "GATE_REVISION", "COMPLETION_REVISION", "RESET_STATE_DIGEST", "FROZEN_MILESTONES", "CANDIDATE_MILESTONES", "RESET_STOP_KIND", "RESET_STOP_REASON"} {
+				if strings.Contains(out, label) != tc.wantReset {
+					t.Errorf("%s present=%v want=%v in %s", label, strings.Contains(out, label), tc.wantReset, out)
+				}
+			}
+			jsonOut, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1", "--json")
+			var got apitypes.RunDTO
+			if code != 0 || json.Unmarshal([]byte(jsonOut), &got) != nil || !reflect.DeepEqual(got, r) {
+				t.Fatalf("JSON altered: code=%d out=%s stderr=%s", code, jsonOut, stderr)
+			}
+		})
+	}
+}
+
+func TestReconciliationReviewWithoutResetProjection(t *testing.T) {
+	r := apitypes.RunDTO{ID: "r1", Status: "awaiting_approval",
+		Milestones:          []apitypes.Milestone{{ID: "m1", Title: "Original"}},
+		MilestonesCandidate: []apitypes.Milestone{}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 || strings.Contains(out, "RESET_WARNING") || strings.Contains(out, "RESET_STATE_DIGEST") {
+		t.Fatalf("missing owner reset projection: code=%d out=%s stderr=%s", code, out, stderr)
+	}
+}
+
+func TestReconciliationReviewAuditIndependentOfGate(t *testing.T) {
+	for _, status := range []string{"awaiting_approval", "running", "completed"} {
+		for _, digest := range []string{"", strings.Repeat("b", 64)} {
+			t.Run(status+"/digest="+digest, func(t *testing.T) {
+				cursor := int64(4)
+				r := apitypes.RunDTO{ID: "r1", Status: status, ResetStateDigest: digest,
+					Milestones:          []apitypes.Milestone{{ID: "m1", Title: "Same"}},
+					MilestonesCandidate: []apitypes.Milestone{{ID: "m1", Title: "Same"}},
+					MilestoneReconciliations: []json.RawMessage{json.RawMessage(
+						`{"gate_revision":5,"created_at":"2026-10-15","reason":"replace scope","before_state":{"milestones_frozen":[{"id":"old","title":"Original"}]},"after_state":{"milestones_frozen":[]}}`)},
+					MilestoneReconciliationsNextBeforeGateRevision: &cursor}
+				fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
+				out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+				if code != 0 {
+					t.Fatalf("code=%d stderr=%s", code, stderr)
+				}
+				for _, want := range []string{"RESET_AUDIT", "gate 5", "2026-10-15", "replace scope", "BEFORE milestones_frozen", "Original", "AFTER milestones_frozen", "--reconciliation-before-gate-revision 4"} {
+					if !strings.Contains(out, want) {
+						t.Errorf("missing %q in %s", want, out)
+					}
+				}
+				for _, label := range []string{"RESET_WARNING", "GATE_REVISION", "COMPLETION_REVISION", "RESET_STATE_DIGEST", "FROZEN_MILESTONES", "CANDIDATE_MILESTONES", "RESET_STOP_KIND", "RESET_STOP_REASON"} {
+					if strings.Contains(out, label) {
+						t.Errorf("unexpected active reset field %s in %s", label, out)
+					}
+				}
+				r.MilestoneReconciliations = nil
+				fc.RunByID["r1"] = r
+				out, stderr, code = runCLI(t, fakeEnv(fc), "run", "get", "r1")
+				if code != 0 || !strings.Contains(out, "--reconciliation-before-gate-revision 4") || strings.Contains(out, "RESET_WARNING") {
+					t.Fatalf("paging-only output: code=%d out=%s stderr=%s", code, out, stderr)
+				}
+			})
+		}
+	}
+}
+
 func TestReconciliationGetPagingAndSafeOutput(t *testing.T) {
 	hostile := "evil\x1b[2J\u202etext"
 	cursor := int64(9)
-	r := apitypes.RunDTO{ID: "r1", ResetStateDigest: strings.Repeat("b", 64), GateRevision: 10,
+	r := apitypes.RunDTO{ID: "r1", Status: "awaiting_approval", ResetStateDigest: strings.Repeat("b", 64), GateRevision: 10,
 		Milestones: []apitypes.Milestone{{ID: "old", Title: hostile}}, MilestonesCandidate: []apitypes.Milestone{},
 		MilestonesCompleted: []string{"old"}, MilestonesInProgress: []string{"active"},
 		MilestoneReconciliationsNextBeforeGateRevision: &cursor}

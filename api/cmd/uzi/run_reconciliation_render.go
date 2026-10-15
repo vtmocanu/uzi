@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -10,26 +11,30 @@ import (
 // reconciliationReviewRows bounds each cell, each collection and the audit page.
 // A malformed audit entry is shown as unavailable and does not hide sibling entries.
 func reconciliationReviewRows(r apitypes.RunDTO) [][]string {
-	if r.ResetStateDigest == "" && len(r.MilestoneReconciliations) == 0 {
-		return nil
-	}
-	rows := [][]string{
-		{"RESET_WARNING", "Reset clears milestone progress, scope ceiling and prior decisions/waivers; invalidates prior permits."},
-		{"GATE_REVISION", fmt.Sprint(r.GateRevision)},
-		{"COMPLETION_REVISION", reviewValue(r.CompletionRevision)},
-		{"RESET_STATE_DIGEST", cellText(r.ResetStateDigest)},
-	}
-	for _, field := range []struct {
-		name  string
-		value any
-	}{
-		{"FROZEN_MILESTONES", r.Milestones}, {"CANDIDATE_MILESTONES", r.MilestonesCandidate},
-		{"MILESTONES_COMPLETED", r.MilestonesCompleted}, {"MILESTONES_IN_PROGRESS", r.MilestonesInProgress},
-		{"MILESTONES_AGENTS", r.MilestonesAgents}, {"COMPLETION_ACCEPTED", r.CompletionAccepted},
-		{"COMPLETION_DEFERRED", r.CompletionDeferred}, {"SCOPE_CEILING", r.ScopeCeiling},
-		{"RESET_STOP_KIND", r.StopKind}, {"RESET_STOP_REASON", r.StopReason},
-	} {
-		rows = append(rows, reviewCollectionRows(field.name, field.value)...)
+	var rows [][]string
+	// Milestone values include titles and order; an absent candidate remains a
+	// change from a frozen definition, including an explicit empty definition.
+	changed := r.Milestones != nil && (r.MilestonesCandidate == nil ||
+		!slices.Equal(r.Milestones, r.MilestonesCandidate))
+	if r.ResetStateDigest != "" && r.Status == "awaiting_approval" && changed {
+		rows = [][]string{
+			{"RESET_WARNING", "Reset clears milestone progress, scope ceiling and prior decisions/waivers; invalidates prior permits."},
+			{"GATE_REVISION", fmt.Sprint(r.GateRevision)},
+			{"COMPLETION_REVISION", reviewValue(r.CompletionRevision)},
+			{"RESET_STATE_DIGEST", cellText(r.ResetStateDigest)},
+		}
+		for _, field := range []struct {
+			name  string
+			value any
+		}{
+			{"FROZEN_MILESTONES", r.Milestones}, {"CANDIDATE_MILESTONES", r.MilestonesCandidate},
+			{"MILESTONES_COMPLETED", r.MilestonesCompleted}, {"MILESTONES_IN_PROGRESS", r.MilestonesInProgress},
+			{"MILESTONES_AGENTS", r.MilestonesAgents}, {"COMPLETION_ACCEPTED", r.CompletionAccepted},
+			{"COMPLETION_DEFERRED", r.CompletionDeferred}, {"SCOPE_CEILING", r.ScopeCeiling},
+			{"RESET_STOP_KIND", r.StopKind}, {"RESET_STOP_REASON", r.StopReason},
+		} {
+			rows = append(rows, reviewCollectionRows(field.name, field.value)...)
+		}
 	}
 	for i, raw := range r.MilestoneReconciliations {
 		if i == 50 {

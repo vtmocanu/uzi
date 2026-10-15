@@ -607,11 +607,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// interlocked runs. This candidate can differ from an earlier frozen contract awaiting
 		// explicit owner reconciliation. A valid candidate, including [], replaces the execution
 		// list for gate presentation only; approved executing claims use the frozen list above.
-		// Invalid candidate data is logged without replacing the decoded list.
+		// Missing or invalid candidate data must not present frozen definitions as the gate.
+		milestones = nil
 		if len(run.MilestonesCandidate) > 0 {
 			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
 				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
-			} else {
+			} else if _, valid := validateMilestones(cand); valid {
 				milestones = cand
 			}
 		}

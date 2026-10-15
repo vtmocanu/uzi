@@ -124,6 +124,24 @@ func reportPlanMilestonesParam(run store.Run, req StateRequest) []byte {
 	if fresh && req.GateCheckpointWitness != nil && req.Milestones != nil && len(*req.Milestones) == 0 {
 		return milestonesParam(run.Kind, req.Milestones)
 	}
+	// A legacy gate re-presentation may omit unchanged definitions after approval.
+	// Preserve only an existing, validated candidate that equals the frozen contract;
+	// NULL can also mean rejection and must never be repaired by inference.
+	if run.Kind == runkind.Issue && !run.CompletionContractVersion.Valid &&
+		req.Milestones == nil && req.PlanMd != nil && run.PlanMd.Valid {
+		clean, _ := stripNUL(*req.PlanMd)
+		if clean == run.PlanMd.String {
+			candidate, err := DecodeMilestones(run.MilestonesCandidate)
+			frozen, frozenErr := DecodeMilestones(run.MilestonesFrozen)
+			if err == nil && frozenErr == nil && candidate != nil && frozen != nil {
+				_, candidateOK := validateMilestones(candidate)
+				_, frozenOK := validateMilestones(frozen)
+				if candidateOK && frozenOK && !changedMilestoneContract(run) {
+					return run.MilestonesCandidate
+				}
+			}
+		}
+	}
 	return planMilestonesParam(run, req.PlanMd, req.Milestones)
 }
 

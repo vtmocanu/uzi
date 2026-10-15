@@ -133,13 +133,15 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	if !reflect.DeepEqual(payload.Milestones, wantMilestones) || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) {
 		t.Fatalf("interlocked gate restore: milestones=%+v plan=%v", payload.Milestones, payload.PlanMd)
 	}
-	// An explicit empty candidate remains distinguishable from an absent candidate.
-	for _, candidate := range []any{"[]", nil} {
+	// A populated execution contract must never fill in a missing or invalid gate list.
+	env.exec(`UPDATE runs SET milestones_frozen=$2::jsonb WHERE id=$1`, runID, string(run.MilestonesCandidate))
+	for _, candidate := range []any{"[]", nil, `[null]`, `["bad"]`} {
 		env.exec(`UPDATE runs SET milestones_candidate=$2::jsonb WHERE id=$1`, runID, candidate)
 		payload, err = svc.assembleClaim(env.ctx, wkr, mustRun(t, env, runID))
 		if err != nil || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) ||
 			(candidate == "[]" && (payload.Milestones == nil || len(payload.Milestones) != 0)) ||
-			(candidate == nil && payload.Milestones != nil) {
+			(candidate != "[]" && payload.Milestones != nil) ||
+			payload.ExecutionMilestones == nil || !reflect.DeepEqual(*payload.ExecutionMilestones, wantMilestones) {
 			t.Fatalf("candidate %v restore: milestones=%+v plan=%v err=%v", candidate, payload.Milestones, payload.PlanMd, err)
 		}
 	}
