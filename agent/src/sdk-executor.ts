@@ -2255,8 +2255,13 @@ export class SdkExecutor implements Executor {
         }
         let revisions = 0;
         let automaticRound = 0;
+        let serverAcceptedReplacement = false;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
+          // PlanRevisionReplacedError carries a live server-accepted human replacement.
+          // Consume its admission once; later ordinary verdicts retain the local guard.
+          const acceptedReplacement = !automatic && serverAcceptedReplacement;
+          serverAcceptedReplacement = false;
           if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
@@ -2276,7 +2281,7 @@ export class SdkExecutor implements Executor {
           // submit time and won't enqueue a revise past it, so this should never trip. If it
           // does, DO NOT run another planning turn — record it and re-gate the current plan so
           // the run stays fail-closed rather than revising unbounded.
-          if (!automatic && revisions >= maxRevisions) {
+          if (!automatic && !acceptedReplacement && revisions >= maxRevisions) {
             this.log.warn(
               "plan revision budget exhausted; re-gating without a turn",
               { run_id: ctx.runId, max_revisions: maxRevisions },
@@ -2341,6 +2346,7 @@ export class SdkExecutor implements Executor {
             if (!(error instanceof PlanRevisionReplacedError)) throw error;
             resumeId = error.sessionId;
             verdict = error.verdict;
+            serverAcceptedReplacement = verdict.automatic !== true;
             continue;
           }
           resumeId = turn.sessionId ?? resumeId;

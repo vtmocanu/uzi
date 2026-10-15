@@ -107,6 +107,55 @@ for (const harness of ["claude", "codex"] as const) {
     });
   }
 
+  it(`M3 ${harness}: server-accepted replacement starts beyond the understated claim cap`, async () => {
+    enable();
+    let id: string;
+    let iId: number;
+    let jId: number;
+    const fixture = providerFixture(harness, n => {
+      if (n === 1) return { plan: SOURCE };
+      if (n <= 3) return { failure: true };
+      assert.equal(n, 4, "only J starts after I's two failed attempts");
+      assert.equal(api.isApplied(id, iId), false, "I remains pending before J publishes");
+      assert.equal(api.isApplied(id, jId), false);
+      assert.equal(api.gateOf(id).revision, 1);
+      return { plan: REVISED };
+    });
+    // The claim understates the server's current allowance. Both rows below are
+    // source-bound admissions; the live replacement helper validates J.
+    const claim = freshClaim(1, { config: { plan_max_revisions: 1 },
+      ...(harness === "codex" ? { secrets: { forge_pat: "fixture-forge-pat", codex: fixture.credential } } : {}) });
+    id = claim.run_id;
+    const r = runner(fixture.executor, fakeGitlab().gitlab, undefined, {
+      planRevisionRetryPolicy: { redrives: 0, sleep: async (ms, signal) => { await delay(ms, undefined, { signal }); } },
+    });
+    const done = r.execute(claim);
+    try {
+      assert.ok(await until(() => gates(id).length === 1));
+      const source = api.gateOf(id);
+      const [i] = send(id, row("revise_plan", "exhausted I"));
+      iId = i!.id;
+      assert.ok(await until(() => feed(id).some(text => text.includes("retry allowance exhausted"))));
+      assert.equal(fixture.starts.length, 3);
+      const [j] = send(id, row("revise_plan", "accepted J"));
+      jId = j!.id;
+      assert.equal(j!.gate_revision, source.revision);
+      assert.equal(j!.gate_binding, "bound");
+      assert.ok(await until(() => gates(id).some(g => g.plan_md === REVISED)), "J must publish through the real driver beyond claim cap 1");
+      assert.equal(fixture.starts.length, 4);
+      assert.match(fixture.starts[3]!.prompt, /accepted J/);
+      assert.doesNotMatch(fixture.starts[3]!.prompt, /exhausted I/);
+      const publication = gates(id).find(g => g.plan_md === REVISED)!;
+      assert.equal(publication.revision_input_id, jId);
+      assert.equal(publication.expected_gate_revision, source.revision);
+      assert.deepEqual(publication.superseded_revision_input_ids, [iId]);
+      assert.ok(api.isApplied(id, jId) && api.isApplied(id, iId));
+      assert.ok(api.isInputSuperseded(id, iId));
+      assert.equal(api.isInputSuperseded(id, jId), false);
+      send(id, row("cancel")); await done;
+    } finally { r.shutdown(); await done; }
+  });
+
   it(`M3 ${harness}: ordinary I to J to K stays pending until K publication; lost ACK replays once`, async () => {
     enable();
     const fixture = providerFixture(harness, n => n === 1 ? { plan: SOURCE } : n <= 5 ? { failure: true } : { plan: REVISED });

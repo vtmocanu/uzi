@@ -2902,8 +2902,13 @@ export class CodexExecutor implements Executor {
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
         let revisions = 0;
         let automaticRound = 0;
+        let serverAcceptedReplacement = false;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
+          // PlanRevisionReplacedError carries a live server-accepted human replacement.
+          // Consume its admission once; later ordinary verdicts retain the local guard.
+          const acceptedReplacement = !automatic && serverAcceptedReplacement;
+          serverAcceptedReplacement = false;
           if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
@@ -2914,7 +2919,7 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_feedback", agent: "worker",
             payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback } });
           if (!automatic) {
-            if (revisions >= maxRevisions) {
+            if (!acceptedReplacement && revisions >= maxRevisions) {
               throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
             }
             revisions++;
@@ -2933,6 +2938,7 @@ export class CodexExecutor implements Executor {
           } catch (error) {
             if (!(error instanceof PlanRevisionReplacedError)) throw error;
             verdict = error.verdict;
+            serverAcceptedReplacement = verdict.automatic !== true;
             continue;
           }
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
