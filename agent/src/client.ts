@@ -2430,7 +2430,9 @@ export class WorkerClient {
     expected: { holdId: string; repoId: string },
     signal?: AbortSignal,
   ): Promise<RecoveryExactHold | undefined> {
-    if (!this.hasFeature("recovery_held_publication_v2") || !this.hasExactHoldCapability ||
+    // Publication advertisement can be disabled while reconciliation stays readable.
+    // An older API ignores the query and supplies no exact_hold, which remains unknown.
+    if (!this.hasExactHoldCapability ||
         !this.registeredWorkerId || !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0 ||
         !terminalUUID(expected.holdId) || !terminalUUID(expected.repoId)) return undefined;
     const worker = this.registeredWorkerId;
@@ -2442,7 +2444,7 @@ export class WorkerClient {
     try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true)); }
     catch { return undefined; }
     if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
-        !this.hasExactHoldCapability || !this.hasFeature("recovery_held_publication_v2") ||
+        !this.hasExactHoldCapability ||
         !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
     const value = body.exact_hold;
     if (value.run_id !== runId || value.generation !== generation || value.hold_id !== expected.holdId ||
@@ -4216,7 +4218,8 @@ function validExactClosedProof(value: Record<string, unknown>): boolean {
   const digest = typeof f.coverage_digest === "string" && /^[0-9a-f]{64}$/.test(f.coverage_digest);
   switch (f.kind) {
     case "held_publication":
-      return value.release_evidence === f.kind && noCapture && terminalUUID(f.publication_id) && completionSHA(f.source_sha) && digest;
+      return value.release_evidence === f.kind && noCapture && terminalUUID(f.publication_id) &&
+        typeof f.source_sha === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(f.source_sha) && digest;
     case "archive":
       return value.release_evidence === f.kind && noPublication && terminalUUID(f.capture_id) && typeof f.source_sha === "string" && /^[0-9a-fA-F]{4,64}$/.test(f.source_sha) && digest;
     case "settled":

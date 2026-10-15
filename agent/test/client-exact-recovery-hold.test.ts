@@ -30,15 +30,20 @@ async function setup(features: string[] = [v2], caps: string[] = [v2]) {
 }
 
 test("exact observation requires both rollout directions and treats old API absence as unknown", async () => {
- for (const [features, caps] of [[[], [v2]], [[v2], []]]) {
-  const e = await setup(features, caps);
-  assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined);
-  assert.deepEqual(e.paths, []);
-  mock.restoreAll();
- }
- const e = await setup();
+ const incapable = await setup([v2], []);
+ assert.equal(await incapable.client.getExactRecoveryHold(run, 1, expected), undefined);
+ assert.deepEqual(incapable.paths, []);
+ mock.restoreAll();
+ const e = await setup(["recovery_held_publication_v1"], [v2]);
  e.answer({ run_id: run, holds: [] });
- assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined, "empty open list is not closed proof");
+ assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined, "old API open list is not closed proof");
+ assert.deepEqual(e.paths, [`/api/worker/runs/${run}/recovery-holds?generation=1`]);
+});
+
+test("publication disabled advertisement does not disable exact custody observations", async () => {
+ const e = await setup([], [v2]);
+ assert.deepEqual(await e.client.getExactRecoveryHold(run, 1, expected), open());
+ assert.deepEqual(e.paths, [`/api/worker/runs/${run}/recovery-holds?generation=1`]);
 });
 
 test("exact observation validates identity and closed evidence without minting a release ACK", async () => {
@@ -58,6 +63,15 @@ test("exact observation validates identity and closed evidence without minting a
  const observed = await e.client.getExactRecoveryHold(run, 1, expected);
  assert.equal(observed?.final_receipt?.publication_id, repo);
  assert.equal((observed as unknown as Record<string, unknown>)?.released, undefined);
+ for (const size of [40, 64]) {
+  const source = "a".repeat(size);
+  e.answer({ run_id: run, holds: [], exact_hold: { ...closed, final_receipt: { ...closed.final_receipt, source_sha: source } } });
+  assert.equal((await e.client.getExactRecoveryHold(run, 1, expected))?.final_receipt?.source_sha, source, `valid ${size}-character held tip`);
+ }
+ for (const size of [39, 41, 63, 65]) {
+  e.answer({ run_id: run, holds: [], exact_hold: { ...closed, final_receipt: { ...closed.final_receipt, source_sha: "a".repeat(size) } } });
+  assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined, `invalid ${size}-character held tip`);
+ }
  e.answer({ run_id: run, holds: [], exact_hold: { ...closed, final_receipt: { ...closed.final_receipt, publication_id: "bad" } } });
  assert.equal(await e.client.getExactRecoveryHold(run, 1, expected), undefined);
  const policy = { ...closed, state: "discarded", release_evidence: "merged_predecessor_discard", final_receipt: undefined };
