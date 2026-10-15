@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
@@ -108,6 +109,10 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 	}
 	if refused {
 		// Refusal is whole-batch: no reservation or chunk has been inserted.
+		// Keep the new refusal reasons ahead of previously skipped entries.
+		sort.SliceStable(m.Entries, func(i, j int) bool {
+			return m.Entries[i].Status == "kept" && m.Entries[j].Status != "kept"
+		})
 		rows := make([]ciartifacts.Entry, 0, ciartifacts.MaxSkipped)
 		omitted := int64(0)
 		if m.Omitted != nil {

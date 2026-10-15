@@ -11311,6 +11311,7 @@ SELECT count(*) FROM workers w WHERE w.user_id = @user_id
  AND w.status = 'online'
  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
  AND NOT w.ephemeral AND NOT w.isolated_lane
+ AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
  AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
 
 -- name: SaveCIArtifactAdmission :one
