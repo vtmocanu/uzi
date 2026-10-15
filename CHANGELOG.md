@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
   Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
 
+- **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
+  Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
+
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
   Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
 
@@ -40,7 +43,6 @@ through `[0.52.0]`.)
 
 - **Approving a changed milestone plan requires explicit owner consent to reset progress.**
   Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
-
 
 ## [0.86.0] - 2026-10-06
 

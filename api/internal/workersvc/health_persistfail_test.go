@@ -90,10 +90,7 @@ func TestHealthPersistFailingBeatsToolLoopingAndSkipsItsQuery(t *testing.T) {
 	r := runRow("running")
 	r.StartedAt = ago(3 * time.Minute)
 	r.LastActivityAt = ago(3 * time.Minute)
-	loop := make([]store.ListRunToolWindowRow, 0, 8)
-	for i := 0; i < 8; i++ {
-		loop = append(loop, useMsg(t, int32(100-i), "call_A", "Bash", map[string]any{"command": "go test ./..."}))
-	}
+	loop := loopPairs(t, 8)
 	fs := &healthFakeStore{
 		active: []store.ListActiveRunsForHealthRow{r},
 		window: map[uuid.UUID][]store.ListRunToolWindowRow{r.ID: loop},
