@@ -21,15 +21,17 @@ generation. A successful ownership read is only a snapshot; the source gate can
 change before the write.
 
 The negotiated `plan_revision_retry_v1` contract compares
-`expected_gate_revision` under the same lock as recovered publication,
-predecessor supersession or terminal rejection. A stale source cannot mutate a
-newer plan, settle its inputs, grant approval or consume a generic presentation
+`expected_gate_revision`, claim generation and unreleased ownership under the
+same run-row lock as recovered publication, predecessor supersession or terminal
+rejection. A stale source cannot mutate a newer plan, settle its inputs, grant
+approval or consume a generic presentation
 refusal budget. Cancellation retains its epoch-exempt owner-stop behavior and
 claim-generation/release fences.
 
-Recognize an identical current presentation replay after validating ownership
-and claim authority: its first accepted publication may already have advanced
-the revision. Return that result without publishing or settling new targets.
+Recognize an identical current presentation and payload with the same committed
+receipt set after validating ownership and claim authority: its first accepted
+publication may already have advanced the revision. Return that result without
+publishing or adding pending settlement targets.
 New presentations must match their source gate; historical identities and
 changed payloads remain refused.
 

@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Recover abandoned plan-gate executions (#3001).**
-  Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion; recovered plan writes gain source-revision fences and atomic feedback dispositions.
+  Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion. Human plan revisions get up to three automatic provider-turn re-drives per accepted revision in a live flight, with 5/10/20-second backoff plus 0–20% jitter (30-second cap), after bounded inner retries. On exhaustion the original plan stays visible and feedback stays pending; an ordinary source-bound revise spends the normal revision allowance, while cancel and source-bound reject remain available at the cap. Approvals and follow-ups cannot restart the expired wait. Revised-plan publication atomically records the successful feedback and explicitly supersedes pending predecessors under a source-gate fence. Upgrade the API before workers for `plan_revision_retry_v1`; reclaim keeps existing Claude replay and Codex fresh-plan/re-send behavior, without durable retry accounting. The live expired gate remains busy and can defer an image roll; existing drain/shutdown policy is unchanged.
 
 ## [0.86.0] - 2026-10-06
 

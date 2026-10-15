@@ -115,9 +115,9 @@ plan the owner answered.
    discard lane, never APPLIED.
 2. **A verdict's receipt never precedes its durable effect.** Revise: after the revised plan
    persists. Reject: in the same statement as the failed transition. Approve: at the gate
-   that takes it. Persistence and APPLIED are separate transactions for a revise, so an
-   interruption between them can repeat a revision. Delivery is at-least-once, never
-   exactly-once.
+   that takes it. Outside the negotiated #3001 publication contract below, persistence
+   and APPLIED are separate transactions for a revise, so an interruption between them
+   can repeat a revision. Delivery remains at-least-once, without an exactly-once guarantee.
 3. **Every reader of "approved" must exclude disposition `superseded`.** Today those readers
    are `human_plan_approved` in `GetRunClaimContext` and the approve clause of
    `SetRunRunning`. A new query that treats an applied `approve_plan` as approval without that
@@ -151,8 +151,23 @@ under the publication lock. A successfully persisted revised plan and its
 successful revise receipt commit in one transaction. The earlier two-transaction
 receipt behavior remains for reports without this negotiated contract.
 
-When a live revision exhausts its automatic retries, an ordinary replacement
-revise is a new human round and consumes `PLAN_MAX_REVISIONS` normally. Keep
+After bounded inner retries, typed provider-origin turn exhaustion permits
+three automatic failed-turn re-drives per accepted human revision per live
+flight, shared across clarification and continuation stages. Delays are
+5/10/20 seconds plus 0–20% jitter, capped at 30 seconds. Missing source evidence
+retains the existing compatibility fallback.
+
+On exhaustion, keep feedback I pending and restore the original plan, gate
+revision R and presentation without a new plan frame or receipt settlement.
+The live poller, snapshot entry and busy slot remain. Sticky cancel wins
+first; rejection bound to R remains available even at the human revision cap.
+Approval and follow-up cannot resume this expired wait. A capped run refuses
+further revise; the owner must cancel/reject, then dispatch a new run for
+further changes. A busy expired gate can defer an image roll; existing
+drain/shutdown policy is unchanged.
+
+An ordinary replacement revise J is a new human round, gets a new live-flight
+allowance and consumes `PLAN_MAX_REVISIONS` normally. Keep
 the earlier input pending while the replacement runs. If the replacement's plan
 persists, that same transaction records earlier inputs as `superseded` and the
 replacement as successfully applied. Supersession does not assert that the
@@ -166,16 +181,19 @@ The approval-only discarded-input endpoint is unchanged.
 
 Automatic retry allowance, expiry and predecessor tracking remain in the live
 flight's memory. Reclaim does not reconstruct them: Claude retains its existing
-resume-at-gate replay; Codex retains fresh-plan and re-send notices. An earlier
-pending input may replay before its former replacement, or that replacement may
+FIFO replay of unapplied inputs on resume; Codex retains fresh-plan and re-send
+notices. An earlier pending input may replay before its former replacement, or that replacement may
 become stale after the gate changes. A stale/ignored receipt records disposal,
 not evidence that the feedback produced a persisted plan. Do not infer successful
 publication from a generic APPLIED receipt.
 
 Each reclaimed flight may receive a fresh provider retry allowance. The initial
-claim, existing redispatch paths and owner-resumed recovery episodes mean this
-is not a lifetime retry bound. No new durable retry accounting, reclaim protocol,
-Codex APPLIED suppression or source cleanup authority is introduced.
+claim, existing episode/credential/transient redispatch paths and owner-resumed
+recovery episodes mean this is not an unconditional lifetime retry bound or an
+ordering guarantee. No new durable allowance, pending-chain reconstruction,
+command, setting, status or migration is introduced. Deploy the API before
+workers; missing negotiation keeps compatibility behavior, without a mixed-version
+repair guarantee. Codex APPLIED suppression and source cleanup authority are unchanged.
 
 ## Consequences and residuals
 
