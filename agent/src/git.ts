@@ -8696,8 +8696,8 @@ export class GitCache {
    * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
    * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
    * there would lose the work outright. This scan guards the frequent mid-run stream only, plus
-   * the ONE scanned exception: a failed run's held publication (issue #2545), which uploads
-   * work the worker would otherwise archive, so an untrusted result there simply archives instead.
+   * the ONE scanned exception: an eligible terminal run's held publication (issues #2545/#3030), which uploads
+   * work the worker would otherwise archive, so an untrusted result there uses a qualifying archive or keeps custody protected.
    *
    * Same instrument discipline as the finalize {@link secretScanRange}: gitleaks' embedded default
    * ruleset via an explicit config, the three silencers disabled (`--ignore-gitleaks-allow`, the

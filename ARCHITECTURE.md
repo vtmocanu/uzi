@@ -1497,7 +1497,23 @@ chain in the diagram above, with no intervening `running`.
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
   count slot freed). See the [ADR-2417 amendment](adr/2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625).
-  A `failed` run's held work is instead published to a run-scoped forge ref, `refs/uzi-held/<run-id>/<generation>`, by the API with the owner's stored connection before custody is released, with the archive as fallback (#2545); see [docs/run-recovery.md](docs/run-recovery.md#publishing-a-failed-runs-held-work).
+  Terminal held publication (#2545/#3030) uses the API's stored forge connection
+  to create `refs/uzi-held/<run-id>/<generation>` before exact custody release.
+  Mutually negotiated `recovery_held_publication_v2` widens V1's scope (failed
+  runs at the current generation) to failed/cancelled/completed runs and ended earlier
+  generations on their original live custodian; the run's current worker may
+  differ. Failed/cancelled runs try held first; completed runs without an applicable
+  receipt stay archive-first, with the held alternative limited to thin archives
+  with prerequisites or structured oversize/quota refusal on the same record.
+  A completing receipt covers its generation, not predecessors. Exact-hold reads
+  reconcile closed evidence without replacing FINAL ACK; immutable FINAL replay
+  precedes mutable checks. Cancellation shares one monotonic 600,000 ms attempt
+  budget; expiry retains protection. Create-marker admission serializes with
+  settlement, while already admitted forge mutations may finish later.
+  See [ADR-2545](adr/2545-failed-run-held-publication.md) for enforcement and the
+  accepted terminal late-writer residual, and
+  [terminal held publication](docs/run-recovery.md#publishing-a-failed-runs-held-work)
+  for recovery, retention and visibility limits.
   The planned automatic-settlement programme, its approved policy changes, child issue order and remaining acceptance are recorded in [PRD #2746](prds/2746-automatic-hold-settlement.md). This is a programme record, not a claim that its pending children have shipped.
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free

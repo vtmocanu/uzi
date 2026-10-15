@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Eligible cancelled runs and earlier terminal generations can publish held work to a fetchable forge ref.**
+  Mutually negotiated held-publication V2 extends the existing original-custodian path while preserving V1 compatibility. Failed/cancelled runs try held publication before archive fallback; completed runs without an applicable receipt stay archive-first, allowing the held alternative only for a prerequisite-bearing thin archive or structured oversize/quota refusal on the same frozen record. Exact-generation reconciliation and immutable FINAL replay preserve lost-ACK recovery, and cancellation uses one 10-minute attempt budget before retaining protection. The existing cleanup boundary accepts possible loss from an undetected terminal late writer after immutable capture; no new post-release source retention across hosted teardown is provided. Held refs follow repository visibility and existing retention, and deleting a public ref cannot revoke fetched copies. See [run recovery](docs/run-recovery.md#publishing-a-failed-runs-held-work) (#3030).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

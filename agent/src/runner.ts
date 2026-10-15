@@ -13191,9 +13191,9 @@ export class RunRunner {
    * BY DESIGN the park / shutdown / pause / capture publishes (and every overlay publish) are NOT
    * scanned: permitted candidates reach the forge UNSCANNED, but #1964 holds findings
    * remembered in this flight at the shared pack/publish seam before any producer starts.
-   * The ONE scanned exception is a failed run's held publication (issue #2545,
+   * The ONE scanned exception is an eligible terminal run's held publication (issues #2545/#3030,
    * {@link RunRunner.heldPublicationStep}): it uploads work the worker would otherwise archive, so it
-   * runs a fresh scan of its own range and archives on anything but a trusted, finding-free result.
+   * runs a fresh scan of its own range; an untrusted result needs a qualifying archive or protected custody.
    * (Service.Publish in api/internal/workersvc/service.go) — they are the run's last chance to be
    * durable before the worker stops working on it, and a blocked or slow scan there would lose the
    * work outright. The scan guards the frequent, mid-run checkpoint stream only; a Codex milestone

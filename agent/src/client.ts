@@ -2129,7 +2129,7 @@ export class WorkerClient {
   }
 
   /**
-   * Issue #2545 step A: upload one raw, non-thin pack of a failed run's held work; the api creates
+   * Issue #2545 step A: upload one raw, non-thin pack of an eligible terminal run's held work; the api creates
    * `refs/uzi-held/<run-id>/<generation>` at `tip` with the stored credential (the worker never
    * sends one). Modeled on {@link publishCheckpoint}: the pack is the `application/octet-stream`
    * body, the tip, generation and coverage digest ride the `X-Uzi-Held-*` headers.
