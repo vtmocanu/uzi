@@ -37,6 +37,12 @@ const (
 // interlocked run through any of those bypass paths.
 const CompletionInterlockV1 = "completion_interlock_v1"
 
+// MilestoneReconciliationClaimV1 identifies workers that stamp the captured claim
+// generation on checkpoint, input and memory requests. It fences reconciled-run
+// placement independently of the older CredentialSwitchV1 capability and of the
+// API feature milestone_reconciliation_v1, which enables gate witness publication.
+const MilestoneReconciliationClaimV1 = "milestone_reconciliation_claim_v1"
+
 // RecoveryArchiveV1 is the PROTOCOL capability a worker self-reports (PRD #1296 M1, D9)
 // to declare it implements the durable-recovery archive path (pin H, reserve/bind/upload
 // a capture, retry custody). Like CompletionInterlockV1 it is a worker/server protocol
@@ -264,6 +270,7 @@ var protocolVocabulary = map[string]struct{}{
 	CodexCustomModelV1:             {},
 	CodexCompletionInterlockV1:     {},
 	CredentialSwitchV1:             {},
+	MilestoneReconciliationClaimV1: {},
 	WallParkV1:                     {},
 	ParkRunV1:                      {},
 	InputReceiptsV1:                {},
@@ -285,7 +292,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1, CIConfigGuardV1}
+var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, MilestoneReconciliationClaimV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1, CIConfigGuardV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

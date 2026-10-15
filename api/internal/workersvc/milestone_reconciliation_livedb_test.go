@@ -20,7 +20,7 @@ const reconciliationNewList = `[{"id":"M1","title":"Replacement one"},{"id":"M2"
 func seedMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gateFix, uuid.UUID) {
 	t.Helper()
 	f := newGateFix(t, 8)
-	f.wkr.ProtocolCapabilities = append(f.wkr.ProtocolCapabilities, capability.CompletionInterlockV1, capability.CredentialSwitchV1)
+	f.wkr.ProtocolCapabilities = append(f.wkr.ProtocolCapabilities, capability.CompletionInterlockV1, capability.CredentialSwitchV1, capability.MilestoneReconciliationClaimV1)
 	f.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.wkr.ID, f.wkr.ProtocolCapabilities)
 	f.svc.SetBackground(func(func()) {})
 	f.svc.SetRetentionLockPool(f.pool)

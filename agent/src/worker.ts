@@ -731,13 +731,16 @@ export class Worker {
           "recovery_completed_publication_v1",
           "recovery_held_publication_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
-          // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
+          // protocol: it stamps claim_generation on state reports (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised
           // UNCONDITIONALLY (like completion_interlock_v1): the server then REQUIRES claim_generation
-          // on every mutating report for this worker's fenced claims, which W2a already stamps, so it
+          // on state reports for this worker's fenced claims, which W2a already stamps, so it
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
+          // #2944: checkpoint, input and memory requests carry the captured claim
+          // generation. Distinct from the API feature milestone_reconciliation_v1.
+          "milestone_reconciliation_claim_v1",
           // M2: this image reconciles unknown Codex refresh outcomes before recovery capture.
           "codex_refresh_recovery_v1",
           "codex_account_park_v1",

@@ -348,9 +348,11 @@ A few worth knowing:
   advertises `milestone_reconciliation_v1`; upgraded workers attempt the gate
   checkpoint when that feature is advertised and the milestone list changes.
   An older worker cannot supply the required witness. After reset, claiming
-  requires the existing worker protocol capability `credential_switch_v1`
-  for generation fencing, even with capability scheduling disabled or an
-  owner capability override; a completion contract also requires
+  requires the worker protocol capability `milestone_reconciliation_claim_v1`
+  for generation-stamped checkpoint, input and memory requests. This worker
+  capability is distinct from the API feature above; older workers advertising
+  only `credential_switch_v1` cannot claim reset runs, even with capability
+  scheduling disabled or an owner capability override; a completion contract also requires
   `completion_interlock_v1`.
 
   `run get` returns a bounded reset-history page. Follow the

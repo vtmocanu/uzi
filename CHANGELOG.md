@@ -36,7 +36,7 @@ through `[0.52.0]`.)
   Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
 
 - **Approving a changed milestone plan requires explicit owner consent to reset progress.**
-  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; deploy the API before upgraded workers (see the CLI guide).
+  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
 
 
 ## [0.86.0] - 2026-10-06

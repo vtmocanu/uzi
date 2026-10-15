@@ -1046,10 +1046,11 @@ WITH claimant AS MATERIALIZED (
       -- ordinary required-capability match, but NONE of them may authorize a worker that does
       -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
       -- stored workers.protocol_capabilities column, passed by the Go caller.
-      -- Reconciled runs require generation-stamped reports even when ordinary capability
-      -- scheduling is disabled or the owner clears required_capabilities.
+      -- Reconciled runs require generation-stamped checkpoint, input and memory requests.
+      -- credential_switch_v1 predates those fields and is insufficient. This fence applies
+      -- even when capability scheduling is disabled or the owner clears required_capabilities.
       AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-           OR 'credential_switch_v1' = ANY($15::text[]))
+           OR 'milestone_reconciliation_claim_v1' = ANY($15::text[]))
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY($15::text[]))
       -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1312,7 +1313,7 @@ WITH claimant AS MATERIALIZED (
                 -- peer's OWN workers.protocol_capabilities column directly (no Go param, unlike
                 -- the claimant's @worker_protocol_caps above).
                 AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                     OR 'credential_switch_v1' = ANY(p.protocol_capabilities))
+                     OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -2319,7 +2320,7 @@ WHERE run.id = $9
         run.required_capabilities,
         $10::boolean)
   AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = run.id)
-       OR 'credential_switch_v1' = ANY(w.protocol_capabilities))
+       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10648,7 +10649,7 @@ WHERE r.status = 'queued'
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'credential_switch_v1' = ANY(w.protocol_capabilities))
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10719,7 +10720,7 @@ WHERE r.status = 'queued'
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'credential_switch_v1' = ANY(w.protocol_capabilities))
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10990,7 +10991,7 @@ WHERE r.status = 'queued'
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
-                      OR 'credential_switch_v1' = ANY(w.protocol_capabilities))
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
