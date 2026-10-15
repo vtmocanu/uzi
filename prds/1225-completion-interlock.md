@@ -25,7 +25,7 @@ The final product rejects an incomplete completion attempt without failing the r
 | 1 | [#1226 Structural completion interlock and exact-head permit](done/1226-structural-completion-interlock.md) | Frozen structural contract, hard claim clause, same-lead rework, permit and recoverable same-worker hold | none |
 | 2 | [#1227 Owner completion decisions and scope-reduced delivery](done/1227-completion-owner-decisions.md) | Continue/partial/accept authority, real contract revisions and truthful closing behavior | #1226 |
 | 3 | [#1228 Shared encrypted provider-context generations](1228-shared-context-generations.md) | One dark storage/codec primitive for run holds and #1214 PR sessions | #1227 by queue policy; no technical dependency |
-| 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | #1226 + #1228 |
+| 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | Not planned (closed 2026-10-15, #2746) |
 | 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Source-backed criteria, independent plan coverage and autopilot fallback | #1226 |
 | 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Exact-head full audit (tool-less, two-pass cap, fixed token/wall budget), captured gate evidence, semantic permit, per-repo semantic opt-in and bounded recovery | #1226 + #1230 |
 | 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
@@ -61,7 +61,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 - [x] #1226 merged: a 4/5 completion cannot open a closing PR; same-lead structural rework and safe hold exist.
 - [x] #1227 merged: only the owner/admin can continue, reduce exact scope or accept exact criteria with a reason.
 - [ ] #1228 merged: one encrypted, bounded provider-context primitive exists for both consumer lifecycles.
-- [ ] #1229 merged: completion holds preserve Git and supported provider context across worker replacement.
+- #1229 not planned (closed 2026-10-15, #2746): completion holds preserve Git; provider context stays `same_worker_only`.
 - [ ] #1230 merged: the per-repo semantic setting has default-off storage and a read seam with no write path or runtime effect, and the dormant compiler/reviewer produce independently reviewed source-backed semantic contracts under test.
 - [ ] #1231 merged: on repos with the semantic setting on, a bounded full exact-head audit gates completion on capable workers.
 - [ ] #1233 merged: structured blocker policy gates completion and governed automatic/manual MR rework.
