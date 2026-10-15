@@ -9,7 +9,7 @@ import { client, homeDir } from "./runner-harness.js";
 import { nullLogger } from "./helpers.js";
 
 export type Frame = { plan: string } | { ask: true } | { failure: true };
-export interface Start { prompt: string; resume?: string }
+export interface Start { prompt: string; resume?: string; threadId?: string }
 export function providerFixture(harness: "claude" | "codex", script: (n: number) => Frame, sessionless = false) {
   const starts: Start[] = [];
   const credential = { auth_mode: "api_key" as const, access_token: "fixture-key", capability: "fixture-cap" };
@@ -77,13 +77,13 @@ class RevisionTransport implements CodexTransport {
     else this.queue.push(value);
   }
   request<T>(method: string, params?: unknown): Promise<T> {
-    const p = params as { type?: string; input?: { text?: string }[] };
+    const p = params as { type?: string; threadId?: string; input?: { text?: string }[] };
     let result: unknown = {};
     if (method === "initialize") result = { userAgent: "codex/0.153.2", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
     if (method === "account/login/start") result = { type: p.type };
     if (method === "thread/start" || method === "thread/resume") result = { thread: { id: "th-revision" } };
     if (method === "turn/start") {
-      this.starts.push({ prompt: p.input?.[0]?.text ?? "" });
+      this.starts.push({ prompt: p.input?.[0]?.text ?? "", threadId: p.threadId });
       const n = this.starts.length;
       if (n === 1) this.push({ kind: "thread_started", method: "thread/started", threadId: "th-revision", params: { thread: { id: "th-revision" } } });
       const f = this.frame();
