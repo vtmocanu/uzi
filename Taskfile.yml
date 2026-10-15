@@ -2565,6 +2565,16 @@ tasks:
       - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
+  test:stale-worker-cancel-e2e:
+    desc: Real worker reconnect cancellation and retained source proof against authenticated Go routes and PostgreSQL
+    cmds:
+      - task: deps-check:agent
+      - |
+        command -v node >/dev/null || { echo "Node 24 or newer is required" >&2; exit 1; }
+        node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        mkdir -p .uzi/scratch
+        UZI_STALE_WORKER_CANCEL_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+
   test:codex-refresh-lostreply-e2e:
     desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:
