@@ -36,7 +36,7 @@ func (s *Service) OpenJobInputFile(ctx context.Context, wkr store.Worker, runID,
 		}
 		return store.JobFile{}, nil, err
 	}
-	if run.Kind != runkind.Job && !(run.Kind == "prompt" && run.CiConfigGuard) {
+	if run.Kind != runkind.Job && (run.Kind != "prompt" || !run.CiConfigGuard) {
 		return store.JobFile{}, nil, ErrNotJobRun
 	}
 	if run.ClaimGeneration != claimGeneration || run.ClaimReleasedAt.Valid {

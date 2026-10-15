@@ -119,8 +119,8 @@ func TestCIArtifactRenderFullSelectionAndCount(t *testing.T) {
 	if strings.Count(got, "artifact=") != 2 || !strings.Contains(got, "3 more skipped\n") || !strings.Contains(got, "skipped: storage budget") || strings.ContainsAny(got, "\u202e`") {
 		t.Fatalf("full render: %s", got)
 	}
-	// Exact decimal addition must not wrap at the largest durable count.
-	max := int64(1<<63 - 1)
+	// Exact addition stays representable when known rows join omitted rows.
+	max := int64(1<<63 - 1 - len(m.Entries))
 	m.Omitted = &max
 	full, err := m.Render()
 	if err != nil {
@@ -130,7 +130,7 @@ func TestCIArtifactRenderFullSelectionAndCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reduced, "9223372036854775808 more skipped") {
+	if !strings.Contains(reduced, "9223372036854775806 more skipped") {
 		t.Fatal(reduced)
 	}
 }

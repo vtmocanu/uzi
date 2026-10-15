@@ -166,9 +166,10 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 				if err != nil {
 					return err
 				}
-				if err := q.InsertJobFileChunk(ctx, store.InsertJobFileChunkParams{FileID: f.ID, ChunkIndex: chunks, Length: int32(len(plain)), Sealed: sealed}); err != nil {
+				length := int32(len(plain)) //nolint:gosec // plain is at most JobFileChunkSize (1 MiB).
+				if err := q.InsertJobFileChunk(ctx, store.InsertJobFileChunkParams{FileID: f.ID, ChunkIndex: chunks, Length: length, Sealed: sealed}); err != nil {
 					return err
-				} //nolint:gosec // bounded by JobFileChunkSize
+				}
 				chunks++
 			}
 			if _, err := q.FinalizeJobFile(ctx, store.FinalizeJobFileParams{ID: f.ID, State: JobFileAttached, ByteSize: e.Size, Sha256: pgconv.Text(e.SHA256), StorageName: pgconv.Text(e.Name), ContentType: pgconv.Text("text/plain"), ChunkCount: chunks}); err != nil {
