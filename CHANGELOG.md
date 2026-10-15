@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
+
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
   Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
 

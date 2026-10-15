@@ -29,7 +29,7 @@
 // a direct client.reportState in the judge/review lanes and at M4 boot), so the same primitive
 // serves every terminal producer without importing the runner.
 
-import { RequestError, type WorkerClient } from "./client.js";
+import { isStrict404Body, RequestError, type WorkerClient } from "./client.js";
 import { WORKER_API_PREFIX } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
@@ -48,17 +48,9 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "
  *  another run's path, another method, another status) is not this answer and keeps today's
  *  retry behaviour. */
 function isRunNotOwnedStateRefusal(err: unknown, runId: string): boolean {
-  if (!(err instanceof RequestError) || err.method !== "POST" || err.status !== 404 ||
-      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/state` || err.body.length > 1024 ||
-      err.bodyEvidence?.complete !== true || err.bodyEvidence.bytes > 1024) return false;
-  try {
-    const body: unknown = JSON.parse(err.body);
-    if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
-    const keys = Object.keys(body).sort();
-    const rec = body as Record<string, unknown>;
-    return keys.length === 2 && keys[0] === "error" && keys[1] === "reason" &&
-      rec.reason === "run_not_owned" && rec.error === "run not found for this worker";
-  } catch { return false; }
+  return err instanceof RequestError && err.method === "POST" &&
+    err.path === `${WORKER_API_PREFIX}/runs/${runId}/state` &&
+    isStrict404Body(err, { error: "run not found for this worker", reason: "run_not_owned" });
 }
 
 /** Block the journal on the not-owned answer and log once. Never retires or deletes it. */
