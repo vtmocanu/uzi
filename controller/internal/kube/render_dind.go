@@ -203,8 +203,8 @@ fallback() {
 [ -d "$1" ] || fallback "network interface directory unavailable: $1"
 min=
 # One startup snapshot, one read per interface; validate all before applying the cap.
-for iface in "$1"/*; do
-    [ "$iface" != "$1/*" ] || [ -e "$iface" ] || [ -L "$iface" ] || continue
+for iface in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -e "$iface" ] || [ -L "$iface" ] || continue
     [ "${iface##*/}" != lo ] || continue
     file="$iface/mtu"
     # The sentinel preserves trailing newlines through command substitution.

@@ -183,6 +183,8 @@ func TestNonRootlessDindMTU(t *testing.T) {
 		{"jumbo", []dindMTUInterface{{"ens5", "9000\n"}}, "1500"},
 		{"minimum-first", []dindMTUInterface{{"a", "1400\n"}, {"z", "9000\n"}}, "1400"},
 		{"minimum-last", []dindMTUInterface{{"a", "9000\n"}, {"z", "1400\n"}}, "1400"},
+		{"dot-minimum", []dindMTUInterface{{"ens5", "1500\n"}, {".low", "1400\n"}}, "1400"},
+		{"double-dot-minimum", []dindMTUInterface{{"ens5", "1500\n"}, {"..low", "1400\n"}}, "1400"},
 		{"bounds-minimum-first", []dindMTUInterface{{"a", "1\n"}, {"z", "65535\n"}}, "1"},
 		{"bounds-minimum-last", []dindMTUInterface{{"a", "65535\n"}, {"z", "1\n"}}, "1"},
 		{"loopback-excluded", []dindMTUInterface{{"lo", "invalid\n"}, {"net1", "1500\n"}}, "1500"},
@@ -267,6 +269,9 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 		{"only-loopback", ""},
 		{"missing-net-directory", ""},
 		{"invalid-before-valid", "abc\n"},
+		{"dot-invalid", "abc\n"},
+		{"double-dot-invalid", "abc\n"},
+		{"dot-dangling-symlink", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var interfaces []dindMTUInterface
@@ -274,6 +279,12 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 			case "no-interfaces", "missing-net-directory":
 			case "invalid-before-valid":
 				interfaces = []dindMTUInterface{{"a-broken", tt.value}, {"z-valid", "1400\n"}}
+			case "dot-invalid":
+				interfaces = []dindMTUInterface{{"ens5", "1500\n"}, {".low", tt.value}}
+			case "double-dot-invalid":
+				interfaces = []dindMTUInterface{{"ens5", "1500\n"}, {"..low", tt.value}}
+			case "dot-dangling-symlink":
+				interfaces = []dindMTUInterface{{"ens5", "1500\n"}}
 			case "only-loopback":
 				interfaces = []dindMTUInterface{{"lo", "65536\n"}}
 			default:
@@ -283,6 +294,15 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 			netDir := dindMTUFixture(t, interfaces)
 			mtuPath := filepath.Join(netDir, "z-broken", "mtu")
 			switch tt.name {
+			case "dot-invalid", "dot-dangling-symlink":
+				mtuPath = filepath.Join(netDir, ".low", "mtu")
+				if tt.name == "dot-dangling-symlink" {
+					if err := os.Symlink("absent", filepath.Join(netDir, ".low")); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "double-dot-invalid":
+				mtuPath = filepath.Join(netDir, "..low", "mtu")
 			case "missing-mtu", "unreadable-mtu-directory":
 				if err := os.Remove(mtuPath); err != nil {
 					t.Fatal(err)
@@ -313,7 +333,7 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 				reason = "invalid MTU (expected decimal 1..65535): " + filepath.Join(netDir, "a-broken", "mtu")
 			case "above-bound", "oversized":
 				reason = "MTU exceeds 65535: " + mtuPath
-			case "missing-mtu", "unreadable-mtu-directory":
+			case "missing-mtu", "unreadable-mtu-directory", "dot-dangling-symlink":
 				reason = "cannot read MTU: " + mtuPath
 			case "no-interfaces", "only-loopback":
 				reason = "no non-loopback interface MTU in " + netDir
