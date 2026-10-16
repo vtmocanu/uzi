@@ -406,6 +406,12 @@ if [ "$OP" != "nextrc" ] && [ -n "$S" ] && [ "$(ver_cmp "$VERSION" "${S#v}")" !=
   echo "release-cut: $VERSION must be above the highest stable tag $S." >&2; exit 3
 fi
 
+# Later-RC and skip-promote routes fold legacy notes rather than applying a draft.
+# Keep their consuming reader strict even when a --changelog-file was supplied.
+if [ -n "$CL_FILE" ] && { [ "$OP" = nextrc ] || [ "$OP" = skiprc ]; }; then
+  if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+fi
+
 # --- resolve TAG / chart version / base / prev --------------------------------
 case "$OP" in
   rc1|skiprc|promote) TAG="v$VERSION-rc.1"; CHARTVER="$VERSION-rc.1"; BASE="$VERSION" ;;

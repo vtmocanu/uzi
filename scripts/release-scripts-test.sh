@@ -685,6 +685,7 @@ fold_order_regressions() {
       version=0.2.0; base=0.2.0
       if [ "$mode" = skip ]; then version=0.3.0; base=0.3.0; fi
       if [ "$mode" = skip ]; then run_rc "$d" "$version" --skip-promote; else run_rc "$d" "$version"; fi
+      if [ "$RC_RC" -ne 0 ]; then printf '%s\n' "$RC_OUT"; fi
       assert_eq "$mode $inventory ordered cut succeeds" 0 "$RC_RC"
       section="$(awk -v base="$base" 'index($0, "## [" base "]")==1{s=1;next} s&&/^## \[/{exit} s' "$d/CHANGELOG.md")"
       expected=$'### Changed\n### Added\n### Fixed'
@@ -2514,6 +2515,33 @@ for mode in promote-only draft ordinary draft-fragment; do
         if cmp -s "$MF/.git/before-fragment" "$MF/$fragment_path"; then pass "$mode fragment bytes exact"; else fail "$mode fragment bytes exact"; fi
       fi ;;
   esac
+  rm -rf "$MF" "$MF.origin.git"
+done
+
+# A draft flag does not bypass grammar on routes that still consume legacy notes.
+for route in nextrc skiprc; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; published_rc "$MF"; add_feature "$MF" 202
+  awk '
+    { print }
+    /^## \[Unreleased\]$/ {
+      print "### Added"; print "- **Feature 202 (#202).**"; print "  Description."
+      print ""; print "Orphan prose after a completed bullet"
+    }
+  ' "$MF/CHANGELOG.md" > "$MF/.git/notes"
+  put_changelog "$MF" < "$MF/.git/notes"
+  start="$(git -C "$MF" rev-parse HEAD)"; index="$(git -C "$MF" write-tree)"
+  tags="$(git -C "$MF" show-ref --tags)"; cp "$MF/CHANGELOG.md" "$MF/.git/before-notes"
+  printf '## [0.3.0]\n### Added\n- Draft (#202)\n' > "$MF/.git/draft"
+  version=0.2.0; args=(--changelog-file "$MF/.git/draft")
+  if [ "$route" = skiprc ]; then version=0.3.0; args+=(--skip-promote); fi
+  run_rc "$MF" "$version" "${args[@]}"
+  assert_eq "$route draft legacy consumer refuses" 3 "$RC_RC"
+  assert_contains "$route draft legacy consumer grammar" 'unknown or misplaced legacy content' "$RC_OUT"
+  assert_eq "$route draft refusal HEAD unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
+  assert_eq "$route draft refusal index unchanged" "$index" "$(git -C "$MF" write-tree)"
+  assert_eq "$route draft refusal tree unchanged" '' "$(git -C "$MF" diff HEAD --binary)"
+  assert_eq "$route draft refusal tags unchanged" "$tags" "$(git -C "$MF" show-ref --tags)"
+  if cmp -s "$MF/.git/before-notes" "$MF/CHANGELOG.md"; then pass "$route draft refusal bytes exact"; else fail "$route draft refusal bytes exact"; fi
   rm -rf "$MF" "$MF.origin.git"
 done
 
