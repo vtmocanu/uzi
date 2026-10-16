@@ -50,6 +50,9 @@ shipped blocks; amendments use new fragments. The existing
 Promotion-only promotes the candidate's own commit, leaving main's pending
 fragments for the next cut. `--changelog-file` refuses pending fragments before
 mutation, avoiding silent replacement of fragment notes by a manual draft.
+Explicit promotion-only and fragment-free drafts bypass main's legacy category/bullet
+grammar because they do not incorporate that body. Fragment inventory, byte limits,
+control-byte and section checks remain in force.
 The [RC train](1265-rc-release-train.md) remains the release state machine.
 
 This preservation boundary belongs to pending assembly. The surrounding release

@@ -85,7 +85,9 @@ the release section, and deletes exactly the incorporated paths in the same
 release commit. Later RCs append new blocks while shipped blocks remain frozen;
 use a new fragment for amendments. Promotion-only promotes the candidate's own
 commit, leaving main's pending fragments for the next cut.
-`--changelog-file` refuses pending fragments before mutation.
+`--changelog-file` refuses pending fragments before mutation. Explicit promotion-only
+and fragment-free drafts do not require main's legacy category/bullet grammar;
+inventory, byte limits, control-byte and section checks still apply.
 
 Preflight failures preserve inputs. Preparation failure or interruption can
 leave assembled notes and fragment deletions staged, or a completed local commit.

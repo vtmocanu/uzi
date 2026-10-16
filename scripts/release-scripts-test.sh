@@ -30,6 +30,7 @@
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 # --fold-order-only runs canonical pending/open-RC ordering fixtures.
+# --fragments-only runs pending fragment consumption and preflight regressions.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -440,7 +441,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ] && [ "${1:-}" != "--fragments-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -637,6 +638,16 @@ add_origin() {
 }
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
 
+feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
+
+published_rc() {
+  seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
+  feature_201_changelog "$1"
+  run_rc "$1" 0.2.0
+  assert_eq "listing fixture initial RC succeeds" 0 "$RC_RC"
+  git -C "$1" tag v0.2.0-rc.1
+  push_tag_to_origin "$1" v0.2.0-rc.1
+}
 # Real cuts preserve published blocks while grouping newly pending categories.
 fold_order_regressions() {
   local d mode inventory version base before oldblock oldaddition section expected
@@ -694,6 +705,7 @@ fold_order_regressions() {
     done
   done
 }
+if [ "${1:-}" != "--fragments-only" ]; then
 if [ "$#" -eq 0 ] || [ "${1:-}" = "--fold-order-only" ]; then fold_order_regressions; fi
 if [ "${1:-}" = "--fold-order-only" ]; then
   printf '=== fold ordering: %s passed, %s failed ===\n' "$PASSES" "$FAILS"
@@ -1947,7 +1959,6 @@ add_dep() {
 }
 dep_bullets() { grep -c '^- \*\*Routine dependency updates' "$1/CHANGELOG.md" || true; }
 dep_bullet()  { grep '^- \*\*Routine dependency updates' "$1/CHANGELOG.md" || true; }
-feature_201_changelog() { printf '# Changelog\n\n## [Unreleased]\n### Added\n- **Feature 201** (#201)\n\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' | put_changelog "$1"; }
 
 # A Renovate-style go.mod bump alongside an entry-carrying feature: cited automatically.
 SDA="$(mktemp -d)"; seed_repo "$SDA"; add_feature "$SDA" 201
@@ -2120,14 +2131,6 @@ unusual_feature() {
   printf 'package main\n' > "$d/$path"
   git -C "$d" add -- "$path"
   gcommit "$d" 'feat: unusual path (#1468)'
-}
-published_rc() {
-  seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
-  feature_201_changelog "$1"
-  run_rc "$1" 0.2.0
-  assert_eq "listing fixture initial RC succeeds" 0 "$RC_RC"
-  git -C "$1" tag v0.2.0-rc.1
-  push_tag_to_origin "$1" v0.2.0-rc.1
 }
 # Snapshot every tracked file, plus index/worktree status, to prove refusal is inert.
 promote_snapshot() {
@@ -2335,6 +2338,8 @@ export PATH="${PATH#"$LIST_SHIM:"}"
 rm -rf "$LN" "$LN.origin.git" "$LIST_SHIM"
 unset LIST_SHA LIST_MODE LIST_LOG LIST_REAL_GIT
 
+fi # non-fragment fixture slices
+
 echo "=== M2 fragments: consumption, isolation and recovery ==="
 fragment_path=changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
 fragment_second=changelog.d/11234567-89ab-4cde-8fab-0123456789ab.md
@@ -2385,19 +2390,22 @@ for mode in rc stable no-commit commit-failure oracle-failure; do
       assert_eq "$mode deletion committed" D "$(git -C "$MF" diff HEAD~1 HEAD --name-status -- "$fragment_path" | awk '{print $1}')"
       if [ "$mode" = rc ]; then
         repeat_start="$(git -C "$MF" rev-parse HEAD)"
-        repeat_notes="$(awk 'NF' "$MF/CHANGELOG.md")"
+        cp "$MF/CHANGELOG.md" "$MF/.git/repeat-notes"
+        repeat_index="$(git -C "$MF" write-tree)"
+        repeat_tree="$(git -C "$MF" diff HEAD --binary)"
+        repeat_tags="$(git -C "$MF" show-ref --tags)"
         awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p{print}' "$MF/CHANGELOG.md" > "$MF/.git/history-before"
         run_rc "$MF" 0.2.0
         assert_eq "repeat first RC before tagging refuses empty pending" 3 "$RC_RC"
         assert_eq "repeat before tag retains HEAD" "$repeat_start" "$(git -C "$MF" rev-parse HEAD)"
-        assert_eq "repeat before tag retains nonblank note lines" "$repeat_notes" "$(awk 'NF' "$MF/CHANGELOG.md")"
+        if cmp -s "$MF/.git/repeat-notes" "$MF/CHANGELOG.md"; then pass "repeat before tag retains complete CHANGELOG bytes"; else fail "repeat before tag retains complete CHANGELOG bytes"; fi
+        assert_eq "repeat before tag retains index" "$repeat_index" "$(git -C "$MF" write-tree)"
+        assert_eq "repeat before tag retains worktree" "$repeat_tree" "$(git -C "$MF" diff HEAD --binary)"
+        assert_eq "repeat before tag retains tags" "$repeat_tags" "$(git -C "$MF" show-ref --tags)"
         awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p{print}' "$MF/CHANGELOG.md" > "$MF/.git/history-after"
         if cmp -s "$MF/.git/history-before" "$MF/.git/history-after"; then pass 'repeat historical bytes including blanks'; else fail 'repeat historical bytes including blanks'; fi
         assert_eq "repeat before tag never replays consumed fragment" 1 "$(fragment_count "$MF" 201)"
         assert_eq "repeat before tag fragment stays absent" no "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
-        # Precommit preparation may normalize blank lines; restore only this repeat's
-        # metadata from its current start, never resurrect the consumed fragment.
-        git -C "$MF" restore --source="$repeat_start" --staged --worktree -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh
         git -C "$MF" tag v0.2.0-rc.1
         run_rc "$MF" 0.2.0
         assert_eq "empty RC respin succeeds" 0 "$RC_RC"
@@ -2435,6 +2443,122 @@ for mode in rc stable no-commit commit-failure oracle-failure; do
   esac
   rm -rf "$MF"
 done
+
+# Empty first cuts and shipping promotion refuse before changing any tracked bytes.
+# Four bounded independent cases; an assertion failure does not stop siblings.
+for mode in rc stable promote promote-dependency; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"
+  args=(); version=0.2.0
+  case "$mode" in
+    rc|stable) seed_repo "$MF"; [ "$mode" != stable ] || args=(--stable) ;;
+    promote*)
+      published_rc "$MF"; version=0.3.0; args=(--promote)
+      if [ "$mode" = promote-dependency ]; then
+        printf 'module example\n' > "$MF/api/go.mod"
+        git -C "$MF" add -- api/go.mod; gcommit "$MF" 'chore(deps): bump (#202)'
+      else add_feature "$MF" 202; fi ;;
+  esac
+  start="$(git -C "$MF" rev-parse HEAD)"
+  index="$(git -C "$MF" write-tree)"; tags="$(git -C "$MF" show-ref --tags)"
+  cp "$MF/CHANGELOG.md" "$MF/.git/before-notes"
+  run_rc "$MF" "$version" "${args[@]}"
+  assert_eq "$mode empty preflight refuses" 3 "$RC_RC"
+  assert_contains "$mode empty refusal reason" 'empty and no --changelog-file given' "$RC_OUT"
+  assert_eq "$mode empty HEAD retained" "$start" "$(git -C "$MF" rev-parse HEAD)"
+  assert_eq "$mode empty index retained" "$index" "$(git -C "$MF" write-tree)"
+  assert_eq "$mode empty tree retained" '' "$(git -C "$MF" diff HEAD --binary)"
+  assert_eq "$mode empty tags retained" "$tags" "$(git -C "$MF" show-ref --tags)"
+  if cmp -s "$MF/.git/before-notes" "$MF/CHANGELOG.md"; then pass "$mode empty complete notes retained"; else fail "$mode empty complete notes retained"; fi
+  rm -rf "$MF" "$MF.origin.git"
+done
+
+# Only explicit promotion and fragment-free manual replacement bypass legacy grammar.
+for mode in promote-only draft ordinary draft-fragment; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"
+  if [ "$mode" = promote-only ]; then published_rc "$MF"; add_feature "$MF" 202
+  else seed_repo "$MF"; add_feature "$MF" 201; fi
+  # Orphan prose is invalid pending grammar; released candidate notes remain valid.
+  awk '/^## \[Unreleased\]$/ {print; print "Malformed orphan legacy prose"; next} {print}' "$MF/CHANGELOG.md" > "$MF/.git/notes"
+  put_changelog "$MF" < "$MF/.git/notes"
+  if [ "$mode" = promote-only ] || [ "$mode" = draft-fragment ]; then commit_fragment "$MF" 202; fi
+  start="$(git -C "$MF" rev-parse HEAD)"; index="$(git -C "$MF" write-tree)"
+  tags="$(git -C "$MF" show-ref --tags)"
+  cp "$MF/CHANGELOG.md" "$MF/.git/before-notes"
+  [ ! -f "$MF/$fragment_path" ] || cp "$MF/$fragment_path" "$MF/.git/before-fragment"
+  printf '## [0.2.0]\n\n### Added\n\n- **Draft shipping feature (#201).**\n  Manual replacement description.\n' > "$MF/.git/draft"
+  args=(); case "$mode" in promote-only) args=(--promote-only);; draft*) args=(--changelog-file "$MF/.git/draft");; esac
+  run_rc "$MF" 0.2.0 "${args[@]}"
+  case "$mode" in
+    draft)
+      assert_eq 'malformed legacy draft succeeds with oracle' 0 "$RC_RC"
+      assert_contains 'draft retains shipping identity' '- **Draft shipping feature ([#201](https://github.com/vtmocanu/uzi/pull/201)).**' "$(cat "$MF/CHANGELOG.md")"
+      assert_eq 'draft replacement removes malformed legacy' 0 "$(awk '/Malformed orphan/{n++} END{print n+0}' "$MF/CHANGELOG.md")"
+      assert_eq 'draft committed tree clean' '' "$(git -C "$MF" status --porcelain --untracked-files=no)" ;;
+    *)
+      expected=3; [ "$mode" != promote-only ] || expected=0
+      assert_eq "$mode malformed legacy result" "$expected" "$RC_RC"
+      assert_eq "$mode malformed legacy HEAD preserved" "$start" "$(git -C "$MF" rev-parse HEAD)"
+      assert_eq "$mode malformed legacy index preserved" "$index" "$(git -C "$MF" write-tree)"
+      assert_eq "$mode malformed legacy tree preserved" '' "$(git -C "$MF" diff HEAD --binary)"
+      if cmp -s "$MF/.git/before-notes" "$MF/CHANGELOG.md"; then pass "$mode malformed main notes exact"; else fail "$mode malformed main notes exact"; fi
+      if [ "$mode" = promote-only ]; then
+        assert_eq 'malformed explicit promotion parent is candidate' "$(git -C "$MF" rev-parse 'v0.2.0-rc.1^{commit}')" "$(git -C "$MF" rev-parse -q --verify 'v0.2.0^{commit}^' 2>/dev/null)"
+        assert_eq 'malformed explicit promotion excludes later shipping' '' "$(git -C "$MF" ls-tree v0.2.0 -- api/feature_202.go "$fragment_path" 2>/dev/null)"
+        assert_eq 'malformed explicit promotion uses candidate notes' 0 "$(git -C "$MF" show v0.2.0:CHANGELOG.md 2>/dev/null | awk '/Malformed orphan|Fragment 202/{n++} END{print n+0}')"
+      else
+        assert_eq "$mode malformed tags preserved" "$tags" "$(git -C "$MF" show-ref --tags)"
+        reason='unknown or misplaced legacy content'; [ "$mode" != draft-fragment ] || reason='--changelog-file is refused with pending fragments'
+        assert_contains "$mode malformed refusal reason" "$reason" "$RC_OUT"
+      fi
+      if [ -f "$MF/.git/before-fragment" ]; then
+        if cmp -s "$MF/.git/before-fragment" "$MF/$fragment_path"; then pass "$mode fragment bytes exact"; else fail "$mode fragment bytes exact"; fi
+      fi ;;
+  esac
+  rm -rf "$MF" "$MF.origin.git"
+done
+
+# Grammar bypasses retain bounded input and fragment validation before routing.
+# Each of these finite cases must fail at input validation, not later discovery.
+for route in draft promote-only; do
+  for fault in fragment nul control bidi pending-limit full-limit duplicate; do
+    MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"
+    reason='control byte in input'
+    case "$fault" in
+      fragment)
+        mkdir -p "$MF/changelog.d"; printf 'invalid\n' > "$MF/$fragment_path"
+        git -C "$MF" add -- "$fragment_path"; reason='expected one canonical category' ;;
+      nul|control|bidi)
+        byte='\000'; [ "$fault" != control ] || byte='\001'; [ "$fault" != bidi ] || byte='\342\200\256'
+        { printf '# Changelog\n\n## [Unreleased]\n'; printf '%b\n' "$byte"; } > "$MF/CHANGELOG.md"
+        [ "$fault" != nul ] || reason='NUL byte'
+        [ "$fault" != bidi ] || reason='direction control in input' ;;
+      pending-limit|full-limit)
+        size=4194305; [ "$fault" != full-limit ] || size=16777217
+        { printf '# Changelog\n\n'; [ "$fault" != pending-limit ] || printf '## [Unreleased]\n'; head -c "$size" /dev/zero | tr '\000' x; } > "$MF/CHANGELOG.md"
+        reason='bytes' ;;
+      duplicate) printf '# Changelog\n\n## [Unreleased]\n\n## [Unreleased]\n' > "$MF/CHANGELOG.md"; reason='expected exactly one [Unreleased] section' ;;
+    esac
+    git -C "$MF" add -- CHANGELOG.md; gcommit "$MF" 'docs: unsafe pending input'
+    start="$(git -C "$MF" rev-parse HEAD)"; index="$(git -C "$MF" write-tree)"
+    printf '## [0.2.0]\n### Added\n- Draft (#201)\n' > "$MF/.git/draft"
+    args=(--promote-only); [ "$route" != draft ] || args=(--changelog-file "$MF/.git/draft")
+    run_rc "$MF" 0.2.0 "${args[@]}"
+    assert_eq "$route $fault input refuses" 3 "$RC_RC"
+    assert_contains "$route $fault input diagnostic" "$reason" "$RC_OUT"
+    assert_eq "$route $fault HEAD retained" "$start" "$(git -C "$MF" rev-parse HEAD)"
+    assert_eq "$route $fault index retained" "$index" "$(git -C "$MF" write-tree)"
+    assert_eq "$route $fault tree retained" '' "$(git -C "$MF" diff HEAD --binary)"
+    rm -rf "$MF"
+  done
+done
+
+MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"
+printf 'module example\n' > "$MF/api/go.mod"
+git -C "$MF" add -- api/go.mod; gcommit "$MF" 'chore(deps): bump (#203)'
+run_rc "$MF" 0.2.0
+assert_eq 'empty legacy dependency-only plain cut succeeds' 0 "$RC_RC"
+assert_contains 'empty legacy dependency-only cut autocites' '- **Routine dependency updates ([#203](https://github.com/vtmocanu/uzi/pull/203)).**' "$(cat "$MF/CHANGELOG.md")"
+rm -rf "$MF"
 
 # Refusals preserve HEAD, files, index and tag set, including combined promotion.
 for mode in malformed untracked draft promote-draft; do
@@ -2702,6 +2826,11 @@ PY
   assert_eq "$phase interrupted retry exactly once" 1 "$(fragment_count "$MF" 201)"
   rm -rf "$MF"
 done
+
+if [ "${1:-}" = "--fragments-only" ]; then
+  echo "=== release-scripts-test: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]; exit $?
+fi
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

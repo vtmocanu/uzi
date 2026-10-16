@@ -254,7 +254,43 @@ done <<< "$FRAGMENT_LIST"
 if [ -n "$CL_FILE" ] && [ "${#INCORPORATED[@]}" -gt 0 ]; then
   echo "release-cut: --changelog-file is refused with pending fragments" >&2; exit 3
 fi
-if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+# Explicit promotion-only does not consume main's notes; a fragment-free draft replaces
+# the legacy body. Read that body only for diagnostics, without imposing its grammar.
+# Keep the renderer's bounded snapshot and byte/section checks on these routes.
+raw_pending_body() (
+  export LC_ALL=C
+  # shellcheck source=scripts/lib/changelog-fragments.sh
+  . "$ROOT/scripts/lib/changelog-fragments.sh"
+  [ ! -L CHANGELOG.md ] && [ -f CHANGELOG.md ] || return 1
+  mkdir -p .uzi/scratch || return 1
+  work="$(mktemp -d .uzi/scratch/release-legacy.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  changelog_fragment_snapshot CHANGELOG.md "$work/source" 16777216 || return 1
+  changelog_fragment_no_nul "$work/source" || return 1
+  # list already checks the combined pending byte budget, including fragments.
+  awk '
+    /^## \[Unreleased\]$/ { seen++; active=1; next }
+    /^## \[/ { active=0 }
+    active {
+      if ($0 ~ /\330\234|\342\200[\216\217\252-\256]|\342\201[\246-\251]/) bad="direction control in input"
+      printable=$0; gsub(/\t/, "", printable)
+      if (printable ~ /[[:cntrl:]]/) bad="control byte in input"
+      print
+    }
+    END {
+      if (seen != 1) bad="expected exactly one [Unreleased] section"
+      if (bad != "") {
+        print "release-cut: " bad > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$work/source"
+)
+if [ "$VERB" = --promote-only ] || [ -n "$CL_FILE" ]; then
+  if ! PENDING_BODY="$(raw_pending_body)"; then exit 3; fi
+else
+  if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+fi
 OWNED_PATHS=(CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh "${INCORPORATED[@]}")
 
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
@@ -398,13 +434,6 @@ fold_or_insert() { # writes the [BASE] section into CHANGELOG (fold [Unreleased]
       END{ if(!done){ print "release-cut: no [Unreleased] heading found" > "/dev/stderr"; exit 7 } }
     ' CHANGELOG.md > "$tmp" || { echo "release-cut: CHANGELOG insert failed" >&2; rm -f "$tmp"; exit 3; }
   else
-    local body; body="$(changelog_unreleased_body | tr -d '[:space:]')"
-    # A window whose only shipping merges are dependency bumps has nothing in [Unreleased]
-    # (the per-PR check spared them) but still has something to release: open the section
-    # and let autocite_dependency_merges fill it.
-    if [ -z "$body" ] && [ -z "$DEP_REFS" ]; then
-      echo "release-cut: [Unreleased] is empty and no --changelog-file given — nothing to release" >&2; rm -f "$tmp"; exit 3
-    fi
     awk -v ver="$base" -v d="$TODAY" '
       /^## \[Unreleased\]/ && !done { print "## [Unreleased]"; print ""; print "## [" ver "] - " d; done=1; next }
       { print }
@@ -803,6 +832,7 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
 $SHIPPING_SHAS
 EOF
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
+  [ "${#INCORPORATED[@]}" -eq 0 ] || unrel=fragments
   # A combined promotion must have notes for the next candidate before tagging the stable.
   # Dependency-only shipping work also requires notes here; plain cuts still autocite it.
   if [ "$OP" = promote ] && [ "$merges" -gt 0 ] && [ -z "$unrel" ] && [ -z "$CL_FILE" ]; then
@@ -850,6 +880,16 @@ fi
 if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
   exit 3
 fi
+
+# Refuse empty new-base cuts before publishing the assembled view. Dependency-only
+# plain cuts still open a section for autocitation; promotion has its earlier guard.
+case "$OP" in
+  rc1|stable|promote)
+    if [ -z "$CL_FILE" ] && [ -z "$(changelog_unreleased_body | tr -d '[:space:]')" ] && [ -z "$DEP_REFS" ]; then
+      echo "release-cut: [Unreleased] is empty and no --changelog-file given — nothing to release" >&2
+      exit 3
+    fi ;;
+esac
 
 # --- CHANGELOG (main half) ----------------------------------------------------
 # Every fold reads canonical pending categories. Keep the original writer input for
