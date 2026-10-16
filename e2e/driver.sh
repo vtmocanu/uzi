@@ -13,7 +13,7 @@
 # them): functions  say pass fail db_psql_rows boundary_cancel
 #         globals    ROOT RUNROOT ENVFILE FORGE EXECUTOR  (MARGINS_FILE optional)
 #                    COMPOSE (array; used ONLY by on-red artifact capture, which is
-#                    `|| true` throughout so a missing/short COMPOSE never reddens a run)
+#                    guarded so missing services never replace the phase verdict)
 #
 # KNOBS: PHASES_DIR (default $ROOT/e2e/phases), E2E_ONLY / E2E_SKIP (comma-lists
 #        of slug globs), E2E_FAULT_PHASE.
@@ -108,29 +108,64 @@ _record() {
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$m" >> "$RUNROOT/results.tsv"
 }
 
-# _capture_artifacts NN_SLUG SECS — retain the first body/service capture on
-# failure. Diagnostic operations have a two-second bound and cannot change the
-# recorded status. Missing services before phase 13 are ordinary capture failures.
+# _capture_artifacts NN_SLUG SECS [body|boundary] — first service capture wins.
+# Body diagnostics allow 30 seconds per operation; boundary-only diagnostics
+# allow two. Operations are independent: failure never skips sibling evidence.
+# Exit sidecars and stderr retain incomplete/unavailable diagnostic evidence.
 _capture_artifacts() {
-  local nn_slug="$1" secs="${2:-0}" dir svc since limiter
+  local nn_slug="$1" secs="${2:-0}" context="${3:-body}" dir svc since limiter budget=30 rc query file
+  [ "$context" != boundary ] || budget=2
   dir="$RUNROOT/artifacts/$nn_slug"
   touch "$RUNROOT/.keep-rundir" 2>/dev/null || true
   # First capture wins: a failed body may already have richer logs before the
   # boundary fails. Boundary evidence uses its own directory.
   [ -d "$dir" ] && return 0
-  mkdir -p "$dir" 2>/dev/null || true
+  if ! mkdir -p "$dir"; then
+    printf 'capture unavailable: cannot create %s\n' "$dir" >&2
+    return 0
+  fi
   since="$((secs + 30))s"
   limiter="$(command -v timeout || command -v gtimeout)" || limiter=""
   for svc in api agent forge-fake db; do
+    rc=0
     if [ -z "$limiter" ]; then
-      printf 'capture unavailable: no timeout/gtimeout limiter\n' > "$dir/$svc.log"; continue
+      printf 'capture unavailable: no timeout/gtimeout limiter\n' > "$dir/$svc.log"; rc=127
+    else
+      "$limiter" --signal=KILL "$budget" "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || rc=$?
     fi
-    "$limiter" --signal=KILL 2 "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
+    printf '%s\n' "$rc" > "$dir/$svc.log.exit"
   done
-  db_psql_rows "select id,user_id,status,kind from runs order by created_at" 2 > "$dir/runs.txt" 2>/dev/null || true
-  db_psql_rows "select status,kind,count(*) from runs group by status,kind order by status,kind" 2 \
-    > "$dir/run-counts.txt" 2>/dev/null || true
+  for file in runs.txt run-counts.txt; do
+    if [ "$file" = runs.txt ]; then query="select id,user_id,status,kind from runs order by created_at"
+    else query="select status,kind,count(*) from runs group by status,kind order by status,kind"; fi
+    rc=0
+    db_psql_rows "$query" "$budget" > "$dir/$file" 2> "$dir/$file.stderr" || rc=$?
+    printf '%s\n' "$rc" > "$dir/$file.exit"
+  done
   [ -f "$RUNROOT/logs/$nn_slug.log" ] && cp "$RUNROOT/logs/$nn_slug.log" "$dir/phase.log" 2>/dev/null || true
+  return 0
+}
+
+# Copy the complete raw boundary directory into the existing workflow upload
+# tree, even when body capture already exists. One two-second copy attempt after
+# settlement (including timeout); failure remains explicit in the final message.
+_mirror_boundary() {
+  local dir="$RUNROOT/artifacts/$1" limiter rc=0
+  if ! mkdir -p "$dir"; then
+    _boundary_error "boundary evidence copy failed: cannot create $dir"
+    return 0
+  fi
+  limiter="$(command -v timeout || command -v gtimeout)" || limiter=""
+  if [ -z "$limiter" ]; then
+    printf 'boundary copy unavailable: no timeout/gtimeout limiter\n' > "$dir/boundary-copy.stderr"
+    rc=127
+  else
+    "$limiter" --signal=KILL 2 cp -R "$_boundary_dir" "$dir/boundary" > "$dir/boundary-copy.stdout" 2> "$dir/boundary-copy.stderr" || rc=$?
+  fi
+  printf '%s\n' "$rc" > "$dir/boundary-copy.exit"
+  if [ "$rc" -ne 0 ]; then
+    _boundary_error "boundary evidence copy failed (exit $rc; see artifacts/$1/boundary-copy.stderr)"
+  fi
   return 0
 }
 
@@ -399,6 +434,8 @@ _rollcall() {
 # --- the driver loop (TOP LEVEL — see the banner at the top of this file) -----
 
 mkdir -p "$RUNROOT/logs"
+# A reused rundir must not publish prior-run responses as current evidence.
+rm -rf "$RUNROOT/boundary"
 : > "$RUNROOT/results.tsv"
 : > "$RUNROOT/boundary_wait_seconds.tsv"
 
@@ -454,7 +491,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     _requires_intersects_failed "$requires" && m="$m [suspect_cascade]"
     [ "$racesens" = yes ] && m="$m — possible race, see margins"
     _record "$slug" FAIL 0 "$m" "$title"
-    _capture_artifacts "$nn_slug" 0
+    _capture_artifacts "$nn_slug" 0 || true
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
     continue
@@ -520,7 +557,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     _requires_intersects_failed "$requires" && _phase_msg="$_phase_msg [suspect_cascade]"
     [ "$racesens" = yes ] && _phase_msg="$_phase_msg — possible race, see margins"
     _phase_status=FAIL
-    _capture_artifacts "$nn_slug" "$secs"
+    _capture_artifacts "$nn_slug" "$secs" || true
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
   fi
@@ -530,10 +567,11 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   secs=$((secs + _boundary_wait))
   if [ "$_boundary_bad" -ne 0 ]; then
     _phase_status=FAIL
+    _capture_artifacts "$nn_slug" "$secs" boundary || true
+    _mirror_boundary "$nn_slug"
     _phase_msg="${_phase_msg:+$_phase_msg; }boundary FAIL: $_boundary_msg"
     [ "$rc" -ne 0 ] || [ -z "$provides" ] || _phase_msg="$_phase_msg [provides suspect]"
     _note_failed "$provides"
-    _capture_artifacts "$nn_slug" "$secs"
   fi
   _record "$slug" "$_phase_status" "$secs" "$_phase_msg" "$title"
 done

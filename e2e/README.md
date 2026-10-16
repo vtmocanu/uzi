@@ -78,12 +78,26 @@ Results and artifacts (written under the rundir, `$RUNROOT`):
   snapshots, pending sets, diagnostics, cancel response bodies and HTTP/transport
   statuses, and observed hold history including release evidence. The supplemental
   hold-history read has its own two-second bound and is diagnostic, not another
-  settlement wait.
+  settlement wait. On boundary FAIL, the complete directory is mirrored to
+  `artifacts/<NN-slug>/boundary/` for the existing CI artifact upload, including
+  when the body also failed. Phase-start evidence stays in `boundary/` so it
+  cannot suppress service capture. Prior boundary snapshots are cleared at driver
+  startup when the rundir is reused. The copy has one two-second attempt, even
+  after settlement timeout; `boundary-copy.exit` and `boundary-copy.stderr` in
+  the artifact directory report missing limiters, failures or partial copies.
+  Copy failure also appears in the final phase message.
 - `artifacts/<NN-slug>/` — captured for a FAIL phase (nothing on a
   PASS/SKIP): `phase.log` (the phase's own stdout), one `<service>.log` per service
   (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
-  (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
-  guarded, so it can never change a phase's recorded status or the suite exit code.
+  (the run enumeration) and `run-counts.txt` (runs by status × kind). First service
+  capture wins, preserving body logs when the boundary also fails. Body capture
+  allows **30 seconds per operation** (four service logs and two DB reads);
+  boundary-only capture allows **two seconds per operation**. Each operation is
+  independent; a failure does not skip the others. Service logs and DB dumps have
+  `<filename>.exit` sidecars; DB stderr is in `<filename>.stderr`. Nonzero statuses
+  expose unavailable or truncated captures; a missing timeout/gtimeout limiter
+  skips service capture with status 127 and an explicit log message. Diagnostic
+  failures do not replace the phase verdict.
 
 Fail-soft behavior: every run prints `summary.md` to stdout **before** teardown,
 so boundary timings remain in the CI log even on a green run. The suite exits `1` iff any
@@ -122,9 +136,10 @@ per-phase boundary wait seconds and their total from `summary.md` in the run log
 together with
 the equivalent lane's job duration before/after the change. Queue, cache and rerun
 effects are unmeasured locally; report those separately when comparing CI runs.
-The workflow's current failure upload includes `summary.md` and `artifacts/`, but
-does not upload `boundary/` or `boundary_wait_seconds.tsv`; inspect the retained
-rundir for that detailed evidence while it is available.
+The workflow's current failure upload includes `summary.md` and `artifacts/`.
+Failed-boundary evidence is included through `artifacts/<NN-slug>/boundary/`;
+per-phase and total timings are also in `summary.md` and the run log. The original
+`boundary/` directory and standalone timing TSV remain in the retained rundir.
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 
@@ -223,10 +238,14 @@ headers, not the rows.
 
 Header authoring: `handoff:` lists shell variable names containing retained run
 IDs. The optional `handoff-holds:` header lists shell variable names containing
-explicitly retained custody hold IDs. Each named variable must be in `provides:`
-and hold a scalar, whitespace-separated list of exact UUIDs (no patterns or
-arrays). An explicitly assigned empty hold list declares no retained holds, for
-conditional no-op bodies; unset variables and whitespace-only values still fail.
+explicitly retained custody hold IDs. New or changed values produced by the
+body must be in `provides:`. Inherited variables, including values provided by an
+earlier successful phase, may be explicitly named without repeating `provides:`.
+Each named variable must hold a scalar, whitespace-separated list of exact UUIDs
+(no patterns or arrays); inherited declarations receive the same validation.
+Permission covers only the IDs in the explicit header's variables, never other
+run or hold IDs. An explicitly assigned empty hold list declares no retained
+holds, for conditional no-op bodies; unset variables and whitespace-only values still fail.
 Run lists must be nonempty.
 Use `-` or omit the header when there is no handoff. Run and
 hold declarations are independent. Variables produced by a body are exported only

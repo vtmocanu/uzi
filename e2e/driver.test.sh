@@ -98,6 +98,11 @@ db_psql_rows() {
   esac
   return 0
 }
+# Model an unavailable limiter without replacing the rest of PATH.
+command() {
+  if [ "${FAKE_NO_LIMITER:-0}" = 1 ] && [ "${1:-}" = -v ] && { [ "${2:-}" = timeout ] || [ "${2:-}" = gtimeout ]; }; then return 1; fi
+  builtin command "$@"
+}
 boundary_cancel() {
   local code
   code="$(apipost_code "$1")"
@@ -204,6 +209,9 @@ run_driver() {
     bash "$TMP/bootstrap" "$FAKES" "$DRIVER" > "$LOG" 2>&1
   RC=$?
   set -e
+  if [ -f "$TSV" ]; then
+    awk -F'\t' 'NF!=4{exit 1}' "$TSV" || bad 'results.tsv no longer has four columns'
+  fi
 }
 # Shared globals inherited by the standalone driver shell; per-case E2E_*/FAKE_*
 # knobs are serialized by run_driver even when they are not exported.
@@ -246,6 +254,7 @@ BODY
 run_driver 2
 has_row provideA PASS || bad "provideA not PASS"
 has_row consumeB PASS || bad "consumeB not PASS (provides did not cross)"
+[ ! -d "$RUNROOT/artifacts" ] || bad "clean run created artifacts"
 [ "$RC" -eq 0 ] || bad "exit code should be 0 (got $RC)"
 end
 
@@ -616,6 +625,9 @@ contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=1" \
   || bad "api.log is not the FAIL-path (first) capture: $(cat "$adir/api.log" 2>/dev/null)"
 contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=5" \
   && bad "api.log was OVERWRITTEN by the leak-sweep re-capture (#990): $(cat "$adir/api.log" 2>/dev/null)"
+[ -f "$adir/boundary/1-runs.exit" ] || bad "body+boundary failure lost mirrored raw read"
+[ -f "$adir/boundary/cancel-00000000-0000-0000-0000-000000000013.body" ] || bad "body+boundary failure lost cancel response"
+[ "$(cat "$adir/boundary-copy.exit" 2>/dev/null)" = 0 ] || bad "boundary mirror failed"
 end
 
 # Boundary milestone regressions use authoritative DB sets, including before phase 13.
@@ -642,6 +654,9 @@ boundary_fail() {
 }
 boundary_evidence() {
   local dir="$RUNROOT/boundary/01-origin"
+  if has_row origin FAIL; then
+    diff -r "$dir" "$RUNROOT/artifacts/01-origin/boundary" > "$TMP/mirror-diff" 2>&1 || bad "uploaded boundary mirror differs: $(cat "$TMP/mirror-diff")"
+  fi
   for f in owner.stdout owner.stderr owner.exit baseline.stdout baseline.exit initial-runs initial-workers initial-holds final-runs final-workers final-holds boundary_wait_seconds; do
     [ -f "$dir/$f" ] || bad "missing boundary evidence $f"
   done
@@ -672,6 +687,7 @@ boundary_fixture
 boundary_fail b3 "$H2"
 contains "$(cat "$RUNROOT/boundary/01-origin/hold-history.stdout")" 'released|archive|archive-proof' || bad 'release evidence not retained'
 contains "$(cat "$RUNROOT/boundary/01-origin/hold-history.stdout")" "$H2" || bad 'new hold history missing'
+diff -r "$RUNROOT/boundary/01-origin" "$RUNROOT/artifacts/01-origin/boundary" || bad 'release evidence not mirrored'
 end
 
 begin 'boundary: already DB-terminal run must leave worker listing' b4
@@ -1021,9 +1037,21 @@ for mode in run hold; do
   end
 done
 
-begin 'artifacts: TERM-ignoring compose is killed at each capture budget' capture-kill
+begin 'artifacts: reused rundir cannot publish stale boundary evidence' capture-fresh
+boundary_fixture
+mkdir -p "$RUNROOT/boundary/01-origin"
+printf 'old cancel response\n' > "$RUNROOT/boundary/01-origin/cancel-$R.body"
+FAKE_WORKER_ERROR=1
+run_driver capture-fresh
+has_row origin FAIL || bad 'read failure lost'
+[ ! -e "$RUNROOT/artifacts/01-origin/boundary/cancel-$R.body" ] || bad 'stale cancel evidence was published'
+[ -f "$RUNROOT/artifacts/01-origin/boundary/1-workers.exit" ] || bad 'current evidence was not published'
+end
+
+begin 'artifacts: TERM-ignoring compose is killed at each boundary capture budget' capture-kill
+FAKE_WORKER_ERROR=1
 mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
-fail body
+pass body
 BODY
 cat > "$TMP/stubborn-compose" <<'COMPOSE_EOF'
 #!/usr/bin/env bash
@@ -1039,9 +1067,69 @@ capture_elapsed=$((SECONDS - capture_start))
 [ "$capture_elapsed" -le 10 ] || bad "four two-second captures took ${capture_elapsed}s"
 for service in api agent forge-fake db; do
   contains "$(cat "$RUNROOT/artifacts/01-origin/$service.log")" delayed-artifact && bad "capture exceeded budget for $service"
+  [ -s "$RUNROOT/artifacts/01-origin/$service.log.exit" ] || bad "truncated capture status missing"
+  [ "$(cat "$RUNROOT/artifacts/01-origin/$service.log.exit" 2>/dev/null)" != 0 ] || bad "truncated capture reported success"
 done
-has_row origin FAIL || bad 'body failure lost'
+has_row origin FAIL || bad 'boundary failure lost'
 [ "$RC" = 1 ] || bad 'suite exit incorrect'
+end
+
+# One real delayed log proves body capture survives two seconds; other operations
+# are immediate. The shim records budgets and simulates one truncated operation.
+begin 'artifacts: body capture allows delayed logs and records operation statuses' capture-body
+mkphase "$PHASES_DIR/01-origin.sh" body yes "" "" "" <<'BODY'
+fail body
+BODY
+mkdir -p "$TMP/limiter-bin"
+export FAKE_LIMITER_LOG="$TMP/limiter-args"
+export FAKE_REAL_LIMITER
+FAKE_REAL_LIMITER="$(command -v timeout || command -v gtimeout)"
+cat > "$TMP/limiter-bin/timeout" <<'LIMITER_EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_LIMITER_LOG"
+if [ "${FAKE_COPY_FAIL:-0}" = 1 ] && [ "$3" = cp ]; then exit 124; fi
+if [[ "$*" = *'forge-fake' ]]; then echo truncated >&2; exit 137; fi
+exec "$FAKE_REAL_LIMITER" "$@"
+LIMITER_EOF
+chmod +x "$TMP/limiter-bin/timeout"
+cat > "$TMP/delayed-compose" <<'COMPOSE_EOF'
+#!/usr/bin/env bash
+if [ "${!#}" = api ]; then sleep 3; echo delayed-body-log; fi
+COMPOSE_EOF
+# shellcheck disable=SC2034
+COMPOSE=(bash "$TMP/delayed-compose")
+PATH="$TMP/limiter-bin:$PATH" run_driver capture-body
+adir="$RUNROOT/artifacts/01-origin"
+contains "$(cat "$adir/api.log")" delayed-body-log || bad 'body log arriving after two seconds lost'
+contains "$(cat "$FAKE_LIMITER_LOG")" '--signal=KILL 30' || bad 'body limiter budget is not 30 seconds'
+contains "$(cat "$FAKE_READ_LOG")" 'timeout=30' || bad 'body DB budget is not 30 seconds'
+[ "$(cat "$adir/api.log.exit" 2>/dev/null)" = 0 ] || bad 'successful log status missing'
+[ "$(cat "$adir/forge-fake.log.exit" 2>/dev/null)" = 137 ] || bad 'truncated log status missing'
+[ "$(cat "$adir/runs.txt.exit" 2>/dev/null)" = 0 ] || bad 'DB capture status missing'
+end
+
+begin 'artifacts: boundary mirror timeout is explicit' capture-copy
+FAKE_WORKER_ERROR=1
+export FAKE_COPY_FAIL=1
+boundary_fixture
+PATH="$TMP/limiter-bin:$PATH" run_driver capture-copy
+adir="$RUNROOT/artifacts/01-origin"
+[ "$(cat "$adir/boundary-copy.exit" 2>/dev/null)" = 124 ] || bad 'copy timeout status missing'
+contains "$(row_msg origin FAIL)" 'boundary evidence copy failed' || bad 'copy failure absent from final result'
+unset FAKE_COPY_FAIL
+end
+
+begin 'artifacts: missing limiter is explicit for capture and mirror' capture-no-limiter
+export FAKE_NO_LIMITER=1
+FAKE_WORKER_ERROR=1
+boundary_fixture
+run_driver capture-no-limiter
+adir="$RUNROOT/artifacts/01-origin"
+[ "$(cat "$adir/api.log.exit" 2>/dev/null)" = 127 ] || bad 'missing capture limiter status absent'
+contains "$(cat "$adir/api.log")" 'no timeout/gtimeout limiter' || bad 'missing capture limiter diagnostic absent'
+[ "$(cat "$adir/boundary-copy.exit" 2>/dev/null)" = 127 ] || bad 'missing copy limiter status absent'
+contains "$(row_msg origin FAIL)" 'boundary evidence copy failed' || bad 'missing limiter silently dropped boundary evidence'
+unset FAKE_NO_LIMITER
 end
 
 # ============================================================================
