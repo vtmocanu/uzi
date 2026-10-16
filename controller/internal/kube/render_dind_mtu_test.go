@@ -51,7 +51,7 @@ type dindLaunchOptions struct {
 }
 
 // runRenderedDind executes the actual rendered Command and Args, replacing only
-// the sysfs positional argument. Discovery failures must leave no daemon or config artifacts.
+// the sysfs positional argument. Discovery failures must launch the original daemon argv without config artifacts.
 func runRenderedDind(t *testing.T, dind corev1.Container, netDir string, options ...dindLaunchOptions) (dindLaunch, string, error) {
 	t.Helper()
 	if len(dind.Command) != 5 || dind.Command[0] != "/bin/sh" || dind.Command[1] != "-c" ||
@@ -116,12 +116,11 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if opts.expectDiscoveryFailure {
-		for _, path := range []string{capture, configPath, configCapture} {
+		for _, path := range []string{configPath, configCapture} {
 			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
-				t.Errorf("discovery failure must not create daemon argv, config, or config capture %q: %v", path, statErr)
+				t.Errorf("discovery fallback must not create config artifacts %q: %v", path, statErr)
 			}
 		}
-		return dindLaunch{}, stderr.String(), err
 	}
 	data, readErr := os.ReadFile(capture) //nolint:gosec // G304: reads the fake daemon capture under t.TempDir.
 	if os.IsNotExist(readErr) {
@@ -134,6 +133,9 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 		t.Fatalf("invalid fake daemon argv capture: %q", data)
 	}
 	argv := strings.Split(string(data[:len(data)-1]), "\x00")
+	if opts.expectDiscoveryFailure {
+		return dindLaunch{argv: argv}, stderr.String(), err
+	}
 	configData, readErr := os.ReadFile(configCapture) //nolint:gosec // G304: fake daemon capture under t.TempDir.
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -257,7 +259,7 @@ func TestNonRootlessDindMTUConfigFailClosed(t *testing.T) {
 	}
 }
 
-func TestNonRootlessDindMTUDiscoveryFailClosed(t *testing.T) {
+func TestNonRootlessDindMTUDiscoveryFallback(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		value string
@@ -336,11 +338,12 @@ func TestNonRootlessDindMTUDiscoveryFailClosed(t *testing.T) {
 				netDir = filepath.Join(netDir, "absent")
 			}
 			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, dindLaunchOptions{expectDiscoveryFailure: true})
-			if err == nil {
-				t.Errorf("discovery failure must stop startup; stderr=%q", stderr)
+			if err != nil {
+				t.Fatalf("discovery failure must preserve startup: %v; stderr=%q", err, stderr)
 			}
-			if launch.argv != nil || launch.config != nil || launch.configPath != "" {
-				t.Fatalf("daemon launched on discovery failure: %#v", launch)
+			wantArgs := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
+			if !reflect.DeepEqual(launch.argv, wantArgs) || launch.config != nil || launch.configPath != "" {
+				t.Fatalf("fallback launch = %#v, want exact original argv %q and no config", launch, wantArgs)
 			}
 			reason := "invalid MTU (expected decimal 1..65535): " + mtuPath
 			switch tt.name {
@@ -355,7 +358,7 @@ func TestNonRootlessDindMTUDiscoveryFailClosed(t *testing.T) {
 			case "missing-net-directory":
 				reason = "network interface directory unavailable: " + netDir
 			}
-			wantDiagnostic := "dind MTU: " + reason + "\n"
+			wantDiagnostic := "dind MTU warning: " + reason + "; starting dockerd with unchanged defaults\n"
 			if stderr != wantDiagnostic {
 				t.Fatalf("discovery diagnostic = %q, want %q", stderr, wantDiagnostic)
 			}
