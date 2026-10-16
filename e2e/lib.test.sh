@@ -1136,6 +1136,70 @@ for mode in entry window discard idle; do
   else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
 done
 
+# Exercise the actual handoff startup/trap, stopping before transport and dispatch.
+# The compose double records its exported environment, not source-code spelling.
+handoff_timing_scope() {
+  HANDOFF_TEST_MODE="$1"
+  # shellcheck disable=SC2034  # consumed by the actual sourced phase prefix
+  EXECUTOR="$2"
+  case "$3" in
+    unset) unset UZI_E2E_RECOVERY_FAST_REDRIVE ;;
+    empty) export UZI_E2E_RECOVERY_FAST_REDRIVE= ;;
+    *) export UZI_E2E_RECOVERY_FAST_REDRIVE="$3" ;;
+  esac
+  # shellcheck disable=SC2034  # consumed by the actual sourced phase prefix
+  COMPOSE=(handoff_compose -p handoff-timing-fixture)
+  HANDOFF_TEST_COMPOSE_CALLS=0
+  HANDOFF_TEST_REGISTRATIONS=0
+  say() { :; }
+  fail() { echo "$*" >&2; exit 1; }
+  handoff_compose() {
+    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    printf 'compose:%s:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" "$*" >> "$SEQ_DIR/handoff-timing"
+    [ "$HANDOFF_TEST_MODE" != activation ] || [ "$HANDOFF_TEST_COMPOSE_CALLS" -ne 1 ] || return 1
+    case "$HANDOFF_TEST_MODE:$HANDOFF_TEST_COMPOSE_CALLS" in restore:2|receipt-restore:2) return 1;; esac
+  }
+  wait_worker_online() {
+    HANDOFF_TEST_REGISTRATIONS=$((HANDOFF_TEST_REGISTRATIONS + 1))
+    [ "$HANDOFF_TEST_MODE" != registration ] || [ "$HANDOFF_TEST_REGISTRATIONS" -ne 1 ] || return 1
+  }
+  # shellcheck disable=SC1090  # real phase prefix, no transport or dispatch
+  source <(awk '/^WC=/ {exit} {print}' "$ROOT/e2e/phases/70-handoff.sh")
+  printf 'body:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" >> "$SEQ_DIR/handoff-timing"
+  case "$HANDOFF_TEST_MODE" in receipt|receipt-restore) exit 7;; esac
+  exit 0
+}
+for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:sdk:unset' 'success:sdk:0' \
+    'activation:stub:unset' 'registration:stub:0' 'receipt:stub:unset' 'restore:stub:0' 'receipt-restore:stub:unset'; do
+  cases=$((cases + 1))
+  IFS=: read -r mode executor prior <<< "$spec"
+  : > "$SEQ_DIR/handoff-timing"
+  if output="$(handoff_timing_scope "$mode" "$executor" "$prior" 2>&1)"; then got=pass; else got=fail; fi
+  events="$(cat "$SEQ_DIR/handoff-timing")"
+  if [ "$prior" = unset ]; then restored=':'; elif [ "$prior" = empty ]; then restored='x:'; else restored="x:$prior"; fi
+  valid=false
+  if [ "$executor" = sdk ]; then
+    [ "$got" = pass ] && [ "$events" = "body:${restored}" ] && valid=true
+  else
+    first="$(head -1 "$SEQ_DIR/handoff-timing")"
+    last="$(tail -1 "$SEQ_DIR/handoff-timing")"
+    [ "$mode" = success ] && want=pass || want=fail
+    if [ "$got" = "$want" ] && [[ "$first" == 'compose:x:1:-p handoff-timing-fixture '* ]] \
+        && [[ "$last" == "compose:${restored}:-p handoff-timing-fixture "* ]]; then
+      valid=true
+      if [ "$mode" = activation ] || [ "$mode" = registration ]; then
+        [[ "$events" != *body:* ]] || valid=false
+      else
+        [[ "$events" == *body:x:1* ]] || valid=false
+      fi
+      case "$mode" in restore|receipt-restore) [[ "$output" == *'handoff timing restore failed'* ]] || valid=false;; esac
+    fi
+  fi
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: handoff timing scope $spec"
+  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] output=[$output]"; fi
+done
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has at least 188 cases green; a zero-case or

@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Keep handoff recovery receipt checks independent of production retry spacing ([#2494](https://github.com/vtmocanu/uzi/issues/2494)).**
+  The Compose handoff fixture uses the existing stub-only recovery clock while checking custody receipts, then restores the worker's prior timing on success or failure. Receipt and cleanup proofs remain unchanged; production retry spacing is unchanged.
+
 - **Accept large terminal state acknowledgments ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
   Terminal reports use the existing six-MiB state-response budget instead of the smaller maintenance-envelope cap, preserving status and completed-publication receipt parsing when a run includes a large issue description or saved patch. Reads remain bounded by bytes and the cancellation deadline.
 

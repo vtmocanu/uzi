@@ -1046,6 +1046,54 @@ it("stub redrive wiring recaptures stale inventory and FINALs within the receipt
   } finally { await f.close(); }
 });
 
+for (const fast of [false, true]) {
+it(`handoff receipt pacing preserves the uploaded task identity with cleanup backlog (${fast ? "stub clock" : "production clock"})`, async t => {
+  const f = await fixture();
+  try {
+    const backlog = Array.from({ length: 20 }, (_, i) => `ack-${String(i).padStart(2, "0")}`);
+    for (const runId of [...backlog, "fresh-task"]) {
+      const context = { ...f.context, runId, kind: "task" as const };
+      f.state.candidates = [{ sha: H, pinRef: `refs/owed/${runId}`, contexts: [context] }];
+      const record = await f.coordinator.freezeInventory({ context, currentSha: H, defaultBranch: "main" });
+      assert.ok(record);
+      if (runId === "fresh-task") f.state.finalError = new Error("foreground tail withheld FINAL");
+      await f.capture(record);
+      if (runId !== "fresh-task") assert.ok((await f.coordinator.inspect(runId)).some(r => r.finalAcknowledged));
+    }
+    f.state.finalError = undefined;
+    f.state.candidates = [];
+    const timing = fast ? buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }) : undefined;
+    const live = new RecoveryCoordinator({ recoveryRoot: path.join(f.root, "journal"),
+      workerToken: "local-worker-fixture", client: f.client as never, git: f.git as never,
+      log: f.log, now: () => f.state.now, ...timing });
+    const snapshot = live.snapshotBootRecords.bind(live);
+    t.mock.method(live, "snapshotBootRecords", async () => (await snapshot())
+      .sort((a, b) => Number(a.runId === "fresh-task") - Number(b.runId === "fresh-task")));
+    const before = f.finals.length;
+    const uploads = f.state.uploads;
+    const started = f.state.now;
+    const step = fast ? 1_000 : 30_000;
+    const original = (await live.inspect("fresh-task")).find(r => r.coverageDigest)!;
+    for (let pass = 0; pass < 5; pass++) {
+      await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+      assert.equal(f.finals.length, before, `bounded queue still precedes this record at pass ${pass}`);
+      f.state.now += step;
+    }
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    assert.equal(f.finals.length, before + 1, "bounded passes eventually reach the unchanged archive");
+    assert.equal(f.state.uploads, uploads);
+    assert.equal(f.state.now - started, fast ? 5_000 : 150_000);
+    const final = f.finals.at(-1)![3] as RecoveryFinalDisposition;
+    assert.equal(final.kind, "archive");
+    if (final.kind === "archive") {
+      assert.equal(final.capture_id, original.serverCaptureId);
+      assert.equal(final.source_sha, original.sourceSha);
+      assert.equal(final.coverage_digest, original.coverageDigest);
+    }
+  } finally { await f.close(); }
+});
+}
+
 it("pending-report ACK cleanup leaves every live-pass slot available for a fresh FINAL", async t => {
   const f = await fixture();
   try {
