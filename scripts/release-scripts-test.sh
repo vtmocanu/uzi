@@ -774,9 +774,9 @@ MD
   assert_eq "templates-only empty Unreleased refuses next RC" "3" "$RC_RC"
   assert_contains "templates-only reaches main-half empty refusal" "pending notes (legacy [Unreleased] plus fragments) are empty and no --changelog-file given" "$RC_OUT"
   if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
-    fail "templates-only empty refusal rolls stable tag back"
+    fail "templates-only empty refusal leaves stable tag absent"
   else
-    pass "templates-only empty refusal rolls stable tag back"
+    pass "templates-only empty refusal leaves stable tag absent"
   fi
   assert_eq "templates-only empty refusal leaves chart at prior RC" "0.2.0-rc.1" "$(chart_ver "$d")"
   awk '{print} /^## \[Unreleased\]/ {print "### Fixed"; print "- Runtime template (#1466)"}' "$d/CHANGELOG.md" > "$d/CHANGELOG.tmp"
@@ -2167,8 +2167,8 @@ for history in feature docs dependency; do
   run_rc "$S10" 0.3.0 --promote
   assert_eq "$history empty-body promote exits 3" 3 "$RC_RC"
   assert_contains "$history refusal names shipping SHA" "$shipping_sha" "$RC_OUT"
-  assert_contains "$history refusal offers next candidate entries" 'next candidate' "$RC_OUT"
-  assert_contains "$history refusal offers writing entries" 'write' "$RC_OUT"
+  assert_contains "$history refusal offers next candidate entries" 'next-candidate UUID-v4 fragments' "$RC_OUT"
+  assert_contains "$history refusal offers fragment authoring" 'under changelog.d/ and commit them' "$RC_OUT"
   assert_contains "$history refusal offers draft" '--changelog-file' "$RC_OUT"
   assert_absent "$history refusal emits no promotion" 'promoted:' "$RC_OUT"
   assert_absent "$history refusal emits no rollback" 'rolled back' "$RC_OUT"
