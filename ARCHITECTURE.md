@@ -1512,7 +1512,7 @@ chain in the diagram above, with no intervening `running`.
   settlement, while already admitted forge mutations may finish later.
   See [ADR-2545](adr/2545-failed-run-held-publication.md) for enforcement and the
   accepted terminal late-writer residual, and
-  [terminal held publication](docs/run-recovery.md#publishing-a-failed-runs-held-work)
+  [terminal held publication](docs/run-recovery.md#publishing-terminal-held-work)
   for recovery, retention and visibility limits.
   The planned automatic-settlement programme, its approved policy changes, child issue order and remaining acceptance are recorded in [PRD #2746](prds/2746-automatic-hold-settlement.md). This is a programme record, not a claim that its pending children have shipped.
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature

@@ -1247,7 +1247,9 @@ export class RecoveryCoordinator {
     if (state === "open") return true;
     const current = await this.requireRecord(record);
     if (!current.finalRequest) return false;
-    if (state === "unknown") return !current.exactHoldBinding;
+    // A saved, MAC-authenticated request may recover its original ACK even after
+    // an API rollback removes exact observations. This grants no new FINAL or fallback.
+    if (state === "unknown") return true;
     const settled = current.holdSettlement;
     return !!settled?.final_receipt &&
       canonicalJson(settled.final_receipt) === canonicalJson(current.finalRequest.disposition) &&
@@ -1628,15 +1630,11 @@ export class RecoveryCoordinator {
     if (!record.inventoryCurrentSha || !record.originalSourceSha || !this.git.buildRecoveryCoverage) return false;
     if (record.originalRoots?.length || record.finalRequest?.disposition.kind !== "settled") {
       const roots = [...new Set([...frozenRoots.map(c => c.sha), record.originalSourceSha])].sort();
-      if (this.git.readRecoveryCoverageClaim) {
-        if (!await ownedRecoveryIO(() => this.git.readRecoveryCoverageClaim!(record.coverageContext!.barePath, {
-          sourceSha: record.sourceSha, fingerprint: record.coverageDigest!, roots, currentSha: record.inventoryCurrentSha!,
-        }))) return false;
-      } else {
-        const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
-          roots, record.inventoryCurrentSha!));
-        if (coverage.sha !== record.sourceSha || coverage.fingerprint !== record.coverageDigest) return false;
-      }
+      // Use the producer's full proof. Optional archive-redundancy claims impose
+      // smaller head/body/encoding limits that cannot become FINAL eligibility limits.
+      const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
+        roots, record.inventoryCurrentSha!));
+      if (coverage.sha !== record.sourceSha || coverage.fingerprint !== record.coverageDigest) return false;
     }
     return true;
   }
@@ -2061,31 +2059,38 @@ export class RecoveryCoordinator {
       try {
         // HeldPublishGate reconciles an existing invocation before reading the body.
         // Without a marker, the empty invalid pack fails pre-verification before heldInvoke.
-        // One readback per cycle; unknown answers retain custody and never archive or resend a pack.
+        // Known invocations remain read-back-only. An empty-pack refusal can also
+        // mean the first request never arrived; a full retry still uses the same server marker.
         const response = await recoveryRPC(() => this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
           record.coverageDigest!, Buffer.alloc(0), maintenanceSignal(input.signal)));
-        if (!response.ok) return outcome("kept");
-        const body = response.body;
-        if (body.tip !== record.sourceSha || body.ref !== `refs/uzi-held/${record.runId}/${record.generation}` ||
-            !HELD_PUBLICATION_ID_RE.test(body.publication_id)) return outcome("kept");
-        if (body.state === "created") {
-          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
-            finalRequest: { disposition: { kind: "held_publication", publication_id: body.publication_id,
-              source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } }));
-          const released = await this.releaseHeldWithinCycle(record, body.publication_id);
-          if (released !== "fallback") return outcome(released);
-        } else if (body.state === "refused" && body.reason === "create_refused") {
-          record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
-        } else return outcome("kept");
-        hold = await this.heldOperationState(record, input.signal);
-        if (hold !== "open") return this.heldStopped(record, hold);
-        return this.captureCycle({ ...input, record });
+        if (!response.ok && response.reason !== "pack_invalid") return outcome("kept");
+        if (response.ok) {
+          const body = response.body;
+          if (body.tip !== record.sourceSha || body.ref !== `refs/uzi-held/${record.runId}/${record.generation}` ||
+              !HELD_PUBLICATION_ID_RE.test(body.publication_id)) return outcome("kept");
+          if (body.state === "created") {
+            record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false,
+              finalRequest: { disposition: { kind: "held_publication", publication_id: body.publication_id,
+                source_sha: cur.sourceSha, coverage_digest: cur.coverageDigest! } } }));
+            const released = await this.releaseHeldWithinCycle(record, body.publication_id);
+            if (released !== "fallback") return outcome(released);
+          } else if (body.state === "refused" && body.reason === "create_refused") {
+            record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
+          } else return outcome("kept");
+          hold = await this.heldOperationState(record, input.signal);
+          if (hold !== "open") return this.heldStopped(record, hold);
+          return this.captureCycle({ ...input, record });
+        }
+        // An empty probe can fail before any invocation exists. It is not proof
+        // of absence: retry the same frozen pack through the API's existing
+        // locked at-most-once invocation marker, never a second remote create.
       } catch { MaintenanceBudget.current()?.check(); return outcome("kept"); }
     }
+    const uncertainCreate = record.heldCreateUncertain === true;
     const v2 = this.client.hasHeldPublicationV2?.() === true;
     // Missing new held metadata cannot grant publication authority, but it must
     // preserve the pre-existing guarded archive path for boot and legacy journals.
-    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return this.captureCycle({ ...input, record });
+    if (v2 && (!record.exactHoldBinding || !record.heldPolicy)) return uncertainCreate ? outcome("kept") : this.captureCycle({ ...input, record });
     let terminal = options.terminal;
     if (v2) {
       terminal = undefined;
@@ -2115,9 +2120,10 @@ export class RecoveryCoordinator {
     const eligible = isCodePublishingKind(record.kind) && terminal && (v2 || (options.foreground && terminal.status === "failed" &&
       this.client.hasFeature?.("recovery_held_publication_v1"))) &&
       terminal.fail_origin !== "push_secret_blocked" && terminal.fail_origin !== "worker_residue_blocked";
+    if (uncertainCreate && !eligible) return outcome("kept");
     // Completed runs attempt the archive first, on precisely this identity.
     let archived: RecoveryOutcome | undefined;
-    if (!eligible || terminal?.status === "completed") {
+    if (!eligible || (terminal?.status === "completed" && !uncertainCreate)) {
       archived = await this.captureCycle({ ...input, record });
       const latest = await this.readLatest(record);
       if (latest.kind === "gone") return archived;
@@ -2129,9 +2135,9 @@ export class RecoveryCoordinator {
       if (!thin && !record.archiveRefusal) return archived;
     }
     if (residueQuarantine() !== undefined) return archived ?? outcome("kept");
-    if (!record.heldPolicy || !this.client.publishHeld) return archived ?? this.captureCycle({ ...input, record });
+    if (!record.heldPolicy || !this.client.publishHeld) return uncertainCreate ? outcome("kept") : archived ?? this.captureCycle({ ...input, record });
     let publicationId: string | undefined;
-    let result: "fallback" | "kept" | "settled" = "fallback";
+    let result: "fallback" | "kept" | "settled" = uncertainCreate ? "kept" : "fallback";
     const publish = async (prove: () => Promise<boolean>) => {
       if (!await prove() || !await this.frozenCoverageProven(record)) { result = "kept"; return; }
       const git = this.git;
@@ -2159,10 +2165,11 @@ export class RecoveryCoordinator {
       // V2 reconciles lost create answers before any retry. V1 retains its legacy
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
-      result = v2 ? "kept" : "fallback";
+      result = v2 || uncertainCreate ? "kept" : "fallback";
       const response = await recoveryRPC(() => this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
         record.coverageDigest!, prepared.pack, maintenanceSignal(input.signal)));
       if (!response.ok) {
+        if (uncertainCreate) return; // Refusal alone cannot erase an earlier invocation's uncertainty.
         if (v2 && (response.reason === "malformed_response" ||
             (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500)))) return;
         if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: false }));
@@ -2191,7 +2198,7 @@ export class RecoveryCoordinator {
         const boundary = await this.inventorySourceBoundary({ ...record.coverageContext!, generation: record.generation }, publish);
         if (boundary !== "passed") result = "kept";
       } else result = "kept";
-    } catch { MaintenanceBudget.current()?.check(); result = v2 ? "kept" : "fallback"; }
+    } catch { MaintenanceBudget.current()?.check(); result = v2 || uncertainCreate ? "kept" : "fallback"; }
     if (publicationId) {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
       if (released !== "fallback") return outcome(released);

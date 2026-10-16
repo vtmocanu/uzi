@@ -32,7 +32,7 @@ uzi publishes its held work to a run-scoped ref on your forge,
 `refs/uzi-held/<run-id>/<generation>`,
 and releases custody against that ref. The archive above is then the fallback
 when publishing is not possible. See
-[Publishing terminal held work](#publishing-a-failed-runs-held-work).
+[Publishing terminal held work](#publishing-terminal-held-work).
 
 This is a safety net for a run that already produced real commits, not a
 guarantee against every possible failure. It does **not** cover uncommitted
@@ -115,7 +115,7 @@ hand a human.
 A third place to look on a terminal run is its **held ref**: when uzi could
 publish the run's work to your forge, the run page shows a **Held work** panel
 and `uzi run held <run-id>` lists the ref. See
-[Publishing terminal held work](#publishing-a-failed-runs-held-work).
+[Publishing terminal held work](#publishing-terminal-held-work).
 
 Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
@@ -674,7 +674,7 @@ release older or successor holds or backfill older completed runs, including
 earlier self-improvement runs without a stamped completion identity. Failed,
 cancelled and parked runs, and `ci_fix`, `prompt` and `task`, keep their
 existing rules for this completion proof; a failed run's separate route is
-[held-work publication](#publishing-a-failed-runs-held-work). Healthy
+[held-work publication](#publishing-terminal-held-work). Healthy
 completion release needs no heartbeat prerequisite.
 
 A successful receipt needs no capture, WIP commit, frozen inventory or
@@ -1286,8 +1286,6 @@ retain commits, but complete inventory protection at terminal release and
 worker reclamation is unsupported. Once a generation's guard has latched,
 later feature loss retains custody rather than falling back to legacy release.
 
-<a id="publishing-a-failed-runs-held-work"></a>
-
 ## Publishing terminal held work
 
 Eligible failed and cancelled runs try to put held work on your forge before
@@ -1471,7 +1469,7 @@ uzi run held <run-id>
 prints one row per generation: `GEN`, `STATE`, `REF`, `TIP`, `EXPIRES`.
 `uzi run recovery <run-id>` also names the ref on a hold that was released
 against a held publication (`hold <id> held: <ref> @ <tip>`). See
-[the CLI reference](cli.md#fetching-and-expiring-a-failed-runs-held-ref-uzi-run-held)
+[the CLI reference](cli.md#fetching-and-expiring-terminal-held-refs-uzi-run-held)
 for the flags, output and JSON form.
 
 Fetch it from a clone of the repository, naming a local branch so a later
@@ -1527,7 +1525,7 @@ work survives only in a clone you fetched it into.
 
 While a held ref may still exist, removing its repo or its forge connection is
 refused with a 409 that names the refs (see
-[the CLI reference](cli.md#fetching-and-expiring-a-failed-runs-held-ref-uzi-run-held)
+[the CLI reference](cli.md#fetching-and-expiring-terminal-held-refs-uzi-run-held)
 for the body). The block lifts once each ref is deleted or settled. An
 acknowledged ref clears at its retention expiry, or sooner with
 `uzi run held expire`.
@@ -1614,7 +1612,7 @@ open first — that is usually where it is.
 ### Recovery order
 
 When you're recovering a failed run's work, check in this order: first its
-[held ref](#publishing-a-failed-runs-held-work), if the run has one (find it with
+[held ref](#publishing-terminal-held-work), if the run has one (find it with
 `uzi run held <run-id>`, then `git fetch origin refs/uzi-held/<run-id>/<generation>`).
 It is published from the run's final frozen tip, so it holds the run's last committed
 and uncommitted work as of the failure, unlike the salvage copy. Then check whether a

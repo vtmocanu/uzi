@@ -61,6 +61,22 @@ test("late headers ignoring abort reject and detach a never-settling cancellatio
   });
 });
 
+const maintenanceWorkerId = "00000000-0000-4000-8000-0000000000aa";
+
+test("review C1 on-time hold body exercises the completion binding loop", async () => {
+  let registered = false;
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => {
+      if (!registered) { registered = true; return Response.json({ worker_id: maintenanceWorkerId, protocol_features: [] }); }
+      return Response.json({ run_id: "run", holds: [{ generation: 1, hold_id: "invalid", inventory_guarded: true }] });
+    },
+  });
+  await client.register("worker");
+  assert.equal(client.canStartPublicationCompletion("run", 1), true);
+  await client.listRecoveryHolds("run");
+  assert.equal(client.canStartPublicationCompletion("run", 1), false, "on-time invalid hold must poison bound provenance");
+});
+
 for (const operation of ["release", "holds", "ack"] as const) {
   test(`stalled ${operation} body and cancellation cannot hold the budget open`, async t => {
     let now = 0, cancelled = 0;
@@ -96,7 +112,7 @@ for (const operation of ["release", "holds", "ack"] as const) {
     let registered = false;
     const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
       fetch: async () => {
-        if (!registered) { registered = true; return Response.json({ worker_id: "worker", protocol_features: [] }); }
+        if (!registered) { registered = true; return Response.json({ worker_id: maintenanceWorkerId, protocol_features: [] }); }
         return res;
       },
     });

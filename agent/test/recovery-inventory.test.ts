@@ -89,6 +89,106 @@ function closedExactFixture(record: RecoveryRecord, exact: RecoveryExactHold, st
   };
 }
 
+for (const delivered of [false, true]) {
+  it(`review G1 lost held create answer recovers on the same frozen identity delivered=${delivered}`, async () => {
+    const f = await v2FrozenFixture();
+    let calls = 0, creates = 0, invoked = false;
+    const publish = Reflect.get(f.client, "publishHeld") as NonNullable<RecoveryArchiveClient["publishHeld"]>;
+    Object.assign(f.client, { publishHeld: async (...args: Parameters<NonNullable<RecoveryArchiveClient["publishHeld"]>>) => {
+      calls++;
+      if (calls === 1) {
+        if (delivered) { invoked = true; creates++; }
+        throw new Error("connection lost");
+      }
+      // The existing API reconciles a committed invocation before reading the body.
+      if (!invoked) {
+        if (!(args[4] instanceof Buffer) || args[4].length === 0) return { ok: false, reason: "pack_invalid", httpStatus: 400 };
+        invoked = true; creates++;
+      }
+      return publish(...args);
+    } });
+    try {
+      await f.operate();
+      const pending = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(pending.heldCreateUncertain, true);
+      await f.operate();
+      const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(saved.finalAcknowledged, true, "a request never delivered must not remain an empty-pack probe forever");
+      assert.equal(saved.sourceSha, f.record.sourceSha);
+      assert.equal(saved.coverageDigest, f.record.coverageDigest);
+      assert.equal(saved.captureId, f.record.captureId);
+      assert.equal(creates, 1, "the API invocation marker prevents a second remote create");
+      assert.equal(f.state.produced, 0);
+    } finally { await f.close(); }
+  });
+}
+
+it("review G2 V1 rollback replays a lost held FINAL without exact observations or new preservation", async () => {
+  const f = await v2FrozenFixture("issue", true);
+  const release = f.client.releaseRecoveryCustody;
+  let loseAnswer = true;
+  Object.assign(f.client, { releaseRecoveryCustody: async (...args: Parameters<typeof release>) => {
+    const ack = await release(...args);
+    if (loseAnswer) { loseAnswer = false; throw new Error("FINAL answer lost"); }
+    return ack;
+  } });
+  try {
+    await f.operate();
+    const pending = (await f.coordinator.inspect(f.context.runId))[0]!;
+    assert.ok(pending.finalRequest);
+    assert.equal(pending.finalAcknowledged, undefined);
+    const original = structuredClone(pending.finalRequest);
+    Object.assign(f.client, { hasHeldPublicationV2: () => false, getExactRecoveryHold: async () => undefined });
+    await f.operate();
+    assert.equal(f.finals.length, 2, "old API receipt replay precedes V2 observation eligibility");
+    assert.deepEqual(f.finals[1]![3], original.disposition);
+    assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.finalAcknowledged, true);
+    assert.equal(f.order.filter(step => step === "held").length, 1);
+    assert.equal(f.state.produced, 0);
+  } finally { await f.close(); }
+});
+
+for (const shape of ["65 heads", "large commit", "non-UTF8 commit"] as const) {
+  it(`review G3 archive FINAL accepts producer-valid coverage with ${shape}`, async () => {
+    const f = await fixture();
+    try {
+      const data = path.join(f.root, "data");
+      const bare = path.join(data, "repos", "repo.git");
+      await fs.mkdir(path.dirname(bare), { recursive: true, mode: 0o700 });
+      const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+      Object.assign(gitEnv, { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" });
+      execFileSync("git", ["init", "--bare", bare], { env: gitEnv, stdio: "pipe", timeout: 10000 });
+      const git = (args: string[], input?: Buffer | string) => execFileSync("git", ["--git-dir", bare, ...args],
+        { env: gitEnv, input, encoding: "utf8", timeout: 10000 }).trim();
+      const tree = git(["mktree"], "");
+      const roots: string[] = [];
+      for (let i = 0; i < (shape === "65 heads" ? 65 : 1); i++) {
+        const message = shape === "large commit" ? Buffer.alloc(70 * 1024, 120) :
+          shape === "non-UTF8 commit" ? Buffer.from([0xff, 0xfe, 0x0a]) : Buffer.from(`root ${i}\n`);
+        const body = Buffer.concat([Buffer.from(`tree ${tree}\nauthor Fixture <fixture@example.com> 946684800 +0000\ncommitter Fixture <fixture@example.com> 946684800 +0000\n\n`), message]);
+        roots.push(git(["hash-object", "-t", "commit", "-w", "--stdin"], body));
+      }
+      f.context.barePath = bare;
+      f.context.defaultIdentity = { ref: "refs/remotes/origin/main", sha: roots[0]! };
+      f.state.candidates = roots.map(sha => ({ sha, pinRef: `refs/owed/${sha}`, contexts: [structuredClone(f.context)] }));
+      f.state.ancestors = new Set(roots);
+      const cache = new GitCache(data, nullLogger(), undefined, testGitCacheOptions());
+      Object.assign(f.git, { buildRecoveryCoverage: cache.buildRecoveryCoverage.bind(cache),
+        readRecoveryCoverageClaim: cache.readRecoveryCoverageClaim.bind(cache) });
+      const record = await f.coordinator.freezeInventory({ context: f.context,
+        currentSha: roots[0]!, originalSourceSha: roots[0]!, defaultBranch: "main" });
+      assert.ok(record);
+      assert.equal(await cache.readRecoveryCoverageClaim(bare, { sourceSha: record.sourceSha,
+        fingerprint: record.coverageDigest!, roots: [...roots].sort(), currentSha: roots[0]! }), undefined,
+      "optional redundancy proof intentionally refuses this producer-valid input");
+      await f.capture(record);
+      assert.equal(f.state.uploads, 1);
+      assert.equal(f.finals.length, 1, "optional redundancy limits must not block ordinary archive FINAL");
+      assert.equal((await f.coordinator.inspect(f.context.runId))[0]!.finalAcknowledged, true);
+    } finally { await f.close(); }
+  });
+}
+
 it("late cancellation releases queued capture before the holder and preserves FIFO", async () => {
   const f = await v2FrozenFixture();
   let release!: () => void, ready!: () => void;
@@ -461,7 +561,7 @@ for (const invalid of ["generation", "status", "repo"] as const) {
 }
 
 for (const readback of ["created", "create_unknown", "refused", "pack_invalid", "mismatch", "settled"]) {
-  it(`B unknown create restart readback ${readback} never resends a pack`, async () => {
+  it(`B unknown create restart readback ${readback} preserves the invocation fence`, async () => {
     const f = await v2FrozenFixture();
     try {
       let sends = 0, reads = 0;
@@ -488,9 +588,9 @@ for (const readback of ["created", "create_unknown", "refused", "pack_invalid", 
       if (readback === "settled") f.setHold("discarded");
       const restarted = f.make(true);
       await restarted.resumePending(undefined, [f.record]);
-      assert.equal(sends, 1);
+      assert.equal(sends, readback === "pack_invalid" ? 2 : 1);
       assert.equal(reads, readback === "settled" ? 0 : 1);
-      assert.deepEqual(f.order.filter(x => x !== "archive"), before);
+      if (readback !== "pack_invalid") assert.deepEqual(f.order.filter(x => x !== "archive"), before);
       if (readback === "created") {
         assert.equal((f.finals[0]?.[3] as RecoveryFinalDisposition)?.kind, "held_publication");
       } else if (readback === "refused") {

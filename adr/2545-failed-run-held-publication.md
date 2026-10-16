@@ -133,7 +133,13 @@ protected; committed-only coverage cannot discharge unproven residue.
   re-checks scope, upserts the `run_held_publications` row for
   `(run, generation)` and commits a monotonic `create_invoked_at` marker
   *before* the network create. Only the request that sets the marker sends.
-  Every other request, and every retry, only lists the ref.
+  Every other request after that marker only lists the ref. If the worker's
+  first request never arrived, an empty reconciliation probe can return
+  `pack_invalid`. That response is not proof of absence: the worker may
+  re-verify and resend the same frozen identity's pack through this same
+  locked marker. A late original request and the retry still have only one
+  create winner. Preparation failure or another ambiguous answer keeps custody
+  and the uncertainty marker; it does not authorize archive fallback.
 - **Unknown outcomes only reconcile.** The broker reports `created` only on a
   read-back at the tip, and `refused` only on an explicit `ng` with no ref of
   ours. Everything else, including a deadline the forge outlives, is

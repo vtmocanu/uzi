@@ -1294,8 +1294,6 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
-<a id="fetching-and-expiring-a-failed-runs-held-ref-uzi-run-held"></a>
-
 ### Fetching and expiring terminal held refs: `uzi run held`
 
 Eligible failed and cancelled runs try to publish held work to your forge as
@@ -1305,7 +1303,7 @@ only a prerequisite-bearing thin archive or structured oversize/quota refusal
 permits the held alternative on the same frozen record. Exact earlier-generation
 holds may qualify on their original custodian even when the run's current worker
 differs. V1 remains failed-current-generation only. See
-[Publishing terminal held work](./run-recovery.md#publishing-a-failed-runs-held-work)
+[Publishing terminal held work](./run-recovery.md#publishing-terminal-held-work)
 for eligibility, deadlines and accepted late-writer risk. Both commands are
 owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
 
