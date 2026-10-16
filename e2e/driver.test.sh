@@ -87,6 +87,9 @@ db_psql_rows() {
         [ -z "${FAKE_WORKERS:-}" ] || printf '%s\n' "$FAKE_WORKERS"
       fi ;;
     *"status not in"*)
+      if [ "${FAKE_READ_EXHAUST_AFTER_FIRST:-0}" = 1 ] && [ "$tick" -ge 30 ]; then
+        echo $((tick + $2)) > "$FAKE_CLOCK"
+      fi
       if [ "$tick" -lt "${FAKE_RUN_SETTLE:-${FAKE_SETTLE:-999}}" ]; then
         # shellcheck disable=SC2086
         [ -z "${FAKE_DB_IDS:-}" ] || printf '%s\n' $FAKE_DB_IDS
@@ -181,7 +184,7 @@ begin() { cur="$1"; case_fail=0
   FAKE_READ_LOG="$TMP/reads-$2"; : > "$FAKE_READ_LOG"
   unset FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_DB_STALL FAKE_HISTORY 2>/dev/null || true
   export FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_BODY_MARK FAKE_BODY_FAIL FAKE_DB_STALL
-  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
+  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE FAKE_DOCKER_SEQ FAKE_READ_EXHAUST_AFTER_FIRST 2>/dev/null || true
 }
 bad() { printf '  - %s\n' "$1"; case_fail=1; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
@@ -854,6 +857,19 @@ boundary_fail stalled-db unverifiable
 [ "$(cat "$FAKE_CLOCK")" = 120 ] || bad 'DB not bounded by remaining deadline'
 [ "$(cat "$RUNROOT/boundary/01-origin/1-workers.exit")" = 124 ] || bad 'DB exit not retained'
 contains "$(cat "$RUNROOT/boundary/01-origin/1-workers.stderr")" 'stalled psql' || bad 'DB stderr missing'
+contains "$(row_msg origin FAIL)" 'last verified pending' && bad 'invented a complete sample after the first read failed'
+end
+
+begin 'boundary: incomplete deadline sample retains last verified pending identities' last-pending
+FAKE_HOLDS="$H|$R|3"; export FAKE_READ_EXHAUST_AFTER_FIRST=1
+boundary_fixture
+boundary_fail last-pending 'unverifiable 2-workers: deadline exhausted'
+contains "$(row_msg origin FAIL)" 'unverifiable 2-holds: deadline exhausted' || bad 'hold read failure missing'
+contains "$(row_msg origin FAIL)" "last verified pending (sample 1): hold=$H run=$R generation=3" || bad 'last complete sample identities missing from verdict'
+contains "$(cat "$RUNROOT/boundary/01-origin/diagnostics")" "last verified pending (sample 1): hold=$H run=$R generation=3" || bad 'last complete sample identities missing from diagnostics'
+[ "$(cat "$FAKE_CLOCK")" = 120 ] || bad 'shared deadline changed'
+[ ! -s "$FAKE_API_LOG" ] || bad 'hold-only leak triggered a cancel or discard'
+[ ! -s "$FAKE_DB_LOG" ] || bad 'hold-only leak triggered a DB write'
 end
 
 for declaration in MISSING bad-name HOLD_HAND; do

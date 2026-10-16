@@ -271,6 +271,7 @@ _boundary_declarations() {
 _quarantine() {
   local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
   local entered now sample=0 runs workers open id run gen pending cancelled="" run_allow="" hold_allow="" baseline_ids
+  local reads_complete last_complete_sample=0 last_complete_pending=""
   entered="$(date +%s)"; _deadline=$((entered + 120))
   if [ "$body_rc" -eq 0 ]; then
     _boundary_declarations "$handoff" handoff; run_allow="$_declared"
@@ -286,16 +287,16 @@ _quarantine() {
     if ! _boundary_remaining; then
       _boundary_error "boundary timeout:$pending"; break
     fi
-    sample=$((sample + 1)); pending=""
-    _boundary_read "$sample-runs" "select id from runs where status not in ('completed','failed','cancelled')" id || true
+    sample=$((sample + 1)); pending=""; reads_complete=1
+    _boundary_read "$sample-runs" "select id from runs where status not in ('completed','failed','cancelled')" id || reads_complete=0
     runs="$_read_data"
-    _boundary_read "$sample-workers" "SELECT worker_id, run_id, claim_generation FROM worker_active_runs" rows || true
+    _boundary_read "$sample-workers" "SELECT worker_id, run_id, claim_generation FROM worker_active_runs" rows || reads_complete=0
     workers="$_read_data"
     open=""
     if [ -n "$_owner" ]; then
-      _boundary_read "$sample-holds" "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_owner' AND state = 'open'" rows || true
+      _boundary_read "$sample-holds" "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_owner' AND state = 'open'" rows || reads_complete=0
       open="$_read_data"
-    else _boundary_error 'unverifiable open holds: owner unavailable'; fi
+    else reads_complete=0; _boundary_error 'unverifiable open holds: owner unavailable'; fi
     for id in $runs; do
       case " $run_allow " in *" $id "*) continue ;; esac
       pending="$pending run=$id"
@@ -330,6 +331,14 @@ _quarantine() {
       fi
     done
     now="$(date +%s)"
+    if [ "$reads_complete" -eq 1 ]; then
+      last_complete_sample="$sample"; last_complete_pending="$pending"
+    elif [ "$last_complete_sample" -gt 0 ]; then
+      # An incomplete sample cannot erase previously verified identities. Keep
+      # their provenance explicit: this is historical evidence, never permission
+      # to pass an unreadable boundary or extend its deadline.
+      _boundary_error "last verified pending (sample $last_complete_sample):${last_complete_pending:- none}"
+    fi
     if [ "$_boundary_bad" -ne 0 ]; then break; fi
     if [ -z "$pending" ] && [ "$now" -lt "$_deadline" ]; then break; fi
     if [ "$now" -ge "$_deadline" ]; then
