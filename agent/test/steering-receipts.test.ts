@@ -132,6 +132,18 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     });
   }
 
+  it("accepts a normal cancel APPLIED reply and releases its held batch", async () => {
+    api.setInputClaimGeneration(RUN, 3);
+    api.setInputs(RUN, [{ id: 11, kind: "cancel", body: null }]);
+    const ch = channel(clientLosingGets(0), 3);
+    assert.deepEqual(await ch.awaitVerdict(), { kind: "cancel" });
+    await until(() => api.isApplied(RUN, 11));
+    await ch.stop();
+    assert.equal(ch.claimFence(), undefined);
+    assert.equal(api.inputReceiptCalls.filter((c) => c.kind === "applied").length, 1,
+      "the accepted reply clears the batch instead of retrying at stop");
+  });
+
   it("delivers follow-up 7 before 8, once each, across a failed GET and a lost ACK", async () => {
     api.setInputClaimGeneration(RUN, 1);
     api.setInputs(RUN, [

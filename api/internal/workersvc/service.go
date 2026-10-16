@@ -5628,21 +5628,26 @@ func inputDTO(id int64, kind string, body pgtype.Text, createdAt pgtype.Timestam
 	}
 }
 
-// ConsumeInputsResult is what ConsumeInputs returns: the drained steering inputs and, when a
-// held-state switch is pending for the run's current claim, the worker-facing switch signal (PRD
-// #1247 M5, D3/D4). On the consume-nothing path (a pending switch) Inputs is empty and
-// CredentialSwitch is set; on the normal path CredentialSwitch is nil.
+// TerminalCancelledSignal is stop-only control for the current generation. It grants
+// no cleanup, custody release, acknowledgement, or retirement authority.
+type TerminalCancelledSignal struct {
+	RunID      uuid.UUID `json:"run_id"`
+	Generation int64     `json:"generation"`
+}
+
+// ConsumeInputsResult carries steering inputs or consume-nothing control for an owned run.
 type ConsumeInputsResult struct {
-	Inputs           []InputDTO
-	CredentialSwitch *CredentialSwitchSignal
+	TerminalCancelled *TerminalCancelledSignal
+	Inputs            []InputDTO
+	CredentialSwitch  *CredentialSwitchSignal
 	// Receipts marks a read-only replay a receipt-capable worker must ACK and apply (issue
 	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
 	// worker, and the worker routes it with no receipts.
 	Receipts bool
 	// OwnerID is the run owner's user id, set only on the paths that return the normal inputs
-	// reply (not on the pending-switch or released-claim early returns). The handler resolves the
-	// per-run now-summary setting for THIS user, never the caller's (PRD #2603); a nil id means
-	// "omit the field", which the worker reads as off.
+	// reply (not on the terminal-cancelled, pending-switch or released-claim early returns).
+	// The handler resolves the per-run now-summary setting for THIS user, never the caller's
+	// (PRD #2603); a nil id means "omit the field", which the worker reads as off.
 	OwnerID uuid.UUID
 }
 
@@ -5699,6 +5704,11 @@ func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, run
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return ConsumeInputsResult{}, err
+	}
+	if run.Status == "cancelled" && run.ClaimGeneration > 0 && run.Kind != "chat" {
+		return ConsumeInputsResult{TerminalCancelled: &TerminalCancelledSignal{
+			RunID: run.ID, Generation: run.ClaimGeneration,
+		}}, nil
 	}
 	if sig := PendingCredentialSwitchSignal(run); sig != nil {
 		// Pending switch: signal + no drain, so a racing answer/follow-up survives for the reclaim.

@@ -114,6 +114,10 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-revising":               func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
 		"board-progress":               func(d bool) string { return boardProgress(d, now) },
+		"detail-plan-running-top":      func(d bool) string { return detailLongPlan(d, now, "running", false).View().Content },
+		"detail-plan-running-bottom":   func(d bool) string { return detailLongPlan(d, now, "running", true).View().Content },
+		"detail-plan-completed-top":    func(d bool) string { return detailLongPlan(d, now, "completed", false).View().Content },
+		"detail-plan-completed-bottom": func(d bool) string { return detailLongPlan(d, now, "completed", true).View().Content },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
 		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
@@ -840,6 +844,35 @@ func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiMo
 
 func withLiveStream(m tuiModel) tuiModel {
 	return step(m, streamReadyMsg{gen: m.detail.gen, runID: detailRunID, stream: uzicli.NewRunStream(context.Background(), nil)})
+}
+
+// detailLongPlan shows a retained plan through the shipped transcript and navigation.
+func detailLongPlan(dark bool, now time.Time, status string, bottom bool) tuiModel {
+	plan := "# Implementation plan\n\nPreserve the approved approach throughout the run.\n\n"
+	for i := 1; i <= 12; i++ {
+		plan += fmt.Sprintf("## Step %d\n\n- Implement the scoped change.\n- Verify the public behavior.\n\n", i)
+	}
+	plan += "## Final acceptance\n\nThe complete plan remains readable through this final line."
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	m = applyDetail(m, apitypes.RunDTO{
+		ID: detailRunID, Kind: "issue", Status: status, Health: "ok",
+		IssueTitle: "Keep the full plan readable in the run transcript",
+		StartedAt:  tp(now.Add(-4 * time.Minute)),
+	}, []apitypes.MessageDTO{leadMsg(1, "plan", `{"plan_md":`+quoteJSON(plan)+`}`, now)})
+	if status == "running" {
+		m = withLiveStream(m)
+	}
+	m = key(m, keyRight)
+	// Both navigation passes are bounded by 200 presses, beyond this fixture's length.
+	for range 200 {
+		m = key(m, keyUp)
+	}
+	if bottom {
+		for range 200 {
+			m = key(m, keyDown)
+		}
+	}
+	return m
 }
 
 func detailRunning(dark bool, now time.Time) string {

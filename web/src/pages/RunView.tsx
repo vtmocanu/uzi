@@ -86,6 +86,7 @@ import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
+import { FullPlanPanel } from "./runView/FullPlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
@@ -2920,6 +2921,12 @@ export function RunView() {
           safety fix), so the two panels are disjoint by construction, not by a status
           guard bolted on here. */}
       {run.plan_source === "seeded" && <SeededPlanPanel run={run} />}
+      {run.plan_source !== "seeded" &&
+        run.status !== "awaiting_approval" &&
+        typeof run.plan_md === "string" &&
+        run.plan_md.trim() !== "" && (
+          <FullPlanPanel key={run.id} plan={run.plan_md} messages={messages} />
+        )}
 
       {/* PRD #88: the clarification park. Gated on BOTH the status and a derived open
           question: the status alone would render a composer with nothing to answer in

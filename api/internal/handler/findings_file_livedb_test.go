@@ -49,6 +49,9 @@ type findingForgeStub struct {
 	creates      []forgeCreate
 	seq          int
 	markerSeq    int // sequence number of the CreateLabel that created the marker
+	ensured      []string
+	ensureSeqs   []int
+	ensureFail   bool
 	firstIssueAt int // sequence number of the first CreateIssue
 	nextIID      int64
 }
@@ -69,10 +72,18 @@ func newFindingForgeStub(t *testing.T, marker string) *findingForgeStub {
 			name, _ := m["name"].(string)
 			fs.mu.Lock()
 			fs.seq++
+			fs.ensured = append(fs.ensured, name)
+			fs.ensureSeqs = append(fs.ensureSeqs, fs.seq)
+			ensureFail := fs.ensureFail
 			if name == marker {
 				fs.markerSeq = fs.seq
 			}
 			fs.mu.Unlock()
+			if ensureFail {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"message":"label creation refused"}`))
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = fmt.Fprintf(w, `{"id":7,"name":%q,"color":"#888888"}`, name)

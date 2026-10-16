@@ -117,13 +117,16 @@ func (c *HTTPClient) ListFindings(ctx context.Context, bucket, repo, run string)
 	return out, nil
 }
 
-func (c *HTTPClient) FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
-	// An empty JSON object body: the file endpoint resolves title/description from the STORED,
+func (c *HTTPClient) FileFinding(ctx context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error) {
+	// An empty JSON object unless sendToUzi is true: the endpoint resolves text from the STORED,
 	// already-sanitised finding row (D4) and assembles labels server-side (D5), so the CLI sends
 	// no edits — the web is the rich editor, the CLI files defaults. postJSON routes a non-2xx
 	// through statusError, so 404→ExitNotFound and 409→ExitConflict come for free.
 	var out apitypes.IncidentalFindingFileResultDTO
-	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/issue", struct{}{}, &out); err != nil {
+	req := struct {
+		SendToUzi bool `json:"send_to_uzi,omitempty"`
+	}{SendToUzi: sendToUzi}
+	if err := c.postJSON(ctx, "/api/findings/"+url.PathEscape(id)+"/issue", req, &out); err != nil {
 		return apitypes.IncidentalFindingFileResultDTO{}, err
 	}
 	return out, nil
@@ -146,11 +149,12 @@ func (c *HTTPClient) GetFindingGroupIssueDraft(ctx context.Context, dispositionI
 	return out, nil
 }
 
-func (c *HTTPClient) FileFindingGroup(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
-	// Only ids are sent: the server renders the default group text. doJSONRead (not postJSON) so
+func (c *HTTPClient) FileFindingGroup(ctx context.Context, dispositionIDs []string, sendToUzi bool) (apitypes.FindingGroupFileResultDTO, bool, error) {
+	// Send ids and the optional sendToUzi opt-in; the server renders the default group text.
+	// Use doJSONRead (not postJSON) so
 	// the 201/202 split stays visible; decode2xx already accepts any 2xx and maps the rest.
 	const path = "/api/findings/issue"
-	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, apitypes.FindingGroupFileRequest{IDs: dispositionIDs})
+	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, apitypes.FindingGroupFileRequest{IDs: dispositionIDs, SendToUzi: sendToUzi})
 	if err != nil {
 		return apitypes.FindingGroupFileResultDTO{}, false, err
 	}
@@ -270,7 +274,7 @@ func (c *HTTPClient) GetReviewIssueDraft(ctx context.Context, runID, recID strin
 }
 
 func (c *HTTPClient) FileReviewIssue(ctx context.Context, runID, recID, repoID, title, description string) (ReviewIssueFileResult, error) {
-	// Unlike FileFinding's empty body, the review file endpoint decodes fileIssueRequest
+	// Unlike FileFinding's default empty body, the review file endpoint decodes fileIssueRequest
 	// {repo_id,title,description} — all three required — so the CLI sends the draft defaults it
 	// just fetched (the web is the rich editor). postJSON routes a non-2xx through statusError,
 	// so 404→ExitNotFound and 409→ExitConflict come for free.

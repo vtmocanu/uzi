@@ -1557,6 +1557,9 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		inputs = []workersvc.InputDTO{}
 	}
 	body := map[string]any{"inputs": inputs}
+	if res.TerminalCancelled != nil {
+		body["terminal_cancelled"] = res.TerminalCancelled
+	}
 	// PRD #1247 M5 (D3/D4, step 2): surface the held-state switch signal on EVERY inputs
 	// response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll
 	// this route continuously) — so the worker holding the current claim learns a switch was

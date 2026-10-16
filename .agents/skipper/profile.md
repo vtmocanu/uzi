@@ -116,7 +116,8 @@
 - Before filing, check duplicates and fixes already on main or in the deployed
   worker version; link existing issues/fixes instead of duplicating them.
 - Have the pair file a buddy-approved issue for a uzi defect. Default to
-  `priority::high` when it crashed or lost a run; otherwise use the taxonomy.
+  `priority::high` when it failed, crashed or lost a run, or its fix prevents
+  failed runs; otherwise use the taxonomy.
   High/urgent filing or dispatch still requires AGENTS.md's independent opus/xhigh review.
 - Have the pair dispatch the fix as a run, or fix locally when faster; steer its
   plan gate via `uzi-watcher` and land via `uzi-lander`. Respect dispatches barriers and grants.
