@@ -72,22 +72,23 @@ func TestPlanRevisionWitnessRestorationLiveDB(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, "SELECT applied_at IS NULL FROM run_user_inputs WHERE id=$1", inputID).Scan(&pending); err != nil || !pending {
 		t.Fatalf("restoration settled unanswered feedback: pending=%v err=%v", pending, err)
 	}
-	// Ordinary approval cannot silently replace the frozen milestone contract.
+	// Ordinary approval must wait for unanswered feedback.
 	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil,
-		SubmitInputOptions{ExpectedGateRevision: i64(1)}); !errors.Is(err, ErrReconciliationRequired) {
-		t.Fatalf("ordinary approval of changed contract: %v", err)
+		SubmitInputOptions{ExpectedGateRevision: i64(1)}); !errors.Is(err, ErrPlanRevisionPending) {
+		t.Fatalf("ordinary approval with pending feedback: %v", err)
 	}
 	// Old consent fails the state CAS before the witness-readiness check.
 	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationConflict) {
 		t.Fatalf("stale reset consent accepted: %v", err)
 	}
-	// Fresh consent cannot renew the restored witness's old captured revise count.
+	// Fresh consent still cannot approve unanswered feedback. The standalone
+	// stale-witness test settles feedback before checking witness readiness.
 	var err error
 	opts.ExpectedResetStateDigest, err = ResetStateDigest(restored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrPlanRevisionPending) {
 		t.Fatalf("restored stale witness accepted for reset: %v", err)
 	}
 	if reconciliationRow(t, f, id).ClaimReleasedAt.Valid {
@@ -203,7 +204,7 @@ func TestPlanRevisionWitnessReceiptReplayLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrPlanRevisionPending) {
 		t.Fatalf("receipt replay renewed stale witness readiness: %v", err)
 	}
 	var pending bool

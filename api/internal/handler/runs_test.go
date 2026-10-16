@@ -1990,3 +1990,28 @@ func (s *runsStore) LeadDispatchCompletionIDsForRun(_ context.Context, _ uuid.UU
 	}
 	return s.completionIDRows, nil
 }
+
+// Approval admission uses an explicit transaction and query binding in unit tests.
+func (s *runsStore) Begin(context.Context) (pgx.Tx, error) { return &runsApprovalTx{store: s}, nil }
+func (s *runsStore) GetRunByIDForUpdate(context.Context, uuid.UUID) (store.Run, error) {
+	r := s.run
+	r.UserID = s.ownerID
+	return r, nil
+}
+
+type runsApprovalTx struct {
+	pgx.Tx
+	store *runsStore
+}
+
+func (t *runsApprovalTx) ApprovalStore() workersvc.Store { return t.store }
+func (t *runsApprovalTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.NewCommandTag("SET"), nil
+}
+func (t *runsApprovalTx) QueryRow(context.Context, string, ...any) pgx.Row { return runsApprovalRow{} }
+func (t *runsApprovalTx) Commit(context.Context) error                     { return nil }
+func (t *runsApprovalTx) Rollback(context.Context) error                   { return nil }
+
+type runsApprovalRow struct{}
+
+func (runsApprovalRow) Scan(dest ...any) error { *dest[0].(*bool) = false; return nil }

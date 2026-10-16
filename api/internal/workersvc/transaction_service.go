@@ -5,18 +5,28 @@ package workersvc
 // wrappers use it while holding their transaction's run lock.
 //
 // Child call inventory:
+//
 //   - requestCompletionPermitLocked, recordCompletionAttemptLocked,
 //     setRunCompletionHoldLocked and consumeInputsLocked use q.
+//
 //   - ReportWallPark, setCheckpointDurability, setLimitWaitLocked and
 //     setRecoveryWait use q, p and now (ownerJudgeBindMode also uses q).
+//
 //   - appendMessagesLocked/foldRunUsage use q; foldUsageTailStamps must wait
 //     for the parent's post-commit call, so txBeginner stays nil.
+//
 //   - SetState's pause_failed/credential_switch/credential_switch_failed arms
 //     use q; their parent publishes/notifies after commit.
+//
 //   - evaluateAutoStopLocked uses q, p, now and the guarded persistFail tracker;
 //     its parent owns the transaction and post-commit terminal effects.
+//
 //   - forgeForRetention uses q, box and forgeBaseURLAllowed; capabilityGate
 //     uses q and capabilitySettings; rosterFor and submitScopeCeiling use q.
+//
+//   - submitInputForRun approval uses q, p and capabilitySettings for admission,
+//     roster validation, milestone/contract/budget freeze, enqueue and override.
+//     Its caller owns the transaction and checks pending revisions after locking.
 //
 // Trackers retain their own guarded identity. Job generation, promoter queues,
 // sweeper cursors, atomics and locks are fresh zero values, never copied.
