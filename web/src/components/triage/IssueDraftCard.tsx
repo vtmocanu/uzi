@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { type Repo } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { stripUnsafeChars } from "../../lib/safeText";
@@ -33,7 +33,12 @@ export interface IssueDraftValues {
   title: string;
   description: string;
   labels: string[];
+  send_to_uzi?: boolean;
 }
+
+export const SEND_TO_UZI_HELP =
+  "Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.";
+export const SEND_TO_UZI_CONFIRMED = "Queued for uzi: starts on the next sync if autopilot is on";
 
 // IssueDraftCard is the single "Draft issue" card for filing a forge issue, serving BOTH
 // surfaces the PRD folds together: the judge/run page (a repo `Select`, seeded to the draft's
@@ -55,6 +60,7 @@ export function IssueDraftCard({
   repos,
   fixedRepoLabel,
   staleWarning,
+  allowSendToUzi = false,
 }: {
   loadDraft: () => Promise<IssueDraftSeed>;
   onCreate: (values: IssueDraftValues) => Promise<void>;
@@ -65,8 +71,10 @@ export function IssueDraftCard({
   fixedRepoLabel?: string;
   // Optional "filed for an earlier version of this recommendation" line under the header.
   staleWarning?: string;
+  allowSendToUzi?: boolean;
 }) {
   const demo = useDemoMode();
+  const sendHelpId = useId();
   const needsRepo = repos !== undefined;
 
   const [seed, setSeed] = useState<IssueDraftSeed | null>(null);
@@ -75,6 +83,7 @@ export function IssueDraftCard({
   const [repoId, setRepoId] = useState("");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [sendToUzi, setSendToUzi] = useState(false);
   const [busy, setBusy] = useState(false);
   const [createErr, setCreateErr] = useState("");
 
@@ -90,6 +99,7 @@ export function IssueDraftCard({
     try {
       const s = await loadRef.current();
       setSeed(s);
+      setSendToUzi(false);
       setRepoId(s.defaultRepoId ?? "");
       // Issue #124 / LOW-1: strip Cf/control chars from what UZI supplies, leave what the USER
       // types alone. These are controlled inputs, so the state IS what gets POSTed — filtering
@@ -112,7 +122,13 @@ export function IssueDraftCard({
     setCreateErr("");
     setBusy(true);
     try {
-      await onCreate({ repoId, title, description, labels: seed?.labels ?? [] });
+      await onCreate({
+        repoId,
+        title,
+        description,
+        labels: seed?.labels ?? [],
+        ...(allowSendToUzi && sendToUzi ? { send_to_uzi: true } : {}),
+      });
       // Success: the surface refetches and stops rendering this card. Nothing more to do here.
     } catch (e) {
       // The forge rejected the write: keep the card open with the edits intact.
@@ -227,11 +243,31 @@ export function IssueDraftCard({
                   </Badge>
                 ))}
               </div>
-              <p className="text-xs text-faint">
-                Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
-                Start.
-              </p>
+              {!(allowSendToUzi && sendToUzi) && (
+                <p className="text-xs text-faint">
+                  Lands on the board and is startable without a PRD file. No autopilot label — nothing runs until you click
+                  Start.
+                </p>
+              )}
             </div>
+
+            {allowSendToUzi && (
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    aria-describedby={sendHelpId}
+                    checked={sendToUzi}
+                    disabled={busy}
+                    onChange={(e) => setSendToUzi(e.target.checked)}
+                  />
+                  Send to uzi
+                </label>
+                <p id={sendHelpId} className="text-xs text-faint">
+                  {SEND_TO_UZI_HELP}
+                </p>
+              </div>
+            )}
 
             <div className="flex flex-wrap gap-2 pt-0.5">
               <Button size="sm" disabled={busy || title.trim() === "" || (needsRepo && !repoId)} onClick={create}>

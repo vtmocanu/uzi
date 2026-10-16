@@ -264,7 +264,7 @@ describe("Findings page — state chips (PRD #1183 vocabulary)", () => {
 });
 
 describe("Findings page — File issue via the shared draft card", () => {
-  it("opens the fixed-repo draft and posts the edits to fileFinding(finding_id)", async () => {
+  it.each([false, true])("posts the row draft with send_to_uzi=%s", async (sendToUzi) => {
     mockApi.findingIssueDraft.mockResolvedValue({
       title: "File race in sweepLoop",
       description: "The ticker leaks on early return.",
@@ -290,6 +290,7 @@ describe("Findings page — File issue via the shared draft card", () => {
     expect(within(draft).getByText("vtmocanu/uzi")).toBeTruthy();
 
     fireEvent.change(screen.getByDisplayValue(/File race in sweepLoop/), { target: { value: "edited title" } });
+    if (sendToUzi) fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
 
     await waitFor(() =>
@@ -297,11 +298,14 @@ describe("Findings page — File issue via the shared draft card", () => {
         title: "edited title",
         description: "The ticker leaks on early return.",
         labels: ["bug"],
+        ...(sendToUzi ? { send_to_uzi: true } : {}),
       }),
     );
     // Filed state is the shared "Filed #N" link chip.
     const link = await screen.findByRole("link", { name: /Filed #512/ });
     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/512");
+    expect(!!screen.queryByText("Queued for uzi: starts on the next sync if autopilot is on")).toBe(sendToUzi);
+    if (sendToUzi) expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
   });
 });
 
@@ -917,6 +921,7 @@ describe("Findings page - File as one issue (issue #1724)", () => {
 
     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "edited" } });
     const listCalls = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
 
     await waitFor(() =>
@@ -925,11 +930,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
         title: "edited",
         description: "1. Alpha\n2. Beta",
         labels: ["uzi"],
+        send_to_uzi: true,
       }),
     );
     await screen.findByText(/Filed 2 findings as issue #77\. Issue created but two rows failed to settle\./);
     await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+    expect(screen.getByText("Queued for uzi: starts on the next sync if autopilot is on")).toBeTruthy();
+    expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Filed #77/ }).getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
     // Selection cleared, so the bar is gone.
     expect(screen.queryByRole("button", { name: "File as one issue" })).toBeNull();
   });
@@ -946,12 +955,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Alpha bug");
     tick("Beta bug");
     fireEvent.click(groupButton());
-    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
     await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202 \(returned_uncertain\)\./);
     expect(screen.getByText(/uzi findings release op-202 --confirm-no-issue/)).toBeTruthy();
     expect(screen.getByText(/deadline has passed/)).toBeTruthy();
     expect(screen.getByText(/Check the forge/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
   });
 
   it("409 closes the card, reloads and explains the rows were already filed", async () => {
@@ -962,12 +974,15 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     const listCalls = mockApi.listFindings.mock.calls.length;
-    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
     await screen.findByText(/already filed or are being filed/);
     // The selection clears on a 409, so the bar is gone.
     expect(screen.queryByRole("button", { name: "File as one issue" })).toBeNull();
     await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
   });
 
   it("201 with a warning keeps the operation id and phase and shows NO release hint (issue_recorded)", async () => {
@@ -1131,8 +1146,11 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     fireEvent.click(groupButton());
     await screen.findByRole("button", { name: "Create issue" });
     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "kept edit" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
     await screen.findByText(/forge rejected the request/);
     expect(screen.getByDisplayValue("kept edit")).toBeTruthy();
+    expect((screen.getByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
   });
 });
