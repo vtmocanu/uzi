@@ -317,6 +317,22 @@ expect 1 "branch-new fragment deleted in workingtree cannot supply entry"
 fresh shipping-newline-path; mkdir -p "$W/api"; echo x > "$W/api/"$'new\nfile.go'
 expect 1 "shipping filename with newline is not lost"
 
+# Legacy limits still apply during migration when the fragment directory is absent.
+for budget in pending full; do
+  fresh "missing-directory-$budget-budget"
+  rm -rf "$W/changelog.d"
+  python3 - "$W/CHANGELOG.md" "$budget" <<'PYFIX'
+from pathlib import Path
+import sys
+if sys.argv[2] == 'pending':
+    content = b'## [Unreleased]\n### Fixed\n- ' + b'x' * 4194304 + b'\n'
+else:
+    content = b'## [Unreleased]\n\n## [0.1.0]\n' + b'x' * 16777216 + b'\n'
+Path(sys.argv[1]).write_bytes(content)
+PYFIX
+  expect 1 "missing fragment directory cannot bypass $budget legacy budget"
+done
+
 # Limits precede all exemptions and cover actual bounded fragment reads.
 for exemption in none docs deps; do
   fresh "safety-limit-$exemption"

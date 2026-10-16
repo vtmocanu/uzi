@@ -107,13 +107,14 @@ changelog_fragment_safe_entries() (
   work=$(mktemp -d .uzi/scratch/changelog-sizes.XXXXXX) || return 1
   trap 'rm -rf "$work"' EXIT
   changelog_fragment_directory || return 1
-  [ -d changelog.d ] || return 0
-  changelog_fragment_paths "$work" || return 1
-  while IFS= read -r path; do
-    changelog_fragment_snapshot "$path" "$work/input" 65536 || return 1
-    total=$((total + $(wc -c < "$work/input")))
-    [ "$total" -le 4194304 ] || { changelog_fragment_error 'pending input exceeds 4194304 bytes'; return 1; }
-  done < "$work/paths"
+  if [ -d changelog.d ]; then
+    changelog_fragment_paths "$work" || return 1
+    while IFS= read -r path; do
+      changelog_fragment_snapshot "$path" "$work/input" 65536 || return 1
+      total=$((total + $(wc -c < "$work/input")))
+      [ "$total" -le 4194304 ] || { changelog_fragment_error 'pending input exceeds 4194304 bytes'; return 1; }
+    done < "$work/paths"
+  fi
   # PR checks share the full-file and combined pending budget, without parsing
   # released history as entries or changing inherited legacy acceptance.
   if [ -f CHANGELOG.md ] && [ ! -L CHANGELOG.md ]; then
