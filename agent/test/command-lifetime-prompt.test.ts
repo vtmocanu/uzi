@@ -50,7 +50,8 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
     assert.match(append, /long_running: true/);
     assert.match(append, /fixed 120-minute bound/);
     assert.match(append, /Child agents cannot/);
-    assert.match(append, /Read on its known log path/);
+    assert.match(append, /use Read only when observing its known log path can/);
+    assert.match(append, /Do not re-read unchanged output or repeat unchanged status updates/);
     assert.match(append, /no[\s\S]*automatic extension or per-command cancel API/);
     assert.match(append, /run wall parks the run/);
     assert.ok(append.includes('echo "EXIT=$rc"'));
