@@ -53,8 +53,17 @@ func TestPolicyLateHoldResourceProjectionLiveDB(t *testing.T) {
 		t.Fatal("hold lost unreleased pause")
 	}
 	latePolicyExec(t, e, "UPDATE workers SET ephemeral=true,ephemeral_run_id=$2 WHERE id=$1", e.wkr.ID, e.runID)
-	if n, err := store.ReapEphemeralWorkers(e.ctx, e.pool, pgconv.Time(time.Now().Add(time.Hour)), pgtype.Interval{}); err != nil || n != 0 {
-		t.Fatalf("held ephemeral reap=%d err=%v", n, err)
+	idleWorker := uuid.New()
+	latePolicyExec(t, e, "INSERT INTO workers(id,user_id,name,token_hash,status,ephemeral) VALUES($1,$2,'policy-unrelated-reap',$3,'offline',true)", idleWorker, e.userID, idleWorker[:])
+	if _, err := store.ReapEphemeralWorkers(e.ctx, e.pool, pgconv.Time(time.Now().Add(time.Hour)), pgtype.Interval{}); err != nil {
+		t.Fatal(err)
+	}
+	var heldExists, idleExists bool
+	if err := e.pool.QueryRow(e.ctx, "SELECT EXISTS(SELECT 1 FROM workers WHERE id=$1), EXISTS(SELECT 1 FROM workers WHERE id=$2)", e.wkr.ID, idleWorker).Scan(&heldExists, &idleExists); err != nil {
+		t.Fatal(err)
+	}
+	if !heldExists || idleExists {
+		t.Fatalf("reaper must retain the held worker and remove the unrelated idle worker: held=%t idle=%t", heldExists, idleExists)
 	}
 	for generation := 2; generation <= 8; generation++ {
 		latePolicyExec(t, e, `INSERT INTO recovery_custody_holds(user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)

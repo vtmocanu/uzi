@@ -1,7 +1,7 @@
 package workersvc
 
 import (
-	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -155,10 +155,11 @@ func TestPolicyPendingExpiredLeaseAllowsOtherClaimLiveDB(t *testing.T) {
 	// Own-current-G conversion is covered by TestPolicyHoldAnyGenerationWithoutCustodyLiveDB.
 	req.SourceGeneration = claimed.ClaimGeneration
 	req.ClaimGeneration = claimed.ClaimGeneration
-	if _, _, err := x.f.svc.ReportPolicyHold(x.env.ctx, x.f.wkr, x.f.runID, req); !errors.Is(err, ErrRunNotOwned) {
-		t.Fatalf("foreign-current-generation report=%v", err)
+	before := mustRun(t, x.env, x.f.runID)
+	if _, disposition, err := x.f.svc.ReportPolicyHold(x.env.ctx, x.f.wkr, x.f.runID, req); err != nil || disposition != PolicyHoldUnauthenticatedHistoricalOutcome {
+		t.Fatalf("foreign-current-generation report: disposition=%s err=%v", disposition, err)
 	}
-	if got := mustRun(t, x.env, x.f.runID); got.PolicyRefusalCount != 0 || got.WorkerID != pgconv.UUID(otherID) {
+	if got := mustRun(t, x.env, x.f.runID); !reflect.DeepEqual(before, got) {
 		t.Fatal("rejected original-worker report changed the new owner's run")
 	}
 }
