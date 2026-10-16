@@ -148,13 +148,16 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# Give handler and workersvc LiveDB suites 20m of timeout headroom on hosted workers.
-# This is not a speedup. Reset other packages to 10m on every iteration,
-# and stop on any failed pipeline before the next one.
+# Keep local LiveDB deadlines bounded per package. With artifact admission coverage,
+# workersvc takes nearly 18m in isolation and integrated sweeps exceeded 20m (#2866),
+# so give it 30m of headroom; handler retains 20m. This changes no test selection or
+# race/skip checks and is not a speedup. Reset other packages to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/handler/..." ] || [ "$p" = "./internal/workersvc/..." ]; then
+  if [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
+  elif [ "$p" = "./internal/workersvc/..." ]; then
+    timeout=30m
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
