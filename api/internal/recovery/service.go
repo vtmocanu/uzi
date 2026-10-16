@@ -235,19 +235,53 @@ func (s *Service) upload(ctx context.Context, wkr store.Worker, runID, captureID
 	return s.stream(ctx, wkr, runID, captureID, manifest, body)
 }
 
-// lockCapture row-locks the capture and applies the authorization every upload transaction shares:
+// lockCapture locks guarded custody before the capture and applies the authorization every upload transaction shares:
 // the capture must belong to this run + owner, be held by THIS worker, and its hold must be open. A
 // different/later worker cannot adopt authority on a terminal run; the run's own status is
 // irrelevant here (post-terminal recovery, D2). A DIFFERENT manifest already bound under this id is
 // a conflict, never an overwrite.
 func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (lockedCapture, error) {
+	// Resolve immutable identity without locking the child first. Guarded streams share
+	// FINAL's hold -> capture order and retain the hold lock through commit.
+	var holdID uuid.UUID
+	var guarded bool
+	if err := tx.QueryRow(ctx, `SELECT c.hold_id, h.inventory_guarded
+		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id=c.hold_id
+		WHERE c.id=$1 AND c.run_id=$2 AND c.user_id=$3`,
+		captureID, runID, wkr.UserID).Scan(&holdID, &guarded); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return lockedCapture{}, ErrCaptureNotFound
+		}
+		return lockedCapture{}, err
+	}
+	if guarded {
+		var eligible bool
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((h.inventory_guarded AND h.state='open' AND h.run_id=$2 AND h.user_id=$3
+			 AND h.original_worker_id=$4 AND h.live_worker_id=$4 AND h.live_run_id=$2
+			 AND h.repo_id=r.repo_id AND h.user_id=r.user_id AND h.generation>0
+			 AND h.generation<=r.claim_generation), false)
+			FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
+			WHERE h.id=$1 FOR NO KEY UPDATE OF h`,
+			holdID, runID, wkr.UserID, wkr.ID).Scan(&eligible); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return lockedCapture{}, ErrNotAuthorized
+			}
+			return lockedCapture{}, err
+		}
+		if !eligible {
+			return lockedCapture{}, ErrNotAuthorized
+		}
+	}
 	var lc lockedCapture
+	var linkedHold uuid.UUID
 	err := tx.QueryRow(ctx, `SELECT c.run_id, c.user_id, c.original_worker_id, c.state, c.manifest_bound,
-			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes, c.prerequisite_shas
+			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes, c.prerequisite_shas,
+			c.hold_id
 		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id = c.hold_id
 		WHERE c.id = $1 FOR UPDATE OF c`, captureID).Scan(
 		&lc.runID, &lc.userID, &lc.origWorker, &lc.state, &lc.bound,
-		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes, &lc.prerequisites)
+		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes, &lc.prerequisites,
+		&linkedHold)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return lockedCapture{}, ErrCaptureNotFound
@@ -258,6 +292,9 @@ func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captur
 		return lockedCapture{}, ErrCaptureNotFound
 	}
 	if !lc.origWorker.Valid || uuid.UUID(lc.origWorker.Bytes) != wkr.ID {
+		return lockedCapture{}, ErrNotAuthorized
+	}
+	if linkedHold != holdID {
 		return lockedCapture{}, ErrNotAuthorized
 	}
 	if lc.holdState != "open" {
@@ -461,9 +498,9 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 // nobody is admitted into room that is already spoken for); a reservation that loses the race to a
 // bind simply fails ErrQuota at its own bind and is retried through admit.
 //
-// LOCK ORDER. This transaction already holds the capture row lock (lockCapture, FOR UPDATE OF c)
-// when it takes the stored-files advisory keys here (store.LockStoredFiles: owner key, then the
-// shared key). admit takes them in the same order (capture row, then advisory keys). The other
+// LOCK ORDER. Guarded uploads lock the exact hold FOR NO KEY UPDATE before the capture
+// FOR UPDATE, then the stored-files advisory keys (owner key, then shared key). admit and
+// stream use the same order. Unguarded legacy uploads retain capture -> advisory order. The other
 // holders of the advisory keys (job-file Reserve and Sweep) take nothing but those keys and
 // job_files rows, never a recovery_captures row, so no path waits on a capture row while holding an
 // advisory key and the cycle cannot close. A job_files row this reclaim updates is never one a

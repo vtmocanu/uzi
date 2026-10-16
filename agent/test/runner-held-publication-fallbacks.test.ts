@@ -8,7 +8,7 @@ import type { HeldPublishResult } from "../src/client.js";
 import { fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, SERVER_CAPTURE_ID, assertCustodyRetained, badRequest, bare, command, commit,
-  failedStates, failingWork, frozenRecords, heldServer, patShaped, pinRef, recoveryOf, redrive, retained, skipCheckpoints,
+  failedStates, failingWork, frozenRecords, heldServer, patShaped, pinRef, redrive, retained, skipCheckpoints,
   watchFreezes, type FinalCall, type HeldCall, type HeldServer, type Work,
 } from "./runner-held-publication-fixture.js";
 
@@ -23,12 +23,11 @@ interface Scenario {
   server: HeldServer;
   work: Partial<Work>;
   r: ReturnType<typeof runner>;
-  capture: ReturnType<typeof mock.method>;
 }
 
 let nextIid = 2600;
 async function scenario(opts: {
-  setup?: (s: Omit<Scenario, "capture">) => void | Promise<void>;
+  setup?: (s: Scenario) => void | Promise<void>;
   extra?: (ctx: RunContext) => Promise<void> | void;
   features?: readonly string[];
   failWith?: string;
@@ -41,18 +40,16 @@ async function scenario(opts: {
   skipCheckpoints();
   const work: Partial<Work> = {};
   const r = runner(failingWork(work, opts.extra, opts.failWith), gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1, ...opts.runnerOptions });
-  const capture = mock.method(recoveryOf(r), "captureAndUpload");
   await opts.setup?.({ claim, server, work, r });
   await r.execute(claim);
-  return { claim, server, work, r, capture };
+  return { claim, server, work, r };
 }
 
 /** The fallback outcome: archived on the same record, custody retained until the archive FINAL is ACKed. */
 async function assertArchived(s: Scenario, label: string, expectedHeldCalls: number): Promise<void> {
-  const { claim, server, work, r, capture } = s;
+  const { claim, server, work, r } = s;
   assert.equal(failedStates(claim.run_id).length, 1, `${label}: the honest failed report is sent once`);
   assert.equal(server.heldCalls.length, expectedHeldCalls, `${label}: held upload attempts`);
-  assert.ok(capture.mock.callCount() >= 1, `${label}: the archive capture ran`);
   assert.equal(server.archiveUploads(), 1, `${label}: one archive uploaded`);
   const record = await assertCustodyRetained(server, claim, work, `${label}, archived, FINAL pending`);
   assert.equal(record.state, "uploaded", `${label}: the archive is on the same frozen record`);
@@ -62,13 +59,27 @@ async function assertArchived(s: Scenario, label: string, expectedHeldCalls: num
     assert.equal(server.holdOpen(), true, `${label}: the hold is open until the archive FINAL is ACKed`);
     assert.equal(server.acked(), 0);
     assert.equal(command(bare(), ["rev-parse", "--verify", pinRef(claim)]), record.inventoryCurrentSha);
-    // The FINAL names a frozen record of this generation (the live pass may also snapshot the
-    // generation afresh, as it does on main; the held path is not involved here).
+    // V1 boot discovery can freeze a new aggregate; FINAL still needs a complete
+    // uploaded record of this exact generation. V2 identity is tested separately.
     const frozen = await frozenRecords(claim);
-    assert.ok(frozen.some(f => f.sourceSha === call.disposition!.source_sha && f.coverageDigest === call.disposition!.coverage_digest));
+    const finalRecord = frozen.find(f => f.sourceSha === call.disposition!.source_sha &&
+      f.coverageDigest === call.disposition!.coverage_digest);
+    assert.ok(finalRecord, `${label}: FINAL matches a frozen source and coverage`);
+    assert.equal(finalRecord.generation, claim.claim_generation);
+    assert.equal(finalRecord.serverCaptureId, call.disposition!.capture_id);
+    assert.equal(finalRecord.state, "uploaded");
+    assert.equal(finalRecord.selfContained, true);
+    assert.deepEqual(finalRecord.prerequisiteShas, []);
   };
-  server.onFinal = sendFinal;
+  const callbackFailures: unknown[] = [];
+  server.onFinal = async call => {
+    try { await sendFinal(call); }
+    catch (error) { callbackFailures.push(error); throw error; }
+  };
   await redrive(r);
+  // The coordinator keeps custody when its RPC throws. Surface a fixture assertion
+  // here so it cannot be hidden behind the later missing-ACK symptom.
+  if (callbackFailures.length) throw callbackFailures[0];
   assert.equal(server.finals.length, 1, `${label}: exactly one FINAL`);
   assert.equal(server.finals[0]!.disposition?.kind, "archive");
   assert.equal(server.finals[0]!.disposition?.capture_id, SERVER_CAPTURE_ID);
@@ -160,7 +171,7 @@ describe("held publication falls back to the archive", () => {
       },
     });
     assert.equal(s.server.heldCalls.length, 1, "a stale branch does not block the held publication");
-    assert.equal(s.capture.mock.callCount(), 0);
+    assert.equal(s.server.archiveUploads(), 0);
     await assertCustodyRetained(s.server, s.claim, s.work, "stale branch");
   });
 
@@ -206,7 +217,6 @@ describe("held publication falls back to the archive", () => {
       const { claim, server, r } = s;
       assert.equal(failedStates(claim.run_id).length, 1);
       assert.equal(server.heldCalls.length, 0, "no held upload without the feature");
-      assert.ok(s.capture.mock.callCount() >= 1, "the archive capture ran in the ordinary place");
       assert.ok(server.archiveUploads() >= 1);
       assert.equal(server.holdOpen(), true, "the hold stays open until the archive FINAL is ACKed");
       assert.equal(server.acked(), 0);
@@ -234,15 +244,16 @@ describe("held publication falls back to the archive", () => {
       commit(ctx.worktreePath, "committed.txt", "work\n");
       return { branch: ctx.branch };
     } }, fakeGitlab().gitlab, JOIN_TOKEN, { github });
-    const capture = mock.method(recoveryOf(r), "captureAndUpload");
     await r.execute(claim);
     assert.equal(failedStates(claim.run_id)[0]!.fail_origin, "push_secret_blocked");
     assert.equal(server.heldCalls.length, 0, "a secret-blocked run never reaches step A");
-    assert.ok(capture.mock.callCount() >= 1, "it archives, as before");
+    assert.equal(server.archiveUploads(), 1, "the secret-blocked run archives, as before");
+    assert.equal((await frozenRecords(claim))[0]?.state, "uploaded");
     const residue = await scenario({ failWith: `${REASON_WORKER_RESIDUE_BLOCKED}: a process survived` });
     assert.equal(failedStates(residue.claim.run_id)[0]!.fail_origin, "worker_residue_blocked");
     assert.equal(residue.server.heldCalls.length, 0);
-    assert.ok(residue.capture.mock.callCount() >= 1);
+    assert.ok(residue.server.archiveUploads() >= 1, "the ordinary residue-blocked flow archives");
+    assert.equal((await frozenRecords(residue.claim))[0]?.state, "uploaded");
   });
 
   it("only a failed terminal can defer: cancelled, parked and completed never do", async () => {
@@ -317,7 +328,6 @@ describe("a held FINAL the api refuses", () => {
       assert.equal(server.archiveUploads(), 1);
       assert.equal(server.acked(), 1);
       assert.equal(server.holdOpen(), false);
-      assert.equal(s.capture.mock.callCount(), 0, "the fallback capture ran from the replay, not the settle");
       assert.ok((await frozenRecords(claim)).length <= 1, "never a second record for the generation (cleanup may already have run)");
     });
   }
@@ -345,7 +355,6 @@ describe("a held FINAL the api refuses", () => {
       const kept = await assertCustodyRetained(server, claim, work, "after non-definitive refusals");
       assert.deepEqual(kept.finalRequest, journaled.finalRequest, "the journaled FINAL is kept, not cleared");
       assert.equal(server.archiveUploads(), 0, "no archive is captured for lack of fresh proof");
-      assert.equal(s.capture.mock.callCount(), 0);
 
       // A restart replays the very same request; this time the api releases.
       server.finalAnswer = ({ disposition }) => ({ run_id: claim.run_id, generation: claim.claim_generation!, released: true, holds_released: 1, ...(disposition ? {} : {}) });
@@ -453,7 +462,6 @@ describe("a WIP transfer that fails retains custody", () => {
     const { claim, server, work, r } = s;
     assert.equal(failedStates(claim.run_id).length, 1, "the honest failure is still reported");
     assert.equal(server.heldCalls.length, 0);
-    assert.equal(s.capture.mock.callCount(), 0);
     assert.equal(server.archiveUploads(), 0);
     assert.equal(server.finals.length, 0, "no FINAL");
     assert.equal(server.holdOpen(), true, "the hold stays open");

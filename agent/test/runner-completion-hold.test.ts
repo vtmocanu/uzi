@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Executor, RunContext } from "../src/executor.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { MessageBatcher } from "../src/batcher.js";
 import {
   api,
@@ -514,3 +515,31 @@ describe("completion hold streamed ownership bounds", () => {
     });
   }
 });
+
+for (const route of ["POST", "ownership probe"] as const) {
+  it(`first cancelled completion hold ${route} stops immediately with one budget`, async () => {
+    const claim = { ...gitlabClaim(2829), claim_generation: 7 };
+    let factories = 0;
+    let stopped = false;
+    let context: RunContext | undefined;
+    const probe = makeHoldExecutor(true, () => {
+      stopped = context!.signal!.aborted;
+      assert.equal(factories, 1);
+    });
+    const run = probe.executor.run.bind(probe.executor);
+    probe.executor.run = async (ctx) => { context = ctx; return run(ctx); };
+    if (route === "POST") api.setCompletionHoldResponse("cancelled", 200);
+    else {
+      api.completionHoldWire.set(claim.run_id, res => { res.writeHead(200); res.end(""); });
+      api.committedHoldOwnership.set(claim.run_id, { ...exactTerminal, status: "cancelled" });
+    }
+    const forge = fakeGitlab();
+    await runnerWith(() => ({ executor: probe.executor }), forge.gitlab, undefined, undefined, {
+      cancellationBudgetFactory: () => { factories++; return new MaintenanceBudget(); },
+    }).execute(claim);
+    assert.equal(stopped, true, "model is stopped before the hold caller resumes");
+    assert.equal(probe.held.value, false);
+    assert.equal(factories, 1, "later terminal handling must reuse the first budget");
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+  });
+}

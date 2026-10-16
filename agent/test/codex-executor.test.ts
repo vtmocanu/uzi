@@ -18547,6 +18547,36 @@ describe("2833 Codex inline summaries", () => {
       }
     });
   }
+  it("2833 exhausted summary bound reports intent abandonment before teardown", async () => {
+    const { rig, intents } = summaryRig();
+    let input: IntentSummaryInput | undefined;
+    let resolve!: (value: string) => void;
+    let abandoned = false;
+    const log = { ...noopLog, warn: (message: string) => {
+      if (message === "intent summary did not settle within the bound") abandoned = true;
+    } };
+    const summaryRunner = {
+      generateIntentSummary: (i: IntentSummaryInput) => {
+        input = i;
+        return new Promise<string>(r => { resolve = r; });
+      },
+      generatePlanSummary: async () => null,
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY), log, undefined, provider, { summaryRunner });
+    const { ctx, emitted } = makeCtx({ reportIteration: async () => {
+      await waitForSummary(() => input !== undefined, "intent started");
+      const proof = await executor.settleForCredentialFreeCapture(0);
+      assert.equal(proof.kind, "incomplete", "an expired capture cannot authorize registry proof");
+      assert.equal(input?.signal?.aborted, true);
+      assert.equal(abandoned, true, "exhausted bound reports abandonment synchronously");
+      throw new Error("capture-ended-run");
+    } });
+    await assert.rejects(executor.run(ctx), /capture-ended-run/);
+    input?.onUsage?.(usage);
+    resolve("Too late"); await drain();
+    assert.deepEqual(intents, []);
+    assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 0);
+  });
   it("2833 terminal intent cooperatively settles before provider teardown", async () => {
     const { rig } = summaryRig();
     let input: IntentSummaryInput | undefined;

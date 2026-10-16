@@ -24,7 +24,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Held-work publication, step A (issue #2545): a failed run's worker uploads one pack and the
+// Held-work publication, step A (issues #2545, #3030): the exact terminal custodian uploads one pack and the
 // API creates refs/uzi-held/<run-id>/<generation> with the stored connection credential. The
 // worker names only the tip, the generation and the coverage digest; the repository, user,
 // worker, ref and credential are all derived here from the hold and the run.
@@ -123,7 +123,8 @@ var heldHoldKinds = []string{runkind.Issue, runkind.CIFix, runkind.SelfImprove, 
 // when none exists. It returns nil when step A may proceed for this run and hold.
 func heldScope(wkr store.Worker, run store.Run, hold store.RecoveryCustodyHold, found bool, req HeldPublishRequest) *HeldRefusal {
 	refuse := func(reason string) *HeldRefusal { return &HeldRefusal{Reason: reason} }
-	if run.Status != "failed" {
+	v2 := slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2)
+	if run.Status != "failed" && (!v2 || (run.Status != "cancelled" && run.Status != "completed")) {
 		return refuse(HeldReasonNotFailed)
 	}
 	if run.FailOrigin.Valid && (run.FailOrigin.String == "push_secret_blocked" || run.FailOrigin.String == "worker_residue_blocked") {
@@ -132,14 +133,15 @@ func heldScope(wkr store.Worker, run store.Run, hold store.RecoveryCustodyHold, 
 	if !slices.Contains(heldHoldKinds, run.Kind) {
 		return refuse(HeldReasonUnsupported)
 	}
-	if run.ClaimGeneration != req.Generation {
+	if req.Generation <= 0 || run.ClaimGeneration < req.Generation || (!v2 && run.ClaimGeneration != req.Generation) {
 		return refuse(HeldReasonGenerationMismatch)
 	}
 	if !found || hold.State != "open" || !hold.InventoryGuarded || !hold.LiveWorkerID.Valid ||
-		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID || hold.Generation != req.Generation {
+		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID || hold.OriginalWorkerID != wkr.ID ||
+		hold.RunID != run.ID || hold.LiveRunID != pgconv.UUID(run.ID) || hold.Generation != req.Generation {
 		return refuse(HeldReasonHoldMissing)
 	}
-	if run.WorkerID != pgconv.UUID(hold.OriginalWorkerID) {
+	if !v2 && run.WorkerID != pgconv.UUID(hold.OriginalWorkerID) {
 		return refuse(HeldReasonGenerationMismatch)
 	}
 	if !hold.RepoID.Valid || run.RepoID != hold.RepoID || hold.UserID != wkr.UserID || run.UserID != wkr.UserID {
@@ -173,14 +175,26 @@ type heldAdmission struct {
 }
 
 // heldAdmit is the unlocked pre-body admission: no forge call and no write. It checks, in
-// order, that the run is owned by this worker (ErrRunNotOwned), the switch and the worker's
-// capability, the D1 scope, and then loads the publication row if one exists.
+// order, the run's owner and lane (plus current worker ownership for V1), the switch
+// and worker capability, exact custody scope, then any existing publication row.
 func (s *Service) heldAdmit(ctx context.Context, wkr store.Worker, runID uuid.UUID, req HeldPublishRequest) (heldAdmission, error) {
-	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	var run store.Run
+	var err error
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) {
+		run, err = s.q.GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = ErrRunNotOwned
+		}
+		if err == nil && ((run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr)) {
+			err = ErrRunNotOwned
+		}
+	} else {
+		run, err = s.runOwnedByWorker(ctx, runID, wkr)
+	}
 	if err != nil {
 		return heldAdmission{}, err
 	}
-	if !s.p.HeldPublication || !slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV1) {
+	if !s.p.HeldPublication || (!slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV1) && !slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2)) {
 		return heldAdmission{}, &HeldRefusal{Reason: HeldReasonUnsupported}
 	}
 	rd, ok := s.q.(heldReader)
@@ -367,6 +381,19 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 	}
 
 	// The marker is committed; nothing below can be undone by a rollback.
+	if s.heldBeforeSendHook != nil {
+		s.heldBeforeSendHook()
+	}
+	// A settlement observed here suppresses the send but preserves the invocation marker.
+	// A failed read also fails closed. Reconciliation owns this unknown outcome; never resend.
+	hold, herr := s.q.(heldReader).GetHeldPublicationHold(ctx, store.GetHeldPublicationHoldParams{
+		RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: req.Generation,
+	})
+	if herr != nil || hold.ID != pub.HoldID || hold.State != "open" || !hold.InventoryGuarded ||
+		hold.OriginalWorkerID != wkr.ID || hold.LiveWorkerID != pgconv.UUID(wkr.ID) ||
+		hold.LiveRunID != pgconv.UUID(runID) || hold.RepoID != pgconv.UUID(pub.RepoID) {
+		return heldResult(pub), nil
+	}
 	outcome, sendErr := s.heldSendFn(ctx, prepared)
 	var (
 		state, refusal, lastErr string
@@ -406,15 +433,31 @@ func (s *Service) heldInvoke(ctx context.Context, wkr store.Worker, runID uuid.U
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
 	qt := store.New(tx)
-	if _, err = qt.GetWorkerForUpdate(ctx, wkr.ID); err != nil {
+	lockedWorker, err := qt.GetWorkerForUpdate(ctx, wkr.ID)
+	if err != nil {
 		return pub, false, fmt.Errorf("held publication worker lock: %w", err)
 	}
-	run, err := qt.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	if lockedWorker.UserID != wkr.UserID {
+		return pub, false, ErrRunNotOwned
+	}
+	wkr = lockedWorker
+	if !s.p.HeldPublication || (!slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV1) && !slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2)) {
+		return pub, false, &HeldRefusal{Reason: HeldReasonUnsupported}
+	}
+	var run store.Run
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) {
+		run, err = qt.GetRunByIDForUpdate(ctx, runID)
+	} else {
+		run, err = qt.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pub, false, ErrRunNotOwned
 	}
 	if err != nil {
 		return pub, false, fmt.Errorf("held publication run lock: %w", err)
+	}
+	if run.UserID != wkr.UserID || (run.Kind == "cross_check" && run.ClaimGeneration == 0) || laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return pub, false, ErrRunNotOwned
 	}
 	hold, err := qt.GetFinalInventoryHold(ctx, store.GetFinalInventoryHoldParams{
 		RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: req.Generation,

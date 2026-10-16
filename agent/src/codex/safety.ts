@@ -15,6 +15,7 @@
 // injected {@link SpawnRootSeam} (the real one lands in m4 behind the M3a
 // supervisor); everything here is unit-testable with fakes.
 
+import { MaintenanceBudget } from "../maintenance-budget.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { CheckpointChildStartupTimeoutError } from "../harness.js";
 import type {
@@ -336,11 +337,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // installs a fresh release the next caller will await.
     const prior = this.queueTail;
     let release!: () => void;
-    this.queueTail = new Promise<void>((res) => {
-      release = res;
-    });
+    const held = new Promise<void>((res) => { release = res; });
+    this.queueTail = prior.then(() => held);
     try {
-      await prior;
+      await MaintenanceBudget.waitFor(prior);
       return await this.runBoundary(request, action, deadlineAt);
     } finally {
       release();
@@ -361,6 +361,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
    */
   async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const budget = MaintenanceBudget.current();
+    const signal = MaintenanceBudget.signal();
+    const cap = budget?.cap(deadlineMs) ?? (() => remainingMs(deadlineAt));
+    const remaining = () => signal?.aborted ? 0 : Math.min(cap(), MaintenanceBudget.current()?.remainingMs() ?? Infinity);
     const prior = this.queueTail;
     let release!: () => void;
     this.queueTail = new Promise<void>((res) => {
@@ -368,24 +372,30 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     });
     let timer: ReturnType<typeof setTimeout> | undefined;
     let queued = true;
+    let onAbort: (() => void) | undefined;
     try {
       const turn = await Promise.race([
         prior.then(() => "ready" as const),
         new Promise<"expired">((res) => {
-          timer = setTimeout(() => res("expired"), remainingMs(deadlineAt));
+          onAbort = () => res("expired");
+          signal?.addEventListener("abort", onAbort, { once: true });
+          if (remaining() <= 0) { res("expired"); return; }
+          timer = setTimeout(onAbort, remaining());
           timer.unref?.();
         }),
       ]);
       if (timer) clearTimeout(timer);
-      if (turn === "expired") {
+      if (turn === "expired" || remaining() <= 0) {
         return {
           kind: "incomplete",
           errors: [{ category: "timeout", message: "codex capture settle expired in the boundary queue" }],
         };
       }
       queued = false;
-      return await this.registry.settleForCapture(remainingMs(deadlineAt));
+      const proof = await this.registry.settleForCapture(remaining());
+      return proof.kind === "incomplete" ? proof : remaining() <= 0 ? { kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] } : proof;
     } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
       if (queued) void prior.then(release);
       else release();

@@ -6,9 +6,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
@@ -194,6 +197,22 @@ func (h *Handler) WorkerListRecoveryHolds(w http.ResponseWriter, r *http.Request
 	}
 	runID, ok := httpx.PathUUID(w, r, "id", "run")
 	if !ok {
+		return
+	}
+	if values, requested := r.URL.Query()["generation"]; requested && slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2) {
+		// The additive read is capability gated, but not governed by the write switch.
+		response := apitypes.RecoveryExactHoldsResponse{RunID: runID.String(), Holds: []apitypes.RecoveryHoldDTO{}}
+		if len(values) == 1 {
+			generation, err := strconv.ParseInt(values[0], 10, 64)
+			if err == nil && generation > 0 && strconv.FormatInt(generation, 10) == values[0] {
+				response.ExactHold, err = h.recovery().ObserveExactHold(r.Context(), wkr, runID, generation)
+				if err != nil {
+					mapRecoveryError(w, err)
+					return
+				}
+			}
+		}
+		httpx.JSON(w, http.StatusOK, response)
 		return
 	}
 	res, err := h.recovery().ListHoldsForWorkerRun(r.Context(), wkr, runID)

@@ -107,15 +107,17 @@ describe("production code never installs a quiescence test view", () => {
   it("in run-quiescence.ts, `view` is added to a request only from the test-set state", () => {
     const src = code(OWNER);
     // Every `view:` / `view?:` in code: the ScanRequest field, two parameter annotations, and the
-    // one object property, the helper's stdin request built from the test-set view.
+    // two object properties, the budgeted and ordinary helper stdin requests.
     const sites = matches(src, /\S*[ \t]*\bview\??[ \t]*:[ \t]*[A-Za-z]+/g).map((s) => s.trim());
     assert.deepEqual(sites.sort(), [
+      "...req, view: testView",
       "...req, view: testView",
       "setQuiescenceViewForTests(view: QuiescenceView",
       "view?: QuiescenceView",
       "viewReapDeps(view: QuiescenceView",
     ]);
-    assert.match(src, /JSON\.stringify\(testView === undefined \? req : \{ \.\.\.req, view: testView \}\)/);
+    assert.equal(matches(src, /JSON\.stringify\(testView === undefined \? req : \{ \.\.\.req, view: testView \}\)/g).length, 2,
+      "both request sites inject only the test-set view when defined");
     // No other way of attaching one: no `.view =` assignment, no computed "view" key, and no
     // shorthand `view` property (`{ ...req, view }`): a bare `view` followed by "," or "}" that is not
     // a member access or a spread (`o.view`, `...view`).

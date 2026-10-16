@@ -147,6 +147,8 @@ settle "never-terminal run: returns 0 once the timeout passes" 5 running
 # timeout. Any SQL or write endpoint invoked by the admission helper fails the test.
 eval "$(awk '/^wait_custody_headroom\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_forge_park_release\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^held_custody_receipt_valid\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^assert_earlier_held_custody_receipt\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_completed_custody_receipt\(\) \{/,/^\}/' "$LIB")"
 pass() { echo "$*"; }
 apiget() {
@@ -515,6 +517,17 @@ db_psql() {
   [[ "$1" == SELECT* && "$1" != *DELETE* && "$1" != *UPDATE* \
     && "$1" == *"r.id='$UUID'"* && "$1" == *"r.user_id=(SELECT id FROM users"* ]] \
     || fail 'unexpected receipt query or write'
+  [[ "$1" == *"h.run_id=r.id AND h.user_id=r.user_id"* &&
+     "$1" == *"FROM run_held_publications p WHERE p.id=h.final_publication_id"* ]] \
+    || fail 'unexpected receipt publication/owner scope'
+  for binding in "'id',p.id" "'run_id',p.run_id" "'user_id',p.user_id" "'repo_id',p.repo_id" "'hold_id',p.hold_id" "'generation',p.generation" "'worker_id',p.worker_id" "'ref',p.ref" "'tip',p.tip" "'coverage_digest',p.coverage_digest"; do
+    [[ "$1" == *"$binding"* ]] || fail 'unexpected receipt missing publication identity'
+  done
+  if [[ "$1" == *"h.generation<r.claim_generation"* ]]; then
+    [[ "$1" == *"h.generation="*" AND h.generation>0"* ]] || fail 'unexpected receipt earlier generation scope'
+  else
+    [[ "$1" == *"h.generation=r.claim_generation"* ]] || fail 'unexpected receipt current generation scope'
+  fi
   local n; n="$(cat "$SEQ_DIR/n")"
   awk -v n="$n" 'NR==n' "$SEQ_DIR/seq"
   [ "$n" -ge "$(wc -l < "$SEQ_DIR/seq")" ] || echo $((n + 1)) > "$SEQ_DIR/n"
@@ -555,6 +568,77 @@ completed_receipt_fixture completed-publication
 jq -c '.holds[0].completed_publication_receipt.observed_branch_head="invalid"' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
 mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
 custody_case "publication receipt refuses an invalid observed head" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+
+# Immutable held FINALs retain their proof after publication expiry/ref deletion.
+held_receipt_fixture() {
+  completed_receipt_fixture released
+  jq -c --arg run "$UUID" '. += {owner_id:"owner",repo_id:"repo",worker_id:"current-worker"} |
+    .holds[0] += {run_id:$run,user_id:"owner",repo_id:"repo",original_worker_id:"original-worker",
+      final_disposition:"held_publication",release_evidence:"held_publication",final_capture_id:null,
+      final_publication_id:"publication",final_source_sha:("a"*40),final_coverage_digest:("b"*64),
+      publication:{id:"publication",run_id:$run,user_id:"owner",repo_id:"repo",hold_id:"own-hold",
+        generation:1,worker_id:"original-worker",ref:("refs/uzi-held/"+$run+"/1"),
+        tip:("a"*40),coverage_digest:("b"*64),state:"expired",ref_deleted:true}}' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+  mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+}
+held_receipt_fixture
+custody_case "current held FINAL accepts original custodian after ref expiry" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+
+for mode in current earlier; do
+  held_receipt_fixture
+  if [ "$mode" = earlier ]; then
+    jq -c '.generation=3 | .status="running" | .holds[0].after_outcome=false' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+    mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+    receipt_helper=assert_earlier_held_custody_receipt; receipt_arg=1; receipt_success='earlier held custody receipt'; receipt_failure='exact held FINAL proof'
+  else
+    receipt_helper=wait_completed_custody_receipt; receipt_arg=2; receipt_success='completed custody receipt'; receipt_failure='lacks final custody proof'
+  fi
+  cp "$SEQ_DIR/seq" "$SEQ_DIR/held-valid"
+  custody_case "$mode held FINAL exact identity and original worker" pass "$receipt_success" "$receipt_helper" "$UUID" "$receipt_arg"
+  for field in id run_id user_id repo_id hold_id generation worker_id ref tip coverage_digest; do
+    jq -c --arg field "$field" '.holds[0].publication[$field]="forged"' "$SEQ_DIR/held-valid" > "$SEQ_DIR/seq"
+    custody_case "$mode held publication refuses forged $field" fail "$receipt_failure" "$receipt_helper" "$UUID" "$receipt_arg"
+  done
+  for change in 'run_id="forged"' 'user_id="forged"' 'repo_id="forged"' 'id="forged"' 'generation=2' 'final_publication_id="forged"' 'original_worker_id="forged"' 'final_source_sha="invalid"' 'final_coverage_digest="invalid"' 'final_capture_id="capture"' 'inventory_guarded=false' 'release_evidence="unknown"' 'final_disposition="unknown"' 'publication=null'; do
+    jq -c ".holds[0].$change" "$SEQ_DIR/held-valid" > "$SEQ_DIR/seq"
+    if [ "$mode" = current ] && [ "$change" = 'generation=2' ]; then diagnostic='missing exact run/generation/hold'; else diagnostic="$receipt_failure"; fi
+    custody_case "$mode held FINAL refuses $change" fail "$diagnostic" "$receipt_helper" "$UUID" "$receipt_arg"
+  done
+  for state in open discarded unknown; do
+    jq -c --arg state "$state" '.holds[0].state=$state' "$SEQ_DIR/held-valid" > "$SEQ_DIR/seq"
+    if [ "$mode" = current ]; then diagnostic='unexpected disposition'; else diagnostic="$receipt_failure"; fi
+    custody_case "$mode held FINAL refuses $state" fail "$diagnostic" "$receipt_helper" "$UUID" "$receipt_arg"
+  done
+  # Forge every related field together: shape/provenance must fail on its own,
+  # without a coincidental tip/digest/ref mismatch masking the regression.
+  for change in \
+    '.holds[0].final_source_sha="invalid" | .holds[0].publication.tip="invalid"' \
+    '.holds[0].final_coverage_digest="invalid" | .holds[0].publication.coverage_digest="invalid"' \
+    '.holds[0].run_id="forged" | .holds[0].publication.run_id="forged" | .holds[0].publication.ref="refs/uzi-held/forged/1"' \
+    '.holds[0].user_id="forged" | .holds[0].publication.user_id="forged"' \
+    '.holds[0].repo_id="forged" | .holds[0].publication.repo_id="forged"' \
+    '.holds[0].original_worker_id=null | .holds[0].publication.worker_id=null' \
+    '.holds[0].final_publication_id=null | .holds[0].publication.id=null'; do
+    jq -c "$change" "$SEQ_DIR/held-valid" > "$SEQ_DIR/seq"
+    custody_case "$mode held FINAL refuses internally matching forgery $change" fail "$receipt_failure" "$receipt_helper" "$UUID" "$receipt_arg"
+  done
+  jq -c '.holds=[]' "$SEQ_DIR/held-valid" > "$SEQ_DIR/seq"
+  if [ "$mode" = current ]; then diagnostic='missing exact run/generation/hold'; else diagnostic="$receipt_failure"; fi
+  custody_case "$mode held FINAL refuses missing hold" fail "$diagnostic" "$receipt_helper" "$UUID" "$receipt_arg"
+done
+for gen in 0 3 4; do
+  held_receipt_fixture
+  jq -c --argjson gen "$gen" --arg run "$UUID" '.generation=3 | .holds[0].generation=$gen |
+    .holds[0].publication.generation=$gen | .holds[0].publication.ref=("refs/uzi-held/"+$run+"/"+($gen|tostring))' \
+    "$SEQ_DIR/seq" > "$SEQ_DIR/changed"; mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+  custody_case "earlier helper refuses non-earlier generation $gen" fail 'earlier receipt' assert_earlier_held_custody_receipt "$UUID" "$gen"
+done
+held_receipt_fixture
+jq -c '.holds[0].after_outcome=false' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"; mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+custody_case "current held FINAL still requires after-outcome" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+held_receipt_fixture
+jq -c '.holds[0].final_source_sha=("a"*64) | .holds[0].publication.tip=("a"*64)' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"; mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+custody_case "held FINAL accepts SHA256 source" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
 
 handoff_receipt_boundary() {
   # shellcheck disable=SC2034  # consumed by the evaluated real phase statements
@@ -989,7 +1073,20 @@ custody_idle_phase() {
   }
   apipost() { echo '{"card":{"iid":1}}'; }
   create_run() { echo window > "$SEQ_DIR/idle-stage"; echo wedge; }
+  assert_earlier_held_custody_receipt() {
+    [ "$1:$2" = "$UUID:1" ] || fail 'wrong earlier receipt boundary identity'
+    [ "$(cat "$SEQ_DIR/idle-stage")" = entry ] || fail 'earlier receipt checked after seeding'
+    echo verified > "$SEQ_DIR/older-verified"
+  }
   db_psql_rows() {
+    if [[ "$1" == 'SELECT h.run_id,h.generation'* ]]; then
+      [[ "$1" == *"h.user_id='owner'"* && "$1" == *"h.state='released'"* &&
+         "$1" == *"h.final_disposition='held_publication'"* &&
+         "$1" == *"h.generation>0 AND h.generation<r.claim_generation"* ]] || fail 'wrong earlier receipt observation scope'
+      printf '%s|1\n' "$UUID"
+      return
+    fi
+    [ "$(cat "$SEQ_DIR/older-verified")" = verified ] || fail 'older held receipt missed before fixture'
     idle_boundary window
     echo $(( $(cat "$SEQ_DIR/idle-polls") + 1 )) > "$SEQ_DIR/idle-polls"
   }
@@ -1037,6 +1134,70 @@ for mode in entry window discard idle; do
   if [ "$valid" = true ]; then
     passed=$((passed + 1)); echo "PASS: real custody phase idle boundary $mode"
   else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
+done
+
+# Exercise the actual handoff startup/trap, stopping before transport and dispatch.
+# The compose double records its exported environment, not source-code spelling.
+handoff_timing_scope() {
+  HANDOFF_TEST_MODE="$1"
+  # shellcheck disable=SC2034  # consumed by the actual sourced phase prefix
+  EXECUTOR="$2"
+  case "$3" in
+    unset) unset UZI_E2E_RECOVERY_FAST_REDRIVE ;;
+    empty) export UZI_E2E_RECOVERY_FAST_REDRIVE= ;;
+    *) export UZI_E2E_RECOVERY_FAST_REDRIVE="$3" ;;
+  esac
+  # shellcheck disable=SC2034  # consumed by the actual sourced phase prefix
+  COMPOSE=(handoff_compose -p handoff-timing-fixture)
+  HANDOFF_TEST_COMPOSE_CALLS=0
+  HANDOFF_TEST_REGISTRATIONS=0
+  say() { :; }
+  fail() { echo "$*" >&2; exit 1; }
+  handoff_compose() {
+    HANDOFF_TEST_COMPOSE_CALLS=$((HANDOFF_TEST_COMPOSE_CALLS + 1))
+    printf 'compose:%s:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" "$*" >> "$SEQ_DIR/handoff-timing"
+    [ "$HANDOFF_TEST_MODE" != activation ] || [ "$HANDOFF_TEST_COMPOSE_CALLS" -ne 1 ] || return 1
+    case "$HANDOFF_TEST_MODE:$HANDOFF_TEST_COMPOSE_CALLS" in restore:2|receipt-restore:2) return 1;; esac
+  }
+  wait_worker_online() {
+    HANDOFF_TEST_REGISTRATIONS=$((HANDOFF_TEST_REGISTRATIONS + 1))
+    [ "$HANDOFF_TEST_MODE" != registration ] || [ "$HANDOFF_TEST_REGISTRATIONS" -ne 1 ] || return 1
+  }
+  # shellcheck disable=SC1090  # real phase prefix, no transport or dispatch
+  source <(awk '/^WC=/ {exit} {print}' "$ROOT/e2e/phases/70-handoff.sh")
+  printf 'body:%s:%s\n' "${UZI_E2E_RECOVERY_FAST_REDRIVE+x}" "$(printenv UZI_E2E_RECOVERY_FAST_REDRIVE || :)" >> "$SEQ_DIR/handoff-timing"
+  case "$HANDOFF_TEST_MODE" in receipt|receipt-restore) exit 7;; esac
+  exit 0
+}
+for spec in 'success:stub:unset' 'success:stub:0' 'success:stub:empty' 'success:sdk:unset' 'success:sdk:0' \
+    'activation:stub:unset' 'registration:stub:0' 'receipt:stub:unset' 'restore:stub:0' 'receipt-restore:stub:unset'; do
+  cases=$((cases + 1))
+  IFS=: read -r mode executor prior <<< "$spec"
+  : > "$SEQ_DIR/handoff-timing"
+  if output="$(handoff_timing_scope "$mode" "$executor" "$prior" 2>&1)"; then got=pass; else got=fail; fi
+  events="$(cat "$SEQ_DIR/handoff-timing")"
+  if [ "$prior" = unset ]; then restored=':'; elif [ "$prior" = empty ]; then restored='x:'; else restored="x:$prior"; fi
+  valid=false
+  if [ "$executor" = sdk ]; then
+    [ "$got" = pass ] && [ "$events" = "body:${restored}" ] && valid=true
+  else
+    first="$(head -1 "$SEQ_DIR/handoff-timing")"
+    last="$(tail -1 "$SEQ_DIR/handoff-timing")"
+    [ "$mode" = success ] && want=pass || want=fail
+    if [ "$got" = "$want" ] && [[ "$first" == 'compose:x:1:-p handoff-timing-fixture '* ]] \
+        && [[ "$last" == "compose:${restored}:-p handoff-timing-fixture "* ]]; then
+      valid=true
+      if [ "$mode" = activation ] || [ "$mode" = registration ]; then
+        [[ "$events" != *body:* ]] || valid=false
+      else
+        [[ "$events" == *body:x:1* ]] || valid=false
+      fi
+      case "$mode" in restore|receipt-restore) [[ "$output" == *'handoff timing restore failed'* ]] || valid=false;; esac
+    fi
+  fi
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: handoff timing scope $spec"
+  else echo "FAIL: handoff timing scope $spec: result=$got events=[$events] output=[$output]"; fi
 done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"

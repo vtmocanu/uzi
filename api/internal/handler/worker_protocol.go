@@ -389,7 +389,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // through it — so advertising the token tells a fence-capable worker it may send the field. Returns
 // a fresh slice so a caller cannot mutate the advertised set.
 //
-// `recovery_held_publication_v1` (issue #2545) is appended last, in its own group, only while
+// `recovery_held_publication_v1` and `recovery_held_publication_v2` are appended last, in its own group, only while
 // heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
 //
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
@@ -453,7 +453,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
 		// the worker capability of the same name, and omitted when UZI_HELD_PUBLICATION is off so
 		// a worker defers nothing and takes the archive path. Step B needs no advertisement.
-		groups = append(groups, []string{"recovery_held_publication_v1"})
+		groups = append(groups, []string{"recovery_held_publication_v1", "recovery_held_publication_v2"})
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
