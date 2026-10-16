@@ -182,6 +182,55 @@ var (
 	}
 )
 
+// rootfulDindCommand passes netDir as a positional argument, keeping the production
+// sysfs path fixed at the call site while allowing isolated filesystem fixtures.
+// MTUs must be canonical decimal integers in 1..65535 (the maximum IPv4 packet
+// size, including jumbo frames). Validate syntax and length before any numeric
+// comparison so shell integer width and octal parsing cannot affect the result.
+// Successful discovery can only lower Docker's default MTU of 1500. Incomplete
+// discovery warns and preserves the original daemon argv without generating config.
+// Docker 29 accepts default-network-opts only in daemon JSON, so keep that
+// setting in a private sidecar-local file and the listener/bridge MTU in argv.
+func rootfulDindCommand(netDir string) []string {
+	return []string{"/bin/sh", "-c", `fail() {
+    printf 'dind MTU: %s\n' "$1" >&2
+    exit 1
+}
+fallback() {
+    printf 'dind MTU warning: %s; starting dockerd with unchanged defaults\n' "$1" >&2
+    exec dockerd --host=tcp://127.0.0.1:2375 --tls=false
+}
+[ -d "$1" ] || fallback "network interface directory unavailable: $1"
+min=
+# One startup snapshot, one read per interface; validate all before applying the cap.
+for iface in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [ -d "$iface" ] || [ -L "$iface" ] || continue
+    [ "${iface##*/}" != lo ] || continue
+    file="$iface/mtu"
+    # The sentinel preserves trailing newlines through command substitution.
+    mtu=$(cat "$file" 2>/dev/null && printf '.') || fallback "cannot read MTU: $file"
+    mtu=${mtu%.}
+    # Accept the kernel's single terminating newline, but no extra lines.
+    mtu=${mtu%"
+"}
+    case "$mtu" in
+        ''|0*|*[!0-9]*) fallback "invalid MTU (expected decimal 1..65535): $file" ;;
+    esac
+    [ "${#mtu}" -le 5 ] || fallback "MTU exceeds 65535: $file"
+    [ "$mtu" -le 65535 ] || fallback "MTU exceeds 65535: $file"
+    if [ -z "$min" ] || [ "$mtu" -lt "$min" ]; then
+        min=$mtu
+    fi
+done
+[ -n "$min" ] || fallback "no non-loopback interface MTU in $1"
+[ "$min" -le 1500 ] || min=1500
+umask 077
+config=$(mktemp /tmp/uzi-dind-daemon.XXXXXX) || fail "cannot create daemon config in /tmp"
+printf '{"default-network-opts":{"bridge":{"com.docker.network.driver.mtu":"%s"}}}\n' "$min" > "$config" || fail "cannot write daemon config: $config"
+exec dockerd --host=tcp://127.0.0.1:2375 --tls=false "--mtu=$min" "--config-file=$config"
+`, "dind-mtu", netDir}
+}
+
 // dindContainer is the Docker-in-Docker daemon, modelled as a NATIVE SIDECAR (an
 // initContainer with restartPolicy: Always) so k8s starts it before the worker and
 // holds the worker container until its startupProbe (`docker info`) passes — the k8s
@@ -259,7 +308,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		// socket ...: bind: no such file or directory") — live-proven on dev-cluster in
 		// 0.8.0 and fixed here (0.8.1). Nothing needs the socket: the worker's DOCKER_HOST
 		// is dindLoopbackTCP and the probe is `docker -H tcp://127.0.0.1:2375 info`.
-		command = []string{"dockerd", "--host=" + dindLoopbackTCP, "--tls=false"}
+		command = rootfulDindCommand("/sys/class/net")
 		// `docker info` over the loopback endpoint: the daemon answering there is the real
 		// readiness signal (the socket existing is not the daemon being up).
 		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"

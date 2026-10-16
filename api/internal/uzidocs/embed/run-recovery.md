@@ -44,6 +44,35 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+## When plan-revision retries expire
+
+After bounded inner retries exhaust a provider transient during a human plan
+revision, uzi can re-drive the failed turn up to three times in that live
+flight. The allowance follows that accepted revision through clarification
+and continuation turns; delays are 5, 10 and 20 seconds plus 0–20% jitter,
+capped at 30 seconds.
+
+If those re-drives exhaust, the feed says the retry allowance expired. The
+original plan, gate revision and presentation remain; your feedback is still
+pending, with no saved revised plan answering it.
+
+1. Read the feed notice and the current plan.
+2. If the normal revision limit permits, send an ordinary request-changes
+   verdict bound to that gate. It spends a normal revision and gets its own
+   live-flight allowance. Earlier feedback stays pending until a successor
+   plan is saved, then is marked **superseded**, not successfully answered.
+3. At the revision cap, cancel or reject that exact gate, then dispatch a new
+   run for further changes. Cancel takes precedence; source-bound rejection
+   remains available at the cap. Approval and follow-up cannot resume this wait.
+
+Use [the existing CLI verdict commands](./cli.md#commands).
+The expired wait keeps its live poller, worker snapshot entry and busy slot,
+so it can defer a worker image roll. Existing drain/shutdown policy still
+applies. Reclaim loses the in-memory allowance, expiry and predecessor chain:
+Claude keeps existing pending-input replay; Codex shows a fresh plan and asks
+you to re-send feedback. A new flight may get a fresh allowance; there is no
+lifetime retry bound or exactly-once/ordering guarantee. Custody safeguards remain.
+
 ## What you'll see
 
 The worker feed may say that **retained heads are retained locally with no

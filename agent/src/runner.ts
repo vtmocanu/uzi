@@ -38,6 +38,7 @@ import type {
   WallParkRefresh,
 } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
+import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
@@ -520,7 +521,7 @@ function canonicalRecoveryInterruption(value: unknown): boolean {
     || value instanceof TransientRecoveryError || value instanceof PauseNowSignal
     || value instanceof CredentialSwitchSignal || value instanceof CredentialSwitchRetainedStop
     || value instanceof DataVolumeFullError || value instanceof DataVolumeWaitShutdown
-    || value instanceof StaleClaimError || value instanceof ServerWallParkedError
+    || value instanceof StaleClaimError || value instanceof PlanRevisionRecoveryStoppedError || value instanceof ServerWallParkedError
     || value instanceof RunningAckTerminalError || value instanceof RunResidueBlockedError
     || value instanceof GateInputDeliveryError || value instanceof PlanRejectedError
     || value instanceof PushSecretBlockedSignal || value instanceof ScratchPublicationError
@@ -792,6 +793,7 @@ function isCheckedLifecycleControl(error: unknown): boolean {
     error instanceof PauseNowSignal || error instanceof ForgeUnreachableAtCloneError ||
     error instanceof DataVolumeFullError || error instanceof DataVolumeWaitShutdown ||
     error instanceof ServerWallParkedError || error instanceof StaleClaimError ||
+    error instanceof PlanRevisionRecoveryStoppedError || error instanceof PlanRejectedError ||
     error instanceof RunningAckTerminalError || error instanceof CredentialSwitchRetainedStop ||
     error instanceof CredentialSwitchSignal || error instanceof E2EDropExecutionError ||
     error instanceof RunResidueBlockedError || isInputReceiptError(error) ||
@@ -1888,6 +1890,9 @@ interface RunFlight {
    *  for Claude/stub (no safety), which equals the live `executor.safety` and settles as before. */
   permanentFailureReapSafety?: unknown;
   preserveSession: boolean;
+  recoveryRetentionCause?: string;
+  /** Captured support, not permission to downgrade a later source-bearing write. */
+  planRevisionRetryNegotiated?: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
    *  HOME + plugin dir ONLY when a resume transcript is resolvable on this worker
@@ -2186,6 +2191,8 @@ export interface RunnerOptions {
   onSourceRetained?: () => void;
   /** Plan-approval gate cap; 0 disables (default 24h). */
   planApprovalTimeoutMs?: number;
+  /** Fixed live-flight provider policy injection, tests only; no operator setting. */
+  planRevisionRetryPolicy?: PlanRevisionRetryPolicy;
   /** PRD #88: fallback answer deadline in ms. The claim's question_timeout_seconds
    *  takes precedence; this covers a server that does not send one. */
   questionTimeoutMs?: number;
@@ -2350,6 +2357,7 @@ export class RunRunner {
   private readonly cancellationBudgetFactory: () => MaintenanceBudget;
   private readonly pollMs: number;
   private readonly planApprovalTimeoutMs: number;
+  private readonly planRevisionRetryPolicy?: PlanRevisionRetryPolicy;
   /** PRD #88 fallback answer deadline, used when the claim carries none (an older
    *  server). The claim value wins when present — see questionTimeoutMs. */
   private readonly questionTimeoutMs: number;
@@ -2529,6 +2537,7 @@ export class RunRunner {
     this.onSourceRetained = opts.onSourceRetained;
     this.attemptPaths = !!opts.dockerHost;
     this.planApprovalTimeoutMs = opts.planApprovalTimeoutMs ?? 24 * 60 * 60_000;
+    this.planRevisionRetryPolicy = opts.planRevisionRetryPolicy;
     this.questionTimeoutMs = opts.questionTimeoutMs ?? 24 * 60 * 60_000;
     this.gitlab = opts.gitlab ?? new GitLabClient();
     this.forgejo = opts.forgejo ?? new ForgejoClient();
@@ -3850,6 +3859,12 @@ export class RunRunner {
           stopped_source: stopped,
         });
         await batcher.close().catch(() => undefined);
+      } else if (err instanceof PlanRevisionRecoveryStoppedError) {
+        flight.preserveSession = err.status === undefined || !TERMINAL_RUN_STATUSES.has(err.status);
+        flight.recoveryRetentionCause = err.message;
+        const stopped = await this.retainStoppedSource(flight, executor, "plan_revision_recovery_stopped", { memo: false, stale: true, record: "none" });
+        runLog.info("plan revision recovery stopped without overwriting server state", { reason: err.message, status: err.status, stopped_source: stopped });
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof StaleClaimError) {
         // PRD #1247 M5b: a /state report came back with the stale_claim disposition — a held-state
         // credential switch RELEASED this claim, or a reclaim SUPERSEDED it. Another claim owns the
@@ -4433,7 +4448,9 @@ export class RunRunner {
         runLog.info(
           flight.completionHoldOutcome === "unresolved"
             ? "completion hold unresolved; preserving plugin dir and HOME for owner action"
-            : "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume",
+            : flight.recoveryRetentionCause
+              ? `${flight.recoveryRetentionCause}; preserving plugin dir and HOME for a same-worker resume`
+              : "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume",
           {
             run_home: runHome,
           },
@@ -5162,6 +5179,9 @@ export class RunRunner {
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
     // fails now leaves the durable journal for a later resolve).
+    const requiresRevisionSourceFence = flight.planRevisionRetryNegotiated === true && err instanceof PlanRejectedError && err.sourceGateRevision !== undefined;
+    let staleRevisionRejection = false;
+    let revisionRejectionConfirmed = false;
     await this.journalAndSendTerminal(
       flight,
       TERMINAL_JOURNAL_PHASE,
@@ -5169,13 +5189,29 @@ export class RunRunner {
         status: "failed",
         failure_reason: reportedReason,
         fail_origin: failOrigin,
+        ...(requiresRevisionSourceFence && err instanceof PlanRejectedError
+          ? { expected_gate_revision: err.sourceGateRevision } : {}),
       },
-      (b, sig) => flight.reportState(b, sig),
+      async (b, sig) => {
+        const ack = await flight.reportState(b, sig);
+        if (ack.staleRevisionSource) staleRevisionRejection = true;
+        if (ack.applied && ack.status !== undefined && TERMINAL_RUN_STATUSES.has(ack.status) && !ack.staleRevisionSource && !ack.staleClaim)
+          revisionRejectionConfirmed = true;
+        return ack;
+      },
     ).catch((e) =>
       runLog.error("could not report failed state", {
         error: errMessage(e),
       }),
     );
+    if (requiresRevisionSourceFence && !revisionRejectionConfirmed) {
+      flight.preserveSession = true;
+      flight.recoveryRetentionCause = staleRevisionRejection
+        ? "recovered rejection refused because its source gate changed"
+        : "source-fenced rejection outcome is unconfirmed";
+      await this.retainStoppedSource(flight, flight.executor, "stale_revision_rejection", { memo: false, stale: true, record: "none" });
+      return; // refusal grants neither terminal authority nor custody settlement
+    }
     // PRD #1349 M2 (D4.5) / #1531: now the provider is reaped, run the non-status-gated custody
     // settle AFTER the terminal report. The credentialed fresh-forge comparison is safe reaped: a
     // provably empty run RELEASES its exact hold, a run that committed work then failed CAPTURES
@@ -8739,6 +8775,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       owedContext: undefined,
       owedFeedClosed: false,
@@ -10727,6 +10764,39 @@ export class RunRunner {
       flight.attempt = attempt;
       this.liveAttempts.add(attempt);
     }
+    const revisionRecovery = flight.planRevisionRetryNegotiated === true &&
+      Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0
+      ? new PlanRevisionRecovery({
+        generation: flight.claimGeneration,
+        steering,
+        ownership: () => this.client.getRunOwnership(runId, {
+          signal: AbortSignal.any([steering.lifecycleSignal(), this.shutdownSignal.signal, AbortSignal.timeout(3_000)]),
+          deadline: Date.now() + 3_000,
+        }),
+        signal: () => AbortSignal.any([steering.lifecycleSignal(), this.shutdownSignal.signal]),
+        checkControl: () => {
+          if (steering.isCancelled()) throw new Error("run cancelled");
+          if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown during plan revision recovery");
+          const pause = steering.getPauseMode();
+          if (pause === "now" || pause === "wall" || pause === "disk") throw new PauseNowSignal();
+          if (!this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE))
+            throw new PlanRevisionRecoveryStoppedError("plan revision source-fence support is unavailable");
+          steering.lifecycleSignal().throwIfAborted();
+        },
+        notice: async (text) => {
+          batcher.emit({ kind: "status", agent: "worker", payload: { text } });
+          await batcher.flush();
+        },
+        policy: this.planRevisionRetryPolicy,
+      }) : undefined;
+    const resumedSource = this.gateResumes.get(runId);
+    if (revisionRecovery && resumedSource) {
+      // Existing same-gate identity only; omitted fields retain the server snapshot.
+      // No old allowance or predecessor chain is reconstructed.
+      revisionRecovery.seed({ status: "awaiting_approval", presentation_id: resumedSource.presentationId,
+        plan_md: resumedSource.planMd, ...presentedReportFields(resumedSource.presented) },
+      resumedSource.revision, reportState);
+    }
     let checkedHuman: CheckedHumanGate | undefined;
     let continueCheckedStorage: (() => Promise<PlanVerdict>) | undefined;
     let crossCheckSelected = false;
@@ -11020,8 +11090,17 @@ export class RunRunner {
       // same condition that guards the channel's first read): a server-approved plan re-gated here
       // (its tree or session was lost) has no pending gate verdict to act on first.
       ...(claim.plan_approved !== true
-        ? { takeResumedGateEvent: (signal?: AbortSignal) => this.takeResumedGateEvent(runId, steering, batcher, runLog, signal) }
+        ? { takeResumedGateEvent: async (signal?: AbortSignal) => {
+          const verdict = await this.takeResumedGateEvent(runId, steering, batcher, runLog, signal);
+          if (verdict) revisionRecovery?.accept(verdict);
+          return verdict;
+        } }
         : {}),
+      beforePlanRevisionTurn: () => revisionRecovery?.beforeTurn() ?? Promise.resolve(),
+      retryPlanRevisionTurn: async (cause) => {
+        if (!(cause instanceof TransientRecoveryError) || !cause.providerOrigin || !revisionRecovery) throw cause;
+        await revisionRecovery.retry(cause);
+      },
       gatePlan: async (planMd, milestones, onPlanPersisted, settles) => {
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
@@ -11193,6 +11272,7 @@ export class RunRunner {
             };
           } : undefined,
           (candidate) => this.prepareGateCheckpoint(claim, flight, steering.lifecycleSignal(), candidate),
+          revisionRecovery,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -11207,6 +11287,7 @@ export class RunRunner {
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
         flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
+        revisionRecovery?.accept(verdict);
         return verdict;
       },
       ...(claim.auto_approve && claim.plan_cross_check_required && !seeded ? {
@@ -11232,7 +11313,8 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
-          { confirmRunning: resolveRunKind(claim.kind) === "issue" && !claim.interactive },
+          { confirmRunning: (resolveRunKind(claim.kind) === "issue" && !claim.interactive) ||
+            revisionRecovery?.hasActiveRevision === true },
         ),
       // Issue #1593: the worker-authored fallback park for a planning turn that stayed
       // prose-only after a nudge. Fixed question, no model text; autopilot never parks.
@@ -11245,6 +11327,7 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
+          { confirmRunning: revisionRecovery?.hasActiveRevision === true },
         ),
       pullFollowUp: () => steering.pullFollowUp(),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
@@ -15509,6 +15592,8 @@ export class RunRunner {
           if (cancelDisposition === "retained") keepClone();
         }
         if (status !== "running") {
+          if (providerOrigin && !flight.active?.shuttingDown && !terminal.has(status))
+            flight.recoveryRetentionCause = `provider transient exhaustion at non-running status ${status}`;
           // A terminal ACK/ownership read is reporting evidence only, never a clone proof.
           if (cancelDisposition !== undefined) return status === "recovery_wait";
           // PRD #1733: the typed provider park landed and only its ack was lost.
@@ -18011,6 +18096,7 @@ export class RunRunner {
     ownerSignal?: () => AbortSignal,
     retainCheckedStorage?: (resume: () => Promise<PlanVerdict>) => void,
     prepareCheckpoint?: (candidate: Milestone[] | undefined) => Promise<StateRequest["gate_checkpoint_witness"]>,
+    revisionRecovery?: PlanRevisionRecovery,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -18198,6 +18284,7 @@ export class RunRunner {
       // empty), keeping a revision gate from showing a stale earlier round's writes.
       plan_changed_files: planChangedFiles,
       ...(associated ? { milestones: milestones ?? [] } : {}),
+      ...revisionRecovery?.fields(settles),
     };
     let confirmed = false;
     let appliedAck: StateAck | undefined;
@@ -18205,7 +18292,7 @@ export class RunRunner {
     const publishAndWait = async (): Promise<PlanVerdict> => {
     if (!confirmed) {
     let ack: StateAck;
-    try { ack = appliedAck ?? await reportState(request); }
+    try { ack = appliedAck ?? await (revisionRecovery ? revisionRecovery.publish(request, reportState) : reportState(request)); }
     catch (error) {
       if (!associated || isCheckedLifecycleControl(error)) throw error;
       throw new Error("plan cross-check: human-presentation ACK unrecoverable", { cause: error });
@@ -18236,7 +18323,8 @@ export class RunRunner {
       throw new TransientRecoveryError(GATE_PRESENTATION_REFUSED_REASON);
     }
     // Issue #1604 (D2): the revised plan is durable, so the revise it answers is final now.
-    if (settles !== undefined && ack.applied === true && ack.status === "awaiting_approval")
+    revisionRecovery?.published(request, ack, reportState);
+    if (settles !== undefined && request.revision_input_id === undefined && ack.applied === true && ack.status === "awaiting_approval")
       steering.settleRevision(settles);
     // PRD #1795 (decision 6): confirm the revision THIS gate's applied report was answered with; a
     // verdict bound to exactly it may act, including one routed while the ACK was in flight (B1).
@@ -18404,8 +18492,8 @@ export class RunRunner {
    * model text is passed in, so the lead's prose cannot reach the question. The lead's last
    * message reaches the owner only on the executor's status card, as untrusted data.
    *
-   * Shares askUser's park body, so the id, the ack check, the settle `running` report and the
-   * shared per-run answer deadline (REASON_QUESTION_TIMEOUT) are identical. It does not count
+   * Shares askUser's park body and per-run answer deadline (REASON_QUESTION_TIMEOUT),
+   * including its optional confirmed `running` settlement. It does not count
    * against question_max; that cap lives in the executors. An autopilot run never parks: it
    * returns `unattended` WITHOUT reporting awaiting_input, and the executor fails the run.
    */
@@ -18417,6 +18505,7 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
+    options: { confirmRunning?: boolean } = {},
   ): Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }> {
     if (autoApprove) {
       runLog.info("plan missing: not parked (autopilot)", { run_id: runId });
@@ -18432,6 +18521,7 @@ export class RunRunner {
       reportState,
       runLog,
       config,
+      options,
     );
     return v.kind === "answer" ? { kind: "answer", answers: v.answers } : { kind: "cancel" };
   }

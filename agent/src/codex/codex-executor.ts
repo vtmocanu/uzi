@@ -72,7 +72,7 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
@@ -2834,7 +2834,7 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
-      const drivePlan = async (initialPrompt: string) => {
+      const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
         assertResidueQuarantineOpen("provider_turn");
@@ -2845,7 +2845,17 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
+          let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
+          try {
+            if (humanRevision) await ctx.beforePlanRevisionTurn?.();
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
+          } catch (error) {
+            if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
+            // The runner hook owns backoff and control checks. Redrive without a new cap,
+            // wall-budget reset, or epoch; clarification/prose recovery state stays local.
+            await ctx.retryPlanRevisionTurn(error);
+            continue;
+          }
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
           // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
           if (turn.kind === "paused") throw new PauseNowSignal();
@@ -2919,8 +2929,13 @@ export class CodexExecutor implements Executor {
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
         let revisions = 0;
         let automaticRound = 0;
+        let serverAcceptedReplacement = false;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
+          // PlanRevisionReplacedError carries a live server-accepted human replacement.
+          // Consume its admission once; later ordinary verdicts retain the local guard.
+          const acceptedReplacement = !automatic && serverAcceptedReplacement;
+          serverAcceptedReplacement = false;
           if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
@@ -2931,7 +2946,7 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_feedback", agent: "worker",
             payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback } });
           if (!automatic) {
-            if (revisions >= maxRevisions) {
+            if (!acceptedReplacement && revisions >= maxRevisions) {
               throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
             }
             revisions++;
@@ -2942,9 +2957,17 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_revising", agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
           // The revise turn resumes the plan thread, which holds the plan being revised.
-          const reviseTurn = await drivePlan(verdict.automatic === true
-            ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
-            : buildRevisePlanPrompt(feedback));
+          let reviseTurn: Awaited<ReturnType<typeof drivePlan>>;
+          try {
+            reviseTurn = await drivePlan(verdict.automatic === true
+              ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
+              : buildRevisePlanPrompt(feedback), !automatic);
+          } catch (error) {
+            if (!(error instanceof PlanRevisionReplacedError)) throw error;
+            verdict = error.verdict;
+            serverAcceptedReplacement = verdict.automatic !== true;
+            continue;
+          }
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (reviseTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: reviseTurn.reason } };
           planResult = reviseTurn.result;
@@ -2954,7 +2977,7 @@ export class CodexExecutor implements Executor {
           }
           verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles);
         }
-        if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
+        if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         pauseNow.vaultLock.gateOpen = false;
         if (verdict.approval === "cross_check") {
