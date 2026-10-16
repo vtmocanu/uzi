@@ -16834,7 +16834,8 @@ export class RunRunner {
         { runId: flight.runId, sourceGeneration: outcome.source_generation });
       this.policyControlGuard(flight);
       if (result.kind === "unsupported") return false;
-      if (result.kind === "observed" && result.ack.disposition !== "pending") {
+      if (result.kind === "observed" && result.ack.disposition !== "pending" &&
+          result.ack.disposition !== "unauthenticated_historical_outcome") {
         if (result.ack.disposition === "applied") {
           flight.parked = true;
           flight.holdOrWallParkConfirmed = true;

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"regexp"
 	"slices"
@@ -44,11 +45,13 @@ type PolicyHoldRequest struct {
 type PolicyHoldDisposition string
 
 const (
-	PolicyHoldApplied        PolicyHoldDisposition = "applied"
-	PolicyHoldAlreadyApplied PolicyHoldDisposition = "already_applied"
-	PolicyHoldResolvedNewer  PolicyHoldDisposition = "resolved_newer_policy"
-	PolicyHoldTerminal       PolicyHoldDisposition = "terminal"
-	PolicyHoldPending        PolicyHoldDisposition = "pending"
+	PolicyHoldApplied                          PolicyHoldDisposition = "applied"
+	PolicyHoldAlreadyApplied                   PolicyHoldDisposition = "already_applied"
+	PolicyHoldResolvedNewer                    PolicyHoldDisposition = "resolved_newer_policy"
+	PolicyHoldTerminal                         PolicyHoldDisposition = "terminal"
+	PolicyHoldPending                          PolicyHoldDisposition = "pending"
+	PolicyHoldRecorded                         PolicyHoldDisposition = "recorded"
+	PolicyHoldUnauthenticatedHistoricalOutcome PolicyHoldDisposition = "unauthenticated_historical_outcome"
 )
 
 var policyCorrelation = regexp.MustCompile(`^pr-[0-9a-f]{32}-[1-9][0-9]{0,15}$`)
@@ -106,8 +109,8 @@ func policyEligible(r store.Run) bool {
 	return r.Harness == "codex" && !r.Interactive && slices.Contains([]string{"issue", "task", "prompt", "self_improve"}, r.Kind)
 }
 
-// ReportPolicyHold authorizes the exact current unreleased claim before reconciling
-// immutable evidence or converting an older local outcome.
+// ReportPolicyHold authorizes current delivery by its claim, or historical delivery
+// by its original custody, before reconciling immutable outcome evidence.
 func (s *Service) ReportPolicyHold(ctx context.Context, w store.Worker, id uuid.UUID, req PolicyHoldRequest) (store.Run, PolicyHoldDisposition, error) {
 	if err := req.validate(); err != nil {
 		return store.Run{}, PolicyHoldPending, err
@@ -139,26 +142,47 @@ func (s *Service) ReportPolicyHold(ctx context.Context, w store.Worker, id uuid.
 	if r.UserID != w.UserID {
 		return store.Run{}, PolicyHoldPending, ErrRunNotOwned
 	}
-	if !r.WorkerID.Valid || r.WorkerID.Bytes != w.ID || r.ClaimGeneration != req.ClaimGeneration {
+	if !policyEligible(r) {
+		return r, PolicyHoldPending, ErrInvalidState
+	}
+	if req.ClaimGeneration > r.ClaimGeneration {
 		return store.Run{}, PolicyHoldPending, ErrRunNotOwned
+	}
+	owned := r.WorkerID.Valid && r.WorkerID.Bytes == w.ID && r.ClaimGeneration == req.ClaimGeneration && !r.ClaimReleasedAt.Valid
+	budgetPark := r.WorkerID.Valid && r.WorkerID.Bytes == w.ID &&
+		r.ClaimGeneration == req.ClaimGeneration && req.SourceGeneration == r.ClaimGeneration &&
+		r.ClaimReleasedAt.Valid && r.ReleasedWorkerID.Valid && r.ReleasedWorkerID.Bytes == w.ID &&
+		r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted"
+	if !owned && !budgetPark {
+		// ClaimRun clears released_worker_*; only original custody authenticates
+		// an old delivery after an owner choice or a subsequent claim.
+		_, err := q.LockPolicyHistoricalCustody(ctx, store.LockPolicyHistoricalCustodyParams{
+			RunID: id, Generation: req.SourceGeneration, OriginalWorkerID: w.ID, UserID: w.UserID,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("policy historical outcome unauthenticated", "run", id,
+				"source_generation", req.SourceGeneration, "current_generation", r.ClaimGeneration,
+				"reason", "custody_missing_mismatched_or_discarded")
+			return r, PolicyHoldUnauthenticatedHistoricalOutcome, nil
+		}
+		if err != nil {
+			return r, PolicyHoldPending, err
+		}
 	}
 	if r.Status == "cancelled" || r.Status == "failed" || r.Status == "completed" {
 		return r, PolicyHoldTerminal, nil
 	}
-	if validateReconciledGeneration(r, &req.ClaimGeneration) != nil {
+	if owned && validateReconciledGeneration(r, &req.ClaimGeneration) != nil {
 		return r, PolicyHoldPending, nil
 	}
 	outcome, _ := uuid.Parse(req.OutcomeID)
-	if r.PolicyLastOutcomeID.Valid && r.PolicyLastOutcomeID.Bytes == outcome {
-		return r, PolicyHoldAlreadyApplied, nil
-	}
 	if r.PolicyLastSourceGeneration.Valid && r.PolicyLastSourceGeneration.Int64 > req.SourceGeneration {
 		return r, PolicyHoldResolvedNewer, nil
 	}
-	if !policyEligible(r) {
-		return r, PolicyHoldPending, ErrInvalidState
+	if r.PolicyLastOutcomeID.Valid && r.PolicyLastOutcomeID.Bytes == outcome {
+		return r, PolicyHoldAlreadyApplied, nil
 	}
-	if r.StopKind.Valid && r.StopKind.String != "" {
+	if owned && r.StopKind.Valid && r.StopKind.String != "" {
 		_, err := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: id, WorkerID: pgconv.UUID(w.ID)})
 		if err != nil {
 			return r, PolicyHoldPending, err
@@ -183,6 +207,26 @@ func (s *Service) ReportPolicyHold(ctx context.Context, w store.Worker, id uuid.
 	provenance := "unverified"
 	if req.Head != "" {
 		provenance = "verified"
+	}
+	if !owned {
+		recorded, err := q.RecordPolicyHoldMetadata(ctx, store.RecordPolicyHoldMetadataParams{
+			ID: id, Detail: req.Detail, OutcomeID: pgconv.UUID(outcome),
+			SourceGeneration: pgtype.Int8{Int64: req.SourceGeneration, Valid: true},
+			Tag:              policyText(req.Tag), Phase: policyText(req.Phase), CorrelationID: policyText(req.CorrelationID),
+			RecordPreservation: budgetPark, Provenance: policyText(&provenance),
+			Head: policyTextNonempty(req.Head), CheckpointContainsLatest: policyBool(req.CheckpointContainsLatest),
+			Published: pgtype.Bool{Bool: req.Published, Valid: true},
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return r, PolicyHoldPending, nil
+		}
+		if err != nil {
+			return r, PolicyHoldPending, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return r, PolicyHoldPending, err
+		}
+		return recorded, PolicyHoldRecorded, nil
 	}
 	held, err := q.SetRunPolicyHold(ctx, store.SetRunPolicyHoldParams{
 		ID: id, WorkerID: pgconv.UUID(w.ID), ClaimGeneration: req.ClaimGeneration,

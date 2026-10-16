@@ -52,7 +52,10 @@ export async function resolvePendingPolicy(
     // Reauthentication happened before singleflight admission without an intervening await.
     const ack = decodePolicyHoldAck(await client.reportPolicyHold(args.runId, observation.request, args.signal), observation.request);
     args.signal?.throwIfAborted();
-    if (ack.disposition !== "pending") {
+    if (ack.disposition === "unauthenticated_historical_outcome") {
+      log.warn("policy historical outcome refused; evidence retained pending reconciliation");
+    }
+    if (ack.disposition !== "pending" && ack.disposition !== "unauthenticated_historical_outcome") {
       await outbox.markPolicyServerSettled(args.runId, args.sourceGeneration,
         { ...observation.context, signal: args.signal });
     }

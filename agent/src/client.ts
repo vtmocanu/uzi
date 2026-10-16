@@ -121,7 +121,9 @@ export function decodePolicyHoldAck(value: unknown, request: PolicyHoldRequest):
     case "applied":
       if (ack.status !== "paused" || ack.hold_reason !== "provider_policy_refusal") return invalid();
       break;
-    case "already_applied": break;
+    case "already_applied":
+    case "unauthenticated_historical_outcome": break;
+    case "recorded":
     case "resolved_newer_policy":
       if (!nonterminal.includes(ack.status)) return invalid();
       break;
@@ -3766,7 +3768,7 @@ export class WorkerClient {
       }
       if (!res.ok && res.status !== 409) throw new Error("policy hold request failed");
       const ack = decodePolicyHoldAck(JSON.parse(text), body);
-      if (res.status === 409 && ack.disposition !== "pending") throw new Error("invalid policy hold acknowledgement");
+      if (res.status === 409 && ack.disposition !== "pending" && ack.disposition !== "unauthenticated_historical_outcome") throw new Error("invalid policy hold acknowledgement");
       return ack;
     } catch (err) {
       signal.throwIfAborted();

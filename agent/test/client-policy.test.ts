@@ -44,6 +44,9 @@ it("policy sends exact body once and decodes flat ACKs including later owner exe
     [{}, 200], [{ disposition: "already_applied", status: "running", hold_reason: undefined }, 200],
     [{ disposition: "resolved_newer_policy", status: "queued" }, 200],
     [{ disposition: "terminal", status: "cancelled" }, 200], [{ disposition: "pending", status: "claimed" }, 409],
+    [{ disposition: "recorded", status: "running" }, 200],
+    [{ disposition: "unauthenticated_historical_outcome", status: "queued" }, 409],
+    [{ disposition: "unauthenticated_historical_outcome", status: "cancelled" }, 409],
   ] as const) {
     const { client, requests } = await setup(() => Response.json(ack(extra), { status }));
     assert.equal((await client.reportPolicyHold("r/1", body)).disposition, extra.disposition ?? "applied");
@@ -58,6 +61,7 @@ it("malformed, wrong identity/generation/status, oversize and transport errors h
   for (const value of [null, [], { run: ack() }, ack({ disposition: "superseded" }), ack({ outcome_id: "other" }),
     ack({ claim_generation: 1 }), ack({ claim_generation: "2" }), ack({ status: "unknown" }),
     ack({ status: "running" }), ack({ disposition: "terminal", status: "paused" }),
+    ack({ disposition: "recorded", status: "completed" }),
     ack({ disposition: "resolved_newer_policy", status: "failed" }), ack({ hold_reason: null }), ack({ unexpected: "must reject" })]) {
     const { client, requests } = await setup(() => Response.json(value));
     await assert.rejects(client.reportPolicyHold("r", body), { message: "policy hold request failed" });

@@ -31,7 +31,8 @@ export interface PolicyHoldRequest {
 export type ImmutablePolicyOutcome = Readonly<Omit<PolicyHoldRequest, "claim_generation">>;
 
 export interface PolicyHoldAck {
-  disposition: "applied" | "already_applied" | "resolved_newer_policy" | "terminal" | "pending";
+  disposition: "applied" | "already_applied" | "resolved_newer_policy" | "terminal" | "pending"
+    | "recorded" | "unauthenticated_historical_outcome";
   outcome_id: string;
   status: string;
   hold_reason?: string;

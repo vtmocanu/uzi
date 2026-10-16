@@ -45,12 +45,12 @@ func (h *Handler) WorkerRunPolicyHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := http.StatusOK
-	if disposition == workersvc.PolicyHoldPending {
+	if disposition == workersvc.PolicyHoldPending || disposition == workersvc.PolicyHoldUnauthenticatedHistoricalOutcome {
 		status = http.StatusConflict
 	}
 	var reason *string
 	if run.HoldReason.Valid {
 		reason = &run.HoldReason.String
 	}
-	httpx.JSON(w, status, policyHoldAck{Disposition: disposition, OutcomeID: req.OutcomeID, Status: run.Status, HoldReason: reason, ClaimGeneration: run.ClaimGeneration})
+	httpx.JSON(w, status, policyHoldAck{Disposition: disposition, OutcomeID: req.OutcomeID, Status: run.Status, HoldReason: reason, ClaimGeneration: req.ClaimGeneration})
 }

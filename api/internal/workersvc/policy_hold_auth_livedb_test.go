@@ -30,8 +30,8 @@ func TestPolicyHoldAuthorizationBeforeIdentityLiveDB(t *testing.T) {
 		}
 		before := mustRun(t, e.codexTestEnv, e.runID)
 		r, d, err := e.svc.ReportPolicyHold(e.ctx, other, e.runID, req)
-		if !errors.Is(err, ErrRunNotOwned) || d != PolicyHoldPending || r.ID != uuid.Nil {
-			t.Fatalf("wrong worker learned identity: %s %v %+v", d, err, r)
+		if err != nil || d != PolicyHoldUnauthenticatedHistoricalOutcome || r.ID != e.runID {
+			t.Fatalf("missing historical authority bypassed refusal: %s %v", d, err)
 		}
 		stale := req
 		stale.ClaimGeneration = 2

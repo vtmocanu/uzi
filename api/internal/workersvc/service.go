@@ -4452,6 +4452,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
 		}
+		// An owner-resumable policy hold keeps the old worker for custody. Refuse
+		// ordinary reports under the existing fence before any metadata writes or
+		// post-transition MR reconciliation. A fresh claimed/running flight continues.
+		if PolicyOwnerConstrained(locked) && (locked.Status == "paused" || locked.Status == "queued") {
+			return locked, false, nil
+		}
 		if req.RequireRunning {
 			if locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil {
 				return locked, false, nil

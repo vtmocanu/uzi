@@ -28,7 +28,7 @@ const ack = (body: PolicyHoldRequest, disposition: PolicyHoldAck["disposition"] 
     status: disposition === "terminal" ? "cancelled" : "paused", hold_reason: "provider_policy_refusal" });
 
 it("exact authenticated ACK settles inventory only, retains source, and restart restores pending", async () => {
-  for (const disposition of ["applied", "already_applied", "resolved_newer_policy", "terminal"] as const) {
+  for (const disposition of ["applied", "already_applied", "resolved_newer_policy", "terminal", "recorded"] as const) {
     const { box, restart } = await setup();
     const result = await resolvePendingPolicy({ outbox: box, client: client(async b => ack(b, disposition)), log: nullLogger() }, args);
     assert.equal(result.kind, "observed");
@@ -44,15 +44,15 @@ it("exact authenticated ACK settles inventory only, retains source, and restart 
 });
 
 it("unknown/unsupported/pending remain evidence and do not settle or send terminal state", async () => {
-  for (const mode of ["pending", "unknown", "unsupported", "error"] as const) {
+  for (const mode of ["pending", "unauthenticated_historical_outcome", "unknown", "unsupported", "error"] as const) {
     const { box } = await setup();
     const { logger, lines } = recordingLogger();
     const result = await resolvePendingPolicy({ outbox: box, log: logger, client: client(async b => {
       if (mode === "unsupported") throw new PolicyHoldUnsupported();
       if (mode === "error") throw new Error("sensitive");
-      return ack(b, mode === "pending" ? "pending" : mode === "unknown" ? "superseded" as "pending" : "applied");
+      return ack(b, mode === "pending" || mode === "unauthenticated_historical_outcome" ? mode as PolicyHoldAck["disposition"] : mode === "unknown" ? "superseded" as "pending" : "applied");
     }) }, args);
-    assert.equal(result.kind, mode === "unsupported" ? "unsupported" : mode === "pending" ? "observed" : "pending");
+    assert.equal(result.kind, mode === "unsupported" ? "unsupported" : mode === "pending" || mode === "unauthenticated_historical_outcome" ? "observed" : "pending");
     assert.equal(box.listPendingPolicies()[0]!.server_settled, undefined);
     assert.equal(JSON.stringify(lines).includes("sensitive"), false);
     assert.equal(box.hasPendingTerminal("r", 1), false);

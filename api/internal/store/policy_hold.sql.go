@@ -184,6 +184,277 @@ func (q *Queries) CountOnlineWorkersSatisfyingPolicyHold(ctx context.Context, ar
 	return column_1, err
 }
 
+const lockPolicyHistoricalCustody = `-- name: LockPolicyHistoricalCustody :one
+SELECT id FROM recovery_custody_holds
+WHERE run_id = $1 AND generation = $2
+ AND original_worker_id = $3 AND user_id = $4
+ AND state <> 'discarded'
+FOR UPDATE
+`
+
+type LockPolicyHistoricalCustodyParams struct {
+	RunID            uuid.UUID `json:"run_id"`
+	Generation       int64     `json:"generation"`
+	OriginalWorkerID uuid.UUID `json:"original_worker_id"`
+	UserID           uuid.UUID `json:"user_id"`
+}
+
+// The caller already holds worker -> run. Retain the exact custody row lock
+// through metadata commit, sharing DiscardCustodyHoldForOwner's row lock.
+func (q *Queries) LockPolicyHistoricalCustody(ctx context.Context, arg LockPolicyHistoricalCustodyParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockPolicyHistoricalCustody,
+		arg.RunID,
+		arg.Generation,
+		arg.OriginalWorkerID,
+		arg.UserID,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const recordPolicyHoldMetadata = `-- name: RecordPolicyHoldMetadata :one
+UPDATE runs SET
+ policy_refusal_count = policy_refusal_count + CASE WHEN $1::text = 'refused' THEN 1 ELSE 0 END,
+ policy_last_tag = CASE WHEN $1 = 'refused' THEN $2::text ELSE policy_last_tag END,
+ policy_last_phase = CASE WHEN $1 = 'refused' THEN $3::text ELSE policy_last_phase END,
+ policy_last_correlation_id = CASE WHEN $1 = 'refused' THEN $4::text ELSE policy_last_correlation_id END,
+ policy_last_refused_at = CASE WHEN $1 = 'refused' THEN now() ELSE policy_last_refused_at END,
+ policy_last_outcome_id = $5, policy_last_source_generation = $6,
+ hold_captured_head = CASE WHEN $7::boolean THEN $8::text ELSE hold_captured_head END,
+ checkpoint_contains_latest = CASE WHEN $7 THEN $9::boolean ELSE checkpoint_contains_latest END,
+ policy_hold_detail = CASE WHEN $7 THEN $1 ELSE policy_hold_detail END,
+ policy_hold_provenance = CASE WHEN $7 THEN $10::text ELSE policy_hold_provenance END,
+ policy_hold_published = CASE WHEN $7 THEN $11::boolean ELSE policy_hold_published END,
+ updated_at = now()
+WHERE id = $12 AND status NOT IN ('completed', 'failed', 'cancelled')
+ AND harness = 'codex' AND NOT interactive
+ AND kind IN ('issue', 'task', 'prompt', 'self_improve')
+ AND stop_kind IS NULL
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, policy_refusal_count, policy_last_tag, policy_last_phase, policy_last_correlation_id, policy_last_refused_at, policy_hold_provenance, policy_hold_published, policy_hold_detail, policy_last_outcome_id, policy_last_source_generation, policy_fresh_claim_generation
+`
+
+type RecordPolicyHoldMetadataParams struct {
+	Detail                   string      `json:"detail"`
+	Tag                      pgtype.Text `json:"tag"`
+	Phase                    pgtype.Text `json:"phase"`
+	CorrelationID            pgtype.Text `json:"correlation_id"`
+	OutcomeID                pgtype.UUID `json:"outcome_id"`
+	SourceGeneration         pgtype.Int8 `json:"source_generation"`
+	RecordPreservation       bool        `json:"record_preservation"`
+	Head                     pgtype.Text `json:"head"`
+	CheckpointContainsLatest pgtype.Bool `json:"checkpoint_contains_latest"`
+	Provenance               pgtype.Text `json:"provenance"`
+	Published                pgtype.Bool `json:"published"`
+	ID                       uuid.UUID   `json:"id"`
+}
+
+// Authorized under worker/run/custody locks. No live claim, owner choice, session,
+// clock, scope, grant, gate, or execution fields belong to historical delivery.
+func (q *Queries) RecordPolicyHoldMetadata(ctx context.Context, arg RecordPolicyHoldMetadataParams) (Run, error) {
+	row := q.db.QueryRow(ctx, recordPolicyHoldMetadata,
+		arg.Detail,
+		arg.Tag,
+		arg.Phase,
+		arg.CorrelationID,
+		arg.OutcomeID,
+		arg.SourceGeneration,
+		arg.RecordPreservation,
+		arg.Head,
+		arg.CheckpointContainsLatest,
+		arg.Provenance,
+		arg.Published,
+		arg.ID,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+		&i.CompletionContractVersion,
+		&i.ContractRevision,
+		&i.CompletionContract,
+		&i.CompletionAttempts,
+		&i.LatestCompletionAttempt,
+		&i.MilestonesAgents,
+		&i.HoldReason,
+		&i.HoldCapturedHead,
+		&i.CompletionBudgetExhaustedAt,
+		&i.CompletionQuestionAt,
+		&i.BudgetExtensionSeconds,
+		&i.ClaimGeneration,
+		&i.Harness,
+		&i.RecoveryWaitCause,
+		&i.ForgeParkCount,
+		&i.CredentialOverrideMode,
+		&i.CredentialOverrideSecretID,
+		&i.ClaimReleasedAt,
+		&i.CredentialSwitchRequestedAt,
+		&i.CredentialSwitchGeneration,
+		&i.StaleRequeueGeneration,
+		&i.BudgetFinalizeSeconds,
+		&i.ReleasedWorkerID,
+		&i.ReleasedWorkerNonce,
+		&i.GateRevision,
+		&i.GatePresentationID,
+		&i.GatePresentedPayload,
+		&i.GatePayloadDigest,
+		&i.GateRefusalCount,
+		&i.GateRefusalGeneration,
+		&i.DiskParkCount,
+		&i.CheckpointContainsLatest,
+		&i.EgressProfileID,
+		&i.EgressSnapshot,
+		&i.JobType,
+		&i.FinalizeResumeGeneration,
+		&i.JobProtocol,
+		&i.FirstStartedAt,
+		&i.PlanCrossCheckRequired,
+		&i.PlanCrossCheckGateReason,
+		&i.IssueRawDigest,
+		&i.IssueSavedBody,
+		&i.IssueInputReason,
+		&i.AutoApproveBlockedReasons,
+		&i.PlanCrossCheckDiffRefusal,
+		&i.WorkerRecoveryEpisode,
+		&i.RequeueEpisodeBaseline,
+		&i.WorkerRecoveryEvidence,
+		&i.CrossCheckLane,
+		&i.CrossCheckLaneGeneration,
+		&i.CompletionFinalHead,
+		&i.CodeCrossCheckRequired,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
+		&i.CiConfigGuard,
+		&i.PolicyRefusalCount,
+		&i.PolicyLastTag,
+		&i.PolicyLastPhase,
+		&i.PolicyLastCorrelationID,
+		&i.PolicyLastRefusedAt,
+		&i.PolicyHoldProvenance,
+		&i.PolicyHoldPublished,
+		&i.PolicyHoldDetail,
+		&i.PolicyLastOutcomeID,
+		&i.PolicyLastSourceGeneration,
+		&i.PolicyFreshClaimGeneration,
+	)
+	return i, err
+}
+
 const resumePolicyHold = `-- name: ResumePolicyHold :one
 UPDATE runs SET status = 'queued', status_since = now(),
  budget_paused_seconds = budget_paused_seconds + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),

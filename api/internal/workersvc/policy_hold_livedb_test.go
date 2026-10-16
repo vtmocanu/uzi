@@ -200,15 +200,15 @@ func TestPolicyHoldCancelAndLostOwnershipLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, d, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
-	if err != nil || d != PolicyHoldPending {
+	if err != nil || d != PolicyHoldUnauthenticatedHistoricalOutcome {
 		t.Fatalf("released report=%s %v", d, err)
 	}
 	if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET status='cancelled' WHERE id=$1", e.runID); err != nil {
 		t.Fatal(err)
 	}
 	_, d, err = e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
-	if err != nil || d != PolicyHoldTerminal {
-		t.Fatalf("released cancel disposition=%s %v", d, err)
+	if err != nil || d != PolicyHoldUnauthenticatedHistoricalOutcome {
+		t.Fatalf("released cancel without custody disposition=%s %v", d, err)
 	}
 }
 

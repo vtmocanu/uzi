@@ -80,13 +80,20 @@ test("summary cleanup failure preserves the admitted policy outcome", async () =
   assert.equal(fs.existsSync(worktreeDirFor(3068)), true);
 });
 
-for (const disposition of ["applied", "already_applied", "resolved_newer_policy", "pending", "terminal"] as const) {
+for (const disposition of ["applied", "already_applied", "resolved_newer_policy", "pending", "terminal", "recorded", "unauthenticated_historical_outcome"] as const) {
   test(`older generation reconciliation: ${disposition}`, async () => {
     const { outbox, claim } = await setup();
     const outcome = { outcome_id: randomUUID(), source_generation: 1, detail: "resume_rejected" as const,
       head: "", published: false };
     assert.equal((await outbox.journalPolicy(claim.run_id, outcome)).journaled, true);
-    api.policyHoldDisposition = disposition;
+    client.reportPolicyHold = async (_id, body) => {
+      api.policyHoldRequests.push({ runId: claim.run_id, body: { ...body } });
+      return {
+        disposition, outcome_id: body.outcome_id, claim_generation: body.claim_generation,
+        status: disposition === "terminal" ? "cancelled" : disposition === "applied" ? "paused" : "running",
+        ...(disposition === "applied" ? { hold_reason: "provider_policy_refusal" } : {}),
+      };
+    };
     let calls = 0;
     const executor: Executor = { async run() { calls++; throw new Error("test execution reached"); } };
     const forge = fakeGitlab();
@@ -99,6 +106,10 @@ for (const disposition of ["applied", "already_applied", "resolved_newer_policy"
     assert.equal(forge.calls.length, 0);
     assert.equal(outbox.hasPendingPolicy(claim.run_id), true, "physical retirement belongs to custody proof");
     if (calls === 0) assert.equal(api.states.some(s => s.body.status === "failed"), false);
+    if (disposition === "unauthenticated_historical_outcome") {
+      assert.equal(outbox.listPendingPolicies()[0]!.server_settled, undefined);
+    }
+
   });
 }
 

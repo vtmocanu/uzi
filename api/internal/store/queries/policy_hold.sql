@@ -199,3 +199,34 @@ WHERE run.id = @run_id
 )
 SELECT count(*) FILTER (WHERE heartbeat_recent AND online AND affinity AND strict_binding)::bigint
 FROM candidates;
+
+-- name: LockPolicyHistoricalCustody :one
+-- The caller already holds worker -> run. Retain the exact custody row lock
+-- through metadata commit, sharing DiscardCustodyHoldForOwner's row lock.
+SELECT id FROM recovery_custody_holds
+WHERE run_id = @run_id AND generation = @generation
+ AND original_worker_id = @original_worker_id AND user_id = @user_id
+ AND state <> 'discarded'
+FOR UPDATE;
+
+-- name: RecordPolicyHoldMetadata :one
+-- Authorized under worker/run/custody locks. No live claim, owner choice, session,
+-- clock, scope, grant, gate, or execution fields belong to historical delivery.
+UPDATE runs SET
+ policy_refusal_count = policy_refusal_count + CASE WHEN @detail::text = 'refused' THEN 1 ELSE 0 END,
+ policy_last_tag = CASE WHEN @detail = 'refused' THEN sqlc.narg('tag')::text ELSE policy_last_tag END,
+ policy_last_phase = CASE WHEN @detail = 'refused' THEN sqlc.narg('phase')::text ELSE policy_last_phase END,
+ policy_last_correlation_id = CASE WHEN @detail = 'refused' THEN sqlc.narg('correlation_id')::text ELSE policy_last_correlation_id END,
+ policy_last_refused_at = CASE WHEN @detail = 'refused' THEN now() ELSE policy_last_refused_at END,
+ policy_last_outcome_id = @outcome_id, policy_last_source_generation = @source_generation,
+ hold_captured_head = CASE WHEN @record_preservation::boolean THEN sqlc.narg('head')::text ELSE hold_captured_head END,
+ checkpoint_contains_latest = CASE WHEN @record_preservation THEN sqlc.narg('checkpoint_contains_latest')::boolean ELSE checkpoint_contains_latest END,
+ policy_hold_detail = CASE WHEN @record_preservation THEN @detail ELSE policy_hold_detail END,
+ policy_hold_provenance = CASE WHEN @record_preservation THEN sqlc.narg('provenance')::text ELSE policy_hold_provenance END,
+ policy_hold_published = CASE WHEN @record_preservation THEN sqlc.narg('published')::boolean ELSE policy_hold_published END,
+ updated_at = now()
+WHERE id = @id AND status NOT IN ('completed', 'failed', 'cancelled')
+ AND harness = 'codex' AND NOT interactive
+ AND kind IN ('issue', 'task', 'prompt', 'self_improve')
+ AND stop_kind IS NULL
+RETURNING *;
