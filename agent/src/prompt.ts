@@ -329,6 +329,14 @@ export const SECRET_FIXTURE_HYGIENE_APPEND = [
   "is enforced by a source-hygiene gate.",
 ].join("\n");
 
+/** Lead-only check-mode static checks, independent of integration-gate timing. */
+export const LEAD_FAST_CHECK_APPEND = [
+  "Before committing a unit for review, run its available cheap, check-only static checks",
+  "on the touched unit (format, lint, typecheck and git diff --check HEAD as applicable).",
+  "Use the repo's supported focused commands; do not substitute a costly full gate or",
+  "invent a check. This does not replace required review or integration gates.",
+].join("\n");
+
 /**
  * Issue #2593: integration-gate sequencing and failed-gate triage for the LEAD only.
  * An append (not a template edit) so customized lead templates get it without
@@ -404,11 +412,22 @@ export const CODEX_LONG_COMMAND_APPEND = [
   "After that command call exits, read the printed log path in a separate call and report",
   "its recorded exit status.",
   "For live observation, choose a known .uzi/scratch log path before invoking Bash.",
-  "While that command is pending, use Read on its known log path to observe progress;",
-  "quiet or redirected output does not extend or shorten its finite bound. There is no",
+  "While that command is pending, use Read only when observing its known log path can",
+  "change your next action. Do not re-read unchanged output or repeat unchanged status updates.",
+  "Quiet or redirected output does not extend or shorten its finite bound. There is no",
   "automatic extension or per-command cancel API. A suspected hang still has a finite",
   "deadline; owner cancellation, pause-now, turn abort and the run wall stop owned work.",
   "The run wall parks the run even when a command has opted into 120 minutes.",
+].join("\n");
+
+/** The runtime roster supplies capabilities, so dispatch should carry work rather than probe them. */
+const CODEX_LEAD_DISPATCH_APPEND = [
+  "Use the available subagent roster and its capability annotations;",
+  "do not dispatch an agent to ask its role or availability.",
+  "Every dispatch needs a concrete question, task scope, available evidence paths and",
+  "expected output, plus a short description label. For validation provide the actual",
+  "plan text or committed base..sha range. Research may start from a concrete discovery",
+  "question before an artifact exists. spawn_agent returns its result in this turn; integrate it.",
 ].join("\n");
 
 /**
@@ -440,7 +459,8 @@ export const CLAUDE_LONG_COMMAND_APPEND = [
   "repeat the literal name and poll a bounded number of times: `s=\"$(git rev-parse",
   "--show-toplevel)/.uzi/scratch\"; for i in $(seq 40); do test -s \"$s/<name>.rc\" && break; sleep",
   "10; done; cat \"$s/<name>.rc\"; tail -n 5 \"$s/<name>.log\"`. Repeat that call in the same turn",
-  "until the `.rc` file exists; its content is the exit status. If the command is gone and no",
+  "until the `.rc` file exists; its content is the exit status. Keep only one poll call outstanding per command;",
+  "never start parallel copies. If the command is gone and no",
   "`.rc` file was written, report the result as unverified.",
 ].join("\n");
 
@@ -593,8 +613,9 @@ export function buildLeadSystemPrompt(
   // across run kinds and pushed before every conditional append, so it sits outside the
   // untrusted-repo fence (repoInstructions is pushed last).
   parts.push(LEAD_GATE_SEQUENCING_APPEND);
+  parts.push(LEAD_FAST_CHECK_APPEND);
   if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
-  if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND);
+  if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
@@ -2041,9 +2062,13 @@ export function milestoneStatusNote(
     return `- [${m.id}] ${m.title} — ${status}`;
   });
   const lines = [
-    "Your approved plan is broken into these milestones. When a milestone's work is",
-    "committed locally, call the `checkpoint` tool once and end your turn so the work is",
-    "saved durably before you start the next one:",
+    "Your approved plan is broken into these milestones.",
+    "Between milestones, when a milestone's work is committed locally, call the `checkpoint`",
+    "tool once and end your turn so the work is saved durably before you start the next one.",
+    "When no planned milestone remains unfinished within the approved run scope and the final milestone's",
+    "work, review and required validation are complete, report its completion and",
+    "call `signal_done` in the same turn instead of checkpointing and ending the turn.",
+    "Milestones:",
     ...rows,
     ...(serverCompletedIds === undefined ? [
       "Prior completion declarations may be unknown because the iteration ACK supplied no completed IDs.",

@@ -634,7 +634,8 @@ export function buildSignalMcpServer(
             tool(
               CHECKPOINT_TOOL,
               "Save the work you have committed for the current milestone durably, so it survives a worker crash. " +
-                "Call this once a milestone's work is committed locally, then STOP and end your turn — you will be " +
+                "Use this between milestones; for the final milestone call signal_done instead. " +
+                "Between milestones, call this once the work is committed locally, then STOP and end your turn. You will be " +
                 "re-prompted to continue with the next milestone. This is a durability checkpoint, NOT a quality gate: " +
                 "it does not run tests or verify that review passed.",
               {},

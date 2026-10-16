@@ -62,6 +62,9 @@ through `[0.52.0]`.)
 - **Codex leads receive their subagent capabilities before planning.**
   Planning and implementation prompts list available roles with their implementation write capabilities, while planning remains read-only. Skill tools list each role's granted skills, shell tools identify their interpreter, and delegation traces include a bounded, scrubbed assignment excerpt without changing milestone labels.
 
+- **Lead guidance clarifies validation ownership and final milestone completion.**
+  Guidance tells leads to assign expensive proofs one owner, check mandatory plan requirements, adjudicate weak regression pins and address conflicting follow-ups. Runtime guidance tells leads to run early static checks, avoid Codex dispatch probes, unchanged waiting updates and duplicate Claude polls, and finish a verified final milestone without an extra checkpoint turn. Customized lead templates receive the runtime appends but not the builtin lead template edits.
+
 ### Changed
 
 - **sqlc regeneration uses verified release binaries.**
