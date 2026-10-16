@@ -642,23 +642,17 @@ resolve_fixture_source_hold() {
 }
 
 # Phase-52 completed fixtures may still be preparing a capture after terminal
-# reporting. Opt in to bounded exact-generation settlement; legacy callers of
-# either strict helper keep their existing semantics.
+# reporting. Wait for a typed exact-generation release, never owner-discard a
+# source that may still be settling. Legacy strict callers keep their semantics.
 resolve_completed_fixture_source_hold() {
   wait_completed_custody_receipt "$1" "${3:-120}" "$2"
-}
-
-discard_completed_fixture_hold() {
-  curl -fsS --max-time "$3" -b "$JAR" -X DELETE \
-    "$BASE/api/runs/$1/recovery-holds/$2?confirm=discard" \
-    -H "X-CSRF-Token: $(csrf)"
 }
 
 # A completed status precedes the worker's final custody ACK. Wait only for this
 # run's current generation, preserving every older or unrelated source hold.
 wait_completed_custody_receipt() {
   local run="$1" timeout="${2:-120}" start=$SECONDS snapshot="" generation expected="${3:-}"
-  local fixture=0 expected_hold="" discarded="" disposition_error="" remaining query id reply
+  local fixture=0 expected_hold="" remaining query id
   if [ "${3+x}" ]; then
     [[ "$expected" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed fixture generation: $expected"
     fixture=1
@@ -687,7 +681,7 @@ wait_completed_custody_receipt() {
       FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')"
     if [ "$fixture" = 1 ]; then
       remaining=$((timeout - (SECONDS - start)))
-      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot $disposition_error"
+      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot"
       snapshot="$(db_psql_rows "$query" "$remaining")" || fail "completed fixture settlement read failed: $snapshot"
       printf '%s' "$snapshot" | jq -e --arg run "$run" '
         .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
@@ -709,10 +703,6 @@ wait_completed_custody_receipt() {
       [[ "$id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || fail "completed fixture invalid hold identity: $snapshot"
       [ -n "$expected_hold" ] || expected_hold="$id"
       [ "$id" = "$expected_hold" ] || fail "completed fixture hold identity changed: $snapshot"
-      if [ "$discarded" = "$id" ] && printf '%s' "$snapshot" | jq -e '.holds[0].state=="discarded"' >/dev/null; then
-        pass "completed fixture owner disposition: run=$run generation=$generation hold=$id"
-        return
-      fi
     fi
     if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
       printf '%s' "$snapshot" | jq -e '. as $run | .holds[0] |
@@ -744,18 +734,6 @@ wait_completed_custody_receipt() {
     fi
     printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null' >/dev/null \
       || fail "completed receipt has unexpected disposition: $snapshot"
-    if [ "$fixture" = 1 ] && [ -z "$discarded" ] && printf '%s' "$snapshot" | jq -e '
-      .worker_active==0 and (.holds[0] | .attention=="source_only" and .capture_count==0 and .capture_state=="")' >/dev/null; then
-      remaining=$((timeout - (SECONDS - start)))
-      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot $disposition_error"
-      # Exactly the owner's existing hold-discard API, never archive deletion.
-      # A concurrent publication release can win this race: re-read and require
-      # its typed proof rather than treating a rejected discard as success.
-      if reply="$(discard_completed_fixture_hold "$run" "$id" "$remaining" 2>&1)"; then
-        printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "completed fixture disposition not acknowledged: $reply snapshot=$snapshot"
-        discarded="$id"
-      else disposition_error="owner disposition failed: $reply"; fi
-    fi
     [ $((SECONDS - start)) -lt "$timeout" ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot"
     sleep 0.5
   done

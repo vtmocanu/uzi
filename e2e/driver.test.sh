@@ -1114,7 +1114,8 @@ FAKE_REAL_LIMITER="$(command -v timeout || command -v gtimeout)"
 cat > "$TMP/limiter-bin/timeout" <<'LIMITER_EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_LIMITER_LOG"
-if [ "${FAKE_COPY_FAIL:-0}" = 1 ] && [ "$2" = 2 ]; then exit 124; fi
+if [ "${FAKE_COPY_FAIL:-0}" = 1 ] && [ "$2" = 2 ] && [ "$3" = bash ] && [ "$4" = -c ] &&
+  [ "$5" = 'rm -rf -- "$2" && cp -R -- "$1" "$2"' ]; then exit 124; fi
 if [[ "$*" = *'forge-fake' ]]; then echo truncated >&2; exit 137; fi
 exec "$FAKE_REAL_LIMITER" "$@"
 LIMITER_EOF

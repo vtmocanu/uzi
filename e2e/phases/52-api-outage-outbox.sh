@@ -433,8 +433,8 @@ NT1="$(printf '%s' "$M1" | jq '[.messages[] | select((.payload.text? // "") | st
 { [ -n "$NT1" ] && [ "$NT1" -ge 5 ] 2>/dev/null; } \
   || fail "case 1: fewer than 5 outbox tick frames replayed (got ${NT1:-none})"
 pass "case 1: spill+drain proven — barrier seen, run completed with no failed report, $NT1 ticks replayed, stream gapless 1..$(printf '%s' "$M1" | jq '.messages | length')"
-# Each sibling case makes its separate fixture-owner disposition only after proving
-# preservation; case 3 alone retains its exact hold for the boundary handoff.
+# Completed siblings wait for their exact-generation typed custody release after
+# proving preservation; case 3 retains its exact hold for the boundary handoff.
 resolve_completed_fixture_source_hold "$RUN1" "$GEN1"
 
 # =============================================================================
