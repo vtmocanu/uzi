@@ -484,7 +484,12 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
 
   if [ "$rc" -eq 0 ]; then
     # 6. provides round-trip — AT TOP LEVEL so the new vars land in this shell and
-    #    are inherited by the next phase's subshell.
+    #    are inherited by the next phase's subshell. Clear only provided shell vars:
+    #    declare without an assignment otherwise retains a stale parent value.
+    for v in $provides; do
+      case "$v" in env:*) continue ;; esac
+      unset -v -- "$v"
+    done
     # shellcheck disable=SC1090  # generated declare-file, path is a runtime var
     source "$RUNROOT/phase.env.next"
     # Capture only requested declarations while no boundary helper locals exist.

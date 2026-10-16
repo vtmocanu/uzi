@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hermetic behavioural test for e2e/driver.sh (PRD #966 M2), the shape of
 # e2e/reclaim-leaked-e2e.test.sh: fake helper FUNCTIONS + fixture phase files,
-# no stack, no docker, no network. Each case runs the REAL driver in a subshell
-# that defines the fakes and sources driver.sh AT TOP LEVEL (never inside a
+# no stack, no docker, no network. Each case runs the REAL driver in standalone
+# Bash that defines the fakes and sources driver.sh AT TOP LEVEL (never inside a
 # function — case 2 is exactly why that matters), then asserts on
 # $RUNROOT/results.tsv, junit.xml and the case log.
 #
@@ -115,7 +115,7 @@ wait_status() { :; }
 # artifact capture: `docker compose logs …` (echo a marker so the captured svc.log
 # has content) and `docker compose ps …` (print nothing, i.e. no service running, so
 # 00-preflight's leg 4 takes the deferred-note path). COMPOSE=(fake_docker) is set in
-# the parent test shell and inherited by run_driver's subshell.
+# the parent test shell and serialized by run_driver's bootstrap.
 fake_docker() {
   local n
   case "$1" in
@@ -188,26 +188,28 @@ end() {
   if [ "$case_fail" -eq 0 ]; then passed=$((passed + 1)); printf 'PASS: %s\n' "$cur"
   else printf 'FAIL: %s\n' "$cur"; fi
 }
-# run_driver — source the fakes + driver AT SUBSHELL TOP LEVEL. NOT wrapped in a
-# function: a function would make the driver's top-level `source phase.env.next`
-# function-local and silently break provides (that IS case 2's mutation).
+# run_driver launches standalone Bash so source runs outside function scope.
+# A subshell inside this function would retain its dynamic scope, masking stale
+# globals when phase.env.next declares an unset scalar.
 LOG=""; RC=0
 run_driver() {
   LOG="$TMP/log-$1"
+  # Preserve arrays and unexported fixture knobs; exported globals are inherited.
+  declare -p RUNROOT PHASES_DIR ENVFILE COMPOSE > "$TMP/bootstrap"
+  while IFS= read -r knob; do
+    declare -p "$knob" >> "$TMP/bootstrap"
+  done < <(compgen -A variable FAKE_; compgen -A variable E2E_ || true)
   set +e
-  # shellcheck disable=SC1090
-  ( source "$FAKES"; source "$DRIVER" ) > "$LOG" 2>&1
+  bash -c 'set -euo pipefail; source "$1"; source "$2"; source "$3"' \
+    bash "$TMP/bootstrap" "$FAKES" "$DRIVER" > "$LOG" 2>&1
   RC=$?
   set -e
 }
-# Shared globals the driver reads — exported because they are consumed by the
-# driver sourced INSIDE run_driver's subshell (which shellcheck cannot see); the
-# same reason applies to the per-case E2E_*/FAKE_* knobs set below.
+# Shared globals inherited by the standalone driver shell; per-case E2E_*/FAKE_*
+# knobs are serialized by run_driver even when they are not exported.
 export ROOT="$REPO_ROOT" FORGE=gitlab EXECUTOR=stub ADMIN_EMAIL=fixture@example.com
-# COMPOSE is an ARRAY (can't be exported), but run_driver's `( … )` is a subshell of
-# THIS shell, so a plain assignment here is visible inside it. The driver uses it only
-# for on-red artifact capture; fake_docker (in FAKES) is the command it resolves to.
-# shellcheck disable=SC2034  # consumed by driver.sh inside the run_driver subshell
+# COMPOSE is an array, serialized into the standalone shell's bootstrap.
+# The driver uses it only for on-red artifact capture.
 export DRIVER_FAKES="$FAKES"
 cat > "$TMP/compose" <<'COMPOSE_EOF'
 source "$DRIVER_FAKES"
@@ -901,9 +903,12 @@ BODY
   end
 done
 
+for parent in absent stale; do
 for mode in run hold; do
-  begin "boundary: declared but unset $mode fails with final reports" "unset-$mode"
+  begin "boundary: unset provided $mode with $parent parent" "unset-$parent-$mode"
+  if [ "$parent" = stale ]; then export HOLD_HAND="$H"; else unset HOLD_HAND; fi
   mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" HOLD_HAND "" <<'BODY'
+unset HOLD_HAND
 declare HOLD_HAND
 pass body
 BODY
@@ -914,9 +919,36 @@ BODY
   else
     echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
   fi
-  boundary_fail "unset-$mode" 'declaration HOLD_HAND'
+  boundary_fail "unset-$parent-$mode" 'declaration HOLD_HAND'
   [ -f "$RUNROOT/junit.xml" ] || bad 'JUnit missing'
   [ -f "$RUNROOT/summary.md" ] || bad 'summary missing'
+  contains "$(cat "$RUNROOT/junit.xml")" 'failures="1"' || bad 'JUnit failure missing'
+  contains "$(cat "$RUNROOT/summary.md")" 'FAIL' || bad 'summary failure missing'
+  unset HOLD_HAND
+  end
+done
+done
+
+# A declaration inherited from the caller remains valid when not provided here.
+for mode in run hold; do
+  begin "boundary: inherited $mode without provides remains valid" "inherited-$mode"
+  export HOLD_HAND="$H"
+  mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
+pass body
+BODY
+  if [ "$mode" = run ]; then
+    sed 's/^# handoff:.*$/# handoff: HOLD_HAND/' "$PHASES_DIR/01-origin.sh" > "$TMP/phase"
+    mv "$TMP/phase" "$PHASES_DIR/01-origin.sh"
+    FAKE_DB_IDS="$H"
+  else
+    echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+    FAKE_HOLDS="$H|$R|1"
+  fi
+  run_driver "inherited-$mode"
+  has_row origin PASS || bad 'inherited declaration lost'
+  [ "$RC" = 0 ] || bad 'inherited declaration must exit zero'
+  [ ! -s "$FAKE_API_LOG" ] || bad 'inherited run cancelled'
+  unset HOLD_HAND
   end
 done
 
