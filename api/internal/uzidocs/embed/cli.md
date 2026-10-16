@@ -787,8 +787,12 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
-- **`run plan <run-id>` prints the latest plan Markdown verbatim.** It
-  appends no newline and does no terminal rendering or sanitation, even on a
+- **`run plan <run-id>` prints the latest plan Markdown verbatim.** Use
+  `uzi run plan <run-id> [--version N] [--diff] [--json]` regardless of run
+  status, including after approval or once the run has finished. For reading
+  the saved full text in the web run page, see
+  [Reading the full plan after the gate](./run-activity.md#reading-the-full-plan-after-the-gate).
+  It appends no newline and does no terminal rendering or sanitation, even on a
   TTY. `--version N` selects the Nth `plan` message in ascending `seq`
   order, starting at 1. An integer outside `1..K` is a usage error
   (`ExitUsage`, exit 2): `run has K plan version(s)`. A run with no plan
@@ -1735,7 +1739,13 @@ A newer release is available.
 - **Run detail** (`[enter]` from the board, or `uzi tui <run-id>` directly).
   A left rail of agent lanes — the lead plus each live subagent, one lane per
   invocation, each with a status dot — beside the selected lane's transcript,
-  rendered as markdown. Lanes are built from the same per-invocation
+  rendered as markdown. Loaded plan messages show their full Markdown under
+  a neutral **plan** header, without the 200-character compact fallback;
+  normal transcript scrolling reaches the final line. The header does not
+  imply approval. Paging and controls are unchanged, so this does not mean
+  a complete plan history is automatically loaded. For version selection
+  and diffs, use `uzi run plan` as described under [Commands](#commands).
+  Lanes are built from the same per-invocation
   `agent`/`agent_instance`/`agent_label` attribution `run logs` prints; see
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
   for what a lane's dot means. The header's status tag folds in the run's
