@@ -1,10 +1,37 @@
 # M5b — calibration implementation and incomplete acceptance
 
 Implementation is committed and reviewed at `f837a257bb7da13c303ed540671ce18d450b019f`.
-M5b acceptance remains **INCOMPLETE**: real 1 GiB/2 GiB calibration failed its
-actual-reader memory.pressure prerequisite before commands or allocation. No successful
+Local M5b measurement is **BLOCKED**; M5b is not passed, skipped or complete.
+Real 1 GiB/2 GiB calibration failed its actual-reader memory.pressure prerequisite
+before commands or allocation. No successful
 reserve inequality, cancellation latency or hosted sizing claim is made. The
 [calibration procedure](worker-memory-calibration.md) defines the remaining acceptance.
+
+## Acceptance-sequence amendment — 2026-10-16
+
+The user's authoritative 2026-10-16 deviation permits publication with **LOCAL M5b
+BLOCKED**. Only M1/M4/M5a are complete; M5b local measurements remain blocked.
+This changes the acceptance sequence, not the lane, checker, report contract or
+arithmetic. No new host can be provisioned in this run; the host/kernel must not
+be modified to enable PSI.
+
+Publication and handoff are authorized after the remaining work is committed
+and reviewed, with the local blocker explicit. CI measurement verification must
+then precede merge. Successful,
+complete 1 GiB and 2 GiB marked reports from CI `test-agent-worker-uid` remain
+mandatory **BEFORE MERGE**; the lander must not merge without both. This amendment
+does not treat publication or a handoff signal as measurement acceptance.
+
+Required wiring is verified: `Taskfile.yml`'s `test:agent:worker-uid` calls
+`calibration.py` in CI mode when `GITHUB_ACTIONS=true`, and direct I/O preserves
+markers. `.github/workflows/ci.yml`'s `test-agent-worker-uid` invokes that Task with
+the provided image and `WORKER_UID_SKIP_BUILD=1`; for relevant changes, the
+`test-agent` aggregator fails when the worker result is not `success`. The local
+`gate-log.DKSwGC` EXIT=201 / inner exit 1 remains failure evidence, not a pass.
+Unchanged focused regressions passed on 2026-10-16 (`gate-log.O8enD4`, EXIT=0):
+one both-size prerequisite-failure case, 24 report-checker cases and three Task
+framing/propagation cases on pinned Task 3.54.0. This required no new calibration
+attempt or changes to the lane, checker, report schema or arithmetic.
 
 ## Delivered behavior and review
 
@@ -75,6 +102,24 @@ reports with the correct host SHA, local identity and finite sizes:
   was absent. Known OOM counters and deltas were 0.
 - Neither report contained plan, tree, allocation, ACK, signal or span measurements.
   Both immutable containers had confirmed owned host cleanup.
+
+The actual leg errors were:
+
+1 GiB (1073741824):
+
+```text
+Error: actual default reader unavailable: {"available":false,"reason":"absent","sampleId":1,"startedAtMs":2118.544014,"completedAtMs":2119.702448}
+```
+
+2 GiB (2147483648):
+
+```text
+Error: actual default reader unavailable: {"available":false,"reason":"absent","sampleId":1,"startedAtMs":1864.704799,"completedAtMs":1865.920241}
+```
+
+In both actual reports, raw `memory.pressure` is null because the actual default
+reader's PSI input was absent. Null denotes unavailable input, not measured zero
+pressure or a successful prerequisite; both legs failed before commands or load.
 
 Raw reports, the trusted manifest and cleanup sidecars remain under
 `.uzi/scratch/memory-calibration-8a61377b82532ea382eb909e2a5f9204`.
@@ -161,7 +206,9 @@ Deferred milestone notes, retained as review dispositions:
 No graded security or demonstrated mandatory correctness finding remained. Prior
 milestone deferred notes remain in their records.
 
-M1/M4/M5a are complete; **M5b is incomplete**. No completion or publication signal
-was issued. Successful real 1 GiB/2 GiB measurements and final successful composed
-timing await a suitable PSI host. Small-fixture success, when obtained, will still
-not establish production reserve settings.
+Only M1/M4/M5a are complete; **M5b local measurements are BLOCKED**, not passed,
+skipped or complete. The 2026-10-16 deviation authorizes publication and handoff
+with the local blocker explicit after committed work is reviewed. The lander must obtain both successful, complete
+1 GiB/2 GiB marked reports from CI `test-agent-worker-uid` before merging and
+retain ownership of final successful composed timing. Small-fixture success,
+when obtained, will still not establish production reserve settings.
