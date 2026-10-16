@@ -155,7 +155,7 @@ cleanup() {
   # A red run KEEPS its scratch dir so the per-phase artifacts/ the driver captured
   # survive for post-mortem (and #967's upload). "Red" = a non-zero exit $code OR the
   # driver's `$RUNROOT/.keep-rundir` sentinel, which the driver `touch`es on ANY
-  # FAIL/LEAK — so a non-strict LEAK, which exits 0, still keeps the dir per D5. The
+  # body or boundary FAIL; every such failure now exits nonzero (#2892). The
   # existing KEEP (KEEP_RUNDIR) path keeps it unconditionally and is handled first.
   if [ -n "$KEEP" ]; then
     exit $code
@@ -285,10 +285,23 @@ db_psql() {
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
 # (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
 # is the memoized module var db_psql uses.
-db_psql_rows() {
+db_psql_rows() (
+  # Keep pipeline failure propagation local, including for callers without pipefail.
+  set -o pipefail
+  local limiter=""
+  if [ "${2+x}" ]; then
+    [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 1
+    limiter="$(command -v timeout || command -v gtimeout)" || {
+      echo 'db_psql_rows: no timeout/gtimeout limiter available' >&2; return 1;
+    }
+  fi
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
-}
+  if [ -n "$limiter" ]; then
+    "$limiter" --signal=KILL "$2" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+  else
+    "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+  fi
+)
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
@@ -335,6 +348,17 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the uzi run-eligibility gate refusing a non-uzi issue).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+
+# boundary_cancel PATH REMAINING EVIDENCE_PREFIX — retain both HTTP and transport
+# outcomes; callers decide whether the cancellation was accepted.
+boundary_cancel() {
+  local rc=0
+  curl -sS --max-time "$2" -o "$3.body" -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
+    -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+    -d '{"kind":"cancel","body":""}' > "$3.http" 2> "$3.stderr" || rc=$?
+  printf '%s\n' "$rc" > "$3.exit"
+  [ "$rc" -eq 0 ] && [[ "$(cat "$3.http")" =~ ^2[0-9][0-9]$ ]]
+}
 
 # wait_http — poll /api/health until the stack answers. Instrumented (PRD #97 M9b)
 # even though it is defined ABOVE record_margin: bash resolves function names at call
@@ -617,18 +641,33 @@ resolve_fixture_source_hold() {
   pass "fixture owner decision recorded: run=$run generation=$generation hold=$id; archives preserved"
 }
 
+# Phase-52 completed fixtures may still be preparing a capture after terminal
+# reporting. Wait for a typed exact-generation release, never owner-discard a
+# source that may still be settling. Legacy strict callers keep their semantics.
+resolve_completed_fixture_source_hold() {
+  wait_completed_custody_receipt "$1" "${3:-120}" "$2"
+}
+
 # A completed status precedes the worker's final custody ACK. Wait only for this
 # run's current generation, preserving every older or unrelated source hold.
 wait_completed_custody_receipt() {
-  local run="$1" timeout="${2:-120}" start=$SECONDS snapshot generation expected=""
+  local run="$1" timeout="${2:-120}" start=$SECONDS snapshot="" generation expected="${3:-}"
+  local fixture=0 expected_hold="" remaining query id
+  if [ "${3+x}" ]; then
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed fixture generation: $expected"
+    fixture=1
+  fi
   [[ "$run" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid completed receipt run: $run"
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed receipt timeout: $timeout"
   while :; do
-    snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
+    query="SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
       'owner_id',r.user_id,'worker_id',r.worker_id,'repo_id',r.repo_id,'mr_iid',r.mr_iid,'final_head',r.completion_final_head,
+      'worker_active',(SELECT count(*) FROM worker_active_runs a WHERE a.run_id=r.id),
       'branch',CASE WHEN r.kind='issue' THEN 'agent/issue-'||r.issue_iid::text
         WHEN r.kind='mr_rework' THEN r.pipeline_ref WHEN r.kind='self_improve' THEN 'uzi/self-improve/'||r.id::text END,
       'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'generation',h.generation,
+        'attention',f.attention,'capture_state',f.capture_state,
+        'capture_count',(SELECT count(*) FROM recovery_captures c WHERE c.hold_id=h.id AND c.user_id=h.user_id),
         'inventory_guarded',h.inventory_guarded,'state',h.state,'final_disposition',h.final_disposition,
         'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,
         'final_coverage_digest',h.final_coverage_digest,'release_evidence',h.release_evidence,
@@ -637,8 +676,21 @@ wait_completed_custody_receipt() {
         'after_outcome',h.released_at >= r.finished_at,'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c
           WHERE c.id=h.final_capture_id AND c.hold_id=h.id AND c.manifest_bound
             AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest)))
-        FROM recovery_custody_holds h WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=r.claim_generation),'[]'::json))::text
-      FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
+        FROM recovery_custody_holds h JOIN recovery_custody_hold_facts f ON f.id=h.id
+        WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=r.claim_generation),'[]'::json))::text
+      FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')"
+    if [ "$fixture" = 1 ]; then
+      remaining=$((timeout - (SECONDS - start)))
+      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot"
+      snapshot="$(db_psql_rows "$query" "$remaining")" || fail "completed fixture settlement read failed: $snapshot"
+      printf '%s' "$snapshot" | jq -e --arg run "$run" '
+        .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
+        and (.holds|type=="array")' >/dev/null || fail "completed fixture invalid run snapshot: $snapshot"
+      [ "$(printf '%s' "$snapshot" | jq -r '.generation')" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
+      if [ "$(printf '%s' "$snapshot" | jq '.holds|length')" = 0 ]; then sleep 0.5; continue; fi
+    else
+      snapshot="$(db_psql "$query")"
+    fi
     printf '%s' "$snapshot" | jq -e --arg run "$run" '
       .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
       and (.holds|type=="array" and length==1) and .holds[0].generation==.generation' >/dev/null \
@@ -646,6 +698,12 @@ wait_completed_custody_receipt() {
     generation="$(printf '%s' "$snapshot" | jq -r '.generation')"
     [ -z "$expected" ] && expected="$generation"
     [ "$generation" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
+    if [ "$fixture" = 1 ]; then
+      id="$(printf '%s' "$snapshot" | jq -r '.holds[0].id')"
+      [[ "$id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || fail "completed fixture invalid hold identity: $snapshot"
+      [ -n "$expected_hold" ] || expected_hold="$id"
+      [ "$id" = "$expected_hold" ] || fail "completed fixture hold identity changed: $snapshot"
+    fi
     if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
       printf '%s' "$snapshot" | jq -e '. as $run | .holds[0] |
         (.inventory_guarded==true and .after_outcome==true and (
@@ -745,7 +803,7 @@ run_claimed_at() { apiget "/api/runs/$1" | jq -r '.run.claimed_at // empty'; }
 # settle_runs_terminal TIMEOUT RUN... — best-effort wait for each run a phase cancelled to
 # become terminal (completed/failed/cancelled) before the phase exits. A cancel to a run with a
 # live worker is only ENQUEUED; the worker applies it at its next poll, so a phase that exits
-# right after its cleanup cancels hands the driver's quarantine a still-live run and logs a LEAK.
+# right after cleanup can leave a still-live run for the driver's bounded boundary check.
 # Never fails a phase: it returns 0 whatever happens, and empty ids are skipped. Each status
 # read is a single curl capped at 5s (run_status_quick, no retry), so a hung api cannot stretch
 # the wait much past TIMEOUT.

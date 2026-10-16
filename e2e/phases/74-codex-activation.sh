@@ -245,7 +245,7 @@ pass "Codex-only user's plain run $CX_ONLY_RUN implicitly resolved to codex (D11
 # fire the cancel, then wait_status ... cancelled). Waiting here (rather than firing and
 # moving straight to teardown) settles the run to a terminal state before the phase
 # ends, so it can never still be mid-cancel when driver.sh's end-of-phase leak-sweep
-# quarantine scan runs (a hard fail under E2E_STRICT_LEAKS=1).
+# quarantine scan runs (unsettled residue fails the boundary regardless of legacy knobs).
 apipost "/api/runs/$CX_ONLY_RUN/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 wait_status "$CX_ONLY_RUN" cancelled
 

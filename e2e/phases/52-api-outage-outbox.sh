@@ -5,8 +5,9 @@
 # lane:     gitlab
 # executor: stub
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
-# provides: -
+# provides: OUTBOX_CASE3_HOLD_ID
 # handoff:  -
+# handoff-holds: OUTBOX_CASE3_HOLD_ID
 # mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
 # restores: placeholder removed; api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
@@ -76,6 +77,8 @@
 # NOTE: this phase runs AFTER 51-auto-stop-poison, which (via 50) left the agent stopped;
 # it brings the agent back up itself. 59-restart-agent still runs after and re-ensures it.
 say "PRD #1391 M5+M6: worker outbox survives an api outage (spill+drain, quota tombstones; write-ahead terminal replay)"
+# SDK execution takes the no-op branch and explicitly retains no new holds.
+OUTBOX_CASE3_HOLD_ID=""
 if [ "$EXECUTOR" != stub ]; then
   say "PRD #1391 outbox scenario: SKIPPED (stub-only — UZI_STUB_OUTBOX is a stub sentinel; executor=$EXECUTOR)"
 else
@@ -400,8 +403,13 @@ pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s (default quotas)"
 
 make_outbox_run
 RUN1="$OUTBOX_RUN"
+GEN1="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$RUN1'")"
+[[ "$GEN1" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 1: invalid claim generation before outage: $GEN1"
 outage "$RUN1" 20
 wait_status "$RUN1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(db_psql "SELECT claim_generation FROM runs WHERE id = '$RUN1'")" = "$GEN1" ] \
+  || fail "case 1: generation advanced across the outage — re-executed instead of replayed (original gen $GEN1)"
 wait_drained "$RUN1"
 assert_contiguous "$RUN1"
 
@@ -425,6 +433,9 @@ NT1="$(printf '%s' "$M1" | jq '[.messages[] | select((.payload.text? // "") | st
 { [ -n "$NT1" ] && [ "$NT1" -ge 5 ] 2>/dev/null; } \
   || fail "case 1: fewer than 5 outbox tick frames replayed (got ${NT1:-none})"
 pass "case 1: spill+drain proven — barrier seen, run completed with no failed report, $NT1 ticks replayed, stream gapless 1..$(printf '%s' "$M1" | jq '.messages | length')"
+# Completed siblings wait for their exact-generation typed custody release after
+# proving preservation; case 3 retains its exact hold for the boundary handoff.
+resolve_completed_fixture_source_hold "$RUN1" "$GEN1"
 
 # =============================================================================
 # CASE 2 — a tiny per-run quota forces eviction; replay fills the range per-seq.
@@ -437,9 +448,14 @@ pass "agent recreated with WORKER_OUTBOX_RUN_MAX_BYTES=1024 (forces quota evicti
 
 make_outbox_run
 RUN2="$OUTBOX_RUN"
+GEN2="$(db_psql "SELECT claim_generation FROM runs WHERE id = '$RUN2'")"
+[[ "$GEN2" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 2: invalid claim generation before outage: $GEN2"
 # A longer post-spill hold than case 1 so many small segments spill and the quota reliably binds.
 outage "$RUN2" 25
 wait_status "$RUN2" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(db_psql "SELECT claim_generation FROM runs WHERE id = '$RUN2'")" = "$GEN2" ] \
+  || fail "case 2: generation advanced across the outage — re-executed instead of replayed (original gen $GEN2)"
 wait_drained "$RUN2"
 assert_contiguous "$RUN2"
 
@@ -462,6 +478,8 @@ else
   # when eviction is actually observed.
   say "case 2: no quota eviction observed on this run (segment sizing / spill volume left it under the 1 KiB quota); the contiguous-stream invariant still held (observed-only, by design)"
 fi
+
+resolve_completed_fixture_source_hold "$RUN2" "$GEN2"
 
 # =============================================================================
 # PRD #1391 M6 (Run B) — write-ahead terminal reports survive the SAME outage. A run-lane
@@ -501,6 +519,17 @@ say "CASE 3: a run finishing during the outage -> completed after its messages (
 make_outbox_run cut_barrier
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
+# Case 3 deliberately leaves its custody evidence untouched. Name only this
+# exact claim before the outage; later release is allowed, but sibling leaks are not.
+[[ "$RUN_B1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ && "$GEN_B1" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 3: invalid claim identity for retained custody: run=$RUN_B1 generation=$GEN_B1"
+OUTBOX_CASE3_HOLD_ID="$(db_psql_rows "SELECT h.id FROM recovery_custody_holds h
+  JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+  WHERE r.id = '$RUN_B1' AND r.claim_generation = $GEN_B1
+    AND h.generation = $GEN_B1 AND h.original_worker_id = r.worker_id" 10)" \
+  || fail "case 3: retained custody identity query failed"
+[[ "$OUTBOX_CASE3_HOLD_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+  || fail "case 3: expected exactly one custody hold for run=$RUN_B1 generation=$GEN_B1 (got: '$OUTBOX_CASE3_HOLD_ID')"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
 api_cut
 release_outbox_cut_barrier "$RUN_B1"
@@ -540,6 +569,8 @@ say "CASE 4: agent restarted mid-outage -> boot gate lands the journaled outcome
 make_outbox_run cut_barrier
 RUN_B2="$OUTBOX_RUN"
 GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
+[[ "$GEN_B2" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 4: invalid claim generation before outage: $GEN_B2"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
 api_cut
@@ -578,6 +609,7 @@ RB2_FR="$(apiget "/api/runs/$RUN_B2" | jq -r '.run.failure_reason // ""')"
 [ -z "$RB2_FR" ] \
   || fail "case 4: run carried a failure_reason after the restart — the journaled outcome was not the result: $RB2_FR"
 pass "case 4: agent restart mid-outage -> boot gate landed the journaled completed at gen $GEN_B2 (no re-claim, no requeue), stream gapless"
+resolve_completed_fixture_source_hold "$RUN_B2" "$GEN_B2"
 
 # =============================================================================
 # CASE 5 — a run in the timeout-sweep CARVE-OUT (completion_attempts>0, set in the DB; the run itself is not interlocked) whose lost terminal lands on replay: it does not sit non-terminal forever.
@@ -585,6 +617,8 @@ say "CASE 5: a sweep-carve-out run's lost terminal lands on replay (never sits n
 make_outbox_run cut_barrier
 RUN_B3="$OUTBOX_RUN"
 GEN_B3="$(rb_run_field "$RUN_B3" claim_generation)"
+[[ "$GEN_B3" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 5: invalid claim generation before outage: $GEN_B3"
 # Place the run in the completion-interlock carve-out the ordinary timeout sweep is DELIBERATELY
 # blind to (SweepRunningTimeout / sweep.go: `completion_attempts > 0 AND a live worker`): a
 # post-attempt run past its wall budget that the wall-clock sweep will NOT terminal-fail. We reach
@@ -625,6 +659,7 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 [ -z "$RB3_ORIGIN" ] \
   || fail "case 5: run carried fail_origin=$RB3_ORIGIN — a wall-clock sweep failed it instead of the journal landing 'completed'"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
+resolve_completed_fixture_source_hold "$RUN_B3" "$GEN_B3"
 
 # =============================================================================
 # Cases 3-8 hold stub completion until the cut. Cases 7-8 require a durable
@@ -638,6 +673,8 @@ set_interlock true
 make_outbox_run cut_barrier
 RUN_B4="$OUTBOX_RUN"
 GEN_B4="$(rb_run_field "$RUN_B4" claim_generation)"
+[[ "$GEN_B4" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 6: invalid claim generation before outage: $GEN_B4"
 [ -n "$(rb_run_field "$RUN_B4" completion_contract_version)" ] \
   || fail "case 6: run $RUN_B4 was not stamped for the completion interlock (completion_contract_version is NULL), so it cannot prove the permit path"
 say "cutting the api so run $RUN_B4 reaches its completion permit while it is down"
@@ -656,6 +693,7 @@ RB4_FR="$(apiget "/api/runs/$RUN_B4" | jq -r '.run.failure_reason // ""')"
 [ "$(rb_run_field "$RUN_B4" claim_generation)" = "$GEN_B4" ] \
   || fail "case 6: generation advanced — the run was re-executed instead of waiting out the outage (gen $GEN_B4 -> $(rb_run_field "$RUN_B4" claim_generation))"
 pass "case 6: the interlocked run waited out the outage for its permit -> completed at gen $GEN_B4, no false failed"
+resolve_completed_fixture_source_hold "$RUN_B4" "$GEN_B4"
 
 # =============================================================================
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart

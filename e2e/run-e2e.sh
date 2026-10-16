@@ -273,10 +273,13 @@ pass "board columns seeded"
 # shell: a `declare -p`-dumped var re-sourced inside a function becomes
 # function-local, which would silently break every phase's `provides:`.
 #
-# driver.sh reads the functions (say/pass/fail/db_psql/apipost/apipost_code/
-# wait_status) and globals (ROOT/RUNROOT/ENVFILE/FORGE/EXECUTOR) established above,
-# plus the E2E_ONLY / E2E_SKIP / E2E_STRICT_LEAKS / E2E_FAULT_PHASE knobs (kept in
-# the env -i allowlist at the top of this file). It ENDS WITH `exit`, so this is
+# driver.sh reads the functions (say/pass/fail/db_psql_rows/boundary_cancel)
+# and globals (ROOT/RUNROOT/ENVFILE/FORGE/EXECUTOR) established above,
+# plus the E2E_ONLY / E2E_SKIP / E2E_FAULT_PHASE knobs (kept in the env -i
+# allowlist above). E2E_STRICT_LEAKS remains allowlisted as a compatibility no-op:
+# dirty or unverifiable boundaries fail regardless, with API-only cancellation,
+# explicit hold handoffs and later-phase contamination annotations (#2892).
+# It ENDS WITH `exit`, so this is
 # the last thing the entry script runs and its exit drives the cleanup trap.
 # shellcheck disable=SC1090  # $ROOT is a runtime path; driver.sh is sourced by design
 source "$ROOT/e2e/driver.sh"

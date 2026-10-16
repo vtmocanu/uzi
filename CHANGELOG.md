@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 - **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
   Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
 
+- **E2E phases fail on dirty or unverifiable boundaries ([#2892](https://github.com/vtmocanu/uzi/issues/2892)).**
+  Boundary settlement checks nonterminal runs, worker associations and owner open custody holds within a shared 120-second deadline, cancelling runs through the API without the SQL fallback or discarding holds. Baseline holds and explicitly declared retained holds are allowed independently of run handoffs; successful cancellation can settle to PASS, while rejected cancels and unverifiable reads remain failures. Later eligible phases carry contamination origins, successful exports become suspect when their boundary fails, and separate boundary evidence and wait timings support diagnosis. Enforcement applies regardless of the legacy E2E_STRICT_LEAKS compatibility no-op.
+
 - **Full submitted plans remain readable after the approval gate ([#2972](https://github.com/vtmocanu/uzi/issues/2972)).**
   Non-seeded web runs with saved full plan text now offer an initially collapsed, scrollable Full plan panel after leaving the gate, including after reload and on finished runs; the neutral title does not imply approval. Earlier submitted versions include only already-loaded submissions and fetch no extra history. The TUI renders loaded plan messages as full Markdown through the final line instead of a 200-character compact fallback, with paging and controls unchanged. Seeded plans, gate actions and history, summaries, and CLI version/diff behavior are unchanged.
 

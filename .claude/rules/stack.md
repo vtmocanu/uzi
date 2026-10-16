@@ -44,7 +44,7 @@ docker compose --profile agent up    # additionally start a worker (needs join t
                         # `down -v` and never `-p uzi`.
 ```
 
-- **Read `run-e2e.sh`'s summary table, not its cleanup line.** A quarantine `LEAK` row keeps the rundir and prints `[cleanup] red run — rundir kept`, yet by default the suite exits 0 with `All E2E checks passed.`: only a `FAIL` row fails it, unless `E2E_STRICT_LEAKS=1` makes a LEAK fail too (`e2e/README.md`).
+- **Read `run-e2e.sh`'s summary table and retained boundary evidence.** Verdicts are `PASS`/`FAIL`/`SKIP`; a dirty or unverifiable boundary fails the suite regardless of `E2E_STRICT_LEAKS` (a compatibility no-op). Settlement shares a 120-second deadline across nonterminal runs, worker associations and owner open holds, using API cancellation without a SQL fallback or hold discard. Successful cancellation can settle to PASS; rejected cancellation remains FAIL. Later eligible phases run with contamination origins unless a critical body failure stops them. See `e2e/README.md` for independent run/hold declarations, `boundary/` evidence and post-merge manual E2E timing validation.
 
 ### smoke.sh recipe
 

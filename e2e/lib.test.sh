@@ -148,6 +148,7 @@ settle "never-terminal run: returns 0 once the timeout passes" 5 running
 eval "$(awk '/^wait_custody_headroom\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_forge_park_release\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_completed_custody_receipt\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^resolve_completed_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
 pass() { echo "$*"; }
 apiget() {
   case "$1" in
@@ -841,18 +842,26 @@ custody_case "captured fixture timeout retains row worker and recreation log" fa
 custody_case "preparing fixture fails immediately" fail 'not a capture-less owner decision' fixture_archive_receipt preparing
 
 # Execute the actual owning phase boundaries against the real owner helper. The
-# nine-hold fixture includes the completed outage case, which must remain open.
+# fixture includes the retained case 3 hold, which must remain open.
+OUTBOX_PHASE_TEST_SOURCE="${OUTBOX_PHASE_TEST_SOURCE:-$ROOT/e2e/phases/52-api-outage-outbox.sh}"
 fixture_phase_boundary() {
   local phase="$1" before after run gen n=0 entry
   local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
   local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
+  # Distinct outage claims make swapped run/generation arguments observable.
+  # shellcheck disable=SC2034  # consumed by actual phase cleanup statements
+  local RUN1=b4dec5cf-e6d4-413b-b3a8-0005a2835711 RUN2=b4dec5cf-e6d4-413b-b3a8-0005a2835712
+  # shellcheck disable=SC2034
+  local RUN_B2=b4dec5cf-e6d4-413b-b3a8-0005a2835714 RUN_B3=b4dec5cf-e6d4-413b-b3a8-0005a2835715 RUN_B4=b4dec5cf-e6d4-413b-b3a8-0005a2835716
+  # shellcheck disable=SC2034
+  local GEN1=11 GEN2=12 GEN_B2=14 GEN_B3=15 GEN_B4=16
   # shellcheck disable=SC2034  # read by the extracted owning phase statements
   local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3
   # shellcheck disable=SC2034  # read by the extracted phase-42 boundary
   local RA_RESTORE_AT=2026-10-08T09:08:20Z
   echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
-  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1"; do
+  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1" "$RUN1:11" "$RUN2:12" "$RUN_B2:14" "$RUN_B3:15" "$RUN_B4:16" "$RUN1:99"; do
     run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
     jq --arg run "$run" --argjson gen "$gen" --arg id "$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")" \
       '.holds += [{id:$id,run_id:$run,generation:$gen,state:"open",attention:"source_only",has_available_capture:false}]' \
@@ -877,15 +886,181 @@ fixture_phase_boundary() {
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
+  db_psql_rows() {
+    [[ "$1" == SELECT* && "$1" != *UPDATE* && "$1" != *DELETE* ]] || fail 'unexpected completed fixture SQL'
+    # Simulate the worker's typed release of only the completed fixture's first
+    # generation. The older source and deliberately retained case 3 stay open.
+    jq --arg run "$run" '
+      [.holds[]|select(.run_id==$run)][0].id as $id |
+      (.holds[]|select(.id==$id)) += {state:"released",inventory_guarded:true,
+        final_disposition:"settled",release_evidence:"publication",after_outcome:true,
+        final_capture_id:null,final_source_sha:null,
+        final_coverage_digest:"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}' \
+      "$SEQ_DIR/boundary-holds" > "$SEQ_DIR/boundary-next"
+    mv "$SEQ_DIR/boundary-next" "$SEQ_DIR/boundary-holds"
+    jq -c --arg run "$run" '
+      [.holds[]|select(.run_id==$run)] as $holds |
+      {run_id:$run,status:"completed",generation:$holds[0].generation,worker_active:0,
+        holds:[$holds[0]+{capture_count:0,capture_state:""}]}' "$SEQ_DIR/boundary-holds"
+  }
+  local source="$ROOT/e2e/phases/$phase.sh"
+  [ "$phase" != 52-api-outage-outbox ] || source="$OUTBOX_PHASE_TEST_SOURCE"
+  eval "$(awk '/^[[:space:]]*resolve_(completed_)?fixture_source_hold /' "$source")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  [ "$before" = 9 ] && [ "$after" -lt 8 ] || fail 'next sweep still blocked by deliberate fixture holds'
+  [ "$before" = 15 ] && [ "$after" -lt 14 ] || fail 'next sweep still blocked by deliberate fixture holds'
   jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
-    || fail 'completed outage case lost its evidence'
+      || fail 'completed outage case lost its evidence'
+  if [ "$phase" = 52-api-outage-outbox ]; then
+    jq -e --arg r1 "$RUN1" --arg r2 "$RUN2" --arg b2 "$RUN_B2" --arg b3 "$RUN_B3" --arg b4 "$RUN_B4" --arg f1 "$RUN_F1" --arg f2 "$RUN_F2" '
+      all(.holds[];
+        .state == (if (.run_id==$r1 and .generation==11) or (.run_id==$r2 and .generation==12)
+          or (.run_id==$b2 and .generation==14) or (.run_id==$b3 and .generation==15)
+          or (.run_id==$b4 and .generation==16) then "released"
+          elif (.run_id==$f1 and .generation==1) or (.run_id==$f2 and (.generation==1 or .generation==3))
+          then "discarded" else "open" end))' "$SEQ_DIR/boundary-holds" >/dev/null \
+      || fail 'phase52 did not resolve exactly its eight fixture holds'
+  fi
   echo 'own phase relieved capacity while completed outage evidence stayed open'
 }
 for phase in 42-api-outage-readoption 45-bounded-concurrency 52-api-outage-outbox; do
   custody_case "$phase resolves only its intentional fixture obligations" pass 'own phase relieved capacity' fixture_phase_boundary "$phase"
+done
+
+# Execute the actual setup, outage and assertion statements for cases 1-6.
+# External operations are inert; files retain ordering evidence across substitutions.
+fixture_outbox_cases() {
+  local mode="$1" target="${2:-0}" bad="${3:-}" n
+  # shellcheck disable=SC2034  # read by the sourced phase statements
+  local COMPLETE_TIMEOUT_DEFAULT=1 COMPOSE=(outbox_compose)
+  # shellcheck disable=SC2034  # assigned and read by sourced phase statements
+  local OUTBOX_RUN RUN1 RUN2 GEN1 GEN2 RUN_B1 RUN_B2 RUN_B3 RUN_B4
+  # shellcheck disable=SC2034  # assigned and read by sourced phase statements
+  local GEN_B1 GEN_B2 GEN_B3 GEN_B4 OUTBOX_CASE3_HOLD_ID
+  echo 0 > "$SEQ_DIR/outbox-case"
+  : > "$SEQ_DIR/outbox-events"
+  unset -f rb_run_field || true
+  say() {
+    case "$*" in 'case 2: no quota eviction'*) echo asserted >> "$SEQ_DIR/outbox-events" ;; esac
+  }
+  pass() {
+    case "$*" in
+      'case '[1246]:*|'case 5: the carve-out run'*) echo asserted >> "$SEQ_DIR/outbox-events" ;;
+    esac
+  }
+  recreate_outbox_agent() { :; }
+  set_interlock() { :; }
+  outbox_compose() { :; }
+  sleep() { SECONDS=$((SECONDS + 10)); }
+  make_outbox_run() {
+    n="$(cat "$SEQ_DIR/outbox-case")"
+    if [ "$n" -gt 0 ] && [ "$n" != 3 ]; then
+      [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = "cleanup:$n" ] \
+      || fail "next creation before cleanup:$n"
+    fi
+    n=$((n + 1))
+    echo "$n" > "$SEQ_DIR/outbox-case"
+    OUTBOX_RUN="$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")"
+    echo "create:$n" >> "$SEQ_DIR/outbox-events"
+  }
+  db_psql() {
+    local i sql="$1" reads
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [[ "$sql" == *"$OUTBOX_RUN"* ]] || fail 'SQL used a different run'
+    case "$sql" in
+      'SELECT claim_generation FROM runs WHERE id = '*)
+        reads="$(awk -v event="snapshot:$i" '$0==event {n++} END {print n+0}' "$SEQ_DIR/outbox-events")"
+        if [ "$reads" = 0 ]; then
+          echo "snapshot:$i" >> "$SEQ_DIR/outbox-events"
+          if [ "$mode" = invalid ] && [ "$target" = "$i" ]; then printf '%s' "$bad"; return; fi
+        elif [ "$mode" = changed ] && [ "$target" = "$i" ]; then
+          echo $((100 + i)); return
+        fi
+        echo $((10 + i)) ;;
+      'SELECT requeue_count '*) echo 0 ;;
+      'SELECT completion_attempts '*) echo 1 ;;
+      'SELECT completion_contract_version '*) echo 1 ;;
+      'SELECT status '*) echo running ;;
+      UPDATE*) : ;;
+      *) fail "unexpected outbox SQL: $sql" ;;
+    esac
+  }
+  db_psql_rows() { echo "$UUID"; }
+  outbox_cut() {
+    local i
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = "snapshot:$i" ] \
+      || fail "outage before generation snapshot:$i"
+    echo "cut:$i" >> "$SEQ_DIR/outbox-events"
+  }
+  outage() { outbox_cut; }
+  api_cut() { outbox_cut; }
+  api_back() { :; }
+  release_outbox_cut_barrier() { :; }
+  wait_terminal_lost() { return 0; }
+  wait_permit_retrying() { return 0; }
+  wait_worker_online() { :; }
+  wait_status() { echo "terminal:$(cat "$SEQ_DIR/outbox-case")" >> "$SEQ_DIR/outbox-events"; }
+  wait_drained() { :; }
+  assert_contiguous() { :; }
+  apiget() {
+    case "$1" in
+      */messages)
+        if [ "$mode" = evicted ] && [ "$(cat "$SEQ_DIR/outbox-case")" = 2 ]; then
+          echo '{"messages":[{"seq":1,"kind":"status","payload":{"event":"message_dropped","reason":"outbox quota"}}]}'
+          return
+        fi
+        echo '{"messages":[{"payload":{"text":"stub: outbox tick 1"}},{"payload":{"text":"stub: outbox tick 2"}},{"payload":{"text":"stub: outbox tick 3"}},{"payload":{"text":"stub: outbox tick 4"}},{"payload":{"text":"stub: outbox tick 5"}}]}' ;;
+      *) echo '{"run":{}}' ;;
+    esac
+  }
+  resolve_fixture_source_hold() {
+    local i
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [ "$i" != 3 ] && [ "$1" = "$OUTBOX_RUN" ] && [ "$2" = "$((10 + i))" ] \
+      || fail 'wrong outbox cleanup identity'
+    [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = asserted ] \
+      || fail 'cleanup preceded original assertions'
+    echo "cleanup:$i" >> "$SEQ_DIR/outbox-events"
+  }
+  resolve_completed_fixture_source_hold() { resolve_fixture_source_hold "$@"; }
+  # Keep every statement between the actual case boundaries, including rb_run_field's
+  # real definition after cases 1/2. No predeclared generation can mask a late snapshot.
+  # shellcheck disable=SC1090
+  source <(awk '/^say "CASE 1:/ {body=1} /^# Issue #1742 / {exit} body {print}' "$OUTBOX_PHASE_TEST_SOURCE")
+  # Represents the next case's creation; also checks case 6 cleanup ordering.
+  make_outbox_run
+  [ "$(cat "$SEQ_DIR/outbox-case")" = 7 ] || fail 'outbox extraction missed cases'
+  [ "$(awk '/^cleanup:/ {print}' "$SEQ_DIR/outbox-events")" = $'cleanup:1\ncleanup:2\ncleanup:4\ncleanup:5\ncleanup:6' ] \
+    || fail 'outbox cleanup set changed'
+  echo 'outbox setup and cleanup boundaries passed'
+}
+fixture_outbox_rejection() {
+  local mode="$1" target="$2" output rc=0
+  output="$(fixture_outbox_cases "$@" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail 'outbox accepted an invalid or changed generation'
+  if [ "$mode" = invalid ]; then
+    ! grep -qxF "cut:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'invalid generation reached the outage'
+  else
+    grep -qxF "terminal:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'changed generation did not reach terminal comparison'
+  fi
+  ! grep -qxF "cleanup:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'invalid or changed generation reached cleanup'
+  printf '%s\n' "$output"
+  return "$rc"
+}
+custody_case 'real outbox cases snapshot before outage and clean before next creation' pass \
+  'outbox setup and cleanup boundaries passed' fixture_outbox_cases valid
+custody_case 'real outbox quota eviction completes assertions before cleanup' pass \
+  'outbox setup and cleanup boundaries passed' fixture_outbox_cases evicted
+for outbox_case in 1 2 4 5 6; do
+  for invalid_gen in '' 0 -1 null 1x 01; do
+    custody_case "outbox case $outbox_case rejects generation [$invalid_gen] before outage" fail \
+      "case $outbox_case: invalid claim generation" fixture_outbox_rejection invalid "$outbox_case" "$invalid_gen"
+  done
+  custody_case "outbox case $outbox_case rejects changed terminal generation" fail \
+    "case $outbox_case: generation advanced" fixture_outbox_rejection changed "$outbox_case"
 done
 
 # The previous cleanup failed with a capture FK and silently removed source-only
@@ -1037,6 +1212,188 @@ for mode in entry window discard idle; do
   if [ "$valid" = true ]; then
     passed=$((passed + 1)); echo "PASS: real custody phase idle boundary $mode"
   else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
+done
+
+eval "$(awk '/^resolve_completed_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
+# On the unfixed library, drive the old cleanup through the same call seam.
+if ! type resolve_completed_fixture_source_hold >/dev/null 2>&1; then
+  resolve_completed_fixture_source_hold() { resolve_fixture_source_hold "$@"; }
+fi
+completed_fixture_pending() {
+  local mode="$1" hold=b4dec5cf-e6d4-413b-b3a8-0005a2835770 step n=0
+  : > "$SEQ_DIR/pending-seq"; echo 1 > "$SEQ_DIR/pending-n"; : > "$SEQ_DIR/discard-attempts"
+  local steps=(missing preparing uploading completed-publication)
+  case "$mode" in
+    archive) steps=(preparing uploading released) ;;
+    archive-publication-race) steps=(available completed-publication) ;;
+    source-publication) steps=(source-only completed-publication) ;;
+    hidden-settlement) steps=(active-source-only source-only preparing uploading available released) ;;
+    source-timeout) steps=(source-only) ;;
+    timeout) steps=(uploading) ;;
+    bad-proof) steps=(wrong-archive) ;;
+    changed-generation) steps=(generation-change) ;;
+  esac
+  for step in "${steps[@]}"; do
+    completed_receipt_fixture "$step"
+    jq -c --arg run "$UUID" --arg id "$hold" --arg step "$step" '
+      .run_status=.status | .worker_active=(if $step=="active-source-only" then 1 else 0 end) |
+      .holds |= map(.+{id:$id,run_id:$run,capture_count:1,attention:"capturing",capture_state:"uploading",captures:[{state:"available"}]}) |
+      if .holds[0].completion_identity then .holds[0].completion_identity.hold_id=$id | .holds[0].completed_publication_receipt.hold_id=$id else . end |
+      if ($step|IN("preparing","uploading","available","source-only","active-source-only")) then
+        .holds[0] += {state:"open",final_disposition:null,release_evidence:null,
+          capture_state:(if ($step|endswith("source-only")) then "" else $step end),
+          capture_count:(if ($step|endswith("source-only")) then 0 else 1 end),
+          attention:(if ($step|endswith("source-only")) then "source_only" elif $step=="available" then "archive_ready" else "capturing" end),
+          has_available_capture:($step=="available")}
+      else . end' "$SEQ_DIR/seq" >> "$SEQ_DIR/pending-seq"
+  done
+  db_psql_rows() {
+    [[ "$1" == SELECT* && "$1" == *"r.id='$UUID'"* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unscoped pending read'
+    [ "$2" -gt 0 ] && [ "$2" -le 10 ] || fail 'pending read exceeded shared budget'
+    n="$(cat "$SEQ_DIR/pending-n")"
+    awk -v n="$n" 'NR==n' "$SEQ_DIR/pending-seq"
+    echo "$n" > "$SEQ_DIR/pending-last-read"
+    [ "$n" -ge "$(wc -l < "$SEQ_DIR/pending-seq")" ] || echo $((n + 1)) > "$SEQ_DIR/pending-n"
+  }
+  db_psql() { db_psql_rows "$1" 5; }
+  apiget() {
+    local frame
+    frame="$(awk -v n="$(cat "$SEQ_DIR/pending-n")" 'NR==n' "$SEQ_DIR/pending-seq")"
+    case "$1" in
+      /api/recovery/holds) printf '%s' "$frame" | jq '{holds}' ;;
+      */archives) echo '{"archives":[{"id":"kept","state":"available","checksum":"stable","byte_size":12}]}' ;;
+      *) printf '%s' "$frame" | jq '{run:{id:.run_id,status:.status}}' ;;
+    esac
+  }
+  discard_completed_fixture_hold() {
+    [ "$1" = "$UUID" ] && [ "$2" = "$hold" ] && [ "$3" -gt 0 ] || fail 'wrong pending disposition'
+    echo attempted >> "$SEQ_DIR/discard-attempts"
+    return 22
+  }
+  uzi_cli() { fail 'old immediate cleanup cannot settle the pending fixture'; }
+  local output rc=0
+  output="$(resolve_completed_fixture_source_hold "$UUID" 1 10 2>&1)" || rc=$?
+  [ ! -s "$SEQ_DIR/discard-attempts" ] || fail 'completed fixture attempted owner discard'
+  if [ "$mode" = source-timeout ]; then
+    [ "$rc" -ne 0 ] && [[ "$output" = *'receipt timeout'* ]] || fail 'source-only fixture did not time out'
+  fi
+  printf '%s\n' "$output"
+  if [ "$mode" = hidden-settlement ] && [ "$rc" = 0 ]; then
+    [ "$(cat "$SEQ_DIR/pending-last-read")" = 6 ] || fail 'completed fixture returned before its typed release'
+  fi
+  [ "$rc" = 0 ] || fail "$output"
+}
+for mode in publication archive archive-publication-race source-publication hidden-settlement; do
+  custody_case "completed fixture settles $mode" pass '' completed_fixture_pending "$mode"
+done
+custody_case 'completed fixture preserves pending capture on timeout' fail 'receipt timeout' completed_fixture_pending timeout
+custody_case 'completed fixture leaves permanently source-only custody open on timeout' fail '"attention":"source_only"' completed_fixture_pending source-timeout
+custody_case 'completed fixture rejects invalid archive proof' fail 'lacks final custody proof' completed_fixture_pending bad-proof
+custody_case 'completed fixture refuses a changed generation' fail 'generation changed' completed_fixture_pending changed-generation
+
+# Real DB helper regressions: use an executable compose fake so timeout wraps
+# the same command shape as production, without sourcing lib.sh's provisioning.
+eval "$(awk '/^db_psql_rows\(\)/,/^[})]$/' "$LIB")"
+mkdir -p "$SEQ_DIR/bin"
+cat > "$SEQ_DIR/bin/docker" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DB_CALLS"
+if [ "${DB_STALL:-0}" = 1 ]; then sleep 5; fi
+if [ "${DB_IGNORE_TERM:-0}" = 1 ]; then
+  trap '' TERM
+  sleep 3
+  echo delayed-row
+fi
+printf '%s' "${DB_FIXTURE:-}"
+echo 'raw psql stderr' >&2
+exit "${DB_RC:-0}"
+DOCKER
+chmod +x "$SEQ_DIR/bin/docker"
+export DB_CALLS="$SEQ_DIR/db-calls"
+: > "$DB_CALLS"
+db_helper_case() {
+  local mode="$1" rc=0 output started elapsed
+  started="$(python3 -c 'import time; print(time.monotonic())')"
+  cases=$((cases + 1))
+  (
+    set +o pipefail
+    export PGPW=fixture
+    # shellcheck disable=SC2034  # consumed by the extracted real DB helper
+    COMPOSE=("$SEQ_DIR/bin/docker")
+    export DB_FIXTURE=$'first\nsecond\n' DB_RC=0
+    case "$mode" in
+      one-arg) db_psql_rows 'SELECT phase72' ;;
+      nonzero) export DB_RC=7; db_psql_rows 'SELECT failing' ;;
+      bounded) db_psql_rows 'SELECT bounded' 2 ;;
+      stalled) export DB_STALL=1; db_psql_rows 'SELECT stalled' 1 ;;
+      ignore-term) export DB_IGNORE_TERM=1; db_psql_rows 'SELECT stubborn' 1 ;;
+      no-limiter)
+        # shellcheck disable=SC2123  # deliberately test the absent host limiter
+        PATH="$SEQ_DIR/absent"
+        db_psql_rows 'SELECT no_limiter' 1 ;;
+    esac
+  ) > "$SEQ_DIR/db-output" 2> "$SEQ_DIR/db-error" || rc=$?
+  elapsed="$(python3 -c 'import sys,time; print(time.monotonic()-float(sys.argv[1]))' "$started")"
+  output="$(cat "$SEQ_DIR/db-output")"
+  local good=0
+  case "$mode" in
+    one-arg|bounded) [ "$rc" = 0 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
+    nonzero) [ "$rc" = 7 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
+    stalled) [ "$rc" -ne 0 ] && [ -z "$output" ] && good=1 ;;
+    ignore-term)
+      [ "$rc" -ne 0 ] && [ -z "$output" ] &&
+        python3 -c 'import sys; sys.exit(not (float(sys.argv[1]) < 1.8))' "$elapsed" && good=1
+      echo "TERM-ignoring DB: budget=1s elapsed=${elapsed}s exit=$rc" ;;
+    no-limiter) [ "$rc" -ne 0 ] && [[ "$(cat "$SEQ_DIR/db-error")" = *'no timeout/gtimeout'* ]] && good=1 ;;
+  esac
+  if [ "$good" = 1 ]; then passed=$((passed + 1)); echo "PASS: real db_psql_rows $mode"
+  else echo "FAIL: real db_psql_rows $mode rc=$rc stdout=[$output] stderr=[$(cat "$SEQ_DIR/db-error")]"; fi
+}
+for mode in one-arg nonzero bounded stalled ignore-term no-limiter; do db_helper_case "$mode"; done
+
+# Exercise the real bounded cancel helper against a curl executable. The existing
+# apipost_code remains status-only; this path retains the response and exit.
+eval "$(awk '/^boundary_cancel\(\) \{/,/^\}/' "$LIB")"
+# Compatibility harness for baseline: same call signature, baseline cancellation
+# primitive. Failures below concern evidence/timeout behaviour, not missing symbols.
+if ! type boundary_cancel >/dev/null 2>&1; then
+  eval "$(awk '/^apipost_code\(\)/,/; \}/' "$LIB")"
+  boundary_cancel() { apipost_code "$1" '{"kind":"cancel","body":""}'; }
+fi
+cat > "$SEQ_DIR/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$CURL_ARGS"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then shift; printf 'cancel response' > "$1"; fi
+  shift
+done
+echo 'transport diagnostic' >&2
+printf '%s' "$CURL_CODE"
+exit "$CURL_RC"
+CURL
+chmod +x "$SEQ_DIR/bin/curl"
+for mode in accepted rejected transport; do
+  cases=$((cases + 1)); rc=0
+  (
+    PATH="$SEQ_DIR/bin:$PATH"
+    export CURL_ARGS="$SEQ_DIR/curl-args" CURL_CODE=200 CURL_RC=0
+    case "$mode" in rejected) CURL_CODE=403 ;; transport) CURL_CODE=000; CURL_RC=28 ;; esac
+    export JAR=fixture BASE=http://example.invalid
+    csrf() { echo fixture; }
+    boundary_cancel /api/runs/fixture/inputs 3 "$SEQ_DIR/cancel-$mode"
+  ) > "$SEQ_DIR/cancel-output" 2>&1 || rc=$?
+  good=0
+  if [ -f "$SEQ_DIR/cancel-$mode.body" ] && [ -f "$SEQ_DIR/cancel-$mode.stderr" ] \
+    && [ -f "$SEQ_DIR/cancel-$mode.http" ] && [ -f "$SEQ_DIR/cancel-$mode.exit" ] \
+    && [[ "$(cat "$SEQ_DIR/curl-args")" = *'--max-time 3'* ]]; then
+    case "$mode" in
+      accepted) [ "$rc" = 0 ] && good=1 ;;
+      rejected) [ "$rc" -ne 0 ] && [ "$(cat "$SEQ_DIR/cancel-$mode.http")" = 403 ] && good=1 ;;
+      transport) [ "$rc" -ne 0 ] && [ "$(cat "$SEQ_DIR/cancel-$mode.exit")" = 28 ] && good=1 ;;
+    esac
+  fi
+  if [ "$good" = 1 ]; then passed=$((passed + 1)); echo "PASS: real boundary_cancel $mode"
+  else echo "FAIL: real boundary_cancel $mode rc=$rc evidence missing or invalid"; fi
 done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"

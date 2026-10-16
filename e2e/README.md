@@ -53,9 +53,8 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
   acceptance with `E2E_ONLY=cli-smoke,api-outage-outbox ./e2e/run-e2e.sh`.
 - `E2E_SKIP=<glob[,glob]>` — the inverse: skip the phases whose slug matches. As
   with `E2E_ONLY`, critical phases are never skipped.
-- `E2E_STRICT_LEAKS=1` — make an end-of-phase quarantine **LEAK** (a non-terminal
-  run left behind and not declared via a `handoff:` header) a **FAIL** instead of a
-  non-fatal note, so a leaked run reddens the suite.
+- `E2E_STRICT_LEAKS` — retained as a compatibility no-op. Boundary checks are
+  enforced regardless of its value; a dirty or unverifiable boundary is a **FAIL**.
 - `E2E_FAULT_PHASE=<slug>` — inject a `fail` as the first statement of that phase,
   the live positive control for fail-soft: a non-critical target lets the suite
   continue (exactly one FAIL, exit 1), a critical one stops it (rest SKIP, exit 1).
@@ -67,25 +66,80 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
 Results and artifacts (written under the rundir, `$RUNROOT`):
 
 - `results.tsv` — one tab-separated row per phase: `slug`, status
-  (`PASS`|`FAIL`|`SKIP`|`LEAK`), seconds, message.
+  (`PASS`|`FAIL`|`SKIP`), seconds, message. The four-column contract is unchanged;
+  contamination annotations stay in the message.
 - `junit.xml` — one `testsuite`, one `testcase` per phase (a `<failure>` carries the
   `fail` message; `<skipped>` for a SKIP).
-- `summary.md` — the phase table, the tightest `wait_*` margins, and any leaks.
-- `artifacts/<NN-slug>/` — captured **only** for a FAIL or LEAK phase (nothing on a
+- `summary.md` — the phase table, the tightest `wait_*` margins, and per-phase
+  `boundary_wait_seconds` with a total.
+- `boundary_wait_seconds.tsv` — phase slug and settlement wait in seconds.
+- `boundary/<NN-slug>/` — boundary evidence, separate from body/service artifacts:
+  read exit statuses (`*.exit`), stdout/stderr, initial/final run, worker and hold
+  snapshots, pending sets, diagnostics, cancel response bodies and HTTP/transport
+  statuses, and observed hold history including release evidence. The supplemental
+  hold-history read has its own two-second bound and is diagnostic, not another
+  settlement wait. On boundary FAIL, the complete directory is mirrored to
+  `artifacts/<NN-slug>/boundary/` for the existing CI artifact upload, including
+  when the body also failed. Phase-start evidence stays in `boundary/` so it
+  cannot suppress service capture. Prior boundary snapshots are cleared at driver
+  startup when the rundir is reused. The copy has one two-second attempt, even
+  after settlement timeout; `boundary-copy.exit` and `boundary-copy.stderr` in
+  the artifact directory report missing limiters, failures or partial copies.
+  Copy failure also appears in the final phase message.
+- `artifacts/<NN-slug>/` — captured for a FAIL phase (nothing on a
   PASS/SKIP): `phase.log` (the phase's own stdout), one `<service>.log` per service
   (`api`, `agent`, `forge-fake`, `db`, via `docker compose logs --since`), `runs.txt`
-  (the run enumeration) and `run-counts.txt` (runs by status × kind). Capture is fully
-  guarded, so it can never change a phase's recorded status or the suite exit code.
+  (the run enumeration) and `run-counts.txt` (runs by status × kind). First service
+  capture wins, preserving body logs when the boundary also fails. Body capture
+  allows **30 seconds per operation** (four service logs and two DB reads);
+  boundary-only capture allows **two seconds per operation**. Each operation is
+  independent; a failure does not skip the others. Service logs and DB dumps have
+  `<filename>.exit` sidecars; DB stderr is in `<filename>.stderr`. Nonzero statuses
+  expose unavailable or truncated captures; a missing timeout/gtimeout limiter
+  skips service capture with status 127 and an explicit log message. Diagnostic
+  failures do not replace the phase verdict.
 
-Fail-soft behavior: a red run now prints `summary.md` (every failing phase, not
-just the first) to stdout **before** teardown, and the suite exits `1` iff any
-phase FAILed (a LEAK alone exits 0 unless `E2E_STRICT_LEAKS=1`).
+Fail-soft behavior: every run prints `summary.md` to stdout **before** teardown,
+so boundary timings remain in the CI log even on a green run. The suite exits `1` iff any
+phase FAILed, including a dirty or unverifiable boundary.
 
-Evidence on red (PRD #966 M3): a **red** run — any FAIL, or any LEAK (which writes a
-`$RUNROOT/.keep-rundir` sentinel even though a non-strict LEAK exits 0) — **keeps its
-rundir** instead of `rm -rf`-ing it, and `cleanup` prints the retained path and the
-`artifacts/` path so the per-phase evidence above survives for post-mortem (and #967's
-upload). A green run with no `KEEP_RUNDIR` is removed as before.
+Evidence on red (PRD #966 M3): a **red** run — any FAIL — **keeps its rundir**
+instead of `rm -rf`-ing it, and `cleanup` prints the retained path and the
+`artifacts/` path. Body failure evidence is retained even if the boundary also
+fails; boundary evidence lives separately. A green run with no `KEEP_RUNDIR` is
+removed as before.
+
+### Phase boundary settlement (#2892)
+
+Before each selected phase body, the driver reads the seeded owner from the DB
+and snapshots that owner's open custody hold IDs as the baseline. After the body,
+quarantine repeatedly reads nonterminal runs, `worker_active_runs` and the owner's
+open holds under one shared 120-second settlement deadline, rather than waiting
+120 seconds per run. Baseline hold IDs and explicitly declared retained hold IDs
+are allowed; a run declaration does not declare its holds.
+
+Undeclared nonterminal runs are cancelled through `POST /api/runs/<id>/inputs`.
+There is no SQL state-update fallback. A successful cancellation can PASS once
+nonterminal runs, active worker associations and unexpected open holds settle.
+A rejected cancel or failed/malformed boundary read remains a FAIL even if a
+later observation would be clean. Pending state at the deadline also fails.
+The driver does not discard custody holds to obtain a clean boundary.
+
+A boundary failure marks its source phase FAIL and records its slug as a
+contamination origin. Later eligible phases still run, with
+`[contaminated after: <origins>]` in their result messages; the existing stop after
+a critical body failure remains. A successful body's exported `provides:` remain
+available but are marked `[provides suspect]` if its boundary fails.
+
+After merge, manually dispatch the existing `.github/workflows/e2e.yml` and record
+per-phase boundary wait seconds and their total from `summary.md` in the run log,
+together with
+the equivalent lane's job duration before/after the change. Queue, cache and rerun
+effects are unmeasured locally; report those separately when comparing CI runs.
+The workflow's current failure upload includes `summary.md` and `artifacts/`.
+Failed-boundary evidence is included through `artifacts/<NN-slug>/boundary/`;
+per-phase and total timings are also in `summary.md` and the run log. The original
+`boundary/` directory and standalone timing TSV remain in the retained rundir.
 
 ## Live-DB candidate-selection test (`run-store-it.sh`)
 
@@ -175,12 +229,28 @@ It applies mutants only to the live task's own throwaway database.
 The suite is now a **phase registry**: each assertion group lives in its own file
 `e2e/phases/NN-<slug>.sh`, sourced in `NN` order by a fail-soft driver
 (`e2e/driver.sh`). The driver runs each phase in an errexit-safe subshell, records
-a PASS/FAIL/SKIP/LEAK verdict, and keeps going after a non-critical failure so one
+a PASS/FAIL/SKIP verdict, and keeps going after a non-critical failure so one
 red phase no longer discards every downstream verdict. `./e2e/run-e2e.sh --list`
 prints the table below (it reads only the phase-file headers, so it needs no
 docker). The table is generated — `task check:e2e-registry-doc` fails if it drifts
 from the phase files, and `task e2e:registry-doc` regenerates it. Edit the phase
 headers, not the rows.
+
+Header authoring: `handoff:` lists shell variable names containing retained run
+IDs. The optional `handoff-holds:` header lists shell variable names containing
+explicitly retained custody hold IDs. New or changed values produced by the
+body must be in `provides:`. Inherited variables, including values provided by an
+earlier successful phase, may be explicitly named without repeating `provides:`.
+Each named variable must hold a scalar, whitespace-separated list of exact UUIDs
+(no patterns or arrays); inherited declarations receive the same validation.
+Permission covers only the IDs in the explicit header's variables, never other
+run or hold IDs. An explicitly assigned empty hold list declares no retained
+holds, for conditional no-op bodies; unset variables and whitespace-only values still fail.
+Run lists must be nonempty.
+Use `-` or omit the header when there is no handoff. Run and
+hold declarations are independent. Variables produced by a body are exported only
+after it succeeds; a failed body's declarations are unavailable to quarantine,
+and its evidence is retained without discarding holds.
 
 <!-- registry:begin (generated by `task e2e:registry-doc`; do not edit by hand) -->
 
