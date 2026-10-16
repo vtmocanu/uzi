@@ -20,23 +20,28 @@ const (
 // drainResult is the outcome of one drain/dispose attempt, shared by the dispose
 // evidence event and the cleanup object embedded in an abnormal event.
 type drainResult struct {
-	State     string
-	Authority string
-	Reason    string
-	Killed    []int
-	Reaped    []int
-	Children  []processIdentity
+	State             string
+	Authority         string
+	Reason            string
+	Killed            []int
+	Reaped            []int
+	Children          []processIdentity
+	EvidenceTruncated bool
 }
 
 // fields renders the drain result to the exact wire shape. killed/reaped are
-// always present (as [] when empty, never null); reaped lists only waits done
-// during this drain, excluding earlier periodic waits. Authority appears only
+// always present (as [] when empty, never null); reaped retains a bounded prefix
+// of waits done during this drain, excluding earlier periodic waits. Omitted
+// diagnostic IDs set evidenceTruncated. Authority appears only
 // for a drained result; reason and children appear only for an unconfirmed one.
 func (d drainResult) fields() map[string]any {
 	m := map[string]any{
 		"state":  d.State,
 		"killed": intSlice(d.Killed),
 		"reaped": intSlice(d.Reaped),
+	}
+	if d.EvidenceTruncated {
+		m["evidenceTruncated"] = true
 	}
 	if d.Authority != "" {
 		m["authority"] = d.Authority

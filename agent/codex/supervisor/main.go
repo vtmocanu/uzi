@@ -444,9 +444,9 @@ func launchChild(childArgv []string) (int, error) {
 	return syscall.ForkExec(childArgv[0], childArgv, attr)
 }
 
-// selfDirectChildren lists the supervisor's current direct children.
-func selfDirectChildren() ([]observationRow, error) {
-	return (&observationProc{root: "/proc", deadline: time.Now().Add(time.Second)}).direct(os.Getpid())
+// selfDirectChildren visits the supervisor's current direct children.
+func selfDirectChildren(deadline time.Time, visit func(observationRow) error) error {
+	return visitCleanupChildren("/proc", os.Getpid(), deadline, visit)
 }
 
 // realKill pidfd-opens the pid and delivers SIGKILL. A vanished process (ESRCH)

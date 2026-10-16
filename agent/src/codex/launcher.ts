@@ -397,6 +397,8 @@ export interface DisposeEvidence {
   readonly killed?: readonly number[];
   readonly reaped?: readonly number[];
   readonly children?: readonly ObservationIdentity[];
+  /** Diagnostic IDs were capped; disposal authority still requires ECHILD. */
+  readonly evidenceTruncated?: boolean;
   /** Present only for a root launched with a cleanup token: the outcome of the
    *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
    *  `reason` is "" when removed, otherwise one of the fixed words mismatch, owner,
@@ -1305,9 +1307,10 @@ async function createHandle(
               return true;
             });
           };
-          const allowed = ["event", "id", "state", "authority", "reason", "killed", "reaped", "children", "tmpCleanup"];
+          const allowed = ["event", "id", "state", "authority", "reason", "killed", "reaped", "children", "tmpCleanup", "evidenceTruncated"];
           if (!Number.isSafeInteger(record.id) || Number(record.id) <= 0 ||
             !pids(record.killed) || !pids(record.reaped) ||
+            ("evidenceTruncated" in record && typeof record.evidenceTruncated !== "boolean") ||
             Object.keys(record).some((key) => !allowed.includes(key)) ||
             (record.state === "drained"
               ? record.authority !== "ECHILD+__WALL" || "reason" in record || "children" in record
@@ -1340,6 +1343,11 @@ async function createHandle(
         return;
       }
       case "abnormal": {
+        if (typeof record.cleanup === "object" && record.cleanup !== null && !Array.isArray(record.cleanup)
+          && "evidenceTruncated" in record.cleanup && typeof record.cleanup.evidenceTruncated !== "boolean") {
+          fail(new TrustedExecutionRefusal("malformed cleanup evidence"));
+          return;
+        }
         // Validated above: record it so the unclean dispose outcome still reports it.
         if ("tmpCleanup" in record) abnormalTmpCleanup = record.tmpCleanup as TmpCleanupEvidence;
         fail(new TrustedExecutionRefusal(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));

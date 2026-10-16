@@ -1270,7 +1270,7 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     ] as const) {
       const fake = newFake({
         disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason,
-          killed: [4243], reaped: [], children: remaining }),
+          killed: [4243], reaped: [], children: remaining, evidenceTruncated: true }),
       });
       const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
       const outcome = await handle.dispose(200);
@@ -1319,6 +1319,9 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
       { reason: "unknown", children: [] },
       { reason: "enumeration", children: [identity] },
       { authority: "ECHILD+__WALL", children: [] },
+      { evidenceTruncated: "true", children: [] },
+      { evidenceTruncated: 1, children: [] },
+      { evidenceTruncated: null, children: [] },
     ];
     for (const fields of cases) {
       const fake = newFake({
@@ -1334,6 +1337,30 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
       assert.ok(handle.failed instanceof TrustedExecutionRefusal);
       assert.equal(treeRemoveCalls.length, 0);
     }
+  });
+
+  it("truncated diagnostic IDs preserve exact ECHILD disposal authority", async () => {
+    for (const evidenceTruncated of [undefined, false, true]) {
+      const fake = newFake({ disposeReply: (id) => {
+        setImmediate(() => fake.exitWith(0));
+        return { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [],
+          ...(evidenceTruncated === undefined ? {} : { evidenceTruncated }) };
+      } });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(200);
+      assert.equal(outcome.clean, true);
+      assert.equal(outcome.event?.evidenceTruncated, evidenceTruncated);
+    }
+  });
+
+  it("abnormal cleanup refuses a malformed diagnostic truncation flag", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({ event: "abnormal", reason: "fixture", cleanup: {
+      state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [], evidenceTruncated: "true",
+    } });
+    const error = await handle.whenFailed;
+    assert.match(error.message, /malformed cleanup evidence/);
   });
 
   it("(f3) a dispose `unconfirmed` is NOT clean", async () => {

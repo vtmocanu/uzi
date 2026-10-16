@@ -12,7 +12,7 @@ import (
 // substitute fakes to drive the loop without root or fork.
 type seams struct {
 	supervisorPid  int
-	directChildren childLister
+	directChildren childVisitor
 	kill           childKiller
 	reap           childReaper
 	childReady     <-chan error
@@ -122,25 +122,28 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			// so the controller can drain any remaining descendants explicitly.
 			childReady = nil
 		case <-ticks:
-			children, err := s.seams.directChildren()
-			if err != nil {
-				continue
-			}
-			for _, child := range children {
+			waitFailure := ""
+			_ = s.seams.directChildren(s.seams.now().Add(time.Second), func(child observationRow) error {
 				pid := child.Pid
 				if primaryPending && pid == childPid {
-					continue
+					return nil
 				}
 				got, err := s.seams.reapAdopted(pid)
 				if err != nil {
 					if errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.EINTR) {
-						continue
+						return nil
 					}
-					return s.abnormal("adopted child wait failed")
+					waitFailure = "adopted child wait failed"
+					return err
 				}
 				if got != 0 && got != pid {
-					return s.abnormal("adopted child wait returned unexpected pid")
+					waitFailure = "adopted child wait returned unexpected pid"
+					return errors.New("adopted child wait returned unexpected pid")
 				}
+				return nil
+			})
+			if waitFailure != "" {
+				return s.abnormal(waitFailure)
 			}
 		case result := <-controls:
 			line, err := result.line, result.err

@@ -19,6 +19,10 @@ const (
 	// snapshot cannot be turned into an unbounded traversal.
 	maxSnapshotDescendants = 200
 
+	// Diagnostic storage is bounded separately from traversal and disposal.
+	// Exhausting it marks evidenceTruncated but never stops ordinary cleanup.
+	maxCleanupDiagnosticItems = 256
+
 	// defaultDisposeTimeoutMs is used when a dispose omits timeoutMs and for the
 	// best-effort drain that accompanies an abnormal outcome.
 	defaultDisposeTimeoutMs = 2000

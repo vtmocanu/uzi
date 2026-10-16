@@ -309,8 +309,30 @@ test("fresh cancellation rechecks supervisor ticks and context before disposal",
   await reply;
 });
 
+test("unavailable initial memory evidence preserves ordinary command execution and cleanup", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  root.observeWith(async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }));
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
+  const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  await until(() => root.observations() === 1);
+  await new Promise<void>((done) => setImmediate(done));
+  assert.equal(root.disposes(), 0, "read-only evidence failure cannot kill the command");
+  assert.equal(registry.hasLiveCommandRoot(), true);
+  assert.equal(c.commands.eligibleEntries()?.length, 0, "unavailable evidence grants no intervention target");
+  (root.handle.transport.stdout as PassThrough).write("normal-command-output");
+  root.child.resolve({ event: "child_exit", code: 0 });
+  const result = await reply;
+  assert.equal(result.ok, true);
+  assert.match(JSON.stringify(result), /normal-command-output/);
+  assert.equal(root.disposes(), 1, "ordinary exit still joins registered cleanup");
+  assert.equal(registry.hasLiveCommandRoot(), false);
+  assert.equal(c.commands.eligibleEntries()?.length, 0);
+});
+
 test("failed or retired initial enrollment boundedly reaps the already launched root", async () => {
-  for (const mode of ["unavailable", "timeout", "retired", "held", "aborted"] as const) {
+  for (const mode of ["timeout", "retired", "held", "aborted", "identity"] as const) {
     const c = captured();
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const root = fakeRoot();
@@ -320,6 +342,10 @@ test("failed or retired initial enrollment boundedly reaps the already launched 
       if (mode === "retired") c.commands.retire(c.context);
       if (mode === "held") c.commands.acquireLatch(c.context);
       if (mode === "aborted") signal.abort();
+      if (mode === "identity") return {
+        event: "observe", id: 1, state: "complete", supervisor: { pid: 999, startTime: ticks },
+        root: { pid: 51, startTime: ticks }, processes: [{ pid: 51, startTime: ticks, ppid: 999, rss: 100 }],
+      };
       return { event: "observe", id: 1, state: "unavailable", reason: "unreadable" };
     });
     const b = new CodexCallbackBroker({

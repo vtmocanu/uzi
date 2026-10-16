@@ -185,10 +185,6 @@ func identities(rows []observationRow) []processIdentity {
 	}
 	return out
 }
-func (p *observationProc) direct(pid int) ([]observationRow, error) {
-	return p.directLimit(pid, observationItems)
-}
-
 func (p *observationProc) directLimit(pid, limit int) ([]observationRow, error) {
 	children, err := p.children(pid, limit)
 	if err != nil {

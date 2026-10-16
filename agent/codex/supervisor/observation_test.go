@@ -253,7 +253,7 @@ func TestObservationControlDoesNotDrainOrSpendLifecycleBudget(t *testing.T) {
 func TestDrainEnumerationFailureCannotConfirmECHILD(t *testing.T) {
 	deadline, clock, sleep := farClock()
 	kill, calls := recordingKiller()
-	got := drain(deadline, clock, sleep, func() ([]observationRow, error) { return nil, errObservationUnreadable }, kill, seqReaper())
+	got := drain(deadline, clock, sleep, listedChildren(func() ([]observationRow, error) { return nil, errObservationUnreadable }), kill, seqReaper())
 	if got.State != stateUnconfirmed || got.Reason != "enumeration" || len(*calls) != 0 {
 		t.Fatalf("%+v calls=%v", got, *calls)
 	}
@@ -262,13 +262,13 @@ func TestDrainSecondEnumerationFailureCannotConfirmECHILD(t *testing.T) {
 	for _, failure := range []error{errObservationUnreadable, errObservationOversize, errObservationGone} {
 		deadline, clock, sleep := farClock()
 		calls := 0
-		children := func() ([]observationRow, error) {
+		children := listedChildren(func() ([]observationRow, error) {
 			calls++
 			if calls == 1 {
 				return nil, nil
 			}
 			return nil, failure
-		}
+		})
 		kill, signals := recordingKiller()
 		got := drain(deadline, clock, sleep, children, kill, seqReaper())
 		if calls != 2 || got.State != stateUnconfirmed || got.Reason != "enumeration" || got.Authority != "" || len(*signals) != 0 {

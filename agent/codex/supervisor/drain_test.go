@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"syscall"
 	"testing"
@@ -14,6 +15,22 @@ import (
 type reapStep struct {
 	pid int
 	err error
+}
+
+// listedChildren adapts finite scripted lists to the production streaming seam.
+func listedChildren(list func() ([]observationRow, error)) childVisitor {
+	return func(_ time.Time, visit func(observationRow) error) error {
+		rows, err := list()
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if err := visit(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // seqReaper returns a childReaper that yields the scripted steps in order, then
@@ -30,18 +47,18 @@ func seqReaper(steps ...reapStep) childReaper {
 	}
 }
 
-// seqChildren returns a childLister that yields the scripted slices in order,
+// seqChildren returns a childVisitor that yields the scripted slices in order,
 // then empty once exhausted.
-func seqChildren(slices ...[]int) childLister {
+func seqChildren(slices ...[]int) childVisitor {
 	i := 0
-	return func() ([]observationRow, error) {
+	return listedChildren(func() ([]observationRow, error) {
 		if i < len(slices) {
 			s := slices[i]
 			i++
 			return testChildRows(s), nil
 		}
 		return nil, nil
-	}
+	})
 }
 
 func recordingKiller() (childKiller, *[]int) {
@@ -83,6 +100,31 @@ func TestDrainDrained(t *testing.T) {
 	}
 }
 
+func TestDrainBeyondObservationDiagnosticLimit(t *testing.T) {
+	for _, count := range []int{257, 600} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			pids := make([]int, count)
+			steps := make([]reapStep, count)
+			for i := range pids {
+				pids[i] = i + 10
+				steps[i] = reapStep{i + 10, nil}
+			}
+			deadline, clock, sleep := farClock()
+			kill, killed := recordingKiller()
+			got := drain(deadline, clock, sleep, seqChildren(pids, nil), kill, seqReaper(steps...))
+			if got.State != stateDrained || got.Authority != authorityECHILD || !reflect.DeepEqual(*killed, pids) {
+				t.Fatalf("finite tree cleanup: state=%s authority=%s killed=%d want=%d reason=%s", got.State, got.Authority, len(*killed), count, got.Reason)
+			}
+			if !got.EvidenceTruncated || !reflect.DeepEqual(got.Killed, pids[:maxCleanupDiagnosticItems]) || !reflect.DeepEqual(got.Reaped, pids[:maxCleanupDiagnosticItems]) {
+				t.Fatalf("diagnostic prefix or truncation lost: %+v", got)
+			}
+			if disposeEvidence(1, got)["evidenceTruncated"] != true || got.fields()["evidenceTruncated"] != true {
+				t.Fatal("wire evidence must explicitly mark omitted diagnostic IDs")
+			}
+		})
+	}
+}
+
 func TestDrainDeadlineUnconfirmed(t *testing.T) {
 	deadline := time.Unix(100, 0)
 	// clock: before the deadline once (so it sleeps), then past it.
@@ -94,8 +136,8 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 		return tm
 	}
 	kill, _ := recordingKiller()
-	children := func() ([]observationRow, error) { return testChildRows([]int{10}), nil } // never drains
-	reap := func() (int, error) { return 0, nil }                                         // WNOHANG, never ready
+	children := listedChildren(func() ([]observationRow, error) { return testChildRows([]int{10}), nil }) // never drains
+	reap := func() (int, error) { return 0, nil }                                                         // WNOHANG, never ready
 
 	got := drain(deadline, clock, func() {}, children, kill, reap)
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline {
@@ -109,7 +151,7 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 func TestDrainEchildContradicted(t *testing.T) {
 	deadline, clock, sleep := farClock()
 	kill, _ := recordingKiller()
-	children := func() ([]observationRow, error) { return testChildRows([]int{11}), nil } // still present when ECHILD claimed
+	children := listedChildren(func() ([]observationRow, error) { return testChildRows([]int{11}), nil }) // still present when ECHILD claimed
 	reap := seqReaper(reapStep{0, syscall.ECHILD})
 
 	got := drain(deadline, clock, sleep, children, kill, reap)
@@ -187,19 +229,21 @@ func TestDrainContinuousReapsDeadline(t *testing.T) {
 }
 
 func TestDrainCumulativeChurnBound(t *testing.T) {
-	deadline, clock, sleep := farClock()
+	now := time.Unix(0, 0)
+	deadline, clock, sleep := now.Add(time.Second), func() time.Time { return now }, func() {}
 	passes, kills, waits := 0, 0, 0
 	got := drain(deadline, clock, sleep,
-		func() ([]observationRow, error) { passes++; return testChildRows([]int{passes}), nil },
+		listedChildren(func() ([]observationRow, error) { passes++; return testChildRows([]int{passes}), nil }),
 		func(processIdentity) error { kills++; return nil },
 		func() (int, error) {
 			waits++
+			now = now.Add(time.Millisecond)
 			if waits%2 == 0 {
 				return 0, nil
 			}
 			return (waits + 1) / 2, nil
 		})
-	if got.State != stateUnconfirmed || got.Reason != "oversize" || kills != 256 || len(got.Killed) != 256 || len(got.Reaped) != 256 {
+	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || kills <= 256 || len(got.Killed) != 256 || len(got.Reaped) != 256 || !got.EvidenceTruncated {
 		t.Fatalf("passes=%d kills=%d waits=%d result=%+v", passes, kills, waits, got)
 	}
 	var output bytes.Buffer
@@ -228,13 +272,13 @@ func TestDrainDeadlineAfterEmptyVerification(t *testing.T) {
 	now := time.Unix(0, 0)
 	lists := 0
 	got := drain(now.Add(time.Second), func() time.Time { return now }, func() {},
-		func() ([]observationRow, error) {
+		listedChildren(func() ([]observationRow, error) {
 			lists++
 			if lists == 2 {
 				now = now.Add(time.Second)
 			}
 			return nil, nil
-		}, func(processIdentity) error { t.Fatal("unexpected kill"); return nil }, seqReaper())
+		}), func(processIdentity) error { t.Fatal("unexpected kill"); return nil }, seqReaper())
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || got.Authority != "" {
 		t.Fatalf("result=%+v", got)
 	}
@@ -265,12 +309,12 @@ func TestDrainActualProducerWire(t *testing.T) {
 			now := time.Unix(0, 0)
 			deadline := now.Add(time.Second)
 			rows := []observationRow{{processIdentity: processIdentity{4243, "18446744073709551615"}}}
-			children := func() ([]observationRow, error) {
+			children := listedChildren(func() ([]observationRow, error) {
 				if reason == "enumeration" {
 					return nil, errors.New("unreadable")
 				}
 				return rows, nil
-			}
+			})
 			reap := func() (int, error) {
 				if reason == reasonDeadline {
 					now = deadline
@@ -316,13 +360,13 @@ func TestDrainCumulativeRetainedEvidenceBound(t *testing.T) {
 			deadline, clock, sleep := farClock()
 			passes, waits := 0, 0
 			got := drain(deadline, clock, sleep,
-				func() ([]observationRow, error) {
+				listedChildren(func() ([]observationRow, error) {
 					passes++
 					if mode == "killed" && passes <= 257 {
 						return testChildRows([]int{passes}), nil
 					}
 					return nil, nil
-				}, func(processIdentity) error { return nil },
+				}), func(processIdentity) error { return nil },
 				func() (int, error) {
 					waits++
 					if mode == "reaped" && waits <= 257 {
@@ -333,7 +377,7 @@ func TestDrainCumulativeRetainedEvidenceBound(t *testing.T) {
 					}
 					return 0, syscall.ECHILD
 				})
-			if got.State != stateUnconfirmed || got.Reason != "oversize" || got.Authority != "" || len(got.Killed) > 256 || len(got.Reaped) > 256 {
+			if got.State != stateDrained || got.Authority != authorityECHILD || len(got.Killed) > 256 || len(got.Reaped) > 256 || !got.EvidenceTruncated {
 				t.Fatalf("retained evidence bound: state=%s reason=%s authority=%s killed=%d reaped=%d", got.State, got.Reason, got.Authority, len(got.Killed), len(got.Reaped))
 			}
 		})

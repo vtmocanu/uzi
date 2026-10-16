@@ -38,7 +38,10 @@ export async function enrollMemoryCommand(
   const startedAtMs = performance.now();
   const initial = await boundedCommandWait(handle.observe(deadlineMs), deadlineMs);
   if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
-  if (initial.state !== "complete" || initial.supervisor.pid !== handle.supervisorPid
+  // Read-only uncertainty prevents memory intervention, not ordinary execution.
+  // The registered root still owns exit, abort, deadline and disposal handling.
+  if (initial.state !== "complete") return undefined;
+  if (initial.supervisor.pid !== handle.supervisorPid
     || initial.supervisor.pid !== handle.started.supervisorPid || initial.root.pid !== handle.started.childPid) throw new Error("memory enrollment evidence unavailable");
   const supervisor = Object.freeze({ ...initial.supervisor });
   const primary = Object.freeze({ ...initial.root });

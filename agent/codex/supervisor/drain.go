@@ -10,14 +10,15 @@ import (
 // The drain seams. Factoring the drain as a pure state machine over these three
 // functions (plus a clock and sleep) lets the drained / unconfirmed-deadline /
 // echild-contradicted / adopt-and-reap branches be driven deterministically in
-// tests, with no root and no fork. The real implementations live in syscalls.go.
+// tests, with no root and no fork. The real implementations live in main.go and
+// cleanupwalk.go.
 type (
-	// childLister returns the supervisor's CURRENT direct children. As a
+	// childVisitor streams the supervisor's CURRENT direct children. As a
 	// subreaper, differently-grouped descendants reparent onto the supervisor as
 	// their intermediates die, so re-reading this each pass is what lets the
 	// drain adopt a code-mode host that setsid'd into its own group — a
 	// process-group kill would miss it.
-	childLister func() ([]observationRow, error)
+	childVisitor func(deadline time.Time, visit func(observationRow) error) error
 
 	// childKiller pidfd-opens the pid and sends SIGKILL. A vanished child
 	// (ESRCH) is not an error the drain records as killed.
@@ -40,66 +41,84 @@ func drain(
 	deadline time.Time,
 	clock func() time.Time,
 	sleep func(),
-	children childLister,
+	children childVisitor,
 	kill childKiller,
 	reap childReaper,
 ) drainResult {
 	killed := map[int]bool{}
 	reaped := map[int]bool{}
-	unconfirmed := func(reason string, rows []observationRow) drainResult {
-		return drainResult{State: stateUnconfirmed, Reason: reason,
+	truncated := false
+	retain := func(ids map[int]bool, pid int) {
+		if ids[pid] {
+			return
+		}
+		if len(ids) < maxCleanupDiagnosticItems {
+			ids[pid] = true
+		} else {
+			truncated = true
+		}
+	}
+	result := func(state, reason string, rows []observationRow) drainResult {
+		return drainResult{State: state, Reason: reason, EvidenceTruncated: truncated,
 			Killed: sortedKeys(killed), Reaped: sortedKeys(reaped), Children: identities(rows)}
 	}
-	// Each destructive step is gated by the deadline and retained-evidence
-	// budget. A failed enumeration or exhausted bound stops the entire drain.
-	for {
-		listed, listErr := children()
-		if listErr != nil {
-			return unconfirmed("enumeration", nil)
+	unconfirmed := func(reason string, rows []observationRow) drainResult {
+		return result(stateUnconfirmed, reason, rows)
+	}
+	appendRow := func(rows *[]observationRow, row observationRow) {
+		if len(*rows) < maxCleanupDiagnosticItems {
+			*rows = append(*rows, row)
+		} else {
+			truncated = true
 		}
-		for _, child := range listed {
+	}
+	// Diagnostic storage never limits cleanup progress. The enclosing deadline
+	// bounds enumeration, every signal, and even an uninterrupted reap stream.
+	for {
+		var listed []observationRow
+		listErr := children(deadline, func(child observationRow) error {
+			appendRow(&listed, child)
 			if !clock().Before(deadline) {
-				return unconfirmed(reasonDeadline, listed)
-			}
-			if !killed[child.Pid] && len(killed) >= observationItems {
-				return unconfirmed("oversize", nil)
+				return errObservationTimeout
 			}
 			if err := kill(child.processIdentity); err == nil {
-				killed[child.Pid] = true
+				retain(killed, child.Pid)
 			}
+			return nil
+		})
+		if errors.Is(listErr, errObservationTimeout) || !clock().Before(deadline) {
+			return unconfirmed(reasonDeadline, listed)
+		}
+		if listErr != nil {
+			return unconfirmed("enumeration", nil)
 		}
 		for {
 			if !clock().Before(deadline) {
 				return unconfirmed(reasonDeadline, listed)
 			}
-			if len(reaped) >= observationItems {
-				return unconfirmed("oversize", nil)
-			}
 			pid, err := reap()
 			if err != nil {
 				if errors.Is(err, syscall.ECHILD) {
-					remaining, err := children()
+					var remaining []observationRow
+					err := children(deadline, func(child observationRow) error {
+						appendRow(&remaining, child)
+						if !clock().Before(deadline) {
+							return errObservationTimeout
+						}
+						return nil
+					})
+					if errors.Is(err, errObservationTimeout) || !clock().Before(deadline) {
+						return unconfirmed(reasonDeadline, remaining)
+					}
 					if err != nil {
 						return unconfirmed("enumeration", nil)
 					}
-					if !clock().Before(deadline) {
-						return unconfirmed(reasonDeadline, remaining)
-					}
 					if len(remaining) > 0 {
-						return drainResult{
-							State:    stateUnconfirmed,
-							Reason:   reasonEchildContradicted,
-							Killed:   sortedKeys(killed),
-							Reaped:   sortedKeys(reaped),
-							Children: identities(remaining),
-						}
+						return unconfirmed(reasonEchildContradicted, remaining)
 					}
-					return drainResult{
-						State:     stateDrained,
-						Authority: authorityECHILD,
-						Killed:    sortedKeys(killed),
-						Reaped:    sortedKeys(reaped),
-					}
+					drained := result(stateDrained, "", nil)
+					drained.Authority = authorityECHILD
+					return drained
 				}
 				// A transient reap error (e.g. EINTR) is not authority; stop
 				// reaping this pass and let the deadline gate decide.
@@ -108,16 +127,10 @@ func drain(
 			if pid == 0 {
 				break
 			}
-			reaped[pid] = true
+			retain(reaped, pid)
 		}
 		if !clock().Before(deadline) {
-			return drainResult{
-				State:    stateUnconfirmed,
-				Reason:   reasonDeadline,
-				Killed:   sortedKeys(killed),
-				Reaped:   sortedKeys(reaped),
-				Children: identities(listed),
-			}
+			return unconfirmed(reasonDeadline, listed)
 		}
 		sleep()
 	}
