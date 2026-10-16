@@ -336,7 +336,8 @@ func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, 
 	if stopReason != nil && !PolicyOwnerCanStop(r, s.p.RunTimeout) {
 		return r, ErrProviderHoldStopUnavailable
 	}
-	if !PolicyOwnerResumable(r) && !(req.completionDecision && r.HoldReason.String == "completion_blocked") {
+	canResume := PolicyOwnerResumable(r) || (req.completionDecision && r.HoldReason.String == "completion_blocked")
+	if !canResume {
 		return r, ErrInvalidState
 	}
 	fresh := req.Mode == "fresh"
@@ -345,15 +346,16 @@ func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, 
 	}
 	if stopReason != nil {
 		completed, _ := DecodeMilestoneIDs(r.MilestonesCompleted)
-		if len(completed) > math.MaxInt32 {
+		completedCount := len(completed)
+		if completedCount < 1 || completedCount > math.MaxInt32 {
 			return r, ErrProviderHoldStopUnavailable
 		}
-		body := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", len(completed))
+		body := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", completedCount)
 		if reason := strings.TrimSpace(*stopReason); reason != "" {
 			body += ": " + reason
 		}
 		if _, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
-			RunID: r.ID, ScopeCeiling: pgtype.Int4{Int32: int32(len(completed)), Valid: true}, Body: policyTextNonempty(body),
+			RunID: r.ID, ScopeCeiling: pgtype.Int4{Int32: int32(completedCount), Valid: true}, Body: policyTextNonempty(body),
 		}); err != nil {
 			return r, err
 		}
