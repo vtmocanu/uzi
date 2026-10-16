@@ -11350,7 +11350,7 @@ export class RunRunner {
           claim.auto_approve ?? false,
           claim.config ?? null,
         ),
-      pullFollowUp: () => steering.pullFollowUp(),
+      pullFollowUp: selection => steering.pullFollowUp(selection),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
       followUpIncluded: (id) => steering.markFollowUpIncluded(id),
       // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
@@ -16721,15 +16721,6 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     const records = outbox.listPendingPolicies(flight.runId);
-    if (!records.length) {
-      flight.runLog.warn("policy evidence unavailable; claim blocked pending reconciliation");
-      // Physical, unauthenticated evidence cannot authorize a fabricated refusal or execution.
-      // Each retry is delayed and Cancel/shutdown/fencing ends the active wait.
-      for (;;) {
-        this.policyControlGuard(flight);
-        await this.waitRecoveryRetry(flight, true, Math.max(250, this.recoveryRetryMs));
-      }
-    }
     for (const record of records) {
       this.policyControlGuard(flight);
       const source = record.outcome.source_generation;
@@ -16753,6 +16744,20 @@ export class RunRunner {
       }
       await flight.batcher.close().catch(() => undefined);
       return true;
+    }
+    // ACKs settle only their own records. Reauthenticate the complete run inventory,
+    // including siblings introduced during delivery or skipped by a cached settlement.
+    this.policyControlGuard(flight);
+    await outbox.refreshPolicyInventory(flight.cancel.signal, flight.runId);
+    this.policyControlGuard(flight);
+    if (!records.length || outbox.hasUnresolvedPolicy(flight.runId)) {
+      flight.runLog.warn("policy evidence unavailable; claim blocked pending reconciliation");
+      // Unknown evidence cannot form a wire outcome. Retain active ownership and source/session
+      // custody indefinitely with delayed retries; Cancel/shutdown/fencing ends this wait.
+      for (;;) {
+        this.policyControlGuard(flight);
+        await this.waitRecoveryRetry(flight, true, Math.max(250, this.recoveryRetryMs));
+      }
     }
     flight.policyReconciliationPending = false;
     return false;

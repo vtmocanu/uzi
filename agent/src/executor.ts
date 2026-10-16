@@ -424,8 +424,10 @@ export interface RunContext {
    *  FIFO and one at a time, and carries it until a turn whose prompt held it yields its first
    *  event evidencing the model processed it (not init or lifecycle), then reports it via {@link followUpIncluded}. The server's consumed_at ("Delivered")
    *  records only the worker's receipt via the steering poll; included_at is the separate record
-   *  that the turn carrying it reached the model (not that the model acted on it). */
-  pullFollowUp?(): { id: number; body: string } | undefined;
+   *  that the turn carrying it reached the model (not that the model acted on it).
+   *  `selection` instead takes the highest queued id above newestAfter, leaving older rows queued.
+   *  Policy resumes use it to prioritize new owner narrowing; omitted means ordinary FIFO. */
+  pullFollowUp?(selection?: { newestAfter: number }): { id: number; body: string } | undefined;
   /** Issue #1800: follow-up `id` (from pullFollowUp or a park's `followup` outcome) was in a prompt
    *  whose turn reached the model (a model-evidencing event arrived). Called once per follow-up; the runner reports
    *  it to the api (POST /inputs/included). Optional; absent (a stub) ⇒ nothing is reported. */

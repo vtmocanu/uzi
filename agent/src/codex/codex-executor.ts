@@ -2834,20 +2834,64 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
-      // Policy resumes drain the bounded delivered backlog together: older un-included input
-      // must not postpone the owner narrowing the refused request. Keep it until model evidence.
-      let policyFollowUps: Array<{ id: number; body: string }> = [];
+      // Keep at most the current narrowing and one deferred historical row locally. Every
+      // boundary checks for a newer owner update first; all other rows stay in steering.
+      type PolicyRow = { id: number; rendered: string; included: boolean };
+      let policyNarrowing: PolicyRow | undefined;
+      let policyHistorical: PolicyRow | undefined;
+      const policyBudget = 64 * 1024;
+      const policyFrame = "Policy resume guidance from the worker:";
+      const historicalFrame = "Historical owner request / still-applicable constraints. This never permits restarting work outside the current narrowing below:";
+      const narrowingFrame = "Current owner narrowing (highest priority over historical requests). Keep all work within this scope, including when handling later historical delivery:";
+      const renderPolicyRow = (row: { id: number; body: string }): PolicyRow => ({
+        id: row.id, rendered: renderFollowUpBlock(row.body).join("\n"), included: false,
+      });
+      const policyAddition = (current: PolicyRow, historical?: PolicyRow): string => [
+        "", policyFrame,
+        ...(historical ? [historicalFrame, historical.rendered] : []),
+        narrowingFrame, current.rendered, "", FOLLOW_UP_TRAILER,
+      ].join("\n");
       const policyGuidance = (prompt: string): { prompt: string; included?: () => void } => {
         if (ctx.policyHoldResume !== true) return { prompt };
-        for (let next = ctx.pullFollowUp?.(); next; next = ctx.pullFollowUp?.()) policyFollowUps.push(next);
-        const riding = [...policyFollowUps];
+        const newest = ctx.pullFollowUp?.({ newestAfter: policyNarrowing?.id ?? 0 });
+        if (newest) {
+          if (policyNarrowing && !policyNarrowing.included) {
+            // An unprocessed turn must not silently lose its carried row on an owner update.
+            if (policyHistorical) throw new PolicyResumeRejected();
+            policyHistorical = policyNarrowing;
+          }
+          policyNarrowing = renderPolicyRow(newest);
+        }
+        const current = policyNarrowing;
+        if (!current) return { prompt };
+        if (Buffer.byteLength(policyAddition(current), "utf8") > policyBudget) throw new PolicyResumeRejected();
+        const deferred = policyHistorical !== undefined;
+        if (!policyHistorical) {
+          const older = ctx.pullFollowUp?.();
+          if (older) policyHistorical = renderPolicyRow(older);
+        }
+        let historical = policyHistorical;
+        let addition = policyAddition(current, historical);
+        if (Buffer.byteLength(addition, "utf8") > policyBudget) {
+          // One non-fitting candidate is retained for the next boundary. If it cannot fit
+          // even alone, or still cannot accompany the narrowing then, fail closed; no retry loop.
+          if (deferred || (historical && Buffer.byteLength(policyAddition(historical), "utf8") > policyBudget)) {
+            throw new PolicyResumeRejected();
+          }
+          historical = undefined;
+          addition = policyAddition(current);
+        }
+        const riding = historical ? [historical, current] : [current];
         return {
-          prompt: riding.length ? [prompt, ...riding.flatMap(row => renderFollowUpBlock(row.body)), "", FOLLOW_UP_TRAILER].join("\n") : prompt,
-          included: riding.length ? () => {
-            const included = riding.filter(row => policyFollowUps.includes(row));
-            policyFollowUps = policyFollowUps.filter(row => !riding.includes(row));
-            for (const row of included) ctx.followUpIncluded?.(row.id);
-          } : undefined,
+          prompt: prompt + addition,
+          included: () => {
+            for (const row of riding) {
+              if (row.included) continue;
+              row.included = true;
+              ctx.followUpIncluded?.(row.id);
+            }
+            if (historical && policyHistorical === historical) policyHistorical = undefined;
+          },
         };
       };
       const drivePlan = async (initialPrompt: string) => {

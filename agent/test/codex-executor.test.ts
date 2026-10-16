@@ -471,6 +471,161 @@ function tokenUsageUpdated(
 }
 
 describe("M1 policy hold executor transport (#3068)", () => {
+  async function boundedRun(bodies: string[]) {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps(bodies.map((body, i) => ({ id: i + 1, kind: "follow_up", body, inclusion_reported: true })));
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(signalDone()).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    try {
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id),
+      }).ctx), 3000, "UTF8 bounded guidance");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      return { addition: text.slice(text.indexOf("\nPolicy resume guidance from the worker:"), text.lastIndexOf(FOLLOW_UP_TRAILER) + FOLLOW_UP_TRAILER.length), included };
+    } catch (error) {
+      assert.equal(rig.transport.turnStartCount, 0, "oversized guidance rejects before model turn");
+      assert.deepEqual(included, [], "no receipt for rejected guidance");
+      throw error;
+    } finally { await ch.stop(); }
+  }
+
+  it("enforces the exact rendered UTF8 limit including frames, fences, separators and trailer", async () => {
+    const small = await boundedRun(["x"]);
+    const bodyBytes = 65536 - Buffer.byteLength(small.addition, "utf8") + 1;
+    const body = "é".repeat(Math.floor(bodyBytes / 2)) + (bodyBytes % 2 ? "x" : "");
+    const exact = await boundedRun([body]);
+    assert.equal(Buffer.byteLength(exact.addition, "utf8"), 65536);
+    assert.deepEqual(exact.included, [1]);
+    const twoSmall = await boundedRun(["x", "y"]);
+    const older = "界".repeat(5000);
+    const currentBytes = 65536 - Buffer.byteLength(twoSmall.addition, "utf8") + 2 - Buffer.byteLength(older, "utf8");
+    const current = "é".repeat(Math.floor(currentBytes / 2)) + (currentBytes % 2 ? "z" : "");
+    const twoExact = await boundedRun([older, current]);
+    assert.equal(Buffer.byteLength(twoExact.addition, "utf8"), 65536);
+    assert.deepEqual(twoExact.included, [1, 2]);
+    await assert.rejects(boundedRun([body + "x"]), (err: Error) => err.name === "PolicyResumeRejected");
+    await assert.rejects(boundedRun(["界".repeat(24000), "only inspect"]),
+      (err: Error) => err.name === "PolicyResumeRejected");
+  });
+
+  it("retains one non-fitting historical candidate and rejects its next delivery without draining siblings", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      { id: 1, kind: "follow_up", body: "OLD:" + "a".repeat(33000), inclusion_reported: true },
+      { id: 2, kind: "follow_up", body: "still queued", inclusion_reported: true },
+      { id: 3, kind: "follow_up", body: "CURRENT:" + "b".repeat(33000), inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(agentMessage("processed current")).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    try {
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id),
+      }).ctx), 3000, "one deferred candidate"), (err: Error) => err.name === "PolicyResumeRejected");
+      assert.equal(rig.transport.turnStartCount, 1);
+      assert.deepEqual(included, [3]);
+      assert.equal(ch.pullFollowUp()?.id, 2, "no second historical candidate was pulled");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      assert.ok(text.includes("CURRENT:" + "b".repeat(33000)));
+      assert.ok(!text.includes("OLD:"), "no partial historical delivery");
+    } finally { await ch.stop(); }
+  });
+
+  it("retains narrowing across historical delivery and prioritizes a new owner update next boundary", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      { id: 1, kind: "follow_up", body: "OLD-ONE restart every subsystem", inclusion_reported: true },
+      { id: 2, kind: "follow_up", body: "OLD-TWO change unrelated service", inclusion_reported: true },
+      { id: 3, kind: "follow_up", body: "NARROW-THREE parser inspection only", inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        c.transport.push(agentMessage("processed", "th-1"));
+        if (c.turnStartCount === 3) c.transport.push(signalDone("th-1", tn));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    } });
+    try {
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx({
+        sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+        pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => {
+          included.push(id);
+          if (id === 2) ch.requeueUnincludedFollowUps([
+            { id: 4, kind: "follow_up", body: "NEW-FOUR read one parser file only", inclusion_reported: true },
+          ]);
+        },
+      }).ctx), 3000, "retained narrowing");
+      const texts = rig.transport.requests.filter(r => r.method === "turn/start")
+        .map(r => (r.params as { input: { text: string }[] }).input[0]!.text);
+      assert.equal(texts.length, 3);
+      assert.ok(texts[0]!.indexOf("OLD-ONE") < texts[0]!.indexOf("NARROW-THREE"));
+      assert.ok(texts[1]!.includes("OLD-TWO") && texts[1]!.includes("NARROW-THREE"));
+      assert.ok(texts[1]!.includes("never permits restarting work outside the current narrowing"));
+      assert.ok(texts[1]!.includes("highest priority over historical requests"));
+      assert.ok(texts[2]!.includes("NEW-FOUR"));
+      assert.ok(!texts[2]!.includes("NARROW-THREE"));
+      assert.deepEqual(included, [1, 3, 2, 4], "retained narrowing is never receipted twice");
+    } finally { await ch.stop(); }
+  });
+  it("bounds policy guidance with 4096 backlog rows and newest narrowing before model evidence", async () => {
+    const ch = new SteeringChannel(withReceipts({ getInputs: async () => ({ inputs: [] }) } as never),
+      "run-1", 1, noopLog, new AbortController());
+    ch.requeueUnincludedFollowUps([
+      ...Array.from({ length: 4096 }, (_, n) => ({ id: n + 1, kind: "follow_up" as const,
+        body: `HISTORICAL-${n + 1}:` + "x".repeat(4096), inclusion_reported: true })),
+      { id: 4097, kind: "follow_up", body: "LATEST-NARROWING: only inspect the parser", inclusion_reported: true },
+    ]);
+    const included: number[] = [];
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+      return {};
+    } });
+    const { ctx } = makeCtx({ sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+      pullFollowUp: selection => ch.pullFollowUp(selection), followUpIncluded: id => included.push(id) });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    try {
+      await waitFor(() => rig.transport.turnStartCount === 1, "bounded first root");
+      const text = (rig.transport.requests.find(r => r.method === "turn/start")!.params as { input: { text: string }[] }).input[0]!.text;
+      const start = text.indexOf("\nPolicy resume guidance from the worker:");
+      // Include every separator, nonce fence, trailer and worker frame in the measurement.
+      assert.ok(Buffer.byteLength(start < 0 ? text : text.slice(start, text.lastIndexOf(FOLLOW_UP_TRAILER) + FOLLOW_UP_TRAILER.length), "utf8") <= 65536);
+      assert.ok(text.includes("LATEST-NARROWING"));
+      assert.equal((text.match(/<follow_up_[0-9a-f]{16}>/g) ?? []).length / 2, 2);
+      assert.equal(ch.hasPendingFollowUpOutcome(), true);
+      assert.deepEqual(included, [], "turn initialization is not model evidence");
+      rig.transport.push(agentMessage("processed narrowing"));
+      await waitFor(() => included.length === 2, "actual model evidence");
+      assert.deepEqual(included, [1, 4097]);
+    } finally {
+      rig.transport.push(signalDone()).push(turnCompleted()).end();
+      await withTimeout(running, 3000, "bounded guidance cleanup");
+      await ch.stop();
+    }
+  });
   for (const kind of [undefined, "ci_fix", "job", "chat", "judge", "mr_rework", "cross_check"] as const) {
     it(`excludes unadmitted kind ${String(kind)} from refusal precedence`, async () => {
       let mode: "wall" | null = null;

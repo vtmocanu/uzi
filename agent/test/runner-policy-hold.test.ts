@@ -3,6 +3,7 @@ import { test } from "node:test";
 import path from "node:path";
 import fs from "node:fs";
 import { Outbox } from "../src/outbox.js";
+import { StaleClaimError } from "../src/runner.js";
 import { PolicyHoldUnsupported } from "../src/client.js";
 import { randomUUID } from "node:crypto";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
@@ -98,6 +99,112 @@ for (const disposition of ["applied", "already_applied", "resolved_newer_policy"
     assert.equal(forge.calls.length, 0);
     assert.equal(outbox.hasPendingPolicy(claim.run_id), true, "physical retirement belongs to custody proof");
     if (calls === 0) assert.equal(api.states.some(s => s.body.status === "failed"), false);
+  });
+}
+
+// Probe the admission boundary directly so a blocked claim never needs an unbounded execute().
+async function policyReconciliationProbe() {
+  const { outbox, claim } = await setup();
+  claim.claim_generation = 3;
+  const outcome = { outcome_id: randomUUID(), source_generation: 1,
+    detail: "resume_rejected" as const, head: "", published: false };
+  assert.equal((await outbox.journalPolicy(claim.run_id, outcome)).journaled, true);
+  let cancelled = false, fenced = false, closed = 0;
+  const active = { shuttingDown: false };
+  const flight = {
+    runId: claim.run_id, claimGeneration: 3, runLog: nullLogger(),
+    cancel: new AbortController(), active,
+    steering: { isCancelled: () => cancelled, claimFence: () => fenced },
+    batcher: { async close() { closed++; } },
+    policyReconciliationPending: false, preserveRecoveryClone: false, preserveSession: false,
+  };
+  const forge = fakeGitlab();
+  const subject = runner({ async run() { assert.fail("forbidden model work"); } },
+    forge.gitlab, undefined, { outbox, recoveryRetryMs: 1 }) as unknown as {
+      reconcileClaimPolicies(flight: unknown): Promise<boolean>;
+      waitRecoveryRetry(flight: unknown, cancelStopsWait: boolean, waitMs: number): Promise<void>;
+    };
+  const unknownFile = path.join(homeDir, "outbox", claim.run_id, "policy-2.json");
+  return { outbox, claim, outcome, flight, active, subject, forge,
+    addUnknown: () => fs.writeFileSync(unknownFile, "unreadable"),
+    cancel: () => { cancelled = true; },
+    fence: () => { fenced = true; },
+    assertBlocked() {
+      assert.equal(flight.policyReconciliationPending, true);
+      assert.equal(flight.preserveRecoveryClone, true);
+      assert.equal(flight.preserveSession, true);
+      assert.equal(flight.active, active);
+      assert.equal(closed, 0, "blocked admission must retain its open active flight");
+      assert.equal(forge.calls.length, 0);
+      assert.equal(api.states.length, 0);
+      assert.equal(fs.readFileSync(unknownFile, "utf8"), "unreadable");
+    },
+  };
+}
+
+for (const disposition of ["already_applied", "resolved_newer_policy"] as const) {
+  for (const timing of ["existing", "cached ACK", "during ACK"] as const) {
+    test(`mixed policy inventory blocks ${disposition} with unknown sibling ${timing}`, async (t) => {
+      const probe = await policyReconciliationProbe();
+      const { subject, flight, outbox, claim, outcome } = probe;
+      api.policyHoldDisposition = disposition;
+      if (timing === "cached ACK") {
+        assert.equal(await subject.reconcileClaimPolicies(flight), false, "clean settled evidence permits admission");
+        assert.equal(outbox.hasUnresolvedPolicy(claim.run_id), false);
+      }
+      if (timing === "during ACK") {
+        const report = client.reportPolicyHold.bind(client);
+        t.mock.method(client, "reportPolicyHold", async (...args: Parameters<typeof report>) => {
+          const ack = await report(...args);
+          probe.addUnknown();
+          return ack;
+        });
+      } else probe.addUnknown();
+      const blocked = new Error("observed delayed blocked wait");
+      let waits = 0;
+      subject.waitRecoveryRetry = async (waiting, cancelStopsWait, waitMs) => {
+        waits++;
+        assert.equal(waiting, flight);
+        assert.equal(cancelStopsWait, true);
+        assert.ok(waitMs >= 250);
+        probe.assertBlocked();
+        assert.equal(outbox.hasUnresolvedPolicy(claim.run_id), true);
+        throw blocked;
+      };
+      await assert.rejects(subject.reconcileClaimPolicies(flight), error => error === blocked);
+      assert.equal(waits, 1);
+      assert.equal(api.policyHoldRequests.length, 1, "unknown evidence must not fabricate a hold");
+      assert.equal(api.policyHoldRequests[0]!.body.outcome_id, outcome.outcome_id);
+      assert.equal(api.policyHoldRequests[0]!.body.source_generation, 1);
+      assert.equal(api.policyHoldRequests[0]!.body.claim_generation, 3);
+      assert.equal(outbox.listPendingPolicies(claim.run_id)[0]!.server_settled, true);
+    });
+  }
+}
+
+for (const control of ["Cancel", "fence", "shutdown"] as const) {
+  test(`mixed policy blocked wait observes ${control}`, async () => {
+    const probe = await policyReconciliationProbe();
+    api.policyHoldDisposition = "already_applied";
+    probe.addUnknown();
+    let waits = 0;
+    const shutdown = new Error("worker shutdown");
+    probe.subject.waitRecoveryRetry = async () => {
+      assert.equal(++waits, 1, "control must stop the next retry");
+      probe.assertBlocked();
+      if (control === "Cancel") probe.cancel();
+      else if (control === "fence") probe.fence();
+      else {
+        probe.active.shuttingDown = true;
+        probe.flight.cancel.abort(shutdown);
+      }
+    };
+    await assert.rejects(probe.subject.reconcileClaimPolicies(probe.flight), error =>
+      control === "fence" ? error instanceof StaleClaimError :
+        control === "shutdown" ? error === shutdown :
+          error instanceof Error && error.message === "run cancelled");
+    assert.equal(waits, 1);
+    probe.assertBlocked();
   });
 }
 

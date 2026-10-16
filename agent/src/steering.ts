@@ -1774,12 +1774,23 @@ export class SteeringChannel {
     w.resolve(v);
   }
 
-  /** Shift the oldest buffered follow-up and advance the last-delivered watermark to its id
+  /** Take the oldest buffered follow-up (or highest id above the selected floor) and advance the last-delivered watermark to its id
    *  (issue #559 M2). The SINGLE delivery site: every place that hands a follow-up to the
    *  executor routes through here so none can forget to advance the watermark — the same
    *  sibling-clear hazard the SQL wake-guard comments guard against. Monotone via Math.max. */
-  private takeFollowUp(): { id: number; body: string } | undefined {
-    const f = this.followUps.shift();
+  private takeFollowUp(selection?: { newestAfter: number }): { id: number; body: string } | undefined {
+    let index = 0;
+    if (selection) {
+      index = -1;
+      let highest = selection.newestAfter;
+      for (let i = 0; i < this.followUps.length; i++) {
+        if (this.followUps[i]!.id > highest) {
+          highest = this.followUps[i]!.id;
+          index = i;
+        }
+      }
+    }
+    const f = index < 0 ? undefined : this.followUps.splice(index, 1)[0];
     if (f)
       this.lastDeliveredFollowUpIdValue = Math.max(
         this.lastDeliveredFollowUpIdValue,
@@ -1829,8 +1840,8 @@ export class SteeringChannel {
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body
    *  so the executor can report the follow-up included (markFollowUpIncluded) once a prompt that
    *  carried it has really started. */
-  pullFollowUp(): { id: number; body: string } | undefined {
-    return this.takeFollowUp();
+  pullFollowUp(selection?: { newestAfter: number }): { id: number; body: string } | undefined {
+    return this.takeFollowUp(selection);
   }
 
   /** Issue #1800: the executor put follow-up `id` into a prompt whose turn reached the model. Queues an inclusion

@@ -1023,9 +1023,9 @@ export class Outbox {
 
   /** Boot refresh precedes the one-shot finalize snapshot. A complete scan is needed even
    * when all cached policies were ACKed: unknown physical siblings still block admission. */
-  async refreshPolicyInventory(signal?: AbortSignal): Promise<void> {
-    // oxlint-disable-next-line unicorn/no-useless-spread -- Freeze a bounded set across awaited filesystem scans.
-    for (const runId of [...this.runs.keys()]) {
+  async refreshPolicyInventory(signal?: AbortSignal, scopedRunId?: string): Promise<void> {
+    // Freeze the scan targets across awaited filesystem scans.
+    for (const runId of scopedRunId === undefined ? [...this.runs.keys()] : [scopedRunId]) {
       signal?.throwIfAborted();
       await this.withRunLock(runId, () => this.loadPolicies(runId, { signal }), signal);
     }

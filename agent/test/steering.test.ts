@@ -592,6 +592,21 @@ describe("SteeringChannel — credential switch (PRD #1247 M5b)", () => {
 // delivery (the takeFollowUp shift) does, which is what keeps it stable across the park
 // report's DB round-trip.
 describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", () => {
+  it("selects highest queued id without losing FIFO backlog or pending outcome", async () => {
+    const { ch } = makeChannel([[]]);
+    ch.requeueUnincludedFollowUps([3, 9, 5].map(id => ({
+      id, kind: "follow_up", body: String(id), inclusion_reported: true,
+    })));
+    assert.deepEqual(ch.pullFollowUp({ newestAfter: 0 }), { id: 9, body: "9" });
+    assert.equal(ch.getLastDeliveredFollowUpId(), 9);
+    assert.equal(ch.hasPendingFollowUpOutcome(), true);
+    assert.equal(ch.pullFollowUp({ newestAfter: 9 }), undefined);
+    assert.equal(ch.pullFollowUp()?.id, 3);
+    assert.equal(ch.pullFollowUp()?.id, 5);
+    assert.equal(ch.getLastDeliveredFollowUpId(), 9);
+    assert.equal(ch.hasPendingFollowUpOutcome(), false);
+    await ch.stop();
+  });
   const inpId = (kind: UserInput["kind"], id: number, body?: string): UserInput => ({
     id,
     kind,
