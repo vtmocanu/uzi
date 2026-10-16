@@ -28,7 +28,7 @@ export interface CIEvidenceHarnessOptions {
   client: CIEvidenceDownloader;
   home: string;
   clone: string;
-  expected: { manifest_id: string; text: string; sha256?: string; size?: number };
+  expected: { manifest_id: string; text: string; sha256?: string; size?: number; truncated?: boolean };
   mode: "fresh" | "resume";
   previousGeneration?: number;
   signal?: AbortSignal;
@@ -134,10 +134,18 @@ function readCases(o: CIEvidenceHarnessOptions): Message[] {
   return [{ manifest_id: o.expected.manifest_id }, { manifest_id: unknownId(o) },
     { manifest_id: o.expected.manifest_id, path: "/fixture/forbidden" }];
 }
+function assertExcerpt(excerpt: { text: string; truncated: boolean; omitted_bytes: number }, o: CIEvidenceHarnessOptions) {
+  if (o.expected.truncated) {
+    assert.equal(excerpt.truncated, true);
+    assert.ok(excerpt.omitted_bytes > 0);
+    assert.ok(excerpt.text.length > 0 && o.expected.text.startsWith(excerpt.text));
+  } else assert.equal(excerpt.text, o.expected.text);
+}
 function assertRead(result: ToolResult, index: number, o: CIEvidenceHarnessOptions) {
+  assert.ok(Buffer.byteLength(result.content[0]!.text) <= 64 << 10);
   if (index === 0) {
     assert.ok(!result.isError);
-    assert.equal(JSON.parse(result.content[0]!.text).text, o.expected.text);
+    assertExcerpt(JSON.parse(result.content[0]!.text), o);
   } else assert.equal(result.isError, true);
 }
 
@@ -213,6 +221,7 @@ async function codex(o: CIEvidenceHarnessOptions, prepared: PreparedCIEvidence, 
   let sequence = 0;
   let childSequence = 0;
   let callbacks = 0;
+  let replyFailure: unknown;
   const pendingCalls = new Map<number | string, string>();
   let rootStarted = false;
   let rootResumed = false;
@@ -224,7 +233,7 @@ async function codex(o: CIEvidenceHarnessOptions, prepared: PreparedCIEvidence, 
         status: "completed", params: { threadId: thread, turn: { id: "turn", status: "completed" } } });
       return;
     }
-    const delegation = !script.role;
+    const delegation = "subagent_type" in args;
     const requestId = ++sequence;
     pendingCalls.set(requestId, thread);
     notes.push({ kind: "activity", method: "item/tool/call", requestId,
@@ -248,7 +257,7 @@ async function codex(o: CIEvidenceHarnessOptions, prepared: PreparedCIEvidence, 
         if (!child) { rootStarted = method === "thread/start"; rootResumed = method === "thread/resume"; }
         scripts.set(thread, { role: roleName, index: 0, calls: roleName
           ? (roleName === "reader" ? readCases(o) : [readCases(o)[0]!])
-          : [{ subagent_type: "reader", prompt: "Read evidence" }, { subagent_type: "noRead", prompt: "Attempt evidence read" }] });
+          : [readCases(o)[0]!, { subagent_type: "reader", prompt: "Read evidence" }, { subagent_type: "noRead", prompt: "Attempt evidence read" }] });
         return { thread: { id: thread } } as T;
       }
       if (method === "turn/start") {
@@ -266,17 +275,23 @@ async function codex(o: CIEvidenceHarnessOptions, prepared: PreparedCIEvidence, 
       assert.ok(thread, "reply matches the exact outstanding wire request");
       pendingCalls.delete(id);
       const script = scripts.get(thread)!;
-      assert.ok(!reply.error);
-      const result = reply.result!;
-      assert.ok(result);
-      if (script.role === "reader") {
-        assert.equal(result.success, true);
-        const text = result.contentItems?.map(c => c.text ?? "").join("") ?? "";
-        const output = JSON.parse(text) as ToolResult;
-        assertRead(output, script.index, o);
-        callbacks++;
-      } else if (script.role === "noRead") { assert.equal(result.success, false); callbacks++; }
-      else assert.equal(result.success, true);
+      // Finish the fixed traffic script even after an oracle fails; report the
+      // original assertion after dispatch settles, never via a real-time wait.
+      try {
+        assert.ok(!reply.error);
+        const result = reply.result!;
+        assert.ok(result);
+        const evidenceRead = script.role === "reader" || (!script.role && "manifest_id" in script.calls[script.index]!);
+        if (evidenceRead) {
+          const index = script.role ? script.index : 0;
+          assert.equal(result.success, index === 0);
+          const text = result.contentItems?.map(c => c.text ?? "").join("") ?? "";
+          assert.ok(Buffer.byteLength(text) <= 64 << 10, `Codex model-visible response has ${Buffer.byteLength(text)} bytes`);
+          if (index === 0) assertExcerpt(JSON.parse(text), o);
+          callbacks++;
+        } else if (script.role === "noRead") { assert.equal(result.success, false); callbacks++; }
+        else assert.equal(result.success, true);
+      } catch (error) { replyFailure ??= error; }
       script.index++;
       pushCall(thread);
     },
@@ -317,9 +332,11 @@ async function codex(o: CIEvidenceHarnessOptions, prepared: PreparedCIEvidence, 
   const turn = harness.startTurn(req);
   let finished = false;
   try { for await (const event of turn.events) if (event.kind === "turn_finished") finished = true; }
+  catch (error) { throw replyFailure ?? error; }
   finally { await turn.close(); }
+  if (replyFailure !== undefined) throw replyFailure;
   assert.equal(finished, true);
-  assert.equal(callbacks, 4);
+  assert.equal(callbacks, 5, "root read, three reader-child calls and one denied child call");
   assert.equal(rootResumed, !!o.claim.session_id);
   assert.equal(rootStarted, !o.claim.session_id);
   return 1;

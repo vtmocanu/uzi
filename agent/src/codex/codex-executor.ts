@@ -1351,7 +1351,12 @@ export interface CodexToolHandlerDeps {
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
   const { client, runId, log, emit, skills } = deps;
   const map = new Map<string, ToolHandler>();
-  if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, args => readCIEvidence(deps.ciEvidence!, args));
+  if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
+    const reply = await readCIEvidence(deps.ciEvidence!, args);
+    if (reply.isError) throw new Error("CI evidence read denied or unavailable");
+    // The reply adapters stringify objects; preserve the already bounded text.
+    return reply.content[0]!.text;
+  });
   if (deps.codeCrossCheck) map.set(CODE_DISPOSITIONS_TOOL, async args => {
     await reportCodeDispositions(deps.codeCrossCheck!, args);
     return { content: [{ type: "text", text: "Code cross-check dispositions recorded." }] };

@@ -181,10 +181,13 @@ test("Codex dynamic wire and production broker dispatch share the prepared reade
   }
   assert.equal((await call(rendered.leadGrants, { manifest_id: ID })).ok, false);
   const extra = await call(rendered.leadGrants, { manifest_id: ID, path: "/secret/path" }, prepared);
-  assert.match(JSON.stringify(extra), /isError/);
+  assert.equal(extra.ok, false);
+  if (!extra.ok) assert.equal(extra.code, "handler_error");
   assert.ok(!JSON.stringify(extra).includes("/secret/path"));
   await prepared.dispose();
-  assert.match(JSON.stringify(await call(rendered.leadGrants, { manifest_id: ID }, prepared)), /unavailable/);
+  const disposed = await call(rendered.leadGrants, { manifest_id: ID }, prepared);
+  assert.equal(disposed.ok, false);
+  if (!disposed.ok) assert.equal(disposed.code, "handler_error");
 });
 
 for (const resumed of [false, true]) test(`Claude executor prepares evidence before model and threads ${resumed ? "approved resume" : "fresh plan and implementation"} prompts`, async t => {

@@ -9,13 +9,16 @@ import { exerciseCIEvidenceHarness } from "./fixtures/ci-artifacts-repair-e2e.js
 
 // Match the descriptor-backed capability; the mandatory opt-in proof requires Linux.
 const test = process.platform === "linux" ? nodeTest : nodeTest.skip;
-for (const harness of ["claude", "codex"] as const) {
-  test(`${harness} reusable adapter proof preserves files across a genuine generation advance`, async t => {
+for (const [harness, content, truncated] of [
+  ["claude", "first\nsecond\n", false], ["codex", "first\nsecond\n", false],
+  ["codex", '\\\"'.repeat(40_000), true],
+] as const) {
+  test(`${harness} reusable adapter proof preserves files across a genuine generation advance${truncated ? " and bounds escaped replies" : ""}`, async t => {
     const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/ci-proof-"));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const home = path.join(root, "home"), clone = path.join(root, "clone");
     await fs.mkdir(clone);
-    const bytes = Buffer.from("first\nsecond\n");
+    const bytes = Buffer.from(content);
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     const manifest_id = "22222222-2222-2222-2222-222222222222";
     const file = { manifest_id, sha256, name: sha256 + ".txt", size: bytes.length };
@@ -33,9 +36,12 @@ for (const harness of ["claude", "codex"] as const) {
     } };
     let active = 0, disposed = 0;
     const options = { harness, claim, client, home, clone,
-      expected: { manifest_id, text: "first\nsecond", sha256, size: bytes.length },
+      expected: { manifest_id, text: content.replace(/\n$/, ""), sha256, size: bytes.length, truncated },
       beforeModel: async ({ prepared }: { prepared: { read(args: unknown): Promise<{ text: string }> } }) => {
-        active++; assert.equal((await prepared.read({ manifest_id })).text, "first\nsecond");
+        active++;
+        const excerpt = await prepared.read({ manifest_id });
+        if (truncated) assert.ok(excerpt.text.length > 0 && content.startsWith(excerpt.text));
+        else assert.equal(excerpt.text, content.replace(/\n$/, ""));
       },
       afterDispose: async () => { disposed++; },
     };
