@@ -2827,9 +2827,10 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		}
 	}
 	var (
-		readopted       []store.FrozenReadoptRunsFromSnapshotRow
-		missingFailed   []store.FrozenFailRunsMissingFromSnapshotRow
-		missingRequeued []store.FrozenRequeueRunsMissingFromSnapshotRow
+		readopted        []store.FrozenReadoptRunsFromSnapshotRow
+		missingFailed    []store.FrozenFailRunsMissingFromSnapshotRow
+		missingRequeued  []store.FrozenRequeueRunsMissingFromSnapshotRow
+		missingCancelled []uuid.UUID
 	)
 	if applied {
 		if updated.Kind == "hosted" && updated.RegisteredPodUid.Valid {
@@ -2848,6 +2849,10 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
 		now := s.now()
 		missingCutoff := pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
+		missingCancelled, err = qtx.CancelFrozenMissingRuns(ctx, updated.ID, missingCutoff, frozen, parents)
+		if err != nil {
+			return store.Worker{}, err
+		}
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 		readopted, err = qtx.FrozenReadoptRunsFromSnapshot(ctx, store.FrozenReadoptRunsFromSnapshotParams{WorkerID: updated.ID, FrozenTargets: frozen, LockedParentIds: parents})
 		if err != nil {
@@ -2886,6 +2891,24 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	// AND funnels into the judge (PRD #46 Decision 2, the same worker-lost runs the sweeper funnels).
 	for _, r := range readopted {
 		s.publishSwept(r.ID, r.Status)
+	}
+	for _, id := range missingCancelled {
+		s.publishSwept(id, "cancelled")
+		// Match owner-side no-poller cancellation's post-commit audit and
+		// checkpoint handling. Open custody still retains the checkpoint.
+		cancelled, readErr := s.q.GetRunByID(ctx, id)
+		if readErr != nil {
+			slog.Error("read missing execution after owner cancel", "run", id, "error", readErr)
+			continue
+		}
+		if cancelled.ScopeCeiling.Valid {
+			if _, settleErr := s.q.SettleScopeInputDisposition(ctx, store.SettleScopeInputDispositionParams{
+				RunID: id, Disposition: pgconv.TextOrNull("declined"),
+			}); settleErr != nil {
+				slog.Error("settle scope after missing execution cancel", "run", id, "error", settleErr)
+			}
+		}
+		s.retainOrDeleteCheckpoint(ctx, id, cancelled.Kind, cancelled.IssueIid)
 	}
 	for _, r := range missingFailed {
 		s.publishSwept(r.ID, r.Status)
@@ -3797,9 +3820,12 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
-	RegisterNonce         string                          `json:"register_nonce,omitempty"`
-	MemoryEpisode         *int64                          `json:"memory_episode,omitempty"`
-	GateCheckpointWitness *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
+	RegisterNonce              string                          `json:"register_nonce,omitempty"`
+	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
+	GateCheckpointWitness      *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
+	ExpectedGateRevision       *int64                          `json:"expected_gate_revision,omitempty"`
+	RevisionInputID            *int64                          `json:"revision_input_id,omitempty"`
+	SupersededRevisionInputIDs []int64                         `json:"superseded_revision_input_ids,omitempty"`
 	// RequireRunning fences a question write against a flight that has already parked.
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
@@ -4187,6 +4213,9 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 }
 
 func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
+	if err := validateRevisionRetry(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
 		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
 	}
@@ -4452,6 +4481,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// released this claim. Return the LOCKED row so the handler can render it beside the
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
+		}
+		if req.ExpectedGateRevision != nil && locked.StopKind.String != "cancelled" {
+			if !gateReportAdmissible(locked.Status) {
+				return locked, false, nil
+			}
+			if req.State == "failed" {
+				if locked.StopKind.String != "plan_rejected" {
+					return locked, false, nil
+				}
+				if locked.GateRevision != *req.ExpectedGateRevision {
+					return locked, false, ErrStaleRevisionSource
+				}
+			}
 		}
 		if req.RequireRunning {
 			if locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil {
@@ -4727,6 +4769,48 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return store.Run{}, false, err
 			}
 		}
+		if req.ExpectedGateRevision != nil {
+			if decision.class == gateClassDeclined {
+				return owned, false, nil
+			}
+			// Recovery source refusals never charge the presentation-refusal counter.
+			if decision.refusal != nil {
+				return owned, false, ErrStaleRevisionSource
+			}
+			if req.RevisionInputID != nil && decision.class == gateClassRetain && revisionReceiptReplay(owned, req) {
+				if reconciliationOut != nil && owned.PlanCrossCheckRequired {
+					proof, err := captureLeadReconciliation(ctx, q.(*store.Queries), wkr, runID, *req.ClaimGeneration)
+					if err != nil {
+						return owned, false, err
+					}
+					*reconciliationOut = proof
+				}
+				if gateRevisionOut != nil {
+					*gateRevisionOut = owned.GateRevision
+				}
+				return owned, true, nil
+			}
+			if owned.GateRevision != *req.ExpectedGateRevision {
+				return owned, false, ErrStaleRevisionSource
+			}
+			if req.RevisionInputID == nil {
+				// Expired clarification restores the exact source presentation.
+				if decision.class != gateClassRetain {
+					return owned, false, ErrStaleRevisionSource
+				}
+			} else {
+				if decision.class != gateClassPublish {
+					return owned, false, ErrStaleRevisionSource
+				}
+				lockedQueries, ok := q.(*store.Queries)
+				if !ok || fenceTx == nil {
+					return owned, false, ErrStaleRevisionSource
+				}
+				if err := validateRevisionTargets(ctx, lockedQueries, owned, wkr.ID, req); err != nil {
+					return owned, false, err
+				}
+			}
+		}
 		if decision.refusal != nil {
 			// A refusal writes no report. Its accounting runs in this transaction under the lock
 			// the fence took: ownership (the locked read is worker-scoped), the claim generation
@@ -4757,6 +4841,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			case gateClassRetain:
 				rev = owned.GateRevision
 				err = q.ResetRunGateRefusals(ctx, runID)
+			}
+			if err == nil && req.RevisionInputID != nil {
+				err = settleRevisionTargets(ctx, q.(*store.Queries), owned, wkr.ID, req)
 			}
 			if err == nil && gateRevisionOut != nil {
 				*gateRevisionOut = rev
@@ -5969,10 +6056,10 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
 // stamp is nil for a run that is not recovery-parked.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, err error) {
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, gateRevision int64, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, 0, nil, false, err
+		return "", nil, 0, nil, false, 0, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
@@ -5989,7 +6076,7 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 		reason := run.HoldReason.String
 		holdReason = &reason
 	}
-	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, nil
+	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, run.GateRevision, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {

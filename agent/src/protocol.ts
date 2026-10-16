@@ -2421,6 +2421,10 @@ export interface StateRequest {
   register_nonce?: string;
   /** Memory-pressure episode; zero is the first episode. */
   memory_episode?: number;
+  /** Source gate and receipts for negotiated plan_revision_retry_v1 writes. */
+  expected_gate_revision?: number;
+  revision_input_id?: number;
+  superseded_revision_input_ids?: number[];
   /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
   require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
@@ -2775,6 +2779,9 @@ export interface StateAck {
     claim_generation: number;
     memory_episode: number;
   }>;
+  revisionInputId?: number;
+  supersededRevisionInputIds?: number[];
+  staleRevisionSource?: boolean;
   /** Validated by WorkerClient against registration, request and known inventory. */
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;
@@ -2937,6 +2944,8 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row gate identity; unknown ownership never authorizes a provider start. */
+  gate_revision?: number;
   /** Same-row park classification; omission cannot prove an ordinary owner pause. PRD #1733: the
    *  worker reads a `paused` + `provider_unavailable` pair as an accepted provider-outage park whose
    *  ack was lost; an absent field (an api that does not expose it) is never read as that pair. */

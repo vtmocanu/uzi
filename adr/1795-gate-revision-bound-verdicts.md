@@ -13,6 +13,28 @@ below).
 executors without `resumesAtGate` from issue #1772, and PRD #37 (agent selection on
 approve) and PRD #1247 M5 (`resume_plan_seq`).
 
+## Amendment — 2026-10-15 (#3001, source-gate writes)
+
+Incoming `gate_revision_v1` verdict binding does not fence a later recovered
+presentation or terminal rejection against a gate change within the same claim
+generation. A successful ownership read is only a snapshot; the source gate can
+change before the write.
+
+The negotiated `plan_revision_retry_v1` contract compares
+`expected_gate_revision`, claim generation and unreleased ownership under the
+same run-row lock as recovered publication, predecessor supersession or terminal
+rejection. A stale source cannot mutate a newer plan, settle its inputs, grant
+approval or consume a generic presentation
+refusal budget. Cancellation retains its epoch-exempt owner-stop behavior and
+claim-generation/release fences.
+
+Recognize an identical current presentation and payload with the same committed
+receipt set after validating ownership and claim authority: its first accepted
+publication may already have advanced the revision. Return that result without
+publishing or adding pending settlement targets.
+New presentations must match their source gate; historical identities and
+changed payloads remain refused.
+
 ## Context
 
 A plan-gate verdict (`approve_plan`, `reject_plan`, `revise_plan`) was matched to a gate by

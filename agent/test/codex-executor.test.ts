@@ -74,7 +74,7 @@ import { MessageBatcher } from "../src/batcher.js";
 import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
-import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
@@ -15795,6 +15795,87 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       return {};
     };
   }
+
+  for (const replace of [false, true]) it(`M2 human revision retries the answered provider turn; replacement=${replace}`, async () => {
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount;
+        const tn = "tn-1";
+        if (n === 1) c.transport.push(threadStarted());
+        if (n === 3 || n === 4) {
+          c.transport.push(turnCompletedWithError("rateLimitExceeded"));
+        } else {
+          c.transport.push(n === 2
+            ? toolCall(n, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, "th-1", tn, "ask")
+            : toolCall(n, "submit_plan", { plan_md: n === 1 ? "initial" : "revised" }, "th-1", tn, `plan-${n}`));
+          c.transport.push(turnCompleted("completed"));
+        }
+        return { turn: { id: tn } };
+      }
+      return {};
+    } });
+    tinyBackoff(rig, { transientRetryMax: 1 });
+    const gated: string[] = [];
+    const settled: (number | undefined)[] = [];
+    let before = 0;
+    let retries = 0;
+    let questions = 0;
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, config: { plan_max_revisions: 2 },
+      askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
+      beforePlanRevisionTurn: async () => { before++; },
+      retryPlanRevisionTurn: async (cause) => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.providerOrigin);
+        assert.equal(rig.transport.turnStartCount, 4);
+        retries++;
+        if (replace) throw new PlanRevisionReplacedError({ kind: "revise", feedback: "replacement J", inputId: 22 });
+      },
+      gatePlan: async (plan, _milestones, _summary, input) => {
+        gated.push(plan);
+        settled.push(input);
+        return gated.length === 1 ? { kind: "revise", feedback: "original I", inputId: 11 }
+          : { kind: "reject", reason: "stop", sourceGateRevision: 8 };
+      },
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M2 human revision"),
+      (e: unknown) => e instanceof PlanRejectedError && e.sourceGateRevision === 8);
+    assert.equal(questions, 1);
+    assert.equal(retries, 1);
+    assert.equal(before, 3);
+    const requests = rig.transport.requests.filter(r => r.method === "turn/start");
+    const texts = requests.map(r => JSON.stringify(r.params));
+    assert.equal(texts[2], texts[3]);
+    if (replace) assert.match(texts[4]!, /replacement J/);
+    else assert.equal(texts[2], texts[4]);
+    assert.deepEqual(gated, ["initial", "revised"]);
+    assert.deepEqual(settled, [undefined, replace ? 22 : 11]);
+    assert.equal(rig.transport.requests.filter(r => r.method === "thread/start" || r.method === "thread/resume").length, 1);
+  });
+
+  for (const automatic of [undefined, true]) it(`M2 no human recovery hook for initial/automatic provider failure: ${automatic}`, async () => {
+    const rig = makeRig({ responder: (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        if (automatic && c.turnStartCount === 1)
+          c.transport.push(toolCall(1, "submit_plan", { plan_md: "initial" }, "th-1", "tn-1", "plan")).push(turnCompleted("completed"));
+        else c.transport.push(turnCompletedWithError("rateLimitExceeded"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    tinyBackoff(rig, { transientRetryMax: 1 });
+    let hooks = 0;
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      beforePlanRevisionTurn: async () => { hooks++; },
+      retryPlanRevisionTurn: async () => { hooks++; throw new Error("unexpected hook"); },
+      gatePlan: async () => ({ kind: "revise", feedback: "automatic", automatic: true, round: 1 }),
+    });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M2 excluded recovery"), TransientRecoveryError);
+    assert.equal(hooks, 0);
+  });
 
   const errorResults = (emitted: EmittedMessage[]): EmittedMessage[] =>
     emitted.filter((m) => m.kind === "error" && rec(m.payload).event === "result");

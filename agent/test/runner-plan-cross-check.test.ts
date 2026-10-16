@@ -1508,10 +1508,17 @@ describe("U2 real runner checked gate", () => {
     }
   }
 
-  for (const switchBeforeRevision of [false, true]) {
-    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}`, { skip: LINUX_CAPTURE }, async () => {
+  for (const [loseSubmitAck, switchBeforeRevision] of [
+    [false, false], [false, true], [true, false], [true, true],
+  ]) {
+    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}${loseSubmitAck ? " after dropped checker ACK" : ""}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
-      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+      let storedCandidate: ReturnType<typeof answer> | undefined;
+      api.crossCheckHandler = ({ runId, method, body }) => {
+        storedCandidate ??= answer(runId, body, "revise", "revise");
+        return { status: 200, body: storedCandidate, ...(loseSubmitAck && method === "POST" ? { drop: true } : {}) };
+      };
+      let initialCheckerRequests: typeof api.crossCheckRequests | undefined;
       const budgetMs = 1000;
       let firstPublishedAt = 0;
       let revisedPublishedAt = 0;
@@ -1525,6 +1532,7 @@ describe("U2 real runner checked gate", () => {
       api.onState(c.run_id, (b) => {
         if (b.status === "awaiting_approval" && b.plan_md === PLAN && !firstPublishedAt) {
           firstPublishedAt = Date.now();
+          initialCheckerRequests = structuredClone(api.crossCheckRequests);
           if (switchBeforeRevision) api.requestCredentialSwitch(c.run_id, 1);
           else reviseId = send(c.run_id, row("revise_plan", "slow revision"))[0]!.id;
         }
@@ -1578,7 +1586,18 @@ describe("U2 real runner checked gate", () => {
         assert.equal(turns, 2);
         assert.equal(switches, switchBeforeRevision ? 1 : 0);
         assert.equal(gates(c.run_id).length, 2, "only normal revision publishes a fresh gate");
-        assert.equal(api.crossCheckRequests.length, 1);
+        // HTTP timeout/lost-ACK reconciliation may add GETs or identical POSTs.
+        // A human revision or switch must never initiate another checker request.
+        assert.ok(initialCheckerRequests);
+        assert.deepEqual(api.crossCheckRequests, initialCheckerRequests);
+        const submissions = initialCheckerRequests.filter((request) => request.method === "POST");
+        assert.ok(submissions.length >= 1 && submissions.length <= 3, "bounded original-candidate submission attempts");
+        const first = submissions[0]!;
+        assert.equal(first.body.round, 1);
+        assert.equal(first.body.plan_md, PLAN);
+        assert.equal(first.body.claim_generation, c.claim_generation);
+        for (const submission of submissions) assert.deepEqual(submission.body, first.body);
+        if (loseSubmitAck) assert.ok(initialCheckerRequests.some((request) => request.method === "GET"));
         assert.ok(api.isApplied(c.run_id, reviseId));
       } finally { releaseRevision(); run.shutdown(); await done; }
     });

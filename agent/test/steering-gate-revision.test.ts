@@ -95,11 +95,103 @@ async function deliver(...rows: UserInput[]): Promise<void> {
 
 /** Resolve to the gate event, or "pending" if none arrives within `ms`. */
 async function gateEvent(ch: SteeringChannel, epoch = ch.currentEpoch(), ms = 80): Promise<PlanVerdict | "pending"> {
-  return Promise.race([ch.awaitGateEvent(epoch), tick(ms).then(() => "pending" as const)]);
+  const abort = new AbortController();
+  const result = await Promise.race([ch.awaitGateEvent(epoch, abort.signal).catch((err: unknown) => {
+    if (abort.signal.aborted) return "pending" as const;
+    throw err;
+  }), tick(ms).then(() => "pending" as const)]);
+  abort.abort();
+  return result;
 }
 
 const receiptIds = (kind: "applied" | "discarded"): number[] =>
   api.inputReceiptCalls.filter((c) => c.kind === kind).flatMap((c) => c.ids);
+
+describe("revision recovery selection", () => {
+  it("takes only a newer exact bound revise, retaining approvals and other revisions", async () => {
+    const { ch, notices } = harness();
+    ch.setGateRevision(4);
+    const active = row("revise_plan", bound(4), "active");
+    await deliver(active);
+    assert.deepEqual(await ch.awaitGateEvent(ch.currentEpoch()), {
+      kind: "revise", feedback: "active", inputId: active.id, sourceGateRevision: 4,
+    });
+    const approve = row("approve_plan", bound(4));
+    const unknown = row("revise_plan", {}, "legacy");
+    const future = row("revise_plan", bound(5), "future");
+    const replacement = row("revise_plan", bound(4), "replacement");
+    await deliver(approve, unknown, future);
+    const pending = ch.awaitRevisionRecoveryEvent(4, active.id);
+    await deliver(replacement);
+    assert.deepEqual(await pending, {
+      kind: "revise", feedback: "replacement", inputId: replacement.id, sourceGateRevision: 4,
+    });
+    assert.deepEqual(notices, []);
+    assert.deepEqual(receiptIds("applied"), []);
+    ch.retirePersistedRevision(replacement.id, [active.id]);
+    await tick(20);
+    assert.deepEqual(receiptIds("applied"), [], "server-settled revisions never get APPLIED");
+    assert.deepEqual(ch.takeResumedGateEvent(), {
+      kind: "revise", feedback: "legacy", inputId: unknown.id,
+    }, "unknown binding was left queued");
+    ch.setGateRevision(4);
+    assert.equal((await ch.awaitGateEvent(ch.currentEpoch())).kind, "approve", "recovery left the approval buffered");
+  });
+
+  it("leaves older IDs queued and captures the resumed selector's source before clearing", async () => {
+    const { ch } = harness();
+    const revise = row("revise_plan", bound(6), "earlier");
+    await deliver(revise);
+    const abort = new AbortController();
+    const pending = ch.awaitRevisionRecoveryEvent(6, revise.id, abort.signal);
+    await assert.rejects(ch.awaitGateEvent(ch.currentEpoch()), /gate waiter already active/);
+    abort.abort(new Error("still waiting"));
+    await assert.rejects(pending, /still waiting/);
+    ch.setGateRevision(6);
+    assert.deepEqual(ch.takeResumedGateEvent(), {
+      kind: "revise", feedback: "earlier", inputId: revise.id, sourceGateRevision: 6,
+    });
+    assert.deepEqual(receiptIds("applied"), []);
+  });
+
+  it("takes exact reject without settling its receipt", async () => {
+    const { ch } = harness();
+    const rejected = row("reject_plan", bound(7), "stop");
+    await deliver(rejected);
+    assert.deepEqual(await ch.awaitRevisionRecoveryEvent(7, 1), {
+      kind: "reject", reason: "stop", sourceGateRevision: 7,
+    });
+    await tick(20);
+    assert.ok(!receiptIds("applied").includes(rejected.id));
+  });
+
+  it("ignores wrong-source reject and follow-up, supports abort and sticky cancel", async () => {
+    const { ch } = harness();
+    await deliver(row("reject_plan", bound(8), "other"), row("follow_up", {}, "later"));
+    const abort = new AbortController();
+    const pending = ch.awaitRevisionRecoveryEvent(7, 1, abort.signal);
+    abort.abort(new Error("test interruption"));
+    await assert.rejects(pending, /test interruption/);
+    assert.equal(ch.pullFollowUp()?.body, "later");
+    await deliver(row("cancel"));
+    assert.deepEqual(await ch.awaitRevisionRecoveryEvent(7, 1), { kind: "cancel" });
+  });
+
+  it("retiring queued IDs suppresses later delivery in this flight", async () => {
+    const { ch } = harness();
+    const first = row("revise_plan", bound(4), "first");
+    const replacement = row("revise_plan", bound(4), "replacement");
+    await deliver(first, replacement);
+    ch.retirePersistedRevision(replacement.id, [first.id]);
+    const abort = new AbortController();
+    const pending = ch.awaitRevisionRecoveryEvent(4, 1, abort.signal);
+    await tick(20);
+    abort.abort(new Error("no restart"));
+    await assert.rejects(pending, /no restart/);
+    assert.deepEqual(receiptIds("applied"), []);
+    assert.equal(api.inputReceiptCalls.filter((call) => call.kind === "ack" && call.ids.includes(first.id)).length, 1);
+  });
+});
 
 describe("bound verdicts match the confirmed gate revision exactly (PRD #1795)", () => {
   // B1 at the channel: a verdict routed while the report's ACK is in flight (after persistence,
@@ -120,7 +212,7 @@ describe("bound verdicts match the confirmed gate revision exactly (PRD #1795)",
       ch.bumpEpoch(); // the revision gate's bump, AFTER the verdict was routed
       const v = await gateEvent(ch);
       assert.notEqual(v, "pending", "the verdict bound to the confirmed revision was taken");
-      assert.deepStrictEqual(c.kind === "revise_plan" ? { ...(v as PlanVerdict), inputId: undefined } : v, c.kind === "revise_plan" ? { ...c.expect, inputId: undefined } : c.expect);
+      assert.deepStrictEqual(c.kind === "revise_plan" ? { ...(v as PlanVerdict), inputId: undefined } : v, c.kind === "revise_plan" ? { ...c.expect, inputId: undefined, sourceGateRevision: 2 } : c.kind === "reject_plan" ? { ...c.expect, sourceGateRevision: 2 } : c.expect);
       assert.ok(!receiptIds("discarded").includes(r.id), "never discarded");
     });
   }
@@ -241,7 +333,7 @@ describe("bound verdicts match the confirmed gate revision exactly (PRD #1795)",
     ch.start();
     await deliver(row("reject_plan", bound(3), "no"));
     assert.deepStrictEqual(notices, []);
-    assert.deepStrictEqual(await ch.takeResumedGateEvent(), { kind: "reject", reason: "no" }, "a pending bound reject acts before the gate is re-presented");
+    assert.deepStrictEqual(await ch.takeResumedGateEvent(), { kind: "reject", reason: "no", sourceGateRevision: 3 }, "a pending bound reject acts before the gate is re-presented");
   });
 });
 

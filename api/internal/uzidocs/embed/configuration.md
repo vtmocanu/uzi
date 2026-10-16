@@ -90,6 +90,32 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 
 **A second, narrower queued reason: `no worker supporting custom Codex models is online`.** This one is independent of the knobs above and fires only when a run's effective Codex model is a custom worker-root ID rather than a curated one ([PRD #1551](../prds/1551-per-harness-worker-model-defaults.md)). It needs a worker advertising the additional `codex_custom_model_v1` capability, which only ships with a newer worker image; an old `codex_harness_v1`-only worker cannot claim the run and never silently substitutes `gpt-6-astra`. See [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
 
+### Docker-tier network MTU (rootful Kubernetes workers)
+
+For Kubernetes Docker-tier workers with `workers.docker.rootless: false`, successful DinD startup discovery validates the MTUs of all visible non-loopback interfaces under `/sys/class/net` as canonical decimal integers from 1 through 65535, then selects `min(1500, discovered minimum)`. This avoids assuming an interface named `eth0` and can only lower Docker's default of 1500: discovered minima of 9000, 1500 and 1400 yield 1500, 1500 and 1400 respectively. The same capped value sets `--mtu` for Docker's default bridge and the default MTU for newly created user-defined bridge networks, addressing MTU-mismatch HTTPS and build stalls when discovery succeeds. There is no MTU override in the chart, controller configuration or API.
+
+Discovery skips regular sysfs control files such as `bonding_masters` and checks interface directories and symlinks, including dot-prefixed names, except `lo`. Any discovery failure prints `dind MTU warning: <reason>; starting dockerd with unchanged defaults` to stderr in the `dind` sidecar logs, then starts `dockerd` with exactly the existing `--host=tcp://127.0.0.1:2375 --tls=false` arguments and no MTU or configuration-file flags. This includes an absent or unreadable interface directory, missing or unreadable interface MTUs, no visible non-loopback interface, and empty, multiline, malformed, noncanonical, zero or oversized values. A valid reading alongside an invalid one also takes this fallback; no partial or invented MTU is applied. The fallback preserves daemon availability, but the original MTU-mismatch hang can still occur on that pod.
+
+Only successful discovery generates the private daemon JSON for new bridge-network defaults, because Docker 29 does not support `--default-network-opts` as a CLI flag. Configuration creation or write failures also fail closed: they prevent daemon startup with a `dind MTU:` diagnostic and exit status 1. The daemon still binds to loopback with `--host=tcp://127.0.0.1:2375 --tls=false`.
+
+Deploy the updated controller renderer and recreate worker pods to acquire the new startup command. MTU selection runs at sidecar startup, with no live adjustment afterward. Existing user-defined networks are not rewritten: recreate networks you own to acquire the new defaults. Explicit per-network Docker MTU options override the default; operators must keep those values at or below the pod MTU. This does not repair arbitrary Docker networks.
+
+**Rootless remains the default and is outside this fix.** Its inherited image entrypoint is unchanged and uses an independent RootlessKit networking path (the pinned image defaults to slirp4netns with MTU 1500). This change adds no supported rootless MTU setting, and rootless behavior has not been live-validated for this fix.
+
+**Live validation after rollout.** Run the following from the `worker` container of a recreated rootful Docker-tier pod with MTU below 1500, using its configured Docker daemon. Inspect the pod interface MTUs and Docker bridge options, then run the acceptance download. Each Docker CLI call has a short outer timeout; the download also bounds network waits with `wget -T 20`.
+
+```sh
+ip link show
+timeout -k 5 15 docker network inspect bridge --format '{{json .Options}}'
+check="mtu-check-$(cat /proc/sys/kernel/random/uuid)"
+if ! timeout -k 5 60 docker run --rm --name "$check" alpine:3 wget -T 20 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz; then
+    timeout -k 5 15 docker rm -f "$check"
+    exit 1
+fi
+```
+
+An outer timeout stops the Docker client, not necessarily its container; the failure path removes the exact container named for this check. If cleanup fails, resolve that owned container before continuing. Do not retry a stalled pull or build. Validation on an actual deployed worker remains pending release and worker rollout; the recipe above is not evidence that it has passed.
+
 ## Forge integration
 
 See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.
