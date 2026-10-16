@@ -867,19 +867,25 @@ has_row origin PASS || bad 'baseline hold should remain permitted'
 boundary_evidence
 end
 
-for mode in whitespace array multi; do
+for mode in whitespace newline newlines tab array multi trailing; do
   begin "boundary: exact scalar hold declaration $mode" "scalar-$mode"
   boundary_fixture HOLD_HAND ""
   echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
   case "$mode" in
     whitespace) echo "HOLD_HAND='   '" >> "$PHASES_DIR/01-origin.sh" ;;
+    newline) printf '%s\n' "HOLD_HAND=\$'\n'" >> "$PHASES_DIR/01-origin.sh" ;;
+    newlines) printf '%s\n' "HOLD_HAND=\$'\n\n'" >> "$PHASES_DIR/01-origin.sh" ;;
+    tab) printf '%s\n' "HOLD_HAND=\$'\t'" >> "$PHASES_DIR/01-origin.sh" ;;
+    trailing)
+      printf "HOLD_HAND='%s\n\n'\n" "$H" >> "$PHASES_DIR/01-origin.sh"
+      FAKE_HOLDS="$H|$R|1" ;;
     array) echo 'HOLD_HAND=(44444444-4444-4444-4444-444444444444)' >> "$PHASES_DIR/01-origin.sh" ;;
     multi)
       printf "HOLD_HAND='%s\n%s'\n" "$H" "$H2" >> "$PHASES_DIR/01-origin.sh"
       FAKE_HOLDS="$H|$R|1
 $H2|$R|2" ;;
   esac
-  if [ "$mode" = multi ]; then
+  if [ "$mode" = multi ] || [ "$mode" = trailing ]; then
     run_driver "scalar-$mode"
     has_row origin PASS || bad 'exact whitespace-separated hold IDs rejected'
     boundary_evidence

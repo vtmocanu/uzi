@@ -211,9 +211,11 @@ _boundary_declarations() {
       "declare -a"*|"declare -A"*|"declare -n"*)
         _boundary_error "malformed $kind declaration $name: expected scalar IDs"; continue ;;
     esac
-    if ! value="$(bash -c 'source "$1"; [ "${!2+x}" ] || exit 1; printf "%s" "${!2}"' bash "$RUNROOT/phase.handoff" "$name")"; then
+    if ! value="$(bash -c 'source "$1"; [ "${!2+x}" ] || exit 1; printf "%s." "${!2}"' bash "$RUNROOT/phase.handoff" "$name")"; then
       _boundary_error "unset $kind declaration $name"; continue
     fi
+    # The sentinel keeps command substitution from dropping trailing newlines.
+    value="${value%.}"
     count=0
     # read tokenizes whitespace without pathname expansion of malformed input.
     while IFS= read -r id; do
