@@ -174,3 +174,52 @@ first failure. The production settlement seam needs a real-helper regression
 and an explicit settlement design before correction; this commit only corrects
 the independently reproduced preload failure. Real PSI and canonical lane
 validation remain blockers under M3, and CI repair is not declared complete.
+
+## M3 validation evidence — incomplete
+
+Runtime validation below tested the repair commit
+`faedbe089b4e550df1c3b21ba95c0910b4db3da4`. The subsequent evidence-only update
+changes no executable source. The agent gate result is reused at the unchanged
+runtime revision; the canonical worker lane was run once after the repair.
+
+| Check | Result | Retained scratch evidence |
+| --- | --- | --- |
+| `task gate:agent`, CI Task 3.54.0 | Exit 0 | `gate-log.WuqUZF` |
+| `task test:agent:worker-uid`, explicit local identity and compatible image | Exit 201, calibration command exit 1 | `gate-log.Turqti` |
+
+The agent unit stage passed 15,802 tests, with zero failures/cancellations and
+15 skips: two require root, one requires `ssh-agent`, one requires an opt-in
+live Anthropic session, and eleven cover non-Linux cases. The real-procfs skip
+checker recorded zero skips. Unit wall time was 3,459 seconds. Codex conformance
+passed 183 tests with zero skips and satisfied its completeness matrix in
+103 seconds. These local results do not establish hosted CI success or the
+change's before/after critical-path impact.
+
+The canonical invocation used `WORKER_UID_IMAGE=wuid-ci-repair-38903954187:proof`,
+`WORKER_UID_SKIP_BUILD=1`, `GITHUB_ACTIONS=false`,
+`WORKER_MEMORY_CALIBRATION_RUN_ID=ci-repair-38903954187-faedbe08`, and
+`WORKER_MEMORY_CALIBRATION_ATTEMPT=1`. The immutable image ID is recorded above
+and again in the log. Runtime metadata: Node v24.20.0, Python 3.14.7, Docker
+client 29.5.3/server 29.8.0, cgroup v2 with cgroupfs, built-in seccomp and cgroup
+namespaces. No dependencies were installed during validation.
+
+All Docker-free harness checks, 17 producer tests, the inventory test and scoped
+typecheck passed. Image layout took 4 seconds; all 38 worker leaves passed in
+38 seconds and both command leaves passed in 18 seconds. Real calibration then
+failed at `actual default reader unavailable`, reason `absent`. Both the 1 GiB
+and 2 GiB reports record null `/sys/fs/cgroup/memory.pressure`, zero enrolled
+handles, and confirmed host removal of their exact owned container IDs. The
+reports remain failed; no calibration acceptance or response measurement exists.
+Host evidence is in `memory-calibration-33f8935cc165c748dd3705b7a24b33c4/`.
+
+The published canonical baseline failed earlier at its cold image-build
+prerequisite, so a full-target before/after comparison is inconclusive. The
+later synthetic cleanup failure remains open as described above. Hosted logs
+and hosted timing measurements remain unavailable. Queue, hosted rerun and
+hosted cache costs are unmeasured; local runs reused the verified image.
+
+M3 is incomplete. Further progress requires real PSI-capable validation and a
+real-helper regression plus explicit design for the settlement seam before a
+production correction. Detailed hosted failure evidence or a subsequent hosted
+run is also needed to establish which failures this pipeline actually reached.
+The required-check workflow expressions and proof requirements are unchanged.
