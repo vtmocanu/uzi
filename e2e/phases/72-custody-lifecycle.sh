@@ -5,8 +5,9 @@
 # lane:     gitlab
 # executor: any
 # requires: REPO_ID UZI_BIN UZI_TOKEN_VAL
-# provides: -
+# provides: WEDGE_HOLD_ID
 # handoff:  -
+# handoff-holds: WEDGE_HOLD_ID
 # mutates:  -
 # restores: -
 # =============================================================================
@@ -235,6 +236,16 @@ BLOCKED_AFTER="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"
 [ "$BLOCKED_AFTER" = 0 ] || fail "aggregate.blocked_runs is $BLOCKED_AFTER after the unblock, want 0 (the episode did not clear)"
 NEW_HOLD="$(uzi_cli run recovery "$WEDGE_RUN" --json | jq -r 'map(select(.state == "open")) | length')"
 [ "$NEW_HOLD" -ge 1 ] || fail "the unblocked claim did not open a fresh custody hold for run $WEDGE_RUN"
+# Read the exact real current-generation hold before cancellation can release it.
+# Keep the observed ID for the boundary declaration even if it later settles.
+WEDGE_HOLD_ID="$(db_psql_rows "SELECT h.id FROM recovery_custody_holds h
+  JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+    AND r.claim_generation = h.generation AND h.original_worker_id = r.worker_id
+  WHERE h.user_id = '$ADMIN_ID' AND h.run_id = '$WEDGE_RUN'
+    AND h.state = 'open' AND h.original_worker_identity IS DISTINCT FROM '$SEED_IDENT'" 10)" \
+  || fail "could not read the current-generation custody hold for wedge run $WEDGE_RUN"
+[[ "$WEDGE_HOLD_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+  || fail "expected exactly one real current-generation custody hold for wedge run $WEDGE_RUN (got: '$WEDGE_HOLD_ID')"
 AGG_AFTER="$(apiget /api/recovery/holds)"
 [ "$(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.open_holds')" = "$LIMIT" ] \
   || fail "aggregate.open_holds != $LIMIT after the healthy claim (got $(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.open_holds'))"
@@ -242,7 +253,7 @@ AGG_AFTER="$(apiget /api/recovery/holds)"
   || fail "aggregate.admission_counted_holds != $((LIMIT - 1)) after the healthy claim (got $(printf '%s' "$AGG_AFTER" | jq -r '.aggregate.admission_counted_holds'))"
 pass "episode cleared: blocked_runs=0, open_holds=$LIMIT, admission_counted_holds=$((LIMIT - 1)); fresh custody remains open"
 
-# --- 5) cleanup: leave the owner as we found it (self-cleaning; 72 is the last phase) ---
+# --- 5) cleanup: remove synthetic seeds, keeping real custody evidence --------
 # Cancel the wedge run so the end-of-phase quarantine finds nothing to reap, then remove
 # ONLY this phase's seed fixtures (matched by SEED_IDENT, in any state). The seeds carry
 # no captures/chunks, so a plain delete is FK-safe; the standalone reset script is for the

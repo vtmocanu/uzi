@@ -455,7 +455,7 @@ end
 
 # ============================================================================
 # Case 10 — no capture on an all-GREEN run: neither artifacts/ nor .keep-rundir.
-# Mutation: capture on every phase (not just FAIL/LEAK) -> artifacts/ appears green.
+# Mutation: capture on every phase (not just FAIL) -> artifacts/ appears green.
 begin "case10: no capture on GREEN" 10
 mkphase "$PHASES_DIR/10-greenA.sh" "green A" no "" "" "" <<'BODY'
 pass "all good A"
@@ -578,7 +578,7 @@ run_driver 15
 has_row leaky FAIL || bad "no final FAIL row for leaky"
 [ -f "$RUNROOT/summary.md" ] || bad "summary.md was not written on a leaky run"
 contains "$(cat "$LOG")" "E2E FAILED:" \
-  || bad "roll-call did not run after a LEAK (driver aborted at _write_summary)"
+  || bad "roll-call did not run after a boundary failure (driver aborted at _write_summary)"
 [ "$RC" -eq 1 ] || bad "boundary failure must exit 1 without strict mode"
 end
 
@@ -592,8 +592,8 @@ BODY
 run_driver 16
 leak_n="$(awk -F'\t' '$1=="leaky" && $2=="FAIL"{n++} END{print n+0}' "$TSV")"
 [ "$leak_n" -eq 1 ] || bad "expected one final FAIL row, got $leak_n (rows fused?)"
-contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000010" || bad "LEAK rows do not name 00000000-0000-0000-0000-000000000010 (rows fused into one token)"
-contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000011" || bad "LEAK rows do not name 00000000-0000-0000-0000-000000000011 (rows fused into one token)"
+contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000010" || bad "boundary failures do not name 00000000-0000-0000-0000-000000000010 (rows fused into one token)"
+contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000011" || bad "boundary failures do not name 00000000-0000-0000-0000-000000000011 (rows fused into one token)"
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000010/inputs" || bad "00000000-0000-0000-0000-000000000010 not cancelled via the API"
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000011/inputs" || bad "00000000-0000-0000-0000-000000000011 not cancelled via the API"
 end
@@ -601,7 +601,7 @@ end
 # ============================================================================
 # Case 17 — the first body capture survives a second capture attempt after
 # boundary failure. fake_docker stamps sequence numbers to detect overwrites.
-begin "case17: FAIL+LEAK capture is not overwritten by the leak sweep" 17
+begin "case17: body+boundary failure capture is not overwritten by quarantine" 17
 export FAKE_DB_IDS="00000000-0000-0000-0000-000000000013" FAKE_CANCEL_CODE=200 FAKE_DOCKER_SEQ="$TMP/dseq-17"
 rm -f "$FAKE_DOCKER_SEQ"
 mkphase "$PHASES_DIR/10-failleak.sh" "fail and leak" no "" "" "" <<'BODY'
@@ -886,6 +886,30 @@ $H2|$R|2" ;;
   else boundary_fail "scalar-$mode" declaration; fi
   end
 done
+
+# Phase 52's SDK branch creates no holds, but exports the declared list explicitly.
+for mode in clean leak; do
+  begin "boundary: explicit empty conditional hold list $mode" "empty-holds-$mode"
+  boundary_fixture HOLD_HAND ""
+  echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+  echo 'HOLD_HAND=""' >> "$PHASES_DIR/01-origin.sh"
+  if [ "$mode" = leak ]; then
+    FAKE_HOLDS="$H|$R|2"
+    boundary_fail "empty-holds-$mode" "$H"
+  else
+    run_driver "empty-holds-$mode"
+    has_row origin PASS || bad 'explicit no-hold handoff must PASS'
+    [ "$RC" -eq 0 ] || bad 'no-hold handoff exit must be zero'
+  fi
+  boundary_evidence
+  end
+done
+
+begin 'boundary: empty run handoff still fails closed' empty-runs
+boundary_fixture RUN_HAND RUN_HAND
+echo 'RUN_HAND=""' >> "$PHASES_DIR/01-origin.sh"
+boundary_fail empty-runs 'empty handoff declaration'
+end
 
 # Helper and caller locals must never replace the imported declaration value.
 for variable in id name value names kind declaration count run gen; do

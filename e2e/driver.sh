@@ -222,7 +222,11 @@ _boundary_declarations() {
       if _uuid "$id"; then _declared="$_declared $id"
       else _boundary_error "malformed $kind declaration $name: $id"; fi
     done < <(printf '%s\n' "$value" | tr '[:space:]' '\n')
-    if [ "$count" -eq 0 ]; then _boundary_error "empty $kind declaration $name"; fi
+    # A successful conditional phase may explicitly provide no retained holds.
+    # Unset values failed above; an empty hold list grants no permission.
+    if [ "$count" -eq 0 ] && { [ "$kind" != handoff-holds ] || [ -n "$value" ]; }; then
+      _boundary_error "empty $kind declaration $name"
+    fi
   done
 }
 _quarantine() {

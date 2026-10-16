@@ -5,8 +5,9 @@
 # lane:     gitlab
 # executor: stub
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
-# provides: -
+# provides: OUTBOX_CASE3_HOLD_ID
 # handoff:  -
+# handoff-holds: OUTBOX_CASE3_HOLD_ID
 # mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
 # restores: placeholder removed; api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
@@ -76,6 +77,8 @@
 # NOTE: this phase runs AFTER 51-auto-stop-poison, which (via 50) left the agent stopped;
 # it brings the agent back up itself. 59-restart-agent still runs after and re-ensures it.
 say "PRD #1391 M5+M6: worker outbox survives an api outage (spill+drain, quota tombstones; write-ahead terminal replay)"
+# SDK execution takes the no-op branch and explicitly retains no new holds.
+OUTBOX_CASE3_HOLD_ID=""
 if [ "$EXECUTOR" != stub ]; then
   say "PRD #1391 outbox scenario: SKIPPED (stub-only — UZI_STUB_OUTBOX is a stub sentinel; executor=$EXECUTOR)"
 else
@@ -501,6 +504,17 @@ say "CASE 3: a run finishing during the outage -> completed after its messages (
 make_outbox_run cut_barrier
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
+# Case 3 deliberately leaves its custody evidence untouched. Name only this
+# exact claim before the outage; later release is allowed, but sibling leaks are not.
+[[ "$RUN_B1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ && "$GEN_B1" =~ ^[1-9][0-9]*$ ]] \
+  || fail "case 3: invalid claim identity for retained custody: run=$RUN_B1 generation=$GEN_B1"
+OUTBOX_CASE3_HOLD_ID="$(db_psql_rows "SELECT h.id FROM recovery_custody_holds h
+  JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+  WHERE r.id = '$RUN_B1' AND r.claim_generation = $GEN_B1
+    AND h.generation = $GEN_B1 AND h.original_worker_id = r.worker_id" 10)" \
+  || fail "case 3: retained custody identity query failed"
+[[ "$OUTBOX_CASE3_HOLD_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] \
+  || fail "case 3: expected exactly one custody hold for run=$RUN_B1 generation=$GEN_B1 (got: '$OUTBOX_CASE3_HOLD_ID')"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
 api_cut
 release_outbox_cut_barrier "$RUN_B1"
