@@ -211,6 +211,18 @@ func TestPlanRevisionWitnessReceiptReplayLiveDB(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, "SELECT count(*)=1 AND bool_and(applied_at IS NULL AND consumed_at IS NULL) FROM run_user_inputs WHERE run_id=$1 AND kind='revise_plan' AND id<>$2", id, inputID).Scan(&pending); err != nil || !pending {
 		t.Fatalf("receipt replay consumed or applied K: pending=%v err=%v", pending, err)
 	}
+	// Once K is settled, pending feedback must no longer mask stale-witness
+	// readiness. A lost-ACK replay cannot renew the captured revision count.
+	f.exec("UPDATE run_user_inputs SET applied_at=now() WHERE run_id=$1 AND kind='revise_plan' AND id<>$2", id, inputID)
+	opts.ExpectedResetStateDigest, err = ResetStateDigest(reconciliationRow(t, f, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeApproval := reconciliationRaceSnapshot(t, f, id)
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+		t.Fatalf("receipt replay renewed stale witness readiness after settlement: %v", err)
+	}
+	reconciliationRaceUnchanged(t, f, id, beforeApproval)
 }
 
 func TestGateWitnessOrdinaryReplayAfterReviseLiveDB(t *testing.T) {

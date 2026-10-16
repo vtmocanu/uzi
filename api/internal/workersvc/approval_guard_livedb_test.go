@@ -60,7 +60,14 @@ func TestApprovalGuardPendingRevisionLiveDB(t *testing.T) {
 			t.Run(fmt.Sprintf("selection=%v/override=%v", selection, override), func(t *testing.T) {
 				f := newGateFix(t, 3)
 				id := f.gatedRun()
+				// Exercise a first approval that would freeze a structural contract.
+				f.exec("UPDATE runs SET completion_contract_version=1 WHERE id=$1", id)
 				approvalGuardSelectionFixture(t, f, id)
+				run := reconciliationRow(t, f, id)
+				if !run.CompletionContractVersion.Valid || len(run.MilestonesCandidate) == 0 ||
+					len(run.MilestonesFrozen) != 0 || len(run.CompletionContract) != 0 || run.ContractRevision.Valid {
+					t.Fatal("pending approval fixture must have an unfrozen structural contract and candidate milestones")
+				}
 				f.liveWorker()
 				input := approvalGuardRevise(t, f, id)
 				var sel *AgentSelection
