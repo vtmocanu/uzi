@@ -97,6 +97,28 @@ it("accepts the literal shared ancestor receipt without inventing archive author
   assert.deepEqual(sent[0], fixture.request);
 });
 
+for (const status of [200, 409]) {
+  it(`preserves completed-publication ACK fields above 1 MiB on HTTP ${status}`, async () => {
+    await client.register("worker");
+    await client.claimRun();
+    await client.listRecoveryHolds(RUN);
+    const large = { ...response, run: { ...(response.run as object),
+      issue_description: "x".repeat(700 * 1024), preserved_patch: "p".repeat(500 * 1024),
+    }, ...(status === 409 ? { completed_publication_receipt: undefined, completed_publication_reason: "identity_changed" } : {}) };
+    let calls = 0;
+    mock.method(globalThis, "fetch", async () => { calls++; return Response.json(large, { status }); });
+    const ack = await client.reportState(RUN, fixture.request);
+    assert.equal(ack.applied, status === 200);
+    assert.equal(ack.status, "completed");
+    if (status === 200) assert.deepEqual(ack.completedPublicationReceipt, receipt);
+    else {
+      assert.equal(ack.completedPublicationReceipt, undefined, "409 cannot mint a receipt ACK");
+      assert.equal(ack.completedPublicationReason, "identity_changed");
+    }
+    assert.equal(calls, 1);
+  });
+}
+
 for (const lostACK of [false, true]) {
   it(`hold-only original replay survives unrelated ineligible claim: ${lostACK ? "lost ACK" : "accepted ACK"}`, async t => {
     const original = Object.freeze(structuredClone(fixture.request)) as StateRequest;

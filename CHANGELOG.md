@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Accept large terminal state acknowledgments ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  Terminal reports use the existing six-MiB state-response budget instead of the smaller maintenance-envelope cap, preserving status and completed-publication receipt parsing when a run includes a large issue description or saved patch. Reads remain bounded by bytes and the cancellation deadline.
+
 - **Server-side cancellation shares the recovery maintenance deadline ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
   A worker observing an exact terminal cancellation starts the same ten-minute maintenance budget before aborting its flight, while preserving the claim fence and retaining unresolved local work.
 

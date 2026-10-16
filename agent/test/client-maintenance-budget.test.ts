@@ -63,6 +63,45 @@ test("late headers ignoring abort reject and detach a never-settling cancellatio
 
 const maintenanceWorkerId = "00000000-0000-4000-8000-0000000000aa";
 
+for (const status of [200, 409]) {
+  test(`terminal ACK above 6 MiB still refuses overflow on HTTP ${status}`, async () => {
+    let calls = 0;
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => {
+        calls++;
+        return Response.json({ run: { status: "completed", issue_description: "x".repeat(6 * 1024 * 1024) } }, { status });
+      },
+    });
+    await assert.rejects(client.reportState("run", { status: "completed" }), { name: "ResponseBodyOverflowError" });
+    assert.equal(calls, 1, "overflow cannot manufacture an ACK or trigger terminal replay");
+  });
+}
+
+for (const status of [200, 409]) {
+  for (const terminal of ["completed", "failed"] as const) {
+    test(`terminal ${terminal} preserves a RunDTO ACK above 1 MiB on HTTP ${status}`, async t => {
+      const budget = new MaintenanceBudget();
+      t.after(() => budget.dispose());
+      let calls = 0;
+      const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+        fetch: async () => {
+          calls++;
+          return Response.json({ run: {
+            status: terminal, budget_max_iterations: 7, budget_wall_seconds: 3600,
+            issue_description: "x".repeat(700 * 1024), preserved_patch: "p".repeat(500 * 1024),
+          } }, { status });
+        },
+      });
+      const ack = await MaintenanceBudget.run(budget, () => client.reportState("run", { status: terminal }));
+      assert.equal(ack.applied, status === 200);
+      assert.equal(ack.status, terminal);
+      assert.equal(ack.budgetMaxIterations, 7);
+      assert.equal(ack.budgetWallSeconds, 3600);
+      assert.equal(calls, 1, "an applied or already-terminal response is not retried");
+    });
+  }
+}
+
 test("review C1 on-time hold body exercises the completion binding loop", async t => {
   const budget = new MaintenanceBudget(600_000, () => 0);
   t.after(() => budget.dispose());
@@ -256,7 +295,7 @@ for (const contentLength of [undefined, "1"]) {
     });
     await assert.rejects(MaintenanceBudget.withoutAttempt(() => client.reportState("run", { status: "failed" })), /limit|large|bytes|exceed/i);
     assert.equal(cancelled, 1);
-    assert.ok(chunks < 32);
+    assert.ok(chunks < 128, "the reader cancels before buffering the whole oversized response");
     const small = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
       fetch: async () => Response.json({ run: { status: "failed" } }),
     });

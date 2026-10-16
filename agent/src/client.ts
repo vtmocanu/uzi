@@ -1864,7 +1864,9 @@ export class WorkerClient {
         path,
         includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined, expected_gate_revision: undefined, revision_input_id: undefined, superseded_revision_input_ids: undefined },
         signal,
-        b.status === "failed" || b.status === "completed" ? MAINTENANCE_RESPONSE_MAX_BYTES : undefined,
+        // Terminal ACKs carry the full RunDTO, as strict gate ACKs do, not a small
+        // maintenance envelope. Keep their shared operational response cap.
+        b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
         evidence,
       );
     try {
@@ -3956,7 +3958,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * and 64 capability plus 64 tool names at 256 bytes each (32 KiB). NormalizeCrossCheckFindings caps
  * serialized findings at 32 KiB. Thus 6 * (256 + 512 + 32) + 256 + 32 = 5088 KiB;
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
- * never Content-Length; the cross-check methods and strict gate ACK opt in. */
+ * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
 const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
