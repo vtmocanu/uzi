@@ -41,6 +41,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Stage the foundation for preserving work after eligible Codex policy refusals ([#3068](https://github.com/vtmocanu/uzi/issues/3068)).**
+  The negotiated path supports parking eligible noninteractive root issue, task, prompt and self_improve runs with content-free refusal metadata, durable delivery and work preservation, plus CLI resume in the original conversation with owner guidance or Cancel; a missing original conversation re-parks rather than automatically starting a fresh thread. Production API and worker advertisement remain off: activation awaits completed owner-choice support in M2 for explicit fresh retry, Stop, set-token and wall handling; web, TUI and Slack owner controls remain pending M3.
+
 - **sqlc regeneration uses verified release binaries.**
   Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
 
