@@ -71,8 +71,8 @@ export function derivePlanRevision(messages: RunMessage[]): PlanRevision {
 
   const priorPlans = plans
     .slice(0, Math.max(0, plans.length - 1))
-    .map((m) => (m.payload as { plan_md?: string } | null)?.plan_md ?? "")
-    .filter((s) => s.trim() !== "");
+    .map((m) => (m.payload as { plan_md?: unknown } | null)?.plan_md ?? "")
+    .filter((s): s is string => typeof s === "string" && s.trim() !== "");
 
   return {
     versions: plans.length,

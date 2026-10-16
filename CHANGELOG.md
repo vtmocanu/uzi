@@ -29,6 +29,11 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
+### Fixed
+
+- **Plan approval tolerates malformed superseded plan text ([#3072](https://github.com/vtmocanu/uzi/issues/3072)).**
+  Superseded plan history skips non-string and blank bodies while preserving valid text and submission order, so malformed earlier submissions no longer crash the approval panel.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
