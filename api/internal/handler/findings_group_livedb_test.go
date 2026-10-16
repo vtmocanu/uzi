@@ -58,6 +58,7 @@ type fgFake struct {
 	mu      sync.Mutex
 	seq     int
 	ensureN int
+	ensured []string
 	ensureS int // seq of the first EnsureLabels
 	createS int // seq of the first CreateIssue
 	creates []fgCreate
@@ -73,10 +74,13 @@ type fgFake struct {
 	ensureGate    chan struct{} // when non-nil EnsureLabels blocks until it is closed
 }
 
-func (f *fgFake) EnsureLabels(_ context.Context, _ int64, _ []forge.Label) error {
+func (f *fgFake) EnsureLabels(_ context.Context, _ int64, labels []forge.Label) error {
 	f.mu.Lock()
 	f.seq++
 	f.ensureN++
+	for _, label := range labels {
+		f.ensured = append(f.ensured, label.Name)
+	}
 	if f.ensureS == 0 {
 		f.ensureS = f.seq
 	}
