@@ -152,9 +152,10 @@ describe("held publication of a failed run", () => {
 
     await r.execute(claim);
 
-    // The freeze happened BEFORE the failed terminal was sent, and nothing froze again after it.
+    // Every new frozen coverage identity precedes the failed send. Later FINAL
+    // verification may rebuild the same aggregate without freezing another inventory.
     assert.ok(freezes.failedAckedAtFreeze.length > 0, "an immutable coverage was built");
-    assert.ok(freezes.failedAckedAtFreeze.every(sent => !sent), "every freeze precedes the failed send");
+    assert.ok(freezes.failedAckedAtFreeze.every(sent => !sent), "every new frozen coverage identity precedes the failed send");
 
     // Step A: one upload, whose pack carries the commits AND the WIP.
     assert.equal(server.heldCalls.length, 1);

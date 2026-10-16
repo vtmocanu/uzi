@@ -149,7 +149,9 @@ for (const scenario of ["wallpark", "clarification", "old-generation-foreground"
       foreground = true;
       flight!.heldDeferredCapture = undefined;
       const reserves = server.archiveReserves();
-      client.getRunOwnership = async () => { throw new RequestError("GET", `/api/worker/runs/${claim.run_id}/ownership`, 404, JSON.stringify({ error: "run not found for this worker" })); };
+      const ownershipBody = JSON.stringify({ error: "run not found for this worker" });
+      client.getRunOwnership = async () => { throw new RequestError("GET", `/api/worker/runs/${claim.run_id}/ownership`, 404,
+        ownershipBody, undefined, { complete: true, bytes: Buffer.byteLength(ownershipBody) }); };
       await r["settleRecoveryGeneration"](claim, flight!, flight!.runLog);
       assert.equal(server.heldCalls.length, 0, "persisted self-contained archive precedes new held production");
       assert.equal(server.finals.length, 1, "original custody settles despite current g72/foreign worker and ownership404");
