@@ -79,7 +79,7 @@ Blocked by: none. Accept bounded retry/cancel handling and authoritative lifecyc
 
 ### M2: existing terminal evidence reconciles (#2494 + #2987)
 
-Blocked by: none. Accept restart/outage replay of exact evidence and already-settled hold retirement without fabricated ACKs, rewritten FINALs or local deletion authority. Conflicts remain protected with a diagnostic.
+Blocked by: #3030 (M3 / PR #3058), whose shared recovery seams and exact-hold settlement representation this repair reuses. Accept restart/outage replay of exact evidence and already-settled hold retirement without fabricated ACKs, rewritten FINALs or local deletion authority. Conflicts remain protected with a diagnostic.
 
 ### M3: widen terminal held-publication eligibility (#3030)
 
