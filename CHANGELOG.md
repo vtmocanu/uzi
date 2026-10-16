@@ -22,74 +22,10 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-### Added
-
-- **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
-  Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
-
-### Fixed
-
-- **Keep handoff recovery receipt checks independent of production retry spacing ([#2494](https://github.com/vtmocanu/uzi/issues/2494)).**
-  The Compose handoff fixture uses the existing stub-only recovery clock while checking custody receipts, then restores the worker's prior timing on success or failure. Receipt and cleanup proofs remain unchanged; production retry spacing is unchanged.
-
-- **Accept large terminal state acknowledgments ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
-  Terminal reports use the existing six-MiB state-response budget instead of the smaller maintenance-envelope cap, preserving status and completed-publication receipt parsing when a run includes a large issue description or saved patch. Reads remain bounded by bytes and the cancellation deadline.
-
-- **Server-side cancellation shares the recovery maintenance deadline ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
-  A worker observing an exact terminal cancellation starts the same ten-minute maintenance budget before aborting its flight, while preserving the claim fence and retaining unresolved local work.
-
-- **Keep recovery retries and immutable FINAL replay progressing (#3030).**
-  A held-publication request lost before delivery can retry its frozen pack through the existing at-most-once server marker. Saved FINAL requests still reach the receipt check after an API rollback, and valid archive coverage no longer inherits the optional redundancy proof's smaller head, commit-size or encoding limits.
-
-- **Recover abandoned plan-gate executions (#3001).**
-  Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion. Human plan revisions get up to three automatic provider-turn re-drives per accepted revision in a live flight, with 5/10/20-second backoff plus 0–20% jitter (30-second cap), after bounded inner retries. On exhaustion the original plan stays visible and feedback stays pending; an ordinary source-bound revise spends the normal revision allowance, while cancel and source-bound reject remain available at the cap. Approvals and follow-ups cannot restart the expired wait. Revised-plan publication atomically records the successful feedback and explicitly supersedes pending predecessors under a source-gate fence. Upgrade the API before workers for `plan_revision_retry_v1`; reclaim keeps existing Claude replay and Codex fresh-plan/re-send behavior, without durable retry accounting. The live expired gate remains busy and can defer an image roll; existing drain/shutdown policy is unchanged.
-
-- **Cancelled runs stop waiting when their worker reconnects.**
-  A worker returning after an outage stops a cancelled run's live execution and plan or question wait, retains its unfinished source for recovery, and admits the next run after teardown completes.
-
-- **Explain rejected Codex resumed usage ([#3065](https://github.com/vtmocanu/uzi/issues/3065)).**
-  Incomplete token accounting notices now identify the failed validation predicate and applicable breakdown and bucket using fixed diagnostic text, without exposing provider data.
-
-- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
-  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
-
-- **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
-  Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
-
-- **Rootful Kubernetes Docker workers lower bridge MTUs after successful discovery to address HTTPS and build stalls ([#3005](https://github.com/vtmocanu/uzi/issues/3005)).**
-  Successful discovery configures the default bridge and new bridge-network defaults with the lowest pod interface MTU, capped at 1500. Discovery errors warn and preserve the original daemon arguments, so the original hang can still recur on that pod; configuration-file creation or write errors after successful discovery still prevent startup. Discovery skips regular sysfs control files such as `bonding_masters` while still requiring valid MTUs from interface directories and symlinks. Deploy the updated controller and recreate worker pods. Existing user-defined networks need recreation to acquire the defaults, and explicit per-network overrides take precedence. Rootless remains the default and is outside this fix; deployed-worker acceptance is pending release and rollout. See [Docker-tier network MTU](docs/configuration.md#docker-tier-network-mtu-rootful-kubernetes-workers).
-
-- **Full submitted plans remain readable after the approval gate ([#2972](https://github.com/vtmocanu/uzi/issues/2972)).**
-  Non-seeded web runs with saved full plan text now offer an initially collapsed, scrollable Full plan panel after leaving the gate, including after reload and on finished runs; the neutral title does not imply approval. Earlier submitted versions include only already-loaded submissions and fetch no extra history. The TUI renders loaded plan messages as full Markdown through the final line instead of a 200-character compact fallback, with paging and controls unchanged. Seeded plans, gate actions and history, summaries, and CLI version/diff behavior are unchanged.
-
-- **Keep Homebrew updates available from a deleted working directory ([#3046](https://github.com/vtmocanu/uzi/issues/3046)).**
-  The TUI's installation probes and foreground Homebrew upgrade run from `/`, so a shell left inside a removed worktree can still detect its installed formula and use Update now.
-
-- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
-  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
-
-- **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
-  Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
-
-- **Codex leads receive their subagent capabilities before planning.**
-  Planning and implementation prompts list available roles with their implementation write capabilities, while planning remains read-only. Skill tools list each role's granted skills, shell tools identify their interpreter, and delegation traces include a bounded, scrubbed assignment excerpt without changing milestone labels.
-
-- **Lead guidance clarifies validation ownership and final milestone completion.**
-  Guidance tells leads to assign expensive proofs one owner, check mandatory plan requirements, adjudicate weak regression pins and address conflicting follow-ups. Runtime guidance tells leads to run early static checks, avoid Codex dispatch probes, unchanged waiting updates and duplicate Claude polls, and finish a verified final milestone without an extra checkpoint turn. Customized lead templates receive the runtime appends but not the builtin lead template edits.
-
 ### Changed
 
 - **An opt-in worker memory guard interrupts eligible Codex shell commands and holds uncertain recovery for the owner ([#2396](https://github.com/vtmocanu/uzi/issues/2396)).**
   One worker-wide monitor uses total cgroup usage and ranks enrolled model command trees by approximate RSS, acting through their exact registered supervisors. Compose and hosted workers relay the enable flag and six required numeric settings; the guard remains off by default, with no calibrated production thresholds. Deploy the feature-advertising API before enabling workers, or keep new workers disabled until the API is ready and then freshly register/restart enabled; unsupported APIs or invalid registration incarnations refuse enabled startup. Heartbeat feature growth creates no memory authority, and shrink revokes reservation/signalling while original settlement and source custody remain owed. Intervention allowance persists per memory episode across ordinary redispatch; exhaustion, uncertain drainage or unconfirmed outcome reporting invokes capture and an owner-held memory-pressure park attempt. Owner Resume starts a fresh memory episode under existing budget, custody and lifecycle fences; an available historical archive does not release retained custody or prove latest-work capture. Unconfirmed capture or park retains local source without an archive guarantee; OPEN memory-pressure and worker-requeue-exhaustion holds preserve owner attention ahead of archive readiness or capture progress. Operational disable preserves accounting and custody; migration 00341 Down destructively fails memory-held runs and drops memory history. Claude enrollment (#2471), internal probes, provider/credential processes, boundary/checkpoint/capture operations and cross-checker authority remain outside the delivered adapter's scope; separately accounted DinD, allocation bursts, sampling stalls and node pressure can still cause OOM. No concurrency or process-authority expansion is introduced, and Codex command bounds and abort/cleanup ownership remain in force.
-
-- **Eligible cancelled runs and earlier terminal generations can publish held work to a fetchable forge ref.**
-  Mutually negotiated held-publication V2 extends the existing original-custodian path while preserving V1 compatibility. Failed/cancelled runs try held publication before archive fallback; completed runs without an applicable receipt stay archive-first, allowing the held alternative only for a prerequisite-bearing thin archive or structured oversize/quota refusal on the same frozen record. Exact-generation reconciliation and immutable FINAL replay preserve lost-ACK recovery, and cancellation uses one 10-minute attempt budget before retaining protection. The existing cleanup boundary accepts possible loss from an undetected terminal late writer after immutable capture; no new post-release source retention across hosted teardown is provided. Held refs follow repository visibility and existing retention, and deleting a public ref cannot revoke fetched copies. See [run recovery](docs/run-recovery.md#publishing-terminal-held-work) (#3030).
-
-- **sqlc regeneration uses verified release binaries.**
-  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
-
-- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
-  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
 
 ## [0.86.0] - 2026-10-06
 
@@ -288,6 +224,15 @@ through `[0.52.0]`.)
 - **Codex root leads can opt foreground Bash commands into a 120-minute bound ([#2986](https://github.com/vtmocanu/uzi/issues/2986)).**
   Authorized commands use the fixed extended bound with `long_running: true`; the default remains 60 minutes. Run-wall parking remains authoritative, and cancellation arriving during deadline cleanup beats the command deadline without replacing an already-selected exit, output cap or nondeadline error.
 
+- **Eligible cancelled runs and earlier terminal generations can publish held work to a fetchable forge ref.**
+  Mutually negotiated held-publication V2 extends the existing original-custodian path while preserving V1 compatibility. Failed/cancelled runs try held publication before archive fallback; completed runs without an applicable receipt stay archive-first, allowing the held alternative only for a prerequisite-bearing thin archive or structured oversize/quota refusal on the same frozen record. Exact-generation reconciliation and immutable FINAL replay preserve lost-ACK recovery, and cancellation uses one 10-minute attempt budget before retaining protection. The existing cleanup boundary accepts possible loss from an undetected terminal late writer after immutable capture; no new post-release source retention across hosted teardown is provided. Held refs follow repository visibility and existing retention, and deleting a public ref cannot revoke fetched copies. See [run recovery](docs/run-recovery.md#publishing-terminal-held-work) ([#3030](https://github.com/vtmocanu/uzi/pull/3030)).
+
+- **sqlc regeneration uses verified release binaries.**
+  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
+
+- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
+  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -367,6 +312,9 @@ through `[0.52.0]`.)
 
 - **A red default-branch workflow now starts one guarded repair run, via the `ci-repair` default job ([#2865](https://github.com/vtmocanu/uzi/issues/2865)).**
   A new `ci_watch` schedule target (`uzi schedule create --ci-watch`, or `uzi schedule catalog enable ci-repair`, hourly by default) reads the newest completed default-branch execution of each watched workflow: green starts nothing, red starts one `prompt` run on a new `uzi/prompt-<id>` branch that opens an MR with the fix or finishes report-only, and the default branch is never written. **Auto-approve is off by default for this job** (every other default stays on) because the run reads CI text that can come from dependencies, tests or outside contributors, so the run stops at the plan gate; the web UI and `schedule get` say why, and you can turn it on. A fire reads one page of executions (100 on GitHub and GitLab, 50 on Forgejo) and a watched workflow missing from it is reported as `ci_watched_not_seen`, never as green; PR events and in-progress executions are ignored. A per-workflow loop guard halts on the same failure signature after an attempt (`ci_halted_no_progress`) or at `CI_AUTOFIX_MAX_ATTEMPTS` (`ci_halted_attempt_cap`) and resets on green; a schedule tracks at most 1024 workflows for its lifetime, its history survives edits, and repointing it to another repo is refused while history exists. Evidence is bounded by `CI_FIX_MAX_JOBS` and `CI_FIX_LOG_TAIL_BYTES`, at most 3 snapshots per fire, 4 MiB per CI JSON response and 16 MiB per fire (compressed and decompressed bytes both counted). These runs can never push a CI-config change: the worker refuses before checkpoint and held-work publication and at the final push, human-approved runs included and also when the diff cannot be computed, and the server refuses conservatively (tree walk capped at 100,000 entries, oversized paths and invalid globs refuse); a refused run fails with the paths named and a preserved patch when its secret scan is clean. **Roll the api out before the workers:** guarded runs require the new `ci_config_guard_v1` worker capability, so workers that predate it cannot claim a repair run, which stays queued with a run-health reason naming the missing capability until a new worker is online; a new worker against an older api reports the capability and nothing else changes. Not included: CI artifacts as evidence, paging past one page, a failure threshold or per-schedule attempt cap, and event-triggered detection. See [Scheduling](docs/scheduling.md#default-branch-ci-repair).
+
+- **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
+  Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
 
 ### Fixed
 
@@ -785,6 +733,54 @@ through `[0.52.0]`.)
 
 - **Merged runs automatically discard earlier custody holds after fresh verification of their recorded PR ([#2506](https://github.com/vtmocanu/uzi/issues/2506), partial, nonclosing).**
   Earlier open holds stop occupying custody slots after the server freshly verifies the completed run's own recorded PR has merged and rechecks its exact binding. Available archives remain downloadable until their normal expiry; this discard policy does not prove earlier work was included in the merge and grants no worker source-deletion authority. Physical local-source and available-archive disposal remain deferred to #2823 and #1373. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for safeguards and rollout limits.
+
+- **Keep handoff recovery receipt checks independent of production retry spacing ([#2494](https://github.com/vtmocanu/uzi/issues/2494)).**
+  The Compose handoff fixture uses the existing stub-only recovery clock while checking custody receipts, then restores the worker's prior timing on success or failure. Receipt and cleanup proofs remain unchanged; production retry spacing is unchanged.
+
+- **Accept large terminal state acknowledgments ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  Terminal reports use the existing six-MiB state-response budget instead of the smaller maintenance-envelope cap, preserving status and completed-publication receipt parsing when a run includes a large issue description or saved patch. Reads remain bounded by bytes and the cancellation deadline.
+
+- **Server-side cancellation shares the recovery maintenance deadline ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  A worker observing an exact terminal cancellation starts the same ten-minute maintenance budget before aborting its flight, while preserving the claim fence and retaining unresolved local work.
+
+- **Keep recovery retries and immutable FINAL replay progressing ([#3030](https://github.com/vtmocanu/uzi/pull/3030)).**
+  A held-publication request lost before delivery can retry its frozen pack through the existing at-most-once server marker. Saved FINAL requests still reach the receipt check after an API rollback, and valid archive coverage no longer inherits the optional redundancy proof's smaller head, commit-size or encoding limits.
+
+- **Recover abandoned plan-gate executions ([#3001](https://github.com/vtmocanu/uzi/pull/3001)).**
+  Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion. Human plan revisions get up to three automatic provider-turn re-drives per accepted revision in a live flight, with 5/10/20-second backoff plus 0–20% jitter (30-second cap), after bounded inner retries. On exhaustion the original plan stays visible and feedback stays pending; an ordinary source-bound revise spends the normal revision allowance, while cancel and source-bound reject remain available at the cap. Approvals and follow-ups cannot restart the expired wait. Revised-plan publication atomically records the successful feedback and explicitly supersedes pending predecessors under a source-gate fence. Upgrade the API before workers for `plan_revision_retry_v1`; reclaim keeps existing Claude replay and Codex fresh-plan/re-send behavior, without durable retry accounting. The live expired gate remains busy and can defer an image roll; existing drain/shutdown policy is unchanged.
+
+- **Cancelled runs stop waiting when their worker reconnects.**
+  A worker returning after an outage stops a cancelled run's live execution and plan or question wait, retains its unfinished source for recovery, and admits the next run after teardown completes.
+
+- **Explain rejected Codex resumed usage ([#3065](https://github.com/vtmocanu/uzi/issues/3065)).**
+  Incomplete token accounting notices now identify the failed validation predicate and applicable breakdown and bucket using fixed diagnostic text, without exposing provider data.
+
+- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
+
+- **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
+  Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
+
+- **Rootful Kubernetes Docker workers lower bridge MTUs after successful discovery to address HTTPS and build stalls ([#3005](https://github.com/vtmocanu/uzi/issues/3005)).**
+  Successful discovery configures the default bridge and new bridge-network defaults with the lowest pod interface MTU, capped at 1500. Discovery errors warn and preserve the original daemon arguments, so the original hang can still recur on that pod; configuration-file creation or write errors after successful discovery still prevent startup. Discovery skips regular sysfs control files such as `bonding_masters` while still requiring valid MTUs from interface directories and symlinks. Deploy the updated controller and recreate worker pods. Existing user-defined networks need recreation to acquire the defaults, and explicit per-network overrides take precedence. Rootless remains the default and is outside this fix; deployed-worker acceptance is pending release and rollout. See [Docker-tier network MTU](docs/configuration.md#docker-tier-network-mtu-rootful-kubernetes-workers).
+
+- **Full submitted plans remain readable after the approval gate ([#2972](https://github.com/vtmocanu/uzi/issues/2972)).**
+  Non-seeded web runs with saved full plan text now offer an initially collapsed, scrollable Full plan panel after leaving the gate, including after reload and on finished runs; the neutral title does not imply approval. Earlier submitted versions include only already-loaded submissions and fetch no extra history. The TUI renders loaded plan messages as full Markdown through the final line instead of a 200-character compact fallback, with paging and controls unchanged. Seeded plans, gate actions and history, summaries, and CLI version/diff behavior are unchanged.
+
+- **Keep Homebrew updates available from a deleted working directory ([#3046](https://github.com/vtmocanu/uzi/issues/3046)).**
+  The TUI's installation probes and foreground Homebrew upgrade run from `/`, so a shell left inside a removed worktree can still detect its installed formula and use Update now.
+
+- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
+  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
+
+- **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
+  Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged ([#1296](https://github.com/vtmocanu/uzi/pull/1296), [#2445](https://github.com/vtmocanu/uzi/pull/2445)).
+
+- **Codex leads receive their subagent capabilities before planning.**
+  Planning and implementation prompts list available roles with their implementation write capabilities, while planning remains read-only. Skill tools list each role's granted skills, shell tools identify their interpreter, and delegation traces include a bounded, scrubbed assignment excerpt without changing milestone labels.
+
+- **Lead guidance clarifies validation ownership and final milestone completion.**
+  Guidance tells leads to assign expensive proofs one owner, check mandatory plan requirements, adjudicate weak regression pins and address conflicting follow-ups. Runtime guidance tells leads to run early static checks, avoid Codex dispatch probes, unchanged waiting updates and duplicate Claude polls, and finish a verified final milestone without an extra checkpoint turn. Customized lead templates receive the runtime appends but not the builtin lead template edits.
 
 ### Security
 
