@@ -124,7 +124,7 @@ var heldHoldKinds = []string{runkind.Issue, runkind.CIFix, runkind.SelfImprove, 
 func heldScope(wkr store.Worker, run store.Run, hold store.RecoveryCustodyHold, found bool, req HeldPublishRequest) *HeldRefusal {
 	refuse := func(reason string) *HeldRefusal { return &HeldRefusal{Reason: reason} }
 	v2 := slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2)
-	if run.Status != "failed" && !(v2 && (run.Status == "cancelled" || run.Status == "completed")) {
+	if run.Status != "failed" && (!v2 || (run.Status != "cancelled" && run.Status != "completed")) {
 		return refuse(HeldReasonNotFailed)
 	}
 	if run.FailOrigin.Valid && (run.FailOrigin.String == "push_secret_blocked" || run.FailOrigin.String == "worker_residue_blocked") {
