@@ -95,6 +95,59 @@ func TestApprovalGuardPendingRevisionLiveDB(t *testing.T) {
 	}
 }
 
+func TestApprovalGuardNonApprovalControlsLiveDB(t *testing.T) {
+	for _, kind := range []string{"revise_plan", "cancel", "reject_plan"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newGateFix(t, 3)
+			id := f.gatedRun()
+			f.liveWorker()
+			input := approvalGuardRevise(t, f, id)
+			approvalGuardRefused(t, f, id, nil, SubmitInputOptions{ExpectedGateRevision: i64(1)})
+
+			opts := SubmitInputOptions{}
+			if kind != "cancel" {
+				opts.ExpectedGateRevision = i64(1)
+			}
+			result, err := f.submit(id, kind, nil, opts)
+			if err != nil || result.ServerSide {
+				t.Fatalf("%s with pending revision: result=%+v err=%v", kind, result, err)
+			}
+			approvalGuardPending(t, f, id, input)
+			var newInput int64
+			var pending bool
+			if err := f.pool.QueryRow(f.ctx, `SELECT id, body='because' AND applied_at IS NULL
+ AND consumed_at IS NULL AND disposition IS NULL
+ FROM run_user_inputs WHERE run_id=$1 AND kind=$2 AND id<>$3`, id, kind, input).Scan(&newInput, &pending); err != nil || !pending || newInput <= input {
+				t.Fatalf("%s durable input=%d pending=%v err=%v", kind, newInput, pending, err)
+			}
+			run := reconciliationRow(t, f, id)
+			wantCount := int32(1)
+			binding := "bound(1)"
+			switch kind {
+			case "revise_plan":
+				wantCount = 2
+				if result.ID != newInput || run.StopKind.Valid {
+					t.Fatalf("second revise result=%+v input=%d stop=%v", result, newInput, run.StopKind)
+				}
+				approvalGuardPending(t, f, id, newInput)
+			case "cancel":
+				binding = "legacy"
+				if !run.StopKind.Valid || run.StopKind.String != "cancelled" || !run.StopReason.Valid || run.StopReason.String != "because" {
+					t.Fatalf("cancel intent=%v reason=%v", run.StopKind, run.StopReason)
+				}
+			case "reject_plan":
+				if !run.StopKind.Valid || run.StopKind.String != "plan_rejected" || run.StopReason.Valid {
+					t.Fatalf("reject intent=%v reason=%v", run.StopKind, run.StopReason)
+				}
+			}
+			if run.ReviseCount != wantCount || run.Status != "awaiting_approval" || run.GateRevision != 1 {
+				t.Fatalf("%s changed revision count or gate: count=%d status=%s revision=%d", kind, run.ReviseCount, run.Status, run.GateRevision)
+			}
+			f.assertVerdicts(t, id, "revise_plan=bound(1)", kind+"="+binding)
+		})
+	}
+}
+
 func TestApprovalGuardPendingPredicateControlsLiveDB(t *testing.T) {
 	for _, control := range []string{"settled", "old gate", "unbound", "superseded", "declined pending"} {
 		t.Run(control, func(t *testing.T) {
