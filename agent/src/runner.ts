@@ -1858,6 +1858,8 @@ interface RunFlight {
   branch: string | undefined;
   active: ActiveRun | undefined;
   parked: boolean;
+  /** Accepted pause ACK; delivery failures must not replace this park with a terminal. */
+  pauseParkAccepted: boolean;
   /** Issue #1784: true only once the server answered `paused` to a completion hold or a wall park on
    *  THIS flight (enterCompletionHold / enterWallPark). A confirmed-`paused` run's credential
    *  reconcile is refused by the server. executeClaim also bypasses the finalize boundary for
@@ -3772,7 +3774,7 @@ export class RunRunner {
         // park does. If the checkpoint could not be published (handlePausePark reported
         // pause_failed and left the run running), preserve the session and leave it for the
         // sweeper to requeue rather than failing a run the owner asked to pause.
-        flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 });
+        flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 }, "owner");
         // Issue #1742 retirement site (c): the api accepted the owner pause park for this generation.
         if (flight.parked) await this.retireFinalizeRecord(flight, "pause_park_accepted");
         if (!flight.parked) {
@@ -4931,7 +4933,7 @@ export class RunRunner {
    * the terminal is not stranded until boot (N4).
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
-    if (flight.completionHoldOutcome === "unresolved") return;
+    if (flight.pauseParkAccepted || flight.completionHoldOutcome === "unresolved") return;
     const outbox = this.outbox;
     if (outbox) outbox.holdTerminalResolve(flight.runId, flight.claimGeneration);
     try {
@@ -6240,7 +6242,7 @@ export class RunRunner {
     };
     // The same predicate gates the write-ahead record and entry into finalization.
     if (!isFinalizeBoundResult(result)) {
-      // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
+      // PRD #1190 M2: a pause PARKED the run mid-loop (handlePausePark reported
       // `paused` and set flight.parked). The run is non-terminal and already reported — there is
       // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
       // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
@@ -6256,7 +6258,7 @@ export class RunRunner {
         await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
-        runLog.info("run parked on an owner-requested pause; skipping finalization", {
+        runLog.info("run parked on pause; skipping finalization", {
           run_id: runId,
         });
         return;
@@ -8998,6 +9000,7 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
+      pauseParkAccepted: false,
       holdOrWallParkConfirmed: false,
       completionHoldOutcome: "none",
       uncertainWallPark: false,
@@ -11717,7 +11720,7 @@ export class RunRunner {
             if (requested.status !== "running" && requested.status !== "paused")
               throw new TrustedExecutionRefusal("park run request refused");
             const parked = requested.applied && requested.status === "running" &&
-              await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
+              await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt, "lead_park"));
             // Remember the completed false result before lifecycle reconciliation can interrupt.
             if (!parked) parkContinuation = "reconcile";
             if (steering.isCancelled()) return { kind: "cancel" };
@@ -11781,7 +11784,7 @@ export class RunRunner {
         }
       },
       parkForPause: async (pausedAt) => {
-        const parked = await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
+        const parked = await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt, "owner"));
         if (!parked) steering.rearmLifecycle();
         return parked;
       },
@@ -16098,7 +16101,7 @@ export class RunRunner {
   }
 
   /**
-   * PRD #1190 M2: park a run on an owner-requested pause (the ctx.parkForPause callback). Called
+   * PRD #1190 M2: park a run on an owner pause or an explicit lead park request. Called
    * from the implement loop at the server-decided pause boundary and when a `now` pause aborted
    * the in-flight turn. Modeled on handleLimitReached, with two deliberate differences from a
    * limit park (Decision 8):
@@ -16139,23 +16142,12 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     pausedAt: { completedCount: number; total?: number },
+    origin: "lead_park" | "owner",
   ): Promise<boolean> {
     const { runLog, batcher, reportState } = flight;
     const barePath = flight.barePath;
     const runnerClone = flight.runnerClone;
     const branch = runnerClone?.branch ?? flight.branch;
-
-    // Announce the park on the feed BEFORE the state report (same ordering as the limit park),
-    // then FLUSH so the line lands ahead of it.
-    batcher.emit({
-      kind: "paused",
-      agent: "worker",
-      payload: {
-        completed: pausedAt.completedCount,
-        ...(pausedAt.total !== undefined ? { total: pausedAt.total } : {}),
-      },
-    });
-    await batcher.flush().catch(() => undefined);
 
     // issue #1783: prove the clone quiescent BEFORE the park sink touches it (the wip marker, the
     // fetch-back into the bare tracking ref, the checkpoint publish). quiesceRun reaps the agent
@@ -16358,7 +16350,8 @@ export class RunRunner {
       return false;
     }
     flight.parked = true;
-    runLog.info("run paused at the owner's request; preserving its HOME for resume", {
+    flight.pauseParkAccepted = true;
+    runLog.info("run pause accepted; preserving its HOME for resume", {
       run_id: flight.runId,
     });
     // PRD #1349 M2 (D4): record this generation's checkpointed restore point in the durable
@@ -16379,6 +16372,22 @@ export class RunRunner {
       }),
     );
     if (claim.inventory_guarded === true) await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+    // Display-only delivery follows the accepted park and custody handling. Both emit and flush
+    // can fail; neither may undo or retry the accepted pause.
+    try {
+      batcher.emit({
+        kind: "paused",
+        agent: "worker",
+        payload: {
+          origin,
+          completed: pausedAt.completedCount,
+          ...(pausedAt.total !== undefined ? { total: pausedAt.total } : {}),
+        },
+      });
+      await batcher.flush();
+    } catch (error) {
+      runLog.warn("could not deliver accepted pause message", { error: errMessage(error) });
+    }
     return true;
   }
 
