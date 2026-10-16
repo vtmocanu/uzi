@@ -31,6 +31,42 @@ empty_output() {
   cases=$((cases + 1))
   if [ ! -s "$TMP/out" ]; then passed=$((passed + 1)); else echo "FAIL: $1 emitted stdout" >&2; fi
 }
+# A failed or truncated directory producer must never look like an empty inventory.
+valid Fixed 'Enumeration original' "$A"
+: > "$W/enumeration-body"
+mkdir "$TMP/find-failure"
+cat > "$TMP/find-failure/find" <<'SH'
+#!/usr/bin/env bash
+set -e
+printf '%s\n' "$FIXTURE_ENUM_MODE" > "$FIXTURE_ENUM_MARKER"
+printf '%s\0' "$FIXTURE_FRAGMENT"
+case "$FIXTURE_ENUM_MODE" in
+  failure) printf '\033[2J\nFORGED: success\n' >&2; exit 23 ;;
+  truncated) printf 'partial'; exit 0 ;;
+  too-many)
+    for ((entry=0; entry<100000; entry++)); do printf '%s\0' "$FIXTURE_FRAGMENT"; done
+    ;;
+esac
+SH
+chmod +x "$TMP/find-failure/find"
+for enumeration in failure truncated too-many; do
+  for mode in validate list render-body; do
+    args=(); [ "$mode" != render-body ] || args=(enumeration-body)
+    PATH="$TMP/find-failure:$PATH" FIXTURE_ENUM_MODE="$enumeration" FIXTURE_ENUM_MARKER="$TMP/enumeration-reached" FIXTURE_FRAGMENT="$A" expect 1 "$enumeration enumeration fails closed in $mode" "$mode" "${args[@]}"
+    empty_output "$enumeration enumeration"
+    printf '%s\n' "$enumeration" > "$TMP/expected-marker"
+    equal "$TMP/expected-marker" "$TMP/enumeration-reached" 'enumeration fault reached'
+    diagnostic='cannot enumerate changelog.d'
+    [ "$enumeration" != too-many ] || diagnostic='more than 1024 fragments'
+    printf 'changelog-fragments: %s\n' "$diagnostic" > "$TMP/expected-error"
+    equal "$TMP/expected-error" "$TMP/err" 'enumeration diagnostic excludes raw producer stderr'
+  done
+done
+rm "$W/$A"
+if [ "${1:-}" = --enumeration-only ]; then
+  echo "changelog-fragments enumeration: cases=$cases passed=$passed"
+  [ "$cases" -eq "$passed" ]; exit
+fi
 bidi_path=$(python3 -c "print('changelog.d/' + chr(0x202e) + 'bad' + chr(0x202c) + '.md')")
 for bad in $'changelog.d/\033[2J\nFORGED: success.md' "$bidi_path"; do
   expect 1 'unsafe path diagnostic' validate "$bad"

@@ -63,27 +63,57 @@ changelog_fragment_validate() (
   if [ "$#" -gt 1 ]; then cp -- "$work/input" "$2"; fi
 )
 
+# Stream directory entries before sorting a bounded, validated path list. Eager
+# shell globs can silently expand to nothing when allocation fails.
+changelog_fragment_paths() {
+  local work=$1 path count=0 fd pid rc=0
+  : > "$work/paths" || return 1
+  exec {fd}< <(find changelog.d -mindepth 1 -maxdepth 1 -print0 2>/dev/null) || return 1
+  pid=$!
+  while IFS= read -r -d '' path <&"$fd"; do
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
+      changelog_fragment_path_error 'unsafe entry' "$path"; rc=1; break
+    fi
+    [ "$path" != changelog.d/README.md ] || continue
+    if ! changelog_fragment_path "$path"; then rc=1; break; fi
+    count=$((count + 1))
+    if [ "$count" -gt 1024 ]; then
+      changelog_fragment_error 'more than 1024 fragments'; rc=1; break
+    fi
+    if ! printf '%s\n' "$path" >> "$work/paths"; then rc=1; break; fi
+  done
+  # A partial final record is not a successful enumeration either.
+  if [ "$rc" -eq 0 ] && [ -n "$path" ]; then
+    changelog_fragment_error 'cannot enumerate changelog.d'; rc=1
+  fi
+  exec {fd}<&-
+  if ! wait "$pid"; then
+    if [ "$rc" -eq 0 ]; then
+      changelog_fragment_error 'cannot enumerate changelog.d'
+    fi
+    rc=1
+  fi
+  [ "$rc" -eq 0 ] || return 1
+  # Filenames have passed the ASCII UUID grammar, so newline sorting is safe.
+  LC_ALL=C sort -o "$work/paths" "$work/paths" || {
+    changelog_fragment_error 'cannot sort fragment paths'; return 1
+  }
+}
+
 # Git does not enumerate FIFOs or empty directories; inspect the directory too.
 changelog_fragment_safe_entries() (
-  local path work count=0 total=0 bytes
+  local path work total=0 bytes
   mkdir -p .uzi/scratch
   work=$(mktemp -d .uzi/scratch/changelog-sizes.XXXXXX) || return 1
   trap 'rm -rf "$work"' EXIT
   changelog_fragment_directory || return 1
   [ -d changelog.d ] || return 0
-  for path in changelog.d/* changelog.d/.[!.]* changelog.d/..?*; do
-    [ -e "$path" ] || [ -L "$path" ] || continue
-    if [ -L "$path" ] || [ ! -f "$path" ]; then
-      changelog_fragment_path_error 'unsafe entry' "$path"; return 1
-    fi
-    [ "$path" != changelog.d/README.md ] || continue
-    changelog_fragment_path "$path" || return 1
-    count=$((count + 1))
-    [ "$count" -le 1024 ] || { changelog_fragment_error 'more than 1024 fragments'; return 1; }
+  changelog_fragment_paths "$work" || return 1
+  while IFS= read -r path; do
     changelog_fragment_snapshot "$path" "$work/input" 65536 || return 1
     total=$((total + $(wc -c < "$work/input")))
     [ "$total" -le 4194304 ] || { changelog_fragment_error 'pending input exceeds 4194304 bytes'; return 1; }
-  done
+  done < "$work/paths"
   # PR checks share the full-file and combined pending budget, without parsing
   # released history as entries or changing inherited legacy acceptance.
   if [ -f CHANGELOG.md ] && [ ! -L CHANGELOG.md ]; then
@@ -95,7 +125,7 @@ changelog_fragment_safe_entries() (
 )
 
 # Sets CHANGELOG_FRAGMENTS in LC_ALL=C filename order, excluding the reserved README.
-# Globbing (including dotfiles) preserves path boundaries without newline parsing.
+# Enumeration preserves path boundaries and checks its producer before sorting.
 changelog_fragment_inventory() {
   local work=${1:-} owned=0 rc=0
   if [ -z "$work" ]; then
@@ -114,12 +144,8 @@ changelog_fragment_inventory_into() {
   CHANGELOG_FRAGMENTS=()
   CHANGELOG_FRAGMENT_INPUTS=()
   [ -d changelog.d ] || return 0
-  for path in changelog.d/* changelog.d/.[!.]* changelog.d/..?*; do
-    [ -e "$path" ] || [ -L "$path" ] || continue
-    if [ -L "$path" ] || [ ! -f "$path" ]; then
-      changelog_fragment_path_error 'unsafe entry' "$path"; return 1
-    fi
-    [ "$path" != changelog.d/README.md ] || continue
+  changelog_fragment_paths "$work" || return 1
+  while IFS= read -r path; do
     snapshot="$work/fragment-$count"
     changelog_fragment_validate "$path" "$snapshot" || return 1
     total=$((total + $(wc -c < "$snapshot")))
@@ -128,5 +154,5 @@ changelog_fragment_inventory_into() {
     count=$((count + 1))
     [ "$count" -le 1024 ] || { changelog_fragment_error 'more than 1024 fragments'; return 1; }
     CHANGELOG_FRAGMENTS+=("$path")
-  done
+  done < "$work/paths"
 }
