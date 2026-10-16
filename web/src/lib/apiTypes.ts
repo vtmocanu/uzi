@@ -4522,7 +4522,7 @@ export interface FileFindingRequest {
 }
 
 export interface FindingGroupFileRequest {
-  ids?: string[] | null;
+  ids: string[] | null;
   title?: string | null;
   description?: string | null;
   labels?: string[] | null;

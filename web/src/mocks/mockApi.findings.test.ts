@@ -354,6 +354,7 @@ describe("mock finding send_to_uzi requests", () => {
     const api = await freshApi();
     const before = (await api.listRuns()).runs.map(r => r.id);
     await expect(api.fileFindingGroup({ ids: null, send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
+    // @ts-expect-error IDs are required; deliberately exercise malformed runtime input.
     await expect(api.fileFindingGroup({ send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
     const rows = (await api.listFindings()).findings.filter(f => f.finding_id && f.repo_id === "repo-uzi").slice(0, 2);
     expect(rows).toHaveLength(2);
