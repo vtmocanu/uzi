@@ -53,6 +53,29 @@ func TestGateWitnessReplayRetainsCapturedReviseCount(t *testing.T) {
 	}
 }
 
+func TestGateWitnessReplayRejectsMissingCapturedReviseCount(t *testing.T) {
+	locked, req, fields := witnessedReplayFixture(t)
+	snapshot, ok, err := decodeGatePresentedPayload(locked.GatePresentedPayload)
+	if err != nil || !ok {
+		t.Fatalf("decode witness fixture: found=%v err=%v", ok, err)
+	}
+	// Preserve a valid stored digest, but remove the count that proves when the
+	// witness was captured. Replay must not infer or refresh the missing evidence.
+	snapshot.ReviseCount = nil
+	locked.GatePresentedPayload, locked.GatePayloadDigest, err = snapshot.digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := bytes.Clone(locked.GatePresentedPayload)
+	decision, err := classifyGateReport(context.Background(), nil, locked, req, fields)
+	if err != nil || !errors.Is(decision.refusal, ErrGatePresentationConflict) {
+		t.Fatalf("missing captured count accepted: class=%v refusal=%v err=%v", decision.class, decision.refusal, err)
+	}
+	if !bytes.Equal(locked.GatePresentedPayload, before) {
+		t.Fatal("replay repaired missing witness evidence")
+	}
+}
+
 func TestGateWitnessReplayRejectsChangedContentAndBinding(t *testing.T) {
 	for _, change := range []string{"plan", "source head", "published checkpoint", "worker", "generation"} {
 		t.Run(change, func(t *testing.T) {
