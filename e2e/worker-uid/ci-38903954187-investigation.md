@@ -92,3 +92,85 @@ published or durable artifact:
 
 The hosted root cause, real PSI measurements, final composed-lane success and a
 subsequent green hosted pipeline remain unproven.
+
+## M2 minimal repair — 2026-10-16
+
+The preceding evidence and repair recommendation record M1. M2 starts from
+`3ba8061876726fbe5266f3bebd15ad67b354dd8c`; the red/green execution owner is
+the implementing Codex agent. Node remains `v24.20.0`, locked tsx `4.23.15`.
+
+The only fixture change is `execArgv: []` on the nested CommonJS churn worker,
+with a comment explaining that this fixed JavaScript needs no TypeScript
+preload. The outer 16/4/1 MiB and nested 8/2/1 MiB limits, all load bounds,
+iterations, supervision and PSI guards are unchanged. Both existing consumers
+continue to use the same fixture.
+
+The new regression in `calibration-producer.test.mts` writes an owned scratch
+`.mjs` entrypoint and launches `process.execPath --import <absolute
+agent/node_modules/tsx/dist/loader.mjs> <script>`. It verifies the exact child
+`execArgv`, then runs the actual CJS fixture with the original outer limits
+and inherited preload. Four consecutive real `step` ACKs exercise all four
+nested churn threads; each of the three files must grow to 4 MiB. A single
+seven-second ACK deadline stops the case on any failure, and a ten-second
+subprocess timeout bounds the child. The script clears its timer and awaits
+worker termination; the parent awaits child completion before removing its
+owned directory. Ordinary scratch directories provide IO coverage only.
+
+Commands below run from the worktree root, with no dependency installation:
+
+```sh
+# Focused red before the CJS edit, then focused green after it:
+(cd agent && node --import tsx --test --test-timeout=120000 --test-name-pattern="CJS load worker ACKs four churn steps" ../e2e/worker-uid/calibration-producer.test.mts)
+# Whole producer test file:
+(cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/calibration-producer.test.mts)
+# Scoped e2e typecheck:
+(cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json)
+```
+
+| Measurement | Scratch log | Exit | Measured duration |
+| --- | --- | --- | --- |
+| Red, original CJS at source HEAD plus new regression | `gate-log.o4kxOr` | 1 | test 565.326 ms; runner 3003.893 ms |
+| Green, nested-worker fix | `gate-log.aXALVR` | 0 | test 794.299 ms; runner 3311.721 ms |
+| Whole producer file, 17 passed, none cancelled/skipped | `gate-log.WL7JhI` | 0 | runner 3655.533 ms |
+| Scoped e2e typecheck | `gate-log.7tsrbM` | 0 | not separately measured |
+
+Red failed at `step 1 ACK failed: ERR_WORKER_OUT_OF_MEMORY`, with no ACKs,
+rather than during setup. Its initial log wrapper changed directory before
+appending the exit marker, so that relative-path append failed; the recorded
+test/child exit 1 was appended separately to the original log without rerunning
+the measurement. Subsequent wrappers used absolute log paths.
+
+These focused checks establish the loader-inheritance regression and repair,
+not tmpfs behavior, real calibration acceptance or a green CI run. Real PSI
+remains unavailable in the recorded environment, and the hosted first failure
+remains unknown. Full repository/component gates were not rerun during the
+focused repair. CI job/critical-path impact is unmeasured; the focused green test
+took about 0.8 seconds locally. Scratch logs are retained only with this runner.
+
+### Later diagnostic failure remains open
+
+A follow-up scratch-only synthetic PSI run with the nested-worker fix progressed
+past the original heap failure but failed at `calibration cleanup failed; no next
+leg` (`gate-log.MwR15t`, exit 1). Its report remained explicitly synthetic and
+unaccepted. Both owned trees had clean disposal evidence; both broker replies
+remained pending, primary exit records were empty, and final reply joins failed.
+The host subsequently confirmed removal of its owned containers, with no owned
+requests remaining. The second limit was not run.
+
+Read-only tracing identified two additional settlement seams. In
+`agent/codex/supervisor/supervisor.go`, the normal child-readiness branch emits
+`child_exit`, whereas disposal drains and returns without that event. The drain
+can reap the live primary through `realReap` in `main.go`, discarding its status.
+The launcher's `waitChild` therefore remains pending even after clean disposal.
+`makeDefaultSpawnCommand` in `agent/src/codex/codex-executor.ts` waits for an
+ordinary terminal condition after receiving pressure feedback, so the broker
+reply can remain pending until abort or its wall deadline. Separately,
+`calibration-fixture.mts` creates abort controllers but supplies no signal to its
+broker, leaving its cleanup aborts disconnected. These paths are unchanged by
+this repair and do not depend on the substituted PSI values.
+
+This diagnostic establishes neither a successful calibration nor the hosted
+first failure. The production settlement seam needs a real-helper regression
+and an explicit settlement design before correction; this commit only corrects
+the independently reproduced preload failure. Real PSI and canonical lane
+validation remain blockers under M3, and CI repair is not declared complete.

@@ -45,6 +45,8 @@ if (workerData.churn) {
     if (round < 4) {
       const child = new Worker(__filename, {
         workerData: { churn: true },
+        // This fixed CommonJS payload needs no inherited TypeScript preload.
+        execArgv: [],
         resourceLimits: { maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 2, stackSizeMb: 1 },
       });
       await new Promise((resolve, reject) => {

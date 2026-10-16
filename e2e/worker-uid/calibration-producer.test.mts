@@ -1,5 +1,7 @@
 import { requireSupervisorObservationPasses } from "./supervisor-observation-proof.mjs";
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { type FileHandle, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { runInNewContext } from "node:vm";
@@ -89,6 +91,64 @@ test("imports expose entrypoints without starting fixture, worker or load", () =
   assert.equal(typeof fixture, "function");
   assert.equal(typeof runProducer, "function");
   assert.equal(process.getActiveResourcesInfo().includes("Worker"), false);
+});
+
+test("CJS load worker ACKs four churn steps under the locked tsx preload", async () => {
+  const directory = await mkdtemp(path.join(scratch, "churn-preload-test."));
+  const script = path.join(directory, "churn-preload.mjs");
+  const loader = fileURLToPath(new URL("../../agent/node_modules/tsx/dist/loader.mjs", import.meta.url));
+  const fixturePath = fileURLToPath(new URL("../../agent/test/fixtures/worker-memory-load.cjs", import.meta.url));
+  try {
+    // A file entrypoint keeps node:test flags out of inherited worker execArgv.
+    await writeFile(script, `
+import assert from "node:assert/strict";
+import { mkdir, stat } from "node:fs/promises";
+import path from "node:path";
+import { Worker } from "node:worker_threads";
+const [fixturePath, directory, loader] = process.argv.slice(2);
+assert.deepEqual(process.execArgv, ["--import", loader]);
+const diskDir = path.join(directory, "disk");
+const shmemDir = path.join(directory, "shmem");
+await mkdir(diskDir);
+await mkdir(shmemDir);
+// Ordinary directories exercise fixture IO; this is not a tmpfs/PSI proof.
+const worker = new Worker(fixturePath, {
+  workerData: { diskDir, shmemDir, rounds: 16, chunkBytes: 1024 * 1024 },
+  resourceLimits: { maxOldGenerationSizeMb: 16, maxYoungGenerationSizeMb: 4, stackSizeMb: 1 },
+});
+let timer;
+let acknowledgements = 0;
+try {
+  // Four sequential steps cover all four nested churn threads. Any failure
+  // stops this case; one seven-second deadline bounds the entire sequence.
+  await new Promise((resolve, reject) => {
+    const fail = (reason) => reject(new Error("step " + (acknowledgements + 1) + " ACK failed: " + reason));
+    timer = setTimeout(() => fail("deadline"), 7000);
+    worker.on("error", (error) => fail(error.code + ": " + error.message));
+    worker.on("exit", (code) => fail("unexpected worker exit " + code));
+    worker.on("message", (message) => {
+      if (message !== "step") { fail("unexpected reply " + message); return; }
+      acknowledgements++;
+      console.log("step " + acknowledgements + " ACK");
+      if (acknowledgements === 4) resolve();
+      else worker.postMessage("step");
+    });
+    worker.postMessage("step");
+  });
+  for (const file of [path.join(diskDir, "dirty"), path.join(diskDir, "cache"), path.join(shmemDir, "shmem")]) {
+    assert.equal((await stat(file)).size, 4 * 1024 * 1024);
+  }
+} finally {
+  clearTimeout(timer);
+  await worker.terminate();
+}
+`);
+    // The child is reaped before cleanup, including the ten-second hard limit.
+    const { stdout } = await promisify(execFile)(process.execPath,
+      ["--import", loader, script, fixturePath, directory, loader],
+      { timeout: 10000, killSignal: "SIGKILL" });
+    assert.equal(stdout, "step 1 ACK\nstep 2 ACK\nstep 3 ACK\nstep 4 ACK\n");
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("ACK publication keeps old JSON readable until the owned temporary file is renamed", async () => {
