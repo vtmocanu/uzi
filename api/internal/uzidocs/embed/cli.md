@@ -144,7 +144,7 @@ uzi review undo <id> <rec> | stats [--json]
 uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings draft <finding-id> [<finding-id>...] [--json]
-uzi findings file <finding-id> [<finding-id>...]
+uzi findings file <finding-id> [<finding-id>...] [--send-to-uzi]
 uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
@@ -2149,6 +2149,8 @@ uzi findings draft <finding-id>                               # preview one issu
 uzi findings draft <finding-id> <finding-id> ...              # preview one grouped issue
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
+uzi findings file <finding-id> --send-to-uzi                 # file and request run labels
+uzi findings file <finding-id> <finding-id> ... --send-to-uzi # same for a group
 uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
@@ -2183,6 +2185,34 @@ a UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
 group draft includes assembled labels, including the mandatory marker label,
 but unedited CLI filing sends only the explicit ids and the server applies its
 mandatory marker label. Use explicit ids with `file`; there is no `--run` shortcut.
+
+`file --send-to-uzi` requests the configured run-eligibility label
+(`UziLabel`, default `uzi`) and autopilot label (`AutopilotLabel`, default
+`autopilot`) for either a single or grouped filing. The server appends them,
+deduplicated, after the mandatory finding marker and sanitized, capped explicit
+labels, without displacing accepted explicit labels. Omitting the flag keeps
+filing unchanged. Stored agent suggestions do not automatically attach; manual
+label selection in the web draft remains available.
+
+In human output, a confirmed issue filed with the flag also prints
+"Queued for uzi: starts on the next sync if autopilot is on", followed by
+"Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
+An uncertain group result without a confirmed issue prints no queued confirmation;
+the pending-operation and release guidance below still applies. JSON output keeps
+the existing result DTO.
+
+This is a label request evaluated on the next normal repo sync, not a guaranteed
+run or an autopilot opt-in. The repo owner's connection PAT supplies the forge
+issue author and label-event actor, which need not match the browser user.
+The owner must already have autopilot enabled and a nonempty `human_username`
+matching the event adder or, as fallback, the issue author; repo ownership and
+opt-in alone do not suffice if both mismatch. A consent refusal records the
+event and attempts one explanatory comment, leaving manual **Start run**
+available. Enabling autopilot after a handled refusal requires removing and
+re-adding its label. A missing current label-add event waits without a run or
+comment. Existing credential, harness, active-run, open-PR and description-size
+checks remain in force. See [sending a finding to uzi](./findings.md#sending-the-filed-issue-to-uzi)
+and [Autopilot](./autopilot.md).
 
 `file` turns one coordinate into a real forge issue on **your own** connection. The
 title, description and labels are assembled server-side from the stored, sanitised

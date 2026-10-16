@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
+  Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
+
 ### Fixed
 
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
