@@ -641,18 +641,39 @@ resolve_fixture_source_hold() {
   pass "fixture owner decision recorded: run=$run generation=$generation hold=$id; archives preserved"
 }
 
+# Phase-52 completed fixtures may still be preparing a capture after terminal
+# reporting. Opt in to bounded exact-generation settlement; legacy callers of
+# either strict helper keep their existing semantics.
+resolve_completed_fixture_source_hold() {
+  wait_completed_custody_receipt "$1" "${3:-120}" "$2"
+}
+
+discard_completed_fixture_hold() {
+  curl -fsS --max-time "$3" -b "$JAR" -X DELETE \
+    "$BASE/api/runs/$1/recovery-holds/$2?confirm=discard" \
+    -H "X-CSRF-Token: $(csrf)"
+}
+
 # A completed status precedes the worker's final custody ACK. Wait only for this
 # run's current generation, preserving every older or unrelated source hold.
 wait_completed_custody_receipt() {
-  local run="$1" timeout="${2:-120}" start=$SECONDS snapshot generation expected=""
+  local run="$1" timeout="${2:-120}" start=$SECONDS snapshot="" generation expected="${3:-}"
+  local fixture=0 expected_hold="" discarded="" disposition_error="" remaining query id reply
+  if [ "${3+x}" ]; then
+    [[ "$expected" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed fixture generation: $expected"
+    fixture=1
+  fi
   [[ "$run" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid completed receipt run: $run"
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid completed receipt timeout: $timeout"
   while :; do
-    snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
+    query="SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
       'owner_id',r.user_id,'worker_id',r.worker_id,'repo_id',r.repo_id,'mr_iid',r.mr_iid,'final_head',r.completion_final_head,
+      'worker_active',(SELECT count(*) FROM worker_active_runs a WHERE a.run_id=r.id),
       'branch',CASE WHEN r.kind='issue' THEN 'agent/issue-'||r.issue_iid::text
         WHEN r.kind='mr_rework' THEN r.pipeline_ref WHEN r.kind='self_improve' THEN 'uzi/self-improve/'||r.id::text END,
       'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'generation',h.generation,
+        'attention',f.attention,'capture_state',f.capture_state,
+        'capture_count',(SELECT count(*) FROM recovery_captures c WHERE c.hold_id=h.id AND c.user_id=h.user_id),
         'inventory_guarded',h.inventory_guarded,'state',h.state,'final_disposition',h.final_disposition,
         'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,
         'final_coverage_digest',h.final_coverage_digest,'release_evidence',h.release_evidence,
@@ -661,8 +682,21 @@ wait_completed_custody_receipt() {
         'after_outcome',h.released_at >= r.finished_at,'archive_matches',EXISTS(SELECT 1 FROM recovery_captures c
           WHERE c.id=h.final_capture_id AND c.hold_id=h.id AND c.manifest_bound
             AND c.source_sha=h.final_source_sha AND c.coverage_digest=h.final_coverage_digest)))
-        FROM recovery_custody_holds h WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=r.claim_generation),'[]'::json))::text
-      FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
+        FROM recovery_custody_holds h JOIN recovery_custody_hold_facts f ON f.id=h.id
+        WHERE h.run_id=r.id AND h.user_id=r.user_id AND h.generation=r.claim_generation),'[]'::json))::text
+      FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')"
+    if [ "$fixture" = 1 ]; then
+      remaining=$((timeout - (SECONDS - start)))
+      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot $disposition_error"
+      snapshot="$(db_psql_rows "$query" "$remaining")" || fail "completed fixture settlement read failed: $snapshot"
+      printf '%s' "$snapshot" | jq -e --arg run "$run" '
+        .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
+        and (.holds|type=="array")' >/dev/null || fail "completed fixture invalid run snapshot: $snapshot"
+      [ "$(printf '%s' "$snapshot" | jq -r '.generation')" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
+      if [ "$(printf '%s' "$snapshot" | jq '.holds|length')" = 0 ]; then sleep 0.5; continue; fi
+    else
+      snapshot="$(db_psql "$query")"
+    fi
     printf '%s' "$snapshot" | jq -e --arg run "$run" '
       .run_id==$run and .status=="completed" and (.generation|type=="number" and .>0 and .==floor)
       and (.holds|type=="array" and length==1) and .holds[0].generation==.generation' >/dev/null \
@@ -670,6 +704,16 @@ wait_completed_custody_receipt() {
     generation="$(printf '%s' "$snapshot" | jq -r '.generation')"
     [ -z "$expected" ] && expected="$generation"
     [ "$generation" = "$expected" ] || fail "completed receipt generation changed: $snapshot"
+    if [ "$fixture" = 1 ]; then
+      id="$(printf '%s' "$snapshot" | jq -r '.holds[0].id')"
+      [[ "$id" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]] || fail "completed fixture invalid hold identity: $snapshot"
+      [ -n "$expected_hold" ] || expected_hold="$id"
+      [ "$id" = "$expected_hold" ] || fail "completed fixture hold identity changed: $snapshot"
+      if [ "$discarded" = "$id" ] && printf '%s' "$snapshot" | jq -e '.holds[0].state=="discarded"' >/dev/null; then
+        pass "completed fixture owner disposition: run=$run generation=$generation hold=$id"
+        return
+      fi
+    fi
     if printf '%s' "$snapshot" | jq -e '.holds[0].state=="released"' >/dev/null; then
       printf '%s' "$snapshot" | jq -e '. as $run | .holds[0] |
         (.inventory_guarded==true and .after_outcome==true and (
@@ -700,6 +744,18 @@ wait_completed_custody_receipt() {
     fi
     printf '%s' "$snapshot" | jq -e '.holds[0] | .state=="open" and .final_disposition==null and .release_evidence==null' >/dev/null \
       || fail "completed receipt has unexpected disposition: $snapshot"
+    if [ "$fixture" = 1 ] && [ -z "$discarded" ] && printf '%s' "$snapshot" | jq -e '
+      .worker_active==0 and (.holds[0] | .attention=="source_only" and .capture_count==0 and .capture_state=="")' >/dev/null; then
+      remaining=$((timeout - (SECONDS - start)))
+      [ "$remaining" -gt 0 ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot $disposition_error"
+      # Exactly the owner's existing hold-discard API, never archive deletion.
+      # A concurrent publication release can win this race: re-read and require
+      # its typed proof rather than treating a rejected discard as success.
+      if reply="$(discard_completed_fixture_hold "$run" "$id" "$remaining" 2>&1)"; then
+        printf '%s' "$reply" | jq -e '.discarded==true' >/dev/null || fail "completed fixture disposition not acknowledged: $reply snapshot=$snapshot"
+        discarded="$id"
+      else disposition_error="owner disposition failed: $reply"; fi
+    fi
     [ $((SECONDS - start)) -lt "$timeout" ] || fail "completed custody receipt timeout after ${timeout}s: $snapshot"
     sleep 0.5
   done

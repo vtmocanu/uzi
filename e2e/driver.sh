@@ -160,7 +160,7 @@ _mirror_boundary() {
     printf 'boundary copy unavailable: no timeout/gtimeout limiter\n' > "$dir/boundary-copy.stderr"
     rc=127
   else
-    "$limiter" --signal=KILL 2 cp -R "$_boundary_dir" "$dir/boundary" > "$dir/boundary-copy.stdout" 2> "$dir/boundary-copy.stderr" || rc=$?
+    "$limiter" --signal=KILL 2 bash -c 'rm -rf -- "$2" && cp -R -- "$1" "$2"' bash "$_boundary_dir" "$dir/boundary" > "$dir/boundary-copy.stdout" 2> "$dir/boundary-copy.stderr" || rc=$?
   fi
   if ! printf '%s\n' "$rc" > "$dir/boundary-copy.exit"; then
     _boundary_error "boundary evidence copy status unavailable (see artifacts/$1/boundary-copy.exit)"

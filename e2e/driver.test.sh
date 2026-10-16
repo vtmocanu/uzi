@@ -1048,6 +1048,20 @@ has_row origin FAIL || bad 'read failure lost'
 [ -f "$RUNROOT/artifacts/01-origin/boundary/1-workers.exit" ] || bad 'current evidence was not published'
 end
 
+begin 'artifacts: replace an uploaded boundary mirror without replacing body evidence' capture-existing
+boundary_fixture
+mkdir -p "$RUNROOT/artifacts/01-origin/boundary"
+printf 'old cancel response\n' > "$RUNROOT/artifacts/01-origin/boundary/cancel-$R.body"
+printf 'current body evidence\n' > "$RUNROOT/artifacts/01-origin/phase.log"
+FAKE_WORKER_ERROR=1
+run_driver capture-existing
+has_row origin FAIL || bad 'read failure lost'
+[ ! -e "$RUNROOT/artifacts/01-origin/boundary/cancel-$R.body" ] || bad 'old uploaded cancel evidence survived'
+[ -f "$RUNROOT/artifacts/01-origin/boundary/1-workers.exit" ] || bad 'current boundary was nested instead of replaced'
+[ ! -d "$RUNROOT/artifacts/01-origin/boundary/01-origin" ] || bad 'nested boundary directory was published'
+[ "$(cat "$RUNROOT/artifacts/01-origin/phase.log")" = 'current body evidence' ] || bad 'body evidence was replaced'
+end
+
 begin 'artifacts: mirror status I/O failure cannot suppress the phase verdict' capture-status-io
 FAKE_WORKER_ERROR=1
 mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
@@ -1100,7 +1114,7 @@ FAKE_REAL_LIMITER="$(command -v timeout || command -v gtimeout)"
 cat > "$TMP/limiter-bin/timeout" <<'LIMITER_EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_LIMITER_LOG"
-if [ "${FAKE_COPY_FAIL:-0}" = 1 ] && [ "$3" = cp ]; then exit 124; fi
+if [ "${FAKE_COPY_FAIL:-0}" = 1 ] && [ "$2" = 2 ]; then exit 124; fi
 if [[ "$*" = *'forge-fake' ]]; then echo truncated >&2; exit 137; fi
 exec "$FAKE_REAL_LIMITER" "$@"
 LIMITER_EOF

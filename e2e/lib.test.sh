@@ -148,6 +148,8 @@ settle "never-terminal run: returns 0 once the timeout passes" 5 running
 eval "$(awk '/^wait_custody_headroom\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_forge_park_release\(\) \{/,/^\}/' "$LIB")"
 eval "$(awk '/^wait_completed_custody_receipt\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^resolve_completed_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
+eval "$(awk '/^discard_completed_fixture_hold\(\) \{/,/^\}/' "$LIB")"
 pass() { echo "$*"; }
 apiget() {
   case "$1" in
@@ -885,9 +887,17 @@ fixture_phase_boundary() {
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
+  db_psql_rows() {
+    [[ "$1" == SELECT* && "$1" != *UPDATE* && "$1" != *DELETE* ]] || fail 'unexpected completed fixture SQL'
+    jq -c --arg run "$run" '
+      [.holds[]|select(.run_id==$run)] as $holds |
+      {run_id:$run,status:"completed",generation:$holds[0].generation,worker_active:0,
+        holds:[$holds[0]+{capture_count:0,capture_state:""}]}' "$SEQ_DIR/boundary-holds"
+  }
+  discard_completed_fixture_hold() { uzi_cli run discard "$1" --hold "$2" --yes --json; }
   local source="$ROOT/e2e/phases/$phase.sh"
   [ "$phase" != 52-api-outage-outbox ] || source="$OUTBOX_PHASE_TEST_SOURCE"
-  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$source")"
+  eval "$(awk '/^[[:space:]]*resolve_(completed_)?fixture_source_hold /' "$source")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
   [ "$before" = 15 ] && [ "$after" -lt 14 ] || fail 'next sweep still blocked by deliberate fixture holds'
   jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
@@ -1004,6 +1014,7 @@ fixture_outbox_cases() {
       || fail 'cleanup preceded original assertions'
     echo "cleanup:$i" >> "$SEQ_DIR/outbox-events"
   }
+  resolve_completed_fixture_source_hold() { resolve_fixture_source_hold "$@"; }
   # Keep every statement between the actual case boundaries, including rb_run_field's
   # real definition after cases 1/2. No predeclared generation can mask a late snapshot.
   # shellcheck disable=SC1090
@@ -1194,6 +1205,75 @@ for mode in entry window discard idle; do
     passed=$((passed + 1)); echo "PASS: real custody phase idle boundary $mode"
   else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
 done
+
+eval "$(awk '/^resolve_completed_fixture_source_hold\(\) \{/,/^\}/' "$LIB")"
+# On the unfixed library, drive the old cleanup through the same call seam.
+if ! type resolve_completed_fixture_source_hold >/dev/null 2>&1; then
+  resolve_completed_fixture_source_hold() { resolve_fixture_source_hold "$@"; }
+fi
+completed_fixture_pending() {
+  local mode="$1" hold=b4dec5cf-e6d4-413b-b3a8-0005a2835770 step n=0
+  : > "$SEQ_DIR/pending-seq"; echo 1 > "$SEQ_DIR/pending-n"; : > "$SEQ_DIR/discard-attempts"
+  local steps=(missing preparing uploading completed-publication)
+  case "$mode" in
+    archive) steps=(preparing uploading released) ;;
+    archive-publication-race) steps=(available completed-publication) ;;
+    owner-publication-race) steps=(source-only completed-publication) ;;
+    owner) steps=(source-only discarded) ;;
+    timeout) steps=(uploading) ;;
+    bad-proof) steps=(wrong-archive) ;;
+    changed-generation) steps=(generation-change) ;;
+  esac
+  for step in "${steps[@]}"; do
+    completed_receipt_fixture "$step"
+    jq -c --arg run "$UUID" --arg id "$hold" --arg step "$step" '
+      .run_status=.status | .worker_active=0 |
+      .holds |= map(.+{id:$id,run_id:$run,capture_count:1,attention:"capturing",capture_state:"uploading",captures:[{state:"available"}]}) |
+      if .holds[0].completion_identity then .holds[0].completion_identity.hold_id=$id | .holds[0].completed_publication_receipt.hold_id=$id else . end |
+      if ($step|IN("preparing","uploading","available","source-only")) then
+        .holds[0] += {state:"open",final_disposition:null,release_evidence:null,
+          capture_state:(if $step=="source-only" then "" else $step end),
+          capture_count:(if $step=="source-only" then 0 else 1 end),
+          attention:(if $step=="source-only" then "source_only" elif $step=="available" then "archive_ready" else "capturing" end),
+          has_available_capture:($step=="available")}
+      else . end' "$SEQ_DIR/seq" >> "$SEQ_DIR/pending-seq"
+  done
+  db_psql_rows() {
+    [[ "$1" == SELECT* && "$1" == *"r.id='$UUID'"* && "$1" != *DELETE* && "$1" != *UPDATE* ]] || fail 'unscoped pending read'
+    [ "$2" -gt 0 ] && [ "$2" -le 5 ] || fail 'pending read exceeded shared budget'
+    n="$(cat "$SEQ_DIR/pending-n")"
+    awk -v n="$n" 'NR==n' "$SEQ_DIR/pending-seq"
+    [ "$n" -ge "$(wc -l < "$SEQ_DIR/pending-seq")" ] || echo $((n + 1)) > "$SEQ_DIR/pending-n"
+  }
+  db_psql() { db_psql_rows "$1" 5; }
+  apiget() {
+    local frame
+    frame="$(awk -v n="$(cat "$SEQ_DIR/pending-n")" 'NR==n' "$SEQ_DIR/pending-seq")"
+    case "$1" in
+      /api/recovery/holds) printf '%s' "$frame" | jq '{holds}' ;;
+      */archives) echo '{"archives":[{"id":"kept","state":"available","checksum":"stable","byte_size":12}]}' ;;
+      *) printf '%s' "$frame" | jq '{run:{id:.run_id,status:.status}}' ;;
+    esac
+  }
+  discard_completed_fixture_hold() {
+    [ "$1" = "$UUID" ] && [ "$2" = "$hold" ] && [ "$3" -gt 0 ] || fail 'wrong pending disposition'
+    echo attempted >> "$SEQ_DIR/discard-attempts"
+    [ "$mode" != owner-publication-race ] || return 22
+    echo '{"discarded":true}'
+  }
+  uzi_cli() { fail 'old immediate cleanup cannot settle the pending fixture'; }
+  resolve_completed_fixture_source_hold "$UUID" 1 5
+  case "$mode" in
+    owner|owner-publication-race) [ "$(wc -l < "$SEQ_DIR/discard-attempts" | tr -d ' ')" = 1 ] || fail 'owner choice not exact' ;;
+    *) [ ! -s "$SEQ_DIR/discard-attempts" ] || fail 'captured evidence was discarded' ;;
+  esac
+}
+for mode in publication archive archive-publication-race owner-publication-race owner; do
+  custody_case "completed fixture settles $mode" pass '' completed_fixture_pending "$mode"
+done
+custody_case 'completed fixture preserves pending capture on timeout' fail 'receipt timeout' completed_fixture_pending timeout
+custody_case 'completed fixture rejects invalid archive proof' fail 'lacks final custody proof' completed_fixture_pending bad-proof
+custody_case 'completed fixture refuses a changed generation' fail 'generation changed' completed_fixture_pending changed-generation
 
 # Real DB helper regressions: use an executable compose fake so timeout wraps
 # the same command shape as production, without sourcing lib.sh's provisioning.

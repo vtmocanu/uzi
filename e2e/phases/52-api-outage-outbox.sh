@@ -435,7 +435,7 @@ NT1="$(printf '%s' "$M1" | jq '[.messages[] | select((.payload.text? // "") | st
 pass "case 1: spill+drain proven — barrier seen, run completed with no failed report, $NT1 ticks replayed, stream gapless 1..$(printf '%s' "$M1" | jq '.messages | length')"
 # Each sibling case makes its separate fixture-owner disposition only after proving
 # preservation; case 3 alone retains its exact hold for the boundary handoff.
-resolve_fixture_source_hold "$RUN1" "$GEN1"
+resolve_completed_fixture_source_hold "$RUN1" "$GEN1"
 
 # =============================================================================
 # CASE 2 — a tiny per-run quota forces eviction; replay fills the range per-seq.
@@ -479,7 +479,7 @@ else
   say "case 2: no quota eviction observed on this run (segment sizing / spill volume left it under the 1 KiB quota); the contiguous-stream invariant still held (observed-only, by design)"
 fi
 
-resolve_fixture_source_hold "$RUN2" "$GEN2"
+resolve_completed_fixture_source_hold "$RUN2" "$GEN2"
 
 # =============================================================================
 # PRD #1391 M6 (Run B) — write-ahead terminal reports survive the SAME outage. A run-lane
@@ -609,7 +609,7 @@ RB2_FR="$(apiget "/api/runs/$RUN_B2" | jq -r '.run.failure_reason // ""')"
 [ -z "$RB2_FR" ] \
   || fail "case 4: run carried a failure_reason after the restart — the journaled outcome was not the result: $RB2_FR"
 pass "case 4: agent restart mid-outage -> boot gate landed the journaled completed at gen $GEN_B2 (no re-claim, no requeue), stream gapless"
-resolve_fixture_source_hold "$RUN_B2" "$GEN_B2"
+resolve_completed_fixture_source_hold "$RUN_B2" "$GEN_B2"
 
 # =============================================================================
 # CASE 5 — a run in the timeout-sweep CARVE-OUT (completion_attempts>0, set in the DB; the run itself is not interlocked) whose lost terminal lands on replay: it does not sit non-terminal forever.
@@ -659,7 +659,7 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 [ -z "$RB3_ORIGIN" ] \
   || fail "case 5: run carried fail_origin=$RB3_ORIGIN — a wall-clock sweep failed it instead of the journal landing 'completed'"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
-resolve_fixture_source_hold "$RUN_B3" "$GEN_B3"
+resolve_completed_fixture_source_hold "$RUN_B3" "$GEN_B3"
 
 # =============================================================================
 # Cases 3-8 hold stub completion until the cut. Cases 7-8 require a durable
@@ -693,7 +693,7 @@ RB4_FR="$(apiget "/api/runs/$RUN_B4" | jq -r '.run.failure_reason // ""')"
 [ "$(rb_run_field "$RUN_B4" claim_generation)" = "$GEN_B4" ] \
   || fail "case 6: generation advanced — the run was re-executed instead of waiting out the outage (gen $GEN_B4 -> $(rb_run_field "$RUN_B4" claim_generation))"
 pass "case 6: the interlocked run waited out the outage for its permit -> completed at gen $GEN_B4, no false failed"
-resolve_fixture_source_hold "$RUN_B4" "$GEN_B4"
+resolve_completed_fixture_source_hold "$RUN_B4" "$GEN_B4"
 
 # =============================================================================
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
