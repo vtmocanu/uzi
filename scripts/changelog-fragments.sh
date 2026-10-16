@@ -22,6 +22,8 @@ shift
 case "$mode" in
   validate)
     if [ "$#" -gt 0 ]; then
+      [ "$#" -le 1024 ] || { changelog_fragment_error 'more than 1024 fragments'; exit 1; }
+      changelog_fragment_safe_entries
       for path in "$@"; do changelog_fragment_validate "$path"; done
     else
       changelog_fragment_inventory
@@ -35,24 +37,29 @@ case "$mode" in
   render-body|render-unreleased)
     [ "$#" -eq 1 ] || usage
     [ ! -L "$1" ] && [ -f "$1" ] || { changelog_fragment_error 'legacy input must be a regular file'; exit 1; }
-    changelog_fragment_no_nul "$1"
-    changelog_fragment_inventory
     mkdir -p .uzi/scratch
     work="$(mktemp -d .uzi/scratch/changelog-render.XXXXXX)"
     trap 'rm -rf "$work"' EXIT
+    changelog_fragment_inventory "$work"
+    limit=4194304
+    [ "$mode" != render-unreleased ] || limit=16777216
+    changelog_fragment_snapshot "$1" "$work/source" "$limit"
+    changelog_fragment_no_nul "$work/source"
     if [ "$mode" = render-unreleased ]; then
       awk '
         /^## \[Unreleased\]$/ { seen++; active = 1; next }
         /^## \[/ { active = 0 }
         active { print }
         END { if (seen != 1) exit 1 }
-      ' < "$1" > "$work/legacy" || { changelog_fragment_error 'expected exactly one [Unreleased] section'; exit 1; }
+      ' < "$work/source" > "$work/legacy" || { changelog_fragment_error 'expected exactly one [Unreleased] section'; exit 1; }
     else
-      cp -- "$1" "$work/legacy"
+      cp -- "$work/source" "$work/legacy"
     fi
     # Prefix operands so awk cannot interpret a filename as an assignment.
-    inputs=("$work/legacy")
-    for path in "${CHANGELOG_FRAGMENTS[@]}"; do inputs+=("./$path"); done
+    total=$(wc -c < "$work/legacy")
+    for path in "${CHANGELOG_FRAGMENT_INPUTS[@]}"; do total=$((total + $(wc -c < "$path"))); done
+    [ "$total" -le 4194304 ] || { changelog_fragment_error 'pending input exceeds 4194304 bytes'; exit 1; }
+    inputs=("$work/legacy" "${CHANGELOG_FRAGMENT_INPUTS[@]}")
     awk -v legacy="$work/legacy" -f "$CHANGELOG_FRAGMENT_PARSER" "${inputs[@]}"
     ;;
   *) usage ;;

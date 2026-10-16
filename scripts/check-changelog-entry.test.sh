@@ -317,6 +317,50 @@ expect 1 "branch-new fragment deleted in workingtree cannot supply entry"
 fresh shipping-newline-path; mkdir -p "$W/api"; echo x > "$W/api/"$'new\nfile.go'
 expect 1 "shipping filename with newline is not lost"
 
+# Limits precede all exemptions and cover actual bounded fragment reads.
+for exemption in none docs deps; do
+  fresh "safety-limit-$exemption"
+  case "$exemption" in
+    none) echo '// change' >> "$W/api/x.go"; commit $'fix: change\n\nChangelog: none' ;;
+    docs) echo '// docs' >> "$W/api/x.go"; commit 'docs: change' ;;
+    deps) echo 'require y v1' >> "$W/api/go.mod"; commit 'chore(deps): change' ;;
+  esac
+  python3 - "$W/$fragment" <<'PYFIX'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b'### Fixed\n\n- **Outcome.**\n  ' + b'x' * 65536 + b'\n')
+PYFIX
+  expect 1 "$exemption cannot exempt oversized fragment"
+done
+fresh bidi-fragment
+printf '### Fixed\n\n- **Outcome.**\n  Unsafe \342\200\256text\342\200\254.\n' > "$W/$fragment"
+expect 1 'PR check rejects bidi in changed fragment'
+fresh count-limit
+python3 - "$W/changelog.d" <<'PYFIX'
+from pathlib import Path
+import sys
+for i in range(1025):
+    (Path(sys.argv[1]) / f'{i:08x}-1111-4111-8111-111111111111.md').write_text('### Fixed\n\n- **Outcome.**\n  Description.\n')
+PYFIX
+expect 1 'PR check rejects inventory count before nonshipping exemption'
+fresh aggregate-limit
+python3 - "$W/changelog.d" <<'PYFIX'
+from pathlib import Path
+import sys
+prefix = b'### Fixed\n\n- **Outcome.**\n  '
+for i in range(65):
+    (Path(sys.argv[1]) / f'{i:08x}-1111-4111-8111-111111111111.md').write_bytes(prefix + b'x' * (65536-len(prefix)-1) + b'\n')
+PYFIX
+expect 1 'PR check rejects fragment aggregate before nonshipping exemption'
+fresh combined-limit
+write_fragment
+python3 - "$W/CHANGELOG.md" <<'PYFIX'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b'## [Unreleased]\n### Fixed\n- ' + b'x' * 4194280 + b'\n')
+PYFIX
+expect 1 'PR check rejects combined body and fragments'
+
 echo "check-changelog-entry.test.sh: cases=$cases passed=$passed"
 [ "$cases" = "$passed" ] || exit 1
 [ "$cases" -ge "$FLOOR" ] || { echo "check-changelog-entry.test.sh: only $cases cases, floor $FLOOR" >&2; exit 1; }

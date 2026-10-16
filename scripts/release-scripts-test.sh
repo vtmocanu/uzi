@@ -2386,10 +2386,13 @@ for mode in rc stable no-commit commit-failure oracle-failure; do
       if [ "$mode" = rc ]; then
         repeat_start="$(git -C "$MF" rev-parse HEAD)"
         repeat_notes="$(awk 'NF' "$MF/CHANGELOG.md")"
+        awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p{print}' "$MF/CHANGELOG.md" > "$MF/.git/history-before"
         run_rc "$MF" 0.2.0
         assert_eq "repeat first RC before tagging refuses empty pending" 3 "$RC_RC"
         assert_eq "repeat before tag retains HEAD" "$repeat_start" "$(git -C "$MF" rev-parse HEAD)"
-        assert_eq "repeat before tag retains all nonblank note bytes" "$repeat_notes" "$(awk 'NF' "$MF/CHANGELOG.md")"
+        assert_eq "repeat before tag retains nonblank note lines" "$repeat_notes" "$(awk 'NF' "$MF/CHANGELOG.md")"
+        awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p{print}' "$MF/CHANGELOG.md" > "$MF/.git/history-after"
+        if cmp -s "$MF/.git/history-before" "$MF/.git/history-after"; then pass 'repeat historical bytes including blanks'; else fail 'repeat historical bytes including blanks'; fi
         assert_eq "repeat before tag never replays consumed fragment" 1 "$(fragment_count "$MF" 201)"
         assert_eq "repeat before tag fragment stays absent" no "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
         # Precommit preparation may normalize blank lines; restore only this repeat's
@@ -2460,11 +2463,12 @@ done
 for mode in promote-only promote skip; do
   MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; published_rc "$MF"; commit_fragment "$MF" 202
   start="$(git -C "$MF" rev-parse HEAD)"
+  cp "$MF/$fragment_path" "$MF/.git/promotion-fragment-before"
   if [ "$mode" = promote-only ]; then run_rc "$MF" 0.2.0 --promote-only; else run_rc "$MF" 0.3.0 "--$([ "$mode" = skip ] && echo skip-promote || echo promote)"; fi
   assert_eq "$mode pending fragment success" 0 "$RC_RC"
   if [ "$mode" = promote-only ]; then
     assert_eq "explicit promotion main unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
-    assert_eq "explicit promotion fragment unchanged" yes "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+    if cmp -s "$MF/.git/promotion-fragment-before" "$MF/$fragment_path"; then pass 'explicit promotion fragment bytes unchanged'; else fail 'explicit promotion fragment bytes unchanged'; fi
     assert_eq "explicit promotion notes not on main" 0 "$(fragment_count "$MF" 202)"
   else
     assert_eq "$mode fragment folded once" 1 "$(fragment_count "$MF" 202)"
@@ -2513,6 +2517,94 @@ for inventory in legacy mixed; do
   [ "$inventory" != mixed ] || expected=$'- Added legacy\n- **Fragment 201\n- **Changed fragment\n- Fixed legacy\n- Fixed duplicate'
   assert_eq "$inventory deterministic block order and multiplicity" "$expected" "$(awk '/^- / && !/Initial/ {sub(/ \(.*/, ""); print}' "$MF/CHANGELOG.md")"
   assert_eq "$inventory released section stays at original version" $'## [0.1.0] - 2026-09-01\n- Initial ([#100](https://github.com/vtmocanu/uzi/pull/100))' "$(awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p && NF{print}' "$MF/CHANGELOG.md")"
+  rm -rf "$MF"
+done
+
+# Already maintained historical content needs no linking/date reconciliation.
+# Bound this section by another released heading so blank bytes are significant.
+MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; commit_fragment "$MF" 201
+cat <<'MD' | put_changelog "$MF"
+# Changelog
+
+## [Unreleased]
+
+## [0.1.0] - 2026-09-01
+
+### Added
+
+- **Initial** ([#100](https://github.com/vtmocanu/uzi/pull/100))
+
+
+## [0.0.9] - 2026-08-01
+
+- Older already maintained history.
+MD
+history_section() { awk '/^## \[0.0.9\]/{exit} /^## \[0.1.0\]/{p=1} p{print}' "$1"; }
+history_section "$MF/CHANGELOG.md" > "$MF/.git/history-before"
+# Exercise the read-only assembly seam before the cutter's splice and full cut.
+(cd "$MF" && bash scripts/changelog-fragments.sh render-unreleased CHANGELOG.md) > "$MF/.git/assembled"
+history_section "$MF/CHANGELOG.md" > "$MF/.git/history-after"
+if cmp -s "$MF/.git/history-before" "$MF/.git/history-after"; then pass 'assembly leaves exact history bytes'; else fail 'assembly leaves exact history bytes'; fi
+run_rc "$MF" 0.2.0
+assert_eq 'maintained historical fixture cut succeeds' 0 "$RC_RC"
+history_section "$MF/CHANGELOG.md" > "$MF/.git/history-after"
+if cmp -s "$MF/.git/history-before" "$MF/.git/history-after"; then pass 'full cut splice preserves exact historical bytes including blanks'; else fail 'full cut splice preserves exact historical bytes including blanks'; fi
+rm -rf "$MF"
+
+# Deterministic two-input failures: remove the first input then fail, or refuse
+# final staging after both removals. Each independent fixture restores and retries.
+for fault in first-deletion staging; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; commit_fragment "$MF" 201
+  write_fragment "$MF" 202; mv "$MF/$fragment_path" "$MF/$fragment_second"
+  git -C "$MF" restore -- "$fragment_path"
+  git -C "$MF" add -- "$fragment_second"; gcommit "$MF" 'docs: second fragment'
+  start="$(git -C "$MF" rev-parse HEAD)"
+  cp "$MF/$fragment_path" "$MF/.git/original-first"
+  cp "$MF/$fragment_second" "$MF/.git/original-second"
+  mkdir "$MF/.git/bin"
+  real_rm="$(command -v rm)"; real_git="$(command -v git)"
+  cat > "$MF/.git/bin/rm" <<'STUB'
+#!/usr/bin/env bash
+if [ "$FIXTURE_FAULT" = first-deletion ] && [ "$#" = 2 ] && [ "$1" = -- ] && [ "$2" = "$FIXTURE_FIRST" ]; then
+  "$FIXTURE_RM" "$@" || exit
+  printf 'first-deletion\n' > .git/fault-reached
+  exit 1
+fi
+exec "$FIXTURE_RM" "$@"
+STUB
+  cat > "$MF/.git/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if [ "$FIXTURE_FAULT" = staging ] && [ "${1:-}" = add ] && [ "${2:-}" = -- ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "$FIXTURE_FIRST" ]; then
+      printf 'staging\n' > .git/fault-reached
+      exit 1
+    fi
+  done
+fi
+exec "$FIXTURE_GIT" "$@"
+STUB
+  chmod +x "$MF/.git/bin/rm" "$MF/.git/bin/git"
+  PATH="$MF/.git/bin:$PATH" FIXTURE_FAULT="$fault" FIXTURE_FIRST="$fragment_path" FIXTURE_RM="$real_rm" FIXTURE_GIT="$real_git" run_rc "$MF" 0.2.0
+  assert_eq "$fault reached intended boundary" "$fault" "$(cat "$MF/.git/fault-reached")"
+  assert_eq "$fault cut fails" 1 "$RC_RC"
+  assert_eq "$fault HEAD retained" "$start" "$(git -C "$MF" rev-parse HEAD)"
+  assert_eq "$fault first input removed" no "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+  expected=no; [ "$fault" != first-deletion ] || expected=yes
+  assert_eq "$fault second input at boundary" "$expected" "$([ -f "$MF/$fragment_second" ] && echo yes || echo no)"
+  for number in 201 202; do assert_eq "$fault assembled $number once" 1 "$(fragment_count "$MF" "$number")"; done
+  assert_contains "$fault restore includes both inputs" "git restore --source=$start --staged --worktree -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh $fragment_path $fragment_second" "$RC_OUT"
+  git -C "$MF" restore --source="$start" --staged --worktree -- "${fragment_owned[@]}" "$fragment_second"
+  for pair in "original-first:$fragment_path" "original-second:$fragment_second"; do
+    original=${pair%%:*}; input=${pair#*:}
+    git -C "$MF" show ":$input" > "$MF/.git/restored-index"
+    if cmp -s "$MF/.git/$original" "$MF/$input" && cmp -s "$MF/.git/$original" "$MF/.git/restored-index"; then pass "$fault $input original index/worktree bytes"; else fail "$fault $input original index/worktree bytes"; fi
+  done
+  assert_eq "$fault restored tree and index clean" '' "$(git -C "$MF" status --porcelain --untracked-files=no)"
+  run_rc "$MF" 0.2.0
+  assert_eq "$fault restored retry succeeds" 0 "$RC_RC"
+  for number in 201 202; do assert_eq "$fault retry $number exactly once" 1 "$(fragment_count "$MF" "$number")"; done
+  assert_eq "$fault retry consumes both inputs" '' "$(git -C "$MF" ls-files -- "$fragment_path" "$fragment_second")"
   rm -rf "$MF"
 done
 

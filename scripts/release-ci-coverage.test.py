@@ -151,6 +151,13 @@ class Metadata(RepoFixture, unittest.TestCase):
 class FragmentMetadata(RepoFixture, unittest.TestCase):
     canonical = 'changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md'
 
+    def test_malformed_content_deletion_is_metadata_only(self):
+        # Cut/parser validation owns content; CI metadata classifies the deletion.
+        self.write(self.canonical, 'malformed fragment content\n')
+        parent = self.commit()
+        Path(self.canonical).unlink()
+        self.assertTrue(policy.metadata(parent, self.commit()))
+
     def test_classifier_matrix(self):
         cases = [
             (self.canonical, 'D', 0o644, True),

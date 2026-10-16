@@ -17,6 +17,8 @@ function flush() {
     }
 }
 {
+    # UTF-8 encodings of ALM, LRM/RLM, embeddings/overrides and isolates.
+    if ($0 ~ /\330\234|\342\200[\216\217\252-\256]|\342\201[\246-\251]/) fail("direction control in input")
     printable = $0
     gsub(/\t/, "", printable)
     if (printable ~ /[[:cntrl:]]/) fail("control byte in input")

@@ -26,6 +26,148 @@ equal() {
   else echo "FAIL: $3" >&2; diff -u "$1" "$2" >&2 || true; fi
 }
 valid() { printf '### %s\n\n- **%s.**\n  Description.\n' "$1" "$2" > "$W/$3"; }
+# Safety regressions also run alone against a frozen source export.
+empty_output() {
+  cases=$((cases + 1))
+  if [ ! -s "$TMP/out" ]; then passed=$((passed + 1)); else echo "FAIL: $1 emitted stdout" >&2; fi
+}
+bidi_path=$(python3 -c "print('changelog.d/' + chr(0x202e) + 'bad' + chr(0x202c) + '.md')")
+for bad in $'changelog.d/\033[2J\nFORGED: success.md' "$bidi_path"; do
+  expect 1 'unsafe path diagnostic' validate "$bad"
+  LC_ALL=C printf 'changelog-fragments: invalid fragment path: %q\n' "$bad" > "$TMP/expected-error"
+  equal "$TMP/expected-error" "$TMP/err" 'exact quoted diagnostic bytes'
+done
+for control in 061c 200e 200f 202a 202b 202c 202d 202e 2066 2067 2068 2069; do
+  direction=$(python3 -c 'import sys; print(chr(int(sys.argv[1], 16)), end="")' "$control")
+  printf '### Fixed\n\n- **Outcome.**\n  Unsafe %s text.\n' "$direction" > "$W/$A"
+  expect 1 "fragment direction control $control" validate "$A"
+  empty_output 'direction control validation'
+  printf '### Fixed\n\n- Legacy %s text\n' "$direction" > "$W/safety-body"
+  rm "$W/$A"
+  expect 1 "legacy direction control $control" render-body safety-body
+  empty_output 'direction control render'
+  printf '%s\n' 'changelog-fragments: .uzi/scratch/PLACEHOLDER/legacy:3: direction control in input' > "$TMP/expected-error"
+  # Normalize only the random scratch directory; message and byte safety stay exact.
+  sed -E 's@changelog-render\.[^/]+@PLACEHOLDER@' "$TMP/err" > "$TMP/normalized-error"
+  equal "$TMP/expected-error" "$TMP/normalized-error" 'direction diagnostic has no raw author bytes'
+done
+printf '### Fixed\n\n- **Café 😀.**\n  Déjà vu 🎉.\n' > "$W/$A"
+printf '### Fixed\n\n- Café 😀\n  Déjà vu 🎉.\n' > "$W/safety-body"
+expect 0 'normal UTF-8 validation' validate "$A"
+expect 0 'normal UTF-8 render' render-body safety-body
+cat > "$TMP/utf8-expected" <<'UTF8'
+### Fixed
+
+- Café 😀
+  Déjà vu 🎉.
+
+- **Café 😀.**
+  Déjà vu 🎉.
+UTF8
+equal "$TMP/utf8-expected" "$TMP/out" 'UTF-8 bytes preserved'
+python3 - "$W/$A" <<'PYFIX'
+from pathlib import Path
+import sys
+prefix = b'### Fixed\n\n- **Outcome.**\n  '
+Path(sys.argv[1]).write_bytes(prefix + b'x' * (65536 - len(prefix) - 1) + b'\n')
+PYFIX
+expect 0 '65536 byte fragment boundary' validate "$A"
+printf x >> "$W/$A"
+for mode in validate list render-body; do
+  args=(); [ "$mode" != render-body ] || args=(safety-body)
+  expect 1 '65537 byte fragment fails closed' "$mode" "${args[@]}"
+  empty_output 'oversized fragment'
+  printf 'changelog-fragments: input exceeds 65536 bytes\n' > "$TMP/expected-error"
+  equal "$TMP/expected-error" "$TMP/err" 'exact oversize diagnostic'
+done
+rm "$W/$A"
+python3 - "$W" <<'PYFIX'
+from pathlib import Path
+import sys
+w = Path(sys.argv[1])
+prefix = b'### Fixed\n\n- '
+(w / 'safety-body').write_bytes(prefix + b'x' * (4194304 - len(prefix) - 1) + b'\n')
+(w / 'safety-full').write_bytes(b'## [Unreleased]\n\n## [1.0.0]\n' + b'x' * (16777216 - 29))
+PYFIX
+expect 0 '4MiB pending body boundary' render-body safety-body
+printf x >> "$W/safety-body"
+expect 1 'pending body over 4MiB' render-body safety-body
+empty_output 'oversized body'
+# Full legacy history is capped separately and never buffered as pending entries.
+python3 - "$W/safety-full" <<'PYFIX'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+prefix = b'## [Unreleased]\n\n## [1.0.0]\n'
+p.write_bytes(prefix + b'x' * (16777216 - len(prefix)))
+PYFIX
+expect 0 '16MiB full legacy boundary' render-unreleased safety-full
+empty_output 'released history not pending'
+printf x >> "$W/safety-full"
+expect 1 'full legacy over 16MiB' render-unreleased safety-full
+empty_output 'oversized full legacy'
+# Combined budget catches individually valid fragments plus a valid body.
+python3 - "$W" "$A" <<'PYFIX'
+from pathlib import Path
+import sys
+w = Path(sys.argv[1])
+fragment = b'### Fixed\n\n- **Outcome.**\n  Description.\n'
+(w / sys.argv[2]).write_bytes(fragment)
+prefix = b'### Fixed\n\n- '
+(w / 'safety-body').write_bytes(prefix + b'x' * (4194304 - len(fragment) - len(prefix) - 1) + b'\n')
+PYFIX
+expect 0 'combined pending boundary' render-body safety-body
+printf x >> "$W/safety-body"
+expect 1 'combined pending over limit' render-body safety-body
+empty_output 'combined pending over limit'
+rm "$W/$A"
+python3 - "$W/changelog.d" <<'PYFIX'
+from pathlib import Path
+import sys
+for i in range(1024):
+    (Path(sys.argv[1]) / f'{i:08x}-1111-4111-8111-111111111111.md').write_text('### Fixed\n\n- **Outcome.**\n  Description.\n')
+PYFIX
+expect 0 '1024 fragments boundary' list
+valid Fixed Extra "$B"
+expect 1 '1025 fragments rejected' list
+empty_output 'fragment count limit'
+rm "$W/changelog.d/"*.md
+# 65 valid 64KiB fragments exceed the aggregate before any output.
+python3 - "$W/changelog.d" <<'PYFIX'
+from pathlib import Path
+import sys
+prefix = b'### Fixed\n\n- **Outcome.**\n  '
+for i in range(65):
+    (Path(sys.argv[1]) / f'{i:08x}-1111-4111-8111-111111111111.md').write_bytes(prefix + b'x' * (65536-len(prefix)-1) + b'\n')
+PYFIX
+expect 1 'fragment inventory aggregate limit' list
+empty_output 'inventory aggregate limit'
+rm "$W/changelog.d/"*.md
+# Change the tracked source immediately after validation. Rendering must consume
+# the validated snapshot, never an unbounded second read of the source path.
+valid Fixed 'Snapshot original' "$A"
+printf '### Fixed\n\n- **Snapshot original.**\n  Description.\n' > "$TMP/snapshot-expected"
+: > "$W/safety-body"
+mkdir "$TMP/awk-swap"
+cat > "$TMP/awk-swap/awk" <<'SH'
+#!/usr/bin/env bash
+"$FIXTURE_AWK" "$@" || exit
+if [ "${1:-}" = -v ] && [ "${2:-}" = mode=validate ]; then
+  printf '### Fixed\n\n- **Source replaced.**\n  Replacement.\n' > "$FIXTURE_FRAGMENT"
+  : > "$FIXTURE_MARKER"
+fi
+SH
+chmod +x "$TMP/awk-swap/awk"
+real_awk=$(command -v awk)
+PATH="$TMP/awk-swap:$PATH" FIXTURE_AWK="$real_awk" FIXTURE_FRAGMENT="$W/$A" FIXTURE_MARKER="$TMP/swap-reached" expect 0 'render uses validated bytes after source replacement' render-body safety-body
+equal "$TMP/snapshot-expected" "$TMP/out" 'rendered exact snapshot bytes'
+cases=$((cases + 1))
+if [ -f "$TMP/swap-reached" ]; then passed=$((passed + 1)); else echo 'FAIL: source replacement boundary not reached' >&2; fi
+rm "$W/$A"
+if [ "${1:-}" = --safety-only ]; then
+  echo "changelog-fragments safety: cases=$cases passed=$passed"
+  [ "$cases" -eq "$passed" ]; exit
+fi
 for category in Added Changed Deprecated Removed Fixed Security; do
   valid "$category" 'Outcome (#99)' "$A"
   expect 0 "category $category" validate
