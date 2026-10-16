@@ -63,7 +63,9 @@ test("late headers ignoring abort reject and detach a never-settling cancellatio
 
 const maintenanceWorkerId = "00000000-0000-4000-8000-0000000000aa";
 
-test("review C1 on-time hold body exercises the completion binding loop", async () => {
+test("review C1 on-time hold body exercises the completion binding loop", async t => {
+  const budget = new MaintenanceBudget(600_000, () => 0);
+  t.after(() => budget.dispose());
   let registered = false;
   const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
     fetch: async () => {
@@ -73,7 +75,7 @@ test("review C1 on-time hold body exercises the completion binding loop", async 
   });
   await client.register("worker");
   assert.equal(client.canStartPublicationCompletion("run", 1), true);
-  await client.listRecoveryHolds("run");
+  await MaintenanceBudget.run(budget, () => client.listRecoveryHolds("run"));
   assert.equal(client.canStartPublicationCompletion("run", 1), false, "on-time invalid hold must poison bound provenance");
 });
 
