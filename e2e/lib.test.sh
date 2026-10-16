@@ -841,18 +841,26 @@ custody_case "captured fixture timeout retains row worker and recreation log" fa
 custody_case "preparing fixture fails immediately" fail 'not a capture-less owner decision' fixture_archive_receipt preparing
 
 # Execute the actual owning phase boundaries against the real owner helper. The
-# nine-hold fixture includes the completed outage case, which must remain open.
+# fixture includes the retained case 3 hold, which must remain open.
+OUTBOX_PHASE_TEST_SOURCE="${OUTBOX_PHASE_TEST_SOURCE:-$ROOT/e2e/phases/52-api-outage-outbox.sh}"
 fixture_phase_boundary() {
   local phase="$1" before after run gen n=0 entry
   local X=b4dec5cf-e6d4-413b-b3a8-0005a2835701 ED=b4dec5cf-e6d4-413b-b3a8-0005a2835702
   local RUN_KA=b4dec5cf-e6d4-413b-b3a8-0005a2835703 RUN_KB=b4dec5cf-e6d4-413b-b3a8-0005a2835704
   local RUN_F1=b4dec5cf-e6d4-413b-b3a8-0005a2835705 RUN_F2=b4dec5cf-e6d4-413b-b3a8-0005a2835706
+  # Distinct outage claims make swapped run/generation arguments observable.
+  # shellcheck disable=SC2034  # consumed by actual phase cleanup statements
+  local RUN1=b4dec5cf-e6d4-413b-b3a8-0005a2835711 RUN2=b4dec5cf-e6d4-413b-b3a8-0005a2835712
+  # shellcheck disable=SC2034
+  local RUN_B2=b4dec5cf-e6d4-413b-b3a8-0005a2835714 RUN_B3=b4dec5cf-e6d4-413b-b3a8-0005a2835715 RUN_B4=b4dec5cf-e6d4-413b-b3a8-0005a2835716
+  # shellcheck disable=SC2034
+  local GEN1=11 GEN2=12 GEN_B2=14 GEN_B3=15 GEN_B4=16
   # shellcheck disable=SC2034  # read by the extracted owning phase statements
   local GEN_X0=1 GEN_X1=2 GEN_ED_ORIGINAL=1 GEN_KA_ORIGINAL=1 GEN_KB_ORIGINAL=1 GEN_F1=1 GEN_F2=1 GEN_F2_OBSERVED=3
   # shellcheck disable=SC2034  # read by the extracted phase-42 boundary
   local RA_RESTORE_AT=2026-10-08T09:08:20Z
   echo '{"holds":[]}' > "$SEQ_DIR/boundary-holds"
-  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1"; do
+  for entry in "$X:1" "$X:2" "$ED:1" "$RUN_KA:1" "$RUN_KB:1" "$RUN_F1:1" "$RUN_F2:1" "$RUN_F2:3" "$UUID:1" "$RUN1:11" "$RUN2:12" "$RUN_B2:14" "$RUN_B3:15" "$RUN_B4:16" "$RUN1:99"; do
     run="${entry%:*}"; gen="${entry##*:}"; n=$((n + 1))
     jq --arg run "$run" --argjson gen "$gen" --arg id "$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")" \
       '.holds += [{id:$id,run_id:$run,generation:$gen,state:"open",attention:"source_only",has_available_capture:false}]' \
@@ -877,15 +885,163 @@ fixture_phase_boundary() {
     echo '{"discarded":true}'
   }
   before="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$ROOT/e2e/phases/$phase.sh")"
+  local source="$ROOT/e2e/phases/$phase.sh"
+  [ "$phase" != 52-api-outage-outbox ] || source="$OUTBOX_PHASE_TEST_SOURCE"
+  eval "$(awk '/^[[:space:]]*resolve_fixture_source_hold /' "$source")"
   after="$(jq '[.holds[]|select(.state=="open")]|length' "$SEQ_DIR/boundary-holds")"
-  [ "$before" = 9 ] && [ "$after" -lt 8 ] || fail 'next sweep still blocked by deliberate fixture holds'
+  [ "$before" = 15 ] && [ "$after" -lt 14 ] || fail 'next sweep still blocked by deliberate fixture holds'
   jq -e --arg run "$UUID" '[.holds[]|select(.run_id==$run)][0].state=="open"' "$SEQ_DIR/boundary-holds" >/dev/null \
-    || fail 'completed outage case lost its evidence'
+      || fail 'completed outage case lost its evidence'
+  if [ "$phase" = 52-api-outage-outbox ]; then
+    jq -e --arg r1 "$RUN1" --arg r2 "$RUN2" --arg b2 "$RUN_B2" --arg b3 "$RUN_B3" --arg b4 "$RUN_B4" --arg f1 "$RUN_F1" --arg f2 "$RUN_F2" '
+      all(.holds[];
+        .state == (if (.run_id==$r1 and .generation==11) or (.run_id==$r2 and .generation==12)
+          or (.run_id==$b2 and .generation==14) or (.run_id==$b3 and .generation==15)
+          or (.run_id==$b4 and .generation==16) or (.run_id==$f1 and .generation==1)
+          or (.run_id==$f2 and (.generation==1 or .generation==3))
+          then "discarded" else "open" end))' "$SEQ_DIR/boundary-holds" >/dev/null \
+      || fail 'phase52 did not resolve exactly its eight fixture holds'
+  fi
   echo 'own phase relieved capacity while completed outage evidence stayed open'
 }
 for phase in 42-api-outage-readoption 45-bounded-concurrency 52-api-outage-outbox; do
   custody_case "$phase resolves only its intentional fixture obligations" pass 'own phase relieved capacity' fixture_phase_boundary "$phase"
+done
+
+# Execute the actual setup, outage and assertion statements for cases 1-6.
+# External operations are inert; files retain ordering evidence across substitutions.
+fixture_outbox_cases() {
+  local mode="$1" target="${2:-0}" bad="${3:-}" n
+  # shellcheck disable=SC2034  # read by the sourced phase statements
+  local COMPLETE_TIMEOUT_DEFAULT=1 COMPOSE=(outbox_compose)
+  # shellcheck disable=SC2034  # assigned and read by sourced phase statements
+  local OUTBOX_RUN RUN1 RUN2 GEN1 GEN2 RUN_B1 RUN_B2 RUN_B3 RUN_B4
+  # shellcheck disable=SC2034  # assigned and read by sourced phase statements
+  local GEN_B1 GEN_B2 GEN_B3 GEN_B4 OUTBOX_CASE3_HOLD_ID
+  echo 0 > "$SEQ_DIR/outbox-case"
+  : > "$SEQ_DIR/outbox-events"
+  unset -f rb_run_field || true
+  say() {
+    case "$*" in 'case 2: no quota eviction'*) echo asserted >> "$SEQ_DIR/outbox-events" ;; esac
+  }
+  pass() {
+    case "$*" in
+      'case '[1246]:*|'case 5: the carve-out run'*) echo asserted >> "$SEQ_DIR/outbox-events" ;;
+    esac
+  }
+  recreate_outbox_agent() { :; }
+  set_interlock() { :; }
+  outbox_compose() { :; }
+  sleep() { SECONDS=$((SECONDS + 10)); }
+  make_outbox_run() {
+    n="$(cat "$SEQ_DIR/outbox-case")"
+    if [ "$n" -gt 0 ] && [ "$n" != 3 ]; then
+      [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = "cleanup:$n" ] \
+      || fail "next creation before cleanup:$n"
+    fi
+    n=$((n + 1))
+    echo "$n" > "$SEQ_DIR/outbox-case"
+    OUTBOX_RUN="$(printf 'b4dec5cf-e6d4-413b-b3a8-%012d' "$n")"
+    echo "create:$n" >> "$SEQ_DIR/outbox-events"
+  }
+  db_psql() {
+    local i sql="$1" reads
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [[ "$sql" == *"$OUTBOX_RUN"* ]] || fail 'SQL used a different run'
+    case "$sql" in
+      'SELECT claim_generation FROM runs WHERE id = '*)
+        reads="$(awk -v event="snapshot:$i" '$0==event {n++} END {print n+0}' "$SEQ_DIR/outbox-events")"
+        if [ "$reads" = 0 ]; then
+          echo "snapshot:$i" >> "$SEQ_DIR/outbox-events"
+          if [ "$mode" = invalid ] && [ "$target" = "$i" ]; then printf '%s' "$bad"; return; fi
+        elif [ "$mode" = changed ] && [ "$target" = "$i" ]; then
+          echo $((100 + i)); return
+        fi
+        echo $((10 + i)) ;;
+      'SELECT requeue_count '*) echo 0 ;;
+      'SELECT completion_attempts '*) echo 1 ;;
+      'SELECT completion_contract_version '*) echo 1 ;;
+      'SELECT status '*) echo running ;;
+      UPDATE*) : ;;
+      *) fail "unexpected outbox SQL: $sql" ;;
+    esac
+  }
+  db_psql_rows() { echo "$UUID"; }
+  outbox_cut() {
+    local i
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = "snapshot:$i" ] \
+      || fail "outage before generation snapshot:$i"
+    echo "cut:$i" >> "$SEQ_DIR/outbox-events"
+  }
+  outage() { outbox_cut; }
+  api_cut() { outbox_cut; }
+  api_back() { :; }
+  release_outbox_cut_barrier() { :; }
+  wait_terminal_lost() { return 0; }
+  wait_permit_retrying() { return 0; }
+  wait_worker_online() { :; }
+  wait_status() { echo "terminal:$(cat "$SEQ_DIR/outbox-case")" >> "$SEQ_DIR/outbox-events"; }
+  wait_drained() { :; }
+  assert_contiguous() { :; }
+  apiget() {
+    case "$1" in
+      */messages)
+        if [ "$mode" = evicted ] && [ "$(cat "$SEQ_DIR/outbox-case")" = 2 ]; then
+          echo '{"messages":[{"seq":1,"kind":"status","payload":{"event":"message_dropped","reason":"outbox quota"}}]}'
+          return
+        fi
+        echo '{"messages":[{"payload":{"text":"stub: outbox tick 1"}},{"payload":{"text":"stub: outbox tick 2"}},{"payload":{"text":"stub: outbox tick 3"}},{"payload":{"text":"stub: outbox tick 4"}},{"payload":{"text":"stub: outbox tick 5"}}]}' ;;
+      *) echo '{"run":{}}' ;;
+    esac
+  }
+  resolve_fixture_source_hold() {
+    local i
+    i="$(cat "$SEQ_DIR/outbox-case")"
+    [ "$i" != 3 ] && [ "$1" = "$OUTBOX_RUN" ] && [ "$2" = "$((10 + i))" ] \
+      || fail 'wrong outbox cleanup identity'
+    [ "$(tail -n 1 "$SEQ_DIR/outbox-events")" = asserted ] \
+      || fail 'cleanup preceded original assertions'
+    echo "cleanup:$i" >> "$SEQ_DIR/outbox-events"
+  }
+  # Keep every statement between the actual case boundaries, including rb_run_field's
+  # real definition after cases 1/2. No predeclared generation can mask a late snapshot.
+  # shellcheck disable=SC1090
+  source <(awk '/^say "CASE 1:/ {body=1} /^# Issue #1742 / {exit} body {print}' "$OUTBOX_PHASE_TEST_SOURCE")
+  # Represents the next case's creation; also checks case 6 cleanup ordering.
+  make_outbox_run
+  [ "$(cat "$SEQ_DIR/outbox-case")" = 7 ] || fail 'outbox extraction missed cases'
+  [ "$(awk '/^cleanup:/ {print}' "$SEQ_DIR/outbox-events")" = $'cleanup:1\ncleanup:2\ncleanup:4\ncleanup:5\ncleanup:6' ] \
+    || fail 'outbox cleanup set changed'
+  echo 'outbox setup and cleanup boundaries passed'
+}
+fixture_outbox_rejection() {
+  local mode="$1" target="$2" output rc=0
+  output="$(fixture_outbox_cases "$@" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail 'outbox accepted an invalid or changed generation'
+  if [ "$mode" = invalid ]; then
+    ! grep -qxF "cut:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'invalid generation reached the outage'
+  else
+    grep -qxF "terminal:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'changed generation did not reach terminal comparison'
+  fi
+  ! grep -qxF "cleanup:$target" "$SEQ_DIR/outbox-events" \
+      || fail 'invalid or changed generation reached cleanup'
+  printf '%s\n' "$output"
+  return "$rc"
+}
+custody_case 'real outbox cases snapshot before outage and clean before next creation' pass \
+  'outbox setup and cleanup boundaries passed' fixture_outbox_cases valid
+custody_case 'real outbox quota eviction completes assertions before cleanup' pass \
+  'outbox setup and cleanup boundaries passed' fixture_outbox_cases evicted
+for outbox_case in 1 2 4 5 6; do
+  for invalid_gen in '' 0 -1 null 1x 01; do
+    custody_case "outbox case $outbox_case rejects generation [$invalid_gen] before outage" fail \
+      "case $outbox_case: invalid claim generation" fixture_outbox_rejection invalid "$outbox_case" "$invalid_gen"
+  done
+  custody_case "outbox case $outbox_case rejects changed terminal generation" fail \
+    "case $outbox_case: generation advanced" fixture_outbox_rejection changed "$outbox_case"
 done
 
 # The previous cleanup failed with a capture FK and silently removed source-only
