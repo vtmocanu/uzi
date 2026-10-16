@@ -57,7 +57,7 @@ func TestHeldTerminalRollbackPreservesReceiptLiveDB(t *testing.T) {
 	if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 1 {
 		t.Fatalf("release: rows=%d err=%v", n, err)
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 338); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 339); err != nil {
 		t.Fatal(err)
 	}
 	var state, evidence, tip, digest string
