@@ -75,6 +75,10 @@ elif args[0] == "create":
                        for m in [dict(part.split("=", 1) for part in args[i+1].split(",") if "=" in part)]]}
     if mode == "ownership": item["Config"]["Labels"] = {}
     if mode == "caps": item["HostConfig"]["CapAdd"] = ["SYS_ADMIN"]
+    masked = {args[i + 1].split(":")[0] for i, arg in enumerate(args) if arg == "--tmpfs"}
+    for volume in ("/data", "/nix"):
+        if volume not in masked:
+            state["anonymous:" + cid + volume] = {"container": cid}
     state[name] = item
     save()
     fixture_number = 1 if name.endswith("-1073741824") else 2
@@ -91,7 +95,10 @@ elif args[0] == "rm":
     assert len(args[-1]) == 64
     found = [k for k,v in state.items() if v.get("Id") == args[-1]]
     assert len(found) == 1
-    state.pop(found[0]); save()
+    state.pop(found[0])
+    if "--volumes" in args:
+        state = {k:v for k,v in state.items() if v.get("container") != args[-1]}
+    save()
     print("wrong" if mode == "remove-ack" else args[-1])
 elif args[0] == "start":
     item = next(v for v in state.values() if v.get("Id") == args[-1])
@@ -153,6 +160,14 @@ class RunnerTest(unittest.TestCase):
         result = subprocess.run(args, env=env, capture_output=True, timeout=20)
         calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
         return result, calls
+
+    def test_no_implicit_volumes_survive(self):
+        _, calls = self.invoke()
+        self.assertTrue(any(c[:2] == ["docker", "create"] for c in calls))
+        self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+        for command in [c for c in calls if c[:2] == ["docker", "create"]]:
+            mounts = {command[i + 1].split(":")[0] for i, arg in enumerate(command) if arg == "--tmpfs"}
+            self.assertTrue({"/data", "/nix"}.issubset(mounts))
 
     def test_no_dependency_volume_copy(self):
         _, calls = self.invoke()

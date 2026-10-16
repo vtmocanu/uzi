@@ -128,7 +128,7 @@ class Host:
             # It never supplies containerId authority for a later start.
         if item["State"]["Running"]:
             self.docker(["stop", "--time", "1", cid], left())
-        removed = self.docker(["rm", cid], left()).decode().strip()
+        removed = self.docker(["rm", "--volumes", cid], left()).decode().strip()
         check.require(removed == cid, "ambiguous remove ACK")
         proof = {"confirmed": True, "containerId": cid, "removedId": removed,
                  "label": self.manifest["invocation"], "hostMonotonicEnd": time.monotonic(),
@@ -152,6 +152,7 @@ class Host:
         self.journal("container", seed)
         receipt = self.docker(["create", "--pull", "never", "--network", "none", "--cgroupns", "private",
                      "--name", seed, "--label", LABEL + "=" + token,
+                     "--tmpfs", "/data", "--tmpfs", "/nix",
                      "--user", "10003:10003", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                      "--memory", str(1024 ** 3), "--memory-swap", str(1024 ** 3),
                      "--entrypoint", "/usr/local/bin/node", image_id, "-e", LAYOUT_PROBE]).decode().strip()
@@ -177,6 +178,7 @@ class Host:
                 "--user", "10003:10003", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                 "--memory", str(fixture["limitBytes"]), "--memory-swap", str(fixture["limitBytes"]),
                 "--pids-limit", "128", "--workdir", "/proof",
+                "--tmpfs", "/data", "--tmpfs", "/nix",
                 "--tmpfs", "/proof/.uzi/scratch:exec,uid=10003,gid=10003,mode=0700,size=256m",
                 "--tmpfs", "/tmp:exec,uid=10003,gid=10003,mode=0700,size=32m",
                 "--env", "HOME=/proof/.uzi/scratch", "--env", "TMPDIR=/proof/.uzi/scratch",

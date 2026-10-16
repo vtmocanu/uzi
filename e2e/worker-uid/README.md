@@ -3,9 +3,11 @@
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
 leaves from five test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
-disposable data and Nix mounts, and removes only its own named container.
+disposable data and Nix mounts, and removes only its own containers and their
+anonymous volumes after checking exact container identity and invocation labels.
 
 To reuse an image, set `WORKER_UID_SKIP_BUILD=1` and `WORKER_UID_IMAGE=<image>`.
+The image must have an existing local tag; the harness never changes its tags.
 `WORKER_UID_TIMEOUT` controls the outer watchdog (default 600 seconds).
 The separate command proof has a 115-second watchdog plus five-second kill grace
 (120 seconds total). All Docker operations use GNU timeout. Image metadata gets
@@ -26,8 +28,9 @@ inspects
 only attempted resources, verifies the invocation label, and removes containers
 by their returned immutable IDs. Missing,
 malformed or mismatching ownership metadata fails closed: planned names alone
-never authorize removal. Metadata/build failure before creation performs no
-resource cleanup. Containers remain until the trap.
+never authorize removal. Failure before creation performs no resource cleanup.
+The tool-image build and probe are journaled before creation; their failures still
+require ownership verification and cleanup. Containers remain until the trap.
 `WORKER_UID_SKIP_BUILD=1` requires the hosted image to exist locally; the harness
 never pulls an image or installs runtime dependencies.
 
@@ -44,7 +47,15 @@ The per-container source parent is an owned tmpfs; a scratch symlink keeps
 repository-relative test writes under `/proof/.uzi/scratch`. Read-only source
 mounts remain separate. The package metadata preserves the source’s ESM boundary.
 Runtime packages resolve directly from the image’s locked `/app/node_modules`,
-without copying dependencies into a volume. Scratch, Go cache and Go temporary files
+without copying dependencies into a volume. All proofs and calibration mask the
+image-declared `/data` and `/nix` volumes with tmpfs so Docker does not initialize
+the full Nix store. The preflight builds an invocation-owned image offline to
+record the supplied image's canonical Go and Task paths, verifies its parent
+layers and platform, and validates those paths in a capless probe. Only the
+static Go tree and Task directory are initialized into read-only anonymous
+volumes for the command proof. Its remaining dependencies stay in the image.
+Cleanup removes the derived image without pruning its shared parent.
+Scratch, Go cache and Go temporary files
 stay in a command-owned executable tmpfs for the freshly built helpers. The fixture checks Linux, UID 10003, all five empty
 capability sets and no-new-privileges before building only the two Go helpers with
 `-mod=vendor`, `GOTOOLCHAIN=local`, `GOPROXY=off` and `GOSUMDB=off`.

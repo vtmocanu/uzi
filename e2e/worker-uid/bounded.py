@@ -99,8 +99,11 @@ def docker(args, directory, seconds=10):
     return output.read_bytes()
 
 
-def owned(kind, name, token, directory, seconds=10):
-    raw = docker(([kind] if kind == "volume" else []) + ["inspect", name], directory, seconds)
+def owned(kind, name, token, directory, seconds=10, expected=None):
+    if kind not in ("container", "volume", "image"):
+        raise ValueError("unknown owned resource kind")
+    prefix = ["image"] if kind == "image" else ["volume"] if kind == "volume" else []
+    raw = docker(prefix + ["inspect", name], directory, seconds)
     items = json.loads(raw)
     if not isinstance(items, list) or len(items) != 1:
         raise ValueError(f"ambiguous ownership metadata: {name}")
@@ -114,9 +117,11 @@ def owned(kind, name, token, directory, seconds=10):
     handle = item.get("Name") if kind == "volume" else item.get("Id")
     if kind == "volume":
         valid = handle == name
+    elif kind == "image":
+        valid = isinstance(handle, str) and handle.startswith("sha256:") and len(handle) == 71 and all(c in "0123456789abcdef" for c in handle[7:])
     else:
         valid = isinstance(handle, str) and len(handle) == 64 and all(c in "0123456789abcdef" for c in handle)
-    if not valid:
+    if not valid or (expected is not None and handle != expected):
         raise ValueError(f"invalid owned handle: {name}")
     return handle
 
@@ -129,17 +134,23 @@ def cleanup(directory, token):
     # Each sibling gets one attempt; failure never authorizes deletion or retries.
     entries = journal.read_text().splitlines() if journal.exists() else []
     for entry in reversed(entries):
-        kind, name = entry.split(" ", 1)
+        fields = entry.split(" ")
+        if len(fields) not in (2, 3):
+            failures.append("invalid ownership journal entry")
+            continue
+        kind, name = fields[:2]
+        expected = fields[2] if len(fields) == 3 else None
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 5:
                 raise ValueError("cleanup deadline exhausted")
-            handle = owned(kind, name, token, directory, min(10, remaining))
+            handle = owned(kind, name, token, directory, min(10, remaining), expected)
             remaining = deadline - time.monotonic()
             if remaining <= 5:
                 raise ValueError("cleanup deadline exhausted")
-            docker(["volume", "rm", handle] if kind == "volume" else ["rm", "-f", handle],
-                   directory, min(10, remaining))
+            args = (["image", "rm", "--no-prune", handle] if kind == "image" else
+                    ["volume", "rm", handle] if kind == "volume" else ["rm", "-f", "--volumes", handle])
+            docker(args, directory, min(10, remaining))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             failures.append(str(exc))
     if failures:

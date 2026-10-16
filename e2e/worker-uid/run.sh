@@ -48,11 +48,15 @@ if [ "${WORKER_UID_SKIP_BUILD:-}" != 1 ]; then
 fi
 # Metadata (10s), optional build (65s), layout/dependency check (25s): <=100s.
 # Never seed a dependency volume: use the immutable image's existing /app/node_modules.
+# Mask image-declared volumes here: this Node-only check needs no Nix store.
 phase image-metadata timeout --kill-after=5s 5s docker image inspect "$IMAGE" >/dev/null
-owned_request container "$NAME-provision"
-phase image-layout timeout --kill-after=5s 20s docker run --pull never --network none \
-  --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$NAME-provision" --user 10003:10003 --cap-drop ALL \
-  --security-opt no-new-privileges --entrypoint /usr/local/bin/node "$IMAGE" -e 'const fs = require("node:fs"); try { fs.lstatSync("/app/uzi-worker-uid-proof"); throw new Error("proof directory already exists in image"); } catch (e) { if (e.code !== "ENOENT") throw e; } if (!require.resolve("tsx").startsWith("/app/node_modules/")) throw new Error("image-native tsx unavailable");'
+prepared=$(phase image-layout timeout --kill-after=5s 20s python3 "$REPO/e2e/worker-uid/tool_image.py" "$REPORT_DIR" "$TOKEN" "$IMAGE")
+read -r IMAGE COMMAND_IMAGE GO_ROOT TASK_BIN extra <<< "$prepared"
+if [ -n "${extra:-}" ] || [ -z "$TASK_BIN" ]; then
+  printf 'worker UID invalid prepared tool fields
+' >&2
+  exit 1
+fi
 # Overlay only test inputs under /app so dependencies resolve from the image.
 set +e
 owned_request container "$NAME" || exit 1
@@ -89,10 +93,13 @@ owned_request container "$COMMAND_NAME"
 phase command-proof capture "$REPORT_DIR/command-results.xml" 120 \
   timeout --kill-after=5s 115s docker run --pull never --network none \
   --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$COMMAND_NAME" --user 10003:10003 --cap-drop ALL \
-  --security-opt no-new-privileges --workdir /proof \
+  --security-opt no-new-privileges --workdir /proof --tmpfs /data --tmpfs /nix \
   --tmpfs /proof/.uzi/scratch:exec,uid=10003,gid=10003,mode=0700 \
   --tmpfs /app/uzi-worker-uid-proof:exec,uid=10003,gid=10003,mode=0755 \
   --env HOME=/proof/.uzi/scratch --env TMPDIR=/proof/.uzi/scratch \
+  --mount "type=volume,dst=$GO_ROOT,readonly" \
+  --mount "type=volume,dst=$TASK_BIN,readonly" \
+  --env "GOROOT=$GO_ROOT" --env "PATH=$GO_ROOT/bin:$TASK_BIN:/usr/local/bin:/usr/bin:/bin" \
   --env GOPATH=/proof/.uzi/scratch/go --env GOCACHE=/proof/.uzi/scratch/go-cache \
   --env GOTOOLCHAIN=local --env GOPROXY=off --env GOSUMDB=off \
   --mount "type=bind,src=$REPO/Taskfile.yml,dst=/app/uzi-worker-uid-proof/Taskfile.yml,readonly" \
@@ -102,7 +109,7 @@ phase command-proof capture "$REPORT_DIR/command-results.xml" 120 \
   --mount "type=bind,src=$REPO/agent/tsconfig.json,dst=/app/uzi-worker-uid-proof/agent/tsconfig.json,readonly" \
   --mount "type=bind,src=$REPO/agent/package.json,dst=/app/uzi-worker-uid-proof/agent/package.json,readonly" \
   --mount "type=bind,src=$REPO/agent/codex/supervisor,dst=/app/uzi-worker-uid-proof/agent/codex/supervisor,readonly" \
-  --entrypoint /usr/local/bin/node "$IMAGE" \
+  --entrypoint /usr/local/bin/node "$COMMAND_IMAGE" \
   --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs \
   --test --test-concurrency=1 --test-timeout=110000 --test-reporter=junit \
   --test-name-pattern "$COMMAND_PATTERN" /app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts || command_rc=$?

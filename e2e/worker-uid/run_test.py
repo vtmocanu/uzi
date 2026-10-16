@@ -7,6 +7,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+import bounded
+import tool_image
 
 
 HARNESS = Path(__file__).resolve().parent
@@ -17,6 +21,103 @@ COMMAND_PASS = ('<testsuites><testcase name="command leaf" '
                 'file="/app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts"/></testsuites>')
 PASS = ('<testsuites><testsuite name="suite"><testcase name="leaf" '
         'file="/app/uzi-worker-uid-proof/agent/test/example.test.ts"/></testsuite></testsuites>')
+
+
+class ToolImageTest(unittest.TestCase):
+    def prepare(self, mode=""):
+        token = "1" * 32
+        parent_id, child_id = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        layer = "sha256:" + "c" * 64
+        parent = {"Id": parent_id, "Os": "linux", "Architecture": "amd64",
+                  "RootFS": {"Layers": [layer]}, "RepoTags": ["local-worker:proof"]}
+        child = {**parent, "Id": child_id, "RootFS": {"Layers": [layer, "sha256:" + "d" * 64]},
+                 "Config": {"Labels": {bounded.LABEL: token, tool_image.PARENT_LABEL: parent_id}}}
+        tools = {"schemaVersion": 1, "invocation": token, "parentImageId": parent_id,
+                 "goRoot": "/nix/store/" + "g" * 32 + "-go/share/go",
+                 "taskBin": "/nix/store/" + "h" * 32 + "-task/bin"}
+        calls = []
+
+        def docker(args, *_):
+            calls.append(args)
+            if args[:2] == ["image", "ls"]: return b"existing" if mode == "collision" else b""
+            if args == ["context", "show"]: return b"default\n"
+            if args[0] == "run":
+                if mode == "lost-probe-ack": raise ValueError("lost probe ACK")
+                return json.dumps(tools).encode()
+            self.assertEqual(args[:2], ["image", "inspect"])
+            item = child if args[-1].endswith("-tools") else parent
+            if mode == "untagged": item = {**item, "RepoTags": []}
+            if mode == "tag-moved" and args[-1] == "local-worker:proof": item = {**item, "Id": child_id}
+            if item is child:
+                if mode == "foreign-label": item = {**item, "Config": {"Labels": {}}}
+                if mode == "foreign-layer": item = {**item, "RootFS": {"Layers": ["sha256:" + "e" * 64]}}
+                if mode == "wrong-platform": item = {**item, "Architecture": "arm64"}
+            return json.dumps([item]).encode()
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            with mock.patch.object(bounded, "docker", side_effect=docker), \
+                 mock.patch.object(bounded, "capture", return_value=124 if mode == "build-timeout" else 0) as build:
+                if mode:
+                    with self.assertRaises(ValueError): tool_image.prepare(directory, token, parent_id)
+                else:
+                    tool_image.prepare(directory, token, parent_id)
+                    self.assertEqual(json.loads((directory / "command-image.json").read_text()),
+                                     {"parentImageId": parent_id, "imageId": child_id,
+                                      "goRoot": tools["goRoot"], "taskBin": tools["taskBin"]})
+                    command = build.call_args.args[0]
+                    self.assertIn("BASE_IMAGE=local-worker:proof", command)
+                    self.assertIn("--network", command)
+                    self.assertIn("none", command)
+                    self.assertIn("--pull=false", command)
+                    self.assertLess(build.call_args.args[2], 25)
+                journal = (directory / "attempted").read_text() if (directory / "attempted").exists() else ""
+                if mode in ("untagged", "tag-moved", "collision"):
+                    build.assert_not_called()
+                    self.assertEqual(journal, "")
+                if mode == "lost-probe-ack":
+                    self.assertIn("image wuid-2134-" + token + "-tools " + child_id, journal)
+                    self.assertIn("container wuid-2134-" + token + "-provision", journal)
+            self.assertFalse(any(call[0] in ("tag", "rm") for call in calls))
+
+    def test_preparation_identity_and_failure_journal(self):
+        self.prepare()
+        for mode in ("untagged", "tag-moved", "collision", "foreign-label", "foreign-layer",
+                     "wrong-platform", "build-timeout", "lost-probe-ack"):
+            with self.subTest(mode=mode): self.prepare(mode)
+
+    def test_canonical_bound_tool_paths(self):
+        item = {"schemaVersion": 1, "invocation": "1" * 32, "parentImageId": "sha256:" + "a" * 64,
+                "goRoot": "/nix/store/" + "g" * 32 + "-go/share/go",
+                "taskBin": "/nix/store/" + "h" * 32 + "-task/bin"}
+        for change in ({"invocation": "2" * 32}, {"parentImageId": "sha256:" + "b" * 64},
+                       {"schemaVersion": True}, {"goRoot": "/nix/store/../etc"},
+                       {"taskBin": item["goRoot"]}, {"taskBin": item["goRoot"] + "/bin"},
+                       {"goRoot": item["goRoot"] + "/../bin"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                tool_image.tool_paths(json.dumps({**item, **change}), "1" * 32, item["parentImageId"])
+
+    def test_preparation_deadline_prevents_docker(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(tool_image.time, "monotonic", side_effect=[0, 14]), \
+             mock.patch.object(bounded, "docker") as docker, self.assertRaises(ValueError):
+            tool_image.prepare(Path(directory), "1" * 32, "worker:proof")
+        docker.assert_not_called()
+
+    def test_image_cleanup_preserves_parent_and_refuses_foreign(self):
+        token, image_id = "1" * 32, "sha256:" + "b" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / "attempted").write_text("image invocation-tools " + image_id + "\n")
+            for foreign in (False, True):
+                item = {"Id": image_id, "Config": {"Labels": {bounded.LABEL: "foreign" if foreign else token}}}
+                with mock.patch.object(bounded, "docker", side_effect=[json.dumps([item]).encode(), b""]) as docker:
+                    if foreign:
+                        with self.assertRaises(ValueError): bounded.cleanup(directory, token)
+                        self.assertEqual(docker.call_count, 1)
+                    else:
+                        bounded.cleanup(directory, token)
+                        self.assertEqual(docker.call_args.args[0], ["image", "rm", "--no-prune", image_id])
 
 
 class CaptureTest(unittest.TestCase):
@@ -51,7 +152,7 @@ class RunnerTest(unittest.TestCase):
         self.repo = Path(self.temp.name)
         harness = self.repo / "e2e/worker-uid"
         harness.mkdir(parents=True)
-        for name in ("run.sh", "bounded.py", "check.py", "check_test.py"):
+        for name in ("run.sh", "bounded.py", "check.py", "check_test.py", "tool_image.py", "tool-image.Dockerfile"):
             shutil.copyfile(HARNESS / name, harness / name)
         self.bin = self.repo / "bin"
         self.bin.mkdir()
@@ -77,6 +178,9 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
     state[name] = {"Name": name, "Id": __import__("hashlib").sha256(name.encode()).hexdigest(),
                    "Labels": {"io.uzi.worker-uid.invocation": token},
                    "Config": {"Labels": {"io.uzi.worker-uid.invocation": token}}}
+    if not volume:
+        masked = {args[i + 1].split(":")[0] for i, arg in enumerate(args) if arg == "--tmpfs"}
+        state[name]["AnonymousVolumes"] = [p for p in ("/data", "/nix") if p not in masked]
     if os.environ["OWNERSHIP_MISMATCH"] and name.endswith(os.environ["OWNERSHIP_MISMATCH"]):
         state[name]["Labels"] = state[name]["Config"]["Labels"] = {}
     state_path.write_text(json.dumps(state))
@@ -84,6 +188,11 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
         print(name)
         sys.exit(int(os.environ["VOLUME_RC"]))
     if name.endswith("-provision"):
+        image = args[args.index("--entrypoint") + 2]
+        derived = next(v for v in state.values() if v.get("Id") == image)
+        print(json.dumps({"schemaVersion": 1, "goRoot": "/nix/store/" + "g" * 32 + "-go/share/go",
+                          "taskBin": "/nix/store/" + "h" * 32 + "-task/bin", "invocation": token,
+                          "parentImageId": derived["Config"]["Labels"]["io.uzi.worker-uid.parent-image"]}))
         sys.exit(int(os.environ["PROVISION_RC"]))
     command = name.endswith("-command")
     prefix = "COMMAND_" if command else ""
@@ -105,25 +214,52 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
 if args[0] == "inspect" or args[:2] == ["volume", "inspect"]:
     print(json.dumps([state[args[-1]]]))
     sys.exit(0)
-assert args[0] in ("build", "rm", "image", "volume"), args
+assert args[0] in ("build", "rm", "image", "volume", "context"), args
 if args[0] == "image":
-    sys.exit(int(os.environ["METADATA_RC"]))
+    if args[1] == "inspect":
+        if int(os.environ["METADATA_RC"]): sys.exit(int(os.environ["METADATA_RC"]))
+        parent = {"Id": "sha256:" + "a" * 64, "Os": "linux", "Architecture": "amd64",
+                  "RootFS": {"Layers": ["sha256:" + "c" * 64]}, "RepoTags": ["fixture-image"]}
+        print(json.dumps([state.get(args[-1], parent)]))
+    elif args[1] == "rm":
+        assert "--no-prune" in args
+        assert args[-1] == "sha256:" + "b" * 64
+    elif args[1] != "ls": raise AssertionError(args)
+    sys.exit(0)
+if args[:2] == ["context", "show"]:
+    print("default")
+    sys.exit(0)
 if args[0] == "build":
+    if "--builder" in args:
+        name = args[args.index("--tag") + 1]
+        labels = dict(args[i + 1].split("=", 1) for i, arg in enumerate(args) if arg == "--label")
+        state[name] = {"Id": "sha256:" + "b" * 64, "Os": "linux", "Architecture": "amd64",
+                       "RootFS": {"Layers": ["sha256:" + "c" * 64, "sha256:" + "d" * 64]},
+                       "Config": {"Labels": labels}}
+        state_path.write_text(json.dumps(state))
+        sys.exit(0)
     sys.exit(int(os.environ["BUILD_RC"]))
 if args[0] == "rm":
+    if "--volumes" in args:
+        item = next(v for v in state.values() if v.get("Id") == args[-1])
+        item["AnonymousVolumes"] = []
+        state_path.write_text(json.dumps(state))
     sys.exit(int(os.environ["CLEANUP_RC"]))
 """)
         self.stub("timeout", """
-assert args[2] == "docker", args
 assert args[0] == "--kill-after=5s", args
 seconds = float(args[1].removesuffix("s"))
+if args[2] == "python3":
+    assert seconds == 20 and args[3].endswith("/tool_image.py"), args
+    sys.exit(subprocess.run(args[2:], check=False).returncode)
+assert args[2] == "docker", args
 operation = args[3]
 if operation == "run":
     name = args[args.index("--name") + 1]
-    expected = 20 if name.endswith("-provision") else 115 if name.endswith("-command") else 7
-    assert seconds == expected, args
+    if name.endswith("-provision"): assert 0 < seconds <= 5, args
+    else: assert seconds == (115 if name.endswith("-command") else 7), args
 elif operation == "build":
-    assert seconds == 60, args
+    assert (0 < seconds < 20) if "--builder" in args else seconds == 60, args
 else:
     assert 0 < seconds <= 5, args
 import signal
@@ -194,7 +330,7 @@ sys.exit(rc)
         self.assertTrue(name.startswith("wuid-2134-"), name)
         state = json.loads((self.repo / "resources.json").read_text())
         self.assertEqual([call for call in calls if call[:2] == ["docker", "rm"]],
-                         [["docker", "rm", "-f", state[n]["Id"]]
+                         [["docker", "rm", "-f", "--volumes", state[n]["Id"]]
                           for n in (name + "-command", name, name + "-provision")])
         self.assertRegex(name, r"^wuid-2134-[0-9a-f]{32}$")
         for n in (name, name + "-command", name + "-provision"):
@@ -215,6 +351,11 @@ sys.exit(rc)
         self.assertEqual(command[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts")
         self.assertEqual(command[command.index("--test-name-pattern") + 1], "^command leaf$")
         mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
+        self.assertEqual([mount for mount in mounts if mount.startswith("type=volume,")], [
+            "type=volume,dst=/nix/store/" + "g" * 32 + "-go/share/go,readonly",
+            "type=volume,dst=/nix/store/" + "h" * 32 + "-task/bin,readonly",
+        ])
+        self.assertEqual(command[command.index("--entrypoint") + 2], "sha256:" + "b" * 64)
         for source, target in (("Taskfile.yml", "/app/uzi-worker-uid-proof/Taskfile.yml"),
                                ("homebrew-tap.yml", "/app/uzi-worker-uid-proof/homebrew-tap.yml"),
                                ("e2e/worker-uid", "/app/uzi-worker-uid-proof/e2e/worker-uid"),
@@ -225,7 +366,7 @@ sys.exit(rc)
             self.assertIn(f"type=bind,src={self.repo}/{source},dst={target},readonly", mounts)
         self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls))
         self.assertIn('lstatSync("/app/uzi-worker-uid-proof")', provision[-1])
-        self.assertIn('e.code !== "ENOENT"', provision[-1])
+        self.assertIn('e.code!=="ENOENT"', provision[-1])
         self.assertIn('require.resolve("tsx")', provision[-1])
         self.assertIn("/app/node_modules/tsx/dist/loader.mjs", command)
         self.assertIn("GOPROXY=off", command)
@@ -256,7 +397,7 @@ sys.exit(rc)
                          ["/data", "/nix", "/app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755",
                           "/proof/.uzi/scratch:exec,uid=10001,gid=10001,mode=0700"])
         self.assertEqual(run[run.index("--entrypoint") + 2:run.index("--test")], [
-            "fixture-image", "/usr/local/bin/node", "--import", "/app/node_modules/tsx/dist/loader.mjs",
+            "sha256:" + "a" * 64, "/usr/local/bin/node", "--import", "/app/node_modules/tsx/dist/loader.mjs",
             "--import", "/app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs",
             "--import", "/app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts",
         ])
@@ -272,6 +413,7 @@ sys.exit(rc)
                 removed = [call[-1] for call in calls if call[:2] == ["docker", "rm"]
                            or call[:3] == ["docker", "volume", "rm"]]
                 for name, item in state.items():
+                    if name.endswith("-tools"): continue
                     mismatch = options.get("ownership_mismatch", "")
                     if mismatch and name.endswith(mismatch):
                         self.assertNotIn(item["Id"], removed)
@@ -298,6 +440,17 @@ sys.exit(rc)
                 self.assertTrue(list(self.repo.glob("*.terminated")))
                 self.assertIn(("command " if command else "") + "node/container exit: 125", result.stderr)
 
+    def test_no_implicit_volumes_survive(self):
+        result, _ = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads((self.repo / "resources.json").read_text())
+        self.assertTrue(all(not item.get("AnonymousVolumes") for item in state.values()), state)
+        calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        for command in [c for c in calls if c[:2] == ["docker", "run"]]:
+            mounts = {command[i + 1].split(":")[0] for i, arg in enumerate(command) if arg == "--tmpfs"}
+            self.assertIn("/data", mounts)
+            self.assertIn("/nix", mounts)
+
     def test_no_dependency_volume_copy(self):
         result, calls = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -309,7 +462,7 @@ sys.exit(rc)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("1 required leaves passed", result.stdout)
         self.assertIn("phase end: image-layout elapsed=", result.stderr)
-        self.assertEqual([call for call in calls if call[:2] == ["docker", "build"]],
+        self.assertEqual([call for call in calls if call[:2] == ["docker", "build"] and "--builder" not in call],
                          [["docker", "build", "-f", "agent/templates/base/Dockerfile",
                            "-t", "fixture-image", "."]])
 
@@ -374,7 +527,7 @@ sys.exit(rc)
         for detail in ("worker UID lane FAIL", "assertion fixture", "stack frame.ts:42"):
             self.assertIn(detail, result.stderr)
         self.assertNotIn("node/container exit", result.stderr)
-        self.assertFalse(any(call[:2] == ["docker", "build"] for call in calls))
+        self.assertFalse(any(call[:2] == ["docker", "build"] and "--builder" not in call for call in calls))
 
     def test_container_and_checker_failure(self):
         result, _ = self.run_lane(xml="<testsuites/>", container_rc=77)
