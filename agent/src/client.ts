@@ -1079,6 +1079,8 @@ export class WorkerClient {
   // Monotonic negative evidence: collisions conservatively refuse only new identities.
   private readonly ineligibleCompletionClaims = new Uint8Array(64 * 1024);
   private completionIncarnation = 0;
+  // Input observations are invalidated at registration entry, including same-ID failures.
+  private inputObservationEpoch = 0;
   private completionRetirementIncarnation: Readonly<object> = {};
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
@@ -1217,6 +1219,7 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
+    this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
@@ -2552,25 +2555,36 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; staleObservation?: true; terminalCancelled?: { run_id: string; generation: number }; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
-    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+    const epoch = this.inputObservationEpoch;
+    let res: InputsResponse;
+    try {
+      res = (await this.inputJSON("GET", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
+    } catch (err) {
+      if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
+      throw err;
+    }
+    if (epoch !== this.inputObservationEpoch) return { inputs: [], staleObservation: true };
+    const control = res.terminal_cancelled;
+    const terminalCancelled = isRecord(control) && terminalUUID(control.run_id) && control.run_id === runId &&
+      terminalGeneration(control.generation) && control.generation > 0 ? control : undefined;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
     // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
-    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
+    return { inputs: res.inputs ?? [], ...(terminalCancelled ? { terminalCancelled } : {}), credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
-    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/ack`,
+    return (await this.inputJSON("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/ack`,
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
   async applyInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
-    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/applied`,
+    return (await this.inputJSON("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/applied`,
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
@@ -2581,7 +2595,7 @@ export class WorkerClient {
    *  400 means the capability or the ids were refused; a 404 means the run is not owned or the api
    *  predates the route (the caller tells them apart and stops sending). */
   async includeInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
-    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/included`,
+    return (await this.inputJSON("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/included`,
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
@@ -2591,7 +2605,7 @@ export class WorkerClient {
    *  the human approval and leaves it out of the replay list. Same reply and status mapping as
    *  applyInputs; an older api answers 404 for the route. */
   async discardInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
-    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/discarded`,
+    return (await this.inputJSON("POST", `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/discarded`,
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
@@ -3707,6 +3721,20 @@ export class WorkerClient {
       abort.abort();
       throw err;
     }
+  }
+
+  /** Input polling/receipts share one deadline through response-body consumption, including
+   * injected transports whose Response stream does not inherit fetch's abort signal. */
+  private async inputJSON(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown> {
+    const signal = AbortSignal.timeout(this.httpTimeoutMs);
+    const res = await this.fetchRaw(method, path, body, this.httpTimeoutMs, signal);
+    if (res.status >= 400) {
+      const text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, false, signal);
+      throw new RequestError(method, path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
+    }
+    if (res.status === 204) return undefined;
+    const text = await readBoundedText(res, Number.MAX_SAFE_INTEGER, true, signal);
+    return text ? JSON.parse(text) : undefined;
   }
 
   private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {

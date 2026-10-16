@@ -357,18 +357,18 @@ const (
 )
 
 // Loop-detection window (Decision 4), code constants (not settings): flag when any
-// tool call recurs at least loopThreshold times among the newest loopWindow
-// tool_use. loopThreshold=4 means an A/B-alternating loop still trips once the
-// window has filled (4 A's and 4 B's), while a healthy edit→test cycle whose
-// distinct edits keep any single call under 4 does not.
+// tool call with the same result and success/error status recurs at least
+// loopThreshold times among the newest loopWindow tool_use. Only valid,
+// unambiguous completed pairs count; unmatched or malformed uses still occupy
+// the window. An A/B loop can trip when each call keeps returning the same result.
 const (
 	loopWindow    = 12
 	loopThreshold = 4
 )
 
 // toolWindowFetch bounds the per-run tool-window fetch (Decisions 4 & 9). It sits
-// well above the loop window so the newest loopWindow tool_use rows plus their
-// interleaved tool_results all fit (each tool_use has at most one result).
+// above the loop window to leave room for interleaved tool_results. Only fetched
+// rows can pair; missing or ambiguous completions do not count toward looping.
 const toolWindowFetch = 40
 
 // leadToolWindowFetch bounds the per-run LEAD-lane fetch that answers "is a lead
@@ -622,9 +622,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 
 	stats := s.toolWindow(ctx, r.ID)
 
-	// looping: the same tool call recurred past the threshold in the window. Not
-	// settings-gated (the window/threshold are code constants) and not suppressed by
-	// in-flight — a run repeating the same call is pathological even mid-call.
+	// looping: the same tool call, result and status recurred past the threshold.
+	// Not settings-gated (the window/threshold are code constants); an open call
+	// does not suppress evidence from completed pairs in the selected window.
 	if stats.looping {
 		return healthLooping, reasonLooping
 	}
@@ -760,8 +760,8 @@ type toolWindowStats struct {
 	// oldestOpen is the created_at of the OLDEST unmatched non-delegation lead
 	// tool_use with a non-empty id and a valid created_at; zero when there is none.
 	oldestOpen time.Time
-	// looping is true when some tool call recurs at least loopThreshold times among
-	// the newest loopWindow tool_use.
+	// looping is true when some eligible tool call/result pair recurs at least
+	// loopThreshold times among the newest loopWindow tool_use.
 	looping bool
 }
 
@@ -796,27 +796,85 @@ func (s *Service) toolWindow(ctx context.Context, runID uuid.UUID) toolWindowSta
 	return stats
 }
 
-// analyzeToolWindow computes the looping signal from mixed-lane rows ordered
-// newest-first (Decision 4): hash each of the newest loopWindow tool_use as
-// sha256(name + canonical-JSON(input)) and flag when any hash count reaches
-// loopThreshold. The in-flight (possibly newest) call is included in the window.
-// The hash is compared transiently and NEVER surfaced — not in health_reason, logs,
-// or Slack. In-flight is NOT derived here (see leadInFlight).
+// analyzeToolWindow selects the newest loopWindow tool_use rows before checking
+// eligibility. The full fetched window supplies IDs and ambiguity counts; a use
+// pairs only with a single valid result at a later sequence and a unique use ID.
+// A fingerprint combines the call, canonical result content and success/error.
+// Digests are transient equality keys, never logged or persisted. The two scans
+// are bounded by the fetched rows; an ineligible pair does not block other pairs.
+// Lead in-flight analysis remains separate (see leadInFlight).
 func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
-	counts := make(map[string]int)
-	var hashed int
+	type completion struct {
+		seq     int32
+		content json.RawMessage
+		isError bool
+		valid   bool
+	}
+	useIDs := make(map[string]int)
+	resultIDs := make(map[string]int)
+	results := make(map[string]completion)
+	var selected []store.ListRunToolWindowRow
+	// Parse fields independently so a readable ID still contributes to ambiguity
+	// when another field has an invalid type.
 	for _, row := range rows {
-		if row.Kind != "tool_use" {
+		if row.Kind == "tool_use" && len(selected) < loopWindow {
+			selected = append(selected, row)
+		}
+		if row.Kind != "tool_use" && row.Kind != "tool_result" {
 			continue
 		}
-		if hashed >= loopWindow {
-			break
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(row.Payload, &fields) != nil || fields == nil {
+			continue
 		}
-		counts[toolCallHash(row.Payload)]++
-		hashed++
+		idField := "id"
+		if row.Kind == "tool_result" {
+			idField = "tool_use_id"
+		}
+		var id string
+		if json.Unmarshal(fields[idField], &id) != nil || id == "" {
+			continue
+		}
+		if row.Kind == "tool_use" {
+			useIDs[id]++
+			continue
+		}
+		resultIDs[id]++
+		c := completion{seq: row.Seq, content: fields["content"], valid: len(fields["content"]) > 0}
+		if value, present := fields["is_error"]; present {
+			// A pointer distinguishes explicit null from a boolean false.
+			var isError *bool
+			if json.Unmarshal(value, &isError) != nil || isError == nil {
+				c.valid = false
+			} else {
+				c.isError = *isError
+			}
+		}
+		results[id] = c
 	}
-	for _, c := range counts {
-		if c >= loopThreshold {
+	counts := make(map[string]int)
+	for _, row := range selected {
+		var fields map[string]json.RawMessage
+		var id, name string
+		if json.Unmarshal(row.Payload, &fields) != nil ||
+			json.Unmarshal(fields["id"], &id) != nil || id == "" ||
+			json.Unmarshal(fields["name"], &name) != nil || name == "" ||
+			len(fields["input"]) == 0 {
+			continue
+		}
+		result := results[id]
+		if useIDs[id] != 1 || resultIDs[id] != 1 || !result.valid || result.seq <= row.Seq {
+			continue
+		}
+		contentHash := sha256.Sum256(canonicalJSON(result.content))
+		// Fixed-width digests and explicit separators keep the components distinct.
+		status := "success"
+		if result.isError {
+			status = "error"
+		}
+		key := toolCallHash(row.Payload) + ":" + hex.EncodeToString(contentHash[:]) + ":" + status
+		counts[key]++
+		if counts[key] >= loopThreshold {
 			return true
 		}
 	}
@@ -936,18 +994,17 @@ scan:
 // it participates deterministically without grouping with a well-formed call. The
 // digest is only ever compared for equality — never logged or stored.
 func toolCallHash(payload []byte) string {
-	var p struct {
-		Name  string          `json:"name"`
-		Input json.RawMessage `json:"input"`
-	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	var fields map[string]json.RawMessage
+	var name string
+	if json.Unmarshal(payload, &fields) != nil ||
+		(len(fields["name"]) > 0 && json.Unmarshal(fields["name"], &name) != nil) {
 		sum := sha256.Sum256(payload)
 		return hex.EncodeToString(sum[:])
 	}
 	h := sha256.New()
-	h.Write([]byte(p.Name))
+	h.Write([]byte(name))
 	h.Write([]byte{0})
-	h.Write(canonicalJSON(p.Input))
+	h.Write(canonicalJSON(fields["input"]))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

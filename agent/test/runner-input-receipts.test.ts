@@ -1,7 +1,7 @@
 import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 // Issue #1673: the runner holds a resume report behind the applied receipt of the input that
-// caused it. When that receipt keeps failing on the active claim, the run must fail cleanly
-// rather than wait forever or send the resume as if the input were applied.
+// caused it. When that receipt keeps failing on the active claim, fail server-visibly
+// rather than wait forever or send a resume as if the input were applied.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -10,7 +10,7 @@ import path from "node:path";
 import { nullLogger } from "./helpers.js";
 import { Outbox } from "../src/outbox.js";
 import { StubExecutor } from "../src/executor.js";
-import { api, fakeGitlab, git, gitlabClaim, input, installHarness, runner, runnerWith } from "./runner-harness.js";
+import { api, client, deferred, fakeGitlab, git, gitlabClaim, input, installHarness, runner, runnerWith } from "./runner-harness.js";
 import type { Executor, RunContext } from "../src/executor.js";
 
 installHarness();
@@ -35,7 +35,7 @@ async function mkOutbox(): Promise<Outbox> {
 }
 
 describe("RunRunner — input receipts (issue #1673)", () => {
-  it("fails the run, without a resume report, when the approval's APPLIED keeps failing", async () => {
+  it("reports failed without resuming when approval APPLIED keeps failing on an active claim", async () => {
     const { gitlab } = fakeGitlab();
     const claim = gitlabClaim(1673);
     // The owner approves once the gate is reported; that approval's applied receipt then fails.
@@ -43,18 +43,64 @@ describe("RunRunner — input receipts (issue #1673)", () => {
       if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [input("approve_plan")]);
     });
     api.failInputReceipts("applied", 503);
-    await runner(new StubExecutor(nullLogger(), { planGate: true }), gitlab).execute(claim);
+    const stub = new StubExecutor(nullLogger(), { planGate: true });
+    let retainedFile = "";
+    await runner({
+      run: async (ctx) => {
+        retainedFile = path.join(ctx.worktreePath, "unfinished-receipt-work.txt");
+        fs.writeFileSync(retainedFile, "unfinished work before the approval receipt\n");
+        return stub.run(ctx);
+      },
+    }, gitlab).execute(claim);
 
     const states = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body);
     const statuses = states.map((s) => s.status);
     const gate = statuses.indexOf("awaiting_approval");
     assert.ok(gate >= 0, `the run reached the plan gate: ${statuses.join(",")}`);
-    assert.deepStrictEqual(statuses.slice(gate + 1), ["failed"], "no resume report after the gate, then failed");
+    assert.deepStrictEqual(statuses.slice(gate + 1), ["failed"], "no resume report after the gate, then a server-visible failure");
     assert.match(states.at(-1)?.failure_reason ?? "", /could not confirm 1 applied operator input/);
+    assert.equal(fs.readFileSync(retainedFile, "utf8"), "unfinished work before the approval receipt\n",
+      "receipt give-up grants no authority to discard unfinished source");
     assert.ok(
       api.inputReceiptCalls.filter((c) => c.runId === claim.run_id && c.kind === "applied").length >= 30,
       "the applied receipt was retried up to the active-claim bound",
     );
+  });
+
+  it("does not resume a report released by terminal control while plan APPLIED is pending", { timeout: 8_000 }, async (t) => {
+    const claim = gitlabClaim(290790, { claim_generation: 7 });
+    const entered = deferred();
+    const release = deferred();
+    const terminal = deferred();
+    const apply = client.applyInputs.bind(client);
+    t.mock.method(client, "applyInputs", async (...args: Parameters<typeof apply>) => {
+      entered.resolve();
+      await release.promise;
+      return apply(...args);
+    });
+    api.onState(claim.run_id, (body) => {
+      if (body.status === "awaiting_approval") api.setInputs(claim.run_id, [input("approve_plan")]);
+    });
+    const stub = new StubExecutor(nullLogger(), { planGate: true });
+    const { gitlab } = fakeGitlab();
+    const run = runner({
+      run: (ctx) => {
+        ctx.terminalLifecycleSignal!.addEventListener("abort", () => terminal.resolve(), { once: true });
+        return stub.run(ctx);
+      },
+    }, gitlab);
+    const executing = run.execute(claim);
+    t.after(async () => { release.resolve(); run.shutdown(); await executing; });
+    await entered.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    api.rawInputGets(claim.run_id, { inputs: [], terminal_cancelled: { run_id: claim.run_id, generation: 7 } });
+    await terminal.promise;
+    release.resolve();
+    await executing;
+    const statuses = api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
+    const gate = statuses.indexOf("awaiting_approval");
+    assert.ok(gate >= 0);
+    assert.deepEqual(statuses.slice(gate + 1), [], "a receipt wait released by the fence grants no reporting authority");
   });
 
   it("stamps the claim's generation on every receipt through a full run (strict generations)", async () => {

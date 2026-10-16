@@ -328,9 +328,9 @@ const ACTIVE_APPLY_ATTEMPTS = 30;
  *  a full HTTP timeout, so the attempt count alone could hold a report for many minutes. */
 const ACTIVE_APPLY_DEADLINE_MS = 60_000;
 
-/** Issue #1673: the applied receipt for a routed batch could not be confirmed. Thrown to every
- *  state report still waiting on it and to the parked waiters, so the run fails instead of
- *  reporting a resume the server's applied-only guards would not recognise. */
+/** Issue #1673: the applied receipt for a routed batch could not be confirmed. State reports
+ *  waiting on it and parked gates reject with this error so the runner can report failure.
+ *  The source rows stay unapplied for a later claim to replay. */
 class InputReceiptError extends Error {
   constructor(message: string) {
     super(message);
@@ -339,8 +339,8 @@ class InputReceiptError extends Error {
 }
 
 /** Issue #1673: a receipt said this claim was released or superseded (or the run is terminal).
- *  The old flight's GETs would never see its inputs again, so it ends; its reports are refused
- *  by the server's claim fence. */
+ *  The old flight ends; runner state reports check the local fence on entry and after waiting
+ *  for receipt settlement. */
 class ClaimFencedSignal extends Error {
   constructor(readonly reason: string) {
     super(`input claim is no longer active (${reason})`);
@@ -650,8 +650,8 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
   }
 
-  /** Give up the applied receipt of a routed batch on an active claim: stop polling, fail every
-   *  report waiting on it and every parked waiter. The rows stay unapplied for a later claim. */
+  /** Give up the applied receipt on an active claim: stop execution and fail server-visibly.
+   *  An unconfirmed receipt is not a server fence. Rows stay unapplied for a later claim. */
   private failReceipts(err: InputReceiptError): void {
     this.log.error("steering: giving up the applied receipt; failing the run", { run_id: this.runId, error: err.message });
     this.receiptFailure = err;
@@ -664,8 +664,8 @@ export class SteeringChannel {
     this.rejectParkedWaiters(err);
   }
 
-  /** The claim is released or superseded: route nothing more and end the old flight. A waiting
-   *  report is let go; the server refuses it as a stale claim. */
+  /** End a fenced flight and route nothing more. Receipt waiters are released; runner state
+   *  reports check the local fence on entry and again after receipt settlement. */
   private endFencedFlight(reason: string): void {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
@@ -949,6 +949,7 @@ export class SteeringChannel {
       const ids = this.discardQueue.slice(0, MAX_INPUT_BATCH);
       try {
         const receipt = await this.client.discardInputs(this.runId, ids, this.claimGeneration);
+        if (this.fence !== undefined) return;
         if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input discarded response");
         this.discardFailures = 0;
         this.discardFirstFailureAt = undefined;
@@ -960,6 +961,7 @@ export class SteeringChannel {
         }
         continue;
       } catch (err) {
+        if (this.fence !== undefined) return;
         if (this.onDiscardFailure(err, ids) === "stop") return;
       }
       await this.sleepFn(this.pollMs);
@@ -1037,8 +1039,9 @@ export class SteeringChannel {
       let next: "stop" | "retry" | "continue";
       try {
         const receipt = await this.client.applyInputs(this.runId, ids, this.claimGeneration);
-        if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input applied response");
         this.readyInFlight = false;
+        if (this.fence !== undefined) return;
+        if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input applied response");
         this.readyFailures = 0;
         if (this.ready) {
           this.ready.ids = this.ready.ids.filter((id) => !ids.includes(id));
@@ -1052,6 +1055,7 @@ export class SteeringChannel {
         continue;
       } catch (err) {
         this.readyInFlight = false;
+        if (this.fence !== undefined) return;
         next = this.onReadyFailure(err, ids, reviseBatch);
         this.log.warn("steering: a gate input's applied receipt failed", { run_id: this.runId, error: errMessage(err) });
       }
@@ -2435,6 +2439,7 @@ export class SteeringChannel {
     if (held.phase === "applied") {
       this.requestStage = "applied";
       const receipt = await this.client.applyInputs(this.runId, held.ids, this.claimGeneration);
+      if (this.fence !== undefined || (this.terminalLifecycle.signal.aborted && !this.cancelled)) return;
       if (!validReceipt(receipt, held.ids)) throw new InvalidInputResponse("invalid input applied response");
       // Settled either way: active, or already applied before the claim was fenced, in which
       // case a released or superseded claim still ends this flight.
@@ -2445,6 +2450,7 @@ export class SteeringChannel {
     if (held.phase !== "ack") return;
     this.requestStage = "ack";
     const receipt = await this.client.ackInputs(this.runId, held.ids, this.claimGeneration);
+    if (this.fence !== undefined || (this.terminalLifecycle.signal.aborted && !this.cancelled)) return;
     if (!validReceipt(receipt, held.ids)) throw new InvalidInputResponse("invalid input ACK response");
     if (!receipt.active) {
       // Route nothing; the rows belong to the next claim. A released or superseded claim ends
@@ -2491,7 +2497,14 @@ export class SteeringChannel {
       try {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
-          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
+          const { inputs: read, staleObservation, terminalCancelled, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
+          if (this.fence !== undefined || this.terminalLifecycle.signal.aborted) break;
+          if (staleObservation) { await this.sleepFn(this.pollMs); continue; }
+          if (terminalCancelled?.run_id === this.runId && Number.isSafeInteger(this.claimGeneration) && this.claimGeneration > 0 &&
+            terminalCancelled.generation === this.claimGeneration) {
+            this.endFencedFlight("terminal_cancelled");
+            break;
+          }
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
           // PRD #2603: the newest poll's Now-summary setting; absent ⇒ off.
           this.nowSummary = nowSummary === true;
@@ -2538,6 +2551,7 @@ export class SteeringChannel {
         }
         if (this.held) await this.advanceHeld();
       } catch (err) {
+        if (this.fence !== undefined) break;
         // Issue #1673: a fenced claim ends the flight; any other 4xx is definitive for these ids
         // (drop the batch, the server replays whatever is unapplied); a failing applied receipt
         // on the active claim is bounded.
@@ -2556,6 +2570,7 @@ export class SteeringChannel {
           error: errMessage(err),
         });
       }
+      if (this.fence !== undefined) break;
       // PRD #2603: tell the Now-summary controller a poll flipped its setting, only after this
       // tick's routing, and never as an input-poll failure.
       if (this.nowSummary !== this.notifiedNowSummary) {
@@ -2595,6 +2610,7 @@ export class SteeringChannel {
       // Issue #1800: report follow-ups an executor has put into a prompt. Its own request, never
       // thrown: a failing api cannot disturb the input poll.
       await this.inclusions.flush();
+      if (this.fence !== undefined) break;
       // Issue #1673: the applied receipt starts on the next tick with these same ids, after
       // every waiter has seen the routed batch. A failed reply retries without GET or route.
       // Issue #1604: without the plan-gate inputs tracked on their own (a batch with nothing else
@@ -2827,7 +2843,9 @@ export class ChatSteering implements ChatInputSource {
       }
       try {
         if (!this.held && !this.stopped && !this.cancel.signal.aborted) {
-          const { inputs, receipts } = await this.client.getInputs(this.runId, this.claimGeneration);
+          // Chat does not consume the non-chat terminalCancelled control.
+          const { inputs, receipts, staleObservation } = await this.client.getInputs(this.runId, this.claimGeneration);
+          if (staleObservation) { await this.sleepFn(this.pollMs); continue; }
           if (!validBatch(inputs)) throw new Error("invalid input GET response");
           if (!receipts) {
             // Issue #1673: a consume-on-read reply (an older api pod): route now, no receipts.

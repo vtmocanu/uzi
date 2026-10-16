@@ -148,12 +148,12 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# workersvc's cumulative LiveDB runtime exceeded 900s with reconciliation coverage.
-# Bound it at 1200s; this is timeout headroom, not a speedup. Reset other packages
-# to 10m on every iteration, and stop on any failed pipeline before the next one.
+# Give handler and workersvc LiveDB suites 20m of timeout headroom on hosted workers.
+# This is not a speedup. Reset other packages to 10m on every iteration,
+# and stop on any failed pipeline before the next one.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/workersvc/..." ]; then
+  if [ "$p" = "./internal/handler/..." ] || [ "$p" = "./internal/workersvc/..." ]; then
     timeout=20m
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
@@ -208,6 +208,29 @@ if [ "${UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E:-}" = "1" ]; then
     exit 1
   fi
   rm -f "$E2E_LOG"
+fi
+
+# Explicit opt-in only: the ordinary Go-only LiveDB sweep does not prove this Node composition.
+if [ "${UZI_STALE_WORKER_CANCEL_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  E2E_LOG="$(mktemp "$ROOT/.uzi/scratch/gate-log.XXXXXX")"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestStaleWorkerCancelE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  # Named positive controls, and zero skips at every indentation level.
+  if ! grep -q '^=== RUN   TestStaleWorkerCancelE2E$' "$E2E_LOG" ||
+    ! grep -q '^--- PASS: TestStaleWorkerCancelE2E ' "$E2E_LOG" ||
+    grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "stale worker cancel proof did not run and pass without skips: $E2E_LOG" >&2
+    exit 1
+  fi
+  for fixture_case in plan-empty question-empty stale-generation ordinary-outage; do
+    if ! grep -q "^=== RUN   TestStaleWorkerCancelE2E/$fixture_case$" "$E2E_LOG" ||
+      ! grep -q -- "--- PASS: TestStaleWorkerCancelE2E/$fixture_case " "$E2E_LOG"; then
+      echo "stale worker cancel case did not run and pass: $fixture_case ($E2E_LOG)" >&2
+      exit 1
+    fi
+  done
+  printf 'Stale worker cancel combined proof log: %s\n' "$E2E_LOG"
 fi
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

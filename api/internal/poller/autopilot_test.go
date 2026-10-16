@@ -142,14 +142,15 @@ type apNote struct {
 
 type apForge struct {
 	forgetest.BaseFake
-	fetches   int
-	events    map[int64][]forge.LabelEvent
-	eventsErr error
-	issue     forge.Issue
-	issueErr  error
-	notes     []apNote
-	noteErr   error
-	ops       *[]string
+	fetches      int
+	events       map[int64][]forge.LabelEvent
+	eventsErr    error
+	issue        forge.Issue
+	issueErr     error
+	notes        []apNote
+	noteAttempts []apNote
+	noteErr      error
+	ops          *[]string
 }
 
 func (f *apForge) ListIssueLabelEvents(_ context.Context, _, iid int64) ([]forge.LabelEvent, error) {
@@ -165,13 +166,14 @@ func (f *apForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, 
 	return issue, f.issueErr
 }
 func (f *apForge) CreateIssueNote(_ context.Context, _, iid int64, body string) (forge.IssueNote, error) {
+	f.noteAttempts = append(f.noteAttempts, apNote{iid, body})
+	if f.ops != nil {
+		*f.ops = append(*f.ops, "comment")
+	}
 	if f.noteErr != nil {
 		return forge.IssueNote{}, f.noteErr
 	}
 	f.notes = append(f.notes, apNote{iid, body})
-	if f.ops != nil {
-		*f.ops = append(*f.ops, "comment")
-	}
 	return forge.IssueNote{ID: 1, Body: body}, nil
 }
 
