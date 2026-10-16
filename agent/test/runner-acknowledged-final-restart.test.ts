@@ -877,7 +877,7 @@ it("new report proof transport failure preserves existing physical archive autho
   assert.deepEqual(await f.r.retireRecoveryReport(f.claim.run_id, f.generation, report.context),
     { retired: true, authority: "existing_archive" });
   assert.equal(old.mock.callCount(), 1);
-  const fallbackBudget = old.mock.calls[0].arguments[2];
+  const fallbackBudget = old.mock.calls[0]!.arguments[2];
   assert.equal(fallbackBudget, firstBudget, "fallback shares the original budget object");
   assert.equal(fallbackBudget.deadline, firstDeadline, "fallback preserves the original deadline");
   assert.equal(fallbackBudget.signal, firstSignal, "fallback preserves the original signal");
