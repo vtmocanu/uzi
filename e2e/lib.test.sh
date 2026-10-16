@@ -1047,6 +1047,11 @@ cat > "$SEQ_DIR/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$DB_CALLS"
 if [ "${DB_STALL:-0}" = 1 ]; then sleep 5; fi
+if [ "${DB_IGNORE_TERM:-0}" = 1 ]; then
+  trap '' TERM
+  sleep 3
+  echo delayed-row
+fi
 printf '%s' "${DB_FIXTURE:-}"
 echo 'raw psql stderr' >&2
 exit "${DB_RC:-0}"
@@ -1055,7 +1060,8 @@ chmod +x "$SEQ_DIR/bin/docker"
 export DB_CALLS="$SEQ_DIR/db-calls"
 : > "$DB_CALLS"
 db_helper_case() {
-  local mode="$1" rc=0 output
+  local mode="$1" rc=0 output started elapsed
+  started="$(python3 -c 'import time; print(time.monotonic())')"
   cases=$((cases + 1))
   (
     set +o pipefail
@@ -1068,24 +1074,30 @@ db_helper_case() {
       nonzero) export DB_RC=7; db_psql_rows 'SELECT failing' ;;
       bounded) db_psql_rows 'SELECT bounded' 2 ;;
       stalled) export DB_STALL=1; db_psql_rows 'SELECT stalled' 1 ;;
+      ignore-term) export DB_IGNORE_TERM=1; db_psql_rows 'SELECT stubborn' 1 ;;
       no-limiter)
         # shellcheck disable=SC2123  # deliberately test the absent host limiter
         PATH="$SEQ_DIR/absent"
         db_psql_rows 'SELECT no_limiter' 1 ;;
     esac
   ) > "$SEQ_DIR/db-output" 2> "$SEQ_DIR/db-error" || rc=$?
+  elapsed="$(python3 -c 'import sys,time; print(time.monotonic()-float(sys.argv[1]))' "$started")"
   output="$(cat "$SEQ_DIR/db-output")"
   local good=0
   case "$mode" in
     one-arg|bounded) [ "$rc" = 0 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
     nonzero) [ "$rc" = 7 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
     stalled) [ "$rc" -ne 0 ] && [ -z "$output" ] && good=1 ;;
+    ignore-term)
+      [ "$rc" -ne 0 ] && [ -z "$output" ] &&
+        python3 -c 'import sys; sys.exit(not (float(sys.argv[1]) < 1.8))' "$elapsed" && good=1
+      echo "TERM-ignoring DB: budget=1s elapsed=${elapsed}s exit=$rc" ;;
     no-limiter) [ "$rc" -ne 0 ] && [[ "$(cat "$SEQ_DIR/db-error")" = *'no timeout/gtimeout'* ]] && good=1 ;;
   esac
   if [ "$good" = 1 ]; then passed=$((passed + 1)); echo "PASS: real db_psql_rows $mode"
   else echo "FAIL: real db_psql_rows $mode rc=$rc stdout=[$output] stderr=[$(cat "$SEQ_DIR/db-error")]"; fi
 }
-for mode in one-arg nonzero bounded stalled no-limiter; do db_helper_case "$mode"; done
+for mode in one-arg nonzero bounded stalled ignore-term no-limiter; do db_helper_case "$mode"; done
 
 # Exercise the real bounded cancel helper against a curl executable. The existing
 # apipost_code remains status-only; this path retains the response and exit.

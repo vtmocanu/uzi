@@ -885,6 +885,103 @@ $H2|$R|2" ;;
   end
 done
 
+# Helper and caller locals must never replace the imported declaration value.
+for variable in id name value names kind declaration count run gen; do
+  begin "boundary: lowercase handoff $variable survives dynamic scope" "lower-$variable"
+  mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "$variable" "$variable" <<BODY
+$variable=$R
+pass body
+BODY
+  FAKE_DB_IDS="$R"; FAKE_WORKERS="$W|$R|3"
+  run_driver "lower-$variable"
+  has_row origin PASS || bad 'valid lowercase handoff rejected'
+  [ "$RC" = 0 ] || bad 'valid handoff must exit zero'
+  [ ! -s "$FAKE_API_LOG" ] || bad 'declared run cancelled'
+  [ -f "$RUNROOT/junit.xml" ] || bad 'JUnit missing'
+  end
+done
+
+for mode in run hold; do
+  begin "boundary: declared but unset $mode fails with final reports" "unset-$mode"
+  mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" HOLD_HAND "" <<'BODY'
+declare HOLD_HAND
+pass body
+BODY
+  if [ "$mode" = run ]; then
+    # Replace the existing empty header rather than adding a duplicate.
+    sed 's/^# handoff:.*$/# handoff: HOLD_HAND/' "$PHASES_DIR/01-origin.sh" > "$TMP/phase"
+    mv "$TMP/phase" "$PHASES_DIR/01-origin.sh"
+  else
+    echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+  fi
+  boundary_fail "unset-$mode" 'declaration HOLD_HAND'
+  [ -f "$RUNROOT/junit.xml" ] || bad 'JUnit missing'
+  [ -f "$RUNROOT/summary.md" ] || bad 'summary missing'
+  end
+done
+
+for mode in clean dirty; do
+  begin "boundary: provided status survives $mode result reporting" "status-$mode"
+  mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" status status <<'BODY'
+status=11111111-1111-1111-1111-111111111111
+pass body
+BODY
+  mkphase "$PHASES_DIR/02-consumer.sh" consumer no status "" "" <<'BODY'
+[ "$status" = 11111111-1111-1111-1111-111111111111 ] || fail 'provided status changed'
+pass consumer
+BODY
+  if [ "$mode" = dirty ]; then FAKE_HOLD_ERROR=1; fi
+  run_driver "status-$mode"
+  expected=PASS; expected_rc=0; failures=0
+  if [ "$mode" = dirty ]; then expected=FAIL; expected_rc=1; failures=2; fi
+  has_row origin "$expected" || bad 'origin result replaced by provided status'
+  has_row consumer "$expected" || bad 'consumer result incorrect'
+  contains "$(cat "$RUNROOT/logs/02-consumer.log")" 'PASS' || bad 'consumer lost status scalar'
+  [ "$RC" = "$expected_rc" ] || bad 'suite exit incorrect'
+  contains "$(cat "$RUNROOT/junit.xml")" "failures=\"$failures\"" || bad 'JUnit result incorrect'
+  end
+done
+
+for mode in run hold; do
+  begin "boundary: $mode header glob cannot expand to a provided name" "glob-$mode"
+  boundary_fixture 'RUN_HAND HOLD_HAND' ""
+  header=handoff; pattern='RUN*'; filename=RUN_HAND
+  if [ "$mode" = hold ]; then header=handoff-holds; pattern='HOLD*'; filename=HOLD_HAND; fi
+  sed "s/^# handoff:.*$/# $header: $pattern/" "$PHASES_DIR/01-origin.sh" > "$TMP/phase"
+  mv "$TMP/phase" "$PHASES_DIR/01-origin.sh"
+  touch "$RUNROOT/$filename"
+  # The real driver must run in Bash, with a matching file in its actual cwd.
+  ( cd "$RUNROOT"; run_driver "glob-$mode" )
+  # run_driver's RC is local to that subshell; final artifacts prove the result.
+  has_row origin FAIL || bad 'header glob expanded into a valid declaration'
+  contains "$(row_msg origin FAIL)" "malformed $header declaration $pattern" || bad 'literal malformed header missing'
+  [ -f "$RUNROOT/junit.xml" ] || bad 'JUnit missing'
+  end
+done
+
+begin 'artifacts: TERM-ignoring compose is killed at each capture budget' capture-kill
+mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
+fail body
+BODY
+cat > "$TMP/stubborn-compose" <<'COMPOSE_EOF'
+#!/usr/bin/env bash
+trap '' TERM
+sleep 3
+echo delayed-artifact
+COMPOSE_EOF
+# shellcheck disable=SC2034  # consumed by the sourced driver
+COMPOSE=(bash "$TMP/stubborn-compose")
+capture_start=$SECONDS
+run_driver capture-kill
+capture_elapsed=$((SECONDS - capture_start))
+[ "$capture_elapsed" -le 10 ] || bad "four two-second captures took ${capture_elapsed}s"
+for service in api agent forge-fake db; do
+  contains "$(cat "$RUNROOT/artifacts/01-origin/$service.log")" delayed-artifact && bad "capture exceeded budget for $service"
+done
+has_row origin FAIL || bad 'body failure lost'
+[ "$RC" = 1 ] || bad 'suite exit incorrect'
+end
+
 # ============================================================================
 printf '\ncases=%s passed=%s\n' "$cases" "$passed"
 [ "$cases" -eq "$passed" ] || exit 1

@@ -297,7 +297,7 @@ db_psql_rows() (
   fi
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
   if [ -n "$limiter" ]; then
-    "$limiter" "$2" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+    "$limiter" --signal=KILL "$2" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
   else
     "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
   fi

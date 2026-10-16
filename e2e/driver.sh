@@ -125,7 +125,7 @@ _capture_artifacts() {
     if [ -z "$limiter" ]; then
       printf 'capture unavailable: no timeout/gtimeout limiter\n' > "$dir/$svc.log"; continue
     fi
-    "$limiter" 2 "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
+    "$limiter" --signal=KILL 2 "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
   done
   db_psql_rows "select id,user_id,status,kind from runs order by created_at" 2 > "$dir/runs.txt" 2>/dev/null || true
   db_psql_rows "select status,kind,count(*) from runs group by status,kind order by status,kind" 2 \
@@ -194,20 +194,27 @@ _boundary_begin() {
 # A run handoff grants no custody hold permission.
 _boundary_declarations() {
   local names="$1" kind="$2" name value id declaration count
+  local tokens=()
   _declared=""
-  for name in $names; do
+  # Header names are whitespace tokens, never shell pathname patterns.
+  read -r -a tokens <<< "$names"
+  for name in "${tokens[@]}"; do
     if [[ ! "$name" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]]; then
       _boundary_error "malformed $kind declaration $name"; continue
     fi
-    if ! declare -p "$name" >/dev/null 2>&1; then
+    # The snapshot was captured at top level, before _quarantine's locals.
+    # A fresh Bash also keeps this helper's locals out of declaration lookup.
+    if ! declaration="$(bash -c 'source "$1"; declare -p -- "$2"' bash "$RUNROOT/phase.handoff" "$name" 2>/dev/null)"; then
       _boundary_error "undefined $kind declaration $name"; continue
     fi
-    declaration="$(declare -p "$name")"
     case "$declaration" in
       "declare -a"*|"declare -A"*|"declare -n"*)
         _boundary_error "malformed $kind declaration $name: expected scalar IDs"; continue ;;
     esac
-    value="${!name}"; count=0
+    if ! value="$(bash -c 'source "$1"; [ "${!2+x}" ] || exit 1; printf "%s" "${!2}"' bash "$RUNROOT/phase.handoff" "$name")"; then
+      _boundary_error "unset $kind declaration $name"; continue
+    fi
+    count=0
     # read tokenizes whitespace without pathname expansion of malformed input.
     while IFS= read -r id; do
       [ -n "$id" ] || continue
@@ -476,25 +483,32 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   secs=$((SECONDS - start))
 
   if [ "$rc" -eq 0 ]; then
-    status=PASS; msg=""
     # 6. provides round-trip — AT TOP LEVEL so the new vars land in this shell and
     #    are inherited by the next phase's subshell.
     # shellcheck disable=SC1090  # generated declare-file, path is a runtime var
     source "$RUNROOT/phase.env.next"
+    # Capture only requested declarations while no boundary helper locals exist.
+    # declare -p preserves unset scalars and scalar/array attributes for validation.
+    read -r -a _handoff_names <<< "$handoff $handoff_holds"
+    : > "$RUNROOT/phase.handoff"
+    if [ "${#_handoff_names[@]}" -gt 0 ]; then
+      declare -p -- "${_handoff_names[@]}" > "$RUNROOT/phase.handoff" 2>/dev/null || true
+    fi
+    _phase_status=PASS; _phase_msg=""
   else
-    msg="$(_strip_ansi < "$RUNROOT/logs/$nn_slug.log" | grep 'FAIL ' | tail -1 \
+    _phase_msg="$(_strip_ansi < "$RUNROOT/logs/$nn_slug.log" | grep 'FAIL ' | tail -1 \
              | sed 's/^[[:space:]]*FAIL[[:space:]]*//')" || true
     # Empty-FAIL-message fallback (PRD #966 M3): a phase that died on a BARE command
-    # under `set -e` (no `fail()` call) leaves no `FAIL ` line, so `msg` is empty and
+    # under `set -e` (no `fail()` call) leaves no `FAIL ` line, so `_phase_msg` is empty and
     # results.tsv/junit would carry an empty <failure> message. Fall back to the last
     # non-empty line of the phase log, clearly marked as not a real fail message.
-    if [ -z "$msg" ]; then
+    if [ -z "$_phase_msg" ]; then
       last="$(_strip_ansi < "$RUNROOT/logs/$nn_slug.log" | grep -v '^[[:space:]]*$' | tail -1)" || true
-      msg="(no fail message; last output: $last)"
+      _phase_msg="(no fail message; last output: $last)"
     fi
-    _requires_intersects_failed "$requires" && msg="$msg [suspect_cascade]"
-    [ "$racesens" = yes ] && msg="$msg — possible race, see margins"
-    status=FAIL
+    _requires_intersects_failed "$requires" && _phase_msg="$_phase_msg [suspect_cascade]"
+    [ "$racesens" = yes ] && _phase_msg="$_phase_msg — possible race, see margins"
+    _phase_status=FAIL
     _capture_artifacts "$nn_slug" "$secs"
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
@@ -504,13 +518,13 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   _quarantine "$nn_slug" "$slug" "$handoff" "$handoff_holds" "$rc"
   secs=$((secs + _boundary_wait))
   if [ "$_boundary_bad" -ne 0 ]; then
-    status=FAIL
-    msg="${msg:+$msg; }boundary FAIL: $_boundary_msg"
-    [ "$rc" -ne 0 ] || [ -z "$provides" ] || msg="$msg [provides suspect]"
+    _phase_status=FAIL
+    _phase_msg="${_phase_msg:+$_phase_msg; }boundary FAIL: $_boundary_msg"
+    [ "$rc" -ne 0 ] || [ -z "$provides" ] || _phase_msg="$_phase_msg [provides suspect]"
     _note_failed "$provides"
     _capture_artifacts "$nn_slug" "$secs"
   fi
-  _record "$slug" "$status" "$secs" "$msg" "$title"
+  _record "$slug" "$_phase_status" "$secs" "$_phase_msg" "$title"
 done
 
 # 10. Results — write the artifacts, then PRINT summary.md to stdout BEFORE we
