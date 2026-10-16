@@ -45,7 +45,7 @@ Four sites enforce the boundary:
 - step B's locked eligibility (`heldStateEligible` in
   `api/internal/recovery/held_final.go`);
 - the `held_publication` branch of `recovery_inventory_hold_guard`, replaced by
-  migration `00339_terminal_held_publication.sql` from migration 338, preserving
+  migration `00340_terminal_held_publication.sql` from migration 338, preserving
   its non-held disposition branches. The database guard binds the publication
   to the exact generation, original worker, live custody, tip and coverage.
 

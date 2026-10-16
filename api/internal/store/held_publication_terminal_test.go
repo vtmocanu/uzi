@@ -19,7 +19,7 @@ func TestTerminalHeldMigrationPreservesGuard(t *testing.T) {
 	start := strings.Index(old, "-- +goose StatementBegin\nCREATE OR REPLACE FUNCTION recovery_inventory_hold_guard()")
 	old = old[start:]
 	old = old[:strings.Index(old, "-- +goose StatementEnd")+len("-- +goose StatementEnd")]
-	newer := read(os.ReadFile("migrations/00339_terminal_held_publication.sql"))
+	newer := read(os.ReadFile("migrations/00340_terminal_held_publication.sql"))
 	parts := strings.Split(newer, "-- +goose Down\n")
 	if len(parts) != 2 || strings.TrimSpace(parts[1]) != old {
 		t.Fatal("Down does not restore preceding live Up guard")
