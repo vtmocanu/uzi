@@ -57,6 +57,14 @@ for bad in '{}' '[null]' \
 done
 ci_fix_snapshot '[]' repo x "$now" || fail empty
 [ "$CI_FIX_ACTIVE" = none ] && [ "$CI_FIX_RECENT" = none ] || fail 'empty is not none'
+# Real run rows contain large payloads; never carry them in a jq argv entry
+# (Linux limits each argument to 128 KiB, separately from total ARG_MAX).
+runs=$(jq -nc '[range(4) | {id:("heavy-"+tostring),kind:"ci_fix",repo_id:"repo",pipeline_ref:"x",status:"running",payload:("x"*70000)}]')
+ci_fix_snapshot "$runs" repo x "$now" || fail 'large active rows exceed the jq argument bound'
+[ "$CI_FIX_ACTIVE_COUNT" = 4 ] || fail 'large active rows lost writers'
+future=$(jq -nc --argjson n "$now" '[{id:"future",kind:"ci_fix",repo_id:"repo",pipeline_ref:"x",status:"completed",finished_at:(($n+301)|todateiso8601)}]')
+if ci_fix_snapshot "$future" repo x "$now" 2>/dev/null; then fail 'accepted a finish beyond the clock-skew allowance'; fi
+[ "$CI_FIX_ACTIVE" = unknown ] && [ "$CI_FIX_RECENT" = unknown ] || fail 'future finish became none'
 # land-prep only needs active exclusion; historical terminal timestamps are irrelevant there.
 [ -z "$(ci_fix_active_ids '[{"id":"r","kind":"ci_fix","repo_id":"repo","pipeline_ref":"x","status":"completed"}]' repo x)" ] || fail 'terminal blocked land-prep'
 echo 'PASS ci-fix: exact branch/repo predicate, active/terminal split, 24h boundary, timestamps and unknowns'

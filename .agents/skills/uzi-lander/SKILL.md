@@ -185,6 +185,8 @@ changes it); trust it over a handover's claim.
 `takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
 repo/branch. Recent is the newest terminal run finished within 24 hours, including failed
 and cancelled runs; `unknown` blocks branch work.
+The lookup uses the owner's latest 200 runs; older active runs and other owners' runs
+are outside its visibility, so `none` is not a global exclusion guarantee.
 
 Before any local fix, push or rebase, refresh the snapshot. With an active ci_fix, decide
 with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
@@ -194,6 +196,8 @@ and wait for authoritative terminal state before fixing locally. Never both. Rec
 `CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
 record `ci_fix reviewed ID SHA`. The 24-hour advisory never waives review of older changes.
+After recording that review, handle `RESULT=ci_fix_recent` as exit 1: fix the red CI
+locally in step 4. The advisory still prints until the window expires.
 
 ## The loop
 
@@ -425,7 +429,10 @@ record `ci_fix reviewed ID SHA`. The 24-hour advisory never waives review of old
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
-   passed, merge; do not ask (the user opts out per PR or per session by saying so):
+   passed, first check `CI_FIX_RECENT`: if it names a run, require a `ci_fix reviewed ID SHA`
+   trail entry covering its pushed delta at the current head. Without it, stop for review,
+   even on exit 0 or `NEXT=ready`. Then merge; do not ask (the user opts out per PR or per
+   session by saying so):
 
    ```
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin

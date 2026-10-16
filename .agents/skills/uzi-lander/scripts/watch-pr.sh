@@ -79,6 +79,7 @@
 #      (RESULT=unknown_persistent lookups=a,b). Fix or inspect that lookup; never merge on it.
 #  10  ci_fix ownership — active on this branch (even with green CI), or recent while CI is red.
 #      CI_FIX_ACTIVE/RECENT name the runs; decide wait/cancel/review before local work.
+# Branch-writer resolution precedes conflicts: unreadable uzi plus CONFLICTING is exit 9, not 8.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no

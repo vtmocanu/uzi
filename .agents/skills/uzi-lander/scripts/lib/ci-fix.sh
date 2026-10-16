@@ -10,7 +10,8 @@ ci_fix_active_runs() {
         (.id | type != "string") or (.id | test("^[A-Za-z0-9_-]+$") | not) or
         (.status | type != "string") or (.status | test("^[a-z_]+$") | not))
       then error("invalid ci_fix identity/status") else . end
-    | [.[]|select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and ((.status|test("completed|failed|cancelled"))|not))]'
+    | [.[]|select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and ((.status|test("completed|failed|cancelled"))|not))
+        | {id,status}]'
 }
 
 ci_fix_active_ids() {
