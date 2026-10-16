@@ -66,6 +66,14 @@ func drain(
 		return result(stateUnconfirmed, reason, rows)
 	}
 	appendRow := func(rows *[]observationRow, row observationRow) {
+		for _, retained := range *rows {
+			if retained.Pid == row.Pid {
+				if retained.processIdentity != row.processIdentity {
+					truncated = true // A later incarnation cannot replace historical evidence.
+				}
+				return
+			}
+		}
 		if len(*rows) < maxCleanupDiagnosticItems {
 			*rows = append(*rows, row)
 		} else {

@@ -125,6 +125,30 @@ func TestDrainBeyondObservationDiagnosticLimit(t *testing.T) {
 	}
 }
 
+func TestDrainDiagnosticChildrenDeduplicateIdentities(t *testing.T) {
+	for _, start := range []string{"1", "2"} {
+		t.Run(start, func(t *testing.T) {
+			deadline, clock, sleep := farClock()
+			children := func(_ time.Time, visit func(observationRow) error) error {
+				for _, row := range []observationRow{
+					{processIdentity: processIdentity{10, "1"}},
+					{processIdentity: processIdentity{10, start}},
+				} {
+					if err := visit(row); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			got := drain(deadline, clock, sleep, children, func(processIdentity) error { return nil }, seqReaper())
+			if got.State != stateUnconfirmed || got.Reason != reasonEchildContradicted || got.Authority != "" ||
+				!reflect.DeepEqual(got.Children, []processIdentity{{10, "1"}}) || got.EvidenceTruncated != (start != "1") {
+				t.Fatalf("diagnostics must satisfy the strict identity wire schema: %+v", got)
+			}
+		})
+	}
+}
+
 func TestDrainDeadlineUnconfirmed(t *testing.T) {
 	deadline := time.Unix(100, 0)
 	// clock: before the deadline once (so it sleeps), then past it.

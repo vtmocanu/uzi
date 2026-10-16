@@ -2,7 +2,8 @@ package main
 
 // Bounds on every untrusted-input and evidence-output surface. Each is a hard
 // cap the control loop enforces: an oversized control line is abnormal, evidence
-// is both length- and count-bounded, and the /proc walk is depth/breadth bounded
+// is both length- and count-bounded. Snapshot and observation walks are capped;
+// ordinary cleanup streams under its deadline with bounded diagnostic storage,
 // so a hostile descendant tree cannot make the supervisor allocate without limit.
 const (
 	// maxControlLine is the largest accepted control frame (fd 3). A longer
