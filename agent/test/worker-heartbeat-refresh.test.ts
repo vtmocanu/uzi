@@ -47,6 +47,8 @@ it("regular Worker ticks retain 15s cadence, original report and nonce, epochs a
   await loops.registerWithRetry(new AbortController().signal);
   const registered = requests[0]!.body;
   assert.ok((registered.protocol_capabilities as string[]).includes("completion_interlock_v1"));
+  assert.ok((registered.protocol_capabilities as string[]).includes("milestone_reconciliation_claim_v1"),
+    "reconciled claims require generation-stamped publish, input and memory requests");
   assert.equal((registered.protocol_capabilities as string[]).includes("codex_runtime_v2"), false);
   const stop = new AbortController();
   const loop = loops.heartbeatLoop(stop.signal);

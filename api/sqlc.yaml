@@ -1,6 +1,6 @@
 # Regenerate the code in internal/store after editing any migration or query
-# (sqlc is not installed globally; this pinned go-run needs no local install):
-#   cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
+# (the wrapper acquires a pinned, sha256-verified release; no global install):
+#   cd api && ../scripts/sqlc.sh v1.31.1 generate
 version: "2"
 sql:
   - engine: "postgresql"

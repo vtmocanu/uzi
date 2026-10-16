@@ -182,8 +182,8 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 		return err
 	}
 	// Same fail-closed rule as appendMessages: a CAPABILITY worker must stamp its claim generation
-	// so the fence can engage; a legacy worker keeps posting unfenced-by-generation (the claim must
-	// still be unreleased).
+	// so the fence can engage. Legacy workers may omit it only before reconciliation;
+	// the transaction checks the durable audit predicate under the run lock.
 	if claimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return ErrMissingClaimGeneration
 	}
@@ -213,6 +213,32 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 	if err := q.LockRunUsage(ctx, runID); err != nil {
 		return err
 	}
+	// Reconciliation holds the run FOR UPDATE through audit insertion. KEY SHARE
+	// serializes that audit without blocking ordinary release/reclaim UPDATEs;
+	// the final FOR SHARE fence still discards a post racing those updates.
+	// Stay on this transaction: beginClaimMutation would take worker/run locks
+	// on another connection while this one holds the usage advisory lock.
+	var lockedRun store.Run
+	err = tx.QueryRow(ctx, `SELECT claim_generation, claim_released_at FROM runs
+		WHERE id=$1 AND worker_id=$2 FOR KEY SHARE`, runID, wkr.ID).
+		Scan(&lockedRun.ClaimGeneration, &lockedRun.ClaimReleasedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrStaleClaim
+	}
+	if err != nil {
+		return err
+	}
+	// A separate READ COMMITTED statement sees an audit committed by a
+	// reconciliation whose run lock the KEY SHARE statement waited for.
+	reconciled, err := reconciliationExists(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if reconciled {
+		if err := validateReconciledGeneration(lockedRun, claimGen); err != nil {
+			return err
+		}
+	}
 	live, err := q.RunUsageFenceLive(ctx, store.RunUsageFenceLiveParams{RunID: runID, ClaimGeneration: pgconv.Int8Ptr(claimGen)})
 	if err != nil {
 		return err
@@ -232,8 +258,7 @@ func (s *Service) RecordRunUsage(ctx context.Context, wkr store.Worker, runID uu
 	// whole write. RunUsageFenceLiveLocked row-locks the runs row (FOR SHARE), so a release that
 	// committed before it is seen here (ErrStaleClaim, the deferred Rollback discards every
 	// write) and one that starts after it waits for our commit. It is last so runs UPDATEs are not
-	// blocked across up to 500 upserts; a post that inserted a leg row may already hold FOR KEY SHARE
-	// on the row (the FK), which this upgrades.
+	// blocked across up to 500 upserts; this upgrades the early FOR KEY SHARE run lock.
 	live, err = q.RunUsageFenceLiveLocked(ctx, store.RunUsageFenceLiveLockedParams{RunID: runID, WorkerID: pgconv.UUID(wkr.ID), ClaimGeneration: pgconv.Int8Ptr(claimGen)})
 	if err != nil {
 		return err

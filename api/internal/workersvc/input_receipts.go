@@ -103,7 +103,7 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if s.txBeginner == nil {
 		return InputReceiptResult{}, errors.New("input receipt transaction unavailable")
 	}
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return InputReceiptResult{}, err
 	}
@@ -154,6 +154,15 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	appliedFollowUp := false
 	toDiscard := 0
 	for _, row := range rows {
+		if row.Kind == "stop" || row.Kind == "cancel" || row.Kind == "reject_plan" {
+			var retired bool
+			if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM run_milestone_reconciliations WHERE run_id=$1 AND stop_cutoff >= $2)", runID, row.ID).Scan(&retired); err != nil {
+				return InputReceiptResult{}, err
+			}
+			if retired {
+				return InputReceiptResult{}, &InputReceiptConflictError{Reason: "superseded"}
+			}
+		}
 		ownReceipt := row.ConsumedAt.Valid && row.ConsumedClaimGeneration.Valid && row.ConsumedClaimGeneration.Int64 == generation &&
 			row.ConsumedWorkerID.Valid && uuid.UUID(row.ConsumedWorkerID.Bytes) == wkr.ID
 		superseded := row.Disposition.Valid && row.Disposition.String == dispositionSuperseded
@@ -262,8 +271,10 @@ func (s *Service) DiscardInputs(ctx context.Context, wkr store.Worker, runID uui
 // prompt. The fence is the caller's claim only: the run's current worker_id must be wkr and its
 // claim_generation must equal generation, whatever the run's status. A terminal or
 // switch_pending run keeps both, so the final turn's receipt still lands after the terminal
-// report. Terminal, switch_pending and released or requeued-at-the-same-generation runs are
-// accepted on purpose: a re-claim bumps claim_generation, which is what fences an old flight. A failed fence answers Active=false with ReceiptStale and stamps nothing. There is no
+// report. Ordinary terminal, switch_pending and released runs remain compatible.
+// After reconciliation, the locked audit read additionally requires a positive,
+// unreleased claim, closing the reset-to-reclaim window. A failed fence answers
+// Active=false with ReceiptStale and stamps nothing. There is no
 // per-row consumed_claim_generation or consumed_worker_id check: a follow-up recovered after a
 // resume was consumed by an earlier claim. Rows that are not follow_up, not yet ACKed or
 // already included are skipped silently, which makes a retry idempotent. Inputs lists only the
@@ -276,7 +287,7 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if s.txBeginner == nil {
 		return InputReceiptResult{}, errors.New("input receipt transaction unavailable")
 	}
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return InputReceiptResult{}, err
 	}
@@ -293,6 +304,13 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 		return InputReceiptResult{}, ErrRunNotOwned
 	}
 	if !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != wkr.ID || run.ClaimGeneration != generation || (run.Kind == "cross_check" && run.ClaimGeneration == 0) {
+		return InputReceiptResult{Inputs: []InputDTO{}, Active: false, Reason: ReceiptStale}, nil
+	}
+	reconciled, err := reconciliationExists(ctx, tx, runID)
+	if err != nil {
+		return InputReceiptResult{}, err
+	}
+	if reconciled && (generation <= 0 || run.ClaimReleasedAt.Valid) {
 		return InputReceiptResult{Inputs: []InputDTO{}, Active: false, Reason: ReceiptStale}, nil
 	}
 	stamped, err := q.IncludeRunInputRows(ctx, store.IncludeRunInputRowsParams{RunID: runID, Ids: ids})

@@ -2491,7 +2491,7 @@ export class SteeringChannel {
       try {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
-          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId);
+          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
           // PRD #2603: the newest poll's Now-summary setting; absent ⇒ off.
           this.nowSummary = nowSummary === true;
@@ -2827,7 +2827,7 @@ export class ChatSteering implements ChatInputSource {
       }
       try {
         if (!this.held && !this.stopped && !this.cancel.signal.aborted) {
-          const { inputs, receipts } = await this.client.getInputs(this.runId);
+          const { inputs, receipts } = await this.client.getInputs(this.runId, this.claimGeneration);
           if (!validBatch(inputs)) throw new Error("invalid input GET response");
           if (!receipts) {
             // Issue #1673: a consume-on-read reply (an older api pod): route now, no receipts.

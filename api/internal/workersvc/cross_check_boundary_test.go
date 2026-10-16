@@ -171,6 +171,8 @@ func (tx *crossCheckBoundaryTx) QueryRow(_ context.Context, sql string, args ...
 		return tx.query(sql, args)
 	}
 	switch {
+	case sql == "SELECT EXISTS (SELECT 1 FROM run_milestone_reconciliations WHERE run_id=$1)":
+		return crossCheckBoundaryRow{value: []any{false}}
 	case strings.HasPrefix(sql, "-- name: GetRunOwnedByWorkerForUpdate"):
 		return crossCheckBoundaryRow{value: tx.run}
 	case strings.HasPrefix(sql, "-- name: GetPlanCrossCheck"):
@@ -181,6 +183,9 @@ func (tx *crossCheckBoundaryTx) QueryRow(_ context.Context, sql string, args ...
 	}
 }
 func (tx *crossCheckBoundaryTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if sql == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" {
+		return pgconn.NewCommandTag("SET"), nil
+	}
 	if tx.exec != nil {
 		return tx.exec(sql, args)
 	}

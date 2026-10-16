@@ -242,7 +242,9 @@ func TestRunningCodexAccountParkContentionLiveDB(t *testing.T) {
 				duration < time.Duration(finishRunClaimAttempts-1)*finishRunClaimRetryDelay {
 				t.Fatalf("bounded fallback: applied=%v err=%v duration=%s", applied, err, duration)
 			}
-			if observer.begins != finishRunClaimAttempts+1 || observer.contentions != finishRunClaimAttempts {
+			// The explicit durability report has one post-commit claim-fenced
+			// transaction; it does not add a classification retry.
+			if observer.begins != finishRunClaimAttempts+2 || observer.contentions != finishRunClaimAttempts {
 				t.Fatalf("attempts=%d contentions=%d", observer.begins, observer.contentions)
 			}
 			assertAccountParkCustody(t, fx, before, false)

@@ -1551,6 +1551,7 @@ export class SdkExecutor implements Executor {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
         client: this.client,
         runId: ctx.runId,
+        claimGeneration: ctx.claimGeneration,
         log: this.log,
       }).server;
       // PRD #158: run-lane forge READ tools (mcp__forge__*). Endpoints are
@@ -2923,6 +2924,7 @@ export class SdkExecutor implements Executor {
             // once the run has parked, so a resumed follow-up turn (iteration back at 1) is
             // NOT treated as first. Non-interactive runs never park → identical to before.
             first: firstImplementTurn,
+            reviewedPlanResume: ctx.reviewedPlanResume === true && !ctx.sessionId,
             priorDecisionsMemo,
             // issue #222: warn the lead on the first implement turn that this resume's
             // reseed destroyed any local-only prior-attempt work, so a queued follow-up

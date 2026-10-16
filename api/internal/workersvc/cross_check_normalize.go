@@ -120,7 +120,7 @@ func bindPlanCrossCheckWrite(p *store.SetRunAutopilotPlanParams, run store.Run, 
 	if err != nil || len(digest) != 32 {
 		return fmt.Errorf("%w: invalid cross-check candidate digest", ErrInvalidState)
 	}
-	rawMilestones := planMilestonesParam(run, req.PlanMd, req.Milestones)
+	rawMilestones := reportPlanMilestonesParam(run, *req)
 	if req.Milestones != nil {
 		rawMilestones, err = json.Marshal(*req.Milestones)
 		if err != nil {

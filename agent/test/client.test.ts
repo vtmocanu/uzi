@@ -752,6 +752,22 @@ describe("reportState held-state credential-switch seam (PRD #1247 M5)", () => {
 // FakeApi inputs route carries no credential_switch, so this pins the back-compat shape (the
 // signal-present case is covered against a purpose-built server in credential-switch.test.ts).
 describe("getInputs return shape (PRD #1247 M5)", () => {
+  it("fences legacy polling with the original optional claim generation", async (t) => {
+    const urls: string[] = [];
+    t.mock.method(globalThis, "fetch", async (url: string) => {
+      urls.push(url);
+      return Response.json({ inputs: [] });
+    });
+    const client = newClient();
+    await client.getInputs("run/inputs", 7);
+    await client.getInputs("run/inputs");
+    await client.getInputs("run/inputs", 0);
+    assert.deepEqual(urls, [
+      baseUrl + "/api/worker/runs/run%2Finputs/inputs?claim_generation=7",
+      baseUrl + "/api/worker/runs/run%2Finputs/inputs",
+      baseUrl + "/api/worker/runs/run%2Finputs/inputs",
+    ]);
+  });
   it("returns the inputs array with credentialSwitch undefined when the poll omits it", async () => {
     api.setInputs("run-inputs", [{ id: 1, kind: "follow_up", body: "hi" }]);
     const client = newClient();

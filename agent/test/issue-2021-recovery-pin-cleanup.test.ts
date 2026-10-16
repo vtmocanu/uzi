@@ -1,9 +1,9 @@
+import { makeScratchRoot } from "./fixture-repo.js";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { RequestError } from "../src/client.js";
@@ -98,7 +98,7 @@ async function journal(generation: number | undefined = 4) {
 }
 
 beforeEach(async () => {
-  root = await fs.mkdtemp(path.join(os.tmpdir(), "issue-2021-"));
+  root = makeScratchRoot("issue-2021-");
   cache = new GitCache(path.join(root, "data"), nullLogger(), undefined, testGitCacheOptions());
   bare = path.join(root, "data", "repos", NAME);
   await fs.mkdir(bare, { recursive: true });

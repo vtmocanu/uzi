@@ -189,7 +189,7 @@ it("issue1924 locally quiescent terminal captures original roots after foreign o
     head = commit(ctx.worktreePath, "foreign-reclaim.txt");
     client.getRunOwnership = async () => {
       throw new RequestError("GET", "/api/worker/runs/" + claim.run_id + "/ownership", 404,
-        JSON.stringify({ error: "run not found " + "for this worker" }));
+        JSON.stringify({ error: "run not found " + "for this worker" }), undefined, { complete: true, bytes: 41 });
     };
     throw new Error("terminal failure after reclaim");
   } }, gitlab, "journal-key");

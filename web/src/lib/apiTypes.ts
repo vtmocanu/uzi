@@ -3084,6 +3084,12 @@ export interface Run {
    *  it back as expected_gate_revision. The api omits it (Go omitempty) while it is 0, i.e.
    *  for a run with no gate published under a revision-allocating api. */
   gate_revision?: number;
+  /** Owner-only consent binding for an explicit milestone reset. */
+  reset_state_digest?: string;
+  /** Bounded owner-only reconciliation history; stored records retain full detail. */
+  milestone_reconciliations?: Record<string, unknown>[];
+  /** Fetch older history using reconciliation_before_gate_revision. */
+  milestone_reconciliations_next_before_gate_revision?: number;
   /** PRD #212: the git-status porcelain lines the plan turn wrote to the worktree,
    *  surfaced at the approval gate. `[]`/absent renders nothing. UNTRUSTED
    *  repo-controlled paths — render as escaped plain text through stripUnsafeChars,
@@ -3742,6 +3748,7 @@ export interface RunListItem extends Run {
 export type RunSummaryItem = Omit<
   RunListItem,
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+  | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
@@ -5063,4 +5070,14 @@ export interface HeldPublications {
 export interface RecoveryCustodyHolds {
   aggregate: RecoveryCustodyAggregate;
   holds: RecoveryCustodyHold[];
+}
+
+/** Explicit owner consent; null binds legacy runs with no completion contract. */
+export interface MilestoneResetOptions {
+  reconciliation: {
+    mode: "reset";
+    reason: string;
+    expected_completion_revision: number | null;
+  };
+  expected_reset_state_digest: string;
 }

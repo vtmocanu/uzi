@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { canonicalValue, changedMilestones } from "../../lib/milestoneReset";
+import { MilestoneResetDetails } from "./MilestoneResetDetails";
 import { diffLines } from "diff";
 import { LineDiff } from "../../components/LineDiff";
 import {
   api,
   type AgentSelectionInput,
+  type MilestoneResetOptions,
   type Run,
   type RunMessage,
   type Worker,
@@ -216,6 +219,7 @@ export function PlanPanel({
   busy,
   canSteer = true,
   onApprove,
+  onResetApprove,
   onReject,
   onRequestChanges,
   onCancel,
@@ -253,6 +257,8 @@ export function PlanPanel({
     overrideCapabilities?: boolean,
     expectedGateRevision?: number,
   ) => void;
+  onResetApprove?: (selection: AgentSelectionInput, overrideCapabilities: boolean,
+    expectedGateRevision: number, reset: MilestoneResetOptions) => Promise<boolean>;
   onReject: (reason: string, expectedGateRevision?: number) => void;
   // Request-changes (PRD #41) and the revising-state Cancel-run affordance. Optional
   // with a no-op default so a base-gate-only caller need not wire them.
@@ -386,6 +392,39 @@ export function PlanPanel({
   // its tests — are untouched.
   // Fix 2 (M4a review): a Codex run (D5) has no Anthropic token to seed/set — gate the
   // seed-and-fetch on the run's ACTUAL harness alongside canSteer, not canSteer alone.
+  const changed = changedMilestones(run);
+  const resetReady = Array.isArray(run.milestones_candidate) && typeof run.reset_state_digest === "string" && run.reset_state_digest.length > 0 &&
+    Number.isSafeInteger(run.gate_revision) && (run.gate_revision ?? 0) > 0 &&
+    (run.completion_revision === null || (Number.isSafeInteger(run.completion_revision) && (run.completion_revision ?? 0) > 0));
+  // One snapshot binds definitions, effects, selection and authorization before any await.
+  const binding = canonicalValue({
+    id: run.id, status: run.status, gate: run.gate_revision, digest: run.reset_state_digest,
+    revision: run.completion_revision, plan: run.plan_md, frozen: run.milestones,
+    proposed: run.milestones_candidate, completed: run.milestones_completed,
+    progress: run.milestones_in_progress, agents: run.milestones_agents,
+    scope: run.scope_ceiling, stop: run.stop_kind, stopReason: run.stop_reason,
+    accepted: run.completion_accepted, deferred: run.completion_deferred,
+    selection, canSteer, revising: rev.revising, agentSource: run.agent_source, exclusions: run.agent_exclusions,
+  });
+  const latestApprovalState = useRef({ id: run.id, changed, canSteer });
+  latestApprovalState.current = { id: run.id, changed, canSteer };
+  const latestBinding = useRef(binding);
+  latestBinding.current = binding;
+  const [resetDraft, setResetDraft] = useState<{
+    binding: string; run: Run; selection: AgentSelectionInput; override: boolean;
+  } | null>(null);
+  const [resetReason, setResetReason] = useState("");
+  const [resetAck, setResetAck] = useState(false);
+  const [resetNotice, setResetNotice] = useState("");
+  const clearReset = useCallback(() => {
+    setResetDraft(null); setResetReason(""); setResetAck(false);
+  }, []);
+  useEffect(() => {
+    if (resetDraft && resetDraft.binding !== binding) {
+      clearReset();
+      setResetNotice("The displayed plan or reset effects changed. Review them again before confirming.");
+    }
+  }, [binding, resetDraft, clearReset]);
   const gateTokenPickerVisible = canSteer && run.harness !== "codex";
   const {
     selection: credential,
@@ -403,7 +442,18 @@ export function PlanPanel({
   const [submitting, setSubmitting] = useState(false);
   const doApprove = useCallback(
     async (withOverride: boolean) => {
-      if (submittingRef.current) return;
+      if (!canSteer || busy || submittingRef.current || run.status !== "awaiting_approval") return;
+      if (changed) {
+        clearReset();
+        setResetNotice("");
+        if (!resetReady || !onResetApprove) {
+          setResetNotice("Reset metadata is unavailable. Refresh and review this plan before approving.");
+          return;
+        }
+        setResetDraft({ binding, run: structuredClone(run), selection: structuredClone(selection), override: withOverride });
+        return;
+      }
+      const ordinaryRunId = run.id;
       // The revision on screen at the click. This callback closes over the render the owner
       // clicked, so a refetch during the credential await below cannot change it; reading it
       // here, before the await, keeps that true should this ever move to a latest-run ref.
@@ -427,6 +477,11 @@ export function PlanPanel({
             return;
           }
         }
+        // A credential operation started on an ordinary plan must never authorize a reset.
+        if (latestApprovalState.current.id !== ordinaryRunId || latestApprovalState.current.changed || !latestApprovalState.current.canSteer) {
+          setCredentialError("The displayed plan changed. Review it again before approving.");
+          return;
+        }
         // Preserve the exact onApprove arg-count contract (1 arg for the plain approve,
         // 2 for the capability override) so RunView's `act` wrapper and the panel tests
         // see no change.
@@ -441,8 +496,31 @@ export function PlanPanel({
         setSubmitting(false);
       }
     },
-    [credential, credentialTouched, run.id, run.gate_revision, onApprove, selection],
+    [credential, credentialTouched, run, onApprove, selection, canSteer, busy, changed, resetReady, onResetApprove, clearReset, binding],
   );
+
+  const confirmReset = async () => {
+    const draft = resetDraft;
+    if (!draft || draft.binding !== latestBinding.current || !canSteer || busy || submittingRef.current ||
+      !resetAck || !resetReason.trim() || !onResetApprove) return;
+    submittingRef.current = true;
+    setSubmitting(true);
+    try {
+      const accepted = await onResetApprove(draft.selection, draft.override, draft.run.gate_revision!, {
+        reconciliation: { mode: "reset", reason: resetReason.trim(), expected_completion_revision: draft.run.completion_revision! },
+        expected_reset_state_digest: draft.run.reset_state_digest!,
+      });
+      if (latestBinding.current === draft.binding && !accepted) {
+        setResetNotice("Reset was refused. Review the refreshed run and open a new confirmation; approval was not retried.");
+      }
+    } catch {
+      if (latestBinding.current === draft.binding) setResetNotice("Reset was refused. Review the run and open a new confirmation.");
+    } finally {
+      clearReset();
+      submittingRef.current = false;
+      setSubmitting(false);
+    }
+  };
 
   const activeRoster = selection.source === "repo" ? repoAgents.map((a) => a.name) : ownTemplates.map((t) => t.name);
   const activeCount = activeRoster.length - selection.exclusions.length;
@@ -514,7 +592,7 @@ export function PlanPanel({
   // Open gate. A v2+ re-gate reads "Updated plan…" and shows the superseded history.
   const revised = rev.versions > 1;
   const currentVersion = Math.max(rev.versions, 1);
-  const disclosing = rejecting || requesting;
+  const disclosing = rejecting || requesting || !!resetDraft;
 
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
@@ -546,7 +624,7 @@ export function PlanPanel({
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-faint">{roundsLabel}</span>
           {canSteer && !disclosing && (
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button disabled={busy || submitting} onClick={() => void doApprove(false)}>
                 {approveLabel}
               </Button>
@@ -576,6 +654,30 @@ export function PlanPanel({
       </div>
       <div className="space-y-4 p-4">
         <PlanCrossCheck run={run} presentation="inset" />
+        {changed && !resetDraft && <MilestoneResetDetails run={run} />}
+        {resetNotice && <Alert message={resetNotice} />}
+        {canSteer && resetDraft && resetDraft.binding === binding && (
+          <section role="region" aria-label="Confirm milestone reset" className="space-y-3 rounded-lg border border-warn p-3">
+            <h3 className="font-semibold">Reset progress and approve plan</h3>
+            <MilestoneResetDetails run={resetDraft.run} />
+            {resetDraft.override && <p>This approval also overrides missing capabilities.</p>}
+            <Field label="Reason for reset" htmlFor="reset-reason">
+              <Textarea id="reset-reason" value={resetReason} disabled={busy || submitting}
+                onChange={(e) => setResetReason(e.target.value)} />
+            </Field>
+            <label className="flex items-start gap-2 text-sm">
+              <input type="checkbox" checked={resetAck} disabled={busy || submitting}
+                onChange={(e) => setResetAck(e.target.checked)} />
+              I acknowledge that reset clears progress and agents, scope ceiling and stop decisions,
+              accepted and deferred criteria, and invalidates permits. Old decisions remain audited.
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <Button disabled={busy || submitting || !resetAck || !resetReason.trim()}
+                onClick={() => void confirmReset()}>Reset progress and approve plan</Button>
+              <Button variant="secondary" disabled={busy || submitting} onClick={clearReset}>Cancel reset</Button>
+            </div>
+          </section>
+        )}
         {/* PRD #1795 D5: the verdict was refused (409 gate_revision_mismatch) and nothing
             was applied. The run is refetched by the caller; the notice says only what the
             reported revisions support. */}
@@ -603,10 +705,10 @@ export function PlanPanel({
               value={credential}
               onChange={onCredentialChange}
               tokens={credentialTokens}
-              disabled={busy}
+              disabled={busy || submitting || changed}
             />
             <p className="mt-1 text-[11px] text-faint">
-              {run.credential_override
+              {changed ? "Credential changes are separate from reset approval. Reset sends no credential changes." : run.credential_override
                 ? "The implementation phase runs on this token. Leaving the current choice keeps this run’s override."
                 : "The implementation phase runs on this token. Inherit keeps the worker’s current binding."}
             </p>
@@ -699,7 +801,7 @@ export function PlanPanel({
                 default path. */}
             {unmetCaps.length > 0 && canSteer && (
               <div className="mt-2.5 border-t border-edge/60 pt-2.5">
-                <Button variant="secondary" size="sm" disabled={busy || submitting} onClick={() => void doApprove(true)}>
+                <Button variant="secondary" size="sm" disabled={busy || submitting || !!resetDraft} onClick={() => void doApprove(true)}>
                   Run without {unmetCaps.map((c) => stripUnsafeChars(c)).join(", ")}
                 </Button>
                 <p className="mt-1 text-[11px] text-faint">

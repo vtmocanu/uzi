@@ -448,3 +448,32 @@ describe("listRuns / adminListRuns summary view (#2661)", () => {
     expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/admin\/runs\?view=summary$/);
   });
 });
+
+
+describe("milestone reset transport", () => {
+  it.each([null, 3])("serializes explicit reset completion revision %s", async revision => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { server_side: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.submitRunInput("r1", "approve_plan", "", undefined, true, undefined, 4, {
+      reconciliation: { mode: "reset", reason: "Scope changed", expected_completion_revision: revision },
+      expected_reset_state_digest: "digest",
+    });
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      kind: "approve_plan", body: "", override_capabilities: true, expected_gate_revision: 4,
+      expected_reset_state_digest: "digest",
+      reconciliation: { mode: "reset", reason: "Scope changed", expected_completion_revision: revision },
+    });
+  });
+  it("leaves ordinary request bodies unchanged and adds only explicit audit cursors", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, {}));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.submitRunInput("r1", "approve_plan");
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({ kind: "approve_plan", body: "" });
+    await api.getRun("r1");
+    await api.getRun("r1", 12);
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/runs/r1");
+    expect(fetchMock.mock.calls[2][0]).toBe("/api/runs/r1?reconciliation_before_gate_revision=12");
+  });
+});

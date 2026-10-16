@@ -415,6 +415,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// sends the new fields ONLY when it sees this token, because an older api's strict
 		// decoder 400s an unknown field.
 		{"gate_revision_v1"},
+		{"milestone_reconciliation_v1"}, // accepts gate checkpoint witness; existing claim generation remains the fence
 		{"plan_revision_retry_v1"},
 		// PRD #1809 M5 (D6): this api accepts {status:"recovery_wait",
 		// recovery_cause:"data_volume_full"} with the optional disk_park_preventive flag, stores
@@ -1541,8 +1542,21 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID)
+	var generation *int64
+	if raw := r.URL.Query().Get("claim_generation"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || value <= 0 {
+			httpx.Error(w, http.StatusBadRequest, "claim_generation must be positive")
+			return
+		}
+		generation = &value
+	}
+	res, err := h.wsvc.ConsumeInputs(r.Context(), wkr, runID, generation)
 	if err != nil {
+		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "stale_claim")
+			return
+		}
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 			return
@@ -1877,8 +1891,9 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 		Head             string `json:"head"`
 		// PRD #1247 M5 (D3): the claim generation the worker holds. A CAPABILITY worker stamps it so
 		// RequestCompletionPermit's fence refuses to issue a permit for a released/superseded stale
-		// flight. Nullable + OPTIONAL (a legacy worker omits it, unfenced), but the field must exist
-		// here because httpx.DecodeJSON rejects unknown fields.
+		// flight. Legacy omission is allowed only before reconciliation. Reconciled runs require a
+		// positive generation regardless of capability. The field must exist because decoding
+		// rejects unknown fields.
 		ClaimGeneration *int64 `json:"claim_generation"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
@@ -2155,11 +2170,15 @@ func (h *Handler) WorkerSaveMemory(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	mem, err := h.wsvc.SaveMemory(r.Context(), wkr, runID, req.Title, req.Body, req.Basis, req.Evidence)
+	mem, err := h.wsvc.SaveMemory(r.Context(), wkr, runID, req.Title, req.Body, req.Basis, req.Evidence, req.ClaimGeneration)
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+			httpx.Error(w, http.StatusConflict, "claim_generation is required")
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			httpx.Error(w, http.StatusConflict, "stale claim")
 		case errors.Is(err, workersvc.ErrMemoryNoRepo):
 			httpx.Error(w, http.StatusConflict, "this run has no repo, so it has no memory to write")
 		case errors.Is(err, workersvc.ErrMemoryEmpty):
@@ -2243,6 +2262,19 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid checkpoint tip")
 		return
 	}
+	var claimGeneration *int64
+	if raw, present := r.URL.Query()["claim_generation"]; present {
+		if len(raw) != 1 {
+			httpx.Error(w, http.StatusBadRequest, "claim_generation must be positive")
+			return
+		}
+		generation, err := strconv.ParseInt(raw[0], 10, 64)
+		if err != nil || generation <= 0 {
+			httpx.Error(w, http.StatusBadRequest, "claim_generation must be positive")
+			return
+		}
+		claimGeneration = &generation
+	}
 	// Raw octet-stream body, NOT JSON: httpx.DecodeJSON is JSON+1 MiB only. Cap with
 	// MaxBytesReader so an over-cap pack is a truthful 413 (a split/too-large signal),
 	// not a silently truncated — and thus malformed — pack.
@@ -2256,8 +2288,12 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "could not read checkpoint pack")
 		return
 	}
-	res, err := h.wsvc.Publish(r.Context(), wkr, runID, tip, body)
+	res, err := h.wsvc.Publish(r.Context(), wkr, runID, tip, body, claimGeneration)
 	if err != nil {
+		if errors.Is(err, workersvc.ErrMissingClaimGeneration) || errors.Is(err, workersvc.ErrStaleClaim) {
+			httpx.ErrorReason(w, http.StatusConflict, "checkpoint publish claim is stale", "stale_claim")
+			return
+		}
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
 			return

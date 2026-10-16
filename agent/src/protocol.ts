@@ -1473,11 +1473,14 @@ export interface ClaimResponse {
   plan_md?: string | null;
   /** The FROZEN milestone list for this run (PRD #122 M1, Decision 11), carried so a
    *  future resume's planning prompt can name what is already committed. Null/absent
-   *  when the approved plan had no milestones. Additive + optional; nothing consumes
-   *  it in M1 — the field is declared now so the wire contract is complete.
-   *  Issue #1626: on a `resume_phase: "awaiting_approval"` claim (nothing frozen yet) it
-   *  carries the unapproved CANDIDATE list instead, so the re-presented gate re-sends it. */
+   *  means none supplied; [] is an explicitly empty list and must survive decoding.
+   *  On a `resume_phase: "awaiting_approval"` claim it carries the unapproved CANDIDATE
+   *  instead, even if an older contract is frozen, so the recovered gate checkpoints
+   *  an empty replacement and re-sends the same proposed definitions. */
   milestones?: Milestone[] | null;
+  /** Frozen execution definitions, distinct from a presented candidate. An explicit []
+   *  is a frozen empty plan; absence means no execution definitions were supplied. */
+  execution_milestones?: Milestone[];
   /** Whether this run's plan is already approved (PRD #35 Decision 6b), derived
    *  SERVER-side as "a consumed approve_plan input exists for the run, OR the run is
    *  autopilot". On a resume with a resumable session this lets the worker skip the
@@ -1856,7 +1859,8 @@ export interface CompletionAttemptRequest {
   /** PRD #1247 M5 (D3): the claim-lane generation the reporting worker holds. A CAPABILITY worker
    *  stamps it so the server's RecordCompletionAttempt fence can engage — a released/superseded
    *  stale flight's attempt then records nothing (the api decodes it as `ClaimGeneration *int64`).
-   *  Optional so a legacy worker omits it and the attempt is unfenced. */
+   *  Legacy omission is allowed only before reconciliation; reconciled runs require a positive
+   *  generation regardless of worker capability. */
   claim_generation?: number;
 }
 
@@ -1964,6 +1968,8 @@ export type MemoryBasis = "observed" | "inferred";
  *  parse them until M3 (extra JSON fields are ignored server-side, so this is
  *  back-compat). */
 export interface SaveMemoryRequest {
+  /** The originating claim; optional for legacy API callers. */
+  claim_generation?: number;
   title: string;
   body: string;
   /** Writer-declared provenance; a save omitting it is defaulted to `inferred`. */
@@ -2391,6 +2397,9 @@ export interface StateRequest {
   /** awaiting_approval carries the captured plan; an autopilot `running` report also
    *  carries it, persisted durably via SetRunAutopilotPlan (RC1 #1197). */
   plan_md?: string;
+  /** API metadata feature milestone_reconciliation_v1: a confirmed published restore point
+   *  covering this gate's source. Never sent on local verification alone. */
+  gate_checkpoint_witness?: { source_head: string; published_checkpoint: string };
   /** PRD #1795 M3 (D1): the worker-minted identity (a UUID) of the gate presentation an
    *  `awaiting_approval` report publishes. A retry of the same report reuses it; an SDK same-gate
    *  reclaim reuses the claim's persisted id; every other gate mints a fresh one. Sent ONLY when

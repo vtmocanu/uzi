@@ -163,11 +163,12 @@ func classifyPersistFail(err error) persistFailKind {
 // pointer: callers get a persistFailStats value snapshot, so no field can be read
 // outside the mutex.
 type persistFailEntry struct {
-	kind    persistFailKind
-	streak  int
-	firstAt time.Time // start of the CURRENT streak (a reset restarts it)
-	lastAt  time.Time // last failure — TTL eviction only
-	lastSeq int32     // runs.last_seq as the last failure observed it
+	generation int64
+	kind       persistFailKind
+	streak     int
+	firstAt    time.Time // start of the CURRENT streak (a reset restarts it)
+	lastAt     time.Time // last failure — TTL eviction only
+	lastSeq    int32     // runs.last_seq as the last failure observed it
 	// stopReqAt is when a stop verdict was enqueued for this run (M5), zero until
 	// then. It is the escalation clock, and it is deliberately NOT reset by a class
 	// or seq change: those restart the EVIDENCE, while this records that we already
@@ -183,11 +184,12 @@ type persistFailEntry struct {
 
 // persistFailStats is the read-only view of an entry.
 type persistFailStats struct {
-	kind      persistFailKind
-	streak    int
-	firstAt   time.Time
-	lastSeq   int32
-	stopReqAt time.Time
+	generation int64
+	kind       persistFailKind
+	streak     int
+	firstAt    time.Time
+	lastSeq    int32
+	stopReqAt  time.Time
 }
 
 // persistFailTracker is the whole of PRD #108 Phase 2's state. It is IN-PROCESS
@@ -217,7 +219,8 @@ type persistFailTracker struct {
 	// A member is a run that ACTUALLY PERSISTED messages, never merely a run that
 	// exists — "active" is not "succeeding", and a neighbour mid-long-build appends
 	// nothing. Only recordSuccess writes this map, which is what enforces that.
-	lastOK map[uuid.UUID]time.Time
+	lastOK           map[uuid.UUID]time.Time
+	lastOKGeneration map[uuid.UUID]int64
 	// capWarnAt rate-limits the at-capacity warning, one slot per map.
 	capWarnAt [persistMapCount]time.Time
 }
@@ -247,8 +250,9 @@ func (c capWarning) emit() {
 
 func newPersistFailTracker() *persistFailTracker {
 	return &persistFailTracker{
-		fail:   make(map[uuid.UUID]*persistFailEntry),
-		lastOK: make(map[uuid.UUID]time.Time),
+		fail:             make(map[uuid.UUID]*persistFailEntry),
+		lastOK:           make(map[uuid.UUID]time.Time),
+		lastOKGeneration: make(map[uuid.UUID]int64),
 	}
 }
 
@@ -256,18 +260,26 @@ func newPersistFailTracker() *persistFailTracker {
 // set. Both halves matter: the delete is the ordinary recovery path, and the
 // lastOK write is the only evidence M5's comparison-set guard will accept that the
 // write path works.
-func (t *persistFailTracker) recordSuccess(runID uuid.UUID, now time.Time) {
-	t.applySuccess(runID, now).emit()
+func (t *persistFailTracker) recordSuccess(runID uuid.UUID, now time.Time, generation ...int64) {
+	t.applySuccess(runID, now, generation...).emit()
 }
 
-func (t *persistFailTracker) applySuccess(runID uuid.UUID, now time.Time) capWarning {
+func (t *persistFailTracker) applySuccess(runID uuid.UUID, now time.Time, generation ...int64) capWarning {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	g := observedGeneration(generation)
+	if e := t.fail[runID]; e != nil && e.generation > g {
+		return capWarning{}
+	}
+	if t.lastOKGeneration[runID] > g {
+		return capWarning{}
+	}
 	delete(t.fail, runID)
 	if _, ok := t.lastOK[runID]; !ok && len(t.lastOK) >= persistFailMaxEntries {
 		return t.noteAtCapLocked(persistMapLastOK, len(t.lastOK), runID, now)
 	}
 	t.lastOK[runID] = now
+	t.lastOKGeneration[runID] = g
 	return capWarning{}
 }
 
@@ -279,19 +291,27 @@ func (t *persistFailTracker) applySuccess(runID uuid.UUID, now time.Time) capWar
 // reset is harder to get wrong than a predicate, and it restarts firstAt too, so
 // the streak count and the sustained-duration window always describe the same
 // episode.
-func (t *persistFailTracker) recordFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time) {
-	t.applyFailure(runID, kind, lastSeq, now).emit()
+func (t *persistFailTracker) recordFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time, generation ...int64) {
+	t.applyFailure(runID, kind, lastSeq, now, generation...).emit()
 }
 
-func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time) capWarning {
+func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind, lastSeq int32, now time.Time, generation ...int64) capWarning {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	g := observedGeneration(generation)
 	e, ok := t.fail[runID]
+	if (ok && e.generation > g) || t.lastOKGeneration[runID] > g {
+		return capWarning{}
+	}
+	if ok && e.generation != g {
+		delete(t.fail, runID)
+		ok = false
+	}
 	if !ok {
 		if len(t.fail) >= persistFailMaxEntries {
 			return t.noteAtCapLocked(persistMapFail, len(t.fail), runID, now)
 		}
-		t.fail[runID] = &persistFailEntry{kind: kind, streak: 1, firstAt: now, lastAt: now, lastSeq: lastSeq}
+		t.fail[runID] = &persistFailEntry{generation: g, kind: kind, streak: 1, firstAt: now, lastAt: now, lastSeq: lastSeq}
 		return capWarning{}
 	}
 	if e.kind != kind || e.lastSeq != lastSeq {
@@ -321,11 +341,16 @@ func (t *persistFailTracker) applyFailure(runID uuid.UUID, kind persistFailKind,
 // no slot — could keep the kill armed for every OTHER user's run on the instance.
 // Requiring the comparison set to be non-terminal means warming it costs a live
 // run that is really doing work.
-func (t *persistFailTracker) evict(runID uuid.UUID) {
+func (t *persistFailTracker) evict(runID uuid.UUID, generation ...int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.fail, runID)
-	delete(t.lastOK, runID)
+	if e := t.fail[runID]; e != nil && (len(generation) == 0 || e.generation == generation[0]) {
+		delete(t.fail, runID)
+	}
+	if len(generation) == 0 || t.lastOKGeneration[runID] == generation[0] {
+		delete(t.lastOK, runID)
+		delete(t.lastOKGeneration, runID)
+	}
 }
 
 // stats returns a value snapshot of a run's streak, or the zero value if it has
@@ -342,7 +367,7 @@ func (t *persistFailTracker) stats(runID uuid.UUID) persistFailStats {
 }
 
 func statsOf(e *persistFailEntry) persistFailStats {
-	return persistFailStats{kind: e.kind, streak: e.streak, firstAt: e.firstAt, lastSeq: e.lastSeq, stopReqAt: e.stopReqAt}
+	return persistFailStats{generation: e.generation, kind: e.kind, streak: e.streak, firstAt: e.firstAt, lastSeq: e.lastSeq, stopReqAt: e.stopReqAt}
 }
 
 // persistFailCandidate is one run the auto-stop evaluator should look at, with its
@@ -360,12 +385,12 @@ type persistFailCandidate struct {
 // agent/src/chat-runner.ts builds the same MessageBatcher against the same
 // /messages route, so a chat run wedges identically. It is also why the evaluator
 // costs zero queries in the common case — this map is normally empty.
-func (t *persistFailTracker) candidates(now time.Time, minStreak int, minWindow time.Duration) []persistFailCandidate {
+func (t *persistFailTracker) candidates(now time.Time) []persistFailCandidate {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	var out []persistFailCandidate
 	for id, e := range t.fail {
-		if e.streak >= minStreak && !e.firstAt.IsZero() && now.Sub(e.firstAt) >= minWindow {
+		if e.streak >= autoStopStreak && !e.firstAt.IsZero() && now.Sub(e.firstAt) >= autoStopWindow {
 			out = append(out, persistFailCandidate{runID: id, persistFailStats: statsOf(e)})
 		}
 	}
@@ -439,21 +464,21 @@ func (t *persistFailTracker) peersSucceeding(runID uuid.UUID, now time.Time, win
 
 // markStopRequested stamps the escalation clock. No-op if the entry is gone (the
 // run recovered or was evicted between the decision and this call).
-func (t *persistFailTracker) markStopRequested(runID uuid.UUID, now time.Time) {
+func (t *persistFailTracker) markStopRequested(runID uuid.UUID, now time.Time, generation ...int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if e, ok := t.fail[runID]; ok {
+	if e, ok := t.fail[runID]; ok && (len(generation) == 0 || e.generation == generation[0]) {
 		e.stopReqAt = now
 	}
 }
 
 // shouldLogDecline reports whether the "auto-stop is holding" line is due for this
 // run, stamping it when it is. Rate-limited to once per `every`.
-func (t *persistFailTracker) shouldLogDecline(runID uuid.UUID, now time.Time, every time.Duration) bool {
+func (t *persistFailTracker) shouldLogDecline(runID uuid.UUID, now time.Time, every time.Duration, generation ...int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	e, ok := t.fail[runID]
-	if !ok {
+	if !ok || (len(generation) > 0 && e.generation != generation[0]) {
 		return false
 	}
 	if !e.declineLoggedAt.IsZero() && now.Sub(e.declineLoggedAt) < every {
@@ -477,6 +502,7 @@ func (t *persistFailTracker) prune(now time.Time) {
 	for id, at := range t.lastOK {
 		if now.Sub(at) > persistFailTTL {
 			delete(t.lastOK, id)
+			delete(t.lastOKGeneration, id)
 		}
 	}
 }
@@ -496,4 +522,19 @@ func (t *persistFailTracker) noteAtCapLocked(slot, entries int, runID uuid.UUID,
 	}
 	t.capWarnAt[slot] = now
 	return capWarning{warn: true, slot: slot, entries: entries, runID: runID}
+}
+
+// Omitted generations are reserved for unreconciled fixtures with unknown claims.
+func observedGeneration(g []int64) int64 {
+	if len(g) == 0 {
+		return 0
+	}
+	return g[0]
+}
+
+func (t *persistFailTracker) current(c persistFailCandidate) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	e := t.fail[c.runID]
+	return e != nil && statsOf(e) == c.persistFailStats
 }

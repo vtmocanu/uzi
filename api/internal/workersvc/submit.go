@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -67,7 +69,9 @@ type SubmitInputOptions struct {
 	// selection, milestone freeze, revise_count, stop_kind, capability clear, server-side reject)
 	// and returns a *GateRevisionMismatchError naming the current revision.
 	// nil keeps the pre-#1795 behaviour.
-	ExpectedGateRevision *int64
+	ExpectedGateRevision     *int64
+	Reconciliation           *apitypes.MilestoneReconciliation
+	ExpectedResetStateDigest string
 }
 
 // SubmitInputWithOptions is SubmitInput carrying the owner-authorized bypasses (PRD #84 M4 4c
@@ -95,6 +99,12 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
+	}
+	if opts.Reconciliation != nil {
+		if kind != "approve_plan" {
+			return SubmitInputResult{}, ErrReconciliationConflict
+		}
+		return s.reconcileMilestoneApproval(ctx, userID, run, body, sel, opts)
 	}
 	// PRD #1795 M2 (D5): an expected gate revision is checked up front against the run just
 	// read, BEFORE the terminal guard, so a verdict sent against a gate the run no longer shows
@@ -139,6 +149,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// here, after the enqueue, rather than in the handler BEFORE this call, is the fix for
 	// the non-atomic drop.
 	if kind == "approve_plan" {
+		if changedMilestoneContract(run) {
+			return SubmitInputResult{}, ErrReconciliationRequired
+		}
 		if !opts.OverrideCapabilities {
 			if err := s.capabilityGate(ctx, run); err != nil {
 				return SubmitInputResult{}, err
@@ -155,6 +168,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		}
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				if current, readErr := s.GetRun(ctx, userID, runID); readErr == nil && changedMilestoneContract(current) {
+					return SubmitInputResult{}, ErrReconciliationRequired
+				}
 				// No row: the expected-revision predicate refused (or the run vanished). With an
 				// expected revision this is a mismatch even when the re-read matches again: the
 				// approve was not written.
@@ -270,7 +286,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if ceiling != n {
 			auditBody += fmt.Sprintf(" (clamped from %d)", n)
 		}
-		return s.submitScopeCeiling(ctx, run, ceiling, auditBody)
+		return s.submitScopeCeiling(ctx, run, n, auditBody)
 	}
 
 	// A `pause` (PRD #1190 M1) is an owner-only request to park a running run on a pushed
@@ -382,7 +398,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			if reason != "" {
 				auditBody += ": " + reason
 			}
-			return s.submitScopeCeiling(ctx, run, len(completed), auditBody)
+			return s.submitScopeCeiling(ctx, run, len(completed), auditBody, true)
 		}
 		// Only an interactive task run has a park that reads the stop flag, so a stop is
 		// meaningful ONLY there. Reject it on any other run BEFORE stamping, so a
@@ -1097,7 +1113,73 @@ func clampInt(v, lo, hi int) int {
 // The statement refuses a terminal run in SQL (issue #1399: the caller's status check is an
 // unlocked read, and a concurrent terminal transition can commit first); that 0-row refusal
 // surfaces as pgx.ErrNoRows and is mapped to ErrRunTerminal.
-func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling int, auditBody string) (SubmitInputResult, error) {
+func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling int, auditBody string, stopping ...bool) (SubmitInputResult, error) {
+	if s.txBeginner != nil {
+		tx, err := s.txBeginner.Begin(ctx)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		q := store.New(tx)
+		current, err := q.GetRunByIDForUpdate(ctx, run.ID)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if current.UserID != run.UserID {
+			return SubmitInputResult{}, ErrRunNotFound
+		}
+		priorFrozen, _ := canonicalRawJSON(run.MilestonesFrozen)
+		currentFrozen, _ := canonicalRawJSON(current.MilestonesFrozen)
+		if current.ContractRevision != run.ContractRevision || current.GateRevision != run.GateRevision || !bytes.Equal(priorFrozen, currentFrozen) {
+			return SubmitInputResult{}, ErrReconciliationConflict
+		}
+		if terminalStatuses[current.Status] {
+			return SubmitInputResult{}, ErrRunTerminal
+		}
+		frozen, err := DecodeMilestones(current.MilestonesFrozen)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		completed, err := DecodeMilestoneIDs(current.MilestonesCompleted)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		requested := ceiling
+		if len(stopping) > 0 && stopping[0] {
+			requested = len(completed)
+		}
+		ceiling = clampInt(requested, len(completed), len(frozen))
+		if len(stopping) > 0 && stopping[0] {
+			_, reason, hasReason := strings.Cut(auditBody, ": ")
+			auditBody = fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", ceiling)
+			if hasReason {
+				auditBody += ": " + reason
+			}
+		} else {
+			auditBody = fmt.Sprintf("scope ceiling → complete through milestone %d of %d", ceiling, len(frozen))
+		}
+		if ceiling != requested {
+			auditBody += fmt.Sprintf(" (clamped from %d)", requested)
+		}
+		locked := s.boundClaimControlService(q)
+		result, err := locked.submitScopeCeiling(ctx, current, ceiling, auditBody)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return SubmitInputResult{}, err
+		}
+		return result, nil
+	}
+	frozen, err := DecodeMilestones(run.MilestonesFrozen)
+	if err != nil {
+		return SubmitInputResult{}, err
+	}
+	completed, err := DecodeMilestoneIDs(run.MilestonesCompleted)
+	if err != nil {
+		return SubmitInputResult{}, err
+	}
+	ceiling = clampInt(ceiling, len(completed), len(frozen))
 	cleanBody, _ := stripNUL(auditBody)
 	// ceiling is clampInt'd into [len(completed), len(frozen)] by the caller, so it is a
 	// small non-negative milestone count. The explicit int32 bound makes that provable to

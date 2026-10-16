@@ -29,9 +29,11 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -58,9 +60,8 @@ const (
 	// — 2 hours, against this PRD's ~2 minute goal. 60s is 20 steering polls for an
 	// issue run (runner.ts pollMs ?? 3_000) and 60 for a chat (WORKER_CHAT_POLL_MS).
 	//
-	// It escalates UNCONDITIONALLY rather than re-testing liveness: if the worker
-	// honoured the cancel it has already reported terminal, and FailRunAutoStop's
-	// status scope makes the write a no-op. The SQL is the guard, not the timing.
+	// It escalates once the grace expires, while evaluateAutoStop rechecks the
+	// running, unreleased generation under the run lock.
 	autoStopEscalateAfter = 60 * time.Second
 )
 
@@ -164,7 +165,7 @@ func (s *Service) autoStopWedgedRuns(ctx context.Context, now time.Time) int64 {
 	if !s.p.AutoStopEnabled {
 		return 0
 	}
-	cands := s.persistFail.candidates(now, autoStopStreak, autoStopWindow)
+	cands := s.persistFail.candidates(now)
 	if len(cands) == 0 {
 		return 0
 	}
@@ -180,19 +181,80 @@ func (s *Service) autoStopWedgedRuns(ctx context.Context, now time.Time) int64 {
 // evaluateAutoStop runs the remaining guards for one candidate and takes the
 // action they allow. Returns whether the run was stopped or a stop was requested.
 func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persistFailCandidate) bool {
-	// STILL NON-TERMINAL, re-read from Postgres at decision time. Double-guarded
-	// on purpose: this read closes the ordinary case and FailRunAutoStop's status
-	// scope closes the race between the read and the write, the same pattern
-	// SetRunHealth's Status param uses for the exit race.
-	run, err := s.q.GetRunByID(ctx, c.runID)
-	if err != nil {
-		slog.Error("workersvc: auto-stop could not re-read the run", "run_id", c.runID.String(), "error", err)
+	// The run lock serializes the authority check and mutation with owner reset,
+	// release and recording. Worker liveness is read through the same querier;
+	// no worker lock is acquired after this run lock.
+	locked := s
+	var run store.Run
+	var err error
+	var tx pgx.Tx
+	if s.txBeginner != nil {
+		tx, err = s.beginReadCommitted(ctx)
+		if err != nil {
+			slog.Error("workersvc: auto-stop transaction failed", "run_id", c.runID.String(), "error", err)
+			return false
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		q := store.New(tx)
+		locked = s.boundClaimControlService(q)
+		run, err = q.GetRunByIDForUpdate(ctx, c.runID)
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("workersvc: auto-stop locked read failed", "run_id", c.runID.String(), "error", err)
+			}
+			return false
+		}
+		audited, auditErr := reconciliationExists(ctx, tx, c.runID)
+		if auditErr != nil {
+			slog.Error("workersvc: auto-stop reconciliation read failed", "run_id", c.runID.String(), "error", auditErr)
+			return false
+		}
+		if audited && c.generation <= 0 {
+			return false
+		}
+	} else {
+		run, err = s.q.GetRunByID(ctx, c.runID)
+		if err != nil {
+			slog.Error("workersvc: auto-stop could not re-read the run", "run_id", c.runID.String(), "error", err)
+			return false
+		}
+	}
+	if !s.persistFail.current(c) {
 		return false
 	}
-	if terminalStatuses[run.Status] {
-		s.persistFail.evict(c.runID)
+	if run.ClaimReleasedAt.Valid || run.ClaimGeneration != c.generation {
+		// Unknown unreconciled fixtures retain their old compatibility. Real
+		// observations always carry the locked run's actual generation.
+		if run.ClaimReleasedAt.Valid || c.generation != 0 {
+			return false
+		}
+	}
+	terminal := false
+	var afterCommit func()
+	acted := locked.evaluateAutoStopLocked(ctx, now, c, run, &terminal, &afterCommit)
+	if !acted {
 		return false
 	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			slog.Error("workersvc: auto-stop commit failed", "run_id", c.runID.String(), "error", err)
+			return false
+		}
+	}
+	if terminal {
+		s.publishSwept(c.runID, "failed")
+		s.maybeEnqueueJudgeByID(ctx, c.runID)
+		s.persistFail.evict(c.runID, c.generation)
+	} else {
+		s.persistFail.markStopRequested(c.runID, now, c.generation)
+	}
+	if afterCommit != nil {
+		afterCommit()
+	}
+	return true
+}
+
+func (s *Service) evaluateAutoStopLocked(ctx context.Context, now time.Time, c persistFailCandidate, run store.Run, terminal *bool, afterCommit *func()) bool {
 	// The kill's status set is IDENTICAL to the flag's. runningTarget is reached only
 	// from healthTargetFor's "running" arm, so a run in any other status was never
 	// flagged — and killing a run that was never flagged breaks the "health first,
@@ -219,7 +281,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	// Chat coverage survives this: chat-runner.ts reports `running` before it does any
 	// work, so a wedged chat run is `running` exactly like an issue run.
 	if run.Status != "running" {
-		s.persistFail.evict(c.runID)
+		s.persistFail.evict(c.runID, c.generation)
 		return false
 	}
 
@@ -230,7 +292,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 	// BUILD is broken, since these runs are never stopped and their flag is erased
 	// by the exit contract when RUN_TIMEOUT finally ends them.
 	if !autoStopKillableKinds[c.kind] {
-		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow) {
+		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow, c.generation) {
 			slog.Warn("workersvc: a run's messages cannot be persisted, but auto-stop is holding",
 				"run_id", c.runID.String(),
 				"run_kind", run.Kind,
@@ -253,7 +315,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 		// the streak, window and no-progress guards but blocked by the comparison set is
 		// the incident's own shape, and without this an
 		// operator sees a `looping` flag and nothing else, forever.
-		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow) {
+		if s.persistFail.shouldLogDecline(c.runID, now, autoStopWindow, c.generation) {
 			slog.Warn("workersvc: a run's messages cannot be persisted, but auto-stop is holding",
 				"run_id", c.runID.String(),
 				"run_kind", run.Kind,
@@ -291,19 +353,18 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 			slog.Error("workersvc: auto-stop could not enqueue the stop verdict", "run_id", c.runID.String(), "error", err)
 			return false
 		}
-		s.persistFail.markStopRequested(c.runID, now)
-		s.logAutoStop("verdict_enqueued", run, c, now, peers, live)
+		*afterCommit = func() { s.logAutoStop("verdict_enqueued", run, c, now, peers, live) }
 		return true
 
 	case c.stopReqAt.IsZero():
 		// Half B. No live poller, so no one will ever consume a verdict: take the
 		// terminal transition server-side.
-		return s.failRunAutoStop(ctx, run, c, now, peers, live, "server_side_failed")
+		return s.failRunAutoStop(ctx, run, c, now, peers, live, "server_side_failed", terminal, afterCommit)
 
 	case now.Sub(c.stopReqAt) >= autoStopEscalateAfter:
 		// The escalation. See autoStopEscalateAfter — the status-scoped write is what
 		// makes this safe to fire without re-testing whether the worker complied.
-		return s.failRunAutoStop(ctx, run, c, now, peers, live, "escalated")
+		return s.failRunAutoStop(ctx, run, c, now, peers, live, "escalated", terminal, afterCommit)
 	}
 	return false
 }
@@ -311,7 +372,7 @@ func (s *Service) evaluateAutoStop(ctx context.Context, now time.Time, c persist
 // failRunAutoStop performs the server-side terminal transition and the side effects
 // every other server-side failed path performs. Omit either and the run rots in the
 // wrong board column with no judge.
-func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistFailCandidate, now time.Time, peers int, live bool, action string) bool {
+func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistFailCandidate, now time.Time, peers int, live bool, action string, terminal *bool, afterCommit *func()) bool {
 	rows, err := s.q.FailRunAutoStop(ctx, store.FailRunAutoStopParams{
 		ID:            c.runID,
 		FailureReason: pgconv.TextOrNull(autoStopReason),
@@ -321,18 +382,13 @@ func (s *Service) failRunAutoStop(ctx context.Context, run store.Run, c persistF
 		return false
 	}
 	if rows == 0 {
-		// The run reached terminal between the evaluator's read and this write. Nothing
-		// happened, which is the correct outcome and the reason the escalation above is
-		// unconditional.
-		s.persistFail.evict(c.runID)
+		// The SQL can additionally refuse a pending-outcome lease. No terminal
+		// fanout is authorized when no row changed.
+		s.persistFail.evict(c.runID, c.generation)
 		return false
 	}
-	s.publishSwept(c.runID, "failed")
-	// PRD #46 Decision 2: a committed-terminal run is worth judging. Best-effort,
-	// gated (kind/toggles/token) inside.
-	s.maybeEnqueueJudgeByID(ctx, c.runID)
-	s.persistFail.evict(c.runID)
-	s.logAutoStop(action, run, c, now, peers, live)
+	*terminal = true
+	*afterCommit = func() { s.logAutoStop(action, run, c, now, peers, live) }
 	return true
 }
 

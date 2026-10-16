@@ -27,6 +27,24 @@ through `[0.52.0]`.)
 - **Recover abandoned plan-gate executions (#3001).**
   Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion. Human plan revisions get up to three automatic provider-turn re-drives per accepted revision in a live flight, with 5/10/20-second backoff plus 0–20% jitter (30-second cap), after bounded inner retries. On exhaustion the original plan stays visible and feedback stays pending; an ordinary source-bound revise spends the normal revision allowance, while cancel and source-bound reject remain available at the cap. Approvals and follow-ups cannot restart the expired wait. Revised-plan publication atomically records the successful feedback and explicitly supersedes pending predecessors under a source-gate fence. Upgrade the API before workers for `plan_revision_retry_v1`; reclaim keeps existing Claude replay and Codex fresh-plan/re-send behavior, without durable retry accounting. The live expired gate remains busy and can defer an image roll; existing drain/shutdown policy is unchanged.
 
+- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
+
+- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
+  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
+
+- **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
+  Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
+
+### Changed
+
+- **sqlc regeneration uses verified release binaries.**
+  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
+
+- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
+  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
+
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

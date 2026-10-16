@@ -1036,7 +1036,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// tick until its grace ends) and the early docker-allowlist probe; a read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
-	if custodyHoldLimit > 0 {
+	// Hold-free cross-check children bypass custody admission independently of
+	// bounded code-publishing continuation; their placement and account gates remain.
+	if custodyHoldLimit > 0 && r.Kind != "cross_check" {
 		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
 			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: custodyHoldLimit,
 			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),

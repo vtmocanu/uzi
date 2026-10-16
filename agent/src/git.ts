@@ -9056,8 +9056,8 @@ export class GitCache {
    * (`runnerCloneForBranch`, `isOverlayMarker`): its `.github/workflows` subtree is swapped to
    * the default's so GitHub's tip-vs-default workflow-scope check passes, while the real branch
    * content lives on its LAST parent (`realTip`). The base (a prior overlay tip) goes FIRST and
-   * `realTip` LAST so the api broker's parent[0]-first strict-descendant DFS over its depth-1
-   * store accepts it (see the PRD's broker note — the broker stays byte-unchanged).
+   * `realTip` LAST for the adoption peel and deterministic construction. Since #3013 the
+   * broker accepts either parent order within traversal budgets despite missing side paths.
    *
    * Synthesis is pure object-DB work via a TEMP INDEX (no live worktree, no filter drivers, no
    * runner-clone perturbation): `read-tree` the real tip, `rm --cached` the workflow set,

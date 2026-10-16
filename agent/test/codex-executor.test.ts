@@ -18332,3 +18332,37 @@ describe("2833 Codex inline summaries", () => {
     }
   });
 });
+
+
+describe("M2 replacement Codex fresh context", () => {
+  it("pre-approved replacement starts a new thread without replanning or inherited scope", async () => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(700, "signal_done", { milestones_completed: ["M1"] }, th, tn, "replacement-done"));
+      t.push(turnCompleted("completed", th, tn));
+    }) });
+    let gates = 0;
+    let progressReads = 0;
+    const { ctx } = makeCtx({
+      sessionId: null, planApproved: true, reviewedPlanResume: true, seeded: false,
+      approvedPlan: "Replacement plan unique-M2", wipRecovered: true,
+      frozenMilestones: [{ id: "M1", title: "Replacement one" }, { id: "M2", title: "Replacement two" }],
+      gatePlan: async () => { gates++; throw new Error("replacement replanned"); },
+      reportIteration: async () => { progressReads++; return { completedCount: 0, completedIds: [] }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "replacement Codex");
+    assert.equal(gates, 0);
+    assert.equal(rig.transport.requests.some(r => r.method === "thread/resume"), false);
+    assert.equal(rig.transport.turnStartCount, 1);
+    const turn = rig.transport.requests.find(r => r.method === "turn/start");
+    assert.ok(turn);
+    const prompt = (turn.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+    assert.equal(progressReads, 1, "fresh turn reads authoritative empty progress");
+    assert.match(prompt, /unique-M2/);
+    assert.match(prompt, /Replacement one — not started/);
+    assert.match(prompt, /Replacement two — not started/);
+    assert.match(prompt, /current frozen milestone definitions and server-reported progress and scope/);
+    assert.match(prompt, /Historical completion or stop declarations.*not authority/);
+    assert.equal(result.scopeCapped, undefined);
+    assert.deepEqual(result.milestonesCompleted, ["M1"]);
+  });
+});

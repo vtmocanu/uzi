@@ -55,6 +55,21 @@ func (s *Service) WorkerNameForRun(ctx context.Context, run store.Run) (*string,
 // checkpointContainsLatest is the park's durability report (PRD #1809 M6, D8), stored on a parked
 // answer exactly as SetState stores it for the other parks (setCheckpointDurability). Display-only.
 func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string, published bool, claimGen *int64, checkpointContainsLatest *bool) (store.Run, bool, error) {
+	if s.txBeginner != nil {
+		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, claimGen)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		run, applied, err := locked.ReportWallPark(ctx, wkr, runID, capturedHead, published, claimGen, checkpointContainsLatest)
+		if err != nil {
+			return run, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return run, false, err
+		}
+		return run, applied, nil
+	}
 	_ = published // informational (the degraded-park feed message, M2); the store transition ignores it.
 	// NUL-strip BEFORE the trim (a NUL is not whitespace), the same order every worker-authored text
 	// field uses; hold_captured_head accepts arbitrary worker input and a NUL would raise 22021.
