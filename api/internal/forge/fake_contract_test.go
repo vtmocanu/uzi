@@ -58,11 +58,15 @@ func TestForgeFakeOperationContracts(t *testing.T) {
 		MRs         []mrFixture
 		Threads     []thread
 	}
-	file, err := os.Open(os.Getenv("UZI_FORGE_FAKE_MANIFEST"))
+	file, err := os.Open(os.Getenv("UZI_FORGE_FAKE_MANIFEST")) //nolint:gosec // G703: operation-contracts.test.mjs creates this temporary fixture and passes its path to the Go child; not user input
 	if err != nil {
 		t.Fatal("required manifest:", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close required manifest: %v", err)
+		}
+	}()
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&manifest); err != nil {
