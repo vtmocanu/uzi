@@ -847,6 +847,8 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	// Policy holds are worker-authenticated, generation-fenced DB writes without forge calls.
+	{"POST", "/api/worker/runs/{id}/policy-hold", noLimiter},
 	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this

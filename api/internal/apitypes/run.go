@@ -1042,6 +1042,7 @@ type CredentialEpochDTO struct {
 // RunDTO / RunListItemDTO source fields exactly; the nested value types are reused. There is
 // exactly one worker_name here, the list-level one (RunListItemDTO.WorkerName).
 type RunSummaryItemDTO struct {
+	PolicyRefusal  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
 	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
 
 	ID string `json:"id"`
@@ -1818,6 +1819,7 @@ type RunSummaryItemDTO struct {
 // key-set test in run_summary_test.go fails until the field is placed here on purpose.
 func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
+		PolicyRefusal:               item.PolicyRefusal,
 		WorkerRecovery:              item.WorkerRecovery,
 		ID:                          item.ID,
 		RepoID:                      item.RepoID,
@@ -1981,6 +1983,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 	return RunListItemDTO{
 		RunDTO: RunDTO{
+			PolicyRefusal:               s.PolicyRefusal,
 			WorkerRecovery:              s.WorkerRecovery,
 			ID:                          s.ID,
 			RepoID:                      s.RepoID,
