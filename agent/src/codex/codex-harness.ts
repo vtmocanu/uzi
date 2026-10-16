@@ -74,7 +74,7 @@ import {
   pickCodexClassification,
   type CodexErrorClassification,
 } from "./terminal-normalize.js";
-import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
+import { CodexUsageAccountant, deriveCodexRunCost, type CodexUsageDiagnostic } from "./token-accounting.js";
 import {
   childProjectedId,
   newProjectionNonce,
@@ -274,25 +274,40 @@ function noteThreadId(note: CodexNotification): string | undefined {
 
 /** Resumed accounting requires raw numeric evidence, including unpriced reasoning/total.
  * Transport coercion preserves liveness but cannot establish a historical baseline. */
-function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage_updated" }>): boolean {
+function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage_updated" }>):
+  { readonly ok: true } | { readonly ok: false; readonly diagnostic: CodexUsageDiagnostic } {
   const container = asObject(asObject(note.params)?.tokenUsage);
-  if (!container || note.usage.pricingEvidenceComplete === false) return false;
+  if (!container) return { ok: false, diagnostic: { predicate: "missing container" } };
   for (const name of ["total", "last"] as const) {
     const raw = asObject(container[name]);
-    if (!raw) return false;
+    if (!raw) return { ok: false, diagnostic: { predicate: "missing breakdown", breakdown: name } };
     const decoded = note.usage[name];
     for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
       "outputTokens", "reasoningOutputTokens", "totalTokens"] as const) {
       const value = raw[key];
-      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value !== decoded[key])
-        return false;
+      if (!(key in raw))
+        return { ok: false, diagnostic: { predicate: "missing bucket", breakdown: name, bucket: key } };
+      if (typeof value !== "number")
+        return { ok: false, diagnostic: { predicate: "non-number", breakdown: name, bucket: key } };
+      if (!Number.isSafeInteger(value) || value < 0)
+        return { ok: false, diagnostic: { predicate: "unsafe or negative", breakdown: name, bucket: key } };
+      if (value !== decoded[key])
+        return { ok: false, diagnostic: { predicate: "raw-vs-decoded mismatch", breakdown: name, bucket: key } };
     }
-    if (decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ||
-        decoded.reasoningOutputTokens > decoded.outputTokens ||
-        decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens) return false;
+    const bucket = decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ? "cachedInputTokens"
+      : decoded.reasoningOutputTokens > decoded.outputTokens ? "reasoningOutputTokens"
+      : decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens ? "totalTokens" : undefined;
+    if (bucket !== undefined)
+      return { ok: false, diagnostic: { predicate: "bucket relationship", breakdown: name, bucket } };
   }
-  return (["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
-    "reasoningOutputTokens", "totalTokens"] as const).every(key => note.usage.last[key] <= note.usage.total[key]);
+  for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
+    "reasoningOutputTokens", "totalTokens"] as const) {
+    if (note.usage.last[key] > note.usage.total[key])
+      return { ok: false, diagnostic: { predicate: "last > total", breakdown: "last", bucket: key } };
+  }
+  if (note.usage.pricingEvidenceComplete === false)
+    return { ok: false, diagnostic: { predicate: "pricing evidence incomplete" } };
+  return { ok: true };
 }
 
 /** Extract non-empty text off an item, from a bare `text` string and/or a `content`
@@ -2143,12 +2158,19 @@ export class CodexHarness implements RunHarness {
     if (this.resumedRoot && root) {
       if (this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
           note.turnId !== this.activeTurnId) return;
-      if (note.kind !== "token_usage_updated" || !validResumedUsage(note)) {
-        // A malformed current-live note is attempted work, not recoverable history.
-        const turnId = note.kind === "token_usage_updated"
-          ? note.turnId : asString(asObject(note.params)?.turnId);
+      if (note.kind !== "token_usage_updated") {
+        const turnId = asString(asObject(note.params)?.turnId);
         this.accountant.markIncomplete(this.threadId!, "invalid_raw_usage",
-          !this.resumeBoundarySeen && turnId === this.activeTurnId);
+          !this.resumeBoundarySeen && turnId === this.activeTurnId,
+          { predicate: "untyped usage notification" });
+        return;
+      }
+      const validation = validResumedUsage(note);
+      if (!validation.ok) {
+        // A malformed current-live note is attempted work, not recoverable history.
+        const turnId = note.turnId;
+        this.accountant.markIncomplete(this.threadId!, "invalid_raw_usage",
+          !this.resumeBoundarySeen && turnId === this.activeTurnId, validation.diagnostic);
         return;
       }
       if (!this.resumeBoundarySeen) {

@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Cancelled runs stop waiting when their worker reconnects.**
   A worker returning after an outage stops a cancelled run's live execution and plan or question wait, retains its unfinished source for recovery, and admits the next run after teardown completes.
 
+- **Explain rejected Codex resumed usage ([#3065](https://github.com/vtmocanu/uzi/issues/3065)).**
+  Incomplete token accounting notices now identify the failed validation predicate and applicable breakdown and bucket using fixed diagnostic text, without exposing provider data.
+
 - **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
   Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
 
