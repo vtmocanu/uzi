@@ -2,6 +2,7 @@ import { requireSupervisorObservationPasses } from "./supervisor-observation-pro
 import assert from "node:assert/strict";
 import { type FileHandle, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { runInNewContext } from "node:vm";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
@@ -275,4 +276,26 @@ test("real supervisor proof refuses absent, skipped or incomplete Go subtests", 
     valid.replace("repeat-and-detached-doublefork (", "repeat-and-detached-doublefork-extra (")]) {
     assert.throws(() => requireSupervisorObservationPasses(output));
   }
+});
+
+
+test("parallel proof children accept only the exact existing scratch symlink", async () => {
+  const script = (await readFile(new URL("./image-layout.mjs", import.meta.url), "utf8"))
+    .replace(/^import .* from "node:fs";$/m, "");
+  let existing: string | undefined;
+  const context = {
+    symlinkSync: (target: string, _link: string) => {
+      if (existing !== undefined) throw Object.assign(new Error("already exists"), { code: "EEXIST" });
+      existing = target;
+    },
+    readlinkSync: (_link: string) => existing,
+  };
+  runInNewContext(script, { ...context });
+  assert.equal(existing, "/proof/.uzi");
+  runInNewContext(script, { ...context }); // The next Node test child sees the first child's link.
+  existing = "/foreign";
+  assert.throws(() => runInNewContext(script, { ...context }), /already exists/);
+  assert.throws(() => runInNewContext(script, { ...context,
+    symlinkSync: () => { throw Object.assign(new Error("permission denied"), { code: "EACCES" }); },
+  }), /permission denied/);
 });

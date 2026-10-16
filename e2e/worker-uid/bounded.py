@@ -71,7 +71,10 @@ def capture(command, output, seconds, limit=REPORT_BYTES):
             if proc.poll() is None:
                 signal_group(proc, signal.SIGKILL)
             rc = proc.wait(timeout=1)
-        return failure or (rc if rc >= 0 else 128 - rc)
+        result = failure or (rc if rc >= 0 else 128 - rc)
+        if result in (124, 137):
+            print(f"worker UID deadline: command={' '.join(command[:6])} bound={seconds}s", file=sys.stderr)
+        return result
     finally:
         signal.signal(signal.SIGTERM, old_handler)
         selector.close()
@@ -86,8 +89,11 @@ def capture(command, output, seconds, limit=REPORT_BYTES):
 def docker(args, directory, seconds=10):
     # All metadata/removal output is capped too; each call includes kill grace.
     output = directory / "docker-output"
+    started = time.monotonic()
+    print(f"worker UID Docker start: {' '.join(args[:3])}", file=sys.stderr)
     rc = capture(["timeout", "--kill-after=5s", f"{max(0.01, seconds - 5):g}s",
                   "docker", *args], output, seconds, METADATA_BYTES)
+    print(f"worker UID Docker end: {' '.join(args[:3])} elapsed={time.monotonic()-started:.3f}s exit={rc}", file=sys.stderr)
     if rc:
         raise ValueError(f"Docker {' '.join(args[:2])} exit: {rc}")
     return output.read_bytes()

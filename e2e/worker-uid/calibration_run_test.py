@@ -34,8 +34,10 @@ if kind == "git":
 if kind == "timeout":
     assert args[0] == "--kill-after=5s"
     assert float(args[1][:-1]) <= 55
-    if mode == "timeout" and args[2:5] == ["docker", "start", "--attach"]:
+    if mode == "timeout" and args[2:5] == ["docker", "start", "--attach"] and (root / "probe-done").exists():
         sys.exit(124)
+    if args[2:5] == ["docker", "start", "--attach"]:
+        (root / "probe-done").touch()
     os.execv(str(root / "bin/docker"), [str(root / "bin/docker"), *args[3:]])
 assert kind == "docker"
 state_file = root / "state.json"
@@ -92,6 +94,9 @@ elif args[0] == "rm":
     state.pop(found[0]); save()
     print("wrong" if mode == "remove-ack" else args[-1])
 elif args[0] == "start":
+    item = next(v for v in state.values() if v.get("Id") == args[-1])
+    if item["Config"]["Labels"].get("io.uzi.memory.fixture") is None:
+        sys.exit(23 if mode == "layout-collision" else 0)
     assert args[1] == "--attach"
     item = next(v for v in state.values() if v.get("Id") == args[-1])
     mount = next(m for m in item["Mounts"] if m["Destination"] == "/expected.json")
@@ -149,11 +154,24 @@ class RunnerTest(unittest.TestCase):
         calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
         return result, calls
 
+    def test_no_dependency_volume_copy(self):
+        _, calls = self.invoke()
+        self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls),
+                         "calibration must use image-native dependencies without copy-up")
+        fixtures = [c for c in calls if c[:2] == ["docker", "create"] and "-seed" not in c[c.index("--name") + 1]]
+        self.assertEqual(len(fixtures), 2)
+        for command in fixtures:
+            mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
+            code = [m for m in mounts if ",dst=/app/" in m]
+            self.assertTrue(code)
+            self.assertTrue(all(",dst=/app/uzi-worker-uid-proof/" in m and m.endswith(",readonly") for m in code))
+            self.assertIn("/app/node_modules/tsx/dist/loader.mjs", command)
+
     def test_failed_prerequisite_both_sizes_raw_and_final_cleanup(self):
         result, calls = self.invoke()
         self.assertNotEqual(result.returncode, 0, result.stderr)
         reports = check.reports(result.stdout)
-        self.assertEqual(len([c for c in calls if c[0:2] == ["docker", "start"]]), 2)
+        self.assertEqual(len([c for c in calls if c[0:2] == ["docker", "start"]]), 3)
         self.assertTrue(all(r["status"] == "FAILED" and r["hostCleanup"]["confirmed"] for r in reports))
         directory = next((self.root / ".uzi/scratch").iterdir())
         self.assertEqual(len(list(directory.glob("*.stdout"))), 3)  # two raw + final stdout
@@ -178,24 +196,26 @@ class RunnerTest(unittest.TestCase):
     def test_failed_or_unparseable_or_timeout_never_pass_and_stop_next_size(self):
         for mode in ("missing", "malformed", "timeout", "active-failure", "zero-failed"):
             with self.subTest(mode=mode):
+                (self.root / "probe-done").unlink(missing_ok=True)
                 result, calls = self.invoke(mode)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 reports = check.reports(result.stdout)
                 self.assertTrue(all(r["status"] == "FAILED" for r in reports))
                 starts = [c for c in calls if c[0] == "timeout" and c[3:5] == ["docker", "start"]]
-                self.assertEqual(len(starts), 2 if mode == "zero-failed" else 1)
+                self.assertEqual(len(starts), 3 if mode == "zero-failed" else 2)
                 self.assertTrue(all(r["hostCleanup"] is not None for r in reports))
                 # A fresh invocation owns different names; previous state must be empty.
                 self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
                 (self.root / "calls").write_text("")
 
     def test_creation_lost_ack_and_ownership_fail_closed(self):
-        for mode in ("lost-ack", "volume-lost-ack", "ownership", "caps", "metadata", "remove-ack"):
+        for mode in ("lost-ack", "layout-collision", "ownership", "caps", "metadata", "remove-ack"):
             with self.subTest(mode=mode):
+                (self.root / "probe-done").unlink(missing_ok=True)
                 result, calls = self.invoke(mode)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 check.reports(result.stdout)  # explicit aborted report for both sizes
-                self.assertFalse(any(c[:2] == ["docker", "start"] for c in calls))
+                self.assertLessEqual(sum(c[:2] == ["docker", "start"] for c in calls), 1)
                 removes = [c for c in calls if c[:2] == ["docker", "rm"]]
                 if mode in ("ownership", "metadata"):
                     self.assertEqual(removes, [])
@@ -217,7 +237,7 @@ class RunnerTest(unittest.TestCase):
                 reports = check.reports(result.stdout)
                 self.assertEqual(len(reports), 2)
                 self.assertTrue(all(r["status"] == "FAILED" and r["observed"] is None for r in reports))
-                self.assertFalse(any(c[:2] == ["docker", "start"] for c in calls))
+                self.assertLessEqual(sum(c[:2] == ["docker", "start"] for c in calls), 1)
                 creates = [c for c in calls if c[:2] == ["docker", "create"]]
                 removes = [c for c in calls if c[:2] == ["docker", "rm"]]
                 self.assertEqual(len(creates), number + 1)
@@ -225,10 +245,10 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(len({c[-1] for c in removes}), number + 1)
                 self.assertTrue(all(len(c[-1]) == 64 for c in removes))
                 self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
-                self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 1)
+                self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 0)
                 directory = sorted((self.root / ".uzi/scratch").iterdir(), key=lambda p: p.stat().st_mtime)[-1]
                 entries = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
-                self.assertEqual(len(entries), number + 2)
+                self.assertEqual(len(entries), number + 1)
                 self.assertTrue((directory / "docker-output").exists())
                 for report in reports[:number]:
                     proof = report["hostCleanup"]
@@ -267,7 +287,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(reports), 2)
         self.assertTrue(all(r["status"] == "FAILED" for r in reports))
         self.assertIn("producer status", reports[0]["reasons"][0])
-        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "start"]]), 1)
+        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "start"]]), 2)
         self.assertNotIn(b"CALIBRATION PASSED", result.stderr)
         self.assertNotIn(b"\x1b", result.stderr)
         directory = next((self.root / ".uzi/scratch").iterdir())

@@ -8,21 +8,23 @@ disposable data and Nix mounts, and removes only its own named container.
 To reuse an image, set `WORKER_UID_SKIP_BUILD=1` and `WORKER_UID_IMAGE=<image>`.
 `WORKER_UID_TIMEOUT` controls the outer watchdog (default 600 seconds).
 The separate command proof has a 115-second watchdog plus five-second kill grace
-(120 seconds total). All Docker operations use GNU timeout. Image metadata, volume
-creation and ownership inspection each get five seconds plus five-second kill grace.
-The optional local build gets 60 seconds plus five-second grace; dependency
-provisioning gets 20 seconds plus five-second grace (120 seconds total including
-metadata and the optional build). Cleanup has a shared 30-second budget including
+(120 seconds total). All Docker operations use GNU timeout. Image metadata gets
+five seconds plus five-second kill grace.
+The optional local build gets 60 seconds plus five-second grace; the image
+layout/dependency preflight gets 20 seconds plus five-second grace
+(100 seconds total including metadata and the optional build). Phase diagnostics
+report elapsed time and identify the command when a deadline fires. Cleanup
+has a shared 30-second budget including
 kill grace and reaping; each metadata/removal request gets at most 10 seconds,
 including at most five-second grace. It tries each recorded resource once, continues
 after failures while budget remains, and propagates failure or exhausted budget.
 
 Every invocation uses an unpredictable 128-bit token in its names and ownership
 labels. Creation requests are journaled before sending, so an ambiguous Docker
-failure or lost acknowledgement still triggers ownership inspection. The volume
-is explicitly created and its label checked before mounting it. Cleanup inspects
+failure or lost acknowledgement still triggers ownership inspection. Cleanup
+inspects
 only attempted resources, verifies the invocation label, and removes containers
-by their returned immutable IDs and the volume by its verified name. Missing,
+by their returned immutable IDs. Missing,
 malformed or mismatching ownership metadata fails closed: planned names alone
 never authorize removal. Metadata/build failure before creation performs no
 resource cleanup. Containers remain until the trap.
@@ -35,10 +37,14 @@ and resolving runtime packages from the image.
 
 A second, serial container starts directly as command UID/GID 10003, with all
 capabilities dropped and no-new-privileges. It mounts this harness, agent source,
-agent tsconfig/package metadata and vendored supervisor source read-only under `/proof`.
-The package metadata preserves the source’s ESM boundary. A unique
-Docker volume is seeded from the image’s locked `/app/node_modules` and mounted
-read-only at `/proof/agent/node_modules`; scratch, Go cache and Go temporary files
+agent tsconfig/package metadata and vendored supervisor source read-only under
+`/app/uzi-worker-uid-proof`. A preflight refuses an image where that directory
+already exists, before any source is mounted there.
+The per-container source parent is an owned tmpfs; a scratch symlink keeps
+repository-relative test writes under `/proof/.uzi/scratch`. Read-only source
+mounts remain separate. The package metadata preserves the source’s ESM boundary.
+Runtime packages resolve directly from the image’s locked `/app/node_modules`,
+without copying dependencies into a volume. Scratch, Go cache and Go temporary files
 stay in a command-owned executable tmpfs for the freshly built helpers. The fixture checks Linux, UID 10003, all five empty
 capability sets and no-new-privileges before building only the two Go helpers with
 `-mod=vendor`, `GOTOOLCHAIN=local`, `GOPROXY=off` and `GOSUMDB=off`.
@@ -190,7 +196,7 @@ remains growth rate times drain-minus-bracket-lower plus baseline jitter in byte
 without adding either timing quantity again.
 
 The host retains each original producer stdout and exit-status sidecar in its
-printed scratch evidence directory. After ownership-verified container and volume
+printed scratch evidence directory. After ownership-verified container
 cleanup, it emits exactly one final version-1 JSON report per size between the
 standalone calibration markers. Each final report carries its host-observed
 container cleanup proof; the matching trusted `host-cleanup.json` sidecar is

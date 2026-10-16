@@ -48,7 +48,7 @@ async function requireCommandProfile() {
 
 test("real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure", { timeout: 110000 }, async () => {
   await requireCommandProfile();
-  const scratch = path.join(root, ".uzi/scratch");
+  const scratch = "/proof/.uzi/scratch";
   await mkdir(scratch, { recursive: true });
   const dir = await mkdtemp(path.join(scratch, "memory-real."));
   const commands = new WorkerMemoryCommands();

@@ -16,6 +16,8 @@ import calibration_check as check
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRATCH = ROOT / ".uzi/scratch"
+PROOF = "/app/uzi-worker-uid-proof"
+LAYOUT_PROBE = 'const fs = require("node:fs"); try { fs.lstatSync("/app/uzi-worker-uid-proof"); throw new Error("proof directory already exists in image"); } catch (e) { if (e.code !== "ENOENT") throw e; } if (!require.resolve("tsx").startsWith("/app/node_modules/")) throw new Error("image-native tsx unavailable");'
 LABEL = bounded.LABEL
 
 
@@ -145,26 +147,23 @@ class Host:
                       "local immutable image ID")
         self.manifest["imageId"] = image_id
         token = self.manifest["invocation"]
-        volume = "mem2396-" + token + "-deps"
-        self.journal("volume", volume)
-        ack = self.docker(["volume", "create", "--label", LABEL + "=" + token, volume]).decode().strip()
-        check.require(ack == volume, "ambiguous volume create ACK")
-        bounded.owned("volume", volume, token, self.directory)
-        # Docker seeds the volume from the provided image at create, without executing it.
+        # Check the unused source mount namespace and image-native dependencies before mounting.
         seed = "mem2396-" + token + "-seed"
         self.journal("container", seed)
         receipt = self.docker(["create", "--pull", "never", "--network", "none", "--cgroupns", "private",
                      "--name", seed, "--label", LABEL + "=" + token,
                      "--user", "10003:10003", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
                      "--memory", str(1024 ** 3), "--memory-swap", str(1024 ** 3),
-                     "--mount", "type=volume,src=" + volume + ",dst=/app/node_modules",
-                     "--entrypoint", "/usr/local/bin/node", image_id, "-e", "void 0"]).decode().strip()
-        self.cleanup_container(seed, expected_cid=receipt)
+                     "--entrypoint", "/usr/local/bin/node", image_id, "-e", LAYOUT_PROBE]).decode().strip()
+        item = self.inspect(seed)
+        check.require(receipt == item["Id"] and item["Image"] == image_id,
+                      "layout preflight create ACK/image binding")
+        self.docker(["start", "--attach", item["Id"]])
+        self.cleanup_container(seed, expected_cid=item["Id"])
         check.require(time.monotonic() - started < 60, "offline provisioning exceeds 60 seconds")
         self.deadline = None
-        return volume
 
-    def create(self, fixture, volume):
+    def create(self, fixture):
         token = self.manifest["invocation"]
         name = "mem2396-" + token + "-" + str(fixture["limitBytes"])
         fixture["containerName"] = name
@@ -182,14 +181,13 @@ class Host:
                 "--tmpfs", "/tmp:exec,uid=10003,gid=10003,mode=0700,size=32m",
                 "--env", "HOME=/proof/.uzi/scratch", "--env", "TMPDIR=/proof/.uzi/scratch",
                 "--mount", "type=bind,src=" + str(disk) + ",dst=/calibration-disk",
-                "--mount", "type=bind,src=" + str(self.directory / "expected.json") + ",dst=/expected.json,readonly",
-                "--mount", "type=volume,src=" + volume + ",dst=/proof/agent/node_modules,readonly"]
+                "--mount", "type=bind,src=" + str(self.directory / "expected.json") + ",dst=/expected.json,readonly"]
         for source in ("e2e/worker-uid", "agent/src", "agent/test/helpers", "agent/test/fixtures",
                        "agent/package.json", "agent/tsconfig.json"):
-            args += ["--mount", "type=bind,src=" + str(ROOT / source) + ",dst=/proof/" + source + ",readonly"]
+            args += ["--mount", "type=bind,src=" + str(ROOT / source) + ",dst=" + PROOF + "/" + source + ",readonly"]
         args += ["--entrypoint", "/usr/local/bin/node", self.manifest["imageId"], "--import",
-                 "/proof/agent/node_modules/tsx/dist/loader.mjs",
-                 "/proof/e2e/worker-uid/calibration-fixture.mts", "/expected.json", fixture["fixtureId"]]
+                 "/app/node_modules/tsx/dist/loader.mjs",
+                 PROOF + "/e2e/worker-uid/calibration-fixture.mts", "/expected.json", fixture["fixtureId"]]
         receipt = self.docker(args).decode().strip()
         item = self.inspect(name)
         check.require(receipt == item["Id"], "create ACK does not match immutable CID")
@@ -217,10 +215,10 @@ class Host:
         started = time.monotonic()
         expected_file = self.directory / "expected.json"
         expected_file.write_text(json.dumps(self.manifest))
-        volume = self.provision()
+        self.provision()
         self.deadline = started + 120
         for fixture in self.manifest["fixtures"]:
-            self.create(fixture, volume)
+            self.create(fixture)
         self.deadline = None
         check.require(time.monotonic() - started < 120, "total provisioning exceeds 120 seconds")
         expected_file.write_text(json.dumps(self.manifest))

@@ -14,9 +14,9 @@ SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
 EXPECTED = [{"file": "agent/test/example.test.ts", "names": ["suite", "leaf"]}]
 COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["command leaf"]}]
 COMMAND_PASS = ('<testsuites><testcase name="command leaf" '
-                'file="/proof/e2e/worker-uid/memory-command-real.test.mts"/></testsuites>')
+                'file="/app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts"/></testsuites>')
 PASS = ('<testsuites><testsuite name="suite"><testcase name="leaf" '
-        'file="/app/test/example.test.ts"/></testsuite></testsuites>')
+        'file="/app/uzi-worker-uid-proof/agent/test/example.test.ts"/></testsuite></testsuites>')
 
 
 class CaptureTest(unittest.TestCase):
@@ -178,7 +178,7 @@ sys.exit(rc)
             if call[0] == "docker":
                 self.assertEqual(calls[index - 1][0], "timeout", call)
                 self.assertEqual(calls[index - 1][3:], call)
-        if metadata_rc or provision_rc or build_rc or volume_rc or ownership_mismatch:
+        if metadata_rc or provision_rc or build_rc or ownership_mismatch:
             self.assertNotEqual(result.returncode, 0, result.stderr)
             removals = [call for call in calls if call[:2] == ["docker", "rm"] or call[:3] == ["docker", "volume", "rm"]]
             if metadata_rc or build_rc:
@@ -197,10 +197,10 @@ sys.exit(rc)
                          [["docker", "rm", "-f", state[n]["Id"]]
                           for n in (name + "-command", name, name + "-provision")])
         self.assertRegex(name, r"^wuid-2134-[0-9a-f]{32}$")
-        for n in (name, name + "-command", name + "-provision", name + "-deps"):
+        for n in (name, name + "-command", name + "-provision"):
             self.assertEqual(state[n]["Labels"]["io.uzi.worker-uid.invocation"], name.removeprefix("wuid-2134-"))
         self.assertEqual([call for call in calls if call[:3] == ["docker", "volume", "rm"]],
-                         [["docker", "volume", "rm", name + "-deps"]])
+                         [])
         self.assertEqual(command[command.index("--name") + 1], name + "-command")
         self.assertEqual(command[command.index("--user") + 1], "10003:10003")
         self.assertEqual(command[command.index("--cap-drop") + 1], "ALL")
@@ -212,19 +212,22 @@ sys.exit(rc)
             self.assertEqual(invocation[invocation.index("--pull") + 1], "never")
         self.assertEqual(command[command.index("--entrypoint") + 1], "/usr/local/bin/node")
         self.assertIn("--test-timeout=110000", command)
-        self.assertEqual(command[-1], "/proof/e2e/worker-uid/memory-command-real.test.mts")
+        self.assertEqual(command[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/memory-command-real.test.mts")
         self.assertEqual(command[command.index("--test-name-pattern") + 1], "^command leaf$")
         mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
-        for source, target in (("Taskfile.yml", "/proof/Taskfile.yml"),
-                               ("homebrew-tap.yml", "/proof/homebrew-tap.yml"),
-                               ("e2e/worker-uid", "/proof/e2e/worker-uid"),
-                               ("agent/src", "/proof/agent/src"),
-                               ("agent/tsconfig.json", "/proof/agent/tsconfig.json"),
-                               ("agent/package.json", "/proof/agent/package.json"),
-                               ("agent/codex/supervisor", "/proof/agent/codex/supervisor")):
+        for source, target in (("Taskfile.yml", "/app/uzi-worker-uid-proof/Taskfile.yml"),
+                               ("homebrew-tap.yml", "/app/uzi-worker-uid-proof/homebrew-tap.yml"),
+                               ("e2e/worker-uid", "/app/uzi-worker-uid-proof/e2e/worker-uid"),
+                               ("agent/src", "/app/uzi-worker-uid-proof/agent/src"),
+                               ("agent/tsconfig.json", "/app/uzi-worker-uid-proof/agent/tsconfig.json"),
+                               ("agent/package.json", "/app/uzi-worker-uid-proof/agent/package.json"),
+                               ("agent/codex/supervisor", "/app/uzi-worker-uid-proof/agent/codex/supervisor")):
             self.assertIn(f"type=bind,src={self.repo}/{source},dst={target},readonly", mounts)
-        self.assertIn(f"type=volume,src={name}-deps,dst=/proof/agent/node_modules,readonly", mounts)
-        self.assertIn(f"type=volume,src={name}-deps,dst=/app/node_modules", provision)
+        self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls))
+        self.assertIn('lstatSync("/app/uzi-worker-uid-proof")', provision[-1])
+        self.assertIn('e.code !== "ENOENT"', provision[-1])
+        self.assertIn('require.resolve("tsx")', provision[-1])
+        self.assertIn("/app/node_modules/tsx/dist/loader.mjs", command)
         self.assertIn("GOPROXY=off", command)
         self.assertIn("GOTOOLCHAIN=local", command)
         self.assertIn("/proof/.uzi/scratch:exec,uid=10003,gid=10003,mode=0700", command)
@@ -238,10 +241,10 @@ sys.exit(rc)
         self.assertEqual(run[run.index("--test-name-pattern") + 1], "^suite leaf$")
         self.assertIn("--test-timeout=120000", run)
         self.assertIn("--test-reporter=junit", run)
-        self.assertEqual([arg for arg in run if arg.startswith("/app/test/") and arg.endswith(".test.ts")], [
-            "/app/test/codex-launcher.test.ts", "/app/test/codex-executor.test.ts",
-            "/app/test/codex-shared-dir.test.ts", "/app/test/entrypoint-migration.test.ts",
-            "/app/test/git-planning-diff.test.ts",
+        self.assertEqual([arg for arg in run if arg.startswith("/app/uzi-worker-uid-proof/agent/test/") and arg.endswith(".test.ts")], [
+            "/app/uzi-worker-uid-proof/agent/test/codex-launcher.test.ts", "/app/uzi-worker-uid-proof/agent/test/codex-executor.test.ts",
+            "/app/uzi-worker-uid-proof/agent/test/codex-shared-dir.test.ts", "/app/uzi-worker-uid-proof/agent/test/entrypoint-migration.test.ts",
+            "/app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts",
         ])
         self.assertEqual(run[run.index("--entrypoint") + 1], "/usr/local/sbin/uzi-entrypoint")
         self.assertEqual(run[run.index("--network") + 1], "none")
@@ -250,16 +253,17 @@ sys.exit(rc)
                          ["CHOWN", "DAC_OVERRIDE", "SETPCAP", "SETUID", "SETGID"])
         self.assertEqual(run[run.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual([run[index + 1] for index, arg in enumerate(run) if arg == "--tmpfs"],
-                         ["/data", "/nix"])
+                         ["/data", "/nix", "/app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755",
+                          "/proof/.uzi/scratch:exec,uid=10001,gid=10001,mode=0700"])
         self.assertEqual(run[run.index("--entrypoint") + 2:run.index("--test")], [
-            "fixture-image", "/usr/local/bin/node", "--import", "tsx",
-            "--import", "/app/test/setup/hermetic-proc.ts",
+            "fixture-image", "/usr/local/bin/node", "--import", "/app/node_modules/tsx/dist/loader.mjs",
+            "--import", "/app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs",
+            "--import", "/app/uzi-worker-uid-proof/agent/test/setup/hermetic-proc.ts",
         ])
         return result, calls
 
     def test_ownership_failure_and_ambiguous_create(self):
-        for options in ({"volume_rc": 23}, {"ownership_mismatch": "-deps"},
-                        {"ownership_mismatch": "-command"}, {"provision_rc": 23}):
+        for options in ({"ownership_mismatch": "-command"}, {"provision_rc": 23}):
             with self.subTest(options=options):
                 self.calls.unlink(missing_ok=True)
                 result, calls = self.run_lane(**options)
@@ -294,10 +298,17 @@ sys.exit(rc)
                 self.assertTrue(list(self.repo.glob("*.terminated")))
                 self.assertIn(("command " if command else "") + "node/container exit: 125", result.stderr)
 
+    def test_no_dependency_volume_copy(self):
+        result, calls = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls),
+                         "proofs must use image-native dependencies without copy-up")
+
     def test_success_and_build(self):
         result, calls = self.run_lane(skip_build="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("1 required leaves passed", result.stdout)
+        self.assertIn("phase end: image-layout elapsed=", result.stderr)
         self.assertEqual([call for call in calls if call[:2] == ["docker", "build"]],
                          [["docker", "build", "-f", "agent/templates/base/Dockerfile",
                            "-t", "fixture-image", "."]])
@@ -327,6 +338,8 @@ sys.exit(rc)
                 if mode in ("status", "timeout"):
                     code = 23 if mode == "status" else 124
                     self.assertIn(f"worker UID command node/container exit: {code}", result.stderr)
+                    if mode == "timeout":
+                        self.assertIn("deadline: phase=command-proof command=capture", result.stderr)
                 else:
                     self.assertIn("worker UID lane FAIL", result.stderr)
 

@@ -388,8 +388,8 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       const dir = dirs[index]!;
       await mkdir(dir.disk, { recursive: true }); await mkdir(dir.shmem, { recursive: true });
       const quote = (v: string) => "'" + v.replaceAll("'", "'\\''") + "'";
-      const command = [process.execPath, "--import", "/proof/agent/node_modules/tsx/dist/loader.mjs",
-        "/proof/e2e/worker-uid/calibration-producer.mts", dir.control, dir.disk, dir.shmem, String(plan.rounds)].map(quote).join(" ");
+      const command = [process.execPath, "--import", "/app/node_modules/tsx/dist/loader.mjs",
+        "/app/uzi-worker-uid-proof/e2e/worker-uid/calibration-producer.mts", dir.control, dir.disk, dir.shmem, String(plan.rounds)].map(quote).join(" ");
       const reply = broker.handleToolCall({ threadId: expected.fixtureId, turnId: expected.legId,
         callId: "calibration-" + index }, "Bash", { command }, "root");
       void reply.then((value) => { brokerReplies[index] = value; }, (error) => {
