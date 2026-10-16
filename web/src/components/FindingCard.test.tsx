@@ -145,6 +145,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     const link = await screen.findByRole("link", { name: /Filed #512/ });
     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/512");
     expect(screen.queryByText("Issue filed.")).toBeNull();
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
     // Draft card unmounted on success.
     expect(screen.queryByText("Draft issue")).toBeNull();
   });
@@ -175,11 +176,15 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
 
     await openDraft();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
 
     // A warning is a success (the issue exists): the filed chip AND the note both show.
     await screen.findByRole("link", { name: /Filed #512/ });
     expect(screen.getByText(/recording it in uzi failed/)).toBeTruthy();
+    expect(mockApi.fileFinding).toHaveBeenCalledWith("find-1", expect.objectContaining({ send_to_uzi: true }));
+    expect(screen.getByText("Queued for uzi: starts on the next sync if autopilot is on")).toBeTruthy();
+    expect(screen.getByText("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.")).toBeTruthy();
   });
 
   it("Dismiss posts the chosen reason and shows the reasoned Dismissed chip", async () => {
@@ -203,6 +208,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     const { container } = render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
 
     await openDraft();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
     fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
 
     await waitFor(() => expect(screen.getByText(/Already filed or resolved/)).toBeTruthy());
@@ -210,6 +216,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     expect(screen.queryByText("Draft issue")).toBeNull();
     expect(container.textContent).not.toContain("already filed or being filed");
     expect(screen.getByText("resolved")).toBeTruthy();
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
   });
 
   it("a stale Dismiss that 409s shows the resolved advisory, never a crash", async () => {
@@ -287,6 +294,7 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
 
     const link = await screen.findByRole("link", { name: /Filed #77/ });
     expect(link.getAttribute("href")).toBe("https://gitlab.example.com/vtmocanu/uzi/-/issues/77");
+    expect(screen.queryByText(/Queued for uzi/)).toBeNull();
     // A filed coordinate does not re-offer File issue.
     expect(screen.queryByRole("button", { name: "File issue" })).toBeNull();
     // No button replaces the Undo that just unmounted, so focus lands on the Filed #N link rather
@@ -342,4 +350,18 @@ describe("FindingCard (PRD #333 M7, PRD #1183 M2 shared row)", () => {
     expect(container.querySelector(".border-info\\/40")).toBeNull();
     expect(container.textContent).toContain("unrenderable finding event");
   });
+});
+
+it("keeps the checked choice and edited draft after a forge failure", async () => {
+  mockApi.findingIssueDraft.mockResolvedValue(draftFixture());
+  mockApi.fileFinding.mockRejectedValue(new ApiError(502, "forge unavailable"));
+  render(<FindingCard id="find-1" title="Leaked ticker" location="a.go#loop" labels={[]} />);
+  await openDraft();
+  fireEvent.click(screen.getByRole("checkbox", { name: "Send to uzi" }));
+  fireEvent.change(screen.getByDisplayValue(draftFixture().title), { target: { value: "keep this title" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+  await screen.findByText("forge unavailable");
+  expect((screen.getByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(true);
+  expect(screen.getByDisplayValue("keep this title")).toBeTruthy();
+  expect(screen.queryByText(/Queued for uzi/)).toBeNull();
 });

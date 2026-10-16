@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
+  Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
+
 ### Fixed
 
 - **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
@@ -32,6 +37,9 @@ through `[0.52.0]`.)
 
 - **E2E phases fail on dirty or unverifiable boundaries ([#2892](https://github.com/vtmocanu/uzi/issues/2892)).**
   Boundary settlement checks nonterminal runs, worker associations and owner open custody holds within a shared 120-second deadline, cancelling runs through the API without the SQL fallback or discarding holds. Baseline holds and explicitly declared retained holds are allowed independently of run handoffs; successful cancellation can settle to PASS, while rejected cancels and unverifiable reads remain failures. Later eligible phases carry contamination origins, successful exports become suspect when their boundary fails, and separate boundary evidence and wait timings support diagnosis. Enforcement applies regardless of the legacy E2E_STRICT_LEAKS compatibility no-op.
+
+- **Full submitted plans remain readable after the approval gate ([#2972](https://github.com/vtmocanu/uzi/issues/2972)).**
+  Non-seeded web runs with saved full plan text now offer an initially collapsed, scrollable Full plan panel after leaving the gate, including after reload and on finished runs; the neutral title does not imply approval. Earlier submitted versions include only already-loaded submissions and fetch no extra history. The TUI renders loaded plan messages as full Markdown through the final line instead of a 200-character compact fallback, with paging and controls unchanged. Seeded plans, gate actions and history, summaries, and CLI version/diff behavior are unchanged.
 
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
   Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
