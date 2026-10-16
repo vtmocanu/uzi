@@ -19,7 +19,8 @@ Publication and handoff are authorized after the remaining work is committed
 and reviewed, with the local blocker explicit. CI measurement verification must
 then precede merge. Successful,
 complete 1 GiB and 2 GiB marked reports from CI `test-agent-worker-uid` remain
-mandatory **BEFORE MERGE**; the lander must not merge without both. This amendment
+mandatory **BEFORE MERGE**; the lander must not merge without both. Issue #2396
+remains open until both complete CI reports pass; this handoff does not close it. This amendment
 does not treat publication or a handoff signal as measurement acceptance.
 
 Required wiring is verified: `Taskfile.yml`'s `test:agent:worker-uid` calls
