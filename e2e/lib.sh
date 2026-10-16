@@ -617,6 +617,55 @@ resolve_fixture_source_hold() {
   pass "fixture owner decision recorded: run=$run generation=$generation hold=$id; archives preserved"
 }
 
+# Validate immutable held FINAL provenance; expiry and ref deletion do not revoke it.
+held_custody_receipt_valid() {
+  jq -e '. as $run | .holds[0] as $h | $h.publication as $p |
+    ($run.owner_id|type=="string" and length>0) and ($run.repo_id|type=="string" and length>0) and
+    ($h.id|type=="string" and length>0) and ($h.original_worker_id|type=="string" and length>0) and
+    ($h.final_publication_id|type=="string" and length>0) and ($p|type)=="object" and
+    $h.inventory_guarded==true and $h.state=="released" and
+    $h.final_disposition=="held_publication" and $h.release_evidence=="held_publication" and
+    $h.final_capture_id==null and ($h.final_source_sha|type=="string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
+    ($h.final_coverage_digest|type=="string" and test("^[0-9a-f]{64}$")) and
+    $h.run_id==$run.run_id and $h.user_id==$run.owner_id and $h.repo_id==$run.repo_id and
+    ($h.generation|type=="number" and .>0 and .==floor) and
+    $p.id==$h.final_publication_id and $p.hold_id==$h.id and $p.run_id==$h.run_id and
+    $p.user_id==$h.user_id and $p.repo_id==$h.repo_id and $p.generation==$h.generation and
+    $p.worker_id==$h.original_worker_id and
+    $p.ref==("refs/uzi-held/"+$h.run_id+"/"+($h.generation|tostring)) and
+    $p.tip==$h.final_source_sha and $p.coverage_digest==$h.final_coverage_digest' >/dev/null
+}
+
+# Earlier FINALs can predate the current outcome and have a different custodian.
+# This assertion is read-only and exact; it does not broaden the current wait.
+assert_earlier_held_custody_receipt() {
+  local run="$1" generation="$2" snapshot
+  [[ "$run" =~ ^[0-9a-fA-F-]{36}$ ]] || fail "invalid earlier receipt run: $run"
+  [[ "$generation" =~ ^[1-9][0-9]*$ ]] || fail "invalid earlier receipt generation: $generation"
+  snapshot="$(db_psql "SELECT json_build_object('run_id',r.id,'status',r.status,'generation',r.claim_generation,
+    'owner_id',r.user_id,'repo_id',r.repo_id,
+    'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'run_id',h.run_id,'user_id',h.user_id,
+      'repo_id',h.repo_id,'original_worker_id',h.original_worker_id,'generation',h.generation,
+      'inventory_guarded',h.inventory_guarded,'state',h.state,'final_disposition',h.final_disposition,
+      'release_evidence',h.release_evidence,'final_capture_id',h.final_capture_id,
+      'final_publication_id',h.final_publication_id,'final_source_sha',h.final_source_sha,
+      'final_coverage_digest',h.final_coverage_digest,
+      'publication',(SELECT json_build_object('id',p.id,'run_id',p.run_id,'user_id',p.user_id,
+          'repo_id',p.repo_id,'hold_id',p.hold_id,'generation',p.generation,'worker_id',p.worker_id,
+          'ref',p.ref,'tip',p.tip,'coverage_digest',p.coverage_digest)
+          FROM run_held_publications p WHERE p.id=h.final_publication_id)))
+      FROM recovery_custody_holds h WHERE h.run_id=r.id AND h.user_id=r.user_id
+        AND h.generation=$generation AND h.generation>0 AND h.generation<r.claim_generation),'[]'::json))::text
+    FROM runs r WHERE r.id='$run' AND r.user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")"
+  printf '%s' "$snapshot" | jq -e --arg run "$run" --argjson gen "$generation" '
+    .run_id==$run and
+    (.generation|type=="number" and .==floor and .>$gen) and
+    (.holds|type=="array" and length==1) and .holds[0].generation==$gen' >/dev/null \
+    && printf '%s' "$snapshot" | held_custody_receipt_valid \
+    || fail "earlier receipt lacks exact held FINAL proof: $snapshot"
+  pass "earlier held custody receipt: run=$run generation=$generation"
+}
+
 # A completed status precedes the worker's final custody ACK. Wait only for this
 # run's current generation, preserving every older or unrelated source hold.
 wait_completed_custody_receipt() {
@@ -629,6 +678,11 @@ wait_completed_custody_receipt() {
       'branch',CASE WHEN r.kind='issue' THEN 'agent/issue-'||r.issue_iid::text
         WHEN r.kind='mr_rework' THEN r.pipeline_ref WHEN r.kind='self_improve' THEN 'uzi/self-improve/'||r.id::text END,
       'holds',COALESCE((SELECT json_agg(json_build_object('id',h.id,'generation',h.generation,
+        'run_id',h.run_id,'user_id',h.user_id,'repo_id',h.repo_id,'original_worker_id',h.original_worker_id,
+        'publication',(SELECT json_build_object('id',p.id,'run_id',p.run_id,'user_id',p.user_id,
+          'repo_id',p.repo_id,'hold_id',p.hold_id,'generation',p.generation,'worker_id',p.worker_id,
+          'ref',p.ref,'tip',p.tip,'coverage_digest',p.coverage_digest)
+          FROM run_held_publications p WHERE p.id=h.final_publication_id),
         'inventory_guarded',h.inventory_guarded,'state',h.state,'final_disposition',h.final_disposition,
         'final_capture_id',h.final_capture_id,'final_source_sha',h.final_source_sha,
         'final_coverage_digest',h.final_coverage_digest,'release_evidence',h.release_evidence,
@@ -670,6 +724,8 @@ wait_completed_custody_receipt() {
             and .final_capture_id==null and .final_source_sha==null
             and .final_coverage_digest=="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))
         or (.inventory_guarded==false and (.release_evidence|IN("archive","publication")))' >/dev/null \
+        || { printf '%s' "$snapshot" | jq -e '.holds[0].after_outcome==true' >/dev/null \
+          && printf '%s' "$snapshot" | held_custody_receipt_valid; } \
         || fail "completed receipt lacks final custody proof: $snapshot"
       pass "completed custody receipt: run=$run generation=$generation"
       return

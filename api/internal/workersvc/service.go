@@ -1970,11 +1970,12 @@ type Service struct {
 	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
 	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
 	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
-	heldPrepareFn   func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
-	heldSendFn      func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
-	heldListFn      func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
-	heldSlots       chan struct{}
-	heldOutcomeHook func() error
+	heldPrepareFn      func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
+	heldSendFn         func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
+	heldListFn         func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	heldSlots          chan struct{}
+	heldBeforeSendHook func()
+	heldOutcomeHook    func() error
 	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
 	// when set, runs inside the cleanup transaction after the run lock and before any forge call
 	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).

@@ -1110,6 +1110,13 @@ describe("buildSignalMcpServer checkpoint schema gate (PRD #122 M6)", () => {
     const shape = checkpoint!.inputSchema?.shape ?? {};
     assert.deepStrictEqual(Object.keys(shape), [], "checkpoint takes no arguments");
   });
+
+  it("limits checkpoint guidance to between milestones and directs final completion to signal_done", () => {
+    const tools = registeredTools(buildSignalMcpServer({ checkpoint: true }));
+    const description = (tools["checkpoint"] as { description?: string }).description ?? "";
+    assert.match(description, /between milestones/);
+    assert.match(description, /for the final milestone call signal_done instead/);
+  });
 });
 
 describe("isSignalToolName", () => {

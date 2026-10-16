@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
@@ -1660,7 +1661,13 @@ export async function runAgentHelper(
   timeout: number,
   input = "",
 ): Promise<{ code: number; stdout: string }> {
+  const budget = MaintenanceBudget.current();
+  budget?.check();
+  const remaining = budget?.cap(timeout);
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
+  budget?.check();
+  const duration = remaining ? Math.floor(remaining()) : timeout;
+  if (remaining && duration <= 0) throw new Error("maintenance helper operation expired");
   return await new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -1678,32 +1685,52 @@ export async function runAgentHelper(
     let size = 0;
     let overflow = false;
     let settled = false;
+    let failure: Error | undefined;
+    const cancel = () => { failure = new Error("maintenance helper cancelled"); child.kill("SIGKILL"); };
     const settle = (fn: () => void): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      budget?.signal.removeEventListener("abort", cancel);
       fn();
     };
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      settle(() => reject(helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" })));
-    }, timeout);
+      if (budget) failure = new Error("maintenance helper timed out");
+      else settle(() => reject(helperFailure({ name: "Error", message: "", killed: true, signal: "SIGKILL" })));
+    }, duration);
+    budget?.signal.addEventListener("abort", cancel, { once: true });
+    if (budget?.signal.aborted) cancel();
     child.stdout?.on("data", (b: Buffer) => {
       size += b.length;
       if (size > TRIM_MAX_STDOUT) overflow = true;
       if (!overflow) chunks.push(b);
     });
-    child.on("error", (e) => settle(() => reject(helperFailure(e as HelperExecError))));
+    child.on("error", (e) => {
+      if (budget) { failure = e; child.kill("SIGKILL"); }
+      else settle(() => reject(helperFailure(e as HelperExecError)));
+    });
     child.on("close", (code, signal) =>
       settle(() => {
-        if (overflow) reject(new Error(`agent-uid helper printed more than ${TRIM_MAX_STDOUT} bytes`));
+        try {
+          budget?.check();
+          if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
+        } catch (error) { failure = error as Error; }
+        if (failure) reject(failure);
+        else if (overflow) reject(new Error(`agent-uid helper printed more than ${TRIM_MAX_STDOUT} bytes`));
         else if (code === null) reject(helperFailure({ name: "Error", message: "", signal }));
         else resolve({ code, stdout: Buffer.concat(chunks).toString("utf8") });
       }),
     );
     // The helper may exit before reading its input (a refused root): never an unhandled EPIPE.
     child.stdin?.on("error", () => undefined);
-    child.stdin?.end(input);
+    if (budget) {
+      try {
+        budget.check();
+        if (remaining!() <= 0) throw new Error("maintenance helper input expired");
+        child.stdin?.end(input);
+      } catch { cancel(); }
+    } else child.stdin?.end(input);
   });
 }
 

@@ -84,6 +84,8 @@ export type AnswerVerdict =
   { kind: "answer"; answers: string[] } | { kind: "cancel" };
 
 export interface SteeringOptions {
+  /** Observe authenticated cancellation before synchronous model/lifecycle abort listeners. */
+  onCancel?: () => void;
   /** Injectable sleep so tests can drive the poll loop deterministically. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** PRD #41: emit a short feed notice (as a worker `status` message) when a verdict
@@ -676,9 +678,17 @@ export class SteeringChannel {
     // A fenced flight owes nothing more: an APPLIED still in flight is let go with the rest.
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
     this.stopped = true;
-    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
-    this.abortLifecycle(signal);
-    this.rejectParkedWaiters(signal);
+    try {
+      // This exact server cancellation starts the same maintenance clock as an input cancel.
+      // Install the fence first: observing cancellation grants no report or custody authority.
+      if (reason === "terminal_cancelled") this.onCancel?.();
+    } finally {
+      try { if (!this.cancel.signal.aborted) this.cancel.abort(signal); }
+      finally {
+        this.abortLifecycle(signal);
+        this.rejectParkedWaiters(signal);
+      }
+    }
   }
 
   /** Issue #1673: a failed receipt request. A fence reason ends the flight or drops the batch;
@@ -1466,6 +1476,7 @@ export class SteeringChannel {
     | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
+  private readonly onCancel: (() => void) | undefined;
   /** PRD #517 M3: clock the follow-up park's idle window measures against. */
   private readonly now: () => number;
   /** PRD #1247 M5b: the claim-lane generation this channel guards a credential switch against. */
@@ -1484,6 +1495,7 @@ export class SteeringChannel {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
+    this.onCancel = opts.onCancel;
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
     this.inclusions = new InclusionReporter(client, runId, this.claimGeneration, log);
@@ -1567,6 +1579,12 @@ export class SteeringChannel {
    *  re-fire, so this sticky flag is the durable record the loop re-checks. */
   isCancelled(): boolean {
     return this.cancelled;
+  }
+
+  /** Record authenticated API cancellation without routing an input or notifying onCancel.
+   * The runner installs its maintenance budget before aborting model/lifecycle listeners. */
+  markCancelled(): void {
+    this.cancelled = true;
   }
 
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
@@ -2333,8 +2351,11 @@ export class SteeringChannel {
         // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
         // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
         this.cancelled = true;
-        if (!this.cancel.signal.aborted) this.cancel.abort();
-        this.abortLifecycle();
+        try { this.onCancel?.(); }
+        finally {
+          try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
+          finally { this.abortLifecycle(); }
+        }
         break;
       case "stop":
         // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but

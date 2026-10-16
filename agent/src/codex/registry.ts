@@ -15,6 +15,7 @@
 // compared, copied or substituted; a new claim constructs a NEW registry with a
 // NEW local execution epoch (PRD #1171 "Frozen boundaries", ADR-1106).
 
+import { MaintenanceBudget } from "../maintenance-budget.js";
 import type { ChildQuiescence, HarnessError, ProcessReap, ToolDisposal } from "../harness.js";
 
 /** Issue #1864: a caught error's class name, as it may appear in a harness error message. That
@@ -698,7 +699,7 @@ export class ExecutionRegistry {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "settleForCapture: registry disposed" }] };
     }
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
-    const remaining = (): number => Math.max(0, deadlineAt - Date.now());
+    const remaining = MaintenanceBudget.current()?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
     if (this.currentState !== "poisoned") {
       this.poison({ category: "protocol", message: "codex credential deferral: settling for capture" });
     }
@@ -734,6 +735,7 @@ export class ExecutionRegistry {
     }
     // The final synchronous check: the only path to observed_empty.
     const errors: HarnessError[] = [];
+    if (remaining() <= 0) errors.push({ category: "timeout", message: "settleForCapture: deadline expired" });
     if (this.state() === "disposed" || this.tablesCleared) {
       errors.push({ category: "protocol", message: "settleForCapture: registry disposed during settle" });
     }

@@ -241,16 +241,20 @@ export function recoveryOf(r: RunRunner): RecoveryCoordinator {
   return Reflect.get(r, "recovery") as RecoveryCoordinator;
 }
 
-/**
- * Record, for every immutable-coverage build, whether the failed terminal had been ACKed at that moment.
- * The freeze must precede the send (all `false`) and no post-send pass may freeze again.
- */
+/** Observe first construction of each coverage identity. FINAL verification may
+ * rebuild the same aggregate; that is not a second immutable inventory freeze.
+ * New identities must precede the failed send (all observations remain false). */
 export function watchFreezes(server: HeldServer): { failedAckedAtFreeze: boolean[] } {
   const seen = { failedAckedAtFreeze: [] as boolean[] };
+  const fingerprints = new Set<string>();
   const build = git.buildRecoveryCoverage.bind(git);
   git.buildRecoveryCoverage = async (...args) => {
-    seen.failedAckedAtFreeze.push(server.failedAcked());
-    return build(...args);
+    const coverage = await build(...args);
+    if (!fingerprints.has(coverage.fingerprint)) {
+      fingerprints.add(coverage.fingerprint);
+      seen.failedAckedAtFreeze.push(server.failedAcked());
+    }
+    return coverage;
   };
   return seen;
 }

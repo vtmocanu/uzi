@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { WorkerClient, type InputReceipt } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import type { UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 
@@ -99,6 +100,45 @@ describe("terminal cancelled input transport", () => {
 });
 
 describe("terminal cancelled steering", () => {
+  it("exact terminal cancellation initializes one maintenance deadline before abort continuations", async () => {
+    let now = 10;
+    let factories = 0;
+    let budget: MaintenanceBudget | undefined;
+    let observedAtAbort: MaintenanceBudget | undefined;
+    let fenceAtAbort: string | undefined;
+    const shared = new AbortController();
+    const c = client(async () => Response.json({ inputs: [], terminal_cancelled: control() }));
+    const ch = new SteeringChannel(c, RUN, 1, nullLogger(), shared, {
+      claimGeneration: 3, onCancel: () => { MaintenanceBudget.observeCancellation(); },
+    });
+    const aborted = new Promise<void>(resolve => shared.signal.addEventListener("abort", () => {
+      observedAtAbort = MaintenanceBudget.current();
+      fenceAtAbort = ch.claimFence();
+      resolve();
+    }, { once: true }));
+    try {
+      await MaintenanceBudget.runAttempt(`${RUN}:3`, () => {
+        factories++;
+        return budget = new MaintenanceBudget(600_000, () => now);
+      }, async () => {
+        ch.start();
+        await aborted;
+        await ch.stop();
+        assert.equal(factories, 1, "exact terminal cancellation must initialize the shared budget");
+        assert.equal(observedAtAbort, budget, "budget precedes synchronous abort continuations");
+        assert.equal(fenceAtAbort, "terminal_cancelled", "the fence precedes the observer");
+        assert.equal(ch.claimFence(), "terminal_cancelled");
+        assert.equal(ch.isCancelled(), false, "the control is still a fence, not a synthetic input");
+        now += 100;
+        assert.equal(MaintenanceBudget.observeCancellation(), budget);
+        assert.equal(budget!.deadline, 600_010, "another observation cannot renew the deadline");
+        now = 600_011;
+        assert.throws(() => MaintenanceBudget.observeCancellation(), /maintenance deadline exhausted/);
+        assert.equal(factories, 1);
+      });
+    } finally { await ch.stop(); budget?.dispose(); }
+  });
+
   for (const generation of [0, 3]) {
     it(`chat generation ${generation} ignores non-chat control and delivers a message`, async () => {
       const shared = new AbortController();

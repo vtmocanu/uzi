@@ -111,7 +111,7 @@ Checks that make this correct, each learned the hard way:
   runs the gate including the format slot). That is `wont-do`, not a code change.
 
 Product templates ship to users: a builtin edit re-applies to pristine rows on
-the next boot, so add a CHANGELOG `[Unreleased]` line whenever you change one.
+the next boot, so add a new lowercase UUID-v4 fragment under `changelog.d/` when you change one. Cite the relevant issue before a PR exists; see [fragment guidance](../../../changelog.d/README.md) for format and exemptions.
 
 ## Agent-improvement session (judge recs + bot reviews + buddy)
 

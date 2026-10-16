@@ -3136,6 +3136,28 @@ export interface RecoveryHold {
   capture_state?: string;
 }
 
+/** Verified persisted custody facts only; never a release ACK or cleanup authority. */
+export interface RecoveryExactHold {
+  run_id: string;
+  hold_id: string;
+  generation: number;
+  repo_id: string;
+  original_worker_id: string;
+  original_worker_identity: string;
+  live_worker_id?: string;
+  live_run_id?: string;
+  inventory_guarded: boolean;
+  state: "open" | "released" | "discarded";
+  run_status: string;
+  current_claim_generation: number;
+  claim_released: boolean;
+  release_evidence?: string;
+  final_receipt?: { kind: string; capture_id?: string; publication_id?: string; source_sha?: string; coverage_digest: string };
+  completed_publication_receipt?: CompletedPublicationReceipt;
+  run_worker_id?: string;
+  recovery_wait_cause?: string;
+}
+
 /** RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349
  *  M1, D3). holds is ALWAYS an array, never null — the server initializes it to []. */
 export interface RecoveryHoldsResponse {

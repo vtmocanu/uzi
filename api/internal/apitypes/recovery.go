@@ -279,6 +279,37 @@ type RecoveryHoldsResponse struct {
 	Holds []RecoveryHoldDTO `json:"holds"`
 }
 
+// RecoveryExactHoldsResponse is the V2-only observation branch of the worker hold endpoint.
+// An absent ExactHold means unknown. It is not a release acknowledgement.
+type RecoveryExactHoldsResponse struct {
+	RunID     string             `json:"run_id"`
+	Holds     []RecoveryHoldDTO  `json:"holds"`
+	ExactHold *RecoveryExactHold `json:"exact_hold,omitempty"`
+}
+
+// RecoveryExactHold contains persisted facts for one verified original custodian.
+// Closed custody alone does not grant FINAL acknowledgement or physical cleanup authority.
+type RecoveryExactHold struct {
+	RunID                       string                       `json:"run_id"`
+	HoldID                      string                       `json:"hold_id"`
+	Generation                  int64                        `json:"generation"`
+	RepoID                      string                       `json:"repo_id"`
+	OriginalWorkerID            string                       `json:"original_worker_id"`
+	OriginalWorkerIdentity      string                       `json:"original_worker_identity"`
+	LiveWorkerID                string                       `json:"live_worker_id,omitempty"`
+	LiveRunID                   string                       `json:"live_run_id,omitempty"`
+	InventoryGuarded            bool                         `json:"inventory_guarded"`
+	State                       string                       `json:"state"`
+	RunStatus                   string                       `json:"run_status"`
+	CurrentClaimGeneration      int64                        `json:"current_claim_generation"`
+	ClaimReleased               bool                         `json:"claim_released"`
+	ReleaseEvidence             string                       `json:"release_evidence,omitempty"`
+	FinalReceipt                *RecoveryFinalDisposition    `json:"final_receipt,omitempty"`
+	CompletedPublicationReceipt *CompletedPublicationReceipt `json:"completed_publication_receipt,omitempty"`
+	RunWorkerID                 string                       `json:"run_worker_id,omitempty"`
+	RecoveryWaitCause           string                       `json:"recovery_wait_cause,omitempty"`
+}
+
 // ── Owner-facing custody-hold DTOs (PRD #1349 M1 D7; SPA/CLI read side, api-contract
 // fixture-pinned like the archive DTOs above, mirrored in web/src/lib/apiTypes.ts) ─────────
 

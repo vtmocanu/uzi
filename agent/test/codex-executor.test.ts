@@ -7167,6 +7167,21 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     ]);
   });
 
+  it("lead guidance checkpoint plus done completes without an extra turn or cooperative checkpoint", async () => {
+    const rig = makeMultiEpochRig([epochResponder("resumed-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(1, "checkpoint", {}, th, tn, "c-checkpoint"))
+        .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    const checkpoints: boolean[] = [];
+    const { ctx } = makeCtx({ checkpoint: async opts => { checkpoints.push(opts.reap); } });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checkpoint plus done");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    assert.deepEqual(checkpoints, [], "done bypasses the intermediate milestone checkpoint");
+  });
+
   it("(m2-2) a cooperative checkpoint (not done) drives ctx.checkpoint({reap:true}), recreates the epoch, and the next implement turn on the NEW root reaches done", async () => {
     // m4 change: a cooperative checkpoint reap recreates the provider epoch, so the second implement
     // turn runs on a DISTINCT root/transport (the reaped root's registry is permanently closed).
@@ -18128,6 +18143,36 @@ describe("2833 Codex inline summaries", () => {
       }
     });
   }
+  it("2833 exhausted summary bound reports intent abandonment before teardown", async () => {
+    const { rig, intents } = summaryRig();
+    let input: IntentSummaryInput | undefined;
+    let resolve!: (value: string) => void;
+    let abandoned = false;
+    const log = { ...noopLog, warn: (message: string) => {
+      if (message === "intent summary did not settle within the bound") abandoned = true;
+    } };
+    const summaryRunner = {
+      generateIntentSummary: (i: IntentSummaryInput) => {
+        input = i;
+        return new Promise<string>(r => { resolve = r; });
+      },
+      generatePlanSummary: async () => null,
+    };
+    const executor = makeExecutor(rig, bindingOf(API_KEY), log, undefined, provider, { summaryRunner });
+    const { ctx, emitted } = makeCtx({ reportIteration: async () => {
+      await waitForSummary(() => input !== undefined, "intent started");
+      const proof = await executor.settleForCredentialFreeCapture(0);
+      assert.equal(proof.kind, "incomplete", "an expired capture cannot authorize registry proof");
+      assert.equal(input?.signal?.aborted, true);
+      assert.equal(abandoned, true, "exhausted bound reports abandonment synchronously");
+      throw new Error("capture-ended-run");
+    } });
+    await assert.rejects(executor.run(ctx), /capture-ended-run/);
+    input?.onUsage?.(usage);
+    resolve("Too late"); await drain();
+    assert.deepEqual(intents, []);
+    assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 0);
+  });
   it("2833 terminal intent cooperatively settles before provider teardown", async () => {
     const { rig } = summaryRig();
     let input: IntentSummaryInput | undefined;

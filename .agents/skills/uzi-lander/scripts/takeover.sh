@@ -21,7 +21,8 @@
 #   run_failed:<origin>   run failed/cancelled and no PR — hand to uzi-watcher recovery
 #   claimed_by_other      another live session is landing this PR (CLAIM_HELD_BY printed)
 #   merged | closed       nothing to land
-#   conflict              mergeable CONFLICTING (wins over any unknown) or mergeStateStatus
+#   conflict              after ci_fix ownership is known inactive, mergeable CONFLICTING
+#                         (wins over other unknowns) or mergeStateStatus
 #                         DIRTY (wins over a CI-only unknown) — rebase with land-prep.sh.
 #                         GitHub may never run pull_request CI on a DIRTY PR, so empty checks
 #                         are expected there
@@ -29,6 +30,7 @@
 #                         (wins over a CI-only unknown)
 #   ci_red | ci_pending   required checks
 #   mr_rework_active      defer to uzi's rework
+#   ci_fix_active         a worker owns this branch; decide wait/cancel with the buddy
 #   cr_rate_limited       CR refused this head; CR_RESET_MIN set when known
 #   review_pending        a bot is reviewing this head now
 #   unknown               a lookup failed or returned an unreadable payload; never act on it.
@@ -39,6 +41,10 @@
 #                         code-scanning alerts, unacknowledged comments; lib/pr-comments.sh)
 #   ready                 CI green, head reviewed, 0 live findings, no rework (BEHIND is fine
 #                         under an admin merge; MERGE_STATE says so)
+#
+# CI_FIX_ACTIVE lists all matching active id/status pairs (semicolon-separated).
+# CI_FIX_RECENT names the newest matching terminal id/status/finished_at within 24h.
+# Both are unknown on lookup/parse failure, never none. A recent run is a review trigger.
 #
 # MR_REWORK_ENABLED=true|false|unknown is printed for the run (uzi run get --json,
 # .mr_rework_enabled; unknown when the lookup fails, no run resolves, or the field is
@@ -77,6 +83,8 @@ fi
 . "$HERE/lib/required-checks.sh"
 # shellcheck source=lib/net-retry.sh
 . "$HERE/lib/net-retry.sh"
+# shellcheck source=lib/ci-fix.sh
+. "$HERE/lib/ci-fix.sh"
 net_retry_install
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
@@ -119,8 +127,8 @@ repo_id=""; repo_listed=0
 if [ "$have_uzi" -eq 1 ]; then
   rl=$(uzi repo list --json 2>/dev/null || echo 'x')
   if printf '%s' "$rl" | jq -e 'type=="array"' >/dev/null 2>&1; then
-    repo_listed=1
-    repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '[.[]|select(.path_with_namespace==$p)|.id]|first // ""' 2>/dev/null) || UNKNOWN=1
+    if repo_id=$(printf '%s' "$rl" | jq -r --arg p "$REPO" '[.[]|select(.path_with_namespace==$p)|.id]|first // ""' 2>/dev/null); then repo_listed=1
+    else UNKNOWN=1; fi
   else
     UNKNOWN=1; echo "UZI_REPO_LIST=unreadable"
   fi
@@ -132,7 +140,7 @@ if printf '%s' "$TARGET" | grep -qE '^[0-9]+$'; then
   PR="$TARGET"; BY_PR=1
   if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
     run_json=$(uzi run list --json 2>/dev/null | jq -c --arg repo "$repo_id" --argjson pr "$PR" \
-      '[.[]|select(.repo_id==$repo and .mr_iid==$pr and .kind!="mr_rework")]|max_by(.created_at) // empty' 2>/dev/null || true)
+      '[.[]|select(.repo_id==$repo and .mr_iid==$pr and .kind!="mr_rework" and .kind!="ci_fix")]|max_by(.created_at) // empty' 2>/dev/null || true)
   fi
 else
   [ "$have_uzi" -eq 1 ] || { echo "uzi CLI not on PATH; cannot resolve a run id" >&2; exit 3; }
@@ -396,19 +404,25 @@ print_items "$blk_items"
 echo "EVERY_AUTHOR=threads=$threads_open code_scanning=$cs_shown unacked=$unacked"
 
 # Active mr_rework on this MR. A repo on uzi whose listing cannot be read is UNKNOWN.
-mrw=0
+mrw=0; ci_fix_known=0
+CI_FIX_ACTIVE=unknown; CI_FIX_RECENT=unknown; CI_FIX_ACTIVE_COUNT=0
 if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
   runs=$(uzi run list --json 2>/dev/null || echo 'x')
   if printf '%s' "$runs" | jq -e 'type=="array"' >/dev/null 2>&1; then
     mrw=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
       '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || UNKNOWN=1
+    if ci_fix_snapshot "$runs" "$repo_id" "$(printf '%s' "$pj" | jq -r '.headRefName // empty')" 2>/dev/null; then ci_fix_known=1
+    else UNKNOWN=1; fi
   else
     UNKNOWN=1; echo "MR_REWORK=unreadable"
   fi
 elif [ "$have_uzi" -eq 1 ] && [ "$repo_listed" -eq 1 ] && [ -z "$repo_id" ]; then
   echo "MR_REWORK=repo-not-on-uzi"
+  CI_FIX_ACTIVE=none; CI_FIX_RECENT=none; ci_fix_known=1
 fi
 echo "MR_REWORK_ACTIVE=$mrw"
+echo "CI_FIX_ACTIVE=$CI_FIX_ACTIVE"
+echo "CI_FIX_RECENT=$CI_FIX_RECENT"
 
 # Workflow files and migrations in the PR diff (added files), vs the base's migration set.
 # An unreadable files list or base listing is UNKNOWN: a missed migration collision
@@ -464,7 +478,9 @@ fi
 reviewed=$cr_reviewed
 [ "$gr_reviewed" -eq 1 ] && reviewed=1
 echo "UNKNOWN=$(( UNKNOWN | CI_UNKNOWN ))"; echo "CI_UNKNOWN=$CI_UNKNOWN"
-if   [ "$mergeable" = "CONFLICTING" ]; then echo "NEXT=conflict"
+if   [ "$ci_fix_known" -ne 1 ]; then echo "NEXT=unknown (ci_fix ownership lookup failed; re-run before touching the branch)"
+elif [ "$CI_FIX_ACTIVE_COUNT" -gt 0 ]; then echo "NEXT=ci_fix_active"
+elif [ "$mergeable" = "CONFLICTING" ]; then echo "NEXT=conflict"
 elif [ "$UNKNOWN" -eq 1 ]; then echo "NEXT=unknown (a lookup failed or returned an unreadable payload; re-run before acting)"
 elif [ -n "$collision" ]; then echo "NEXT=migration_collision"
 elif [ "$merge_state" = "DIRTY" ]; then echo "NEXT=conflict"
