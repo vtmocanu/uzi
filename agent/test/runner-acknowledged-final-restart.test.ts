@@ -849,6 +849,9 @@ for (const { caller, afterUnlinkFault, liveClient } of [
 }
 
 it("new report proof transport failure preserves existing physical archive authority within the same budget", { skip: linuxReportSkip }, async t => {
+  // Issue #3079: under CPU contention, the real archive proof can exhaust its
+  // one-second budget during source inspection. Test-only headroom lets the same
+  // proof finish and retire the report while preserving physical source custody.
   const f = await reportRetirementFixture(t);
   const recovery = Reflect.get(f.r, "recovery") as RecoveryCoordinator;
   const report = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
