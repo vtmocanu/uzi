@@ -640,6 +640,14 @@ func transcriptText(f laneFrame) string {
 	if len(f.Payload) == 0 {
 		return ""
 	}
+	if f.Kind == "plan" {
+		var plan struct {
+			Markdown string `json:"plan_md"`
+		}
+		if err := json.Unmarshal(f.Payload, &plan); err == nil && strings.TrimSpace(plan.Markdown) != "" {
+			return plan.Markdown
+		}
+	}
 	var p struct {
 		Text  string `json:"text"`
 		Name  string `json:"name"`

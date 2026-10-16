@@ -74,6 +74,8 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	file.Flags().Bool("send-to-uzi", false, "label the issue for uzi; automatic starts require autopilot to be enabled and a matching forge identity")
+
 	draft := &cobra.Command{
 		Use:   "draft <finding-id> [<finding-id>...]",
 		Short: "Preview the issue draft for one or more findings (read-only)",
@@ -394,7 +396,8 @@ func runFindingsResolve(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
 // created-with-warning note. A 409 (already filed/filing) and a 404 (unknown/foreign id) arrive
 // as *ExitError with exit 5 / 4 from statusError, propagated unchanged.
 func runFindingsFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, id string) error {
-	res, err := c.FileFinding(cmd.Context(), id)
+	sendToUzi, _ := cmd.Flags().GetBool("send-to-uzi")
+	res, err := c.FileFinding(cmd.Context(), id, sendToUzi)
 	if err != nil {
 		return err
 	}
@@ -408,6 +411,10 @@ func runFindingsFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comma
 		p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
 		if res.Issue.WebURL != "" {
 			p.Printf("  %s\n", res.Issue.WebURL)
+		}
+		if sendToUzi {
+			p.Printf("Queued for uzi: starts on the next sync if autopilot is on\n")
+			p.Printf("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.\n")
 		}
 		// A warning is created-with-warning: the forge issue is REAL, so this is a note on a
 		// success (exit 0), never a retry signal.
@@ -549,7 +556,8 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
 	if len(dispIDs) == 1 {
 		return runFindingsFile(env, gf, c, cmd, distinct[0])
 	}
-	res, accepted, err := c.FileFindingGroup(cmd.Context(), dispIDs)
+	sendToUzi, _ := cmd.Flags().GetBool("send-to-uzi")
+	res, accepted, err := c.FileFindingGroup(cmd.Context(), dispIDs, sendToUzi)
 	if err != nil {
 		var ee *uzicli.ExitError
 		if errors.As(err, &ee) && ee.Code == uzicli.ExitConflict {
@@ -569,6 +577,10 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
 				p.Printf("  %s\n", res.Issue.WebURL)
 			}
 			p.Printf("linked findings: %s\n", strings.Join(res.DispositionIDs, ", "))
+			if sendToUzi {
+				p.Printf("Queued for uzi: starts on the next sync if autopilot is on\n")
+				p.Printf("Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi.\n")
+			}
 		}
 		// An unsettled operation (202, or a 201 not yet settled) and any warning are always
 		// printed, --quiet included: the operation id is what the user later inspects, and must

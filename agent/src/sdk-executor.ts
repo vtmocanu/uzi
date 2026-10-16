@@ -1202,41 +1202,55 @@ export class SdkExecutor implements Executor {
     this.spentSwitchSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
-    const drive = await this.phaseSetup(ctx);
+    let liveState: RunDrive | undefined;
+    const onTerminal = (): void => {
+      if (liveState) this.trip(liveState, REASON_CANCELLED);
+      this.activeDeps?.abort.abort();
+    };
+    ctx.terminalLifecycleSignal?.addEventListener("abort", onTerminal, { once: true });
     try {
-      const early = await this.phasePlanGate(ctx, drive);
-      if (early !== undefined) return (summaryResult = early);
-      return (summaryResult = await this.phaseRunLoop(ctx, drive));
-    } finally {
-      // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
-      // open, so its observed usage is emitted rather than dropped by a closed batcher.
-      await this.closeAndSettlePlanSummary();
-      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.()
-        || (ctx.signal?.aborted && ctx.signal !== this.spentSwitchSignal) || ctx.terminalLifecycleSignal?.aborted)) {
-        delete summaryResult.summaryPlan;
-        delete summaryResult.summaryDeltas;
+      this.throwIfTerminal(ctx);
+      const drive = await this.phaseSetup(ctx, (state) => {
+        liveState = state;
+        if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) onTerminal();
+      });
+      try {
+        const early = await this.phasePlanGate(ctx, drive);
+        if (early !== undefined) return (summaryResult = early);
+        return (summaryResult = await this.phaseRunLoop(ctx, drive));
+      } finally {
+        // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
+        // open, so its observed usage is emitted rather than dropped by a closed batcher.
+        await this.closeAndSettlePlanSummary();
+        if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.()
+          || (ctx.signal?.aborted && ctx.signal !== this.spentSwitchSignal) || ctx.terminalLifecycleSignal?.aborted)) {
+          delete summaryResult.summaryPlan;
+          delete summaryResult.summaryDeltas;
+        }
+        this.disarmWall(drive.state);
+        if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
+        // PRD #121 M2: no install may outlive the run. On every path that never reached
+        // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
+        // install may still be in flight, and the runner tears the clone down and pushes
+        // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
+        // kill rather than by the install's own 10-minute cap (that is what stops a
+        // rejected plan blocking on deps nobody needs); the promise already carries its
+        // own catch, so awaiting it can never throw here and mask the real failure.
+        drive.depsAbort.abort();
+        await drive.depsInstall;
+        this.depsJoined = true;
+        this.activeDeps = undefined;
+        // Reap every agent subprocess before returning, so none survives into the
+        // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
+        // too, not just the runner's explicit pre-push call.
+        this.killAgentTree();
+        // Remove the per-run provisioning dir (the synthesized devbox.json + profile
+        // symlinks). The nix STORE is global (on the data volume), NOT here, so this
+        // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
+        if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
       }
-      this.disarmWall(drive.state);
-      if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
-      // PRD #121 M2: no install may outlive the run. On every path that never reached
-      // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
-      // install may still be in flight, and the runner tears the clone down and pushes
-      // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
-      // kill rather than by the install's own 10-minute cap (that is what stops a
-      // rejected plan blocking on deps nobody needs); the promise already carries its
-      // own catch, so awaiting it can never throw here and mask the real failure.
-      drive.depsAbort.abort();
-      await drive.depsInstall;
-      this.depsJoined = true;
-      this.activeDeps = undefined;
-      // Reap every agent subprocess before returning, so none survives into the
-      // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
-      // too, not just the runner's explicit pre-push call.
-      this.killAgentTree();
-      // Remove the per-run provisioning dir (the synthesized devbox.json + profile
-      // symlinks). The nix STORE is global (on the data volume), NOT here, so this
-      // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
-      if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
+    } finally {
+      ctx.terminalLifecycleSignal?.removeEventListener("abort", onTerminal);
     }
   }
 
@@ -1248,7 +1262,7 @@ export class SdkExecutor implements Executor {
    * before the split. Returns the populated carrier; the cancel listener it registers
    * closes over the same `state`/`depsAbort` objects it stores on the carrier.
    */
-  private async phaseSetup(ctx: RunContext): Promise<DriveState> {
+  private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken) {
       // OAuth is the sole supported credential (no API keys). Detect its
@@ -1682,6 +1696,7 @@ export class SdkExecutor implements Executor {
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
     };
+    observeState(state);
     const idleMs = seconds(
       ctx.config?.idle_timeout_seconds,
       DEFAULT_IDLE_TIMEOUT_SECONDS,
@@ -2698,6 +2713,7 @@ export class SdkExecutor implements Executor {
         // unaffected: it aborts the LIVE turn, which throws Error(REASON_CANCELLED) from driveTurn
         // before control returns here. Throwing the same error takes the identical terminal cancel
         // path, so a late cancel is honored exactly like an in-flight one.
+        this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         // PRD #1809 D4: a worker-local `disk` stop parks at the next boundary, UNCONDITIONALLY. Its
         // turn drop is first-wins with every other trip (trip()), so a stop that landed while a
@@ -2712,6 +2728,7 @@ export class SdkExecutor implements Executor {
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
         const served = finalizing ? undefined : await ctx.reportIteration?.(iteration, latestProgress);
+        this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
@@ -2986,6 +3003,7 @@ export class SdkExecutor implements Executor {
         // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
         // Both provider interruptions and idle park waits use the same lifecycle precedence.
         const handlePauseNow = async (at: { completedCount: number; total?: number }): Promise<boolean> => {
+          this.throwIfTerminal(ctx);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
@@ -3004,6 +3022,7 @@ export class SdkExecutor implements Executor {
             pausedAt = at;
             return true;
           }
+          this.throwIfTerminal(ctx);
           state.tripReason = undefined;
           throwIfDiskStop(ctx);
           return false;
@@ -3156,6 +3175,7 @@ export class SdkExecutor implements Executor {
               break;
             }
             if (outcome === "gave_up") {
+              this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
@@ -3208,6 +3228,7 @@ export class SdkExecutor implements Executor {
             // fall-through below re-throws REASON_WALL, the legacy terminal, byte-identical to before.
             if (outcome === "refused") {
               ctx.clearWallMode?.();
+              this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               throwIfDiskStop(ctx);
               continue;
@@ -3923,19 +3944,25 @@ export class SdkExecutor implements Executor {
     let attempt = run;
     for (;;) {
       try {
+        this.throwIfTerminal(ctx);
         return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
         const outcome = await this.attemptCredentialSwitch(ctx);
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
+          this.throwIfTerminal(ctx);
           state.tripReason = undefined;
           this.markSwitchSignalSpent(ctx);
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
           if (options?.reopenPlanSummary) this.reopenPlanSummary(ctx);
-          attempt = continueWait ? () => continueWait(run) : run;
+          const guardedRun = (): Promise<T> => {
+            this.throwIfTerminal(ctx);
+            return run();
+          };
+          attempt = continueWait ? () => continueWait(guardedRun) : guardedRun;
           continue;
         }
         throw err; // no hook wired: let the runner's outer catch handle it, as before this fix
@@ -4126,6 +4153,7 @@ export class SdkExecutor implements Executor {
     // the same turn (driveTurnWithEmptyRecovery) calls it again, so the handler must be idempotent.
     onFirstEvent?: () => void,
   ): Promise<TurnResult> {
+    this.throwIfTerminal(ctx);
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);
 
@@ -4768,6 +4796,10 @@ export class SdkExecutor implements Executor {
       agent: "worker",
       payload: { text: `skills plugin failed to load (${desc}); continuing without it` },
     });
+  }
+
+  private throwIfTerminal(ctx: RunContext): void {
+    if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) throw new Error(REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */

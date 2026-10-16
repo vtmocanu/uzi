@@ -2,6 +2,9 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -28,6 +31,285 @@ func loopSvc(t *testing.T, r store.ListActiveRunsForHealthRow, window []store.Li
 	return fs, healthSvc(fs, defaultHealthSettings())
 }
 
+// loopResult supplies a complete result without changing the lead-lane helpers.
+func loopResult(t *testing.T, seq int32, id string, content any) store.ListRunToolWindowRow {
+	t.Helper()
+	return store.ListRunToolWindowRow{Seq: seq, Kind: "tool_result", Payload: mustJSON(t, map[string]any{"tool_use_id": id, "content": content})}
+}
+
+// completeLoopUses turns call-only fixtures into uniquely identified completed
+// calls, preserving their newest-first order and their name/input payloads.
+func completeLoopUses(t *testing.T, uses []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+	t.Helper()
+	if len(uses) > loopWindow {
+		t.Fatalf("fixture has %d uses, maximum %d", len(uses), loopWindow)
+	}
+	var rows []store.ListRunToolWindowRow
+	seq := int32(2 * loopWindow)
+	for i, use := range uses {
+		var payload map[string]any
+		if err := json.Unmarshal(use.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		id := fmt.Sprintf("completed-%d", i)
+		payload["id"] = id
+		use.Payload = mustJSON(t, payload)
+		use.Seq = seq - 1
+		rows = append(rows, loopResult(t, seq, id, "same output"), use)
+		seq -= 2
+	}
+	return rows
+}
+
+func loopPairs(t *testing.T, n int32) []store.ListRunToolWindowRow {
+	t.Helper()
+	var rows []store.ListRunToolWindowRow
+	for i := n; i > 0; i-- {
+		id := fmt.Sprintf("use-%d", i)
+		rows = append(rows, loopResult(t, 2*i, id, "same output"),
+			useMsg(t, 2*i-1, id, "Bash", map[string]any{"command": "status"}))
+	}
+	return rows
+}
+
+func TestAnalyzeToolWindowDifferentResults(t *testing.T) {
+	rows := loopPairs(t, 5)
+	for i := 0; i < 5; i++ {
+		rows[2*i] = loopResult(t, rows[2*i].Seq, fmt.Sprintf("use-%d", 5-i), fmt.Sprintf("progress %d", i))
+	}
+	if analyzeToolWindow(rows) {
+		t.Fatal("same call with different results must not flag looping")
+	}
+}
+
+func TestAnalyzeToolWindow(t *testing.T) {
+	raw := func(kind, payload string, seq int32) store.ListRunToolWindowRow {
+		return store.ListRunToolWindowRow{Kind: kind, Payload: []byte(payload), Seq: seq}
+	}
+	for _, tc := range []struct {
+		name string
+		want bool
+		edit func([]store.ListRunToolWindowRow) []store.ListRunToolWindowRow
+	}{
+		{"same output", true, nil},
+		{"three pairs", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow { return r[:6] }},
+		{"unmatched excluded", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow { return r[1:] }},
+		{"mismatch ID", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0] = loopResult(t, 8, "other", "same output")
+			return r
+		}},
+		{"empty use ID", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[1] = useMsg(t, 7, "", "Bash", map[string]any{"command": "status"})
+			return r
+		}},
+		{"empty result ID", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0] = loopResult(t, 8, "", "same output")
+			return r
+		}},
+		{"earlier result", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0].Seq = 0
+			return r
+		}},
+		{"equal seq", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0].Seq = r[1].Seq
+			return r
+		}},
+		{"duplicate result newer", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			return append([]store.ListRunToolWindowRow{loopResult(t, 9, "use-4", "same output")}, r...)
+		}},
+		{"duplicate result older", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			return append(r, loopResult(t, 0, "use-4", "same output"))
+		}},
+		{"duplicate use outside selection", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 8; i++ {
+				r = append(r, useMsg(t, -int32(i), fmt.Sprintf("open-%d", i), "Read", nil))
+			}
+			return append(r, useMsg(t, -9, "use-4", "Bash", nil))
+		}},
+		{"malformed duplicate use readable ID", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			return append(r, raw("tool_use", `{"id":"use-4","name":false}`, 0))
+		}},
+		{"malformed duplicate result readable ID", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			return append(r, raw("tool_result", `{"tool_use_id":"use-4","is_error":null}`, 0))
+		}},
+		{"duplicate uses inside selection", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[3] = useMsg(t, 5, "use-4", "Bash", map[string]any{"command": "status"})
+			return r
+		}},
+		{"same error output", true, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 4; i++ {
+				r[2*i].Payload = []byte(fmt.Sprintf(`{"tool_use_id":"use-%d","content":"same output","is_error":true}`, 4-i))
+			}
+			return r
+		}},
+		{"success error split", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0] = raw("tool_result", `{"tool_use_id":"use-4","content":"same output","is_error":true}`, 8)
+			return r
+		}},
+		{"explicit success metadata ignored", true, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			r[0] = raw("tool_result", `{"tool_use_id":"use-4","content":"same output","is_error":false,"duration":42}`, 8)
+			r[1] = raw("tool_use", `{"id":"use-4","name":"Bash","input":{"command":"status"},"agent":"other"}`, 7)
+			return r
+		}},
+		{"raw object order", true, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 4; i++ {
+				input, content := `{"a":1,"b":{"x":2,"y":3}}`, `{"first":1,"second":2}`
+				if i%2 == 0 {
+					input, content = `{"b":{"y":3,"x":2},"a":1}`, `{"second":2,"first":1}`
+				}
+				r[2*i+1].Payload = []byte(fmt.Sprintf(`{"id":"use-%d","name":"Bash","input":%s}`, 4-i, input))
+				r[2*i].Payload = []byte(fmt.Sprintf(`{"tool_use_id":"use-%d","content":%s}`, 4-i, content))
+			}
+			return r
+		}},
+		{"input array order preserved", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 4; i++ {
+				input := []int{1, 2}
+				if i == 0 {
+					input = []int{2, 1}
+				}
+				r[2*i+1] = useMsg(t, r[2*i+1].Seq, fmt.Sprintf("use-%d", 4-i), "Bash", input)
+			}
+			return r
+		}},
+		{"content array order preserved", false, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 4; i++ {
+				content := []int{1, 2}
+				if i == 0 {
+					content = []int{2, 1}
+				}
+				r[2*i] = loopResult(t, r[2*i].Seq, fmt.Sprintf("use-%d", 4-i), content)
+			}
+			return r
+		}},
+		{"null input and content allowed", true, func(r []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
+			for i := 0; i < 4; i++ {
+				id := fmt.Sprintf("use-%d", 4-i)
+				r[2*i+1] = useMsg(t, r[2*i+1].Seq, id, "Bash", nil)
+				r[2*i] = loopResult(t, r[2*i].Seq, id, nil)
+			}
+			return r
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := loopPairs(t, 4)
+			if tc.edit != nil {
+				rows = tc.edit(rows)
+			}
+			sort.SliceStable(rows, func(i, j int) bool { return rows[i].Seq > rows[j].Seq })
+			if got := analyzeToolWindow(rows); got != tc.want {
+				t.Fatalf("looping = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	for _, kind := range []string{"tool_use", "tool_result"} {
+		payloads := []string{`null`, `[]`, `"text"`, `{`}
+		if kind == "tool_use" {
+			payloads = append(payloads, `{"id":"use-4","name":"","input":null}`, `{"id":"use-4","name":7,"input":null}`, `{"id":"use-4","name":"Bash"}`, `{"id":7,"name":"Bash","input":null}`)
+		} else {
+			payloads = append(payloads, `{"tool_use_id":"use-4"}`, `{"tool_use_id":7,"content":"same output"}`, `{"tool_use_id":"use-4","content":"same output","is_error":null}`, `{"tool_use_id":"use-4","content":"same output","is_error":"false"}`)
+		}
+		for _, payload := range payloads {
+			t.Run(kind+"/"+payload, func(t *testing.T) {
+				rows := loopPairs(t, 4)
+				index := 0
+				if kind == "tool_use" {
+					index = 1
+				}
+				rows[index].Payload = []byte(payload)
+				if analyzeToolWindow(rows) {
+					t.Fatal("invalid payload must not complete a repeated pair")
+				}
+			})
+		}
+	}
+}
+
+func TestAnalyzeToolWindowExactFields(t *testing.T) {
+	for _, field := range []struct {
+		lower string
+		upper string
+	}{
+		{"id", "ID"},
+		{"name", "Name"},
+		{"input", "Input"},
+	} {
+		t.Run("missing lowercase "+field.lower, func(t *testing.T) {
+			rows := loopPairs(t, 4)
+			for i := 1; i < len(rows); i += 2 {
+				var payload map[string]json.RawMessage
+				if err := json.Unmarshal(rows[i].Payload, &payload); err != nil {
+					t.Fatal(err)
+				}
+				payload[field.upper] = payload[field.lower]
+				delete(payload, field.lower)
+				rows[i].Payload = mustJSON(t, payload)
+			}
+			if analyzeToolWindow(rows) {
+				t.Fatal("wrong-case field must not replace a required lowercase field")
+			}
+		})
+	}
+	for _, alias := range []string{
+		`,"ID":"other"`,
+		`,"Name":"Read"`,
+		`,"Input":{"command":"other"}`,
+		`,"Name":false,"Input":false`,
+	} {
+		t.Run("use metadata "+alias, func(t *testing.T) {
+			rows := loopPairs(t, 4)
+			rows[1].Payload = []byte(`{"id":"use-4","name":"Bash","input":{"command":"status"}` + alias + "}")
+			if !analyzeToolWindow(rows) {
+				t.Fatal("uppercase metadata must not override lowercase call fields")
+			}
+		})
+	}
+	t.Run("result metadata", func(t *testing.T) {
+		rows := loopPairs(t, 4)
+		rows[0].Payload = []byte(`{"tool_use_id":"use-4","content":"same output","is_error":false,"Tool_use_id":"other","Content":"other output","Is_error":true}`)
+		if !analyzeToolWindow(rows) {
+			t.Fatal("uppercase metadata must not override lowercase result fields")
+		}
+	})
+}
+
+func TestAnalyzeToolWindowSelection(t *testing.T) {
+	t.Run("full alternating window", func(t *testing.T) {
+		rows := loopPairs(t, 12)
+		for i := 0; i < 12; i++ {
+			name, content := "Read", "file A"
+			if i%2 == 0 {
+				name, content = "Bash", "output B"
+			}
+			id := fmt.Sprintf("use-%d", 12-i)
+			rows[2*i+1] = useMsg(t, rows[2*i+1].Seq, id, name, nil)
+			rows[2*i] = loopResult(t, rows[2*i].Seq, id, content)
+		}
+		if !analyzeToolWindow(rows) {
+			t.Fatal("A/B completed pairs must flag in a full 12-use window")
+		}
+	})
+	for _, malformed := range []bool{false, true} {
+		for _, open := range []int{8, 9} {
+			t.Run(fmt.Sprintf("malformed=%v/open=%d", malformed, open), func(t *testing.T) {
+				var rows []store.ListRunToolWindowRow
+				for i := 0; i < open; i++ {
+					row := useMsg(t, int32(100-i), fmt.Sprintf("open-%d", i), "Read", nil)
+					if malformed {
+						row.Payload = []byte("{")
+					}
+					rows = append(rows, row)
+				}
+				rows = append(rows, loopPairs(t, 4)...)
+				want := open == 8
+				if got := analyzeToolWindow(rows); got != want {
+					t.Fatalf("looping = %v, want %v; older pairs must not backfill", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestHealthLoopingFlagsIdenticalCalls(t *testing.T) {
 	r := loopingRun()
 	// Four identical Bash calls (distinct ids, identical name+input) — newest first.
@@ -37,6 +319,7 @@ func TestHealthLoopingFlagsIdenticalCalls(t *testing.T) {
 		useMsg(t, 12, "id2", "Bash", map[string]any{"command": "go test ./..."}),
 		useMsg(t, 11, "id1", "Bash", map[string]any{"command": "go test ./..."}),
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
@@ -55,6 +338,7 @@ func TestHealthLoopingThreeIdenticalBelowThreshold(t *testing.T) {
 		useMsg(t, 12, "id2", "Bash", map[string]any{"command": "go test ./..."}),
 		useMsg(t, 11, "id1", "Bash", map[string]any{"command": "go test ./..."}),
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
@@ -67,20 +351,20 @@ func TestHealthLoopingThreeIdenticalBelowThreshold(t *testing.T) {
 
 func TestHealthLoopingABAlternationFlagsWhenWindowFills(t *testing.T) {
 	r := loopingRun()
-	// Alternating A/B, four of each — an A/B loop trips only once the window fills
-	// enough for one call to reach the threshold (Decision 4).
+	// A full 12-use A/B window with stable results per call reaches the threshold.
 	var window []store.ListRunToolWindowRow
-	seq := int32(20)
-	for i := 0; i < 4; i++ {
+	seq := int32(30)
+	for i := 0; i < 6; i++ {
 		window = append(window, useMsg(t, seq, "a", "Read", map[string]any{"path": "a.go"}))
 		seq--
 		window = append(window, useMsg(t, seq, "b", "Read", map[string]any{"path": "b.go"}))
 		seq--
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
-		t.Fatalf("changed = %d, want 1 (A and B each reach 4)", n)
+		t.Fatalf("changed = %d, want 1 (A and B each reach 6)", n)
 	}
 	if w := lastWrite(t, fs, r.ID); w.Health != healthLooping {
 		t.Fatalf("health = %q, want looping", w.Health)
@@ -92,7 +376,7 @@ func TestHealthLoopingABAlternationFlagsWhenWindowFills(t *testing.T) {
 		useMsg(t, 12, "b", "Read", map[string]any{"path": "b.go"}),
 		useMsg(t, 11, "a", "Read", map[string]any{"path": "a.go"}),
 	}
-	fs2, svc2 := loopSvc(t, loopingRun(), short)
+	fs2, svc2 := loopSvc(t, loopingRun(), completeLoopUses(t, short))
 	if n := svc2.detectRunHealth(context.Background(), t0); n != 0 {
 		t.Fatalf("short A/B changed = %d, want 0", n)
 	}
@@ -111,6 +395,7 @@ func TestHealthLoopingInterleavedDistinctNoFalsePositive(t *testing.T) {
 		useMsg(t, 12, "t1", "Bash", map[string]any{"command": "go test ./..."}),
 		useMsg(t, 11, "e1", "Edit", map[string]any{"path": "a.go", "line": 10}),
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 0 {
@@ -133,6 +418,7 @@ func TestHealthLoopingResumeBoundaryReflag(t *testing.T) {
 		useMsg(t, 17, "old2", "Bash", map[string]any{"command": "make build"}),
 		useMsg(t, 16, "old1", "Bash", map[string]any{"command": "make build"}),
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
@@ -153,6 +439,7 @@ func TestHealthLoopingBeatsStalledAndSlow(t *testing.T) {
 		useMsg(t, 12, "id2", "Bash", map[string]any{"command": "go build ./..."}),
 		useMsg(t, 11, "id1", "Bash", map[string]any{"command": "go build ./..."}),
 	}
+	window = completeLoopUses(t, window)
 	fs, svc := loopSvc(t, r, window)
 
 	svc.detectRunHealth(context.Background(), t0)
@@ -170,6 +457,18 @@ func TestHealthLoopingCanonicalizesInputKeyOrder(t *testing.T) {
 		useMsg(t, 13, "id3", "Bash", map[string]any{"dir": "/x", "command": "go test"}),
 		useMsg(t, 12, "id2", "Bash", map[string]any{"command": "go test", "dir": "/x"}),
 		useMsg(t, 11, "id1", "Bash", map[string]any{"dir": "/x", "command": "go test"}),
+	}
+	window = completeLoopUses(t, window)
+	for i := range window {
+		if window[i].Kind != "tool_use" {
+			continue
+		}
+		id := toolUseID(window[i].Payload)
+		input := `{"command":"go test","dir":"/x"}`
+		if i%4 == 1 {
+			input = `{"dir":"/x","command":"go test"}`
+		}
+		window[i].Payload = []byte(fmt.Sprintf(`{"id":%q,"name":"Bash","input":%s}`, id, input))
 	}
 	fs, svc := loopSvc(t, r, window)
 

@@ -4947,7 +4947,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     let hookError: unknown;
     let gates = 0;
     let switches = 0;
-    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { queryFn, turns } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
     const probe = makeCtx({
       agents: [lead, coder], summaryIntentPresent: true,
       signal: switchAbort.signal,
@@ -4972,7 +4972,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       continueExistingPlanGate: async () => {
         const first = stash!.persisted(stash!.md);
         retryDone = opts.callbackTwice ? (await first, stash!.persisted(stash!.md)) : first;
-        // run() failures are swallowed below, so surface an assertion thrown by the retry hook.
+        // run() errors are captured below, so surface an assertion thrown by the retry hook.
         if (opts.duringRetry) await opts.duringRetry(retryDone, ctl).catch(e => { hookError = e; });
         if (opts.awaitRetry !== false) await retryDone;
         return { kind: "approve", selection: { status: "absent" } };
@@ -4982,9 +4982,10 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     executor = new SdkExecutor(nullLogger(), homeDir, {
       queryFn, client: fake.client, summaryRunner: opts.runner ?? fake.runner, intentSettleBoundMs: opts.bound ?? 50,
     });
-    const result = await executor.run(probe.ctx).catch(() => undefined);
+    let error: unknown;
+    const result = await executor.run(probe.ctx).catch(e => { error = e; return undefined; });
     if (hookError) throw hookError;
-    return { fake, probe, result, gates, switches, usage: probe.emits.filter(m => m.kind === "summary_usage") };
+    return { fake, probe, result, error, turns, gates, switches, usage: probe.emits.filter(m => m.kind === "summary_usage") };
   }
 
   it("#2945 a plan accepted on the retry after a credential-switch give-up still gets one summary", async () => {
@@ -5005,17 +5006,17 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
   // Each condition turns true DURING the switch attempt, so the case reaches the give-up (or the
   // release) and proves the retried callback never generates, rather than an early exit.
   interface Flip { on: boolean; terminal: AbortController }
-  const neverGenerated: [string, (flip: Flip) => Partial<RunContext>, "gave_up" | "released"][] = [
-    ["a cancel lands during the switch", f => ({ cancelRequested: () => f.on }), "gave_up"],
-    ["the claim is fenced during the switch", f => ({ claimFenced: () => f.on }), "gave_up"],
-    ["the terminal lifecycle aborts during the switch (claim release)", f => ({ terminalLifecycleSignal: f.terminal.signal }), "gave_up"],
-    ["the live lifecycle stays aborted after the switch", () => ({}), "gave_up"],
-    ["the switch releases the claim", () => ({}), "released"],
+  const neverGenerated: [string, (flip: Flip) => Partial<RunContext>, "gave_up" | "released", boolean][] = [
+    ["a cancel lands during the switch", f => ({ cancelRequested: () => f.on }), "gave_up", true],
+    ["the claim is fenced during the switch", f => ({ claimFenced: () => f.on }), "gave_up", true],
+    ["the terminal lifecycle aborts during the switch (claim release)", f => ({ terminalLifecycleSignal: f.terminal.signal }), "gave_up", true],
+    ["the live lifecycle stays aborted after the switch", () => ({}), "gave_up", false],
+    ["the switch releases the claim", () => ({}), "released", false],
   ];
-  for (const [name, ctxFor, outcome] of neverGenerated) {
+  for (const [name, ctxFor, outcome, expectsCancellation] of neverGenerated) {
     it(`#2945 the retried callback never generates when ${name}`, async () => {
       const flip: Flip = { on: false, terminal: new AbortController() };
-      const { fake, result, usage, gates, switches } = await runSwitchGiveUp({
+      const { fake, result, error, turns, usage, gates, switches } = await runSwitchGiveUp({
         ctx: ctxFor(flip), outcome,
         duringSwitch: ctl => {
           flip.on = true;
@@ -5025,8 +5026,17 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       });
       assert.equal(switches, 1, "the case reached the switch attempt");
       assert.ok(gates >= 1, "the gate ran before the switch");
-      // A cancel legitimately ends the run with REASON_CANCELLED; every other case must return.
-      if (!name.startsWith("a cancel")) assert.ok(result, "the run returned rather than threw");
+      if (expectsCancellation) {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "run cancelled");
+        assert.equal(result, undefined);
+      } else {
+        assert.equal(error, undefined);
+        assert.ok(result, "the run returned rather than threw");
+      }
+      if (expectsCancellation || outcome === "released") {
+        assert.equal(turns.length, 1, "no new turn starts after cancellation or claim release");
+      }
       assert.equal(fake.rec.planCalls.length, 0);
       assert.equal(fake.rec.planPosts.length, 0);
       assert.equal(usage.length, 0);

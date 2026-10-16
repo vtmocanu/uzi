@@ -2859,6 +2859,8 @@ export interface UserInput {
 
 export interface InputsResponse {
   inputs: UserInput[];
+  /** Already cancelled server-side: stop this exact flight without another terminal report. */
+  terminal_cancelled?: { run_id: string; generation: number };
   /** PRD #1247 M5b: the held-state credential-switch signal, surfaced on EVERY inputs response —
    *  including an empty-inputs poll (the idle gate/question/follow-up waiters poll this route
    *  continuously) — so the worker holding the current claim learns a switch was requested. Present

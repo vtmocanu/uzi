@@ -228,6 +228,240 @@ function run(over: Partial<Run>): Run {
   };
 }
 
+describe("RunView Full plan M1", () => {
+  const finalParagraph = "Final verification preserves every acceptance criterion, including recovery after reconnect, the exact deployment sequence, and the operator handoff. This distinctive final paragraph belongs only to the full authoritative plan and must remain available after approval and completion.";
+  const fullPlan = "# Authoritative execution plan\n\n" + "Detailed implementation steps. ".repeat(15) + "\n\n" + finalParagraph;
+  const extra = mockApi as unknown as Record<string, unknown>;
+
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function stream(over: Partial<Run>, messages: RunMessage[] = []) {
+    const controls = { submit: vi.fn(), refreshRun: vi.fn() };
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "running", plan_md: fullPlan, summary_plan: "A short implementation summary.", ...over }),
+      messages, connected: true, error: "", inputs: [], canSteer: true, ...controls,
+    } as unknown as ReturnType<typeof useRunStream>);
+    return controls;
+  }
+  function page() {
+    return <MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>;
+  }
+  function disclosure(title = "Full plan") {
+    const summary = screen.getByText(title, { selector: "summary", exact: true });
+    expect(summary.textContent).toBe(title);
+    return summary.parentElement as HTMLDetailsElement;
+  }
+  async function toggle(details: HTMLDetailsElement, open: boolean) {
+    await act(async () => {
+      details.open = open;
+      fireEvent(details, new Event("toggle"));
+    });
+  }
+
+  it("retains the full plan after approval and completion behind a lazy native disclosure", async () => {
+    stream({ status: "awaiting_approval" });
+    const view = render(page());
+    expect(await screen.findByRole("button", { name: /Approve plan/ })).toBeTruthy();
+    expect(screen.queryByText("Full plan", { selector: "summary" })).toBeNull();
+    expect(screen.getByText(finalParagraph)).toBeTruthy();
+    for (const status of ["running", "completed"] as const) {
+      stream({ status });
+      view.rerender(page());
+      const details = disclosure();
+      expect(details.tagName).toBe("DETAILS");
+      expect(details.open).toBe(false);
+      expect(details.querySelector(".docs-prose")).toBeNull();
+      expect(screen.queryByText(finalParagraph)).toBeNull();
+      await toggle(details, true);
+      expect(within(details).getByRole("heading", { name: "Authoritative execution plan" })).toBeTruthy();
+      expect(within(details).getByText(finalParagraph).textContent).toBe(finalParagraph);
+      expect(details.textContent).toContain("Detailed implementation steps. ".repeat(15).trim());
+      await toggle(details, false);
+      expect(details.querySelector(".docs-prose")).toBeNull();
+      expect(screen.queryByText(finalParagraph)).toBeNull();
+    }
+  });
+});
+
+describe("RunView Full plan M1 edge cases", () => {
+  const extra = mockApi as unknown as Record<string, unknown>;
+  const authoritative = "# Full authoritative body\n\nThe final instruction is present.";
+  let submit: ReturnType<typeof vi.fn>;
+  let refreshRun: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+    extra.getRunMessages = vi.fn().mockResolvedValue({ messages: [] });
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    submit = vi.fn();
+    refreshRun = vi.fn();
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+    delete extra.getRunMessages;
+  });
+  function stream(over: Partial<Run> = {}, messages: RunMessage[] = []) {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "completed", plan_source: "agent", plan_md: authoritative, ...over }),
+      messages, connected: true, error: "", inputs: [], canSteer: true, submit, refreshRun,
+    } as unknown as ReturnType<typeof useRunStream>);
+  }
+  function page() {
+    return <MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>;
+  }
+  function details(title = "Full plan") {
+    return screen.getByText(title, { selector: "summary", exact: true }).parentElement as HTMLDetailsElement;
+  }
+  async function toggle(node: HTMLDetailsElement, open: boolean) {
+    await act(async () => {
+      node.open = open;
+      fireEvent(node, new Event("toggle"));
+    });
+  }
+
+  it.each(["running", "completed", "failed", "cancelled"] as const)("shows the authoritative plan on a %s reload with no messages", async (status) => {
+    stream({ status });
+    render(page());
+    const node = details();
+    expect(node.open).toBe(false);
+    expect(node.querySelector(".docs-prose")).toBeNull();
+    expect(screen.queryByText("Earlier submitted versions")).toBeNull();
+    // Native summary activation opens the element; its toggle event mounts Markdown.
+    fireEvent.click(node.querySelector("summary")!);
+    await waitFor(() => expect(within(node).getByRole("heading", { name: "Full authoritative body" })).toBeTruthy());
+    expect(node.open).toBe(true);
+    expect(node.querySelector(".max-h-96.overflow-auto")).toBeTruthy();
+  });
+
+  it.each([null, "", " \n\t ", 42, false, {}, ["unexpected"]])("hides an invalid authoritative plan (%j) even with loaded plans", (plan_md) => {
+    stream({ plan_md: plan_md as unknown as Run["plan_md"] }, [
+      planMsg(1, "plan", { plan_md: "old body" }),
+      planMsg(2, "plan", { plan_md: "latest body" }),
+    ]);
+    render(page());
+    expect(screen.queryByText("Full plan", { selector: "summary" })).toBeNull();
+    expect(screen.queryByText("Earlier submitted versions", { selector: "summary" })).toBeNull();
+  });
+
+  it("preserves leading Markdown indentation and trailing code whitespace", async () => {
+    stream({ plan_md: "    indented code  \n" });
+    render(page());
+    const node = details();
+    await toggle(node, true);
+    expect(node.querySelector("pre code")?.textContent).toBe("indented code  \n");
+  });
+
+  it("resets both disclosures when the run id changes and on a fresh mount", async () => {
+    const messages = [planMsg(1, "plan", { plan_md: "Earlier body" }), planMsg(2, "plan", { plan_md: authoritative })];
+    stream({}, messages);
+    const view = render(page());
+    await toggle(details(), true);
+    await toggle(details("Earlier submitted versions"), true);
+    expect(screen.getByText("Earlier body")).toBeTruthy();
+    stream({ id: "r2" }, messages);
+    view.rerender(page());
+    expect(details().open).toBe(false);
+    expect(details().querySelector(".docs-prose")).toBeNull();
+    await toggle(details(), true);
+    expect(details("Earlier submitted versions").open).toBe(false);
+    view.unmount();
+    render(page());
+    expect(details().open).toBe(false);
+  });
+
+  it("sorts a copy of partial loaded history, keeps duplicates, and excludes the newest plan before validation", async () => {
+    const messages = [
+      planMsg(80, "plan", { plan_md: "Later loaded body" }),
+      planMsg(20, "plan", { plan_md: "Duplicate loaded body" }),
+      planMsg(100, "plan", null),
+      planMsg(30, "plan", { plan_md: "Duplicate loaded body" }),
+      planMsg(15, "plan", null),
+      planMsg(16, "plan", 12),
+      planMsg(17, "plan", "not an object"),
+      planMsg(18, "plan", []),
+      planMsg(40, "plan", { plan_md: {} }),
+      planMsg(41, "plan", { plan_md: ["bad"] }),
+      planMsg(42, "plan", { plan_md: " \n " }),
+      planMsg(90, "assistant", { plan_md: "Not a submitted plan" }),
+    ];
+    const original = [...messages];
+    stream({}, messages);
+    render(page());
+    await toggle(details(), true);
+    const history = details("Earlier submitted versions");
+    expect(history.open).toBe(false);
+    expect(history.querySelector(".docs-prose")).toBeNull();
+    expect(screen.queryByText("Later loaded body")).toBeNull();
+    await toggle(history, true);
+    expect(Array.from(history.querySelectorAll(".docs-prose")).map((node) => node.textContent)).toEqual([
+      "Duplicate loaded body", "Duplicate loaded body", "Later loaded body",
+    ]);
+    expect(history.textContent).not.toMatch(/Plan v\d|complete history|Not a submitted plan/);
+    expect(messages).toEqual(original);
+    await toggle(history, false);
+    expect(history.querySelector(".docs-prose")).toBeNull();
+  });
+
+  it("does not relabel a lone loaded plan as an earlier version", async () => {
+    stream({}, [planMsg(500, "plan", { plan_md: "Lone loaded submission" })]);
+    render(page());
+    await toggle(details(), true);
+    expect(screen.queryByText("Earlier submitted versions", { selector: "summary" })).toBeNull();
+    expect(screen.queryByText("Lone loaded submission")).toBeNull();
+  });
+
+  it("keeps the seeded surface without a second full-plan section", () => {
+    stream({ plan_source: "seeded" });
+    render(page());
+    expect(screen.getByText("Seeded plan", { selector: "summary", exact: false })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Full authoritative body" })).toBeTruthy();
+    expect(screen.queryByText("Full plan", { selector: "summary" })).toBeNull();
+  });
+
+  it("retains the gate actions, revision, and history without a second full-plan section", async () => {
+    stream({ status: "awaiting_approval", gate_revision: 2 }, [
+      planMsg(1, "plan", { plan_md: "First gate body" }),
+      planMsg(2, "plan_feedback", { feedback: "Please revise" }),
+      planMsg(3, "plan", { plan_md: authoritative }),
+    ]);
+    const view = render(page());
+    expect(await screen.findByRole("button", { name: /Approve plan/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Request changes" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reject" })).toBeTruthy();
+    expect(view.container.textContent).toContain("revision 1 of 3");
+    expect(screen.getByText("Plan v1 · superseded", { selector: "summary" })).toBeTruthy();
+    expect(screen.queryByText("Full plan", { selector: "summary" })).toBeNull();
+    expect(screen.queryByText("Earlier submitted versions", { selector: "summary" })).toBeNull();
+  });
+
+  it("makes no API, stream write, or refresh calls when either disclosure is toggled", async () => {
+    stream({}, [planMsg(1, "plan", { plan_md: "Earlier body" }), planMsg(2, "plan", { plan_md: authoritative })]);
+    render(page());
+    await act(async () => {});
+    const apiCounts = () => Object.entries(mockApi).filter(([, value]) => vi.isMockFunction(value))
+      .map(([name, value]) => [name, vi.mocked(value as ReturnType<typeof vi.fn>).mock.calls.length]);
+    const before = apiCounts();
+    await toggle(details(), true);
+    await toggle(details("Earlier submitted versions"), true);
+    expect(screen.getByText("Earlier body")).toBeTruthy();
+    await toggle(details("Earlier submitted versions"), false);
+    await toggle(details(), false);
+    expect(apiCounts()).toEqual(before);
+    expect(mockApi.getRunMessages).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(refreshRun).not.toHaveBeenCalled();
+  });
+});
+
 describe("RunView issue-input creation history", () => {
   const extra = mockApi as unknown as Record<string, unknown>;
   const disabledCopy = "Scheduled automatic approval was disabled.";
