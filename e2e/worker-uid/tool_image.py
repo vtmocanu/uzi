@@ -117,7 +117,22 @@ def prepare(directory, token, provided):
                   "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--entrypoint",
                   "/usr/local/bin/node", child_id, "-e", PROBE])
     go_root, task_bin = tool_paths(raw, token, parent_id)
-    result = {"parentImageId": parent_id, "imageId": child_id, "goRoot": go_root, "taskBin": task_bin}
+    volumes = {}
+    for tool in ("go", "task"):
+        name = f"wuid-2134-{token}-{tool}"
+        if docker(["volume", "ls", "--filter", "name=" + name, "--format", "{{.Name}}"] ).strip():
+            raise ValueError("proof tool volume name already exists")
+        journal("volume", name)
+        receipt = docker(["volume", "create", "--label", bounded.LABEL + "=" + token, name]).decode().strip()
+        if receipt != name:
+            raise ValueError("tool volume create identity mismatch")
+        left = deadline - time.monotonic()
+        if left <= 5:
+            raise ValueError("tool volume preparation deadline exhausted")
+        bounded.owned("volume", name, token, directory, min(10, left))
+        volumes[tool] = name
+    result = {"parentImageId": parent_id, "imageId": child_id, "goRoot": go_root, "taskBin": task_bin,
+              "goVolume": volumes["go"], "taskVolume": volumes["task"]}
     (directory / "command-image.json").write_text(json.dumps(result) + "\n")
     print(parent_id, child_id, go_root, task_bin)
 

@@ -40,6 +40,14 @@ class ToolImageTest(unittest.TestCase):
         def docker(args, *_):
             calls.append(args)
             if args[:2] == ["image", "ls"]: return b"existing" if mode == "collision" else b""
+            if args[:2] == ["volume", "ls"]: return b"existing" if mode == "volume-collision" else b""
+            if args[:2] == ["volume", "create"]:
+                if mode == "volume-lost-ack": raise ValueError("lost volume ACK")
+                if mode == "task-lost-ack" and args[-1].endswith("-task"): raise ValueError("lost second volume ACK")
+                return b"foreign" if mode == "volume-ack" else args[-1].encode()
+            if args[:2] == ["volume", "inspect"]:
+                return json.dumps([{"Name": "foreign" if mode == "volume-name" else args[-1], "Labels": {
+                    bounded.LABEL: "foreign" if mode == "volume-label" else token}}]).encode()
             if args == ["context", "show"]: return b"default\n"
             if args[0] == "run":
                 if mode == "lost-probe-ack": raise ValueError("lost probe ACK")
@@ -64,7 +72,9 @@ class ToolImageTest(unittest.TestCase):
                     tool_image.prepare(directory, token, parent_id)
                     self.assertEqual(json.loads((directory / "command-image.json").read_text()),
                                      {"parentImageId": parent_id, "imageId": child_id,
-                                      "goRoot": tools["goRoot"], "taskBin": tools["taskBin"]})
+                                      "goRoot": tools["goRoot"], "taskBin": tools["taskBin"],
+                                      "goVolume": "wuid-2134-" + token + "-go",
+                                      "taskVolume": "wuid-2134-" + token + "-task"})
                     command = build.call_args.args[0]
                     self.assertIn("BASE_IMAGE=local-worker:proof", command)
                     self.assertIn("--network", command)
@@ -78,12 +88,22 @@ class ToolImageTest(unittest.TestCase):
                 if mode == "lost-probe-ack":
                     self.assertIn("image wuid-2134-" + token + "-tools " + child_id, journal)
                     self.assertIn("container wuid-2134-" + token + "-provision", journal)
+                if mode in ("volume-ack", "volume-lost-ack", "volume-label", "volume-name"):
+                    self.assertIn("volume wuid-2134-" + token + "-go\n", journal)
+                    self.assertNotIn("volume wuid-2134-" + token + "-task", journal)
+                if mode == "volume-collision":
+                    self.assertNotIn("volume ", journal)
+                    self.assertFalse(any(call[:2] == ["volume", "create"] for call in calls))
+                if mode == "task-lost-ack":
+                    for tool in ("go", "task"):
+                        self.assertIn("volume wuid-2134-" + token + "-" + tool + "\n", journal)
             self.assertFalse(any(call[0] in ("tag", "rm") for call in calls))
 
     def test_preparation_identity_and_failure_journal(self):
         self.prepare()
         for mode in ("untagged", "tag-moved", "collision", "foreign-label", "foreign-layer",
-                     "wrong-platform", "build-timeout", "lost-probe-ack"):
+                     "wrong-platform", "build-timeout", "lost-probe-ack", "volume-collision",
+                     "volume-ack", "volume-lost-ack", "volume-label", "volume-name", "task-lost-ack"):
             with self.subTest(mode=mode): self.prepare(mode)
 
     def test_canonical_bound_tool_paths(self):
@@ -171,11 +191,25 @@ else:
         self.stub("docker", """
 state_path = Path("resources.json")
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
+if args[:2] == ["volume", "ls"]:
+    sys.exit(0)
+if args[:2] == ["volume", "rm"]:
+    sys.exit(int(os.environ["CLEANUP_RC"]))
 if args[0] == "run" or args[:2] == ["volume", "create"]:
     volume = args[0] == "volume"
+    if not volume:
+        for i, arg in enumerate(args):
+            if arg == "--mount":
+                parts = args[i + 1].split(",")
+                fields = dict(p.split("=", 1) for p in parts if "=" in p)
+                readonly = "readonly" in parts or fields.get("readonly") == "true"
+                if fields.get("type") == "volume" and readonly and not (fields.get("src") or fields.get("source")):
+                    print('invalid mount config for type "volume": must not set ReadOnly mode when using anonymous volumes', file=sys.stderr)
+                    sys.exit(125)
     name = args[-1] if volume else args[args.index("--name") + 1]
     token = args[args.index("--label") + 1].split("=", 1)[1]
     state[name] = {"Name": name, "Id": __import__("hashlib").sha256(name.encode()).hexdigest(),
+                   "Kind": "volume" if volume else "container",
                    "Labels": {"io.uzi.worker-uid.invocation": token},
                    "Config": {"Labels": {"io.uzi.worker-uid.invocation": token}}}
     if not volume:
@@ -314,7 +348,7 @@ sys.exit(rc)
             if call[0] == "docker":
                 self.assertEqual(calls[index - 1][0], "timeout", call)
                 self.assertEqual(calls[index - 1][3:], call)
-        if metadata_rc or provision_rc or build_rc or ownership_mismatch:
+        if metadata_rc or provision_rc or build_rc or volume_rc or ownership_mismatch:
             self.assertNotEqual(result.returncode, 0, result.stderr)
             removals = [call for call in calls if call[:2] == ["docker", "rm"] or call[:3] == ["docker", "volume", "rm"]]
             if metadata_rc or build_rc:
@@ -324,6 +358,7 @@ sys.exit(rc)
             else:
                 self.assertTrue(removals)
             return result, calls
+        self.assertNotIn("must not set ReadOnly mode when using anonymous volumes", result.stderr)
         self.assertEqual(len(runs), 3, result.stderr)
         provision, run, command = runs
         name = run[run.index("--name") + 1]
@@ -336,7 +371,7 @@ sys.exit(rc)
         for n in (name, name + "-command", name + "-provision"):
             self.assertEqual(state[n]["Labels"]["io.uzi.worker-uid.invocation"], name.removeprefix("wuid-2134-"))
         self.assertEqual([call for call in calls if call[:3] == ["docker", "volume", "rm"]],
-                         [])
+                         [["docker", "volume", "rm", name + suffix] for suffix in ("-task", "-go")])
         self.assertEqual(command[command.index("--name") + 1], name + "-command")
         self.assertEqual(command[command.index("--user") + 1], "10003:10003")
         self.assertEqual(command[command.index("--cap-drop") + 1], "ALL")
@@ -352,8 +387,8 @@ sys.exit(rc)
         self.assertEqual(command[command.index("--test-name-pattern") + 1], "^command leaf$")
         mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
         self.assertEqual([mount for mount in mounts if mount.startswith("type=volume,")], [
-            "type=volume,dst=/nix/store/" + "g" * 32 + "-go/share/go,readonly",
-            "type=volume,dst=/nix/store/" + "h" * 32 + "-task/bin,readonly",
+            "type=volume,src=" + name + "-go,dst=/nix/store/" + "g" * 32 + "-go/share/go,readonly",
+            "type=volume,src=" + name + "-task,dst=/nix/store/" + "h" * 32 + "-task/bin,readonly",
         ])
         self.assertEqual(command[command.index("--entrypoint") + 2], "sha256:" + "b" * 64)
         for source, target in (("Taskfile.yml", "/app/uzi-worker-uid-proof/Taskfile.yml"),
@@ -364,7 +399,7 @@ sys.exit(rc)
                                ("agent/package.json", "/app/uzi-worker-uid-proof/agent/package.json"),
                                ("agent/codex/supervisor", "/app/uzi-worker-uid-proof/agent/codex/supervisor")):
             self.assertIn(f"type=bind,src={self.repo}/{source},dst={target},readonly", mounts)
-        self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls))
+        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "create"]]), 2)
         self.assertIn('lstatSync("/app/uzi-worker-uid-proof")', provision[-1])
         self.assertIn('e.code!=="ENOENT"', provision[-1])
         self.assertIn('require.resolve("tsx")', provision[-1])
@@ -404,7 +439,7 @@ sys.exit(rc)
         return result, calls
 
     def test_ownership_failure_and_ambiguous_create(self):
-        for options in ({"ownership_mismatch": "-command"}, {"provision_rc": 23}):
+        for options in ({"ownership_mismatch": "-command"}, {"ownership_mismatch": "-go"}, {"provision_rc": 23}):
             with self.subTest(options=options):
                 self.calls.unlink(missing_ok=True)
                 result, calls = self.run_lane(**options)
@@ -420,7 +455,7 @@ sys.exit(rc)
                         self.assertNotIn(name, removed)
                         self.assertIn("ownership mismatch", result.stderr)
                     else:
-                        self.assertIn(name if name.endswith("-deps") else item["Id"], removed)
+                        self.assertIn(name if item.get("Kind") == "volume" else item["Id"], removed)
 
     def test_capture_overflow_in_both_lanes(self):
         from bounded import REPORT_BYTES
@@ -451,11 +486,21 @@ sys.exit(rc)
             self.assertIn("/data", mounts)
             self.assertIn("/nix", mounts)
 
-    def test_no_dependency_volume_copy(self):
+    def test_readonly_tools_use_named_owned_volumes(self):
         result, calls = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls),
-                         "proofs must use image-native dependencies without copy-up")
+        creates = [call for call in calls if call[:3] == ["docker", "volume", "create"]]
+        self.assertEqual(len(creates), 2)
+        for command in creates:
+            self.assertIn("--label", command)
+            self.assertRegex(command[-1], r"^wuid-2134-[0-9a-f]{32}-(go|task)$")
+
+    def test_only_static_tool_directories_use_copyup_volumes(self):
+        result, calls = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        creates = [c for c in calls if c[:3] == ["docker", "volume", "create"]]
+        self.assertEqual(len(creates), 2)
+        self.assertTrue(all(c[-1].endswith(("-go", "-task")) for c in creates))
 
     def test_success_and_build(self):
         result, calls = self.run_lane(skip_build="")
@@ -503,9 +548,11 @@ sys.exit(rc)
         self.assertIn("worker UID command node/container exit: 77", result.stderr)
 
     def test_cleanup_failure_still_attempts_volume(self):
-        result, _ = self.run_lane(cleanup_rc=124)
+        result, calls = self.run_lane(cleanup_rc=124)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Docker rm -f exit: 124", result.stderr)
+        self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 2,
+                         "a failed container removal must not suppress owned volume cleanup attempts")
 
     def test_worker_skip(self):
         result, _ = self.run_lane(xml=PASS.replace("/>", '><skipped/></testcase>'))
@@ -513,7 +560,7 @@ sys.exit(rc)
         self.assertIn("skipped from testcase", result.stderr)
 
     def test_setup_failures(self):
-        for key in ("metadata_rc", "provision_rc", "build_rc"):
+        for key in ("metadata_rc", "provision_rc", "build_rc", "volume_rc"):
             with self.subTest(key=key):
                 self.calls.unlink(missing_ok=True)
                 result, _ = self.run_lane(skip_build="", **{key: 124})

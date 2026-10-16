@@ -4,7 +4,8 @@
 leaves from five test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
-anonymous volumes after checking exact container identity and invocation labels.
+anonymous volumes and its two named tool volumes after checking exact resource
+identity and invocation labels.
 
 To reuse an image, set `WORKER_UID_SKIP_BUILD=1` and `WORKER_UID_IMAGE=<image>`.
 The image must have an existing local tag; the harness never changes its tags.
@@ -52,8 +53,11 @@ image-declared `/data` and `/nix` volumes with tmpfs so Docker does not initiali
 the full Nix store. The preflight builds an invocation-owned image offline to
 record the supplied image's canonical Go and Task paths, verifies its parent
 layers and platform, and validates those paths in a capless probe. Only the
-static Go tree and Task directory are initialized into read-only anonymous
-volumes for the command proof. Its remaining dependencies stay in the image.
+static Go tree and Task directory are initialized into invocation-owned named
+volumes and mounted read-only for the command proof. The preflight journals each
+name before creation, rejects collisions, and verifies the exact create receipt
+and invocation label. Named sources also support daemons that reject read-only
+anonymous mounts. Its remaining dependencies stay in the image.
 Cleanup removes the derived image without pruning its shared parent.
 Scratch, Go cache and Go temporary files
 stay in a command-owned executable tmpfs for the freshly built helpers. The fixture checks Linux, UID 10003, all five empty

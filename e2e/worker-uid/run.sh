@@ -97,8 +97,8 @@ phase command-proof capture "$REPORT_DIR/command-results.xml" 120 \
   --tmpfs /proof/.uzi/scratch:exec,uid=10003,gid=10003,mode=0700 \
   --tmpfs /app/uzi-worker-uid-proof:exec,uid=10003,gid=10003,mode=0755 \
   --env HOME=/proof/.uzi/scratch --env TMPDIR=/proof/.uzi/scratch \
-  --mount "type=volume,dst=$GO_ROOT,readonly" \
-  --mount "type=volume,dst=$TASK_BIN,readonly" \
+  --mount "type=volume,src=$NAME-go,dst=$GO_ROOT,readonly" \
+  --mount "type=volume,src=$NAME-task,dst=$TASK_BIN,readonly" \
   --env "GOROOT=$GO_ROOT" --env "PATH=$GO_ROOT/bin:$TASK_BIN:/usr/local/bin:/usr/bin:/bin" \
   --env GOPATH=/proof/.uzi/scratch/go --env GOCACHE=/proof/.uzi/scratch/go-cache \
   --env GOTOOLCHAIN=local --env GOPROXY=off --env GOSUMDB=off \
