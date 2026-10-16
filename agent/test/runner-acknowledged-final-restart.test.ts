@@ -849,28 +849,46 @@ for (const { caller, afterUnlinkFault, liveClient } of [
 }
 
 it("new report proof transport failure preserves existing physical archive authority within the same budget", { skip: linuxReportSkip }, async t => {
-  // Issue #3079: under CPU contention, the real archive proof can exhaust its
-  // one-second budget during source inspection. Test-only headroom lets the same
-  // proof finish and retire the report while preserving physical source custody.
+  // Issue #3079: the real proof exceeded one second under measured CPU contention.
+  // Lend this positive physical proof the fixture's headroom.
   const f = await reportRetirementFixture(t);
   const recovery = Reflect.get(f.r, "recovery") as RecoveryCoordinator;
   const report = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
+  const proofBudgetMs = 61_001;
+  t.mock.method(reportProofTiming, "proofBudgetMs", () => proofBudgetMs);
   let firstBudget: { signal: AbortSignal; deadline: number } | undefined;
+  let firstDeadline: number | undefined;
+  let firstSignal: AbortSignal | undefined;
+  let firstAckEntryAt: number | undefined;
   t.mock.method(recovery, "retireAcknowledgedFinalReport", async (...[_run, _generation, budget]:
     Parameters<RecoveryCoordinator["retireAcknowledgedFinalReport"]>) => {
+    firstAckEntryAt = Date.now();
     firstBudget = budget;
+    firstDeadline = budget.deadline;
+    firstSignal = budget.signal;
     throw new Error("custody transport unavailable before unlink");
   });
   const oldProof = recovery.retireArchivedReport.bind(recovery);
   const old = t.mock.method(recovery, "retireArchivedReport", async (...args: Parameters<typeof oldProof>) => {
-    assert.equal(args[2], firstBudget, "fallback shares the original signal and deadline");
-    assert.ok(args[2].deadline <= Date.now() + 1000, "fallback gets no extended budget");
     return oldProof(...args);
   });
   const sources = t.mock.method(git, "readInventoryCloneHeads");
+  const beforeProofAt = Date.now();
   assert.deepEqual(await f.r.retireRecoveryReport(f.claim.run_id, f.generation, report.context),
     { retired: true, authority: "existing_archive" });
   assert.equal(old.mock.callCount(), 1);
+  const fallbackBudget = old.mock.calls[0].arguments[2];
+  assert.equal(fallbackBudget, firstBudget, "fallback shares the original budget object");
+  assert.equal(fallbackBudget.deadline, firstDeadline, "fallback preserves the original deadline");
+  assert.equal(fallbackBudget.signal, firstSignal, "fallback preserves the original signal");
+  assert.ok(firstDeadline !== undefined);
+  assert.ok(firstAckEntryAt !== undefined);
+  const callerDeadline = report.context.deadline ?? Infinity;
+  assert.ok(firstDeadline >= Math.min(beforeProofAt + proofBudgetMs, callerDeadline),
+    "first deadline includes the configured budget, capped by the caller");
+  assert.ok(firstDeadline <= Math.min(firstAckEntryAt + proofBudgetMs, callerDeadline),
+    "first deadline does not exceed the configured budget or caller cap");
+  assert.ok(fallbackBudget.deadline <= Date.now() + proofBudgetMs, "fallback gets no extended budget");
   assert.ok(sources.mock.callCount() >= 3, "real existing archive proof inspects and rereads physical sources");
   assert.ok(f.processObservation.calls >= 4, "existing proof observes the actual clone before and after content inspection");
   assert.equal(await f.outbox.readTerminalJournal(f.claim.run_id, f.generation), undefined);
