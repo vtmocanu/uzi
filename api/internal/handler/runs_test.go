@@ -121,6 +121,8 @@ type runsStore struct {
 	createdApproval *store.CreateApprovePlanInputParams
 	// approvalErr programs a refusal of CreateApprovePlanInput (pgx.ErrNoRows = the 0-row CTE).
 	approvalErr error
+	// pendingRevision scripts the approval transaction's pending-feedback query.
+	pendingRevision bool
 }
 
 func (s *runsStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
@@ -2008,10 +2010,12 @@ func (t *runsApprovalTx) ApprovalStore() workersvc.Store { return t.store }
 func (t *runsApprovalTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.NewCommandTag("SET"), nil
 }
-func (t *runsApprovalTx) QueryRow(context.Context, string, ...any) pgx.Row { return runsApprovalRow{} }
-func (t *runsApprovalTx) Commit(context.Context) error                     { return nil }
-func (t *runsApprovalTx) Rollback(context.Context) error                   { return nil }
+func (t *runsApprovalTx) QueryRow(context.Context, string, ...any) pgx.Row {
+	return runsApprovalRow{pending: t.store.pendingRevision}
+}
+func (t *runsApprovalTx) Commit(context.Context) error   { return nil }
+func (t *runsApprovalTx) Rollback(context.Context) error { return nil }
 
-type runsApprovalRow struct{}
+type runsApprovalRow struct{ pending bool }
 
-func (runsApprovalRow) Scan(dest ...any) error { *dest[0].(*bool) = false; return nil }
+func (r runsApprovalRow) Scan(dest ...any) error { *dest[0].(*bool) = r.pending; return nil }

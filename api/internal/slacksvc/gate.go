@@ -69,6 +69,10 @@ const (
 // adapter in main translates it, keeping slacksvc free of a workersvc import.
 var ErrSelectionRejected = errors.New("slack: agent selection rejected by the server")
 
+// ErrPlanRevisionPending means pending feedback prevents approval. The gate stays
+// open; the server adapter translates the service error without a workersvc import.
+var ErrPlanRevisionPending = errors.New("slack: plan revision is pending")
+
 // ErrReviseCapReached is the replier-facing translation of workersvc's
 // ErrReviseCapReached (PRD #41): the run already hit PLAN_MAX_REVISIONS persisted
 // revisions, so a further revise_plan is refused server-side. Surfaced to the user
