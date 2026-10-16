@@ -14,6 +14,7 @@ import { projectToolOutput } from "../../agent/src/codex/projection.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex/registry.js";
 import { COMMAND_UID } from "../../agent/src/runner-uid.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
+import { requireSupervisorObservationPasses } from "./supervisor-observation-proof.mjs";
 import type { WorkerMemoryPressureResult } from "../../agent/src/protocol.js";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -32,7 +33,7 @@ async function ready(predicate: () => boolean) {
   assert.fail("real command enrollment prerequisite: five-second readiness deadline");
 }
 
-test("real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure", { timeout: 110000 }, async () => {
+async function requireCommandProfile() {
   assert.equal(process.platform, "linux", "prerequisite: Linux supervisor");
   assert.equal(process.getuid?.(), COMMAND_UID,
     "prerequisite: run this bounded command-only proof as cap-less command uid 10003");
@@ -43,6 +44,10 @@ test("real adopted detached tree: eligibility, identity refusal, concurrent clea
     assert.equal(BigInt(`0x${value}`), 0n, `prerequisite: ${name} must be empty`);
   }
   assert.match(status, /^NoNewPrivs:\s+1$/m, "prerequisite: no-new-privileges");
+}
+
+test("real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure", { timeout: 110000 }, async () => {
+  await requireCommandProfile();
   const scratch = path.join(root, ".uzi/scratch");
   await mkdir(scratch, { recursive: true });
   const dir = await mkdtemp(path.join(scratch, "memory-real."));
@@ -361,4 +366,16 @@ process.exit(7);
     }
     for (const result of joined) assert.equal(result.status, "fulfilled", "owned broker callback must settle");
   }
+});
+
+test("real supervisor observation fixtures execute under the command UID", { timeout: 65000 }, async () => {
+  await requireCommandProfile();
+  // This required command-UID leaf owns the tagged real Go fixtures.
+  // Reject empty/skipped output even when `go test` exits successfully.
+  const observation = await promisify(execFile)("task", ["test:codex-supervisor:real"], {
+    cwd: root, timeout: 60000, maxBuffer: 256 * 1024, env: process.env,
+  });
+  process.stderr.write(observation.stdout);
+  process.stderr.write(observation.stderr);
+  requireSupervisorObservationPasses(observation.stdout);
 });

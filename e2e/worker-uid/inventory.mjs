@@ -68,9 +68,14 @@ export function inventoryForSource(source, file) {
       if (!expected.some(test => test.names[1] === leaf)) throw new Error(`${file}: missing required literal capture leaf: ${leaf}`);
     }
   } else if (command) {
-    const title = 'real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure';
-    if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
-      throw new Error(`${file}: missing required literal command proof`);
+    const titles = [
+      'real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure',
+      'real supervisor observation fixtures execute under the command UID',
+    ];
+    for (const title of titles) {
+      if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
+        throw new Error(`${file}: missing required literal command proof: ${title}`);
+      }
     }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);

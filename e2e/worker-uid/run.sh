@@ -88,6 +88,8 @@ capture "$REPORT_DIR/command-results.xml" 120 \
   --env HOME=/proof/.uzi/scratch --env TMPDIR=/proof/.uzi/scratch \
   --env GOPATH=/proof/.uzi/scratch/go --env GOCACHE=/proof/.uzi/scratch/go-cache \
   --env GOTOOLCHAIN=local --env GOPROXY=off --env GOSUMDB=off \
+  --mount "type=bind,src=$REPO/Taskfile.yml,dst=/proof/Taskfile.yml,readonly" \
+  --mount "type=bind,src=$REPO/homebrew-tap.yml,dst=/proof/homebrew-tap.yml,readonly" \
   --mount "type=bind,src=$REPO/e2e/worker-uid,dst=/proof/e2e/worker-uid,readonly" \
   --mount "type=bind,src=$REPO/agent/src,dst=/proof/agent/src,readonly" \
   --mount "type=bind,src=$REPO/agent/tsconfig.json,dst=/proof/agent/tsconfig.json,readonly" \

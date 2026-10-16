@@ -2947,6 +2947,8 @@ tasks:
     # `platforms: [linux]`. GOTOOLCHAIN=local pins the host toolchain (the module go.mod
     # floors go 1.26.0); -mod=vendor builds offline from the committed vendor tree;
     # -buildvcs=false skips VCS stamping, which otherwise fails inside a linked worktree.
+    # Real-profile observation fixtures use supervisor_observation_real and are
+    # required by test:agent:worker-uid; this repo target needs no privileged setup.
     dir: agent/codex/supervisor
     env:
       GOTOOLCHAIN: local
@@ -2959,6 +2961,17 @@ tasks:
         if [ -n "$drift" ]; then printf 'gofmt drift:\n%s\n' "$drift"; exit 1; fi
       - go vet ./...
       - go test ./...
+
+  test:codex-supervisor:real:
+    desc: Required real observation fixtures under the worker-UID command profile
+    platforms: [linux]
+    interactive: true
+    dir: agent/codex/supervisor
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - go test -count=1 -timeout=30s -v -tags=supervisor_observation_real -run '^TestRealObservationSupervisedTrees$' .
 
   test:home-uid-split:
     desc: Opt-in run the HOME cleanup suite as the worker uid under the real uid split (#1607)

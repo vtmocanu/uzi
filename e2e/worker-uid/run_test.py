@@ -215,7 +215,9 @@ sys.exit(rc)
         self.assertEqual(command[-1], "/proof/e2e/worker-uid/memory-command-real.test.mts")
         self.assertEqual(command[command.index("--test-name-pattern") + 1], "^command leaf$")
         mounts = [command[index + 1] for index, arg in enumerate(command) if arg == "--mount"]
-        for source, target in (("e2e/worker-uid", "/proof/e2e/worker-uid"),
+        for source, target in (("Taskfile.yml", "/proof/Taskfile.yml"),
+                               ("homebrew-tap.yml", "/proof/homebrew-tap.yml"),
+                               ("e2e/worker-uid", "/proof/e2e/worker-uid"),
                                ("agent/src", "/proof/agent/src"),
                                ("agent/tsconfig.json", "/proof/agent/tsconfig.json"),
                                ("agent/package.json", "/proof/agent/package.json"),

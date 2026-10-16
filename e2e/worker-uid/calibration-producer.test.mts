@@ -1,3 +1,4 @@
+import { requireSupervisorObservationPasses } from "./supervisor-observation-proof.mjs";
 import assert from "node:assert/strict";
 import { type FileHandle, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -260,4 +261,18 @@ test("control ingestion bounds bytes before decoding and rejects malformed input
     await rm(file);
     await assert.rejects(readControl(file), { code: "ENOENT" });
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("real supervisor proof refuses absent, skipped or incomplete Go subtests", () => {
+  const names = ["TestRealObservationSupervisedTrees",
+    "TestRealObservationSupervisedTrees/repeat-and-detached-doublefork",
+    "TestRealObservationSupervisedTrees/two-oversized-siblings-stay-alive"];
+  const lines = names.map(name => `    --- PASS: ${name} (0.01s)`);
+  const valid = lines.join("\n");
+  requireSupervisorObservationPasses(valid);
+  for (const output of ["ok [no tests to run]", lines[0]!, lines.slice(1).join("\n"), lines.slice(0, 2).join("\n"),
+    valid.replace("--- PASS:", "--- SKIP:"), valid.replace("--- PASS:", "--- FAIL:"),
+    valid.replace("repeat-and-detached-doublefork (", "repeat-and-detached-doublefork-extra (")]) {
+    assert.throws(() => requireSupervisorObservationPasses(output));
+  }
 });
