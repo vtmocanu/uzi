@@ -300,14 +300,7 @@ func (g *github) artifactBlob(ctx context.Context, location string, limit int64)
 	}
 	// One connection attempt, one validated address, no proxy or second DNS lookup.
 	// URL hostname remains intact for normal TLS certificate and SNI verification.
-	transport := &http.Transport{
-		DisableCompression:     true,
-		DisableKeepAlives:      true,
-		MaxResponseHeaderBytes: 64 << 10,
-		ResponseHeaderTimeout:  10 * time.Second,
-		TLSHandshakeTimeout:    10 * time.Second,
-		DialContext:            func(ctx context.Context, network, _ string) (net.Conn, error) { return dial(ctx, network, pinned) },
-	}
+	transport := artifactBlobTransport(dial, pinned)
 	defer transport.CloseIdleConnections()
 	var rt http.RoundTripper = transport
 	if g.artifactHooks.blob != nil {
@@ -328,4 +321,16 @@ func (g *github) artifactBlob(ctx context.Context, location string, limit int64)
 		return nil, artifactStatus(resp)
 	}
 	return artifactRead(resp, limit)
+}
+
+// artifactBlobTransport is the transport used for the unauthenticated, pinned blob request.
+func artifactBlobTransport(dial func(context.Context, string, string) (net.Conn, error), pinned string) *http.Transport {
+	return &http.Transport{
+		DisableCompression:     true,
+		DisableKeepAlives:      true,
+		MaxResponseHeaderBytes: 64 << 10,
+		ResponseHeaderTimeout:  10 * time.Second,
+		TLSHandshakeTimeout:    10 * time.Second,
+		DialContext:            func(ctx context.Context, network, _ string) (net.Conn, error) { return dial(ctx, network, pinned) },
+	}
 }

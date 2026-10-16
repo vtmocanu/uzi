@@ -30,6 +30,8 @@ type Collector struct {
 	compressed int64
 	reads      int
 	stopped    bool
+	// compressedProgress observes compressed consumption synchronously in tests.
+	compressedProgress func()
 }
 
 func NewCollector(limits Limits, scrub func(string) string) *Collector {
@@ -133,10 +135,10 @@ func (c *Collector) Add(ctx context.Context, artifactID, artifactName string, zi
 	// Per-reader overrides retain archive/zip\'s size, CRC and descriptor checks,
 	// while exposing actual compressed consumption (not just header claims).
 	zr.RegisterDecompressor(zip.Store, func(r io.Reader) io.ReadCloser {
-		return io.NopCloser(&compressedReader{Reader: r, count: &c.compressed})
+		return io.NopCloser(&compressedReader{Reader: r, ctx: ctx, count: &c.compressed, progress: c.compressedProgress})
 	})
 	zr.RegisterDecompressor(zip.Deflate, func(r io.Reader) io.ReadCloser {
-		return flate.NewReader(&compressedReader{Reader: r, count: &c.compressed})
+		return flate.NewReader(&compressedReader{Reader: r, ctx: ctx, count: &c.compressed, progress: c.compressedProgress})
 	})
 	paths := make(map[string]bool)
 	for i, f := range zr.File {
@@ -304,6 +306,9 @@ func (c *Collector) inflate(ctx context.Context, f *zip.File) ([]byte, string) {
 		n, readErr := r.Read(buf[:int(want)])
 		c.inflated += int64(n)
 		total += int64(n)
+		if ctx.Err() != nil {
+			return nil, "deadline"
+		}
 		if c.inflated > c.limits.MaxInflatedBytes {
 			c.stopped = true
 			return nil, "inflated_budget"
@@ -333,12 +338,20 @@ func (c *Collector) inflate(ctx context.Context, f *zip.File) ([]byte, string) {
 // ReadByte prevents flate from hiding compressed read-ahead in its own buffer.
 type compressedReader struct {
 	io.Reader
-	count *int64
+	ctx      context.Context
+	count    *int64
+	progress func()
 }
 
 func (r *compressedReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
 	n, err := r.Reader.Read(p)
 	*r.count += int64(n)
+	if n > 0 && r.progress != nil {
+		r.progress()
+	}
 	return n, err
 }
 func (r *compressedReader) ReadByte() (byte, error) {

@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -111,11 +112,10 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	if payload.PlanApproved {
 		t.Fatalf("assembled claim PlanApproved = true, want false for an awaiting_approval resume")
 	}
-	// Issue #1626 (N-a): this fixture is a LEGACY run (no completion_contract_version), so its
-	// claim stays byte-identical to before the interlock: nothing is frozen, and the candidate is
-	// NOT replayed.
-	if len(payload.Milestones) != 0 {
-		t.Fatalf("legacy assembled claim Milestones = %+v, want none (the candidate replay is interlock-only)", payload.Milestones)
+	// Gate restoration carries the candidate and its exact plan for legacy runs too.
+	wantMilestones := []Milestone{{ID: "m1", Title: "First"}, {ID: "m2", Title: "Second"}}
+	if !reflect.DeepEqual(payload.Milestones, wantMilestones) || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) || len(run.MilestonesFrozen) != 0 {
+		t.Fatalf("legacy gate restore: milestones=%+v plan=%v frozen=%s", payload.Milestones, payload.PlanMd, run.MilestonesFrozen)
 	}
 
 	// Issue #1626 (B1): an INTERLOCKED run's gate resume carries the unapproved CANDIDATE
@@ -130,8 +130,27 @@ func TestAssembleClaimResumePhaseAwaitingApprovalLiveDB(t *testing.T) {
 	if payload.ResumePhase != "awaiting_approval" {
 		t.Fatalf("interlocked assembled claim ResumePhase = %q, want awaiting_approval", payload.ResumePhase)
 	}
-	if len(payload.Milestones) != 2 || payload.Milestones[0].ID != "m1" || payload.Milestones[1].ID != "m2" {
-		t.Fatalf("interlocked assembled claim Milestones = %+v, want the m1,m2 candidate on an awaiting_approval resume", payload.Milestones)
+	if !reflect.DeepEqual(payload.Milestones, wantMilestones) || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) {
+		t.Fatalf("interlocked gate restore: milestones=%+v plan=%v", payload.Milestones, payload.PlanMd)
+	}
+	// A populated execution contract must never fill in a missing or invalid gate list.
+	env.exec(`UPDATE runs SET milestones_frozen=$2::jsonb WHERE id=$1`, runID, string(run.MilestonesCandidate))
+	for _, candidate := range []any{"[]", nil, `[null]`, `["bad"]`} {
+		env.exec(`UPDATE runs SET milestones_candidate=$2::jsonb WHERE id=$1`, runID, candidate)
+		payload, err = svc.assembleClaim(env.ctx, wkr, mustRun(t, env, runID))
+		if err != nil || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) ||
+			(candidate == "[]" && (payload.Milestones == nil || len(payload.Milestones) != 0)) ||
+			(candidate != "[]" && payload.Milestones != nil) ||
+			payload.ExecutionMilestones == nil || !reflect.DeepEqual(*payload.ExecutionMilestones, wantMilestones) {
+			t.Fatalf("candidate %v restore: milestones=%+v plan=%v err=%v", candidate, payload.Milestones, payload.PlanMd, err)
+		}
+	}
+	// Executing an approved claim uses the frozen definitions, even with a moved candidate.
+	env.exec(`UPDATE runs SET auto_approve=true, milestones_frozen=$2::jsonb,
+		milestones_candidate='[{"id":"m3","title":"Moved"}]' WHERE id=$1`, runID, string(run.MilestonesCandidate))
+	payload, err = svc.assembleClaim(env.ctx, wkr, mustRun(t, env, runID))
+	if err != nil || !payload.PlanApproved || !reflect.DeepEqual(payload.Milestones, wantMilestones) || (payload.PlanMd == nil || *payload.PlanMd != run.PlanMd.String) {
+		t.Fatalf("approved restore: milestones=%+v approved=%v plan=%v err=%v", payload.Milestones, payload.PlanApproved, payload.PlanMd, err)
 	}
 }
 

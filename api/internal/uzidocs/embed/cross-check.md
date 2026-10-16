@@ -68,6 +68,13 @@ its own Claude lead on Codex even with a run cap of 1. A Claude checker (for a C
 queued. Code cross-check has its own, stricter placement
 (see [Code cross-check](#code-cross-check)).
 
+Plan and Code checker children (`kind = 'cross_check'`) in both harness families
+are hold-free and exempt from the owner's recovery custody admission limit.
+This is separate from the bounded continuation exemption for code-publishing
+runs; judges and jobs gain no exemption. Owner identity, current parent,
+generation and round, deadline, protocol, vault, credential, checker-slot and
+worker eligibility requirements still apply.
+
 The lead's worker is preferred. Another eligible worker of the same user may
 claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
 worker may still claim its own pinned child; maintenance fences and worker

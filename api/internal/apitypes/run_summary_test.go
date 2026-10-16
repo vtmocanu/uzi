@@ -11,6 +11,9 @@ import (
 // summaryOmitted is the exact set of RunListItemDTO keys the ?view=summary projection drops
 // (issue #2661). Adding a key here is a deliberate wire decision, never a side effect.
 var summaryOmitted = map[string]bool{
+	"reset_state_digest":                                  true,
+	"milestone_reconciliations":                           true,
+	"milestone_reconciliations_next_before_gate_revision": true,
 	"plan_md":           true,
 	"repo_agents":       true,
 	"issue_description": true,
@@ -40,13 +43,16 @@ func TestRunSummaryItemDTOKeys(t *testing.T) {
 }
 
 // TestRunSummaryItemRoundTrip proves ListItem is the inverse of RunSummaryOf for every field
-// the summary carries: only the four omitted fields (and the embedded worker name, which the
+// the summary carries: only the omitted detail and owner audit fields (and the embedded worker name, which the
 // list path never populates) differ from the source.
 func TestRunSummaryItemRoundTrip(t *testing.T) {
 	var full RunListItemDTO
 	apitypestest.Populate(&full)
 
 	want := full
+	want.ResetStateDigest = ""
+	want.MilestoneReconciliations = nil
+	want.MilestoneReconciliationsNextBeforeGateRevision = nil
 	want.PlanMd = nil
 	want.RepoAgents = nil
 	want.IssueDescription = ""

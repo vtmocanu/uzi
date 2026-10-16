@@ -449,7 +449,7 @@ it("issue1924 an acknowledged older generation's source journal does not block a
 
 function ownershipLost() {
   return new RequestError("GET", "/api/worker/runs/" + "run-1/ownership", 404,
-    JSON.stringify({ error: "run not found " + "for this worker" }));
+    JSON.stringify({ error: "run not found " + "for this worker" }), undefined, { complete: true, bytes: 41 });
 }
 
 it("issue1924 crossworker ownership404 archives all original roots under open hold", async () => {

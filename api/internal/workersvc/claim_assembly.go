@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -473,6 +474,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		milestones = nil
 	}
 
+	var executionMilestones *[]Milestone
+	if len(run.MilestonesFrozen) > 0 && !bytes.Equal(bytes.TrimSpace(run.MilestonesFrozen), []byte("null")) && err == nil {
+		frozen := append([]Milestone{}, milestones...)
+		executionMilestones = &frozen
+	}
+
 	// PRD #381: replay the structured issue-comments snapshot captured at run
 	// creation. A malformed column degrades to nil-and-log rather than failing the
 	// claim, matching the milestone decode above — the column is data a prior write
@@ -585,6 +592,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// PRD #1247 M5, D13: the server-derived phase a resumed claim RESTORES instead of
 	// re-entering the planning turn. Empty for a fresh run (omitted by omitempty).
 	resumePhase := resumePhaseFor(run, planApproved)
+	sessionID, err := s.reconciledClaimSession(ctx, run)
+	if err != nil {
+		return nil, err
+	}
 	// The submitted plan's seq rides ONLY the awaiting_approval resume (D13: "awaiting_approval
 	// with the submitted plan's seq"), so the query stays off the hot path for every other
 	// claim. A query error degrades to seq 0 and NEVER fails the claim — the same degrade-and-log
@@ -592,18 +603,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// worker just cannot correlate a buffered approve_plan to a specific plan revision.
 	var resumePlanSeq int64
 	if resumePhase == "awaiting_approval" {
-		// Issue #1626 (B1): a gate resume re-presents the SUBMITTED plan, whose milestones are
-		// still only the CANDIDATE (milestones_frozen is NULL until approval). Deliver that
-		// candidate so the worker re-sends the same breakdown with the re-presented plan instead
-		// of a milestone-less report. Never overrides a frozen list; a malformed candidate
-		// degrades to none, like the frozen decode above (the server's planMilestonesParam
-		// guard keeps the stored candidate either way). Gated on an INTERLOCKED run
-		// (completion_contract_version stamped): a legacy run's claim stays byte-identical to
-		// before the interlock existed.
-		if len(milestones) == 0 && run.CompletionContractVersion.Valid {
+		// A gate resume re-presents the submitted candidate with its plan, for both legacy and
+		// interlocked runs. This candidate can differ from an earlier frozen contract awaiting
+		// explicit owner reconciliation. A valid candidate, including [], replaces the execution
+		// list for gate presentation only; approved executing claims use the frozen list above.
+		// Missing or invalid candidate data must not present frozen definitions as the gate.
+		milestones = nil
+		if len(run.MilestonesCandidate) > 0 {
 			if cand, cerr := DecodeMilestones(run.MilestonesCandidate); cerr != nil {
 				slog.Error("workersvc: decode run milestone candidate", "run_id", run.ID, "error", cerr)
-			} else {
+			} else if _, valid := validateMilestones(cand); valid {
 				milestones = cand
 			}
 		}
@@ -676,7 +685,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Status:         run.Status,
 		Pipeline:       pipeline,
 		Branch:         textPtr(branch),
-		SessionID:      textPtr(run.SessionID),
+		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
 		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
@@ -780,7 +789,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		AgentSelection: persistedSelection(run),
 		// PRD #122 M1: the frozen milestone list, decoded above. omitempty keeps a
 		// milestone-less run's claim byte-identical to today's.
-		Milestones: milestones,
+		Milestones:          milestones,
+		ExecutionMilestones: executionMilestones,
 		// PRD #362 Decision 8: the model the inline run-summary generator runs on,
 		// resolved user-value-wins above. nil (omitted) when settings are unwired, so
 		// an old worker's wire shape is unchanged.

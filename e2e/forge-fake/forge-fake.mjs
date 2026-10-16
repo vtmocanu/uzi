@@ -1314,6 +1314,12 @@ const server = https.createServer(
         const mr = state.mrs.find((m) => m.source_branch === head && m.target_branch === base && m.state === "opened");
         return mr ? send(res, 200, toForgejoPR(mr)) : send(res, 404, { message: "pull request does not exist" });
       }
+      // GetMergeRequestSummary reads reviews even when this fixture has none.
+      const fjPrReviews = rest.match(/^\/pulls\/(\d+)\/reviews$/);
+      if (method === "GET" && fjPrReviews) {
+        const mr = state.mrs.find((m) => m.project_id === project.id && m.iid === Number(fjPrReviews[1]));
+        return mr ? sendPage(req, res, url, [], "limit", 50) : send(res, 404, { message: "pull request does not exist" });
+      }
       const fjPrGet = rest.match(/^\/pulls\/(\d+)$/);
       if (method === "GET" && fjPrGet) {
         // GetMergeRequest / LatestMRPipeline head resolution.
@@ -1627,6 +1633,12 @@ const server = https.createServer(
             (m) => m.state === "opened" && (headBranch ? m.source_branch === headBranch : true) && (baseParam ? m.target_branch === baseParam : true),
           );
           return send(res, 200, list.map(toGitHubPR));
+        }
+        // GetMergeRequestSummary always asks for this PR's review stream.
+        const ghPrReviews = rest.match(/^\/pulls\/(\d+)\/reviews$/);
+        if (method === "GET" && ghPrReviews) {
+          const mr = state.mrs.find((m) => m.project_id === project.id && m.iid === Number(ghPrReviews[1]));
+          return mr ? sendPage(req, res, url, [], "per_page", 100) : send(res, 404, { message: "Not Found" });
         }
         const ghPrGet = rest.match(/^\/pulls\/(\d+)$/);
         if (method === "GET" && ghPrGet) {

@@ -1159,13 +1159,13 @@ describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandle
 
   /** A minimal WorkerClient with just the reads/writes the wired handlers call, recording
    *  what each saw so a test can prove the callback reached the real handler. */
-  function toolClient(): { client: WorkerClient; forgeIssue: number[]; memory: string[]; finding: string[] } {
+  function toolClient(): { client: WorkerClient; forgeIssue: number[]; memory: Array<{ title: string; claim_generation?: number }>; finding: string[] } {
     const forgeIssue: number[] = [];
-    const memory: string[] = [];
+    const memory: Array<{ title: string; claim_generation?: number }> = [];
     const finding: string[] = [];
     const client = {
       async getForgeIssue(_runId: string, iid: number) { forgeIssue.push(iid); return { iid, title: "FORGE_ISSUE_CANARY" }; },
-      async saveMemory(_runId: string, body: { title: string }) { memory.push(body.title); return { id: "mem-canary", title: body.title }; },
+      async saveMemory(_runId: string, body: { title: string; claim_generation?: number }) { memory.push({ title: body.title, claim_generation: body.claim_generation }); return { id: "mem-canary", title: body.title }; },
       async reportFinding(_runId: string, _body: unknown) { finding.push("find-canary"); return "find-canary"; },
     } as unknown as WorkerClient;
     return { client, forgeIssue, memory, finding };
@@ -1178,7 +1178,7 @@ describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandle
   } {
     const emitted: EmittedMessage[] = [];
     const calls = toolClient();
-    const map = buildCodexToolHandlers({ client: calls.client, runId: "run-tools", log: NOOP_LOG, emit: (m) => emitted.push(m), skills });
+    const map = buildCodexToolHandlers({ client: calls.client, runId: "run-tools", claimGeneration: 7, log: NOOP_LOG, emit: (m) => emitted.push(m), skills });
     return { map, emitted, calls };
   }
 
@@ -1196,7 +1196,7 @@ describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandle
     const h = makeBroker({ grants: grants({ allowedTools: new Set([MEMORY_TOOL]), isRoot: true }), toolHandlers: map });
     const r = await h.broker.handleToolCall(rt(), MEMORY_TOOL, { title: "a durable fact", body: "the mechanism" }, "root");
     assert.equal(r.ok, true);
-    assert.deepEqual(calls.memory, ["a durable fact"]);
+    assert.deepEqual(calls.memory, [{ title: "a durable fact", claim_generation: 7 }]);
   });
 
   it("routes a ROOT findings callback to the real handler and emits the finding card", async () => {

@@ -71,10 +71,10 @@ Override the target with `BASE=http://127.0.0.1:8080 ./scripts/smoke.sh`.
 Editing a migration or a query file (`api/internal/store/migrations/`, `api/internal/store/queries/`) requires regenerating the `sqlc` code before it compiles:
 
 ```sh
-cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
+cd api && ../scripts/sqlc.sh v1.31.1 generate
 ```
 
-Pinned via `go run`, so no local `sqlc` install is needed (the same command is commented atop `api/sqlc.yaml`). Never hand-edit the generated files under `api/internal/store/`.
+The wrapper downloads and caches the pinned, sha256-verified sqlc release for Linux amd64 or macOS arm64, so no local `sqlc` install or source build is needed (the same command is commented atop `api/sqlc.yaml`). A cold cache needs network access; cached archives are verified before use. Never hand-edit the generated files under `api/internal/store/`.
 
 ## Persistence
 

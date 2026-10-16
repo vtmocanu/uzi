@@ -2,7 +2,10 @@ package workersvc
 
 import (
 	"context"
+	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/google/uuid"
 
@@ -10,20 +13,17 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #1399: SetState's `failed` and `completed` arms decide the scope-audit settle from
-// `owned`, which for any report that skips the FOR UPDATE fence (a LEGACY nil ClaimGeneration
-// report, a chat run, an interlocked completion; see stateUsesGenerationFence) is the UNLOCKED
-// pre-switch read. A
-// scope directive (CreateScopeCeilingInput) that commits after that read but before the
-// terminal write must still see its pending run_user_inputs row settled 'declined', decided off
-// the post-transition re-read. These inject the directive from inside the terminal store call,
-// so it commits while the run is still running and after `owned` was read.
+// Issue #1399: a scope directive committed after SetState's initial ownership
+// snapshot must settle on the terminal transition. Legacy reports now lock and
+// refresh that snapshot, so directive injection runs before the run lock. A
+// separate after-commit hook proves the post-transition reread observes a
+// concurrent scope-capped completion before either report settles its disposition.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via
 // ./e2e/run-store-it.sh). A package that prints `ok` with PASS=0 is INVALID, not green.
 
 // ssDirectiveBeforeTerminal wraps the live Store and commits a scope directive on the pool
-// immediately before delegating the terminal write (SetRunFailed / SetRunCompleted).
+// before the transaction acquires the run lock, after SetState's initial ownership read.
 type ssDirectiveBeforeTerminal struct {
 	Store
 	e     interlockLiveDB
@@ -39,14 +39,43 @@ func (w *ssDirectiveBeforeTerminal) inject() {
 	}
 }
 
-func (w *ssDirectiveBeforeTerminal) SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error) {
-	w.inject()
-	return w.Store.SetRunFailed(ctx, arg)
+// ssMutationBeginner interposes only at transaction boundaries: another connection
+// can commit before the run lock, or after commit, without waiting on our own lock.
+type ssMutationBeginner struct {
+	TxBeginner
+	beforeRunLock func()
+	afterCommit   func()
 }
 
-func (w *ssDirectiveBeforeTerminal) SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error) {
-	w.inject()
-	return w.Store.SetRunCompleted(ctx, arg)
+type ssMutationTx struct {
+	pgx.Tx
+	beforeRunLock func()
+	afterCommit   func()
+}
+
+func (b ssMutationBeginner) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := b.TxBeginner.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ssMutationTx{Tx: tx, beforeRunLock: b.beforeRunLock, afterCommit: b.afterCommit}, nil
+}
+
+func (tx *ssMutationTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.HasPrefix(sql, "-- name: GetRunOwnedByWorkerForUpdate") && tx.beforeRunLock != nil {
+		tx.beforeRunLock()
+	}
+	return tx.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (tx *ssMutationTx) Commit(ctx context.Context) error {
+	if err := tx.Tx.Commit(ctx); err != nil {
+		return err
+	}
+	if tx.afterCommit != nil {
+		tx.afterCommit()
+	}
+	return nil
 }
 
 // ssService builds a Service over the wrapped live store, with the pool as the tx beginner and
@@ -64,17 +93,18 @@ func (e interlockLiveDB) ssService(t *testing.T, q Store) *Service {
 // 'declined' on the terminal fail.
 func TestLegacyFailedScopeDirectiveAfterSnapshotSettlesDeclinedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	w := e.seedWorker(t, nil) // no capabilities: legacy, unfenced report
+	w := e.seedWorker(t, nil) // no capabilities: legacy nil-generation report
 	runID := e.seedLegacyRunningRun(t, w)
 	hook := &ssDirectiveBeforeTerminal{Store: e.q, e: e, t: t, runID: runID}
-	svc := e.ssService(t, hook)
+	svc := e.ssService(t, e.q)
+	svc.SetTxBeginner(ssMutationBeginner{TxBeginner: e.pool, beforeRunLock: hook.inject})
 
 	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, StateRequest{State: "failed"})
 	if err != nil || !applied {
 		t.Fatalf("SetState(failed): applied=%v err=%v", applied, err)
 	}
 	if !hook.fired {
-		t.Fatal("SetRunFailed hook never fired: the scope directive was not injected before the terminal write")
+		t.Fatal("pre-lock directive hook never fired: the scope directive was not injected before the terminal write")
 	}
 	if run.Status != "failed" {
 		t.Fatalf("run status = %q, want failed", run.Status)
@@ -89,17 +119,18 @@ func TestLegacyFailedScopeDirectiveAfterSnapshotSettlesDeclinedLiveDB(t *testing
 // settles the row 'declined' on the committed completion.
 func TestLegacyCompletedScopeDirectiveAfterSnapshotSettlesDeclinedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	w := e.seedWorker(t, nil)             // no capabilities: legacy, unfenced report
+	w := e.seedWorker(t, nil)             // no capabilities: legacy nil-generation report
 	runID := e.seedLegacyRunningRun(t, w) // completion_contract_version NULL: direct SetRunCompleted
 	hook := &ssDirectiveBeforeTerminal{Store: e.q, e: e, t: t, runID: runID}
-	svc := e.ssService(t, hook)
+	svc := e.ssService(t, e.q)
+	svc.SetTxBeginner(ssMutationBeginner{TxBeginner: e.pool, beforeRunLock: hook.inject})
 
 	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, StateRequest{State: "completed"})
 	if err != nil || !applied {
 		t.Fatalf("SetState(completed): applied=%v err=%v", applied, err)
 	}
 	if !hook.fired {
-		t.Fatal("SetRunCompleted hook never fired: the scope directive was not injected before the terminal write")
+		t.Fatal("pre-lock directive hook never fired: the scope directive was not injected before the terminal write")
 	}
 	if run.Status != "completed" {
 		t.Fatalf("run status = %q, want completed", run.Status)
@@ -115,7 +146,7 @@ func TestLegacyCompletedScopeDirectiveAfterSnapshotSettlesDeclinedLiveDB(t *test
 // pending scope row. The post-transition fallback must not replace it with 'declined'.
 func TestLegacyCompletedScopeCappedKeepsAppliedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	w := e.seedWorker(t, nil)             // no capabilities: legacy, unfenced report
+	w := e.seedWorker(t, nil)             // no capabilities: legacy nil-generation report
 	runID := e.seedLegacyRunningRun(t, w) // completion_contract_version NULL: direct SetRunCompleted
 	e.fpSeedScopeDirected(t, runID)       // directive visible to the arm's `owned` read
 	svc := e.ssService(t, e.q)
@@ -136,9 +167,8 @@ func TestLegacyCompletedScopeCappedKeepsAppliedLiveDB(t *testing.T) {
 	}
 }
 
-// ssCompleteAfterRunning wraps the live Store so a concurrent completer's terminal write
-// (completed, stop_kind scope_capped) commits right after this `running` report's own
-// SetRunRunning applies, and before the completer settles its 'applied'.
+// ssCompleteAfterRunning commits a concurrent scope-capped completion after the
+// running report commits, but before its reread and either report's disposition settle.
 type ssCompleteAfterRunning struct {
 	Store
 	e        interlockLiveDB
@@ -148,9 +178,8 @@ type ssCompleteAfterRunning struct {
 	fired    bool
 }
 
-func (w *ssCompleteAfterRunning) SetRunRunning(ctx context.Context, arg store.SetRunRunningParams) (int64, error) {
-	rows, err := w.Store.SetRunRunning(ctx, arg)
-	if err == nil && !w.fired {
+func (w *ssCompleteAfterRunning) inject(ctx context.Context) {
+	if !w.fired {
 		w.fired = true
 		if n, cerr := w.e.q.SetRunCompleted(ctx, store.SetRunCompletedParams{
 			StopKind: pgconv.TextOrNull("scope_capped"),
@@ -159,7 +188,6 @@ func (w *ssCompleteAfterRunning) SetRunRunning(ctx context.Context, arg store.Se
 			w.t.Fatalf("concurrent SetRunCompleted: rows=%d err=%v", n, cerr)
 		}
 	}
-	return rows, err
 }
 
 // TestRunningReportRereadsScopeCappedCompletionSettlesAppliedLiveDB: a non-terminal `running`
@@ -168,18 +196,19 @@ func (w *ssCompleteAfterRunning) SetRunRunning(ctx context.Context, arg store.Se
 // would then beat the completer's 'applied'. The fallback keys on the re-read stop_kind.
 func TestRunningReportRereadsScopeCappedCompletionSettlesAppliedLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	w := e.seedWorker(t, nil) // no capabilities: legacy, unfenced report
+	w := e.seedWorker(t, nil) // no capabilities: legacy nil-generation report
 	runID := e.seedLegacyRunningRun(t, w)
 	e.fpSeedScopeDirected(t, runID)
 	hook := &ssCompleteAfterRunning{Store: e.q, e: e, t: t, runID: runID, workerID: w}
-	svc := e.ssService(t, hook)
+	svc := e.ssService(t, e.q)
+	svc.SetTxBeginner(ssMutationBeginner{TxBeginner: e.pool, afterCommit: func() { hook.inject(e.ctx) }})
 
 	run, applied, err := svc.SetState(e.ctx, store.Worker{ID: w}, runID, StateRequest{State: "running"})
 	if err != nil || !applied {
 		t.Fatalf("SetState(running): applied=%v err=%v", applied, err)
 	}
 	if !hook.fired {
-		t.Fatal("SetRunRunning hook never fired: the concurrent completion was not injected")
+		t.Fatal("post-commit completion hook never fired: the concurrent completion was not injected")
 	}
 	if run.Status != "completed" || !run.StopKind.Valid || run.StopKind.String != "scope_capped" {
 		t.Fatalf("re-read = status %q stop_kind %+v, want completed/scope_capped", run.Status, run.StopKind)

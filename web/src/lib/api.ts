@@ -29,6 +29,7 @@ import type {
   AdminUsage,
   AdminWorker,
   AgentSelectionInput,
+  MilestoneResetOptions,
   AgentSourceApplyResult,
   AgentSourceView,
   AgentTemplate,
@@ -1193,7 +1194,8 @@ const realApi = {
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
   listRuns,
-  getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
+  getRun: (id: string, reconciliationBeforeGateRevision?: number) =>
+    request<{ run: Run }>("GET", `/runs/${id}${reconciliationBeforeGateRevision === undefined ? "" : `?reconciliation_before_gate_revision=${reconciliationBeforeGateRevision}`}`),
   /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
   getUsage: () => request<SelfUsage>("GET", "/usage"),
   /** Factory-wide usage + per-user breakdown (PRD #40). Admin-only — a non-admin 403s. */
@@ -1297,6 +1299,7 @@ const realApi = {
     // a typed 409 (see gateRevisionMismatchCurrent) and nothing is written. Sent only when
     // defined, so a run with no revision (a legacy or pre-gate run) keeps today's body.
     expectedGateRevision?: number,
+    reset?: MilestoneResetOptions,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -1311,6 +1314,7 @@ const realApi = {
         ...(overrideCapabilities ? { override_capabilities: true } : {}),
         ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
         ...(expectedGateRevision !== undefined ? { expected_gate_revision: expectedGateRevision } : {}),
+        ...reset,
       },
     ),
 

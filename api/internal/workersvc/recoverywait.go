@@ -108,6 +108,27 @@ type recoveryWaitWriter interface {
 }
 
 func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+	if s.txBeginner != nil {
+		locked, current, tx, err := s.beginClaimMutation(ctx, wkr, run.ID, req.ClaimGeneration)
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		rows, err := locked.setRecoveryWaitLocked(ctx, locked.q, cause, current, wkr, req, sessionID)
+		if err != nil {
+			return 0, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return rows, nil
+	}
+	return s.setRecoveryWaitLocked(ctx, writer, cause, run, wkr, req, sessionID)
+}
+
+// setRecoveryWaitLocked stays on an existing fenced run transaction. Its caller
+// must already have checked claim generation and release under the run lock.
+func (s *Service) setRecoveryWaitLocked(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	return writer.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
 		ResetProviderStreak: req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0 &&

@@ -379,6 +379,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		}
 		rows = append(rows, []string{"MR_REWORK_CYCLES", cycles})
 	}
+	rows = append(rows, reconciliationReviewRows(r)...)
 	if err := p.Table(nil, rows); err != nil {
 		return err
 	}

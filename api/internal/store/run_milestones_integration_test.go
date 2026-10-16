@@ -2,11 +2,13 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -143,8 +145,20 @@ func TestRunMilestonesLifecycleLiveDB(t *testing.T) {
 			t.Fatalf("snapshot frozen post-approve = %s, want a copy of the candidate", snap.MilestonesFrozen)
 		}
 
-		// A DOUBLE-approve does not change an already-frozen list (idempotent freeze),
-		// even after the candidate moves again.
+		// An unchanged double-approve still succeeds and preserves the first freeze.
+		if _, err := q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+			RunID: gateRun, Body: pgtype.Text{String: "{}", Valid: true},
+			AgentSource: pgtype.Text{String: "own", Valid: true}, AgentExclusions: []byte("[]"),
+		}); err != nil {
+			t.Fatalf("CreateApprovePlanInput (unchanged double approve): %v", err)
+		}
+		var approvalsBefore int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'approve_plan'`, gateRun).Scan(&approvalsBefore); err != nil {
+			t.Fatal(err)
+		}
+
+		// Issue #2944: a changed candidate requires explicit owner reconciliation.
+		// Plain approval must neither enqueue approval nor replace the first freeze.
 		if _, err := q.SetRunAwaitingApproval(ctx, store.SetRunAwaitingApprovalParams{
 			MilestonesCandidate: candidateJSON, ID: gateRun, WorkerID: workerID,
 		}); err != nil {
@@ -153,11 +167,18 @@ func TestRunMilestonesLifecycleLiveDB(t *testing.T) {
 		if _, err := q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
 			RunID: gateRun, Body: pgtype.Text{String: "{}", Valid: true},
 			AgentSource: pgtype.Text{String: "own", Valid: true}, AgentExclusions: []byte("[]"),
-		}); err != nil {
-			t.Fatalf("CreateApprovePlanInput (double approve): %v", err)
+		}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("CreateApprovePlanInput (changed candidate): got %v, want no rows", err)
+		}
+		var approvalsAfter int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id = $1 AND kind = 'approve_plan'`, gateRun).Scan(&approvalsAfter); err != nil {
+			t.Fatal(err)
+		}
+		if approvalsAfter != approvalsBefore {
+			t.Fatalf("changed candidate enqueued approval: before=%d after=%d", approvalsBefore, approvalsAfter)
 		}
 		if got := milestones(gateRun, "milestones_frozen"); string(got) != string(frozen) {
-			t.Fatalf("frozen changed on double-approve: got %s, want unchanged %s", got, frozen)
+			t.Fatalf("frozen changed on refused approval: got %s, want unchanged %s", got, frozen)
 		}
 	})
 

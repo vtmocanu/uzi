@@ -893,7 +893,8 @@ type ListRefsOptions struct {
 // under refs/uzi-checkpoints/, refs/uzi-recovery/, refs/uzi-salvage/ or refs/uzi-held/, else
 // ErrInvalidRef before any network I/O. A read, never a write: a caller uses it to tell
 // the reasons CreateRef reported ErrSourceMissing apart, to pick a salvage source, or to
-// confirm a salvage delete (PRD #1867).
+// confirm a salvage delete (PRD #1867). Discovery is bounded by
+// MaxRefAdvertisementBytes; overflow returns ErrRefAdvertisementTooLarge and no tips.
 func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxDeleteDuration)
 	defer cancel()
@@ -904,24 +905,7 @@ func ListRefTips(ctx context.Context, o ListRefsOptions, refs ...string) (map[st
 		}
 		want[plumbing.ReferenceName(r)] = true
 	}
-	remote, err := newOriginRemote(o.CloneURL)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]string, len(refs))
-	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: authFor(Options{Username: o.Username, PAT: o.PAT})})
-	if err != nil {
-		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
-			return out, nil
-		}
-		return nil, fmt.Errorf("pushbroker: list: %w", err)
-	}
-	for _, r := range advertised {
-		if want[r.Name()] {
-			out[r.Name().String()] = r.Hash().String()
-		}
-	}
-	return out, nil
+	return boundedRefTips(ctx, o.CloneURL, authFor(Options{Username: o.Username, PAT: o.PAT}), want)
 }
 
 // createRefRequest builds the single-command create: Old is ALWAYS the zero hash (the

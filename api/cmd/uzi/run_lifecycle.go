@@ -209,6 +209,24 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			reset, err := resetApprovalOptions(cmd, sel)
+			if err != nil {
+				return err
+			}
+			if reset != nil {
+				res, err := c.SubmitRunInputWithOptions(cmd.Context(), args[0], *reset)
+				if err != nil {
+					return err
+				}
+				p := env.printer(gf)
+				if p.Format == uzicli.FormatJSON {
+					return p.JSON(res)
+				}
+				if !gf.quiet {
+					p.Printf("%s: %s\n", sanitizeTTY(args[0]), inputOutcome(kindApprovePlan, res.ServerSide))
+				}
+				return nil
+			}
 			// PRD #1795 D5: the revision is fixed at invocation, BEFORE the credential switch,
 			// so the approve names the plan that was at the gate when the owner decided.
 			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
@@ -264,6 +282,10 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 		"switch which Anthropic token this run spends BEFORE approving: a token label (pins "+
 			"the run to it), 'auto' (auto-select from your pool), 'default' (your default token), "+
 			"or 'inherit' (the worker's binding); omit to approve without switching")
+	approve.Flags().Bool("reset-milestones", false, "replace the frozen milestone contract and clear prior progress/decisions")
+	approve.Flags().String("reason", "", "owner reason for resetting milestones")
+	approve.Flags().String("expected-reset-state-digest", "", "reviewed reset state SHA-256 digest")
+	approve.Flags().String("expected-completion-revision", "", "reviewed positive completion revision or literal null")
 	addExpectedGateRevisionFlag(approve)
 	return approve
 }

@@ -34,10 +34,21 @@ func (c *HTTPClient) ListRunSummaries(ctx context.Context) ([]apitypes.RunSummar
 }
 
 func (c *HTTPClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
+	return c.GetRunWithOptions(ctx, id, RunReadOptions{})
+}
+
+func (c *HTTPClient) GetRunWithOptions(ctx context.Context, id string, opts RunReadOptions) (apitypes.RunDTO, error) {
+	if opts.ReconciliationBeforeGateRevision != nil && *opts.ReconciliationBeforeGateRevision <= 0 {
+		return apitypes.RunDTO{}, Exitf(ExitUsage, "reconciliation cursor must be positive")
+	}
+	path := "/api/runs/" + url.PathEscape(id)
+	if opts.ReconciliationBeforeGateRevision != nil {
+		path += "?reconciliation_before_gate_revision=" + strconv.FormatInt(*opts.ReconciliationBeforeGateRevision, 10)
+	}
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	if err := c.get(ctx, "/api/runs/"+url.PathEscape(id), &env); err != nil {
+	if err := c.get(ctx, path, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil
@@ -545,8 +556,12 @@ func (c *HTTPClient) SubmitRunInput(ctx context.Context, runID, kind, body strin
 		DiscardPendingOutcome: discardPendingOutcome,
 		ExpectedGateRevision:  expectedGateRevision,
 	}
+	return c.SubmitRunInputWithOptions(ctx, runID, reqBody)
+}
+
+func (c *HTTPClient) SubmitRunInputWithOptions(ctx context.Context, runID string, opts RunInputOptions) (apitypes.RunInputResponse, error) {
 	var out apitypes.RunInputResponse
-	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", reqBody, &out); err != nil {
+	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(runID)+"/inputs", opts, &out); err != nil {
 		return apitypes.RunInputResponse{}, err
 	}
 	return out, nil

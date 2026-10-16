@@ -47,6 +47,17 @@ function handlers(client: WorkerClient, runId = "run-current") {
 const bodyText = (r: { content: { text: string }[] }): string => r.content[0]!.text;
 
 describe("save_memory handler (PRD #90 M2)", () => {
+  it("keeps the originating claim generation after shared deps advance", async () => {
+    const { client, calls } = fakeClient();
+    const deps = { client, runId: "run-current", log: nullLogger(), claimGeneration: 7 };
+    const retained = makeMemoryToolHandlers(deps);
+    deps.claimGeneration = 8;
+    const current = makeMemoryToolHandlers(deps);
+    await retained.saveMemory({ title: "old", body: "durable fact" });
+    await current.saveMemory({ title: "new", body: "durable fact" });
+    assert.deepStrictEqual(calls.saveMemory.map(call => call.body.claim_generation), [7, 8]);
+  });
+
   it("POSTs the trimmed {title, body} for the CURRENT run id and confirms", async () => {
     const { client, calls } = fakeClient({
       entry: { id: "mem-9", title: "gcc baked in", body: "no build-essential needed", created_at: "2026-07-19T00:00:00Z" },

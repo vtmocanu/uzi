@@ -2932,8 +2932,22 @@ func (s *Service) recordCheckpointDurability(ctx context.Context, wkr store.Work
 // It returns the stored value and whether a row was written, so a caller that does not re-read
 // the run can reflect the write on the row it returns.
 func (s *Service) setCheckpointDurability(ctx context.Context, wkr store.Worker, prev store.Run, status string, reported *bool) (pgtype.Bool, bool) {
+	// No report and no previous value means no mutation to fence.
 	if reported == nil && !prev.CheckpointContainsLatest.Valid {
 		return pgtype.Bool{}, false
+	}
+	if s.txBeginner != nil {
+		gen := prev.ClaimGeneration
+		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, prev.ID, &gen)
+		if err != nil {
+			return pgtype.Bool{}, false
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		value, applied := locked.setCheckpointDurability(ctx, wkr, prev, status, reported)
+		if err := tx.Commit(ctx); err != nil {
+			return pgtype.Bool{}, false
+		}
+		return value, applied
 	}
 	var v pgtype.Bool
 	if reported != nil {
@@ -3272,6 +3286,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= this many admission-counted open holds (ADR-2445; owner-scoped, never global).
+		//     Hold-free cross-check children are exempt. Code-publishing continuations
+		//     are exempt only with a prior claim and 1..limit-1 own open holds.
 		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
 		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
 		//     versioned contract; any one of the three suffices): the custody hold is
@@ -3783,6 +3799,7 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	GateCheckpointWitness *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
 	// RequireRunning fences a question write against a flight that has already parked.
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
@@ -4217,6 +4234,35 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	// Withdrawal/release helpers have their own short claim transaction; they must
+	// not nest beneath the generic state fence on another connection.
+	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed") {
+		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
+		if err != nil {
+			return owned, false, err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		locked.bcast = nil
+		locked.lifecycle = nil
+		current, applied, err := locked.SetState(ctx, wkr, runID, req)
+		if err != nil {
+			return current, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return current, false, err
+		}
+		if applied && req.State == "credential_switch_failed" {
+			slog.Info("credential switch abandoned: bounded capture-failure give-up cleared the pending switch stamp; run continues on its current token",
+				"run", runID, "worker", wkr.ID, "generation", current.ClaimGeneration)
+		}
+		if applied && s.bcast != nil {
+			s.bcast.PublishState(runID, current.Status)
+		}
+		if applied && current.Status != owned.Status {
+			s.notify(runID, current.Status)
+		}
+		return current, applied, nil
+	}
 	sessionID := stripNULParam(req.SessionID)
 	// PRD #1190 M1: pause_failed is a worker REPORT, not a status transition — the worker could
 	// not publish the checkpoint, so the run STAYS running (Decision 8) and only the pending
@@ -4234,7 +4280,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// generic fail-closed check below, so its own check lives here: a worker advertising
 		// credential_switch_v1 that OMITS claim_generation is refused (ErrMissingClaimGeneration →
 		// the same 409 the handler maps it to) rather than clearing the pause unfenced. A LEGACY
-		// worker (no capability, nil generation) skips the fence, byte-identical to before.
+		// worker may omit generation only before reconciliation; the outer claim guard checks the audit.
 		if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 			return owned, false, ErrMissingClaimGeneration
 		}
@@ -4310,12 +4356,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// generation has moved past the reported one (a reclaim) or its claim has been RELEASED (a
 	// held-state switch requeued it). Holding the row lock from the check THROUGH the mutation
 	// is what makes it atomic and serialized against ClaimRun / ReleaseCredentialSwitch — a
-	// Go-side check on a stale read then an unfenced UPDATE would be a TOCTOU (D3). A LEGACY
-	// report (nil generation, no capability) skips the tx entirely and runs UNFENCED exactly as
-	// before — back-compat by construction. The single-statement arms run their mutation
+	// Go-side check on a stale read then an unfenced UPDATE would be a TOCTOU (D3). With a
+	// transaction beginner, legacy nil-generation reports also lock the run and read reconciliation
+	// history before mutation. Only unreconciled legacy runs may omit generation. The arms mutate
 	// through the tx-bound `q`; the multi-query park helpers (limit_wait/recovery_wait) and the
 	// interlocked-completion permit transaction do NOT nest under this lock — see
-	// stateUsesGenerationFence for why each is covered by its own guard.
+	// stateUsesForUpdateFence for why each is covered by its own guard.
 	// PRD #1795 M1: an id-bearing awaiting_approval report (presentation_id or
 	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
 	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
@@ -4353,18 +4399,17 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// PRD #1497 M1 (D16): close the released window for a generation-less (legacy) report too. A
 	// nil-generation report on a fenced state whose claim is RELEASED (a held-state switch, or a
 	// server-side wall park set claim_released_at) is rejected as stale — the released window closes
-	// for it. This is a best-effort check on the UNLOCKED `owned` snapshot: a legacy worker (no
-	// generation) never reclaims, so the released flag is stable, and this path deliberately does NOT
-	// take the FOR UPDATE tx (a generation-stamping worker takes the fence below, which re-checks
-	// claim_released_at under the lock). A LIVE nil-generation report stays honoured, unchanged.
+	// for it. This early check uses the unlocked ownership snapshot. The production transaction
+	// below rechecks released state under the run lock and requires generation after reconciliation.
+	// An unreconciled live legacy report may still omit generation.
 	if req.ClaimGeneration == nil && stateUsesForUpdateFence(req.State, owned) && owned.ClaimReleasedAt.Valid {
 		return owned, false, ErrStaleClaim
 	}
-	if req.ClaimGeneration != nil && (req.RequireRunning || stateUsesForUpdateFence(req.State, owned)) {
+	if (req.ClaimGeneration != nil || s.txBeginner != nil) && (req.RequireRunning || stateUsesForUpdateFence(req.State, owned)) {
 		if s.txBeginner == nil {
 			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
 		}
-		tx, berr := s.txBeginner.Begin(ctx)
+		tx, berr := s.beginReadCommitted(ctx)
 		if berr != nil {
 			return store.Run{}, false, berr
 		}
@@ -4372,7 +4417,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		qtx := store.New(tx)
 		// Completed publication and ephemeral leasing serialize on the worker before the run.
 		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
-		leaseFence = s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
+		leaseFence = req.ClaimGeneration != nil && s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
 		if leaseFence || completedPublicationCapable(wkr, req) {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
@@ -4390,7 +4435,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 			return store.Run{}, false, lerr
 		}
-		if locked.ClaimGeneration != *req.ClaimGeneration || locked.ClaimReleasedAt.Valid {
+		reconciled, rerr := reconciliationExists(ctx, tx, runID)
+		if rerr != nil {
+			return locked, false, rerr
+		}
+		if reconciled {
+			if err := validateReconciledGeneration(locked, req.ClaimGeneration); err != nil {
+				return locked, false, err
+			}
+		}
+		if (req.ClaimGeneration != nil && locked.ClaimGeneration != *req.ClaimGeneration) || locked.ClaimReleasedAt.Valid {
 			// Stale: a reclaim bumped the generation past the reported one, or a switch/wall-park
 			// released this claim. Return the LOCKED row so the handler can render it beside the
 			// stale_claim disposition. The deferred Rollback releases the lock.
@@ -4433,7 +4487,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// verdict insert or publication. A nil txBeginner (unit tests; prod wires SetTxBeginner)
 	// keeps the pre-#1795 unlocked write and allocates nothing.
 	if gateTracked && fenceTx == nil && s.txBeginner != nil {
-		tx, berr := s.txBeginner.Begin(ctx)
+		tx, berr := s.beginReadCommitted(ctx)
 		if berr != nil {
 			return store.Run{}, false, berr
 		}
@@ -4458,11 +4512,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// the `completed` case and applied best-effort in the applied-transition block below.
 	// Empty means "no settle". The failed arm also sets it 'declined' for a scope-directed run;
 	// the limit_wait rate-limit opt-out settles inline in limitwait.go instead.
-	// Issue #1399: those arm decisions read `owned`, which for any report that skips the FOR
-	// UPDATE fence (a legacy nil-generation report, a generation-zero chat, an interlocked completion; see
-	// stateUsesGenerationFence / stateUsesForUpdateFence) is the UNLOCKED pre-switch snapshot, so
-	// a scope directive can commit after it and before the terminal write. The applied-transition
-	// block therefore also settles when it is still empty and the post-transition re-read is
+	// Issue #1399: arm decisions use `owned`. The generic lock refreshes it, including for legacy
+	// nil-generation reports, but a helper's separate terminal transaction can still start from an
+	// earlier snapshot. The applied-transition block also settles when the arm left the decision
+	// empty and the post-transition re-read is
 	// terminal and scope-directed: 'applied' if the re-read carries stop_kind scope_capped,
 	// 'declined' otherwise.
 	var settleScopeDisposition string
@@ -4498,7 +4551,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// txBeginner (unit tests; prod wires SetTxBeginner in cmd/server/main.go) keeps the
 			// previous non-atomic pair.
 			if fenceTx == nil && s.txBeginner != nil {
-				tx, berr := s.txBeginner.Begin(ctx)
+				tx, berr := s.beginReadCommitted(ctx)
 				if berr != nil {
 					return store.Run{}, false, berr
 				}
@@ -4632,7 +4685,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// non-empty candidate to `[]` (no superseded criteria freeze), and after a REJECTED list
 			// (stored candidate NULL beside a stored plan_md) it stays NULL: nothing freezes and the
 			// run holds at finalize.
-			MilestonesCandidate:  planMilestonesParam(owned, req.PlanMd, req.Milestones),
+			MilestonesCandidate:  reportPlanMilestonesParam(owned, req),
 			InferredCapabilities: inferredCaps,
 			InferredTools:        inferredTools,
 			SizeClass:            sizeClass,
@@ -4643,7 +4696,23 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// needs no trial write.
 		decision := gateDecision{class: gateClassUntracked}
 		if gateTracked && fenceTx != nil {
+			var witnessWorker *uuid.UUID
+			if req.GateCheckpointWitness != nil {
+				if req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 || !validGitObjectID(req.GateCheckpointWitness.SourceHead) || !validGitObjectID(req.GateCheckpointWitness.PublishedCheckpoint) {
+					return owned, false, ErrInvalidState
+				}
+				id := wkr.ID
+				witnessWorker = &id
+			}
 			decision, err = classifyGateReport(ctx, q, owned, req, gateReportFields{
+				checkpointWitness: req.GateCheckpointWitness,
+				witnessWorkerID:   witnessWorker,
+				witnessClaimGeneration: func() *int64 {
+					if witnessWorker != nil {
+						return req.ClaimGeneration
+					}
+					return nil
+				}(),
 				planMd:             approvalParams.PlanMd,
 				milestones:         approvalParams.MilestonesCandidate,
 				milestonesReported: req.Milestones != nil,
@@ -5098,8 +5167,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// separate pool connection) and re-reads the run, so it must not run while this tx holds
 	// the row lock (the re-read would see the pre-commit row, and any run-row write would
 	// self-deadlock against the lock). A commit failure fails the report; the deferred Rollback
-	// is a no-op once fenceTx is cleared. A legacy (nil-generation) report left fenceTx nil, so this
-	// is skipped.
+	// is a no-op once fenceTx is cleared. Legacy reports also commit their locked audit check;
+	// an arm that did not acquire this transaction skips the commit.
 	if fenceTx != nil {
 		// PRD #2006: a genuinely applied terminal transition on an ephemeral worker (fence tx
 		// opened with the worker locked first) releases the completed run's custody hold and
@@ -5158,12 +5227,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// transition, or a run with no scope directive, leaves settleScopeDisposition empty
 		// and skips it.
 		//
-		// Issue #1399: an arm's decision reads `owned`, which is unlocked for any report that
-		// skips the FOR UPDATE fence (legacy nil-generation, generation-zero chat, interlocked completion; see
-		// stateUsesGenerationFence), and the forge park arm decides nothing. A scope directive
-		// that committed after that read but before the terminal write shows up only in this
-		// post-transition re-read, so a terminal (completed/failed/cancelled) scope-directed run
-		// with no arm decision settles here. An arm's own decision is kept.
+		// Issue #1399: an arm's `owned` snapshot can predate a helper's separate terminal
+		// transaction, and the forge park arm decides nothing. A scope directive committed after
+		// that snapshot is visible in this post-transition re-read. A terminal
+		// (completed/failed/cancelled) scope-directed run with no arm decision settles here.
+		// An arm's own decision is kept.
 		//
 		// The re-read status is not necessarily THIS report's transition: a non-terminal report
 		// (e.g. `running`, rows>0) can re-read a run a concurrent completed+ScopeCapped report
@@ -5592,7 +5660,39 @@ type ConsumeInputsResult struct {
 //     cleared, so without this fence a stray poll from the departing worker would drain the very
 //     rows the reclaim must see. Drain nothing here too. The drain resumes only after ClaimRun
 //     reclaims the run (which clears claim_released_at and bumps the generation).
-func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
+func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID, generations ...*int64) (ConsumeInputsResult, error) {
+	// Receipt delivery is read-only; authority remains in ack/apply/discard.
+	if slices.Contains(wkr.ProtocolCapabilities, capability.InputReceiptsV1) {
+		return s.consumeInputsLocked(ctx, wkr, runID)
+	}
+	var g *int64
+	if len(generations) > 0 {
+		g = generations[0]
+	}
+	locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, g)
+	if err != nil {
+		return ConsumeInputsResult{}, err
+	}
+	if tx != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
+		locked.bcast = nil
+	}
+	result, err := locked.consumeInputsLocked(ctx, wkr, runID)
+	if err != nil {
+		return ConsumeInputsResult{}, err
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return ConsumeInputsResult{}, err
+		}
+	}
+	if tx != nil && s.bcast != nil && slices.ContainsFunc(result.Inputs, func(i InputDTO) bool { return i.Kind == "follow_up" }) {
+		s.bcast.PublishInput(runID)
+	}
+	return result, nil
+}
+
+func (s *Service) consumeInputsLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID) (ConsumeInputsResult, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return ConsumeInputsResult{}, err
@@ -5686,7 +5786,34 @@ func (s *Service) ConsumedFollowUps(ctx context.Context, wkr store.Worker, runID
 // are the writer's declared provenance (PRD #266): basis is normalized at write to
 // one of the two known trust labels or empty, evidence is trimmed/sanitized/capped,
 // both stored NULL when empty — a bad or absent basis is never a write failure.
-func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body, basis, evidence string) (store.AgentMemory, error) {
+func (s *Service) SaveMemory(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body, basis, evidence string, claimGeneration ...*int64) (store.AgentMemory, error) {
+	var generation *int64
+	if len(claimGeneration) > 0 {
+		generation = claimGeneration[0]
+	}
+	child, run, tx, err := s.beginClaimMutation(ctx, wkr, runID, generation)
+	if err != nil {
+		return store.AgentMemory{}, err
+	}
+	if tx != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+	if generation != nil && (*generation <= 0 || *generation != run.ClaimGeneration || run.ClaimReleasedAt.Valid) {
+		return store.AgentMemory{}, ErrStaleClaim
+	}
+	mem, err := child.saveMemoryLocked(ctx, wkr, runID, title, body, basis, evidence)
+	if err != nil {
+		return store.AgentMemory{}, err
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return store.AgentMemory{}, err
+		}
+	}
+	return mem, nil
+}
+
+func (s *Service) saveMemoryLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, title, body, basis, evidence string) (store.AgentMemory, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.AgentMemory{}, err
@@ -6127,7 +6254,7 @@ type PublishResult struct {
 // treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
-func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
+func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte, claimGeneration ...*int64) (PublishResult, error) {
 	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
 	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
@@ -6137,9 +6264,34 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
 	// named (the run id), and it can only reach its own runs.
-	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
+	var generation *int64
+	if len(claimGeneration) > 0 {
+		generation = claimGeneration[0]
+	}
+	// Admission reads the reconciliation audit only after worker -> run locking,
+	// including for legacy unstamped requests. Keep this caller-authorized snapshot
+	// for the attempt and confirmation fences; do not refresh its generation.
+	_, owned, tx, err := s.beginClaimMutation(ctx, wkr, runID, generation)
 	if err != nil {
 		return PublishResult{}, err
+	}
+	if tx != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+	if generation != nil {
+		if *generation <= 0 {
+			return PublishResult{}, ErrMissingClaimGeneration
+		}
+		if *generation != owned.ClaimGeneration || owned.ClaimReleasedAt.Valid {
+			return PublishResult{}, ErrStaleClaim
+		}
+	}
+	// Release admission locks before retention locking or forge I/O. Publish needs
+	// the full service dependencies, rather than the claim-control facade.
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return PublishResult{}, err
+		}
 	}
 
 	// 2. Branch is derived SERVER-SIDE from validated run-row fields (kind, the run's

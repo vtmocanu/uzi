@@ -1193,6 +1193,25 @@ type RunMessage struct {
 	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
 }
 
+type RunMilestoneReconciliation struct {
+	ID               uuid.UUID          `json:"id"`
+	RunID            uuid.UUID          `json:"run_id"`
+	OwnerID          uuid.UUID          `json:"owner_id"`
+	GateRevision     int64              `json:"gate_revision"`
+	PresentationID   uuid.UUID          `json:"presentation_id"`
+	GateDigest       []byte             `json:"gate_digest"`
+	ResetStateDigest string             `json:"reset_state_digest"`
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	Reason           string             `json:"reason"`
+	Consent          []byte             `json:"consent"`
+	BeforeState      []byte             `json:"before_state"`
+	AfterState       []byte             `json:"after_state"`
+	AppliedInputID   int64              `json:"applied_input_id"`
+	StopCutoff       int64              `json:"stop_cutoff"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type RunReview struct {
 	ID          uuid.UUID          `json:"id"`
 	TargetRunID uuid.UUID          `json:"target_run_id"`

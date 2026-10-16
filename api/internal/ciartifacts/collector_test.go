@@ -234,14 +234,14 @@ func TestCollectorRowsKeepLateEvidenceAndExactCounts(t *testing.T) {
 	}
 }
 
-// Err becomes canceled immediately after one decompressor read.
+// Err becomes canceled immediately after the first plaintext byte is charged.
 type cancelOnRead struct {
 	context.Context
 	c *Collector
 }
 
 func (x cancelOnRead) Err() error {
-	if x.c.reads > 0 {
+	if x.c.inflated > 0 {
 		return context.Canceled
 	}
 	return nil
@@ -275,6 +275,47 @@ func TestCollectorIncrementalCancellation(t *testing.T) {
 	m, in := c.Result()
 	if c.reads != 1 || c.inflated != 1 || len(in) != 0 || !m.Uninspected {
 		t.Fatalf("reads=%d work=%d manifest=%+v", c.reads, c.inflated, m)
+	}
+}
+
+// Two empty stored DEFLATE blocks consume input without emitting plaintext.
+// CreateRaw keeps this tiny deterministic fixture independent of flate's writer.
+func TestCollectorCancellationWithoutOutput(t *testing.T) {
+	var b bytes.Buffer
+	w := zip.NewWriter(&b)
+	raw := []byte{0, 0, 0, 255, 255, 1, 0, 0, 255, 255}
+	f, err := w.CreateRaw(&zip.FileHeader{Name: "empty", Method: zip.Deflate, CompressedSize64: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	later, err := w.CreateHeader(&zip.FileHeader{Name: "later", Method: zip.Store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := later.Write([]byte("must not read")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := NewCollector(Limits{}, nil)
+	c.compressedProgress = cancel
+	c.Add(ctx, "a", "a", b.Bytes())
+	m, inputs := c.Result()
+	if ctx.Err() == nil || c.compressed != 1 || c.inflated != 0 || len(inputs) != 0 ||
+		!m.Uninspected || len(m.Entries) != 1 || m.Entries[0].Reason != "deadline" ||
+		len(m.Reasons) != 1 || m.Reasons[0] != "deadline" || *m.Omitted != 0 {
+		t.Fatalf("compressed=%d output=%d inputs=%d manifest=%+v", c.compressed, c.inflated, len(inputs), m)
+	}
+	reads := c.reads
+	c.Add(ctx, "b", "b", zipFixture(t, zipItem{name: "later archive", text: "must not read"}))
+	if c.reads != reads || c.inflated != 0 {
+		t.Fatal("continued work after cancellation")
 	}
 }
 

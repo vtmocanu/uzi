@@ -1,4 +1,9 @@
 {
+  "reset_state_digest": "x",
+  "milestone_reconciliations": [
+    {}
+  ],
+  "milestone_reconciliations_next_before_gate_revision": 1,
   "worker_recovery": {
     "episode": 1,
     "automatic_requeue_limit": 1,

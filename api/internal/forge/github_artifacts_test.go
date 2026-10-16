@@ -296,6 +296,11 @@ func TestArtifactActualReadBounds(t *testing.T) {
 }
 
 func TestArtifactEncodingAndBlobRedirectRefusal(t *testing.T) {
+	// Inspect the actual production transport as well as the response refusal seam.
+	transport := artifactBlobTransport(nil, "8.8.8.8:443")
+	if !transport.DisableCompression {
+		t.Fatal("blob transport must preserve raw Content-Encoding and byte accounting")
+	}
 	for _, enc := range [][]string{{"gzip"}, {"identity", "identity"}, {"identity, gzip"}, {"br"}, {""}} {
 		for _, stage := range []string{"list", "blob"} {
 			t.Run(stage+fmt.Sprint(enc), func(t *testing.T) {
