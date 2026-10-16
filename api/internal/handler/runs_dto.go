@@ -515,6 +515,12 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// resume, which would finalize nothing otherwise; SubmitInput refuses the same case).
 	dto.CanStopAtProviderHold = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "provider_unavailable" &&
 		r.Kind == "issue" && !r.Interactive && len(dto.MilestonesCompleted) >= 1
+	if workersvc.PolicyOwnerConstrained(r) {
+		dto.CanStopAtProviderHold = workersvc.PolicyOwnerCanStop(r, globalTimeout)
+		if dto.PolicyRefusal != nil {
+			dto.PolicyRefusal.CanResume = workersvc.PolicyOwnerResumable(r) && (r.HoldReason.String != "budget_exhausted" || workersvc.PolicyOwnerBudgetAvailable(r, globalTimeout))
+		}
+	}
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.
@@ -815,7 +821,7 @@ func policyRefusalDTO(r store.Run) *apitypes.PolicyRefusalDTO {
 		LastCorrelationID: textPtrValue(r.PolicyLastCorrelationID.Valid, r.PolicyLastCorrelationID.String),
 		Detail:            textPtrValue(r.PolicyHoldDetail.Valid, r.PolicyHoldDetail.String),
 		Provenance:        textPtrValue(r.PolicyHoldProvenance.Valid, r.PolicyHoldProvenance.String),
-		CanResume:         r.Status == "paused" && r.HoldReason.String == "provider_policy_refusal",
+		CanResume:         workersvc.PolicyOwnerResumable(r),
 		CanCancel:         r.Status != "completed" && r.Status != "failed" && r.Status != "cancelled",
 	}
 	if r.PolicyLastRefusedAt.Valid {
@@ -826,7 +832,9 @@ func policyRefusalDTO(r store.Run) *apitypes.PolicyRefusalDTO {
 		v := r.PolicyHoldPublished.Bool
 		dto.Published = &v
 	}
-	if dto.CanResume {
+	// Live completion decisions also need the presented policy identity.
+	// Action availability remains separate from this precondition.
+	if workersvc.PolicyOwnerConstrained(r) {
 		dto.ActionIfMatch = workersvc.PolicyHoldActionToken(r)
 	}
 	return dto

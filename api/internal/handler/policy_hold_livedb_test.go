@@ -30,7 +30,7 @@ func TestPolicyHoldStrictAndOwnerResumeLiveDB(t *testing.T) {
 	defer pool.Close()
 	e.h.wsvc.SetTxBeginner(pool)
 	id := e.providerHold(0)
-	e.exec("UPDATE runs SET harness='codex',status='running',hold_reason=NULL WHERE id=$1", id)
+	e.exec("UPDATE runs SET harness='codex',status='running',hold_reason=NULL,started_at=now(),budget_wall_seconds=57600,session_id='prior-http-session' WHERE id=$1", id)
 	worker := store.Worker{ID: e.worker, UserID: e.owner.ID, ProtocolCapabilities: []string{capability.ProviderPolicyHoldV1, capability.CredentialSwitchV1}}
 	call := func(workerRoute bool, body, token string, auth bool) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/", strings.NewReader(body))
@@ -89,7 +89,7 @@ func TestPolicyHoldStrictAndOwnerResumeLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := workersvc.PolicyHoldActionToken(held)
-	for _, body := range []string{"null", `{"unknown":true}`, `{} {}`, "{}" + strings.Repeat(" ", policyResumeBodyMaxBytes), `{"guidance":"` + strings.Repeat("a", 16001) + `"}`, `{"mode":"fresh"}`} {
+	for _, body := range []string{"null", `{"unknown":true}`, `{} {}`, "{}" + strings.Repeat(" ", policyResumeBodyMaxBytes), `{"guidance":"` + strings.Repeat("a", 16001) + `"}`, `{"mode":"invalid"}`, `{"mode":""}`, `{"mode":null}`, `{"guidance":null}`, `{"guidance":"\u0000"}`, "{\"guidance\":\"" + string([]byte{0xff}) + "\"}"} {
 		rec := call(false, body, token, true)
 		if rec.Code != 400 {
 			t.Fatalf("owner malformed code=%d body=%s", rec.Code, rec.Body)
@@ -116,6 +116,24 @@ func TestPolicyHoldStrictAndOwnerResumeLiveDB(t *testing.T) {
 	var inputs, audits int
 	if err := e.query("SELECT count(*) FILTER(WHERE kind='follow_up'),count(*) FILTER(WHERE kind='resume') FROM run_user_inputs WHERE run_id=$1", id).Scan(&inputs, &audits); err != nil || inputs != 1 || audits != 1 {
 		t.Fatalf("inputs=%d audit=%d err=%v", inputs, audits, err)
+	}
+	// A later hold requires its own token and fresh records the prior session.
+	e.exec("UPDATE runs SET status='paused',claim_generation=2,policy_last_outcome_id=$2 WHERE id=$1", id, uuid.New())
+	held, err = e.race.GetRunByID(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(false, `{"mode":"fresh"}`, workersvc.PolicyHoldActionToken(held), true); rec.Code != 200 {
+		t.Fatalf("fresh=%d %s", rec.Code, rec.Body)
+	}
+	var sid *string
+	var grant int64
+	var freshAudit string
+	if err := e.query("SELECT session_id,policy_fresh_claim_generation FROM runs WHERE id=$1", id).Scan(&sid, &grant); err != nil || sid != nil || grant != 3 {
+		t.Fatalf("fresh sid=%v grant=%d err=%v", sid, grant, err)
+	}
+	if err := e.query("SELECT body FROM run_user_inputs WHERE run_id=$1 AND kind='resume' ORDER BY id DESC LIMIT 1", id).Scan(&freshAudit); err != nil || !strings.Contains(freshAudit, "prior-http-session") {
+		t.Fatalf("fresh audit=%q err=%v", freshAudit, err)
 	}
 	// Bodyless ordinary owner resume remains supported.
 	ordinary := e.providerHold(0)

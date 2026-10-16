@@ -928,6 +928,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	// so an approve without the capability override and a cancel of a run with no pending outcome
 	// behave exactly as before.
 	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
+		ActionIfMatch:            r.Header.Get("If-Match"),
 		OverrideCapabilities:     req.OverrideCapabilities,
 		DiscardPendingOutcome:    req.DiscardPendingOutcome,
 		ExpectedGateRevision:     req.ExpectedGateRevision,
@@ -937,6 +938,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var mismatch *workersvc.GateRevisionMismatchError
 		switch {
+		case errors.Is(err, workersvc.ErrStaleClaim):
+			httpx.Error(w, http.StatusConflict, "policy hold changed; upgrade your client and refetch the presented action")
 		case errors.Is(err, workersvc.ErrReconciliationRequired):
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "milestone_reconciliation_required")
 		case errors.Is(err, workersvc.ErrReconciliationConflict):

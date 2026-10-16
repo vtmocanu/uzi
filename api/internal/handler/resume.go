@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -44,19 +47,37 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var policyReq workersvc.PolicyResumeRequest
+	policyOptions := false
 	if r.Body != nil {
-		var decoded *workersvc.PolicyResumeRequest
+		raw, readErr := io.ReadAll(io.LimitReader(r.Body, policyResumeBodyMaxBytes+1))
+		if readErr != nil || len(raw) > policyResumeBodyMaxBytes || !utf8.Valid(raw) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		var decoded *struct {
+			Mode     json.RawMessage `json:"mode"`
+			Guidance json.RawMessage `json:"guidance"`
+		}
 		err := httpx.DecodeJSONStrictBounded(r, &decoded, policyResumeBodyMaxBytes)
 		if (err != nil && !errors.Is(err, io.EOF)) || (err == nil && decoded == nil) {
 			httpx.Error(w, http.StatusBadRequest, "invalid request body")
 			return
 		}
 		if decoded != nil {
-			policyReq = *decoded
+			policyOptions = len(decoded.Mode) > 0 || len(decoded.Guidance) > 0
+			if len(decoded.Mode) > 0 && (string(decoded.Mode) == "null" || json.Unmarshal(decoded.Mode, &policyReq.Mode) != nil || (policyReq.Mode != "preserve" && policyReq.Mode != "fresh")) {
+				httpx.Error(w, http.StatusBadRequest, "mode must be preserve or fresh")
+				return
+			}
+			if len(decoded.Guidance) > 0 && (string(decoded.Guidance) == "null" || json.Unmarshal(decoded.Guidance, &policyReq.Guidance) != nil) {
+				httpx.Error(w, http.StatusBadRequest, "guidance must be a string")
+				return
+			}
 		}
 	}
-	policyHold := run.HoldReason.String == "provider_policy_refusal"
-	if !policyHold && (policyReq.Mode != "" || policyReq.Guidance != "") {
+	policyHold := workersvc.PolicyOwnerConstrained(run)
+	if !policyHold && policyOptions {
 		httpx.Error(w, http.StatusConflict, "policy guidance requires a policy hold")
 		return
 	}
@@ -64,11 +85,15 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 		run, err = h.wsvc.ResumePolicyHold(r.Context(), user.ID, runID, r.Header.Get("If-Match"), policyReq)
 		if err != nil {
 			if errors.Is(err, workersvc.ErrInvalidState) {
-				httpx.Error(w, http.StatusBadRequest, "invalid preserving resume")
+				httpx.Error(w, http.StatusBadRequest, "invalid policy resume: mode must be preserve or fresh and guidance must be valid UTF-8 without NUL, at most 16000 bytes")
 				return
 			}
 			if errors.Is(err, workersvc.ErrStaleClaim) {
-				httpx.Error(w, http.StatusConflict, "policy hold changed; refresh the presented action")
+				httpx.Error(w, http.StatusConflict, "policy hold changed; upgrade your client and refetch the presented action")
+				return
+			}
+			if errors.Is(err, workersvc.ErrWallParkStopUnavailable) {
+				httpx.Error(w, http.StatusConflict, err.Error())
 				return
 			}
 			httpx.Error(w, http.StatusInternalServerError, "policy resume unavailable")

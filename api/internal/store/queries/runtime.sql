@@ -3690,6 +3690,7 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND runs.hold_reason IS DISTINCT FROM 'provider_policy_refusal'
+  AND runs.policy_refusal_count = 0
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
@@ -3756,6 +3757,7 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND runs.hold_reason IS DISTINCT FROM 'provider_policy_refusal'
+  AND runs.policy_refusal_count = 0
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).

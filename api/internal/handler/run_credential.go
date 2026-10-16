@@ -56,7 +56,7 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 		secretID = &id
 	}
 
-	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID)
+	res, err := h.wsvc.SetRunCredential(r.Context(), user.ID, runID, req.Mode, secretID, r.Header.Get("If-Match"))
 	if err != nil {
 		h.writeSetRunCredentialError(w, err)
 		return
@@ -78,6 +78,10 @@ func (h *Handler) SetRunCredential(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 	var workerUnsupported *workersvc.CredentialSwitchWorkerUnsupportedError
 	switch {
+	case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrWallParkStopUnavailable):
+		httpx.Error(w, http.StatusConflict, err.Error())
+	case errors.Is(err, workersvc.ErrInvalidState):
+		httpx.Error(w, http.StatusConflict, "resolve the current hold before switching its token")
 	case errors.Is(err, workersvc.ErrRunNotFound):
 		httpx.Error(w, http.StatusNotFound, "run not found")
 	case errors.As(err, &workerUnsupported):

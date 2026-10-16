@@ -52,6 +52,7 @@ func (s *Service) SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind
 // a struct rather than a growing tail of booleans so an added bypass never re-widens SubmitInput's
 // fixed signature (matching the SubmitInputWithCapabilityOverride precedent, now folded in here).
 type SubmitInputOptions struct {
+	ActionIfMatch string
 	// OverrideCapabilities is the PRD #84 M4 4c "run without the capability" override, meaningful
 	// only with approve_plan (see SubmitInputWithCapabilityOverride).
 	OverrideCapabilities bool
@@ -135,6 +136,15 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
+	}
+	if kind == "stop" && run.Status == "paused" && PolicyOwnerConstrained(run) {
+		reason, _ := stripNUL(body)
+		resumed, err := s.resumePolicyOwnerAction(ctx, userID, runID, opts.ActionIfMatch, PolicyResumeRequest{Mode: "preserve"}, &reason, &run)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		c := int(resumed.ScopeCeiling.Int32)
+		return SubmitInputResult{ScopeCeiling: &c, Resumed: true}, nil
 	}
 	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
 	// approve_plan — both the selection-bearing dispatch and the nil-selection plain-enqueue
@@ -232,7 +242,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if kind == "extend" && run.Kind == runkind.Job {
 		return SubmitInputResult{}, s.extendRefusal(run, 0, 0)
 	}
-	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
+	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" && !PolicyOwnerConstrained(run) {
 		switch kind {
 		case "extend":
 			secs, err := strconv.Atoi(strings.TrimSpace(body))
@@ -1135,6 +1145,11 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		}
 		if terminalStatuses[current.Status] {
 			return SubmitInputResult{}, ErrRunTerminal
+		}
+		// A Stop presented before a policy hold cannot mutate its newly held scope.
+		// The dedicated paused-policy path authorizes its own token under this lock.
+		if len(stopping) > 0 && stopping[0] && current.Status == "paused" && PolicyOwnerConstrained(current) {
+			return SubmitInputResult{}, ErrStaleClaim
 		}
 		frozen, err := DecodeMilestones(current.MilestonesFrozen)
 		if err != nil {

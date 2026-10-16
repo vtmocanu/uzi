@@ -44,11 +44,21 @@ RETURNING runs.*;
 -- name: ResumePolicyHold :one
 UPDATE runs SET status = 'queued', status_since = now(),
  budget_paused_seconds = budget_paused_seconds + GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int),
- policy_fresh_claim_generation = NULL,
+ session_id = CASE WHEN @fresh::boolean THEN NULL ELSE session_id END,
+ policy_fresh_claim_generation = CASE WHEN @fresh::boolean THEN claim_generation + 1 ELSE NULL END,
+ worker_id = CASE WHEN claim_released_at IS NOT NULL THEN NULL ELSE worker_id END,
+ hold_reason = CASE WHEN hold_reason = 'budget_exhausted' THEN NULL ELSE hold_reason END,
+ hold_captured_head = CASE WHEN hold_reason = 'budget_exhausted' THEN NULL ELSE hold_captured_head END,
  codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
  health = 'ok', health_reason = NULL, health_since = NULL, updated_at = now()
 WHERE id = @id AND user_id = @user_id AND status = 'paused'
- AND hold_reason = 'provider_policy_refusal'
+ AND (policy_refusal_count > 0 OR hold_reason = 'provider_policy_refusal')
+ AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+ AND hold_reason IS DISTINCT FROM 'credential_disabled'
+ AND (NOT @fresh::boolean OR claim_generation < 9223372036854775807)
+ AND (hold_reason IS DISTINCT FROM 'budget_exhausted' OR started_at IS NULL OR
+   (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)::bigint + budget_extension_seconds + budget_finalize_seconds)
+   - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::bigint) - budget_paused_seconds) > 0)
  AND policy_last_outcome_id = @outcome_id AND claim_generation = @claim_generation
 RETURNING *;
 

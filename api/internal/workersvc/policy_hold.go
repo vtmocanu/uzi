@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -236,12 +238,17 @@ func PolicyHoldActionToken(r store.Run) string {
 }
 
 type PolicyResumeRequest struct {
-	Mode     string `json:"mode,omitempty"`
-	Guidance string `json:"guidance,omitempty"`
+	Mode               string `json:"mode,omitempty"`
+	Guidance           string `json:"guidance,omitempty"`
+	completionDecision bool
 }
 
 func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest) (store.Run, error) {
-	if req.Mode != "" && req.Mode != "preserve" || len(req.Guidance) > PolicyResumeGuidanceMaxBytes || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
+	return s.resumePolicyOwnerAction(ctx, owner, id, token, req, nil, nil)
+}
+
+func (s *Service) resumePolicyOwnerAction(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest, stopReason *string, observed *store.Run) (store.Run, error) {
+	if req.Mode != "" && req.Mode != "preserve" && req.Mode != "fresh" || len(req.Guidance) > PolicyResumeGuidanceMaxBytes || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
 		return store.Run{}, ErrInvalidState
 	}
 	if s.txBeginner == nil {
@@ -260,18 +267,14 @@ func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, tok
 	if r.UserID != owner {
 		return store.Run{}, ErrRunNotOwned
 	}
-	if r.Status != "paused" || r.HoldReason.String != "provider_policy_refusal" || token == "" || token != PolicyHoldActionToken(r) {
-		return r, ErrStaleClaim
-	}
-	if strings.TrimSpace(req.Guidance) != "" {
-		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: id, Kind: "follow_up", Body: policyText(&req.Guidance)}); err != nil {
-			return r, err
+	if observed != nil {
+		priorFrozen, _ := canonicalRawJSON(observed.MilestonesFrozen)
+		currentFrozen, _ := canonicalRawJSON(r.MilestonesFrozen)
+		if r.ContractRevision != observed.ContractRevision || r.GateRevision != observed.GateRevision || string(priorFrozen) != string(currentFrozen) {
+			return r, ErrReconciliationConflict
 		}
 	}
-	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: id, Kind: "resume", Body: policyTextNonempty("policy hold: preserve conversation")}); err != nil {
-		return r, err
-	}
-	r, err = q.ResumePolicyHold(ctx, store.ResumePolicyHoldParams{ID: id, UserID: owner, OutcomeID: r.PolicyLastOutcomeID, ClaimGeneration: r.ClaimGeneration})
+	r, err = s.resumePolicyHoldLocked(ctx, q, r, token, req, stopReason)
 	if err != nil {
 		return r, err
 	}
@@ -279,4 +282,97 @@ func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, tok
 		return r, err
 	}
 	return r, nil
+}
+
+// PolicyOwnerConstrained remains true when a later hold replaces the policy reason.
+func PolicyOwnerConstrained(r store.Run) bool {
+	return !terminalStatuses[r.Status] && (r.PolicyRefusalCount > 0 || r.HoldReason.String == "provider_policy_refusal")
+}
+
+// PolicyOwnerResumable excludes holds with a separate owner decision mechanism.
+func PolicyOwnerResumable(r store.Run) bool {
+	return PolicyOwnerConstrained(r) && r.Status == "paused" &&
+		r.HoldReason.String != "completion_blocked" && r.HoldReason.String != "credential_disabled"
+}
+
+// PolicyOwnerBudgetAvailable uses the frozen pause instant, as ResumePausedRun does.
+func PolicyOwnerBudgetAvailable(r store.Run, timeout time.Duration) bool {
+	if !r.StartedAt.Valid {
+		return true
+	}
+	wall := int64(timeout / time.Second)
+	if r.BudgetWallSeconds.Valid {
+		wall = int64(r.BudgetWallSeconds.Int32)
+	}
+	used := int64(math.Round(r.StatusSince.Time.Sub(r.StartedAt.Time).Seconds()))
+	if used < 0 {
+		used = 0
+	}
+	return wall+int64(r.BudgetExtensionSeconds)+int64(r.BudgetFinalizeSeconds)-(used-int64(r.BudgetPausedSeconds)) > 0
+}
+
+// PolicyOwnerCanStop is shared by the locked writer and the owner DTO.
+func PolicyOwnerCanStop(r store.Run, timeout time.Duration) bool {
+	if !PolicyOwnerResumable(r) || (r.HoldReason.String == "budget_exhausted" && !PolicyOwnerBudgetAvailable(r, timeout)) || r.Kind != "issue" || r.Interactive {
+		return false
+	}
+	frozen, err := DecodeMilestones(r.MilestonesFrozen)
+	if err != nil || len(frozen) == 0 {
+		return false
+	}
+	completed, err := DecodeMilestoneIDs(r.MilestonesCompleted)
+	return err == nil && len(completed) > 0 && len(completed) <= len(frozen)
+}
+
+// resumePolicyHoldLocked requires the caller's transaction and run lock. Stop and
+// credential reassignment reuse it without starting a nested transaction.
+func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, r store.Run, token string, req PolicyResumeRequest, stopReason *string) (store.Run, error) {
+	if r.Status != "paused" || !PolicyOwnerConstrained(r) || token == "" || token != PolicyHoldActionToken(r) {
+		return r, fmt.Errorf("%w: policy action changed; upgrade your client and refetch the presented action", ErrStaleClaim)
+	}
+	if r.HoldReason.String == "budget_exhausted" && !PolicyOwnerBudgetAvailable(r, s.p.RunTimeout) {
+		return r, fmt.Errorf("%w: this run is out of time; extend it before resuming", ErrWallParkStopUnavailable)
+	}
+	if stopReason != nil && !PolicyOwnerCanStop(r, s.p.RunTimeout) {
+		return r, ErrProviderHoldStopUnavailable
+	}
+	if !PolicyOwnerResumable(r) && !(req.completionDecision && r.HoldReason.String == "completion_blocked") {
+		return r, ErrInvalidState
+	}
+	fresh := req.Mode == "fresh"
+	if fresh && r.ClaimGeneration == math.MaxInt64 {
+		return r, ErrInvalidState
+	}
+	if stopReason != nil {
+		completed, _ := DecodeMilestoneIDs(r.MilestonesCompleted)
+		if len(completed) > math.MaxInt32 {
+			return r, ErrProviderHoldStopUnavailable
+		}
+		body := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", len(completed))
+		if reason := strings.TrimSpace(*stopReason); reason != "" {
+			body += ": " + reason
+		}
+		if _, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
+			RunID: r.ID, ScopeCeiling: pgtype.Int4{Int32: int32(len(completed)), Valid: true}, Body: policyTextNonempty(body),
+		}); err != nil {
+			return r, err
+		}
+	}
+	if strings.TrimSpace(req.Guidance) != "" {
+		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: r.ID, Kind: "follow_up", Body: policyText(&req.Guidance)}); err != nil {
+			return r, err
+		}
+	}
+	audit := "policy hold: preserve conversation"
+	if fresh {
+		audit = fmt.Sprintf("policy hold: fresh conversation; prior session_id=%q", r.SessionID.String)
+	}
+	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: r.ID, Kind: "resume", Body: policyTextNonempty(audit)}); err != nil {
+		return r, err
+	}
+	return q.ResumePolicyHold(ctx, store.ResumePolicyHoldParams{
+		ID: r.ID, UserID: r.UserID, OutcomeID: r.PolicyLastOutcomeID, ClaimGeneration: r.ClaimGeneration,
+		AllowCompletionBlockedHold: req.completionDecision,
+		Fresh:                      fresh, GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
+	})
 }

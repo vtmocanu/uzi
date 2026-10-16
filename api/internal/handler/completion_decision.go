@@ -84,11 +84,14 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		Criteria:         req.Criteria,
 		Reason:           req.Reason,
 		ContractRevision: req.ContractRevision,
+		ActionIfMatch:    r.Header.Get("If-Match"),
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrStaleClaim), errors.Is(err, workersvc.ErrWallParkStopUnavailable):
+			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrCompletionNotBlocked):
 			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrCompletionRevisionConflict):

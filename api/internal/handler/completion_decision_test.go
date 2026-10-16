@@ -140,11 +140,35 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 			}
 		})
 	}
+	for _, decision := range []string{"continue", "partial", "accept"} {
+		t.Run("policy "+decision, func(t *testing.T) {
+			mustExecT(ctx, t, pool, "UPDATE runs SET status='paused',hold_reason='completion_blocked',contract_revision=1,completion_contract=$2,policy_refusal_count=1,policy_last_outcome_id=$3,policy_fresh_claim_generation=1,session_id='original-session' WHERE id=$1", runID, contract, uuid.New())
+			req := completionDecisionRequest{Decision: decision, Guidance: "continue narrowly", Keep: []string{"m1"}, Criteria: []string{"m1.c1"}, Reason: "accept scope", ContractRevision: 1}
+			for _, token := range []string{"", "\"stale\""} {
+				rec := postCompletionDecision(t, h, owner, false, runID, req, token)
+				if rec.Code != http.StatusConflict {
+					t.Fatalf("rejected token: %d %s", rec.Code, rec.Body)
+				}
+			}
+			held, err := q.GetRunByID(ctx, runID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := postCompletionDecision(t, h, owner, false, runID, req, workersvc.PolicyHoldActionToken(held))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("presented token: %d %s", rec.Code, rec.Body)
+			}
+			got, err := q.GetRunByID(ctx, runID)
+			if err != nil || got.Status != "queued" || got.SessionID.String != "original-session" || got.PolicyFreshClaimGeneration.Valid {
+				t.Fatalf("policy completion resume: status=%s session=%v grant=%v err=%v", got.Status, got.SessionID, got.PolicyFreshClaimGeneration, err)
+			}
+		})
+	}
 }
 
 // postCompletionDecision issues POST /api/runs/{id}/completion/decision as user with the given body,
 // calling the handler method directly with a user context and the chi {id} route param.
-func postCompletionDecision(t *testing.T, h *Handler, user uuid.UUID, isAdmin bool, runID uuid.UUID, req completionDecisionRequest) *httptest.ResponseRecorder {
+func postCompletionDecision(t *testing.T, h *Handler, user uuid.UUID, isAdmin bool, runID uuid.UUID, req completionDecisionRequest, token ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -154,6 +178,9 @@ func postCompletionDecision(t *testing.T, h *Handler, user uuid.UUID, isAdmin bo
 	rctx := chi.NewRouteContext()
 	rctx.URLParams.Add("id", runID.String())
 	r = r.WithContext(context.WithValue(mw.ContextWithUser(r.Context(), store.User{ID: user, IsAdmin: isAdmin}), chi.RouteCtxKey, rctx))
+	if len(token) > 0 {
+		r.Header.Set("If-Match", token[0])
+	}
 	rec := httptest.NewRecorder()
 	h.ContinueCompletionDecision(rec, r)
 	return rec
