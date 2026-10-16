@@ -742,14 +742,15 @@ UPDATE runs SET
         + CASE WHEN status = 'awaiting_approval'
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    session_id=COALESCE($1, session_id),
     status='recovery_wait', status_since=now(),
     recovery_wait_cause='worker_memory_pressure', recovery_retry_not_before=NULL,
     claim_released_at=now(), released_worker_id=worker_id,
-    released_worker_nonce= $1,
+    released_worker_nonce= $2,
     codex_cap_hash=NULL, codex_claim_epoch=codex_claim_epoch+1,
     health='ok', health_reason=NULL, health_since=NULL, updated_at=now()
-WHERE runs.id= $2 AND runs.worker_id= $3 AND runs.claim_generation= $4
-    AND runs.memory_episode= $5 AND runs.claim_released_at IS NULL
+WHERE runs.id= $3 AND runs.worker_id= $4 AND runs.claim_generation= $5
+    AND runs.memory_episode= $6 AND runs.claim_released_at IS NULL
     AND runs.pause_requested_at IS NULL AND runs.credential_switch_requested_at IS NULL
     AND (runs.status IN ('claimed','running') OR (runs.status = 'awaiting_approval' AND EXISTS (
         SELECT 1 FROM run_user_inputs i
@@ -767,6 +768,7 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type ParkWorkerMemoryPressureParams struct {
+	SessionID       pgtype.Text `json:"session_id"`
 	RegisterNonce   pgtype.Text `json:"register_nonce"`
 	ID              uuid.UUID   `json:"id"`
 	WorkerID        pgtype.UUID `json:"worker_id"`
@@ -777,6 +779,7 @@ type ParkWorkerMemoryPressureParams struct {
 // The caller holds the worker, parent and run locks. Custody and drain evidence survive.
 func (q *Queries) ParkWorkerMemoryPressure(ctx context.Context, arg ParkWorkerMemoryPressureParams) (Run, error) {
 	row := q.db.QueryRow(ctx, parkWorkerMemoryPressure,
+		arg.SessionID,
 		arg.RegisterNonce,
 		arg.ID,
 		arg.WorkerID,

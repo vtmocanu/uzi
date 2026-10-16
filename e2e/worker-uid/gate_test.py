@@ -10,6 +10,20 @@ import unittest
 
 
 class RequiredCheckTest(unittest.TestCase):
+    def test_agent_dependencies_are_confined_to_provisioned_lane(self):
+        root = Path(__file__).resolve().parents[2]
+        taskfile = (root / 'Taskfile.yml').read_text()
+        harness = taskfile.split('  test:worker-uid-harness:\n', 1)[1].split('  test:agent:worker-uid:', 1)[0]
+        lane = taskfile.split('  test:agent:worker-uid:\n', 1)[1].split('  test:agent:shard:', 1)[0]
+        self.assertNotIn('cd agent', harness)
+        for command in ('calibration-producer.test.mts', 'inventory.test.mts',
+                        'tsc --project ../e2e/worker-uid/tsconfig.json'):
+            self.assertIn(command, lane)
+        workflow = (root / '.github/workflows/ci.yml').read_text()
+        job = workflow.split('  test-agent-worker-uid:\n', 1)[1].split('\n  test-agent:', 1)[0]
+        self.assertLess(job.index('run: npm ci --ignore-scripts'),
+                        job.index('run: task test:agent:worker-uid'))
+
     def test_calibration_failure_propagates_in_ci_and_local_modes(self):
         root = Path(__file__).resolve().parents[2]
         taskfile = (root / 'Taskfile.yml').read_text()
@@ -45,6 +59,11 @@ class RequiredCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='calibration-task-frame.', dir=scratch) as directory:
             directory = Path(directory)
             (directory / 'e2e/worker-uid').mkdir(parents=True)
+            (directory / 'agent').mkdir()
+            for command in ('node', 'npx'):
+                stub_command = directory / command
+                stub_command.write_text('#!/bin/sh\nexit 0\n')
+                stub_command.chmod(0o755)
             (directory / 'e2e/worker-uid/run.sh').write_text('exit 0\n')
             fake = directory / 'python3'
             # Framing only: this synthetic probe is deliberately not a measurement.

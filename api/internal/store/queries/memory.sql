@@ -97,6 +97,7 @@ UPDATE runs SET
         + CASE WHEN status = 'awaiting_approval'
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
                ELSE 0 END,
+    session_id=COALESCE(sqlc.narg('session_id'), session_id),
     status='recovery_wait', status_since=now(),
     recovery_wait_cause='worker_memory_pressure', recovery_retry_not_before=NULL,
     claim_released_at=now(), released_worker_id=worker_id,

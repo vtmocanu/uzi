@@ -25,6 +25,31 @@ class CheckerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             check.verify(self.manifest, encode(values), self.cleanup)
 
+    def test_real_monitor_history_with_confirmed_receipts(self):
+        # report() journals its outcome attempt as ambiguous even after the
+        # independently recorded ACK resolves the guard's outstanding ticket.
+        for report in self.reports:
+            report["settlement"]["history"][0]["status"] = "ambiguous"
+        self.verify()
+
+    def test_history_does_not_replace_confirmation_evidence(self):
+        for status in ("admitted", "unknown", "denied", None):
+            with self.subTest(status=status):
+                manifest, reports, cleanup = case()
+                reports[0]["settlement"]["history"][0]["status"] = status
+                with self.assertRaisesRegex(ValueError, "history report attempt"):
+                    check.verify(manifest, encode(reports), cleanup, synthetic=True)
+        for field in ("outcome", "acknowledgements"):
+            with self.subTest(missing=field):
+                manifest, reports, cleanup = case()
+                reports[0]["settlement"]["history"][0]["status"] = "ambiguous"
+                if field == "outcome":
+                    reports[0]["settlement"]["history"][0]["outcome"] = "unknown"
+                else:
+                    reports[0]["settlement"]["acknowledgements"].pop()
+                with self.assertRaises(ValueError):
+                    check.verify(manifest, encode(reports), cleanup, synthetic=True)
+
     def test_literal_pairs_and_earliest_ties(self):
         derivation = self.verify()[0]["derivation"]
         self.assertEqual(derivation["samplePairs"][2], {

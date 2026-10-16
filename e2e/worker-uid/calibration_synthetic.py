@@ -104,7 +104,7 @@ def case():
                       "serviceRecords": [{"request": request, "ack": ack, "path": "/reservation", "atMs": 1504.5},
                                          {"request": {**request, "outcome": "confirmed_drained"},
                                           "ack": outcome_ack, "path": "/outcome", "atMs": 1510.5}],
-                      "history": [{"request": request, "status": "admitted", "outcome": "confirmed_drained"}],
+                      "history": [{"request": request, "status": "ambiguous", "outcome": "confirmed_drained"}],
                       "observations": [{"index": 0, "startMs": 1502, "endMs": 1503},
                                        {"index": 0, "startMs": 1505.1, "endMs": 1505.9}],
                       "signalWrites": [{"index": 0, "startMs": 1506, "endMs": 1507}],

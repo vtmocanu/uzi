@@ -449,7 +449,9 @@ def verify_report(report, manifest, expected, synthetic=False):
         require(same(base, settlement["history"][0]["request"]) and
                 base["intervention_id"] == binding["interventionId"], "idempotent request binding")
         require(records[n]["startMs"] <= record["atMs"] <= records[n]["endMs"], "service timing")
-    require(settlement["history"][0]["status"] == "admitted", "history admission")
+    # report() records its attempt before IO; confirmed ACKs above and the
+    # settled monitor state prove completion, not this journal status.
+    require(settlement["history"][0]["status"] == "ambiguous", "history report attempt")
     require(records[1]["startMs"] >= spans["drain"]["endMs"] and
             records[1]["endMs"] <= low_dwell[0]["startedAtMs"], "outcome timing before fresh dwell")
     schedule = settlement["schedule"]

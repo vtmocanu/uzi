@@ -2705,9 +2705,6 @@ tasks:
       - python3 e2e/worker-uid/gate_test.py
       - python3 -B e2e/worker-uid/calibration_check_test.py
       - python3 -B e2e/worker-uid/calibration_run_test.py
-      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/calibration-producer.test.mts
-      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/inventory.test.mts
-      - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
 
   test:agent:worker-uid:
     desc: agent - require worker UID proofs and private cgroup memory calibration
@@ -2715,6 +2712,10 @@ tasks:
     interactive: true
     cmds:
       - task: test:worker-uid-harness
+      # This lane's CI job installs agent dependencies; gate:repo deliberately does not.
+      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/calibration-producer.test.mts
+      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/inventory.test.mts
+      - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
       - bash e2e/worker-uid/run.sh
       - |
           if [ "${GITHUB_ACTIONS:-}" = true ]; then
