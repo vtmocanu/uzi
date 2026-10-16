@@ -3,6 +3,7 @@
 set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 cd "$root"
+mkdir -p .uzi/scratch
 sha=$(git rev-parse 'b0893dce^{commit}')
 snap=$(mktemp -d .uzi/scratch/plan-revision-base.XXXXXX)
 trap 'rm -rf "$snap"' EXIT

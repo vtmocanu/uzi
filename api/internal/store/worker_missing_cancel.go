@@ -81,7 +81,7 @@ func (q *Queries) CancelFrozenMissingRuns(ctx context.Context, worker uuid.UUID,
 		if n != 1 {
 			continue
 		}
-		if _, err := q.db.Exec(ctx, `UPDATE run_user_inputs SET applied_at = now()
+		if _, err := q.db.Exec(ctx, `UPDATE run_user_inputs SET applied_at = now(), consumed_at = COALESCE(consumed_at, now())
    WHERE run_id = $1 AND kind = 'cancel' AND applied_at IS NULL`, id); err != nil {
 			return nil, err
 		}

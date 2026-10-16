@@ -160,7 +160,7 @@ func TestHeartbeatOmittedQueuedCancelLiveDB(t *testing.T) {
 				t.Fatalf("omitted queued cancel: %+v", got)
 			}
 			var settled bool
-			if err := env.pool.QueryRow(env.ctx, "SELECT count(*)=1 AND bool_and(applied_at IS NOT NULL) FROM run_user_inputs WHERE run_id=$1 AND kind='cancel'", run).Scan(&settled); err != nil || !settled {
+			if err := env.pool.QueryRow(env.ctx, "SELECT count(*)=1 AND bool_and(applied_at IS NOT NULL AND consumed_at IS NOT NULL) FROM run_user_inputs WHERE run_id=$1 AND kind='cancel'", run).Scan(&settled); err != nil || !settled {
 				t.Fatalf("settled receipt=%v err=%v", settled, err)
 			}
 		})
