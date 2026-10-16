@@ -188,7 +188,7 @@ var (
 // size, including jumbo frames). Validate syntax and length before any numeric
 // comparison so shell integer width and octal parsing cannot affect the result.
 // Successful discovery can only lower Docker's default MTU of 1500. Incomplete
-// discovery warns and preserves the original daemon launch without MTU options.
+// discovery stops startup before config generation or daemon invocation.
 // Docker 29 accepts default-network-opts only in daemon JSON, so keep that
 // setting in a private sidecar-local file and the listener/bridge MTU in argv.
 func rootfulDindCommand(netDir string) []string {
@@ -196,33 +196,29 @@ func rootfulDindCommand(netDir string) []string {
     printf 'dind MTU: %s\n' "$1" >&2
     exit 1
 }
-fallback() {
-    printf 'dind MTU: warning: %s; using original daemon launch\n' "$1" >&2
-    exec dockerd --host=tcp://127.0.0.1:2375 --tls=false
-}
-[ -d "$1" ] || fallback "network interface directory unavailable: $1"
+[ -d "$1" ] || fail "network interface directory unavailable: $1"
 min=
 # One startup snapshot, one read per interface; validate all before applying the cap.
 for iface in "$1"/* "$1"/.[!.]* "$1"/..?*; do
-    [ -e "$iface" ] || [ -L "$iface" ] || continue
+    [ -d "$iface" ] || [ -L "$iface" ] || continue
     [ "${iface##*/}" != lo ] || continue
     file="$iface/mtu"
     # The sentinel preserves trailing newlines through command substitution.
-    mtu=$(cat "$file" 2>/dev/null && printf '.') || fallback "cannot read MTU: $file"
+    mtu=$(cat "$file" 2>/dev/null && printf '.') || fail "cannot read MTU: $file"
     mtu=${mtu%.}
     # Accept the kernel's single terminating newline, but no extra lines.
     mtu=${mtu%"
 "}
     case "$mtu" in
-        ''|0*|*[!0-9]*) fallback "invalid MTU (expected decimal 1..65535): $file" ;;
+        ''|0*|*[!0-9]*) fail "invalid MTU (expected decimal 1..65535): $file" ;;
     esac
-    [ "${#mtu}" -le 5 ] || fallback "MTU exceeds 65535: $file"
-    [ "$mtu" -le 65535 ] || fallback "MTU exceeds 65535: $file"
+    [ "${#mtu}" -le 5 ] || fail "MTU exceeds 65535: $file"
+    [ "$mtu" -le 65535 ] || fail "MTU exceeds 65535: $file"
     if [ -z "$min" ] || [ "$mtu" -lt "$min" ]; then
         min=$mtu
     fi
 done
-[ -n "$min" ] || fallback "no non-loopback interface MTU in $1"
+[ -n "$min" ] || fail "no non-loopback interface MTU in $1"
 [ "$min" -le 1500 ] || min=1500
 umask 077
 config=$(mktemp /tmp/uzi-dind-daemon.XXXXXX) || fail "cannot create daemon config in /tmp"

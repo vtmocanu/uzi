@@ -46,12 +46,12 @@ type dindLaunch struct {
 }
 
 type dindLaunchOptions struct {
-	expectFallback bool
-	configFailure  string
+	expectDiscoveryFailure bool
+	configFailure          string
 }
 
 // runRenderedDind executes the actual rendered Command and Args, replacing only
-// the sysfs positional argument. Config capture is required unless fallback is expected.
+// the sysfs positional argument. Discovery failures must leave no daemon or config artifacts.
 func runRenderedDind(t *testing.T, dind corev1.Container, netDir string, options ...dindLaunchOptions) (dindLaunch, string, error) {
 	t.Helper()
 	if len(dind.Command) != 5 || dind.Command[0] != "/bin/sh" || dind.Command[1] != "-c" ||
@@ -82,8 +82,8 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 	if len(options) == 1 {
 		opts = options[0]
 	}
-	if opts.expectFallback && opts.configFailure != "" {
-		t.Fatal("fallback and config failure expectations are mutually exclusive")
+	if opts.expectDiscoveryFailure && opts.configFailure != "" {
+		t.Fatal("discovery and config failure expectations are mutually exclusive")
 	}
 	if opts.configFailure != "" {
 		switch opts.configFailure {
@@ -115,6 +115,14 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	if opts.expectDiscoveryFailure {
+		for _, path := range []string{capture, configPath, configCapture} {
+			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+				t.Errorf("discovery failure must not create daemon argv, config, or config capture %q: %v", path, statErr)
+			}
+		}
+		return dindLaunch{}, stderr.String(), err
+	}
 	data, readErr := os.ReadFile(capture) //nolint:gosec // G304: reads the fake daemon capture under t.TempDir.
 	if os.IsNotExist(readErr) {
 		return dindLaunch{}, stderr.String(), err
@@ -126,14 +134,6 @@ printf '%s\n' "$DIND_CONFIG_PATH"
 		t.Fatalf("invalid fake daemon argv capture: %q", data)
 	}
 	argv := strings.Split(string(data[:len(data)-1]), "\x00")
-	if opts.expectFallback {
-		for _, path := range []string{configPath, configCapture} {
-			if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
-				t.Fatalf("fallback must not create config or capture %q: %v", path, statErr)
-			}
-		}
-		return dindLaunch{argv: argv}, stderr.String(), err
-	}
 	configData, readErr := os.ReadFile(configCapture) //nolint:gosec // G304: fake daemon capture under t.TempDir.
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -179,6 +179,8 @@ func TestNonRootlessDindMTU(t *testing.T) {
 		want       string
 	}{
 		{"1400", []dindMTUInterface{{"ens5", "1400\n"}}, "1400"},
+		{"control-file", []dindMTUInterface{{"ens5", "1400\n"}}, "1400"},
+		{"symlink-directory", []dindMTUInterface{{"ens5", "1500\n"}}, "1400"},
 		{"1500", []dindMTUInterface{{"ens5", "1500\n"}}, "1500"},
 		{"jumbo", []dindMTUInterface{{"ens5", "9000\n"}}, "1500"},
 		{"minimum-first", []dindMTUInterface{{"a", "1400\n"}, {"z", "9000\n"}}, "1400"},
@@ -193,7 +195,19 @@ func TestNonRootlessDindMTU(t *testing.T) {
 		{"without-newline", []dindMTUInterface{{"ens5", "1400"}}, "1400"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), dindMTUFixture(t, tt.interfaces))
+			netDir := dindMTUFixture(t, tt.interfaces)
+			switch tt.name {
+			case "control-file":
+				if err := os.WriteFile(filepath.Join(netDir, "bonding_masters"), []byte("bond0\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink-directory":
+				deviceDir := dindMTUFixture(t, []dindMTUInterface{{"device", "1400\n"}})
+				if err := os.Symlink(filepath.Join(deviceDir, "device"), filepath.Join(netDir, "net1")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir)
 			if err != nil || stderr != "" {
 				t.Fatalf("launch: %v; stderr: %s", err, stderr)
 			}
@@ -243,7 +257,7 @@ func TestNonRootlessDindMTUConfigFailClosed(t *testing.T) {
 	}
 }
 
-func TestNonRootlessDindMTUFallback(t *testing.T) {
+func TestNonRootlessDindMTUDiscoveryFailClosed(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
 		value string
@@ -266,6 +280,7 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 		{"missing-mtu", ""},
 		{"unreadable-mtu-directory", ""},
 		{"no-interfaces", ""},
+		{"only-control-file", ""},
 		{"only-loopback", ""},
 		{"missing-net-directory", ""},
 		{"invalid-before-valid", "abc\n"},
@@ -276,7 +291,7 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var interfaces []dindMTUInterface
 			switch tt.name {
-			case "no-interfaces", "missing-net-directory":
+			case "no-interfaces", "only-control-file", "missing-net-directory":
 			case "invalid-before-valid":
 				interfaces = []dindMTUInterface{{"a-broken", tt.value}, {"z-valid", "1400\n"}}
 			case "dot-invalid":
@@ -313,19 +328,19 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+			case "only-control-file":
+				if err := os.WriteFile(filepath.Join(netDir, "bonding_masters"), []byte("bond0\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
 			case "missing-net-directory":
 				netDir = filepath.Join(netDir, "absent")
 			}
-			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, dindLaunchOptions{expectFallback: true})
-			if err != nil {
-				t.Fatalf("fallback launch failed: %v; stderr=%q", err, stderr)
+			launch, stderr, err := runRenderedDind(t, renderedRootfulDind(t), netDir, dindLaunchOptions{expectDiscoveryFailure: true})
+			if err == nil {
+				t.Errorf("discovery failure must stop startup; stderr=%q", stderr)
 			}
-			want := []string{"--host=tcp://127.0.0.1:2375", "--tls=false"}
-			if !reflect.DeepEqual(launch.argv, want) {
-				t.Fatalf("fallback argv = %q, want %q", launch.argv, want)
-			}
-			if launch.config != nil || launch.configPath != "" {
-				t.Fatalf("fallback has config: %#v", launch)
+			if launch.argv != nil || launch.config != nil || launch.configPath != "" {
+				t.Fatalf("daemon launched on discovery failure: %#v", launch)
 			}
 			reason := "invalid MTU (expected decimal 1..65535): " + mtuPath
 			switch tt.name {
@@ -335,14 +350,14 @@ func TestNonRootlessDindMTUFallback(t *testing.T) {
 				reason = "MTU exceeds 65535: " + mtuPath
 			case "missing-mtu", "unreadable-mtu-directory", "dot-dangling-symlink":
 				reason = "cannot read MTU: " + mtuPath
-			case "no-interfaces", "only-loopback":
+			case "no-interfaces", "only-control-file", "only-loopback":
 				reason = "no non-loopback interface MTU in " + netDir
 			case "missing-net-directory":
 				reason = "network interface directory unavailable: " + netDir
 			}
-			wantWarning := "dind MTU: warning: " + reason + "; using original daemon launch\n"
-			if stderr != wantWarning {
-				t.Fatalf("fallback warning = %q, want %q", stderr, wantWarning)
+			wantDiagnostic := "dind MTU: " + reason + "\n"
+			if stderr != wantDiagnostic {
+				t.Fatalf("discovery diagnostic = %q, want %q", stderr, wantDiagnostic)
 			}
 		})
 	}
