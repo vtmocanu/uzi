@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,14 +218,20 @@ func TestPolicyLateBudgetMetadataLiveDB(t *testing.T) {
 	before := mustRun(t, e.codexTestEnv, e.runID)
 	req := policyRequest()
 	latest := true
+	session := "budget-refused-thread"
+	req.SessionID = &session
 	req.CheckpointContainsLatest = &latest
 	r, d, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
 	if err != nil || string(d) != "recorded" || r.PolicyRefusalCount != 1 {
 		t.Fatalf("budget metadata: disposition=%s count=%d err=%v", d, r.PolicyRefusalCount, err)
 	}
+	if r.SessionID.String != session {
+		t.Fatal("budget policy report lost the refused conversation identity")
+	}
 	if r.HoldCapturedHead.String != req.Head || !r.CheckpointContainsLatest.Valid || !r.CheckpointContainsLatest.Bool {
 		t.Fatal("budget policy preservation does not identify the reported source")
 	}
+	before.SessionID = r.SessionID
 	before.HoldCapturedHead = r.HoldCapturedHead
 	before.CheckpointContainsLatest = r.CheckpointContainsLatest
 	if !reflect.DeepEqual(latePolicyLive(before), latePolicyLive(r)) {
@@ -234,6 +241,15 @@ func TestPolicyLateBudgetMetadataLiveDB(t *testing.T) {
 	if err != nil || d != PolicyHoldAlreadyApplied || r.PolicyRefusalCount != 1 {
 		t.Fatalf("duplicate=%s count=%d err=%v", d, r.PolicyRefusalCount, err)
 	}
+	latePolicyExec(t, e, "UPDATE runs SET budget_extension_seconds=3600 WHERE id=$1", e.runID)
+	resumed, err := e.svc.ResumePolicyHold(e.ctx, e.userID, e.runID, PolicyHoldActionToken(r), PolicyResumeRequest{Mode: "fresh"})
+	if err != nil || resumed.SessionID.Valid || resumed.WorkerID.Valid || resumed.PolicyFreshClaimGeneration.Int64 != 2 {
+		t.Fatalf("budget fresh choice: generation grant=%v session=%v worker=%v err=%v", resumed.PolicyFreshClaimGeneration, resumed.SessionID, resumed.WorkerID, err)
+	}
+	var audit string
+	if err := e.pool.QueryRow(e.ctx, "SELECT body FROM run_user_inputs WHERE run_id=$1 AND kind='resume'", e.runID).Scan(&audit); err != nil || !strings.Contains(audit, session) {
+		t.Fatalf("prior refused conversation absent from fresh audit: body=%q err=%v", audit, err)
+	}
 }
 
 func TestPolicyLateHistoricalAuthorizationLiveDB(t *testing.T) {
@@ -242,6 +258,8 @@ func TestPolicyLateHistoricalAuthorizationLiveDB(t *testing.T) {
 			e := setupPolicyHold(t)
 			req := policyRequest()
 			hold := latePolicyHold(t, e)
+			oldSession := "historical-refused-thread"
+			req.SessionID = &oldSession
 			switch mode {
 			case "missing":
 				latePolicyExec(t, e, "DELETE FROM recovery_custody_holds WHERE id=$1", hold)

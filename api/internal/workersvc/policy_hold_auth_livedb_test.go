@@ -65,7 +65,7 @@ func TestPolicyHoldDuplicateCurrentGenerationLiveDB(t *testing.T) {
 	if err != nil || d != PolicyHoldAlreadyApplied || !reflect.DeepEqual(before, after) {
 		t.Fatalf("duplicate changed current owner action: %s %v", d, err)
 	}
-	// M1 has no grant producer; this injected future grant must survive deduplication.
+	// A grant for the current claim must survive delivery of an already applied outcome.
 	if after.PolicyFreshClaimGeneration.Int64 != 2 {
 		t.Fatal("duplicate burned grant")
 	}

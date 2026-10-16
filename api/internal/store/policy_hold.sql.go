@@ -215,19 +215,20 @@ func (q *Queries) LockPolicyHistoricalCustody(ctx context.Context, arg LockPolic
 
 const recordPolicyHoldMetadata = `-- name: RecordPolicyHoldMetadata :one
 UPDATE runs SET
- policy_refusal_count = policy_refusal_count + CASE WHEN $1::text = 'refused' THEN 1 ELSE 0 END,
- policy_last_tag = CASE WHEN $1 = 'refused' THEN $2::text ELSE policy_last_tag END,
- policy_last_phase = CASE WHEN $1 = 'refused' THEN $3::text ELSE policy_last_phase END,
- policy_last_correlation_id = CASE WHEN $1 = 'refused' THEN $4::text ELSE policy_last_correlation_id END,
- policy_last_refused_at = CASE WHEN $1 = 'refused' THEN now() ELSE policy_last_refused_at END,
- policy_last_outcome_id = $5, policy_last_source_generation = $6,
- hold_captured_head = CASE WHEN $7::boolean THEN $8::text ELSE hold_captured_head END,
- checkpoint_contains_latest = CASE WHEN $7 THEN $9::boolean ELSE checkpoint_contains_latest END,
- policy_hold_detail = CASE WHEN $7 THEN $1 ELSE policy_hold_detail END,
- policy_hold_provenance = CASE WHEN $7 THEN $10::text ELSE policy_hold_provenance END,
- policy_hold_published = CASE WHEN $7 THEN $11::boolean ELSE policy_hold_published END,
+ session_id = CASE WHEN $1::boolean THEN COALESCE($2::text, session_id) ELSE session_id END,
+ policy_refusal_count = policy_refusal_count + CASE WHEN $3::text = 'refused' THEN 1 ELSE 0 END,
+ policy_last_tag = CASE WHEN $3 = 'refused' THEN $4::text ELSE policy_last_tag END,
+ policy_last_phase = CASE WHEN $3 = 'refused' THEN $5::text ELSE policy_last_phase END,
+ policy_last_correlation_id = CASE WHEN $3 = 'refused' THEN $6::text ELSE policy_last_correlation_id END,
+ policy_last_refused_at = CASE WHEN $3 = 'refused' THEN now() ELSE policy_last_refused_at END,
+ policy_last_outcome_id = $7, policy_last_source_generation = $8,
+ hold_captured_head = CASE WHEN $1::boolean THEN $9::text ELSE hold_captured_head END,
+ checkpoint_contains_latest = CASE WHEN $1 THEN $10::boolean ELSE checkpoint_contains_latest END,
+ policy_hold_detail = CASE WHEN $1 THEN $3 ELSE policy_hold_detail END,
+ policy_hold_provenance = CASE WHEN $1 THEN $11::text ELSE policy_hold_provenance END,
+ policy_hold_published = CASE WHEN $1 THEN $12::boolean ELSE policy_hold_published END,
  updated_at = now()
-WHERE id = $12 AND status NOT IN ('completed', 'failed', 'cancelled')
+WHERE id = $13 AND status NOT IN ('completed', 'failed', 'cancelled')
  AND harness = 'codex' AND NOT interactive
  AND kind IN ('issue', 'task', 'prompt', 'self_improve')
  AND stop_kind IS NULL
@@ -235,13 +236,14 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type RecordPolicyHoldMetadataParams struct {
+	RecordPreservation       bool        `json:"record_preservation"`
+	SessionID                pgtype.Text `json:"session_id"`
 	Detail                   string      `json:"detail"`
 	Tag                      pgtype.Text `json:"tag"`
 	Phase                    pgtype.Text `json:"phase"`
 	CorrelationID            pgtype.Text `json:"correlation_id"`
 	OutcomeID                pgtype.UUID `json:"outcome_id"`
 	SourceGeneration         pgtype.Int8 `json:"source_generation"`
-	RecordPreservation       bool        `json:"record_preservation"`
 	Head                     pgtype.Text `json:"head"`
 	CheckpointContainsLatest pgtype.Bool `json:"checkpoint_contains_latest"`
 	Provenance               pgtype.Text `json:"provenance"`
@@ -249,17 +251,18 @@ type RecordPolicyHoldMetadataParams struct {
 	ID                       uuid.UUID   `json:"id"`
 }
 
-// Authorized under worker/run/custody locks. No live claim, owner choice, session,
+// Authorized under worker/run locks and historical custody when required. No live claim, owner choice, session,
 // clock, scope, grant, gate, or execution fields belong to historical delivery.
 func (q *Queries) RecordPolicyHoldMetadata(ctx context.Context, arg RecordPolicyHoldMetadataParams) (Run, error) {
 	row := q.db.QueryRow(ctx, recordPolicyHoldMetadata,
+		arg.RecordPreservation,
+		arg.SessionID,
 		arg.Detail,
 		arg.Tag,
 		arg.Phase,
 		arg.CorrelationID,
 		arg.OutcomeID,
 		arg.SourceGeneration,
-		arg.RecordPreservation,
 		arg.Head,
 		arg.CheckpointContainsLatest,
 		arg.Provenance,

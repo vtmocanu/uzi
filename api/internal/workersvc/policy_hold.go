@@ -215,7 +215,7 @@ func (s *Service) ReportPolicyHold(ctx context.Context, w store.Worker, id uuid.
 			Tag:              policyText(req.Tag), Phase: policyText(req.Phase), CorrelationID: policyText(req.CorrelationID),
 			RecordPreservation: budgetPark, Provenance: policyText(&provenance),
 			Head: policyTextNonempty(req.Head), CheckpointContainsLatest: policyBool(req.CheckpointContainsLatest),
-			Published: pgtype.Bool{Bool: req.Published, Valid: true},
+			Published: pgtype.Bool{Bool: req.Published, Valid: true}, SessionID: policyText(req.SessionID),
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return r, PolicyHoldPending, nil

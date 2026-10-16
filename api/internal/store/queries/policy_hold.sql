@@ -210,9 +210,10 @@ WHERE run_id = @run_id AND generation = @generation
 FOR UPDATE;
 
 -- name: RecordPolicyHoldMetadata :one
--- Authorized under worker/run/custody locks. No live claim, owner choice, session,
+-- Authorized under worker/run locks and historical custody when required. No live claim, owner choice, session,
 -- clock, scope, grant, gate, or execution fields belong to historical delivery.
 UPDATE runs SET
+ session_id = CASE WHEN @record_preservation::boolean THEN COALESCE(sqlc.narg('session_id')::text, session_id) ELSE session_id END,
  policy_refusal_count = policy_refusal_count + CASE WHEN @detail::text = 'refused' THEN 1 ELSE 0 END,
  policy_last_tag = CASE WHEN @detail = 'refused' THEN sqlc.narg('tag')::text ELSE policy_last_tag END,
  policy_last_phase = CASE WHEN @detail = 'refused' THEN sqlc.narg('phase')::text ELSE policy_last_phase END,
