@@ -84,7 +84,7 @@ export type AnswerVerdict =
   { kind: "answer"; answers: string[] } | { kind: "cancel" };
 
 export interface SteeringOptions {
-  /** Observe sticky cancellation before synchronous model/lifecycle abort listeners. */
+  /** Observe authenticated cancellation before synchronous model/lifecycle abort listeners. */
   onCancel?: () => void;
   /** Injectable sleep so tests can drive the poll loop deterministically. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -676,9 +676,17 @@ export class SteeringChannel {
     // A fenced flight owes nothing more: an APPLIED still in flight is let go with the rest.
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
     this.stopped = true;
-    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
-    this.abortLifecycle(signal);
-    this.rejectParkedWaiters(signal);
+    try {
+      // This exact server cancellation starts the same maintenance clock as an input cancel.
+      // Install the fence first: observing cancellation grants no report or custody authority.
+      if (reason === "terminal_cancelled") this.onCancel?.();
+    } finally {
+      try { if (!this.cancel.signal.aborted) this.cancel.abort(signal); }
+      finally {
+        this.abortLifecycle(signal);
+        this.rejectParkedWaiters(signal);
+      }
+    }
   }
 
   /** Issue #1673: a failed receipt request. A fence reason ends the flight or drops the batch;

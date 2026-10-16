@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Server-side cancellation shares the recovery maintenance deadline ([#3030](https://github.com/vtmocanu/uzi/issues/3030)).**
+  A worker observing an exact terminal cancellation starts the same ten-minute maintenance budget before aborting its flight, while preserving the claim fence and retaining unresolved local work.
+
 - **Keep recovery retries and immutable FINAL replay progressing (#3030).**
   A held-publication request lost before delivery can retry its frozen pack through the existing at-most-once server marker. Saved FINAL requests still reach the receipt check after an API rollback, and valid archive coverage no longer inherits the optional redundancy proof's smaller head, commit-size or encoding limits.
 

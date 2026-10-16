@@ -20,6 +20,8 @@ it("every documented production cancellation route maps to existing preservation
     routes++;
   }
   assert.ok(routes > 0, "production route mapping must not be empty");
+  assert.match(consumerRows, /\| steering\.ts[^\n]*terminal_cancelled[^\n]*terminal-cancelled\.test\.ts[^\n]*runner-cancellation-deadline\.test\.ts/,
+    "server-side terminal cancellation needs an explicit deadline and retained-source coverage mapping");
 });
 
 it("tracked cancellation inventory enumerates every named SQL run-cancellation writer", async () => {

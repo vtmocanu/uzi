@@ -9,6 +9,47 @@ import { api, fakeGitlab, git, gitlabClaim, installHarness, runnerWith, worktree
 
 installHarness();
 
+for (const expired of [false, true]) {
+  it(`server terminal cancellation shares the first deadline and retains fenced source (${expired ? "expired" : "active"})`, async () => {
+    const iid = expired ? 30312 : 30311;
+    const claim = gitlabClaim(iid, { claim_generation: 7 });
+    let now = 10;
+    let factories = 0;
+    let budget: MaintenanceBudget | undefined;
+    let atAbort: MaintenanceBudget | undefined;
+    const executor: Executor = {
+      async run(ctx) {
+        const stopped = new Promise<void>(resolve => ctx.signal!.addEventListener("abort", () => {
+          atAbort = MaintenanceBudget.current();
+          now += expired ? 600_001 : 1;
+          resolve();
+        }, { once: true }));
+        api.rawInputGets(claim.run_id, {
+          inputs: [], terminal_cancelled: { run_id: claim.run_id, generation: 7 },
+        });
+        await stopped;
+        throw new Error("server terminal cancellation");
+      },
+      killAgentTree() {},
+    };
+    const { gitlab, calls } = fakeGitlab();
+    const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      cancellationBudgetFactory: () => {
+        factories++;
+        return budget = new MaintenanceBudget(600_000, () => now);
+      },
+    });
+    await runner.execute(claim);
+    assert.equal(factories, 1, "the authenticated control initializes exactly one budget");
+    assert.equal(atAbort, budget, "model abort continuations inherit that budget");
+    assert.equal(budget!.deadline, 600_010);
+    assert.equal(fs.existsSync(worktreeDirFor(iid)), true, "fencing and expiry both retain the local source");
+    assert.ok(!api.states.some(s => s.runId === claim.run_id &&
+      ["failed", "completed", "cancelled"].includes(s.body.status)), "no competing terminal report");
+    assert.equal(calls.length, 0, "a fence grants no forge publication authority");
+  });
+}
+
 
 it("cancellation observed in an active maintenance scope reuses its original budget", async () => {
   const budget = new MaintenanceBudget();
