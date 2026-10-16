@@ -112,6 +112,7 @@ import {
   admitPolicyTurn,
   isPolicyRefusalTag,
   ProviderPolicyRefusal,
+  PolicyResumeRejected,
   validatePolicyRefusal,
 } from "../provider-policy-refusal.js";
 import type { CallbackResult, CodexCallbackBroker } from "./broker.js";
@@ -1139,6 +1140,9 @@ export class CodexHarness implements RunHarness {
       //    and NEVER a hook-trust bypass. Reused across turns once established.
       if (this.threadId === undefined) {
         const resumed = request.resumeSessionId !== undefined;
+        if (!resumed && request.policyHoldResume === true && request.policyHoldFreshSession !== true) {
+          throw new PolicyResumeRejected();
+        }
         this.resumedRoot = resumed;
         this.threadId = resumed
           ? await this.resumeThread(transport, request, rendered)
@@ -1550,9 +1554,15 @@ export class CodexHarness implements RunHarness {
       if (request.signal.aborted || !(error instanceof CodexTransportError) ||
           error.failure.category !== "protocol" ||
           !error.message.startsWith("codex app-server returned a JSON-RPC error")) throw error;
+      if (request.policyHoldResume === true && request.policyHoldFreshSession !== true) throw new PolicyResumeRejected();
       throw new CodexResumeError();
     }
     const id = res?.thread?.id;
+    if (request.policyHoldResume === true && (typeof id !== "string" || id.length === 0 || id !== resumeId)) {
+      // A provider-substituted identity is not preservation, even with a fresh grant.
+      if (request.policyHoldFreshSession !== true) throw new PolicyResumeRejected();
+      throw new CodexResumeError();
+    }
     if (typeof id !== "string" || id.length === 0) throw new CodexResumeError();
     return id;
   }

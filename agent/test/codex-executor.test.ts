@@ -46,6 +46,7 @@ import {
 } from "../src/codex/codex-executor.js";
 import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.js";
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
+
 import { RunRunner } from "../src/runner.js";
 import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache } from "../src/git.js";
@@ -467,6 +468,165 @@ function tokenUsageUpdated(
     params: { threadId, turnId, tokenUsage: usage },
   };
 }
+
+describe("M1 policy hold executor transport (#3068)", () => {
+  for (const kind of [undefined, "ci_fix", "job", "chat", "judge", "mr_rework"] as const) {
+    it(`excludes unadmitted kind ${String(kind)} from refusal precedence`, async () => {
+      let mode: "wall" | null = null;
+      let interrupt: (() => void) | undefined;
+      let parks = 0;
+      const rig = makeRig();
+      rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+        params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+      const { ctx } = makeCtx({ kind, policyHoldSupported: true,
+        onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode,
+        parkForWall: async () => { parks++; return "parked"; } });
+      const emit = ctx.emit;
+      ctx.emit = message => {
+        emit(message);
+        if (message.payload.event === "provider_policy_refusal") { mode = "wall"; interrupt?.(); }
+      };
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 excluded kind");
+      assert.ok(result.walled);
+      assert.equal(parks, 1);
+      assert.equal(rig.transport.turnStartCount, 1);
+    });
+  }
+  for (const phase of ["plan", "implement"] as const) {
+    for (const mode of ["missing", "rejected", "substituted", "preserved", "unmarked"] as const) {
+      it(`${phase} ${mode} resume authority`, async () => {
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/resume") {
+            if (mode === "rejected" || mode === "unmarked") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+            return { thread: { id: mode === "substituted" ? "different" : "th-1" } };
+          }
+          if (c.method === "thread/start") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            if (phase === "plan") c.transport.push(toolCall(1, "submit_plan", { plan_md: "preserved plan" }, "th-1", "tn-1", "c-plan")).push(turnCompleted("completed"));
+            else c.transport.push(signalDone()).push(turnCompleted("completed"));
+            return { turn: { id: "tn-1" } };
+          }
+          return {};
+        } });
+        const { ctx, emitted } = makeCtx({ policyHoldSupported: true, policyHoldResume: mode !== "unmarked",
+          sessionId: mode === "missing" ? undefined : "th-1", planApproved: phase !== "plan",
+          gatePlan: async () => { throw new Error("plan reached"); } });
+        const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 resume");
+        const blocked = mode === "missing" || mode === "rejected" || mode === "substituted";
+        if (blocked) await assert.rejects(running, (err: Error) => err.name === "PolicyResumeRejected");
+        else if (phase === "plan") await assert.rejects(running, /plan reached/);
+        else await running;
+        assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, mode === "unmarked" ? 1 : 0);
+        assert.equal(rig.transport.turnStartCount, blocked ? 0 : 1);
+        assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length, mode === "unmarked" ? 1 : 0);
+      });
+    }
+    for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
+      for (const control of ["none", "now", "wall", "cancel"] as const) it(`${phase} ${tag} precedence ${control}`, async () => {
+        let interrupt: (() => void) | undefined;
+        let mode: "now" | "wall" | null = null;
+        let cancelled = false;
+        let parks = 0;
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            c.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+              params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: tag } } } });
+            return { turn: { id: "tn-1" } };
+          }
+          return {};
+        } });
+        const { ctx, emitted } = makeCtx({ kind: "issue", policyHoldSupported: true, planApproved: phase !== "plan",
+          gatePlan: async () => { throw new Error("unexpected gate"); },
+          onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          parkForWall: async () => { parks++; return "parked"; }, parkForPause: async () => { parks++; return true; } });
+        const emit = ctx.emit;
+        ctx.emit = m => {
+          emit(m);
+          if (m.payload.event === "provider_policy_refusal") {
+            if (control === "cancel") cancelled = true;
+            if (control === "now" || control === "wall") { mode = control; interrupt?.(); }
+          }
+        };
+        await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 precedence"), (err: Error) => {
+          if (control === "cancel") return /cancel/i.test(err.message) && !(err instanceof ProviderPolicyRefusal);
+          assert.ok(err instanceof ProviderPolicyRefusal, `got ${err.name}: ${err.message}`);
+          assert.equal(err.policyRefusal.policy_tag, tag);
+          assert.equal(err.policyRefusal.phase, phase === "plan" ? "planning" : "implementation");
+          return true;
+        });
+        assert.equal(parks, 0);
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+      });
+    }
+  }
+  it("retains the constraint after a successful turn and epoch recreation", async () => {
+    const rig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt")).push(turnCompleted("completed", th, tn));
+      }),
+      c => {
+        if (c.method === "thread/resume") throw new CodexTransportError({
+          category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)",
+        });
+        return {};
+      },
+    ]);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1", policyHoldSupported: true, policyHoldResume: true,
+      checkpoint: async () => undefined });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 recreated epoch"),
+      (err: Error) => err.name === "PolicyResumeRejected");
+    assert.equal(rig.providerLaunches(), 2);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 0);
+    assert.equal(rig.epochs.flatMap(e => e.transport.requests).filter(r => r.method === "thread/start").length, 0);
+    assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length, 0);
+    assert.equal(ctx.policyHoldResume, true);
+  });
+  it("reports failed persistence and preserves the typed outcome with deferred registry teardown", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+      sessionStore: { ...rig.deps.sessionStore!, persist: async () => { throw new Error("PROVIDER_PRIVATE_DETAIL"); } } };
+    const warnings: string[] = [];
+    const details: unknown[] = [];
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (message, fields) => { warnings.push(message); details.push(fields); } });
+    try {
+      await assert.rejects(withTimeout(executor.run(makeCtx({ kind: "issue", policyHoldSupported: true }).ctx),
+        3000, "M1 persist degradation"), ProviderPolicyRefusal);
+      assert.ok(warnings.includes("Codex session persistence failed"));
+      assert.ok(!JSON.stringify(details).includes("PROVIDER_PRIVATE_DETAIL"));
+      assert.equal(rig.sessionOps.removeCalls, 0);
+    } finally { await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 200 }); }
+  });
+  it("Cancel arriving during policy cleanup wins after sibling cleanup settles", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const abort = new AbortController();
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    executor.closeAndSettlePlanSummary = async () => { abort.abort(); throw new Error("summary cleanup failed"); };
+    await assert.rejects(withTimeout(executor.run(makeCtx({ kind: "issue", policyHoldSupported: true, signal: abort.signal }).ctx),
+      3000, "M1 cleanup cancel"), /run cancelled/);
+    assert.ok(rig.transport.closes > 0);
+  });
+  it("retains the admitted refusal when final summary cleanup rejects", async () => {
+    const rig = makeRig();
+    rig.transport.push({ kind: "turn_completed", method: "turn/completed", threadId: "th-1", turnId: "tn-1", status: "failed",
+      params: { threadId: "th-1", turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const details: unknown[] = [];
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (_message, fields) => { details.push(fields); } });
+    executor.closeAndSettlePlanSummary = async () => { throw new Error("PROVIDER_PRIVATE_DETAIL"); };
+    await assert.rejects(withTimeout(executor.run(makeCtx({
+      kind: "issue", policyHoldSupported: true,
+    }).ctx), 3000, "M1 cleanup"), ProviderPolicyRefusal);
+    assert.ok(rig.transport.closes > 0, "transport cleanup still runs");
+    assert.ok(!JSON.stringify(details).includes("PROVIDER_PRIVATE_DETAIL"));
+  });
+});
+
 
 // --- binding + client + context builders ---------------------------------------
 function bindingOf(codex: Record<string, unknown>): CodexBinding {

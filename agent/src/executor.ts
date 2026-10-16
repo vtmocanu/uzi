@@ -266,6 +266,10 @@ export interface RunContext {
    *  a resume locally, so passing an unresolvable id fails the whole run before the
    *  first turn instead of resuming anything. */
   sessionId?: string | null;
+  /** Negotiated worker admission, retained refusal constraint, and exact-claim fresh grant. */
+  policyHoldSupported?: boolean;
+  policyHoldResume?: boolean;
+  policyHoldFreshSession?: boolean;
   /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
    *  already carries pushed work. Forwarded to the planning prompt so an amnesiac lead is
    *  told to read the existing commits rather than redo them — the honest degradation must

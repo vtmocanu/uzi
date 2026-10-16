@@ -55,6 +55,7 @@
 
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
+import { PolicyResumeRejected, ProviderPolicyRefusal } from "../provider-policy-refusal.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -1946,6 +1947,14 @@ function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
   return Math.min(5_000, Math.max(1, Math.floor(boundaryDeadlineMs / 4)));
 }
 
+
+function admittedPolicyOutcome(ctx: RunContext, error: unknown): error is PolicyResumeRejected | ProviderPolicyRefusal {
+  if (error instanceof PolicyResumeRejected) return ctx.policyHoldResume === true;
+  return ctx.policyHoldSupported === true && ctx.interactive !== true
+    && (ctx.kind === "issue" || ctx.kind === "task" || ctx.kind === "prompt" || ctx.kind === "self_improve")
+    && error instanceof ProviderPolicyRefusal && error.policyRefusal.origin === "root";
+}
+
 export class CodexExecutor implements Executor {
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
@@ -2349,6 +2358,21 @@ export class CodexExecutor implements Executor {
     // each epoch's local-execution epoch and its own owned HOME; `provisionDir` is the ONE per-run
     // provisioning dir the finally removes.
     let epoch: ProviderEpoch | undefined;
+    let policyOutcome: PolicyResumeRejected | ProviderPolicyRefusal | undefined;
+    const checkPolicyCancellation = (): void => {
+      if (policyOutcome && (ctx.cancelRequested?.() || (ctx.signal?.aborted && reasonForSignal(ctx.signal) === REASON_CANCEL))) {
+        throw new Error(REASON_CANCEL);
+      }
+    };
+    // Each existing cleanup runs once, serially, with its existing deadline. A failed step
+    // is reported and does not prevent sibling cleanup when preserving a policy outcome.
+    const cleanup = async (stage: string, operation: () => Promise<unknown>): Promise<void> => {
+      try { await operation(); }
+      catch (error) {
+        if (!policyOutcome) throw error;
+        this.log.warn("Codex policy hold cleanup degraded", { run_id: ctx.runId, stage });
+      }
+    };
     // Issue #1764: true once `epoch`'s session was persisted ahead of a sink that may reap its
     // provider root: a `ctx.checkpoint({ reap: true })`, or a wall park / completion hold, whose
     // runner-side capture runs the Codex boundary (quiesce + reap) on the LIVE root. It is set
@@ -3470,9 +3494,12 @@ export class CodexExecutor implements Executor {
       const codeSummary = await ctx.codeCrossCheckSummary?.();
       if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
       return completed;
+    } catch (error) {
+      if (admittedPolicyOutcome(ctx, error)) policyOutcome = error;
+      throw error;
     } finally {
       summaryState.closed = true;
-      await this.closeAndSettlePlanSummary();
+      await cleanup("summary", () => this.closeAndSettlePlanSummary());
       if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
         delete summaryResult.summaryPlan;
         delete summaryResult.summaryDeltas;
@@ -3480,7 +3507,7 @@ export class CodexExecutor implements Executor {
       this.summaryLifecycleClosed = true;
       this.summaryRunActive = false;
       lifecycleSignal.removeEventListener("abort", intentAbort);
-      await settleInstall();
+      await cleanup("install", settleInstall);
       ctx.signal?.removeEventListener("abort", forwardInstallAbort);
       if (!this.deps.deferRegistryTeardown || epoch === undefined) {
         ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
@@ -3496,8 +3523,9 @@ export class CodexExecutor implements Executor {
       if (epoch) {
         // Issue #1764: a reaped epoch's home is gone; its session was persisted right before the
         // reap, so re-persisting would only overwrite that generation with an empty one.
-        if (!reapedSinceLastPersist) await epoch.persistSession();
-        await this.tearDownEpoch(epoch.registry, epoch.harness, epoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown);
+        const finalEpoch = epoch;
+        if (!reapedSinceLastPersist) await cleanup("session persistence", () => finalEpoch.persistSession());
+        await cleanup("epoch teardown", () => this.tearDownEpoch(finalEpoch.registry, finalEpoch.harness, finalEpoch.fileopHandle, boundaryDeadlineMs, !this.deps.deferRegistryTeardown));
       }
       // (C) Evict the DURING-run released tokens (every epoch's provider-root launches + refreshes)
       // from the logger's secret set — AFTER the harness/transport is closed above, so no late log
@@ -3516,7 +3544,9 @@ export class CodexExecutor implements Executor {
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile symlinks).
       // The nix STORE is global (on the data volume), NOT here, so this never evicts the
       // warm-start cache. Best-effort, mirroring sdk-executor. Absent ⇒ nothing was provisioned.
-      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
+      if (provisionDir) await cleanup("provision directory", () => removeProvisionDir(provisionDir!, this.log));
+      // Cancel arriving during cleanup supersedes the retained policy outcome.
+      checkPolicyCancellation();
     }
   }
 
@@ -3818,15 +3848,17 @@ export class CodexExecutor implements Executor {
         resumeSessionId,
         buildPhaseBroker,
         // Persist THIS epoch's credential-free session subset into the SHARED store. Best-effort:
-        // a persist failure never blocks the reap/recreation (the store fails safe to a fresh
-        // session on the next adopt).
+        // a persist failure is reported and never blocks reap/recreation. A constrained
+        // request still requires its preserved identity or an exact fresh grant.
         // Issue #1782: an epoch recreated after a refused wall park persists nothing until its
         // provider has launched and adopted the session, so an unpopulated home never replaces the
         // generation persisted before the park.
         persistSession: async (): Promise<void> => {
           await settleDepsInstall();
           if (opts.persistAfterLaunchOnly && !launched) return;
-          await this.sessionStore.persist(codexHome, storeDir).catch(() => undefined);
+          await this.sessionStore.persist(codexHome, storeDir).catch(() => {
+            this.log.warn("Codex session persistence failed", { run_id: ctx.runId });
+          });
         },
         // Full teardown of an ABANDONED epoch on recreation: quiesce + reap (best-effort) +
         // disposeTools the registry (WITHOUT the onDispose token-eviction hook — a live token must
@@ -4015,6 +4047,7 @@ export class CodexExecutor implements Executor {
           // A rejected thread/resume has started no model turn. The persisted rollout may
           // have disappeared or the provider may refuse it despite a successful preflight.
           if (!resumeId || !(error instanceof CodexResumeError)) throw error;
+          if (ctx.policyHoldResume === true && ctx.policyHoldFreshSession !== true) throw new PolicyResumeRejected();
           this.log.warn("codex provider rejected resumed thread; starting a fresh session", { run_id: ctx.runId });
           ctx.emit({ kind: "status", agent: "worker", payload: {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
@@ -4068,6 +4101,11 @@ export class CodexExecutor implements Executor {
         }
       }
       if (terminal?.policyRefusal) {
+        const refusal = new ProviderPolicyRefusal(terminal.policyRefusal);
+        if (admittedPolicyOutcome(ctx, refusal)) {
+          if (tripReason === REASON_CANCEL || ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          throw refusal;
+        }
         const pending = ctx.cancelRequested?.() ? REASON_CANCEL : this.pendingInterruption(ctx, pauseNow, wall);
         if (pending !== undefined) trip(pending);
       }
@@ -4089,6 +4127,11 @@ export class CodexExecutor implements Executor {
       // bounded, scrubbed tail.
       if (rootText) result.finalText = scrubLeadText(rootText);
     } catch (err) {
+      // An admitted policy outcome survives pause/wall/vault trips; Cancel still wins.
+      if (admittedPolicyOutcome(ctx, err)) {
+        if (tripReason === REASON_CANCEL || ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        throw err;
+      }
       // (a) again: a trip beats the raw aborted/protocol error the iterator threw.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       throw err instanceof Error ? err : new Error(errMessage(err));
@@ -4244,6 +4287,10 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
+        if (admittedPolicyOutcome(ctx, caught)) {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+          throw caught;
+        }
         let err: unknown = idleOperation && caught instanceof PauseNowSignal
           ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
@@ -4657,6 +4704,9 @@ export class CodexExecutor implements Executor {
       systemPrompt,
       phase,
       parkRunSupported: ctx.parkRunSupported,
+      policyHoldSupported: ctx.policyHoldSupported,
+      policyHoldResume: ctx.policyHoldResume,
+      policyHoldFreshSession: ctx.policyHoldFreshSession,
       nonInteractiveIssue: parkRunEligible(ctx, phase),
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,

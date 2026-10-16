@@ -1261,6 +1261,9 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
 }
 
 export interface ClaimResponse {
+  /** Nonterminal refusal-count constraint and server-derived exact-claim fresh grant. */
+  policy_hold_resume?: boolean;
+  policy_hold_fresh_session?: boolean;
   /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
   park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */

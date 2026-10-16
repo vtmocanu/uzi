@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { CodexTransportError } from "../src/codex/transport.js";
+
 import { RunRunner } from "../src/runner.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -221,6 +223,56 @@ class FakeTransport implements CodexTransport {
     return Promise.resolve();
   }
 }
+
+describe("M1 policy hold harness authority (#3068)", () => {
+  for (const phase of ["plan", "implement"] as const) {
+    for (const mode of ["missing", "empty", "substituted", "rejected"] as const) {
+      it(`${phase} blocks constrained ${mode} before model work`, async () => {
+        const transport = new FakeTransport(method => {
+          if (method === "thread/resume") {
+            if (mode === "rejected") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+            return { thread: { id: mode === "empty" ? "" : "different" } };
+          }
+          return defaultResponder(method);
+        });
+        transport.end();
+        const { harness } = makeHarness({ transport });
+        try {
+          await assert.rejects(collect(harness.startTurn(makeRequest({
+            phase, policyHoldResume: true,
+            ...(mode === "missing" ? {} : { resumeSessionId: "preserved" }),
+          })).events), (err: Error) => err.name === "PolicyResumeRejected");
+          assert.equal(transport.requests.filter(r => r.method === "thread/start").length, 0);
+          assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 0);
+        } finally { await harness.close(); }
+      });
+    }
+    it(`${phase} permits exact preserve and subsequent existing-thread turns`, async () => {
+      const transport = new FakeTransport(method => method === "thread/resume"
+        ? { thread: { id: "preserved" } } : defaultResponder(method));
+      const { harness } = makeHarness({ transport });
+      try {
+        transport.push(turnCompleted("completed", undefined, "preserved"));
+        await collect(harness.startTurn(makeRequest({ phase, policyHoldResume: true, resumeSessionId: "preserved" })).events);
+        transport.push(turnCompleted("completed", undefined, "preserved"));
+        await collect(harness.startTurn(makeRequest({ phase, policyHoldResume: true })).events);
+        assert.equal(transport.requests.filter(r => r.method === "thread/start").length, 0);
+        assert.equal(transport.requests.filter(r => r.method === "thread/resume").length, 1);
+        assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 2);
+      } finally { await harness.close(); }
+    });
+  }
+  for (const constrained of [false, true]) it(`fresh start trusted grant control constrained=${constrained}`, async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(turnCompleted()).end();
+    try {
+      await collect(harness.startTurn(makeRequest({ policyHoldResume: constrained, policyHoldFreshSession: true })).events);
+      assert.equal(transport.requests.filter(r => r.method === "thread/start").length, 1);
+      assert.equal(transport.requests.filter(r => r.method === "turn/start").length, 1);
+    } finally { await harness.close(); }
+  });
+});
+
 
 // --- notification builders (the app-server wire vocabulary, per the M0 fixtures) -----
 

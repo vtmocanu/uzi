@@ -321,6 +321,11 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Trusted worker admission and until-terminal constraint; never prompt-derived. */
+  policyHoldSupported?: boolean;
+  policyHoldResume?: boolean;
+  /** Server-derived permission for this exact claim only (M2 owner action). */
+  policyHoldFreshSession?: boolean;
   /** Worker-derived park admission; never supplied by the model. */
   parkRunSupported?: boolean;
   nonInteractiveIssue?: boolean;

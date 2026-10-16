@@ -1,5 +1,14 @@
 import { randomBytes } from "node:crypto";
 
+/** Missing or refused preserved conversation; carries no fabricated refusal metadata. */
+export class PolicyResumeRejected extends Error {
+  readonly detail = "resume_rejected";
+  constructor() {
+    super("Codex policy hold resume rejected");
+    this.name = "PolicyResumeRejected";
+  }
+}
+
 export type PolicyRefusalTag = "cyberPolicy" | "misalignmentPolicyViolation";
 type Admission = {
   readonly correlation_id: string;
