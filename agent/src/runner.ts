@@ -8954,7 +8954,10 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
-        const policyObservation = await this.preparePolicyTerminalAck(runId, flight.claimGeneration, body);
+        // Nonterminal sends must enter the client in the released checked-state turn.
+        // Even an empty async policy probe would delay the session sender by a microtask.
+        const policyObservation = body.status === "completed" || body.status === "failed"
+          ? await this.preparePolicyTerminalAck(runId, flight.claimGeneration, body) : undefined;
         const sending = checked
           ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : this.client.reportState(runId, stamped, signal);

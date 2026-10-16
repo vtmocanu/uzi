@@ -35,6 +35,72 @@ describe("combined policy inventory", () => {
     assert.equal(snap.active[0]!.terminal_pending, true);
   });
 
+  it("merges only policy-affected runs and uses delivery inventory rather than source generation", () => {
+    const policies = [policy(RUN_A, 1, 4), policy(RUN_A, 2, 5)];
+    const reg = new ActiveRunRegistry(
+      () => [pt(RUN_A, 3), pt(RUN_A, 6), pt(RUN_B, 1), pt(RUN_B, 2)],
+      () => 3, () => policies,
+    );
+    const snap = reg.build();
+    assert.deepEqual(snap.active.map(e => [e.run_id, e.claim_generation]),
+      [[RUN_A, 6], [RUN_B, 1], [RUN_B, 2]]);
+    assert.deepEqual(snap.pending_all, [
+      { run_id: RUN_A, claim_generation: 6 },
+      { run_id: RUN_B, claim_generation: 1 },
+      { run_id: RUN_B, claim_generation: 2 },
+    ]);
+    assert.equal(snap.pending_overflow, false);
+  });
+
+  for (const cap of [0, 1, 8]) {
+    it(`old policy inventory preserves a newer live claim during prepare at cap ${cap}`, () => {
+      const policies = [policy(RUN_A, 1, 1)];
+      const original = structuredClone(policies);
+      let calls = 0;
+      const reg = new ActiveRunRegistry(undefined, () => cap, () => {
+        calls += 1;
+        return calls === 1 ? policies : [];
+      });
+      reg.add(RUN_A, 3);
+      reg.setPhase(RUN_A, "awaiting_input");
+      const snap = reg.build();
+      assert.equal(calls, 1, "one policy observation feeds the whole projection");
+      assert.deepEqual(snap.active, [
+        { run_id: RUN_A, claim_generation: 3, phase: "awaiting_input", terminal_pending: false },
+      ]);
+      assert.deepEqual(snap.pending_all, [{ run_id: RUN_A, claim_generation: 1 }]);
+      assert.equal(snap.pending_overflow, cap === 0);
+      assert.deepEqual(policies, original, "projection cannot settle or rebind the old journal");
+      const stable = new ActiveRunRegistry(undefined, () => cap, () => policies);
+      stable.add(RUN_A, 3);
+      assert.equal(stable.claimsPausedByPendingOverflow(), cap === 0);
+    });
+  }
+
+  for (const generation of [3, 4]) {
+    it(`pending delivery generation ${generation} takes precedence over live generation 3`, () => {
+      const reg = new ActiveRunRegistry(undefined, () => 8, () => [policy(RUN_A, 1, generation)]);
+      reg.add(RUN_A, 3);
+      assert.deepEqual(reg.build().active, [
+        { run_id: RUN_A, claim_generation: generation, phase: "running", terminal_pending: true },
+      ]);
+    });
+  }
+
+  it("settled policies neither coalesce legacy duplicates nor hide live runs", () => {
+    const reg = new ActiveRunRegistry(
+      () => [pt(RUN_B, 1), pt(RUN_B, 2)], () => 8,
+      () => [policy(RUN_A, 1, 9, true), policy(RUN_B, 1, 9, true)],
+    );
+    reg.add(RUN_A, 3);
+    assert.deepEqual(reg.build().active, [
+      { run_id: RUN_A, claim_generation: 3, phase: "running", terminal_pending: false },
+      { run_id: RUN_B, claim_generation: 1, phase: "running", terminal_pending: true },
+      { run_id: RUN_B, claim_generation: 2, phase: "running", terminal_pending: true },
+    ]);
+    assert.equal(reg.claimsPausedByPendingOverflow(), false);
+  });
+
   it("an unowned terminal cannot hide a leasable policy for the same run", () => {
     const unowned = { ...pt(RUN_A, 9), blocked: true, blocked_reason: "run_not_owned" as const };
     const reg = new ActiveRunRegistry(() => [unowned], () => 1, () => [policy(RUN_A, 1, 3)]);
@@ -357,7 +423,7 @@ describe("issue 2009 — complete pending_all wire coverage regressions", () => 
   }
 
   for (const method of ["build", "buildRegisterSnapshot"] as const) {
-    it(`${method} captures the pending lister once and projects the highest generation per run`, () => {
+    it(`${method} captures the pending lister once and projects every distinct generation`, () => {
       let calls = 0;
       const pending = [pt(RUN_A, 2), pt(RUN_A, 3), pt(RUN_B, 7)];
       const reg = new ActiveRunRegistry(() => {
@@ -370,14 +436,17 @@ describe("issue 2009 — complete pending_all wire coverage regressions", () => 
         assert.deepStrictEqual(snap.active, []);
         assert.strictEqual(snap.pending_overflow, true);
       } else {
+        // Preserve the accepted duplicate-run construction limit: the API rejects this enclosing
+        // snapshot, so its pending_all list provides no coverage despite carrying both generations.
         assert.deepStrictEqual(snap.active.map((e) => [e.run_id, e.claim_generation]),
-          [[RUN_A, 3], [RUN_B, 7]]);
+          [[RUN_A, 2], [RUN_A, 3], [RUN_B, 7]]);
         assert.strictEqual(snap.pending_overflow, false);
       }
       assert.deepStrictEqual(wire(snap).pending_all, [
+        { run_id: RUN_A, claim_generation: 2 },
         { run_id: RUN_A, claim_generation: 3 },
         { run_id: RUN_B, claim_generation: 7 },
-      ], "pending_all uses one highest authorized delivery generation per run");
+      ], "issue 2009: pending_all preserves full run/generation identities and excludes phase/age");
     });
 
     it(`${method} emits explicit [] after the pending set empties`, () => {

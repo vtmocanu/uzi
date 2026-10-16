@@ -110,6 +110,8 @@ for (const fence of ["running", "older", "admission", "registry", "execution", "
 function fakeOutbox(entries: PendingFinalize[]) {
   const deleted: PendingFinalize[] = [];
   const outbox = {
+    listPendingPolicies: () => [],
+    hasUnresolvedPolicy: () => false,
     listPendingFinalizeGenerations: () => entries.filter(e => !deleted.includes(e)),
     finalizeRecordIdentity: (id: string, gen: number) => entries.find(e => e.run_id === id && e.claim_generation === gen),
     retireFinalizeIfEligible: async (id: string, gen: number, eligible: () => boolean, signal: AbortSignal) => {
