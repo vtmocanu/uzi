@@ -1044,7 +1044,10 @@ WITH claimant AS MATERIALIZED (
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      -- Report-only checkers open no custody hold; their exemption is independent
+      -- of the bounded continuation exemption for code-publishing runs above.
       AND (@custody_hold_limit::int <= 0
+           OR r.kind = 'cross_check'
            OR (r.claim_generation >= 1
                AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
@@ -1061,6 +1064,11 @@ WITH claimant AS MATERIALIZED (
       -- ordinary required-capability match, but NONE of them may authorize a worker that does
       -- not implement the completion protocol. @worker_protocol_caps is the claiming worker's
       -- stored workers.protocol_capabilities column, passed by the Go caller.
+      -- Reconciled runs require generation-stamped checkpoint, input and memory requests.
+      -- credential_switch_v1 predates those fields and is insufficient. This fence applies
+      -- even when capability scheduling is disabled or the owner clears required_capabilities.
+      AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
+           OR 'milestone_reconciliation_claim_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1322,6 +1330,8 @@ WITH claimant AS MATERIALIZED (
                 -- that would never be able to claim it — making the run unclaimable. Reads the
                 -- peer's OWN workers.protocol_capabilities column directly (no Go param, unlike
                 -- the claimant's @worker_protocol_caps above).
+                AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
+                     OR 'milestone_reconciliation_claim_v1' = ANY(p.protocol_capabilities))
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
                 -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -1576,7 +1586,9 @@ RETURNING runs.*;
 -- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
 -- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
 -- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
--- ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
+-- ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
+-- kind='cross_check' exemption is handled before this health read; hold-free children do not
+-- become continuation-exempt. A run that does not exist (or
 -- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
 SELECT
     fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,
@@ -8382,6 +8394,7 @@ WITH locked AS (
     SELECT runs.id, runs.status, runs.gate_revision, runs.kind
     FROM runs
     WHERE runs.id = @run_id
+      AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
     FOR UPDATE
@@ -8587,6 +8600,7 @@ WITH selected AS (
                  ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
     WHERE runs.id = @run_id
+      AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
@@ -9086,7 +9100,9 @@ WITH pending AS (
     -- worker must never drain or route it either. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
     -- flag clear). Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.applied_at IS NULL AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+    WHERE p.run_id = @run_id AND p.applied_at IS NULL AND p.disposition IS DISTINCT FROM 'superseded'
+      AND NOT (p.kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=p.run_id AND p.id<=a.stop_cutoff))
+      AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
     LIMIT 1000
     FOR UPDATE SKIP LOCKED
@@ -9102,7 +9118,8 @@ FROM consumed JOIN pending USING (id) ORDER BY consumed.id ASC;
 
 -- name: ListReplayRunInputs :many
 SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inputs
-WHERE run_id = @run_id AND applied_at IS NULL
+WHERE run_user_inputs.run_id = @run_id AND applied_at IS NULL AND disposition IS DISTINCT FROM 'superseded'
+  AND NOT (kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=run_user_inputs.run_id AND run_user_inputs.id<=a.stop_cutoff))
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
 LIMIT 1000;
@@ -9679,6 +9696,8 @@ WHERE run.id = @run_id
         COALESCE(w.capabilities, '{}')::text[],
         run.required_capabilities,
         @capability_aware::boolean)
+  AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = run.id)
+       OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
   -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10119,6 +10138,8 @@ WHERE r.status = 'queued'
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
+        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10312,6 +10333,8 @@ WHERE r.status = 'queued'
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
+        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
@@ -10381,6 +10404,8 @@ WHERE r.status = 'queued'
                  -- The lease admits only runs outside the isolated lane.
                  AND NOT w.isolated_lane))
         -- Protocol requirements apply to persistent and leased workers alike.
+        AND (NOT EXISTS (SELECT 1 FROM run_milestone_reconciliations audit WHERE audit.run_id = r.id)
+                      OR 'milestone_reconciliation_claim_v1' = ANY(w.protocol_capabilities))
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
         -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside

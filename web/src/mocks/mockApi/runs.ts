@@ -1,6 +1,7 @@
 import {
   type AdminUsage,
   type AgentSelectionInput,
+  type MilestoneResetOptions,
   type CredentialEpoch,
   type CredentialOverride,
   type Harness,
@@ -13,6 +14,7 @@ import {
   type RunSummaryItem,
   type SelfUsage,
 } from "../../lib/api";
+import { changedMilestones } from "../../lib/milestoneReset";
 import { ApiError } from "../../lib/apiError";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
 import { isTerminalRun } from "../../lib/runStatus";
@@ -661,7 +663,7 @@ export const runsApi = {
       },
       60,
     ),
-  getRun: async (id: string) => {
+  getRun: async (id: string, reconciliationBeforeGateRevision?: number) => {
     const run = getRun(id);
     if (!run) throw new ApiError(404, "run not found");
     if (id === LIVE_RUN_ID) ensureLive(id);
@@ -676,7 +678,14 @@ export const runsApi = {
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
     const decorated = harnessOverlay(credentialOverlay(run));
-    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents } }, 60);
+    const history = (decorated.milestone_reconciliations ?? []).filter(r =>
+      reconciliationBeforeGateRevision === undefined || (typeof r.gate_revision === "number" && r.gate_revision < reconciliationBeforeGateRevision));
+    const page = history.slice(0, 50);
+    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents,
+      milestone_reconciliations: page,
+      milestone_reconciliations_next_before_gate_revision: history.length > page.length
+        ? page[page.length - 1]?.gate_revision as number : undefined,
+    } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
@@ -1086,6 +1095,7 @@ export const runsApi = {
     overrideCapabilities?: boolean,
     _discardPendingOutcome?: boolean,
     expectedGateRevision?: number,
+    reset?: MilestoneResetOptions,
   ) => {
     if (id.startsWith("run-memory-hold") && mockScenario() === "memory-hold-nonowner")
       throw new ApiError(404, "run not found");
@@ -1109,12 +1119,44 @@ export const runsApi = {
         });
       }
     }
+    // UI demo consent checks only; worker checkpoint eligibility remains server-owned.
+    if (kind === "approve_plan" && changedMilestones(current) && !reset) {
+      throw new ApiError(409, "Milestone reset consent required", { reason: "milestone_reconciliation_required" });
+    }
+    if (reset && !current.reset_state_digest) {
+      throw new ApiError(409, "Request a plan revision for a fresh checkpoint", { reason: "milestone_reconciliation_not_ready" });
+    }
+    if (reset && (kind !== "approve_plan" || reset.reconciliation.mode !== "reset" ||
+      !changedMilestones(current) || !Array.isArray(current.milestones_candidate) ||
+      !Number.isSafeInteger(expectedGateRevision) || (expectedGateRevision ?? 0) <= 0 ||
+      !reset.reconciliation.reason.trim() ||
+      reset.expected_reset_state_digest !== current.reset_state_digest ||
+      reset.reconciliation.expected_completion_revision !== current.completion_revision)) {
+      throw new ApiError(409, "Reset consent changed", { reason: "milestone_reconciliation_conflict" });
+    }
     // PRD #88: the engine returns the refusals the real api answers with (a 409 for an
     // answer to a question that has moved on, a 400 for a malformed body) rather than
     // resolving 200 over a no-op. A mock that swallows a refusal is how a surface ends up
     // built against a laxer contract than the one that ships.
     const rejection = handleInput(id, kind, body);
     if (rejection) throw new ApiError(rejection.status, rejection.message);
+    if (reset) {
+      const before = { milestones_frozen: current.milestones, milestones_completed: current.milestones_completed,
+        milestones_in_progress: current.milestones_in_progress, milestones_agents: current.milestones_agents,
+        scope_ceiling: current.scope_ceiling, stop_kind: current.stop_kind, stop_reason: current.stop_reason,
+        completion_contract: { accepted: current.completion_accepted, deferred: current.completion_deferred } };
+      const after = { milestones_frozen: current.milestones_candidate, milestones_completed: [],
+        milestones_in_progress: [], milestones_agents: [], scope_ceiling: null, stop_kind: null, stop_reason: null,
+        completion_contract: { accepted: [], deferred: [] } };
+      patchRun(id, { milestones: current.milestones_candidate, milestones_completed: [], milestones_in_progress: [],
+        milestones_agents: [], scope_ceiling: null, stop_kind: null, stop_reason: null,
+        completion_accepted: [], completion_deferred: [], completion_revision: current.completion_revision === null ? null : (current.completion_revision ?? 0) + 1,
+        reset_state_digest: undefined,
+        milestone_reconciliations: [{ gate_revision: expectedGateRevision, reason: reset.reconciliation.reason,
+          created_at: new Date().toISOString(), before_state: before, after_state: after },
+          ...(current.milestone_reconciliations ?? [])],
+      });
+    }
     // PRD #37: mirror the selection onto the run row so the mock's read-only
     // post-approval view has something to show.
     if (kind === "approve_plan" && selection) {

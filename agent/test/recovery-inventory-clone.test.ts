@@ -1,7 +1,7 @@
+import { makeScratchRoot } from "./fixture-repo.js";
 import { it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { GitCache, type PositiveOwedCandidateContext } from "../src/git.js";
@@ -13,7 +13,7 @@ async function withJournalInventory(check: (f: {
   config: (value: string, add?: boolean) => void;
   ownClone: () => Promise<string>;
 }) => Promise<void>): Promise<void> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-tombstone-"));
+  const root = makeScratchRoot("inventory-tombstone-");
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
   const git = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args],
     { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 }).trim();
@@ -114,7 +114,7 @@ for (const value of [" ", "{", JSON.stringify({ runId: "other-run" })]) {
 
 for (const latestJournal of [false, true]) {
   it(`restart refuses older H/H2 archive when failed transfer leaves clone-only H3 (source journal=${latestJournal})`, async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-clone-"));
+    const root = makeScratchRoot("inventory-clone-");
     const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
     const cmd = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args],
       { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 }).trim();
@@ -379,7 +379,7 @@ const otherInventoryAttempt = "20260907T030405Z-g3-fedcba9876543210";
 const emptyInventory = { kind: "verified", heads: [], clones: [], foreignOwners: [] };
 
 async function inventoryFixture(attempt: boolean) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-clone-"));
+  const root = makeScratchRoot("inventory-clone-");
   const data = path.join(root, "data");
   const bare = path.join(data, "repos", "repo.git");
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };

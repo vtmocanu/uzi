@@ -141,4 +141,42 @@ for (const dep of vulnDeps) {
 assertEqual(resolved(goSurfaces[0], "patch").groupName, undefined, "Go patch grouping");
 assertEqual(resolved(goSurfaces[2], "digest").groupName, undefined, "golang digest grouping");
 
+// sqlc's CI pin and per-platform wrapper archives must advance together.
+const sqlcWrapperDeps = extract(
+  attachmentManager,
+  read("scripts/sqlc.sh"),
+  "scripts/sqlc.sh",
+);
+assertEqual(sqlcWrapperDeps.length, 2, "sqlc platform dependency count");
+assertEqual(
+  sqlcWrapperDeps.map((dep) => dep.depName).sort().join(","),
+  "sqlc-darwin-arm64,sqlc-linux-amd64",
+  "sqlc dependency aliases",
+);
+const sqlcCIDeps = extract(
+  attachmentManager,
+  read(".github/workflows/ci.yml"),
+  ".github/workflows/ci.yml",
+).filter((dep) => dep.packageName === "sqlc-dev/sqlc");
+assertEqual(sqlcCIDeps.length, 1, "sqlc CI dependency count");
+const sqlcDeps = [...sqlcCIDeps, ...sqlcWrapperDeps];
+assertEqual(new Set(sqlcDeps.map((dep) => dep.currentValue)).size, 1, "sqlc versions must agree");
+assertEqual(
+  new Set(sqlcWrapperDeps.map((dep) => dep.currentDigest)).size, 2,
+  "sqlc platform archives need distinct digests",
+);
+assertEqual(
+  sqlcCIDeps[0].currentDigest,
+  sqlcWrapperDeps.find((dep) => dep.depName === "sqlc-linux-amd64").currentDigest,
+  "sqlc Linux wrapper and CI digests must agree",
+);
+for (const dep of sqlcDeps) {
+  assertEqual(dep.packageName, "sqlc-dev/sqlc", `${dep.depName} packageName`);
+  assert(/^[0-9a-f]{64}$/.test(dep.currentDigest), `${dep.depName} digest is not sha256`);
+  for (const updateType of ["patch", "minor", "major", "digest"]) {
+    assertEqual(resolved(dep, updateType).groupName, "sqlc", `${dep.depName} ${updateType} group`);
+    assertEqual(resolved(dep, updateType).separateMajorMinor, false, `${dep.depName} separation`);
+  }
+}
+
 console.log("Renovate Go-toolchain contract: PASS");

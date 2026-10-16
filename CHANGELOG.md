@@ -22,10 +22,30 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
+
+- **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
+  Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
+
+- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
+  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
+
+- **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
+  Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
+
 ### Changed
 
 - **An opt-in worker memory guard interrupts eligible Codex shell commands and holds uncertain recovery for the owner ([#2396](https://github.com/vtmocanu/uzi/issues/2396)).**
   One worker-wide monitor uses total cgroup usage and ranks enrolled model command trees by approximate RSS, acting through their exact registered supervisors. Compose and hosted workers relay the enable flag and six required numeric settings; the guard remains off by default, with no calibrated production thresholds. Deploy the feature-advertising API before enabling workers, or keep new workers disabled until the API is ready and then freshly register/restart enabled; unsupported APIs or invalid registration incarnations refuse enabled startup. Heartbeat feature growth creates no memory authority, and shrink revokes reservation/signalling while original settlement and source custody remain owed. Intervention allowance persists per memory episode across ordinary redispatch; exhaustion, uncertain drainage or unconfirmed outcome reporting invokes capture and an owner-held memory-pressure park attempt. Owner Resume starts a fresh memory episode under existing budget, custody and lifecycle fences; an available historical archive does not release retained custody or prove latest-work capture. Unconfirmed capture or park retains local source without an archive guarantee; OPEN memory-pressure and worker-requeue-exhaustion holds preserve owner attention ahead of archive readiness or capture progress. Operational disable preserves accounting and custody; migration 00339 Down destructively fails memory-held runs and drops memory history. Claude enrollment (#2471), internal probes, provider/credential processes, boundary/checkpoint/capture operations and cross-checker authority remain outside the delivered adapter's scope; separately accounted DinD, allocation bursts, sampling stalls and node pressure can still cause OOM. No concurrency or process-authority expansion is introduced, and Codex command bounds and abort/cleanup ownership remain in force.
+
+- **sqlc regeneration uses verified release binaries.**
+  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
+
+- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
+  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
 
 ## [0.86.0] - 2026-10-06
 

@@ -61,7 +61,15 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			if len(fields) > 0 && p.Format == uzicli.FormatJSON {
 				return uzicli.Exitf(uzicli.ExitUsage, "--field cannot be combined with --json")
 			}
-			run, err := c.GetRun(cmd.Context(), args[0])
+			var opts uzicli.RunReadOptions
+			if cmd.Flags().Changed("reconciliation-before-gate-revision") {
+				cursor, _ := cmd.Flags().GetInt64("reconciliation-before-gate-revision")
+				if cursor <= 0 {
+					return uzicli.Exitf(uzicli.ExitUsage, "--reconciliation-before-gate-revision must be positive")
+				}
+				opts.ReconciliationBeforeGateRevision = &cursor
+			}
+			run, err := c.GetRunWithOptions(cmd.Context(), args[0], opts)
 			if err != nil {
 				return err
 			}
@@ -87,6 +95,7 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+	get.Flags().Int64("reconciliation-before-gate-revision", 0, "read older reset audit entries before this positive gate revision")
 	get.Flags().StringSlice("field", nil,
 		"print only these top-level scalar field(s), raw and one per line (repeatable; mutually exclusive with --json)")
 	return get

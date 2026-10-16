@@ -12,7 +12,7 @@ A claim opens a generation-scoped custody hold before execution. Counting health
 
 ### D1: Fixed limit, separate counts
 
-`workersvc.custodyHoldLimit` stays fixed at 8. `open_holds` remains the owner's total `state = 'open'` count. `admission_counted_holds` is that total minus at most one qualifying hold per run. New code-run admission compares the latter to 8. This is owner-scoped accounting, without fleet percentages or a new configuration knob.
+`workersvc.custodyHoldLimit` stays fixed at 8. `open_holds` remains the owner's total `state = 'open'` count. `admission_counted_holds` is that total minus at most one qualifying hold per run. New code-run admission compares the latter to 8. This is owner-scoped accounting, without fleet percentages or a new configuration knob. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) bypass owner custody admission independently of the continuation bound; judges and jobs gain no exemption. See [ADR-1296's checker amendment](1296-durable-run-recovery.md#amendment-2026-10-15--report-only-checker-admission).
 
 ### D2: Exact healthy live claim evidence
 

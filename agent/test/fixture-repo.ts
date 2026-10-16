@@ -118,12 +118,13 @@ function normalizeRoot(base: string): void {
 }
 
 /**
- * Create a private (uid/gid-owned, 0700) scratch root under os.tmpdir() whose
+ * Create a private (uid/gid-owned, 0700) scratch root under the optional parent
+ * (default os.tmpdir()), preserving its lexical symlink path. Its
  * descendants cannot inherit a setgid TMPDIR's foreign group or setgid bit.
  * The parent directory is never touched. The caller removes the root.
  */
-export function makeScratchRoot(prefix: string): string {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+export function makeScratchRoot(prefix: string, parent = os.tmpdir()): string {
+  const base = fs.mkdtempSync(path.join(parent, prefix));
   ledger("created", base, { file: process.argv[1] ?? null, test: null, site: callerSites() });
   normalizeRoot(base);
   return base;

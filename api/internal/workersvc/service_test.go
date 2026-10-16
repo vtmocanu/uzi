@@ -39,6 +39,10 @@ func uziLabels(extra ...string) []byte {
 
 // fakeStore embeds the Store interface so unimplemented methods panic if a test
 // path reaches them unexpectedly; the tests override only what they exercise.
+func (f *fakeStore) LatestRunMilestoneReconciliationSession(context.Context, uuid.UUID) ([][]byte, error) {
+	return nil, nil
+}
+
 type fakeStore struct {
 	// pendingRemovals records the pending-only ledger removals (no run created).
 	pendingRemovals    []store.RemoveMRReworkPendingKeysParams

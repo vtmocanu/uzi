@@ -289,8 +289,9 @@ async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<n
  *  `not_descendant` (a 2xx skip) when the ref is set and the tip does not descend it, else advance
  *  the ref with a compare-and-swap. `ack` lets a call model a lost ACK: `landed` advances the ref
  *  and answers HTTP 500; `dropped` answers HTTP 500 without landing. Every answer is recorded.
- *  It uses `merge-base --is-ancestor` only as an oracle for descent; the parent ORDER the real
- *  depth-1 broker depends on is pinned by explicit parent assertions in the tests. */
+ *  It uses `merge-base --is-ancestor` only as an oracle for descent; explicit parent assertions
+ *  pin the worker's base-first/real-tip-last format. Pushbroker tests cover bounded positive
+ *  proof across missing side paths in a depth-1 store, with either parent order. */
 function brokerPublish(
   originPath: string,
   ref: string,

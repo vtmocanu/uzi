@@ -19,7 +19,7 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 	if s.txBeginner == nil {
 		return false, errors.New("live checkpoint confirmation requires a transaction")
 	}
-	tx, err := s.txBeginner.Begin(ctx)
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return false, fmt.Errorf("begin live checkpoint confirmation: %w", err)
 	}
@@ -35,6 +35,28 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 	}
 	if err != nil {
 		return false, fmt.Errorf("lock live checkpoint run: %w", err)
+	}
+	reconciled, err := reconciliationExists(ctx, tx, run.ID)
+	if err != nil {
+		return false, err
+	}
+	if reconciled {
+		if err := validateReconciledGeneration(run, &observedRun.ClaimGeneration); err != nil {
+			return false, err
+		}
+		if run.WorkerID != observedRun.WorkerID {
+			return false, ErrStaleClaim
+		}
+		// Attempts have no generation column. A pre-release attempt cannot acquire
+		// authority merely because the sweeper observed the reclaimed run.
+		var predatesRelease bool
+		err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM run_milestone_reconciliations WHERE run_id=$1 AND created_at >= $2)", run.ID, a.AttemptedAt).Scan(&predatesRelease)
+		if err != nil {
+			return false, err
+		}
+		if !a.AttemptedAt.Valid || predatesRelease {
+			return false, ErrStaleClaim
+		}
 	}
 	if terminalStatuses[run.Status] {
 		return false, nil

@@ -41,6 +41,11 @@ func summariesOf(items []apitypes.RunListItemDTO) []apitypes.RunSummaryItemDTO {
 	return out
 }
 
+func (f *FakeClient) GetRunWithOptions(ctx context.Context, id string, opts RunReadOptions) (apitypes.RunDTO, error) {
+	f.LastRunReadOptions = opts
+	return f.GetRun(ctx, id)
+}
+
 func (f *FakeClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	f.LastGetRunCtx = ctx
 	f.RunVerbCalls = append(f.RunVerbCalls, "get_run")
@@ -373,7 +378,14 @@ func (f *FakeClient) DispatchTaskRun(_ context.Context, runID string) (apitypes.
 	return f.DispatchedRun, nil
 }
 
-func (f *FakeClient) SubmitRunInput(_ context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error) {
+func (f *FakeClient) SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error) {
+	return f.SubmitRunInputWithOptions(ctx, runID, RunInputOptions{Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome, ExpectedGateRevision: expectedGateRevision})
+}
+
+func (f *FakeClient) SubmitRunInputWithOptions(_ context.Context, runID string, opts RunInputOptions) (apitypes.RunInputResponse, error) {
+	f.LastInputOptions = opts
+	kind, body, sel := opts.Kind, opts.Body, opts.Selection
+	discardPendingOutcome, expectedGateRevision := opts.DiscardPendingOutcome, opts.ExpectedGateRevision
 	f.LastInputRunID = runID
 	f.RunVerbCalls = append(f.RunVerbCalls, "submit_run_input")
 	f.LastInputKind = kind

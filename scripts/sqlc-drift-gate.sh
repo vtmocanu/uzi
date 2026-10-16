@@ -24,10 +24,9 @@
 # VERSION PARITY WITH CI IS BY CONSTRUCTION. The pinned sqlc version is READ from
 # .github/workflows/ci.yml's `SQLC_VERSION="v..."` line -- the one Renovate keeps
 # current (renovate.json's `# renovate-tarball:` manager) -- rather than hardcoded
-# here, so the local `go run` codegen can never drift from the version CI's pinned
-# release binary produces. Same version => byte-identical codegen (ci.yml documents
-# this). Local uses `go run` (portable, no install), per .claude/rules/go.md; CI
-# uses the sha256-verified amd64 release binary for speed. If that line ever changes
+# here. The sibling sqlc.sh wrapper runs a sha256-verified platform release binary
+# at that version, keeping local generation in lockstep with CI without compiling
+# sqlc into the Go caches. If that line ever changes
 # shape, this script fails closed (exit 2) rather than silently using a wrong sqlc.
 set -eu
 
@@ -64,8 +63,8 @@ if [ -z "$SQLC_VERSION" ]; then
   exit 2
 fi
 
-SQLC_PKG="github.com/sqlc-dev/sqlc/cmd/sqlc@$SQLC_VERSION"
-echo "sqlc-drift-gate: regenerating with $SQLC_PKG (pinned via $CI_YML)"
+SQLC="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)/sqlc.sh"
+echo "sqlc-drift-gate: regenerating with sqlc $SQLC_VERSION (pinned via $CI_YML)"
 
 TMP="$(mktemp -d)"
 # shellcheck disable=SC2064  # expand TMP now: the trap must survive its unset.
@@ -74,11 +73,11 @@ trap "rm -rf '$TMP'" EXIT INT TERM
 # 🔴 RC FIRST. Redirect to a file and read `$?` on the very next line; `|| rc=$?`
 # puts the command in a condition context so errexit does not pre-empt the capture.
 rc=0
-(cd "$API_DIR" && go run "$SQLC_PKG" generate) >"$TMP/gen.out" 2>&1 || rc=$?
+(cd "$API_DIR" && "$SQLC" "$SQLC_VERSION" generate) >"$TMP/gen.out" 2>&1 || rc=$?
 if [ "$rc" -ne 0 ]; then
   cat "$TMP/gen.out" >&2
-  echo "sqlc-drift-gate: \`go run $SQLC_PKG generate\` exited $rc." >&2
-  echo "  This is an INSTRUMENT failure (toolchain, module fetch/network, or a SQL error)," >&2
+  echo "sqlc-drift-gate: \`$SQLC $SQLC_VERSION generate\` exited $rc." >&2
+  echo "  This is an INSTRUMENT failure (binary acquisition/network, or a SQL error)," >&2
   echo "  not a clean run -- an empty diff below it would be meaningless. Fix the tool first." >&2
   exit 2
 fi
@@ -95,7 +94,7 @@ untracked_gen="$(git -C "$ROOT" ls-files --others --exclude-standard -- "api/$GE
 if [ -n "$untracked_gen" ]; then
   echo "sqlc-drift-gate: DRIFT -- untracked generated file(s) under api/$GEN_SUBDIR (missing from the commit):" >&2
   printf '%s\n' "$untracked_gen" >&2
-  echo "  Regenerate and stage the codegen:  cd api && go run $SQLC_PKG generate && git add -A internal/store" >&2
+  echo "  Regenerate and stage the codegen:  cd api && ../scripts/sqlc.sh $SQLC_VERSION generate && git add -A internal/store" >&2
   echo "  (CI's validate-api job would report clean here; this untracked-file check catches it before the push.)" >&2
   exit 1
 fi
@@ -113,7 +112,7 @@ fi
 if [ "$rc" -eq 1 ]; then
   echo "sqlc-drift-gate: DRIFT -- committed codegen under api/$GEN_SUBDIR is stale." >&2
   git -C "$ROOT" diff --stat -- "api/$GEN_SUBDIR" >&2 || true
-  echo "  Regenerate and commit:  cd api && go run $SQLC_PKG generate" >&2
+  echo "  Regenerate and commit:  cd api && ../scripts/sqlc.sh $SQLC_VERSION generate" >&2
   echo "  (CI's validate-api job runs the same check; this catches it before the push.)" >&2
   exit 1
 fi

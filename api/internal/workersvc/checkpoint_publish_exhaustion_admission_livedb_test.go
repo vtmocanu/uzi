@@ -23,6 +23,7 @@ import (
 type exhaustionPublishSnapshot struct {
 	Store
 	owned    store.Run
+	workerID uuid.UUID
 	captured chan struct{}
 	resume   chan struct{}
 }
@@ -35,6 +36,12 @@ func (q *exhaustionPublishSnapshot) GetRunOwnedByWorker(ctx context.Context, p s
 
 func (q *exhaustionPublishSnapshot) GetRunClaimContext(ctx context.Context, id uuid.UUID) (store.GetRunClaimContextRow, error) {
 	r, err := q.Store.GetRunClaimContext(ctx, id)
+	// Publish now reads ownership through its admission transaction, bypassing
+	// Store decorators. Read the live tuple after that commit and before pausing;
+	// all competing mutations below wait for captured.
+	if err == nil {
+		q.owned, err = q.Store.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: id, WorkerID: pgconv.UUID(q.workerID)})
+	}
 	close(q.captured)
 	select {
 	case <-q.resume:
@@ -345,7 +352,7 @@ func TestCheckpointPublishExhaustionAdmissionLiveDB(t *testing.T) {
 			f, w := exhaustionPublishFixture(t)
 			ctx, cancel := context.WithTimeout(f.e.ctx, 15*time.Second)
 			defer cancel()
-			g := &exhaustionPublishSnapshot{Store: f.svc1.q, captured: make(chan struct{}), resume: make(chan struct{})}
+			g := &exhaustionPublishSnapshot{Store: f.svc1.q, workerID: w.ID, captured: make(chan struct{}), resume: make(chan struct{})}
 			f.svc1.q = g
 			var calls atomic.Int32
 			broker := make(chan struct{}, 1)
@@ -505,7 +512,7 @@ func TestCheckpointPublishExhaustionAdmissionLiveDB(t *testing.T) {
 			} else {
 				ctx, cancel := context.WithTimeout(f.e.ctx, 15*time.Second)
 				defer cancel()
-				g := &exhaustionPublishSnapshot{Store: f.svc1.q, captured: make(chan struct{}), resume: make(chan struct{})}
+				g := &exhaustionPublishSnapshot{Store: f.svc1.q, workerID: w.ID, captured: make(chan struct{}), resume: make(chan struct{})}
 				f.svc1.q = g
 				out := exhaustionPublishStart(ctx, f, w)
 				var resumeOnce sync.Once

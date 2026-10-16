@@ -553,6 +553,26 @@ func limitParkJitter() time.Duration {
 // until RUN_TIMEOUT fails it with something misleading. So the report is coerced to
 // a server-composed failure instead of refused. Same branch point as the budget cap.
 func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
+	locked, current, tx, err := s.beginClaimMutation(ctx, wkr, run.ID, req.ClaimGeneration)
+	if err != nil {
+		return 0, err
+	}
+	if tx != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+	rows, err := locked.setLimitWaitLocked(ctx, current, wkr, req, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	if tx != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, err
+		}
+	}
+	return rows, nil
+}
+
+func (s *Service) setLimitWaitLocked(ctx context.Context, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	// The candidate pool is fetched ONLY when the run names the credential it was
 	// spending. Without that id there is nothing to exclude, and NextAvailable would
 	// have to be trusted not to let the dead credential vote for its own replacement
@@ -673,7 +693,8 @@ func (s *Service) setLimitWait(ctx context.Context, run store.Run, wkr store.Wor
 		RetryNotBefore: pgconv.Time(d.RetryNotBefore),
 		// PRD #1247 M5a-1 rework (reviewer NB1): thread the reported generation to the per-query
 		// fence. A capability worker stamps it; a stale/reclaimed old flight's park matches 0 rows
-		// and cannot clobber the reclaiming run. nil (legacy) parks unfenced.
+		// and cannot clobber the reclaiming run. The outer locked claim guard permits nil
+		// only for unreconciled legacy runs.
 		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
 		// PRD #217 M2: record the credential this run was spending so its NEXT claim
 		// excludes it (runs.limit_dead_secret_id). Passed straight through from the run

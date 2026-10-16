@@ -148,13 +148,13 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# workersvc's cumulative LiveDB runtime approaches the default 600s timeout.
-# Bound it at 900s; this is timeout headroom, not a speedup. Reset other packages
-# to 10m on every iteration, and stop on any failed pipeline before the next one.
+# Give handler and workersvc LiveDB suites 20m of timeout headroom on hosted workers.
+# This is not a speedup. Reset other packages to 10m on every iteration,
+# and stop on any failed pipeline before the next one.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/workersvc/..." ]; then
-    timeout=15m
+  if [ "$p" = "./internal/handler/..." ] || [ "$p" = "./internal/workersvc/..." ]; then
+    timeout=20m
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"

@@ -124,6 +124,12 @@
       "separateMajorMinor": false
     },
     {
+      "description": "sqlc: group the CI pin and both platform release archives so local generation stays in lockstep with CI.",
+      "matchPackageNames": ["sqlc-dev/sqlc"],
+      "groupName": "sqlc",
+      "separateMajorMinor": false
+    },
+    {
       "description": "govulncheck: group the api + controller Taskfile pins so a bump moves both in one PR. Distinct depName aliases avoid same-file deduplication; shared packageName joins them here.",
       "matchPackageNames": ["golang.org/x/vuln"],
       "groupName": "govulncheck"

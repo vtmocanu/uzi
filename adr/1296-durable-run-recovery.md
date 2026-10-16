@@ -678,3 +678,23 @@ a FINAL that did land or otherwise captures the archive on the same record.
 Retention for the held ref runs from
 acknowledgement for `UZI_RECOVERY_READY_RETENTION`. #2544 quota and #2506 failed
 thin release remain excluded.
+
+## Amendment 2026-10-15 — report-only checker admission
+
+Hold-free, nonpublishing children with exact `kind = 'cross_check'` bypass
+owner custody admission for both Plan and Code cross-check, in both harness
+families. This exemption is independent of [ADR-1751](1751-continuation-custody-admission.md)'s
+bounded continuation: a previously claimed code-publishing run still needs
+1–7 of its own owner-scoped open holds to bypass admission; at 8 it loses that
+exemption. Judges and jobs gain no exemption.
+
+The limit remains 8 and [ADR-2445](2445-custody-admission-accounting.md)'s
+`fn_custody_admission_count` accounting is unchanged. Checker claims open no
+custody hold; hold creation for code-publishing claims, disposition and capture
+quotas are unchanged. Claim admission and queued-run health reasons exempt
+checkers; `blocked_runs` already excludes them through its code-run kind list.
+Owner identity, current parent/generation/round, deadline, protocol, vault,
+credential, checker-slot and worker eligibility checks continue to apply.
+
+This amendment addresses [#3011](https://github.com/vtmocanu/uzi/issues/3011).
+It does not discount or release any existing hold.

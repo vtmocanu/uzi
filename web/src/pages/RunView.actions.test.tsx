@@ -34,7 +34,8 @@ let stopAllowed = true;
 let runOverrides: Partial<Run> = {};
 function runFor(id: string, mode: Mode): Run {
   return { ...mockRuns[0], id, outcome_pending: undefined, hold_reason: null,
-    milestones: [{ id: "one", title: "One" }, { id: "two", title: "Two" }], milestones_completed: ["one"],
+    milestones: [{ id: "one", title: "One" }, { id: "two", title: "Two" }],
+    milestones_candidate: [{ id: "one", title: "One" }, { id: "two", title: "Two" }], milestones_completed: ["one"],
     can_stop_at_provider_hold: stopAllowed,
     ...(mode === "provider" ? { hold_reason: "provider_unavailable" } : {}),
     status: mode === "ordinary" || mode === "provider" ? "paused" : mode === "exhaustion" ? "recovery_wait" : mode === "pool" ? "pool_wait" : "awaiting_approval",

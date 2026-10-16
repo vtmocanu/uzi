@@ -314,8 +314,9 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     assert.strictEqual(parents.length, 2, "a chained overlay carries two parents");
     assert.strictEqual(parents[0], ov1, "parent[0] is the prior overlay (base FIRST)");
     assert.strictEqual(parents[parents.length - 1], realTip2, "the LAST parent is realTip2");
-    // The base-first shape is what the depth-1 broker accepts on; the true depth-1
-    // broker-accept property is proven separately by a pushbroker test.
+    // Base-first/realTip-last is the worker format for adoption and determinism.
+    // Pushbroker tests separately prove both orders work within traversal budgets
+    // when the depth-1 store is missing a non-base side path (#3013).
     assert.doesNotThrow(
       () => gitIn(bareA, ["merge-base", "--is-ancestor", ov1, ov2]),
       "O_ov1 is an ancestor of O_ov2 (a genuine fast-forward chain)",

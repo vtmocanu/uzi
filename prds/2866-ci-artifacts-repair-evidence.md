@@ -1,6 +1,6 @@
 # PRD #2866: CI artifacts as repair evidence
 
-**Status**: Draft, blocked by #2865
+**Status**: Draft; M1 ready (#2865 merged via #2983, transport seam decided in D3). M1 is the dispatched scope; M2 follows M1.
 **Issue**: #2866
 **Umbrella**: #2864 (child 2 of 2)
 **Priority**: Low

@@ -108,6 +108,57 @@ func TestPlanMilestonesParam(t *testing.T) {
 	}
 }
 
+func TestReportPlanMilestonesParamLegacyUnchangedFrozen(t *testing.T) {
+	const candidate = `[{"title":"First","id":"m1"}]`
+	base := store.Run{Kind: runkind.Issue, PlanMd: pgtype.Text{String: "# Plan", Valid: true},
+		MilestonesCandidate: []byte(candidate), MilestonesFrozen: []byte(`[{"id":"m1","title":"First"}]`)}
+	cases := []struct {
+		name   string
+		change func(*store.Run, *StateRequest)
+		want   string
+	}{
+		{"same plan", nil, candidate},
+		{"NUL normalized", func(_ *store.Run, q *StateRequest) { q.PlanMd = strPtr("# Pl\x00an") }, candidate},
+		{"different plan", func(_ *store.Run, q *StateRequest) { q.PlanMd = strPtr("# Revised") }, ""},
+		{"absent plan", func(_ *store.Run, q *StateRequest) { q.PlanMd = nil }, ""},
+		{"absent stored plan", func(r *store.Run, _ *StateRequest) { r.PlanMd.Valid = false }, ""},
+		{"invalid explicit", func(_ *store.Run, q *StateRequest) { q.Milestones = &[]Milestone{{ID: "", Title: "bad"}} }, ""},
+		{"explicit empty", func(_ *store.Run, q *StateRequest) { q.Milestones = &[]Milestone{} }, "[]"},
+		{"absent candidate", func(r *store.Run, _ *StateRequest) { r.MilestonesCandidate = nil }, ""},
+		{"JSON null candidate", func(r *store.Run, _ *StateRequest) { r.MilestonesCandidate = []byte("null") }, ""},
+		{"corrupt candidate", func(r *store.Run, _ *StateRequest) { r.MilestonesCandidate = []byte("{") }, ""},
+		{"invalid matching definitions", func(r *store.Run, _ *StateRequest) {
+			r.MilestonesCandidate = []byte("[null]")
+			r.MilestonesFrozen = []byte("[null]")
+		}, ""},
+		{"no frozen", func(r *store.Run, _ *StateRequest) { r.MilestonesFrozen = nil }, ""},
+		{"JSON null frozen", func(r *store.Run, _ *StateRequest) { r.MilestonesFrozen = []byte("null") }, ""},
+		{"different candidate", func(r *store.Run, _ *StateRequest) { r.MilestonesCandidate = []byte(`[{"id":"m2","title":"Second"}]`) }, ""},
+		{"non issue", func(r *store.Run, _ *StateRequest) { r.Kind = runkind.Chat }, ""},
+		{"empty definitions", func(r *store.Run, _ *StateRequest) {
+			r.MilestonesCandidate = []byte("[]")
+			r.MilestonesFrozen = []byte("[]")
+		}, "[]"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := base
+			req := StateRequest{PlanMd: strPtr("# Plan")}
+			if tc.change != nil {
+				tc.change(&run, &req)
+			}
+			got := reportPlanMilestonesParam(run, req)
+			if string(got) != tc.want || (tc.want == "" && got != nil) {
+				t.Fatalf("report candidate = %q, want %q (empty means SQL NULL)", got, tc.want)
+			}
+			// The general autopilot helper retains its legacy omission semantics.
+			if req.Milestones == nil && planMilestonesParam(run, req.PlanMd, nil) != nil {
+				t.Fatal("legacy autopilot inferred a candidate")
+			}
+		})
+	}
+}
+
 // TestEmptyContractIsVacuouslyMet: the `[]` source builds criteria:[] and computeUnmetCriteria
 // reads it as (empty, verifiable) — the permit's grant precondition (issue #1626).
 func TestEmptyContractIsVacuouslyMet(t *testing.T) {

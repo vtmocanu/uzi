@@ -5,6 +5,7 @@ import {
   createRunSocket,
   isTerminalRun,
   type AgentSelectionInput,
+  type MilestoneResetOptions,
   type Run,
   type RunInputKind,
   type RunMessage,
@@ -253,6 +254,7 @@ export function useRunStream(runId: string) {
       // PRD #1795 D5: the plan-gate revision a verdict is bound to, threaded through to
       // submitRunInput. Meaningful only with approve_plan / reject_plan / revise_plan.
       expectedGateRevision?: number,
+      reset?: MilestoneResetOptions,
     ) => {
       // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
       // optimistically prepend a temp entry (the queue is newest-first), then adopt
@@ -293,7 +295,7 @@ export function useRunStream(runId: string) {
         void refreshRun();
         return;
       }
-      await api.submitRunInput(
+      const args = [
         runId,
         kind,
         body,
@@ -301,7 +303,9 @@ export function useRunStream(runId: string) {
         overrideCapabilities,
         discardPendingOutcome,
         expectedGateRevision,
-      );
+      ] as const;
+      if (reset) await api.submitRunInput(...args, reset);
+      else await api.submitRunInput(...args);
       void refreshRun();
     },
     [runId, refreshRun],

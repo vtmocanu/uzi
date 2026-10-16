@@ -707,3 +707,27 @@ describe("useRunStream out-of-order run refresh (issue #2760)", () => {
     });
   }
 });
+
+
+describe("useRunStream milestone reset propagation", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  it("only appends reset options when present, preserving ordinary and follow-up calls", async () => {
+    vi.stubGlobal("WebSocket", DeadSocket);
+    vi.spyOn(api, "getRun").mockResolvedValue({ run: fakeRun() });
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+    const submitted = vi.spyOn(api, "submitRunInput").mockResolvedValue({ server_side: true });
+    const { result, unmount } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run).not.toBeNull());
+    const selection = { source: "own" as const, exclusions: [] };
+    const reset = { reconciliation: { mode: "reset" as const, reason: "Scope changed", expected_completion_revision: null },
+      expected_reset_state_digest: "displayed-digest" };
+    await act(async () => result.current.submit("approve_plan", "", selection, true, undefined, 4, reset));
+    expect(submitted).toHaveBeenLastCalledWith("run-1", "approve_plan", "", selection, true, undefined, 4, reset);
+    await act(async () => result.current.submit("approve_plan", "", selection));
+    expect(submitted.mock.calls[1]).toEqual(["run-1", "approve_plan", "", selection, undefined, undefined, undefined]);
+    await act(async () => result.current.submit("follow_up", "hello"));
+    expect(submitted.mock.calls[2]).toEqual(["run-1", "follow_up", "hello", undefined]);
+    unmount();
+  });
+});

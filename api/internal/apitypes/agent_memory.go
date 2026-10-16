@@ -12,10 +12,11 @@ import "time"
 // to what backs the claim. Both are optional — a bad or absent basis never fails the
 // write (PRD #90: memory writes must not fail a run).
 type AgentMemoryWriteRequest struct {
-	Title    string `json:"title"`
-	Body     string `json:"body"`
-	Basis    string `json:"basis"`
-	Evidence string `json:"evidence"`
+	ClaimGeneration *int64 `json:"claim_generation,omitempty"`
+	Title           string `json:"title"`
+	Body            string `json:"body"`
+	Basis           string `json:"basis"`
+	Evidence        string `json:"evidence"`
 }
 
 // AgentMemoryDTO is the browser/CLI/worker view of one memory entry. repo_id +

@@ -42,34 +42,39 @@ func (s *Service) AppendMessages(ctx context.Context, wkr store.Worker, runID uu
 // FENCE (PRD #1247 M5, D3). A CAPABILITY worker stamps its claim_generation on every message
 // batch; the fenced InsertRunMessage / UpdateRunLastSeq then persist ONLY while the run is at
 // that generation with an unreleased claim, so a message batch from a RELEASED or RECLAIMED old
-// flight persists nothing and cannot advance last_seq. A nil generation is the LEGACY path
-// (identical to AppendMessages), unfenced — back-compat by construction. The handler
-// (WorkerRunMessages) passes the decoded batch generation here; every test caller keeps using
-// AppendMessages (nil), so the fence adds no test churn.
+// flight persists nothing and cannot advance last_seq. A legacy caller may omit generation only
+// before reconciliation. The transaction-bound claim guard checks durable reconciliation history
+// before any message write. WorkerRunMessages passes the decoded batch generation here.
 func (s *Service) AppendMessagesForClaim(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
 	return s.appendAndRecord(ctx, wkr, runID, msgs, claimGen)
 }
 
 func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) error {
 	obs, err := s.appendMessages(ctx, wkr, runID, msgs, claimGen)
+	s.recordAppendObservation(ctx, wkr, runID, obs, err)
+	return err
+}
+
+// Recording re-locks after the append transaction (including a failed/aborted one)
+// has ended. The observed generation is never replaced with the new locked value.
+func (s *Service) recordAppendObservation(ctx context.Context, wkr store.Worker, runID uuid.UUID, obs appendObservation, err error) {
+	// Unowned or generation-refused reports grant no authority and are not
+	// persistence failures; recording them could build a spurious kill streak.
+	if !obs.resolved || errors.Is(err, ErrMissingClaimGeneration) || errors.Is(err, ErrStaleClaim) {
+		return
+	}
+	if s.txBeginner != nil {
+		_, run, tx, lockErr := s.beginClaimMutation(ctx, wkr, runID, &obs.generation)
+		if lockErr != nil {
+			return
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if run.ClaimGeneration != obs.generation || run.ClaimReleasedAt.Valid {
+			return
+		}
+		obs.status = run.Status
+	}
 	switch {
-	case errors.Is(err, ErrMissingClaimGeneration):
-		// PRD #1247 M5a-1 rework (auditor fail-open finding): a CAPABILITY worker omitted its
-		// claim_generation on a message batch — a PROTOCOL violation refused before any insert,
-		// NOT a persistence failure. Do NOT record a streak against the run for the worker's
-		// missing field (recording here would build a spurious kill streak). Placed FIRST so it
-		// skips the recorder regardless of the run's status.
-	case errors.Is(err, ErrStaleClaim):
-		// PRD #1247 M5 (BLOCKING-4 rework): the batch fenced out — the run was released or
-		// reclaimed under this OLD flight, so it persisted nothing. Like the missing-generation
-		// case this is NOT a persistence failure of the run; recording a streak here would punish
-		// a run for a superseded flight's late delivery. Skip the recorder; the handler answers
-		// the worker a stale_claim 409 so the old flight STOPS.
-	case !obs.resolved:
-		// Ownership never resolved (ErrRunNotOwned, or the lookup itself failed), so
-		// this run is not this worker's to vouch for. Recording here is what would let
-		// worker A build a kill streak against user B's run — see persistfail.go's
-		// ownership tripwire. NOT a persistence failure, and not counted as one.
 	case obs.status != "running":
 		// NOT RUNNING — checked BEFORE the success arm on purpose, and stated as one
 		// rule rather than as a terminal special case: A STREAK IS EVIDENCE ABOUT ONE
@@ -118,13 +123,12 @@ func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID u
 		// reader restoring recordSuccess for a parked run would be undoing something
 		// deliberate with nothing in the place they would look to say so. Pinned by
 		// TestAppendMessagesComparisonSetIsRunningRunsOnly.
-		s.persistFail.evict(runID)
+		s.persistFail.evict(runID, obs.generation)
 	case err == nil:
-		s.persistFail.recordSuccess(runID, s.now())
+		s.persistFail.recordSuccess(runID, s.now(), obs.generation)
 	default:
-		s.persistFail.recordFailure(runID, classifyPersistFail(err), obs.lastSeq, s.now())
+		s.persistFail.recordFailure(runID, classifyPersistFail(err), obs.lastSeq, s.now(), obs.generation)
 	}
-	return err
 }
 
 // appendObservation is what the recorder needs from one append attempt and cannot
@@ -137,6 +141,7 @@ func (s *Service) appendAndRecord(ctx context.Context, wkr store.Worker, runID u
 // which counts deduplicated rows too, so the column is a faithful high-water mark
 // that is already on the row this path holds and costs no extra query.
 type appendObservation struct {
+	generation int64
 	// resolved is true once runOwnedByWorker has returned a run — i.e. once the
 	// caller is known to own this run. Nothing may be recorded while it is false.
 	resolved bool
@@ -162,18 +167,18 @@ type appendObservation struct {
 // runOwnedByWorker — because an unowned record is a cross-tenant kill primitive.
 // Best-effort: a lookup failure records nothing.
 //
-// COST, stated for the case that is not benign. This arm previously did zero
-// database work; it now does one indexed lookup. Rare for the incident's own
-// shape (a 413 means a worker already past the 1 MiB cap), but a worker holding a
-// valid join token can POST oversized bodies as fast as it likes, so this is one
-// GetRunOwnedByWorker per such request — on a path that exists because the
-// database is already under stress. The alternative was leaving both the flag and
-// the kill blind in the incident's own steady state, which is worse; naming the
-// cost is not the same as calling it free.
+// With transactions wired, beginClaimMutation locks the worker and run, then
+// reads the reconciliation audit before recording. Legacy tests without a
+// transaction beginner retain their ownership lookup.
 func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID uuid.UUID) {
-	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	// No generation can be trusted before the oversized body is decoded. Under
+	// the run lock, an audited run therefore refuses this recorder entirely.
+	_, run, tx, err := s.beginClaimMutation(ctx, wkr, runID, nil)
 	if err != nil {
 		return
+	}
+	if tx != nil {
+		defer func() { _ = tx.Rollback(ctx) }()
 	}
 	// THE SAME RULE AS THE RECORDER'S, and it must stay the same rule. This hook was
 	// left on the old terminal-only check when AppendMessages moved to
@@ -189,11 +194,14 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 	// entirely at the gate, `window_seconds=95`, then the human approves and the
 	// first sweep after the run returns to `running` kills it — and `oversize` IS a
 	// killable class, so nothing downstream stopped it.
-	if run.Status != "running" {
-		s.persistFail.evict(runID)
+	if run.ClaimReleasedAt.Valid {
 		return
 	}
-	s.persistFail.recordFailure(runID, persistFailOversize, run.LastSeq, s.now())
+	if run.Status != "running" {
+		s.persistFail.evict(runID, run.ClaimGeneration)
+		return
+	}
+	s.persistFail.recordFailure(runID, persistFailOversize, run.LastSeq, s.now(), run.ClaimGeneration)
 }
 
 // appendMessages is AppendMessages' persistence half. It returns the observation
@@ -287,11 +295,44 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // nothing extra, while reintroducing exactly the misattribution this narrowness
 // exists to prevent.
 func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) (appendObservation, error) {
+	if s.txBeginner == nil {
+		return s.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, nil)
+	}
+	child, run, tx, err := s.beginClaimMutation(ctx, wkr, runID, claimGen)
+	if err != nil {
+		return appendObservation{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	child.bcast = nil
+	child.lifecycle = nil
+	var inserted []IncomingMessage
+	obs, err := child.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, &inserted)
+	if err != nil {
+		return obs, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return obs, err
+	}
+	// Usage-tail stamps derive from the committed frames and own their transaction.
+	// The child has no transaction beginner, so they cannot nest under the run lock.
+	if err := s.foldUsageTailStamps(ctx, run, msgs); err != nil {
+		return obs, err
+	}
+	if s.bcast != nil {
+		now := s.now()
+		for _, m := range inserted {
+			s.bcast.PublishMessage(runID, m.Seq, m.Kind, m.Agent, m.AgentInstance, m.AgentLabel, []byte(m.Payload), now)
+		}
+	}
+	return obs, nil
+}
+
+func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64, committedMessages *[]IncomingMessage) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return appendObservation{}, err
 	}
-	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq}
+	obs := appendObservation{resolved: true, status: run.Status, lastSeq: run.LastSeq, generation: run.ClaimGeneration}
 	// Generation-zero chats retain legacy supplied-mismatch compatibility. Fresh chat claims
 	// advance the generation, so honor any supplied generation throughout insertion, stale
 	// detection, high-water updates and usage attribution. Omitted chat generations remain
@@ -304,7 +345,8 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// per-query InsertRunMessage/UpdateRunLastSeq fence engages only when the batch STAMPS a
 	// generation, so a worker advertising credential_switch_v1 could bypass it by OMITTING it and
 	// persist unfenced. A capability worker MUST stamp its claim_generation, so an omission is
-	// refused; a LEGACY worker (no capability) keeps inserting unfenced (nil generation), unchanged.
+	// refused. An unreconciled legacy run may omit generation; the outer locked claim guard
+	// already rejects omission after reconciliation, independently of capability.
 	// Checked AFTER ownership resolves so ErrRunNotOwned (a foreign worker) still takes precedence.
 	// A CHAT run is exempt via effectiveClaimGen (nil) plus the explicit run.Kind guard.
 	if effectiveClaimGen == nil && run.Kind != runkind.Chat && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
@@ -314,17 +356,9 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// message rejects the batch with nothing written, so a [valid, valid, invalid]
 	// batch never leaves the first two half-persisted.
 	//
-	// That all-or-nothing property is TRUE OF VALIDATION AND FALSE OF THE STORE.
-	// The insert loop below is not transactional, so a batch whose third message
-	// the database refuses leaves the first two committed. This comment used to
-	// claim the batch was all-or-nothing outright; that was unreachable in practice
-	// before PRD #108 and is routine after it, and it is about to be load-bearing
-	// for the worker's bisection, so it is corrected here rather than left to
-	// mislead. Idempotency on (run_id, seq) is what keeps the partial apply benign:
-	// any regrouping or re-post converges. Making it genuinely transactional needs
-	// a Store interface change (the generated queries take no tx) and is deferred
-	// to Phase 2, which has its own reason to care — its "max(seq) has not
-	// advanced" guard reads the column this path leaves behind.
+	// appendMessages rolls back failed batches when a transaction beginner is wired.
+	// Without one, an insert failure can leave earlier messages committed; retries
+	// deduplicate those rows by (run_id, seq).
 	for i := range msgs {
 		m := &msgs[i]
 		if m.Seq <= 0 || m.Kind == "" || m.Kind == "cross_check" || len(m.Payload) == 0 || !json.Valid(m.Payload) {
@@ -542,6 +576,9 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	// spend, Decision 4).
 	if err := s.foldRunUsage(ctx, run, msgs); err != nil {
 		return obs, err
+	}
+	if committedMessages != nil {
+		*committedMessages = inserted
 	}
 	// Fan out after the log + high-water mark are durably advanced, so a browser
 	// that reacts by replaying from last_seq sees a consistent state.
