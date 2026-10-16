@@ -64,6 +64,11 @@ export class PlanRevisionRecovery {
       this.source = { request: structuredClone(request), revision, report };
   }
 
+  /** A question answer must reach running before this revision's next ownership probe. */
+  get hasActiveRevision(): boolean {
+    return this.active !== undefined;
+  }
+
   accept(verdict: PlanVerdict): void {
     if (verdict.kind === "revise" && !verdict.automatic && this.source &&
         positive(verdict.sourceGateRevision) && verdict.sourceGateRevision !== this.source.revision)

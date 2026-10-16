@@ -11257,7 +11257,8 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
-          { confirmRunning: resolveRunKind(claim.kind) === "issue" && !claim.interactive },
+          { confirmRunning: (resolveRunKind(claim.kind) === "issue" && !claim.interactive) ||
+            revisionRecovery?.hasActiveRevision === true },
         ),
       // Issue #1593: the worker-authored fallback park for a planning turn that stayed
       // prose-only after a nudge. Fixed question, no model text; autopilot never parks.
@@ -11270,6 +11271,7 @@ export class RunRunner {
           runLog,
           claim.auto_approve ?? false,
           claim.config ?? null,
+          { confirmRunning: revisionRecovery?.hasActiveRevision === true },
         ),
       pullFollowUp: () => steering.pullFollowUp(),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
@@ -18312,8 +18314,8 @@ export class RunRunner {
    * model text is passed in, so the lead's prose cannot reach the question. The lead's last
    * message reaches the owner only on the executor's status card, as untrusted data.
    *
-   * Shares askUser's park body, so the id, the ack check, the settle `running` report and the
-   * shared per-run answer deadline (REASON_QUESTION_TIMEOUT) are identical. It does not count
+   * Shares askUser's park body and per-run answer deadline (REASON_QUESTION_TIMEOUT),
+   * including its optional confirmed `running` settlement. It does not count
    * against question_max; that cap lives in the executors. An autopilot run never parks: it
    * returns `unattended` WITHOUT reporting awaiting_input, and the executor fails the run.
    */
@@ -18325,6 +18327,7 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     config: ClaimConfig | null,
+    options: { confirmRunning?: boolean } = {},
   ): Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }> {
     if (autoApprove) {
       runLog.info("plan missing: not parked (autopilot)", { run_id: runId });
@@ -18340,6 +18343,7 @@ export class RunRunner {
       reportState,
       runLog,
       config,
+      options,
     );
     return v.kind === "answer" ? { kind: "answer", answers: v.answers } : { kind: "cancel" };
   }
