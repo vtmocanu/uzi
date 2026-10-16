@@ -15,6 +15,25 @@ function grants(allowedTools: readonly string[]): RunGrants {
 }
 
 
+describe("Codex runtime discovery", () => {
+  for (const isRoot of [true, false]) {
+    it(`lists only granted skills for ${isRoot ? "root" : "child"}`, () => {
+      const input = { ...grants(["Skill"]), isRoot, allowedSkills: new Set(["zebra", "review"]) };
+      const spec = buildCodexDynamicTools(input).find(s => s.name === "uzi_skill")!;
+      assert.match(spec.description, /Granted skills: review, zebra\./);
+      const empty = buildCodexDynamicTools({ ...input, allowedSkills: new Set<string>() })[0]!;
+      assert.match(empty.description, /No skills are granted/);
+      assert.deepEqual([...input.allowedSkills], ["zebra", "review"], "advertising never changes grants");
+    });
+  }
+  it("advertises the actual shell and POSIX syntax without recommending script execution", () => {
+    const spec = buildCodexDynamicTools(grants(["Bash"]))[0]!;
+    assert.match(spec.description, /\/bin\/sh -c/);
+    assert.match(spec.description, /write POSIX sh syntax/);
+    assert.ok(!spec.description.includes("bash <file>") && !spec.description.includes("script"));
+  });
+});
+
 describe("m1 non-closing dynamic schema", () => {
   it("requires a string reason structurally without a raw maxLength cap", () => {
     const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;

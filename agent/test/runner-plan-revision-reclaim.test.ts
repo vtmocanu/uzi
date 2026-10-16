@@ -5,6 +5,7 @@ import { api, client, fakeGitlab, installHarness, runner } from "./runner-harnes
 import { feed, freshClaim, gates, newApi, row, send, until } from "./gate-revision-harness.js";
 import { providerFixture } from "./plan-revision-provider-fixture.js";
 import type { ClaimResponse } from "../src/protocol.js";
+import type { RunContext } from "../src/executor.js";
 
 installHarness();
 const SOURCE = "# Source R";
@@ -19,7 +20,7 @@ function barrier() {
 // durable retry checkpoint, exactly-once provider execution, or lifetime allowance.
 for (const harness of ["claude", "codex"] as const) {
   for (const stage of ["expired", "J queued", "J publication uncommitted", "J committed before ACK"] as const) {
-    it(`reclaim ${harness}: loss at ${stage}`, async () => {
+    it(`reclaim ${harness}: loss at ${stage}`, async t => {
       newApi();
       api.planRevisionRetries = true;
       client.protocolFeatures = [...client.protocolFeatures, "plan_revision_retry_v1"];
@@ -30,6 +31,8 @@ for (const harness of ["claude", "codex"] as const) {
       const id = claim.run_id;
       const hold = barrier();
       const arrived = barrier();
+      const nextRevision = barrier();
+      const nextRevisionBlocked = barrier();
       let restore = () => {};
       const oldFlight = runner(old.executor, fakeGitlab().gitlab, undefined, {
         planRevisionRetryPolicy: { random: () => 0, sleep: async (ms, signal) => {
@@ -90,6 +93,21 @@ for (const harness of ["claude", "codex"] as const) {
 
         const persisted = committed ? REVISED : SOURCE;
         const successor = providerFixture(harness, () => harness === "claude" ? { failure: true } : { plan: FRESH });
+        if (harness === "claude" && !committed) {
+          const run = successor.executor.run.bind(successor.executor);
+          t.mock.method(successor.executor, "run", (ctx: RunContext) => run({
+            ...ctx,
+            beforePlanRevisionTurn: async () => {
+              // After I exhausts its fresh allowance, queued J may immediately
+              // start. Hold that next turn while inspecting I's eight starts.
+              if (successor.starts.length >= 8) {
+                nextRevisionBlocked.release();
+                await nextRevision.promise;
+              }
+              await ctx.beforePlanRevisionTurn?.();
+            },
+          }));
+        }
         api.setInputClaimGeneration(id, 2);
         api.setOwnershipStatus(id, "awaiting_approval", 2);
         const resumed: ClaimResponse = { ...claim, claim_generation: 2,
@@ -111,6 +129,8 @@ for (const harness of ["claude", "codex"] as const) {
         if (harness === "claude" && !committed) {
           assert.ok(await until(() => successor.starts.length === 8), "new claim gets a fresh three-redrive allowance");
           assert.ok(await until(() => feed(id).some(t => t.includes("generation 2,") && t.includes("retry allowance exhausted"))));
+          if (j) await nextRevisionBlocked.promise;
+          assert.equal(successor.starts.length, 8, "inspect only I's completed allowance before J can start");
           assert.ok(successor.starts.every(s => s.prompt.includes("old I")), "FIFO replay starts I, not reconstructed J flight");
           assert.ok(successor.starts.every(s => !s.prompt.includes("old J")));
           assert.equal(waits.reduce((a, b) => a + b, 0), 35000);
@@ -149,6 +169,7 @@ for (const harness of ["claude", "codex"] as const) {
           assert.equal(api.isInputSuperseded(id, j!.id), false);
         }
         send(id, row("cancel"));
+        nextRevision.release();
         await nextDone;
       } finally {
         hold.release();
@@ -156,6 +177,7 @@ for (const harness of ["claude", "codex"] as const) {
         await oldDone;
         restore();
         nextFlight?.shutdown();
+        nextRevision.release();
         await nextDone;
       }
     });

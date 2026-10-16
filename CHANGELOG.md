@@ -35,6 +35,9 @@ through `[0.52.0]`.)
 - **Cancelled runs stop waiting when their worker reconnects.**
   A worker returning after an outage stops a cancelled run's live execution and plan or question wait, retains its unfinished source for recovery, and admits the next run after teardown completes.
 
+- **Explain rejected Codex resumed usage ([#3065](https://github.com/vtmocanu/uzi/issues/3065)).**
+  Incomplete token accounting notices now identify the failed validation predicate and applicable breakdown and bucket using fixed diagnostic text, without exposing provider data.
+
 - **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
   Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
 
@@ -55,6 +58,9 @@ through `[0.52.0]`.)
 
 - **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
   Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
+
+- **Codex leads receive their subagent capabilities before planning.**
+  Planning and implementation prompts list available roles with their implementation write capabilities, while planning remains read-only. Skill tools list each role's granted skills, shell tools identify their interpreter, and delegation traces include a bounded, scrubbed assignment excerpt without changing milestone labels.
 
 ### Changed
 

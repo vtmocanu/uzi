@@ -46,7 +46,7 @@
 #   2  reset unknown (switch reviewer after an exact query; plain --wait has a ceiling)
 #   3  usage / gh error
 # With --trigger-review, a successful trigger hands control to watch-pr.sh and the final exit
-# code is its 0..9 readiness/finding contract; quota-phase failures retain the meanings above.
+# code is its 0..10 readiness/finding contract; quota-phase failures retain the meanings above.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
