@@ -43,6 +43,7 @@ import {
   type RunGrants,
 } from "./broker.js";
 import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
+import { CI_EVIDENCE_READ, ciEvidenceRoleAllowed } from "../ci-evidence-tools.js";
 import { MEMORY_SERVER_NAME, memoryToolNames } from "../memory-tools.js";
 import { reportIncidentalIssueToolName } from "../findings-tools.js";
 import { forgeToolNames } from "../forge-tools.js";
@@ -251,6 +252,7 @@ function buildAllowedTools(
   isRoot: boolean,
   role: string,
   diagnostics: MutableDiagnostics,
+  evidencePrepared: boolean,
 ): ReadonlySet<string> {
   const allowed = new Set<string>();
   if (tools.kind === "inherit") {
@@ -274,6 +276,9 @@ function buildAllowedTools(
   // allowlist named one (the broker also root-gates these at dispatch). Filtered in
   // one pass into a fresh set rather than deleting from `allowed` while iterating it.
   const denied = new Set(deniedTools.map(canonicalizeCodexToolName));
+  allowed.delete(CI_EVIDENCE_READ);
+  if (evidencePrepared && tools.kind !== "inherit"
+    && ciEvidenceRoleAllowed(tools.names.map(canonicalizeCodexToolName), [...denied])) allowed.add(CI_EVIDENCE_READ);
   const kept: string[] = [];
   for (const t of allowed) {
     if (denied.has(t)) continue;
@@ -451,6 +456,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
       ...fullVocabulary(true).filter((tool) => tool !== "park_run"
         || (request.phase === "implement" && request.parkRunSupported === true && request.nonInteractiveIssue === true)),
       ...(request.codeCrossCheck ? [CODE_DISPOSITIONS_TOOL] : []),
+      ...(request.ciEvidencePrepared ? [CI_EVIDENCE_READ] : []),
     ]),
     parkRunSupported: request.parkRunSupported,
     nonInteractiveIssue: request.nonInteractiveIssue,
@@ -478,7 +484,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
     perRoleGrants.set(role, {
       role,
       phase: request.phase,
-      allowedTools: buildAllowedTools(agent.tools, agent.deniedTools, false, role, diagnostics),
+      allowedTools: buildAllowedTools(agent.tools, agent.deniedTools, false, role, diagnostics, request.ciEvidencePrepared === true),
       allowedSkills: buildAllowedSkills(agent.skills, role, diagnostics),
       isRoot: false,
     });

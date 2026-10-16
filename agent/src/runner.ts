@@ -1,3 +1,4 @@
+import { prepareCIEvidence, validateCIRepairClaim, type PreparedCIEvidence } from "./ci-evidence.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
@@ -1780,6 +1781,7 @@ interface RunFlight {
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
   retainedDiscoveryRetries?: number;
+  ciEvidence?: PreparedCIEvidence;
   readonly runHome: string | undefined;
   readonly runScopedSecrets: string[];
   readonly runLog: Logger;
@@ -2985,6 +2987,7 @@ export class RunRunner {
   }
 
   async execute(claim: ClaimResponse): Promise<void> {
+    validateCIRepairClaim({ ...claim, config: claim.config ?? undefined }, claim.claim_generation);
     const runId = claim.run_id;
     // Defense in depth (PRD #42): runId becomes a path segment in the per-run HOME
     // (agent-home/<runId>) which the runner fs.rm's on terminal. It is a
@@ -4060,6 +4063,8 @@ export class RunRunner {
     } catch (err) {
       await dispatchFailure(err, true);
     } finally {
+      await flight.ciEvidence?.dispose().catch(() => runLog.warn("CI evidence reader disposal failed"));
+      flight.ciEvidence = undefined;
       // #1539: AWAIT the permanent-failure hook's settlement BEFORE the Codex registry disposal
       // below. The arms that do NOT go through reportGenericFailure (limit, pause, forge-unreachable,
       // shutdown, stale/credential-switch stops) never await it themselves, so without this a hook
@@ -10728,6 +10733,24 @@ export class RunRunner {
     let parkContinuation: "attempt" | "reconcile" | "question" = "attempt";
     let parkOwnershipProbe: Promise<RunOwnershipResponse> | undefined;
     const ctx: RunContext = {
+      ...(claim.kind === "prompt" && claim.config?.ci_config_guard === true && claim.ci_repair != null ? {
+        prepareCIEvidence: async () => {
+          if (!flight.runHome) throw new Error("CI evidence requires a prepared run home");
+          await flight.ciEvidence?.dispose();
+          flight.ciEvidence = undefined;
+          const prepared = await prepareCIEvidence({
+            claim: { ...claim, config: claim.config ?? undefined },
+            claimGeneration: flight.claimGeneration, runHome: flight.runHome,
+            cloneRoot: runnerClone.path, downloader: this.client,
+            signal: AbortSignal.any([cancel.signal, steering.terminalLifecycleSignal()]),
+            downloadSignal: AbortSignal.any([cancel.signal, steering.lifecycleSignal()]),
+            isCurrent: () => this.activeRuns.get(runId) === flight.active
+              && steering.claimFence() === undefined && !steering.lifecycleSignal().aborted && !flight.active?.shuttingDown,
+          });
+          flight.ciEvidence = prepared;
+          return prepared;
+        },
+      } : {}),
       runId,
       claimGeneration: claim.claim_generation,
       kind: resolveRunKind(claim.kind),

@@ -213,4 +213,27 @@ if [ "${UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E:-}" = "1" ]; then
   rm -f "$E2E_LOG"
 fi
 
+# M1 composition proof: real GitHub collection, sealed storage and both worker
+# reader adapters, including an actually reclaimed generation. Keep this log.
+if [ "${UZI_CI_ARTIFACTS_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  E2E_LOG="$(mktemp "$ROOT/.uzi/scratch/ci-artifacts-repair-log.XXXXXX")"
+  printf 'CI artifact repair proof: revision=%s log=%s\n' "$(git -C "$ROOT" rev-parse HEAD)" "$E2E_LOG"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestCIArtifactsRepairE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  if grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "CI artifact repair proof skipped: $E2E_LOG" >&2
+    exit 1
+  fi
+  for proof_case in TestCIArtifactsRepairE2E \
+    TestCIArtifactsRepairE2E/claude/fresh TestCIArtifactsRepairE2E/claude/resume \
+    TestCIArtifactsRepairE2E/codex/fresh TestCIArtifactsRepairE2E/codex/resume; do
+    if ! grep -Fxq "=== RUN   $proof_case" "$E2E_LOG" ||
+      ! grep -Eq "^[[:space:]]*--- PASS: $proof_case \\(" "$E2E_LOG"; then
+      echo "CI artifact repair proof missing RUN/PASS for $proof_case: $E2E_LOG" >&2
+      exit 1
+    fi
+  done
+fi
+
 printf '\n\033[32mStore integration tests passed.\033[0m\n'
