@@ -35,6 +35,11 @@
 #      be mistaken for a file header.
 set -eu
 export NET_RETRY_BASE_SLEEP=0
+case "${1:-}" in
+  "") FRAGMENTS_ONLY=0;;
+  --fragments-only) FRAGMENTS_ONLY=1;;
+  *) echo "usage: $0 [--fragments-only]" >&2; exit 2;;
+esac
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/land-prep.sh"
@@ -118,6 +123,7 @@ EOF
 }
 origin_main() { git --git-dir="$ORIGIN" rev-parse refs/heads/main; }
 
+if [ "$FRAGMENTS_ONLY" -eq 0 ]; then
 # A. disjoint move during the gate: rebased, pushed, the gate NOT re-run.
 mk_branch ba; printf 'a\n' > "$SEED/web/a.txt"; commit_push ba 'branch a'
 hook prds/1650-new.md 'prd\n' 'unrelated prd'
@@ -433,3 +439,111 @@ run br3 224 --no-push --gate none
 grep -qF -- 'preserved note' "$WORK/out.224" || fail "R3: the removed line was not printed: $(cat "$WORK/out.224")"
 
 echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, branch-only heading collapse and base-order guard, blank-separated and sparse union"
+fi
+
+# S. Fragment-only callers must never execute the union engine, even when the base
+# retains repeated headings. Copy the caller and its library, leaving the real engine alone.
+mkdir -p "$WORK/fragment-scripts/lib"
+cp "$SCRIPT" "$WORK/fragment-scripts/land-prep.sh"
+cp "$HERE/lib/net-retry.sh" "$WORK/fragment-scripts/lib/"
+SCRIPT="$WORK/fragment-scripts/land-prep.sh"
+export ENGINE_LOG="$WORK/engine.log"
+cat > "$WORK/fragment-scripts/changelog-union.sh" <<'CANARY'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "engine invoked: $*" >> "$ENGINE_LOG"
+echo 'rejecting union engine canary' >&2
+exit 97
+CANARY
+: > "$ENGINE_LOG"
+canary_rc=0
+bash "$WORK/fragment-scripts/changelog-union.sh" --calibrate > "$WORK/canary.out" 2>&1 || canary_rc=$?
+[ "$canary_rc" -eq 97 ] || fail "S: rejecting engine canary did not reject"
+[ "$(cat "$ENGINE_LOG")" = 'engine invoked: --calibrate' ] || fail "S: engine canary did not log"
+: > "$ENGINE_LOG"
+
+# Use deliberately uneven blank spacing as well as repeated headings: cmp below must
+# detect normalization of either. This also seeds the --fragments-only selection.
+git -C "$SEED" switch -q main
+printf '## [Unreleased]\n\n\n### Added\n\n- **added one**\n\n### Fixed\n\n\n- **fixed one**\n\n### Added\n\n- **added two**\n\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+commit_push main 'fragment base with repeated sections'
+OWN_FRAGMENT=changelog.d/11111111-1111-4111-8111-111111111111.md
+OTHER_FRAGMENT=changelog.d/22222222-2222-4222-a222-222222222222.md
+printf '### Fixed\n\n- **Own change survives preparation (#2957).**\n  Keep the original branch fragment bytes.\n\n' > "$WORK/own.md"
+printf '### Added\n\n- **Other change lands independently (#2957).**\n  Keep the other branch fragment bytes.\n' > "$WORK/other.md"
+
+fragment_branch() {
+  mk_branch "$1"
+  mkdir -p "$SEED/changelog.d"
+  cp "$WORK/own.md" "$SEED/$OWN_FRAGMENT"
+  commit_push "$1" 'own fragment only'
+}
+# Snapshot the actual final base, then compare both file bytes and the complete branch
+# delta. A single unchanged commit subject and count rule out a normalization commit.
+assert_fragment_result() {
+  local label="$1" pr="$2" br="$3" result="$4" other="$5" wt="$WORK/wt-$2" base
+  [ ! -s "$ENGINE_LOG" ] || fail "$label: union engine executed: $(cat "$ENGINE_LOG")"
+  [ "$rc" -eq 0 ] || fail "$label: fragment preparation failed, rc=$rc: $(cat "$WORK/out.$pr")"
+  grep -q "^RESULT=$result " "$WORK/out.$pr" || fail "$label: expected $result status"
+  base=$(origin_main)
+  git --git-dir="$ORIGIN" show "$base:CHANGELOG.md" > "$WORK/expected-changelog"
+  cmp -s "$WORK/expected-changelog" "$wt/CHANGELOG.md" || fail "$label: base CHANGELOG bytes changed"
+  cmp -s "$WORK/own.md" "$wt/$OWN_FRAGMENT" || fail "$label: own fragment bytes changed"
+  if [ "$other" = yes ]; then
+    cmp -s "$WORK/other.md" "$wt/$OTHER_FRAGMENT" || fail "$label: other fragment bytes changed"
+  fi
+  [ "$(git -C "$wt" diff --name-only "$base" HEAD)" = "$OWN_FRAGMENT" ] || fail "$label: branch delta is not precisely its own fragment"
+  [ "$(git -C "$wt" rev-parse HEAD^)" = "$base" ] || fail "$label: not one commit above final base"
+  [ "$(git -C "$wt" log -1 --format=%s)" = 'own fragment only' ] || fail "$label: original commit replaced"
+  [ -z "$(git -C "$wt" status --porcelain)" ] || fail "$label: prepared worktree dirty"
+  if [ "$result" = pushed ]; then
+    [ "$(git --git-dir="$ORIGIN" rev-parse "refs/heads/$br")" = "$(git -C "$wt" rev-parse HEAD)" ] || fail "$label: prepared head not pushed"
+    git --git-dir="$ORIGIN" show "refs/heads/$br:CHANGELOG.md" > "$WORK/pushed-changelog"
+    cmp -s "$WORK/expected-changelog" "$WORK/pushed-changelog" || fail "$label: pushed CHANGELOG bytes changed"
+  fi
+}
+
+fragment_branch bs
+run bs 226 --no-push --gate none
+assert_fragment_result S 226 bs prepared no
+
+# T. Another branch lands both a fragment and a legacy changelog edit before preparation.
+fragment_branch bt
+git -C "$SEED" switch -q main
+mkdir -p "$SEED/changelog.d"
+cp "$WORK/other.md" "$SEED/$OTHER_FRAGMENT"
+awk '{print} $0=="- **fixed one**"{print ""; print "- **Independent legacy update (#2957).**"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push main 'other fragment and legacy entry'
+run bt 227 --no-push --gate none
+assert_fragment_result T 227 bt prepared yes
+
+# U. The same two-path base move during the gate is disjoint from our fragment.
+# Each hook runs once, with no retry; a failed hook makes the task stub fail.
+# Remove the other fragment from main first so the hook lands a new fragment.
+git -C "$SEED" rm -q "$OTHER_FRAGMENT"
+commit_push main 'prepare next independent fragment landing'
+fragment_branch bu
+export OTHER_FRAGMENT
+cat > "$GATE_HOOK" <<'EOF'
+set -eu
+git -C "$SEED" switch -q main
+mkdir -p "$SEED/changelog.d"
+cp "$OTHER_BYTES" "$SEED/$OTHER_FRAGMENT"
+awk '{print} $0=="- **fixed one**"{print ""; print "- **During-gate legacy update (#2957).**"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"
+mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+git -C "$SEED" add -- "$OTHER_FRAGMENT" CHANGELOG.md
+git -C "$SEED" commit -qm 'during gate fragment and legacy entry'
+git -C "$SEED" push -q origin main
+printf 'fired\n' > "$HOOK_FIRED"
+EOF
+export OTHER_BYTES="$WORK/other.md" HOOK_FIRED="$WORK/fragment-hook-fired"
+U_BASE=$(origin_main)
+: > "$TASK_LOG"
+run bu 228 --gate repo
+assert_fragment_result U 228 bu pushed yes
+[ -f "$HOOK_FIRED" ] && [ ! -f "$GATE_HOOK" ] || fail "U: base-move hook did not complete"
+[ "$(origin_main)" != "$U_BASE" ] || fail "U: hook did not move base"
+[ "$(cat "$TASK_LOG")" = gate:repo ] || fail "U: expected exactly one gate:repo call"
+grep -qF 'delta disjoint from the branch (2 files); rebased without re-gating' "$WORK/out.228" || fail "U: base move tolerance not logged"
+echo "PASS land-prep fragment-only: ordinary preparation, initial rebase, during-gate base move; exact bytes and no union engine"

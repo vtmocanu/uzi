@@ -98,7 +98,7 @@ base's candidate is still in flight; `--promote` promotes the in-flight candidat
 then cuts the next candidate; `--promote-only`, given the in-flight base, promotes it and stops
 (no next candidate, `main` untouched, one push: the stable tag); `--skip-promote` abandons the
 in-flight base and cuts a new
-`vX.Y.Z-rc.1` candidate (renaming the open section and folding `[Unreleased]` in), never a
+`vX.Y.Z-rc.1` candidate (renaming the open section and assembling legacy `[Unreleased]` plus pending fragments), never a
 stable tag; `--stable` is the old one-step model, refused while a candidate is in
 flight. **Push order on a promote: the stable tag, then `main`, then the next candidate's
 tag** — the candidate's changelog-coverage gate needs the new stable tag visible first. A
@@ -133,8 +133,8 @@ re-resolves the version and triggers the sync; no separate `argocd app sync` is 
 Why direct-to-`main` is preferred here: it skips the MR gate cycle, so `ci.yml` runs the full
 suite **once** on `main` instead of twice (MR, then merge), which matters because every gate run
 is an independent roll against flaky tests. The trade is that the release commit gets no
-independent pre-land review; that is low risk because it only bumps `Chart.yaml` + CHANGELOG on
-code every feature PR already gated.
+independent pre-land review; its scope is release metadata on code every feature PR already
+gated: chart/worker metadata, assembled CHANGELOG notes and incorporated fragment deletions.
 
 **Release publication proves CI coverage without repeating the full gate.**
 `assert-ci-coverage` requires successful main-push CI and smoke on the tagged SHA or its
@@ -155,6 +155,20 @@ registry layers are reused when their inputs match; release image identity check
    coverage. A manually prepared metadata bump can also land through an MR; publication
    requires the same exact-SHA or strict-parent coverage proof.
 
+   **Pending notes come from independent fragments plus legacy `[Unreleased]`.** Ordinary
+   PRs create a new lowercase UUID-v4 fragment before the PR exists, initially citing the
+   relevant issue; see [fragment guidance](../changelog.d/README.md). Keep existing legacy
+   bullets until the next cut. The cutter groups categories, preserves legacy order within
+   each, appends fragments in C filename order, and consumes incorporated paths in the
+   release commit. Later RCs append new blocks without changing frozen shipped blocks;
+   promotion-only promotes the candidate's own commit, leaving main's pending fragments.
+   `--changelog-file` refuses pending fragments before mutation. Preflight failures preserve
+   inputs, but preparation failure or interruption can leave notes/deletions staged or a
+   completed local commit. Inspect HEAD, index and worktree; use the printed starting SHA
+   and exact owned paths for deliberate recovery, with no automatic destructive rollback.
+   Linkification and previous-stable date reconciliation still apply. See
+   [ADR-2957](../adr/2957-changelog-fragments.md) for the classifier and safety boundaries.
+
    **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
    `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous stable tag
    changed shipping code without being cited in the new version's section. Run it yourself
@@ -164,7 +178,8 @@ registry layers are reused when their inputs match; release image identity check
    it.** That has happened three times (0.11.7 and 0.11.8 shipped with entries still under
    `[Unreleased]`; issue #60 landed inside 0.11.10's window with no entry at all). A merge
    with genuinely nothing to announce is exempted with a `Changelog: none` line in its
-   commit message.
+   commit message. Fragment touches do not provide this exemption; the oracle still
+   requires the shipping commit's identity in the assembled release section.
 
 2. **Tag the reviewed release commit and push the tag.**
 
@@ -219,7 +234,9 @@ setting `targetRevision` back to `0.*`.
 
 **Hotfix** remains a manual procedure. Start a worktree at the previous stable patch
 (for example `v0.85.2` for `v0.85.3`), cherry-pick the already-merged fixes, add a cited
-CHANGELOG section and bump both chart version fields. Run
+CHANGELOG section and bump both chart version fields. This manual off-main preparation
+must incorporate the cherry-picked fixes' notes and deliberately consume their fragment
+paths in the same release commit; a pending fragment alone is not release coverage. Run
 `scripts/worker-tag-autobump.sh 0.85.3` before committing the metadata so an agent runtime
 fix also advances the worker pin. Run the affected component gates
 and `task check:release-metadata` locally. Since this off-main tree has no main-push CI,

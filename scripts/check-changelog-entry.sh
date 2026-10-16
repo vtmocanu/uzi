@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PR-time half of the CHANGELOG coverage rule: a branch that changes shipping code must
-# add a CHANGELOG.md line or say why it has nothing to announce.
+# add a new changelog fragment, a legacy CHANGELOG.md line, or explain no announcement.
 #
 # usage: scripts/check-changelog-entry.sh
 #
@@ -16,6 +16,8 @@
 # uncommitted and untracked, so a pre-commit `task gate` agrees with CI). When any path in it
 # is shipping (scripts/lib/shipping-paths.sh, the oracle's own definition), one of these must
 # hold:
+#   - A valid changelog.d/<uuid-v4>.md fragment absent at the base supplies an entry.
+#     Every added/changed fragment is validated before any entry or exemption succeeds.
 #   - CHANGELOG.md's `## [Unreleased]` section gains a nonblank line (a blank line, a
 #     removal or an edit under a released version does not count; the landing tooling's
 #     changelog guard owns deletions).
@@ -44,7 +46,7 @@
 #
 # EXIT CODES (check-migration-numbering.sh convention; `task` itself reports 201):
 #     2 = instrument broken (not a git repo, base unresolvable, no merge-base)
-#     1 = shipping change with no CHANGELOG line and no exemption
+#     1 = malformed/unsafe fragment, or shipping change without entry/exemption
 #     0 = nothing shipping, or an entry or exemption covers it
 set -euo pipefail
 
@@ -57,6 +59,9 @@ cd "$ROOT"
 . "$ROOT/scripts/lib/shipping-paths.sh"
 # shellcheck source=scripts/lib/dependency-bump.sh
 . "$ROOT/scripts/lib/dependency-bump.sh"
+CHANGELOG_FRAGMENT_PARSER="$ROOT/scripts/lib/changelog-fragments.awk"
+# shellcheck source=scripts/lib/changelog-fragments.sh
+. "$ROOT/scripts/lib/changelog-fragments.sh"
 
 BASE_REF="refs/remotes/origin/main"
 if ! git rev-parse --verify --quiet "$BASE_REF^{commit}" > /dev/null; then
@@ -71,16 +76,32 @@ BASE="$(git merge-base "$BASE_REF" HEAD 2>/dev/null)" || {
   exit 2
 }
 
-TMP="$(mktemp -d)"
+mkdir -p "$ROOT/.uzi/scratch"
+TMP="$(mktemp -d "$ROOT/.uzi/scratch/changelog-entry.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # Every path changed since the base: tracked (committed or not) plus untracked.
-{ git diff --name-only "$BASE" --; git ls-files --others --exclude-standard; } | sort -u > "$TMP/files"
+{ git diff --no-renames --name-only -z "$BASE" --; git ls-files -z --others --exclude-standard; } > "$TMP/files"
+
+# Validate changed fragments before ANY success, including nonshipping/exempt branches.
+# Deleted paths cannot supply evidence; inherited edits never count as a new entry.
+changelog_fragment_safe_entries || exit 1
+fragment_entry=0
+while IFS= read -r -d '' f; do
+  case "$f" in
+    changelog.d/README.md) continue ;;
+    changelog.d/*|changelog.d)
+      if [ ! -e "$f" ] && [ ! -L "$f" ]; then continue; fi
+      changelog_fragment_validate "$f" || exit 1
+      if ! git cat-file -e "$BASE:$f" 2>/dev/null; then fragment_entry=1; fi
+      ;;
+  esac
+done < "$TMP/files"
 
 shipping=0
 manifest_only=1
 : > "$TMP/shipping"
-while read -r f; do
+while IFS= read -r -d '' f; do
   [ -n "$f" ] || continue
   is_shipping "$f" || continue
   shipping=1
@@ -91,6 +112,7 @@ done < "$TMP/files"
 pass() { echo "check-changelog-entry.sh: OK: $1"; exit 0; }
 
 [ "$shipping" = 1 ] || pass "no shipping path changed since $(git rev-parse --short "$BASE")"
+[ "$fragment_entry" = 0 ] || pass "a new changelog fragment supplies an entry"
 
 # The [Unreleased] section's lines, from its heading to the next `## [` heading.
 unreleased() { awk '/^## \[Unreleased\]/ {f=1; next} /^## \[/ {f=0} f'; }
@@ -119,18 +141,18 @@ all_shipping_commits() {
   while read -r sha; do
     [ -n "$sha" ] || continue
     touches=0
-    while read -r f; do
+    while IFS= read -r -d '' f; do
       [ -n "$f" ] || continue
       if is_shipping "$f"; then touches=1; break; fi
-    done < <(git diff-tree --no-commit-id --name-only -r "$sha")
+    done < <(git diff-tree --no-commit-id --name-only -z -r "$sha")
     [ "$touches" = 1 ] || continue
     n=$((n + 1))
     git log -1 --format=%s "$sha" > "$TMP/subject"
     grep -qE "$1" "$TMP/subject" || return 1
   done < <(git rev-list --no-merges "$BASE..HEAD")
   [ "$n" -gt 0 ] || return 1
-  { git diff --name-only HEAD --; git ls-files --others --exclude-standard; } > "$TMP/uncommitted"
-  while read -r f; do
+  { git diff --name-only -z HEAD --; git ls-files -z --others --exclude-standard; } > "$TMP/uncommitted"
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     if is_shipping "$f"; then return 1; fi
   done < "$TMP/uncommitted"
@@ -149,8 +171,9 @@ echo "check-changelog-entry.sh: FAIL: shipping paths changed with no CHANGELOG.m
 sed 's/^/  /' "$TMP/shipping" | head -20 >&2
 cat >&2 <<'MSG'
 
-Add a line under `## [Unreleased]` in CHANGELOG.md (Keep-a-Changelog subsection, cite the
-issue or PR number), or, when there is genuinely nothing to announce, put
+Add a new UUID-v4 fragment under changelog.d/ (see changelog.d/README.md), or a
+legacy line under `## [Unreleased]` in CHANGELOG.md. When there is genuinely
+nothing to announce, put
 
     Changelog: none    # and why
 

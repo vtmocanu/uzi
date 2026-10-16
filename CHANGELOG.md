@@ -1,24 +1,31 @@
 # Changelog
 
 Notable changes to uzi, loosely following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B) — this
-file is not bumped per-commit; `[Unreleased]` collects everything since the last tag. Under the
-release-candidate train (PRD #1265) a `## [X.Y.Z]` section is opened by folding `[Unreleased]` at
-the FIRST candidate cut for that version (`vX.Y.Z-rc.1`); later candidates of the same version append
-to that open section, and promotion to stable only refreshes its date. So a section keyed by the
-stable `X.Y.Z` may describe a version that is still a candidate; the git tag carries the `-rc.N`.
+Versions are release git tags (`deploy/chart/Chart.yaml`'s `version`/`appVersion`, Model B).
 
-Format each bullet as a bold title on its own physical line, then the description directly on the
-next physical line (NO blank line between them), the description on ONE physical line (no
-mid-description newlines) indented two spaces so it stays inside the list item: a release's notes are
-the selected bullet blocks verbatim (`scripts/changelog-section.sh body`), and GitHub renders
-single newlines in a release body as hard `<br>` breaks, so the title and its description render on
-consecutive lines with nothing between them, while a hard-wrapped description would show as short,
-ragged lines and a blank line after the title would open a gap. Keeping the description on one
-physical line lets GitHub reflow it to the reader's width. Blank lines between bullets and `###`
-subsection headers are unaffected. (Title-line-then-description established 2026-08-22, applied
-back across earlier sections too; one-physical-line-per-bullet was the interim rule from 2026-08-21
-through `[0.52.0]`.)
+Ordinary PRs add a new lowercase UUID-v4 `changelog.d/<uuid>.md` fragment before the PR
+exists, citing the relevant issue. See [fragment guidance](changelog.d/README.md) for the
+exact grammar, validation and exemptions; there is no shared index. Leave existing legacy
+`[Unreleased]` bullets in place until the next release. Direct additions remain accepted
+during migration. Fragment touches do not exempt shipping commits from the release oracle.
+
+The cutter assembles legacy `[Unreleased]` plus pending fragments into the stable-keyed
+`## [X.Y.Z]` section: canonical categories, legacy order within each category, then fragments
+in C filename order. Incorporated paths are consumed in the release commit. The first
+candidate opens that section; later RCs append new blocks while shipped blocks remain
+frozen. Promotion-only promotes the candidate's own commit and leaves main's pending
+fragments for the next cut. A stable-keyed section may therefore still describe a candidate;
+the git tag carries `-rc.N`. Linkification and previous-stable date reconciliation still
+apply; see [ADR-2957](adr/2957-changelog-fragments.md) for those boundaries and recovery.
+
+Format new entries as a bold outcome sentence ending in a period on its own physical line,
+then immediately one nonempty description physical line indented two spaces. No blank line
+separates the title and description; only trailing blank lines follow a fragment. A release's
+notes use selected bullet blocks (`scripts/changelog-section.sh body`); GitHub renders single
+newlines as hard `<br>` breaks, so one physical description line lets it reflow to the reader's
+width. Existing one-line and multiline legacy bullets stay as written until incorporation.
+(Title-line-then-description established 2026-08-22, applied back across earlier sections too;
+one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52.0]`.)
 
 ## [Unreleased]
 

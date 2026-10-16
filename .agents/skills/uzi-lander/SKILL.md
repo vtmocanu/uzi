@@ -391,7 +391,12 @@ locally in step 4. The advisory still prints until the window expires.
    signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
    `test-api-store-it` job's `LiveDB: N passed, 0 skipped` line on the exact head, since a test
-   pinned to an older schema can break on the other side's new columns. After a release folds `[Unreleased]`,
+   pinned to an older schema can break on the other side's new columns.
+   Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
+   the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union
+   independent fragments or build a shared index. Fragment touches are not a release-oracle
+   exemption. Keep inherited fragments intact; release cuts consume incorporated paths.
+   **Legacy CHANGELOG compatibility only:** after a release folds `[Unreleased]`,
    keep only the branch's `CHANGELOG.md` bullets `main` lacks.
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
@@ -419,11 +424,11 @@ locally in step 4. The advisory still prints until the window expires.
    moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
    whole file from that backup: it predates what landed on the base since. Exit 9 = the
-   branch deletes `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
+   branch deletes legacy `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
    them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
    branch changes workflow files: split the edit out (*Always yours*);
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
-   Exit 11 = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
+   Exit 11 (legacy direct writes) = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
    under a released section after a fold) or missing after the rebase: restore under `[Unreleased]`, `--skip-rebase`.
    Changing only the renamed migration's number inside the branch's own bullet passes.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
@@ -655,7 +660,7 @@ wrapper always completes with 0.
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
 - `scripts/land-prep.sh` rebase / renumber / optional gate / lease push (`scripts/changelog-union.sh`
-  unions a CHANGELOG-only conflict or refuses); `scripts/merge.sh` the
+  unions a legacy CHANGELOG-only conflict or refuses; ordinary PRs use independent UUID fragments); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
   `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the
