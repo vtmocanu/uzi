@@ -162,7 +162,9 @@ _mirror_boundary() {
   else
     "$limiter" --signal=KILL 2 cp -R "$_boundary_dir" "$dir/boundary" > "$dir/boundary-copy.stdout" 2> "$dir/boundary-copy.stderr" || rc=$?
   fi
-  printf '%s\n' "$rc" > "$dir/boundary-copy.exit"
+  if ! printf '%s\n' "$rc" > "$dir/boundary-copy.exit"; then
+    _boundary_error "boundary evidence copy status unavailable (see artifacts/$1/boundary-copy.exit)"
+  fi
   if [ "$rc" -ne 0 ]; then
     _boundary_error "boundary evidence copy failed (exit $rc; see artifacts/$1/boundary-copy.stderr)"
   fi
@@ -568,7 +570,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   if [ "$_boundary_bad" -ne 0 ]; then
     _phase_status=FAIL
     _capture_artifacts "$nn_slug" "$secs" boundary || true
-    _mirror_boundary "$nn_slug"
+    _mirror_boundary "$nn_slug" || true
     _phase_msg="${_phase_msg:+$_phase_msg; }boundary FAIL: $_boundary_msg"
     [ "$rc" -ne 0 ] || [ -z "$provides" ] || _phase_msg="$_phase_msg [provides suspect]"
     _note_failed "$provides"

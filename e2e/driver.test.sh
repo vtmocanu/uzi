@@ -1048,6 +1048,19 @@ has_row origin FAIL || bad 'read failure lost'
 [ -f "$RUNROOT/artifacts/01-origin/boundary/1-workers.exit" ] || bad 'current evidence was not published'
 end
 
+begin 'artifacts: mirror status I/O failure cannot suppress the phase verdict' capture-status-io
+FAKE_WORKER_ERROR=1
+mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
+mkdir -p "$RUNROOT/artifacts/01-origin/boundary-copy.exit"
+pass body
+BODY
+run_driver capture-status-io
+has_row origin FAIL || bad 'artifact metadata failure suppressed final FAIL row'
+[ -f "$RUNROOT/junit.xml" ] || bad 'artifact metadata failure prevented JUnit'
+[ "$RC" = 1 ] || bad 'suite exit incorrect'
+contains "$(row_msg origin FAIL)" 'copy status unavailable' || bad 'metadata write failure not explicit'
+end
+
 begin 'artifacts: TERM-ignoring compose is killed at each boundary capture budget' capture-kill
 FAKE_WORKER_ERROR=1
 mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "" "" <<'BODY'
