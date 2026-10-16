@@ -753,6 +753,21 @@ describe("launchCodexRoot: trusted construction contract", () => {
 });
 
 describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () => {
+  it("preserves sorted snapshot rows and an empty comm from best-effort reporting", async () => {
+    const fake = newFake();
+    fake.autoSnapshots = false;
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const pending = handle.snapshot();
+    const processes = [
+      { pid: fake.pid + 1, ppid: fake.pid, pgid: fake.pid, comm: "" },
+      { pid: fake.pid + 2, ppid: fake.pid, pgid: fake.pid, comm: "fixture" },
+    ];
+    fake.writeEvidence({ event: "snapshot", id: fake.snapshotIds[0], processes });
+    assert.deepEqual((await pending).processes, processes);
+    assert.equal(handle.failed, undefined, "best-effort rows do not poison the root");
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
   it("(e) surfaces started, snapshot, and a drained dispose", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
