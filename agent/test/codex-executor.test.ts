@@ -4518,7 +4518,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.match(String(dispatchId), new RegExp(DISPATCH_ID.source + "c-root$"));
     assert.equal(dispatch.agent, "lead");
     assert.ok(!("agentInstance" in dispatch), "the lead dispatch carries no agent_instance");
-    assert.deepEqual(dispatch.payload.input, { subagent_type: "coder", description: "[m1] wire it" });
+    assert.deepEqual(dispatch.payload.input, { subagent_type: "coder", description: "[m1] wire it", prompt: "wire the thing" });
 
     const childOf = (kind: string): EmittedMessage => {
       const m = emitted.find((e) => e.kind === kind && e.agent === "coder");
@@ -4644,7 +4644,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
 
     const uses = agentUses(emitted);
     assert.equal(uses.length, 1);
-    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] do reviewer work" });
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] do reviewer work", prompt: "p" });
     const childFrames = emitted.filter((m) => m.agentInstance === uses[0]!.payload.id);
     assert.ok(childFrames.length >= 3, "the child's tool pair and text were projected");
     assert.ok(childFrames.every((m) => m.agent === "coder"));
@@ -4669,7 +4669,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
 
     const uses = agentUses(emitted);
     assert.equal(uses.length, 1);
-    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "no tag here" });
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "no tag here", prompt: "p" });
     const text = emitted.find((m) => m.kind === "text" && m.payload.text === "untagged child");
     assert.ok(text);
     assert.equal(text.agent, "coder");
@@ -4902,7 +4902,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
 
     const uses = agentUses(emitted);
     assert.equal(uses.length, 1);
-    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] which role" });
+    assert.deepEqual(uses[0]!.payload.input, { subagent_type: "coder", description: "[m1] which role", prompt: "p" });
     const text = emitted.find((m) => m.kind === "text" && m.payload.text === "coded");
     assert.ok(text);
     assert.equal(text.agent, "coder");
@@ -9271,7 +9271,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     assert.deepEqual(asked, ["Which target?"]);
     assert.deepEqual(gated, ["approved plan"]);
     assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
-      "The human answered your questions:\n\nQ: Which target?\nA: server\n\nContinue the work with these answers.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
+      "The human answered your questions:\n\nQ: Which target?\nA: server\n\nContinue the work with these answers.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.\n\nNo subagents are available; do the work yourself.");
     assert.equal(rig.epochs[0]!.transport.threadStartCount, 1);
     assert.equal(emitted.filter((m) => m.kind === "answer").length, 1);
   });
@@ -9302,7 +9302,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         await run;
         assert.equal(gates, 1);
         assert.equal(promptTexts(rig.epochs[0]!.transport)[1],
-          "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.");
+          "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.\n\nNo subagents are available; do the work yourself.");
         if (mode === "auto") assert.doesNotMatch(promptTexts(rig.epochs[0]!.transport)[1]!, /AUTOPILOT_SENTINEL/);
       }
       assert.equal(asks, mode === "unwired" ? 0 : 1);
@@ -9753,6 +9753,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
   const promptTexts = (t: FakeTransport): string[] => t.requests.filter((r) => r.method === "turn/start")
     .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const cards = (emitted: EmittedMessage[]) => emitted.filter((m) => m.kind === "status" && m.payload.event === "plan_missing");
+  const nudgeWithRoster = `${PLAN_MISSING_NUDGE}\n\nNo subagents are available; do the work yourself.`;
   const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
   // The nudge and guidance turns RESUME the prose turn's session: one thread/start, no fresh
   // thread, and every root turn/start targets the same thread id.
@@ -9774,7 +9775,8 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
       gatePlan: async (plan) => { gated.push(plan); return approve; },
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "nudge then plan");
-    assert.equal(promptTexts(rig.epochs[0]!.transport)[1], PLAN_MISSING_NUDGE);
+    assert.equal(promptTexts(rig.epochs[0]!.transport)[1], nudgeWithRoster);
+    assert.ok(!promptTexts(rig.epochs[0]!.transport)[1]!.includes("All planning dispatches are read-only"), "no capability annotation without subagents");
     assertSameSession(rig.epochs[0]!.transport, 2);
     assert.deepEqual(gated, ["approved plan"]);
     assert.equal(parks, 0);
@@ -9794,7 +9796,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "nudge then question");
     assert.deepEqual(asked, ["Which target?"]);
     assert.equal(gates, 1);
-    assert.equal(promptTexts(rig.epochs[0]!.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+    assert.equal(promptTexts(rig.epochs[0]!.transport).filter((p) => p === nudgeWithRoster).length, 1);
   });
 
   it("gives the initial plan turn and a revision turn one nudge each", async () => {
@@ -9808,9 +9810,9 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revision nudge");
     const prompts = promptTexts(rig.epochs[0]!.transport);
     assert.equal(gates, 2);
-    assert.equal(prompts[1], PLAN_MISSING_NUDGE);
-    assert.equal(prompts[3], PLAN_MISSING_NUDGE);
-    assert.equal(prompts.filter((p) => p === PLAN_MISSING_NUDGE).length, 2);
+    assert.equal(prompts[1], nudgeWithRoster);
+    assert.equal(prompts[3], nudgeWithRoster);
+    assert.equal(prompts.filter((p) => p === nudgeWithRoster).length, 2);
   });
 
   it("parks on the owner after a nudged prose turn and resumes on guidance only", async () => {
@@ -9828,7 +9830,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     assert.deepEqual(parkArgs, [[]], "the park takes no model text");
     assert.match(prompts[2]!, /use the server path/);
     assert.ok(!prompts[2]!.includes(PROSE), "the lead's prose never re-enters a prompt");
-    assert.equal(prompts.filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+    assert.equal(prompts.filter((p) => p === nudgeWithRoster).length, 1);
     assert.deepEqual(gated, ["approved plan"], "the plan after guidance still goes to the gate");
     assert.equal(cards(emitted).length, 1);
     assert.equal(cards(emitted)[0]!.payload.lead_final_message, PROSE);
@@ -9851,7 +9853,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
     assert.equal(parks, 1);
     assert.equal(gates, 0);
     assert.equal(rig.transport.turnStartCount, 3);
-    assert.equal(promptTexts(rig.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 1);
+    assert.equal(promptTexts(rig.transport).filter((p) => p === nudgeWithRoster).length, 1);
     assert.equal(cards(emitted).length, 2);
   });
 
@@ -9945,7 +9947,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
         (e: Error) => e.message === "codex plan turn produced no plan");
       assert.ok(emitted.some((m) => m.payload.text === CHILD), "the child text did reach the feed");
       assert.equal(cards(emitted).length, 0);
-      assert.equal(promptTexts(rig.transport).filter((p) => p === PLAN_MISSING_NUDGE).length, 0, "child text does not trigger a nudge");
+      assert.equal(promptTexts(rig.transport).filter((p) => p.startsWith(PLAN_MISSING_NUDGE)).length, 0, "child text does not trigger a nudge regardless of the roster");
     });
 
     it("a turn with lead prose and child text carries only the lead prose on the status card", async () => {
@@ -14847,7 +14849,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
 
 // ================================================================================
 // Issue #1718: the Codex implement phase honours the approved agent selection (and the repo
-// roster) the way the Claude executor does. The plan phase is deliberately unchanged.
+// roster) the way the Claude executor does. Planning keeps the owner's roster.
 describe("CodexExecutor agent selection (issue #1718)", () => {
   const tmpl = (name: string, body: string, extra: Partial<AgentTemplate> = {}): AgentTemplate =>
     ({ name, description: `${name} agent`, prompt_body: body, tools: null, skills: [], ...extra });
@@ -15062,16 +15064,30 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.deepEqual(result.agentSelection, { source: "own", agents: ["tester"] });
   });
 
-  it("approval of a repo selection: the implement turn and resume carry the passage and the selected names; the plan phase is unchanged", async () => {
+  it("Codex runtime discovery advertises actual own capabilities on both phases", async () => {
+    const agents = [ownAgents[0]!, tmpl("inherited", "body"),
+      tmpl("empty", "body", { tools: [] }), tmpl("reader", "body", { tools: ["Read"] }),
+      tmpl("alias", "body", { tools: ["MultiEdit"] }), tmpl("unknown", "body", { tools: ["InventedWriteTool"] })];
+    const { rig } = await gated(okSel("own"), { agents }, []);
+    const roster = "Available subagents to delegate to: inherited (can edit files), empty (read-only), reader (read-only), alias (can edit files), unknown (read-only).";
+    assert.ok(turnInputs(rig.epochs[0]!.transport)[0]!.includes(roster));
+    assert.ok(turnInputs(rig.epochs[1]!.transport)[0]!.includes(roster));
+    assert.ok(turnInputs(rig.epochs[0]!.transport)[0]!.includes("All planning dispatches are read-only"));
+    assert.ok(!turnInputs(rig.epochs[1]!.transport)[0]!.includes("All planning dispatches are read-only"));
+  });
+
+  it("approval of a repo selection: both phases advertise capabilities without changing the plan roster", async () => {
     const { rig, admitted } = await gated(okSel("repo", ["repo-tester"]), { repoAgents: [repoReviewer, repoTester] }, ["repo-reviewer", "repo-tester", "coder"]);
     assert.deepEqual(admitted, { "repo-reviewer": true, "repo-tester": false, coder: false });
     const [planText] = turnInputs(rig.epochs[0]!.transport);
-    assert.ok(!planText!.includes(PASSAGE) && !planText!.includes("Available subagents") && !planText!.includes("No subagents"), "no roster block on the plan turn");
+    assert.ok(!planText!.includes(PASSAGE), "repo selection is not applied to the plan turn");
+    assert.ok(planText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
+    assert.ok(planText!.includes("All planning dispatches are read-only"));
     assert.ok(!rootInstructions(rig.epochs[0]!.transport).includes(PASSAGE), "no passage in the plan thread's instructions");
     assert.ok(rootInstructions(rig.epochs[0]!.transport).includes("OWN LEAD BODY"));
     const [implText] = turnInputs(rig.epochs[1]!.transport);
     assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
-    assert.ok(implText!.includes("Available subagents to delegate to: repo-reviewer."), "and the selected names only");
+    assert.ok(implText!.includes("Available subagents to delegate to: repo-reviewer (can edit files)."), "and the selected names only");
     assert.ok(!implText!.includes("repo-tester"));
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE), "the resumed thread's developer instructions carry the passage");
     assert.ok(rootInstructions(rig.epochs[1]!.transport).includes("OWN LEAD BODY"), "the lead stays uzi's builtin");
@@ -15080,7 +15096,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
   it("own source: names on the base turn, no passage", async () => {
     const { rig } = await gated(okSel("own"), { repoAgents: [repoReviewer] }, []);
     const [implText] = turnInputs(rig.epochs[1]!.transport);
-    assert.ok(implText!.includes("Available subagents to delegate to: coder, tester."));
+    assert.ok(implText!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
     assert.ok(!implText!.includes(PASSAGE));
     assert.ok(!rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE));
   });
@@ -15143,7 +15159,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
       assert.deepEqual(result.agentSelection, { source: "repo", agents: ["toml-agent"] });
       const [implText] = turnInputs(rig.epochs[1]!.transport);
       assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
-      assert.ok(implText!.includes("Available subagents to delegate to: toml-agent."));
+      assert.ok(implText!.includes("Available subagents to delegate to: toml-agent (can edit files)."));
       const childStarts = rig.epochs[1]!.transport.requests.filter((r) => r.method === "thread/start");
       assert.ok(childStarts.length >= 1, "the TOML agent was spawned");
       for (const c of childStarts) {
@@ -15232,7 +15248,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     await withTimeout(makeExecutor(reworkRig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "rework run");
     const [rework] = turnInputs(reworkRig.epochs[1]!.transport);
     assert.ok(rework!.startsWith("Completion check (structural interlock)"));
-    assert.ok(rework!.includes(PASSAGE) && rework!.includes("Available subagents to delegate to: repo-reviewer."));
+    assert.ok(rework!.includes(PASSAGE) && rework!.includes("Available subagents to delegate to: repo-reviewer (can edit files)."));
 
     // Clarification continuation on the same epoch.
     const clarRig = makeMultiEpochRig([script1("th-1", (tn) => [
@@ -15247,7 +15263,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     await withTimeout(makeExecutor(clarRig, bindingOf(SUBSCRIPTION)).run(clarCtx), 5000, "clarification run");
     const texts = turnInputs(clarRig.epochs[0]!.transport);
     assert.ok(texts[2]!.startsWith("The human answered your questions:"));
-    assert.ok(texts[2]!.includes(PASSAGE) && texts[2]!.includes("Available subagents to delegate to: repo-reviewer."));
+    assert.ok(texts[2]!.includes(PASSAGE) && texts[2]!.includes("Available subagents to delegate to: repo-reviewer (can edit files)."));
   });
 
   it("own source: a replacement prompt carries the names and no passage", async () => {
@@ -15271,7 +15287,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "own clarification run");
     const texts = turnInputs(rig.epochs[0]!.transport);
     assert.ok(texts[2]!.startsWith("The human answered your questions:"));
-    assert.ok(texts[2]!.includes("Available subagents to delegate to: coder, tester."));
+    assert.ok(texts[2]!.includes("Available subagents to delegate to: coder (can edit files), tester (can edit files)."));
     assert.ok(!texts[2]!.includes(PASSAGE));
   });
 });

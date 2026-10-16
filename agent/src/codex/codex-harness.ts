@@ -63,7 +63,7 @@ import { LimitReachedError } from "../limit.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
 import { emptyCounts, sanitizeText } from "../sanitize.js";
-import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
+import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName, delegationTaskInput } from "./broker.js";
 import {
   CodexTurnFailedError,
   formatCodexClassification,
@@ -351,6 +351,8 @@ interface DelegationDispatch {
   readonly dispatchId: string;
   /** The scrubbed + bounded `description` arg (display only, never authority); may be "". */
   readonly label: string;
+  /** Display-only normalized assignment, scrubbed and bounded like the label. */
+  readonly instructions?: string;
   readonly ordinal: number;
   /** Issue #1864: when the dispatch was reserved (epoch ms), for the open-at-turn-end warn. */
   readonly openedAt: number;
@@ -725,7 +727,8 @@ export class CodexHarness implements RunHarness {
           phase: "started",
           id: dispatch.dispatchId,
           name: DISPATCH_TOOL_NAME,
-          input: { subagent_type: role, description: dispatch.label },
+          input: { subagent_type: role, description: dispatch.label,
+            ...(dispatch.instructions === undefined ? {} : { prompt: dispatch.instructions }) },
         }),
         dispatch.ordinal,
       );
@@ -1864,21 +1867,29 @@ export class CodexHarness implements RunHarness {
 
   /** Issue #1583: record one active-turn root delegation callback as a pending dispatch. Its id
    *  comes from the same namespaced, per-turn-unique helper as every projected id; its label is
-   *  the `description` arg (scrubbed + bounded) or "". The role is NOT read here: it is bound
+   *  the `description` arg (scrubbed + bounded) or "". The normalized assignment is
+   *  projected separately under the same bound. The role is NOT read here: it is bound
    *  later from what the broker admitted. Fail-safe: undefined on any failure. */
   private recordDispatch(threadId: string, turnId: string, callId: string, args: unknown): DelegationDispatch | undefined {
     try {
       const ordinal = this.turnOrdinal;
       const dispatchId = this.issueProjectionId(ordinal, callId);
       let label = "";
+      let instructions: string | undefined;
       try {
         const description = asObject(args)?.description;
         if (typeof description === "string") label = projectLabel(description, this.scrubProjected);
       } catch {
         label = "";
       }
+      try {
+        const task = delegationTaskInput(args);
+        if (task !== undefined) instructions = projectLabel(task, this.scrubProjected);
+      } catch {
+        // Projection failure must neither disclose raw instructions nor block the child.
+      }
       const dispatch: DelegationDispatch = {
-        threadId, turnId, callId, dispatchId, label, ordinal, openedAt: Date.now(), state: "pending",
+        threadId, turnId, callId, dispatchId, label, instructions, ordinal, openedAt: Date.now(), state: "pending",
       };
       this.dispatches.add(dispatch);
       return dispatch;

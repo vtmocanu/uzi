@@ -4250,6 +4250,65 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     if (!cond()) throw new Error(`timed out waiting for ${label}`);
   }
 
+  for (const key of ["prompt", "task", "input", "message", "description"] as const) {
+    it(`Codex runtime discovery projects a scrubbed bounded ${key} assignment without changing execution`, async () => {
+      let harnessRef!: CodexHarness;
+      const assignment = `Review SECRET\u001b ${"🧪".repeat(200)}`;
+      const broker = stubBroker(async (rt, _name, args) => {
+        assert.equal((args as Record<string, unknown>)[key], assignment, "the delegate receives its original assignment");
+        harnessRef.registerChildSink("th-c", { push: () => {} });
+        harnessRef.bindChildDispatch("th-c", rt, "coder");
+        harnessRef.unregisterChildSink("th-c");
+        return { ok: true, output: {} };
+      });
+      const { harness, transport } = makeHarness({ broker, scrubProjected });
+      harnessRef = harness;
+      transport.push(threadStarted()).push(toolCall(1, "spawn_agent", {
+        subagent_type: "coder", description: "[m1] review", [key]: assignment,
+      }, "th-1", "tn-1", "c-1"));
+      const pending = collect(harness.startTurn(makeRequest()).events);
+      await waitUntil(() => transport.responses.length === 1, "assignment reply");
+      transport.push(turnCompleted("completed")).end();
+      const events = await withTimeout(pending, 2000, "assignment projection");
+      const item = frames(events)[0]!.items[0]!;
+      assert.ok(item.kind === "tool" && item.phase === "started");
+      const input = item.input as { prompt: string; description: string };
+      assert.match(input.prompt, /^Review \*\*\*/);
+      assert.ok(Buffer.byteLength(input.prompt, "utf8") <= 256, "the excerpt shares the label's UTF-8 byte bound");
+      assert.ok(!input.prompt.includes("SECRET") && !input.prompt.includes("\u001b") && !input.prompt.includes("\ufffd"));
+      if (key !== "description") assert.equal(input.description, "[m1] review", "milestone labels remain unchanged");
+    });
+  }
+
+  it("Codex runtime discovery omits assignment text if scrubbing fails", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async rt => {
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      harnessRef.unregisterChildSink("th-c");
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker, scrubProjected: (text) => {
+      if (text.includes("SECRET")) throw new Error("scrub failed");
+      return text;
+    } });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] review", prompt: "SECRET" }, "th-1", "tn-1", "c-1"));
+    const pending = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "scrub failure reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(pending, 2000, "scrub failure turn");
+    const item = frames(events)[0]?.items[0];
+    assert.ok(item?.kind === "tool" && item.phase === "started", "Agent started frame survives assignment scrubbing failure");
+    assert.equal(item.name, "Agent");
+    const input = item.input as Record<string, unknown>;
+    assert.equal(input.subagent_type, "coder");
+    assert.equal(input.description, "[m1] review");
+    assert.ok(!Object.hasOwn(input, "prompt"));
+    assert.ok(!JSON.stringify(events).includes("SECRET"));
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+  });
+
   it("binds nothing when the parent key is ambiguous (two in-flight calls share an empty call id)", async () => {
     let harnessRef!: CodexHarness;
     let entered = 0;
@@ -4345,7 +4404,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     harnessRef = harness;
     transport
       .push(threadStarted())
-      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] SECRET label" }, "th-1", "tn-1", "c-1"));
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] SECRET label", prompt: "Review SECRET changes", task: "ignored fallback" }, "th-1", "tn-1", "c-1"));
     const eventsP = collect(harness.startTurn(makeRequest()).events);
     await waitUntil(() => transport.responses.length === 1, "the parent reply");
     transport.push(turnCompleted("completed")).end();
@@ -4358,7 +4417,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     assert.deepEqual(dispatch.origin, { kind: "main" });
     assert.deepEqual(dispatch.attribution, { agent: "lead" });
     assert.deepEqual(dispatch.items, [
-      { kind: "tool", phase: "started", id: dispatchId, name: "Agent", input: { subagent_type: "coder", description: "[m1] *** label" } },
+      { kind: "tool", phase: "started", id: dispatchId, name: "Agent", input: { subagent_type: "coder", description: "[m1] *** label", prompt: "Review *** changes" } },
     ]);
     assert.deepEqual(child.origin, { kind: "subagent", role: "coder", instanceId: dispatchId });
     assert.deepEqual(child.attribution, { agent: "coder", agentInstance: dispatchId, agentLabel: "[m1] *** label" });

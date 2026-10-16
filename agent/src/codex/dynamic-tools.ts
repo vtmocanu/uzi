@@ -40,7 +40,7 @@ function definition(name: string, isRoot: boolean): Omit<CodexDynamicToolSpec, "
       };
     case "Bash":
       return {
-        description: "Run one worker-screened shell command inside the current worktree.",
+        description: "Run one worker-screened shell command inside the current worktree using /bin/sh -c; write POSIX sh syntax.",
         inputSchema: objectSchema({ command: STRING, cwd: STRING, ...(isRoot ? { long_running: { type: "boolean", description: "Root lead only: true selects a fixed 120-minute command bound; false or absent keeps 60 minutes." } } : {}) }, ["command"], false),
       };
     case "apply_patch":
@@ -264,5 +264,14 @@ export function buildCodexDynamicTools(grants: RunGrants): readonly CodexDynamic
     .map((canonical) => ({ canonical, wire: codexDynamicToolWireName(canonical) }))
     .filter((entry): entry is { canonical: string; wire: string } => entry.wire !== undefined)
     .sort((a, b) => a.wire < b.wire ? -1 : a.wire > b.wire ? 1 : 0)
-    .map(({ canonical, wire }) => ({ type: "function", name: wire, ...definition(canonical, grants.isRoot) }));
+    .map(({ canonical, wire }): CodexDynamicToolSpec => {
+      const spec = definition(canonical, grants.isRoot);
+      if (canonical === "Skill") {
+        const skills = [...grants.allowedSkills].sort();
+        return { type: "function", name: wire, ...spec, description: `${spec.description} ${skills.length > 0
+          ? `Granted skills: ${skills.join(", ")}.`
+          : "No skills are granted to this role."}` };
+      }
+      return { type: "function", name: wire, ...spec };
+    });
 }

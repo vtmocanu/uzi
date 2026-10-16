@@ -156,6 +156,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { codexSubagentWriteCapabilities } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -4637,12 +4638,14 @@ export class CodexExecutor implements Executor {
       leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
       const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
-      // The roster (and, for a repo roster, the untrusted-content passage) rides EVERY implement
-      // prompt built here, so the base prompt and every replacement prompt (completion rework,
-      // safety steer, clarification continuation, resume-reject restart) carry it: the resumed thread's developer
-      // instructions alone are not enough on a turn that bypasses implementPrompt.
-      prompt = [prompt, "", delegatesLine(Object.keys(agents)), ...(repoSourced ? [REPO_SUBAGENT_UNTRUSTED_APPEND] : [])].join("\n");
+      // Every implement request, including replacement and continuation prompts,
+      // carries the repo roster's untrusted-content passage. The resumed thread's
+      // developer instructions alone are not enough. Both phases get the roster below.
+      if (repoSourced) prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}`;
     }
+    prompt = [prompt, "", delegatesLine(Object.keys(agents), codexSubagentWriteCapabilities(agents)),
+      ...(phase === "plan" && Object.keys(agents).length > 0 ? ["These annotations describe implementation capabilities. All planning dispatches are read-only."] : []),
+    ].join("\n");
     if (ctx.config?.override_subagent_model) {
       for (const agent of Object.values(agents)) agent.model = undefined;
     }
