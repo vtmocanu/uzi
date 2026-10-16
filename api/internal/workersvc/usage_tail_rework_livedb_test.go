@@ -141,7 +141,7 @@ func TestUsageTailWritersRunReadCommittedLiveDB(t *testing.T) {
 	a := e.leg()
 	e.batch(t, stampedInit(1, a, "S1")) // the fold's stamp transaction
 	e.mustPost(t, []UsageLegMarker{closed(a, 1)}, um(a, "m1", 1))
-	if !slices.Equal(seen, []string{"read committed", "read committed"}) {
-		t.Fatalf("isolation seen at commit = %v, want read committed for the stamp tx and the route tx", seen)
+	if !slices.Equal(seen, []string{"read committed", "read committed", "read committed"}) {
+		t.Fatalf("isolation seen at commit = %v, want read committed for the claim mutation, stamp and route transactions", seen)
 	}
 }

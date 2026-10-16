@@ -274,7 +274,7 @@ for (const outcome of ["typed 404", "terminal", "foreign generation"] as const) 
       shutdownSignal: new AbortController(),
       client: { getRunOwnership: async () => {
         if (outcome === "typed 404") throw new RequestError("GET", `/api/worker/runs/${f.source.runId}/ownership`,
-          404, JSON.stringify({ error: "run not found for this worker" }));
+          404, JSON.stringify({ error: "run not found for this worker" }), undefined, { complete: true, bytes: 41 });
         return { status: outcome === "terminal" ? "completed" : "running", claim_generation: outcome === "terminal" ? 2 : 3 };
       } },
       cloneCoordinates: () => ({ branch: "branch" }),

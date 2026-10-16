@@ -40,6 +40,7 @@ type Client interface {
 	// keeps ListRuns so its output is unchanged.
 	ListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error)
 	GetRun(ctx context.Context, id string) (apitypes.RunDTO, error)
+	GetRunWithOptions(ctx context.Context, id string, opts RunReadOptions) (apitypes.RunDTO, error)
 	// RunLogs returns a run's persisted messages after seq (0 = from the start);
 	// `uzi run logs` polls it with the highest seq seen (Decision: REST polling, not
 	// a WebSocket — PRD #64 Out of scope). The live client pages the fetch internally
@@ -373,6 +374,7 @@ type Client interface {
 	// other kind). nil omits it, keeping today's body; a stale value is a 409 whose
 	// *ExitError carries Reason ReasonGateRevisionMismatch and CurrentGateRevision.
 	SubmitRunInput(ctx context.Context, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) (apitypes.RunInputResponse, error)
+	SubmitRunInputWithOptions(ctx context.Context, runID string, opts RunInputOptions) (apitypes.RunInputResponse, error)
 	// DeleteWorker removes one of the caller's workers: DELETE /api/workers/{id}
 	// (204 No Content on success). A worker with active runs is a 409 (exit 5); an
 	// unknown/foreign id is a 404 (exit 4). Minting a worker stays a webui action —
@@ -1086,6 +1088,13 @@ const ReasonOutcomePendingConfirmationRequired = "outcome_pending_confirmation_r
 // carried on *ExitError.CurrentGateRevision.
 const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 
+// Typed owner-reset refusals never authorize rebinding or retrying consent.
+const (
+	ReasonMilestoneReconciliationRequired = "milestone_reconciliation_required"
+	ReasonMilestoneReconciliationConflict = "milestone_reconciliation_conflict"
+	ReasonMilestoneReconciliationNotReady = "milestone_reconciliation_not_ready"
+)
+
 // statusError maps a non-2xx status to an *ExitError with the documented exit
 // code, folding in the server's {"error": "..."} message when present. retryAfter
 // is the response's Retry-After header (empty when absent), read only for a 429. A
@@ -1095,6 +1104,15 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
 	reason := serverErrReason(body)
 	e := buildStatusError(status, msg, reason, retryAfter)
+	e.Reason = reason
+	switch reason {
+	case ReasonMilestoneReconciliationRequired:
+		e = Exitf(ExitConflict, "milestone contract changed; review uzi run get, then explicitly approve with --reset-milestones --reason --expected-gate-revision --expected-reset-state-digest --expected-completion-revision (positive revision or null)")
+	case ReasonMilestoneReconciliationConflict:
+		e = Exitf(ExitConflict, "reset consent is stale or conflicts with the current gate; review uzi run get again and make a new explicit decision with its bindings; consent was not retried")
+	case ReasonMilestoneReconciliationNotReady:
+		e = Exitf(ExitConflict, "milestone reset is not ready; request a plan revision to attempt a fresh published checkpoint; if revisions are exhausted, cancel and start a new run")
+	}
 	e.Reason = reason
 	if reason == ReasonGateRevisionMismatch {
 		e.CurrentGateRevision = serverErrCurrentGateRevision(body)

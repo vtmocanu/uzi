@@ -248,6 +248,19 @@ headers, not the rows.
 
 ## How the fakes are wired (no real GitLab, no live session)
 
+Run `task test:forge-fake-contract` standalone without Compose or Docker. It
+requires Go, Git, OpenSSL with IP SAN support, and Node with built-in TypeScript
+transform support (22.13+; capability-probed). It drives production worker MR
+create/read/description-update/head operations and Go forge reads, refs, ancestry,
+MR summaries and paginated issue comments across GitLab, GitHub and Forgejo,
+using real HTTPS and independently seeded bare Git repos. Go has no MR create or
+update operation; those contracts are covered by the worker client. The worker's
+fetch seam maps generated API origins to loopback; DNS/default fetch is outside
+this target. `task test:forge-fake` retains the separate raw HTTPS route suite.
+Both run under `gate:repo`; no additional npm packages or loader tooling are
+needed. A cold Go cache may fetch the module's existing dependencies and selected
+toolchain, as with the other Go test targets.
+
 - **`forge-fake`** (`e2e/forge-fake/`) serves, over HTTPS on `forge-fake.e2e:443`,
   the GitLab v4 subset the api (verify/list/get/create issue, **single-MR GET**)
   and the worker (create/list merge request) call. It applies issue label

@@ -252,7 +252,7 @@ func TestApproveContractBoundLiveDB(t *testing.T) {
 	})
 }
 
-// (f) The predicate binds only when the statement would freeze the contract.
+// (f) Unchanged re-approval preserves the freeze; a moved candidate requires reconciliation.
 func TestApproveContractPredicateUntouchedCasesLiveDB(t *testing.T) {
 	t.Run("legacy run approves as before", func(t *testing.T) {
 		f := newApproveSrcFix(t, false, []byte(listA))
@@ -275,22 +275,30 @@ func TestApproveContractPredicateUntouchedCasesLiveDB(t *testing.T) {
 			t.Fatalf("no-source approve: frozen=%s contract=%s inputs=%d", r.frozen, r.contract, r.inputs)
 		}
 	})
-	t.Run("re-approve of a frozen contract is not refused by a moved candidate", func(t *testing.T) {
+	t.Run("unchanged re-approve succeeds and moved candidate requires reconciliation", func(t *testing.T) {
 		f := newApproveSrcFix(t, true, []byte(listA))
 		if err := f.approve(SubmitInputOptions{}); err != nil {
 			t.Fatalf("first approve: %v", err)
 		}
 		before := f.row(t)
-		f.e.exec(t, `UPDATE runs SET milestones_candidate = $2 WHERE id = $1`, f.runID, listB)
 		if err := f.approve(SubmitInputOptions{}); err != nil {
-			t.Fatalf("re-approve: %v", err)
+			t.Fatalf("unchanged re-approve: %v", err)
 		}
 		after := f.row(t)
-		if string(after.contract) != string(before.contract) || string(after.frozen) != string(before.frozen) {
+		if string(after.contract) != string(before.contract) || after.contractRev != before.contractRev || string(after.frozen) != string(before.frozen) {
 			t.Fatalf("re-approve changed the freeze: frozen %s -> %s, contract %s -> %s", before.frozen, after.frozen, before.contract, after.contract)
 		}
 		if after.inputs != 2 {
 			t.Fatalf("approve_plan inputs = %d, want 2", after.inputs)
+		}
+		f.e.exec(t, `UPDATE runs SET milestones_candidate = $2 WHERE id = $1`, f.runID, listB)
+		if err := f.approve(SubmitInputOptions{}); !errors.Is(err, ErrReconciliationRequired) {
+			t.Fatalf("changed re-approve: %v, want ErrReconciliationRequired", err)
+		}
+		refused := f.row(t)
+		if string(refused.contract) != string(after.contract) || refused.contractRev != after.contractRev ||
+			string(refused.frozen) != string(after.frozen) || !jsonEqual(t, refused.candidate, listB) || refused.inputs != after.inputs {
+			t.Fatalf("refused re-approve changed approval: before=%+v after=%+v", after, refused)
 		}
 	})
 }

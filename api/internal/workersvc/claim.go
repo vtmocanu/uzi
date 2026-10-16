@@ -249,12 +249,16 @@ type ClaimPayload struct {
 
 	// Milestones is the run's FROZEN, human-approved milestone list (PRD #122 M1),
 	// decoded from runs.milestones_frozen and replayed on every claim so a resumed
-	// worker carries the immutable list. omitempty because a run with no frozen list
+	// worker carries the immutable list. omitzero because a run with no frozen list
 	// (never proposed one, or is not an issue run) keeps today's claim wire shape
 	// exactly — an old worker ignores the key. Nil when the run has none.
-	// Issue #1626: on a ResumePhase=="awaiting_approval" claim (no frozen list yet) it carries
-	// the unapproved CANDIDATE instead, so the re-presented gate re-sends the same breakdown.
-	Milestones []Milestone `json:"milestones,omitempty"`
+	// On a ResumePhase=="awaiting_approval" claim it carries the unapproved CANDIDATE
+	// instead, even when an older frozen contract exists. Preserve [] distinctly from
+	// nil so recovery can checkpoint an explicitly empty replacement before re-gating.
+	Milestones []Milestone `json:"milestones,omitzero"`
+	// ExecutionMilestones distinguishes the approved frozen contract from a restored
+	// gate candidate. A pointer preserves an explicitly frozen empty list.
+	ExecutionMilestones *[]Milestone `json:"execution_milestones,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through

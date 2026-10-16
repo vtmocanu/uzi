@@ -337,10 +337,10 @@ export class RequestError extends Error {
     readonly body: string,
     /** The response's `Retry-After` in milliseconds, when it carried whole seconds. */
     readonly retryAfterHeaderMs?: number,
-    /** Whether `body` is the whole response: `complete` is true only when the body was read through
+    /** Raw response evidence: `complete` is true only when the body was read through
      *  EOF within the error-body cap with no read error; `bytes` is the raw byte length read (before
-     *  decode and trim). Absent on errors not minted by toError, which therefore prove nothing about
-     *  completeness. */
+     *  decode and any diagnostic trimming or slicing). Supplied by bounded response readers;
+     *  absent evidence proves nothing about completeness. */
     readonly bodyEvidence?: { readonly complete: boolean; readonly bytes: number },
   ) {
     super(`${method} ${path} returned ${status}: ${body}`);
@@ -360,16 +360,24 @@ export class StateReportUnappliedError extends RequestError {
 class StateDecodeRefusalError extends RequestError {}
 interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
 
-/** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
-export function isRunOwnershipLost(err: unknown, runId: string): boolean {
-  if (!(err instanceof RequestError) || err.method !== "GET" || err.status !== 404 ||
-      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/ownership` || err.body.length > 1024) return false;
+/** Match a small, complete 404 JSON object against exactly the expected keys and values. */
+export function isStrict404Body(err: unknown, expected: Readonly<Record<string, string>>): boolean {
+  if (!(err instanceof RequestError) || err.status !== 404 || err.body.length > 1024) return false;
+  if (!(err.bodyEvidence?.complete === true && err.bodyEvidence.bytes <= 1024)) return false;
   try {
     const body: unknown = JSON.parse(err.body);
-    return typeof body === "object" && body !== null && !Array.isArray(body) &&
-      Object.keys(body).length === 1 &&
-      (body as { error?: unknown }).error === "run not found for this worker";
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+    const rec = body as Record<string, unknown>;
+    return Object.keys(rec).length === Object.keys(expected).length &&
+      Object.entries(expected).every(([key, value]) => Object.hasOwn(rec, key) && rec[key] === value);
   } catch { return false; }
+}
+
+/** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
+export function isRunOwnershipLost(err: unknown, runId: string): boolean {
+  return err instanceof RequestError && err.method === "GET" &&
+    err.path === `${WORKER_API_PREFIX}/runs/${runId}/ownership` &&
+    isStrict404Body(err, { error: "run not found for this worker" });
 }
 
 /** Typed credential deferrals require a RequestError, HTTP 409 and a JSON object with an
@@ -2092,8 +2100,11 @@ export class WorkerClient {
     tipOid: string,
     pack: Readable,
     boundarySignal?: AbortSignal,
+    claimGeneration?: number,
   ): Promise<PublishResult> {
-    const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
+    const query = claimGeneration !== undefined && claimGeneration > 0
+      ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
     const signal = boundarySignal
       ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
       : maintenanceSignal(this.httpTimeoutMs);
@@ -2610,8 +2621,10 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
-    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
+  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+    const query = claimGeneration !== undefined && claimGeneration > 0
+      ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
@@ -3775,8 +3788,10 @@ export class WorkerClient {
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
     if (res.status >= 400) {
       if (!signal) throw await this.toError("GET", path, res);
-      const text = await readBoundedText(res, maxResponseBytes ?? ERROR_BODY_MAX_BYTES, true, signal);
-      throw new RequestError("GET", path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
+      const raw = await readBoundedBytes(res, maxResponseBytes ?? ERROR_BODY_MAX_BYTES, true, signal);
+      const text = new TextDecoder().decode(raw);
+      throw new RequestError("GET", path, res.status, text.slice(0, 4096),
+        retryAfterMsOf(res.headers.get("Retry-After")), { complete: true, bytes: raw.length });
     }
     const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, signal);
     MaintenanceBudget.current()?.check();

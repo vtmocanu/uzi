@@ -301,7 +301,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
-| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs until the counted pressure falls. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
 reason can read `storage quota exceeded`; current workers preserve a typed
@@ -867,7 +867,12 @@ completed-run check above.
 ## Reviewing and resolving held work
 
 Once **8 admission-counted holds per owner** (the *Admission-counted recovery
-holds* limit above) accumulate, uzi pauses admitting **new** runs for you.
+holds* limit above) accumulate, uzi pauses admitting **new** runs subject to
+custody admission for you. Hold-free Plan and Code checker children
+(`kind = 'cross_check'`) in both harness families are exempt; judges and jobs
+gain no exemption. Checker claims still require eligible owner identity,
+current parent/generation/round, deadline, protocol, vault, credentials,
+checker slots and workers (see [Cross-check](./cross-check.md)).
 A run that was interrupted and requeued while it has 1 to 7 of its own open
 holds keeps resuming; once that one run alone holds 8, it loses the exemption.
 When that happens, the dashboard shows a full-width alert beneath the page

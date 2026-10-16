@@ -238,6 +238,16 @@ func TestFilterProtocol_KeepsAdviceClaimFenceV1(t *testing.T) {
 	}
 }
 
+func TestFilterProtocol_KeepsMilestoneReconciliationClaimV1(t *testing.T) {
+	want := []string{CredentialSwitchV1, MilestoneReconciliationClaimV1}
+	if got := FilterProtocol([]string{MilestoneReconciliationClaimV1, CredentialSwitchV1, MilestoneReconciliationClaimV1}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("registration filters reconciliation capability: got %v, want %v", got, want)
+	}
+	if got := Filter([]string{MilestoneReconciliationClaimV1}); len(got) != 0 {
+		t.Fatalf("worker protocol capability became a user-selectable requirement: %v", got)
+	}
+}
+
 // TestFilterProtocol_KeepsJobRunnerV1 pins PRD #1908 D-A: job_runner_v1 survives registration (the
 // job claim clause reads it off workers.protocol_capabilities), is not a scheduler capability,
 // and orders last in protocolOrder.

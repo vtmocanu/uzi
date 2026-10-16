@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -93,11 +94,15 @@ type GatePresentedRequirements struct {
 // plan_changed_files is deliberately absent: it is advisory evidence recomputed every round,
 // not part of presentation identity (PRD #1795 A1).
 type gatePresentedPayload struct {
-	PlanMd               *string         `json:"plan_md"`
-	Milestones           json.RawMessage `json:"milestones"`
-	RequiredCapabilities []string        `json:"required_capabilities"`
-	RequiredTools        []string        `json:"required_tools"`
-	SizeClass            *string         `json:"size_class"`
+	ReviseCount            *int32                          `json:"revise_count,omitempty"`
+	CheckpointWitness      *apitypes.GateCheckpointWitness `json:"checkpoint_witness,omitempty"`
+	WitnessWorkerID        *uuid.UUID                      `json:"witness_worker_id,omitempty"`
+	WitnessClaimGeneration *int64                          `json:"witness_claim_generation,omitempty"`
+	PlanMd                 *string                         `json:"plan_md"`
+	Milestones             json.RawMessage                 `json:"milestones"`
+	RequiredCapabilities   []string                        `json:"required_capabilities"`
+	RequiredTools          []string                        `json:"required_tools"`
+	SizeClass              *string                         `json:"size_class"`
 }
 
 // canonicalJSON returns the payload's canonical encoding: fixed key order, the two requirement
@@ -106,16 +111,24 @@ type gatePresentedPayload struct {
 // a stored snapshot, so a digest is only ever computed over this form, never over stored bytes.
 func (p gatePresentedPayload) canonicalJSON() ([]byte, error) {
 	out := struct {
-		PlanMd               *string         `json:"plan_md"`
-		Milestones           json.RawMessage `json:"milestones"`
-		RequiredCapabilities []string        `json:"required_capabilities"`
-		RequiredTools        []string        `json:"required_tools"`
-		SizeClass            *string         `json:"size_class"`
+		ReviseCount            *int32                          `json:"revise_count,omitempty"`
+		CheckpointWitness      *apitypes.GateCheckpointWitness `json:"checkpoint_witness,omitempty"`
+		WitnessWorkerID        *uuid.UUID                      `json:"witness_worker_id,omitempty"`
+		WitnessClaimGeneration *int64                          `json:"witness_claim_generation,omitempty"`
+		PlanMd                 *string                         `json:"plan_md"`
+		Milestones             json.RawMessage                 `json:"milestones"`
+		RequiredCapabilities   []string                        `json:"required_capabilities"`
+		RequiredTools          []string                        `json:"required_tools"`
+		SizeClass              *string                         `json:"size_class"`
 	}{
-		PlanMd:               p.PlanMd,
-		RequiredCapabilities: sortedSet(p.RequiredCapabilities),
-		RequiredTools:        sortedSet(p.RequiredTools),
-		SizeClass:            p.SizeClass,
+		ReviseCount:            p.ReviseCount,
+		CheckpointWitness:      p.CheckpointWitness,
+		WitnessWorkerID:        p.WitnessWorkerID,
+		WitnessClaimGeneration: p.WitnessClaimGeneration,
+		PlanMd:                 p.PlanMd,
+		RequiredCapabilities:   sortedSet(p.RequiredCapabilities),
+		RequiredTools:          sortedSet(p.RequiredTools),
+		SizeClass:              p.SizeClass,
 	}
 	ms, err := canonicalRawJSON(p.Milestones)
 	if err != nil {
@@ -213,7 +226,11 @@ func nonEmptyPtr(v string) *string {
 // already in the form SetRunAwaitingApproval writes (NUL-stripped plan_md, the resolved
 // milestone candidate, the vocabulary-filtered requirement set).
 type gateReportFields struct {
-	planMd pgtype.Text
+	reviseCount            *int32
+	checkpointWitness      *apitypes.GateCheckpointWitness
+	witnessWorkerID        *uuid.UUID
+	witnessClaimGeneration *int64
+	planMd                 pgtype.Text
 	// milestones is the candidate the report resolves to; milestonesReported says whether the
 	// report carried a milestone list at all. An absent list falls back to the base.
 	milestones         []byte
@@ -234,11 +251,15 @@ type gateReportFields struct {
 //   - required_tools / size_class are absent-safe replacements: reported when present.
 func effectiveGatePayload(base gatePresentedPayload, f gateReportFields) gatePresentedPayload {
 	out := gatePresentedPayload{
-		PlanMd:               textPtr(f.planMd),
-		Milestones:           base.Milestones,
-		RequiredCapabilities: sortedSet(append(slices.Clone(base.RequiredCapabilities), f.caps...)),
-		RequiredTools:        base.RequiredTools,
-		SizeClass:            base.SizeClass,
+		ReviseCount:            f.reviseCount,
+		CheckpointWitness:      f.checkpointWitness,
+		WitnessWorkerID:        f.witnessWorkerID,
+		WitnessClaimGeneration: f.witnessClaimGeneration,
+		PlanMd:                 textPtr(f.planMd),
+		Milestones:             base.Milestones,
+		RequiredCapabilities:   sortedSet(append(slices.Clone(base.RequiredCapabilities), f.caps...)),
+		RequiredTools:          base.RequiredTools,
+		SizeClass:              base.SizeClass,
 	}
 	if f.milestonesReported {
 		out.Milestones = json.RawMessage(f.milestones)
@@ -302,6 +323,12 @@ func gateReportAdmissible(status string) bool {
 func classifyGateReport(ctx context.Context, q Store, locked store.Run, req StateRequest, f gateReportFields) (gateDecision, error) {
 	if !gateReportAdmissible(locked.Status) {
 		return gateDecision{class: gateClassDeclined}, nil
+	}
+	// The existing runs counter is captured under the same lock as the witness.
+	// Any subsequently accepted revise invalidates readiness, even after delivery.
+	if f.checkpointWitness != nil {
+		count := locked.ReviseCount
+		f.reviseCount = &count
 	}
 	rowPayload := gatePayloadFromRow(locked)
 	snapshot, hasSnapshot, err := decodeGatePresentedPayload(locked.GatePresentedPayload)

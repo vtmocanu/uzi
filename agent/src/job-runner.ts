@@ -1174,7 +1174,7 @@ export class JobRunner {
   private async watchCancel(runId: string, generation: number, signal: AbortSignal, log: Logger, onCancel: () => void): Promise<void> {
     while (!signal.aborted) {
       try {
-        const { inputs, receipts } = await this.client.getInputs(runId);
+        const { inputs, receipts } = await this.client.getInputs(runId, generation);
         const cancels = inputs.filter((i) => (i.kind as InputKind) === "cancel");
         if (cancels.length > 0) {
           if (receipts) {

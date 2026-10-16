@@ -48,6 +48,23 @@ function publish(boundary?: AbortSignal) {
 const overflow = { name: "ResponseBodyOverflowError" };
 
 describe("checkpoint publication acknowledgment", () => {
+  it("keeps the caller generation on each pack request and preserves legacy omission", async () => {
+    const urls: string[] = [];
+    globalThis.fetch = (async (input: unknown) => {
+      urls.push(String(input));
+      return Response.json({ published: true });
+    }) as typeof fetch;
+    const client = new WorkerClient("http://ckpt.test", "tok", "test", nullLogger());
+    for (const generation of [7, 7, undefined, 0]) {
+      await client.publishCheckpoint("run/old", TIP, Readable.from(["pack"]), undefined, generation);
+    }
+    assert.deepEqual(urls, [
+      "http://ckpt.test/api/worker/runs/run%2Fold/publish?claim_generation=7",
+      "http://ckpt.test/api/worker/runs/run%2Fold/publish?claim_generation=7",
+      "http://ckpt.test/api/worker/runs/run%2Fold/publish",
+      "http://ckpt.test/api/worker/runs/run%2Fold/publish",
+    ]);
+  });
   it("returns a small valid ack, a skipped ack and an empty 2xx as before", async () => {
     stub(() => Response.json({ published: true }));
     assert.deepEqual(await publish(), { ok: true, body: { published: true } });

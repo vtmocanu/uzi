@@ -18,6 +18,8 @@ import {
 import { useAuth } from "../auth/AuthContext";
 import { mergeRequestUrl } from "../lib/forgeUrls";
 import { errorMessage } from "../lib/apiError";
+import { changedMilestones } from "../lib/milestoneReset";
+import { MilestoneResetHistory } from "./runView/MilestoneResetHistory";
 import { canToggleWaitOnLimit, formatCountdown, runWindowLabel, usageLimitPhrase } from "../lib/limitWait";
 import {
   budgetRightLabel,
@@ -1883,6 +1885,17 @@ export function RunView() {
         await fn();
         if (isCurrent()) accepted = true;
       } catch (e) {
+        const refusalReason = e instanceof ApiError && e.body && typeof e.body === "object" && "reason" in e.body
+          ? e.body.reason : null;
+        if (refusalReason === "milestone_reconciliation_required" || refusalReason === "milestone_reconciliation_conflict" ||
+          refusalReason === "milestone_reconciliation_not_ready") {
+          if (!isCurrent()) return;
+          setActionErr(refusalReason === "milestone_reconciliation_not_ready"
+            ? "Request a plan revision so the worker can attempt a fresh published checkpoint. If revisions are exhausted, cancel and start a new run. Approval was not retried."
+            : "The milestone reset requires a fresh review. Review the refreshed run before opening a new confirmation. Approval was not retried.");
+          await settleWithin(refreshRun(), GATE_REFETCH_WAIT_MS);
+          return;
+        }
         const current = gateRevisionMismatchCurrent(e);
         if (current === null) throw e;
         if (!isCurrent()) return;
@@ -2180,7 +2193,7 @@ export function RunView() {
         actionsBesideTitle
         actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
-            {!isCredentialDisabledHold(run) && (
+            {!isCredentialDisabledHold(run) && !(run.status === "awaiting_approval" && changedMilestones(run)) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
             )}
             <CredentialEpochList epochs={run.credential_epochs} />
@@ -2505,6 +2518,7 @@ export function RunView() {
       )}
 
 
+      {canSteer && confirmedOwner === true && <MilestoneResetHistory key={`reset-history-${run.id}`} run={run} />}
       {run.status === "awaiting_approval" && (
         <PlanPanel
           key={run.id}
@@ -2517,6 +2531,11 @@ export function RunView() {
           onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
             void gateAct(expectedGateRevision, () =>
               submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+            )
+          }
+          onResetApprove={(selection, overrideCapabilities, expectedGateRevision, reset) =>
+            gateAct(expectedGateRevision, () =>
+              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision, reset),
             )
           }
           onReject={(reason, expectedGateRevision) =>

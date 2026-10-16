@@ -1,6 +1,7 @@
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
+import { makeScratchRoot } from "./fixture-repo.js";
 import { it } from "node:test";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
@@ -1339,7 +1340,7 @@ it("issue1924 an acknowledged older generation's source journal does not block a
 
 function ownershipLost() {
   return new RequestError("GET", "/api/worker/runs/" + "run-1/ownership", 404,
-    JSON.stringify({ error: "run not found " + "for this worker" }));
+    JSON.stringify({ error: "run not found " + "for this worker" }), undefined, { complete: true, bytes: 41 });
 }
 
 it("issue1924 crossworker ownership404 archives all original roots under open hold", async () => {
@@ -1480,7 +1481,7 @@ it("issue1924 queue rotation survives repeated discovery so later contexts are n
 });
 
 it("issue1924 a symlinked ancestor of the recovery root still finalizes; a symlinked run directory does not", async () => {
-  const outer = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-link-"));
+  const outer = makeScratchRoot("inventory-link-");
   try {
     await fs.mkdir(path.join(outer, "real"));
     await fs.symlink(path.join(outer, "real"), path.join(outer, "link"), "dir");
@@ -1629,7 +1630,7 @@ for (const kind of ["issue", "mr_rework"] as const) for (const cause of sourceDi
   }
 
 async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1") {
-  const root = await fs.mkdtemp(path.join(rootParent, "inventory-"));
+  const root = makeScratchRoot("inventory-", rootParent);
   const context: PositiveOwedCandidateContext = {
     runId, generation: 7, kind: "issue", branch: "task",
     barePath: path.join(root, "repo.git"),
@@ -3045,7 +3046,7 @@ it("permanent oversized inventory is retained without repeated boot or live prod
 });
 
 it("real aggregate bundle imports H and exact disposition H2 with current tree and original production intact", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-git-"));
+  const root = makeScratchRoot("inventory-git-");
   const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
     GIT_TERMINAL_PROMPT: "0" };
   const git = (cwd: string, args: string[]) =>
@@ -3118,7 +3119,7 @@ it("real aggregate bundle imports H and exact disposition H2 with current tree a
 });
 
 it("restart from persisted divergent owed refs without a journal uploads an importable inventory", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-git-"));
+  const root = makeScratchRoot("inventory-git-");
   const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null",
     GIT_TERMINAL_PROMPT: "0" };
   const git = (cwd: string, args: string[]) =>
@@ -3252,7 +3253,7 @@ it("restart from persisted divergent owed refs without a journal uploads an impo
 });
 
 it("a guarded journal never uses the legacy release RPC after feature loss", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "inventory-"));
+  const root = makeScratchRoot("inventory-");
   const calls: unknown[] = [];
   let feature = true;
   const coordinator = new RecoveryCoordinator({

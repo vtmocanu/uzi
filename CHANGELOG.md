@@ -22,10 +22,28 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Require complete bounded ownership-loss responses ([#2985](https://github.com/vtmocanu/uzi/issues/2985)).**
+  Ownership probes now require a complete 404 response of at most 1024 raw bytes with the exact expected JSON before reporting lost ownership, preventing padded or truncated diagnostic bodies from reporting false ownership loss. Signal and deadline reads retain raw-byte completeness evidence while preserving cancellation and error diagnostics.
+
+- **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
+  Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
+
+- **Plan and Code cross-checkers can claim while their owner is at the custody admission limit ([#3011](https://github.com/vtmocanu/uzi/issues/3011)).**
+  Hold-free, nonpublishing `cross_check` children in both harness families bypass owner custody admission independently of the existing continuation exemption, which still requires a prior claim and 1–7 own open holds. Judges and jobs gain no exemption; owner, current-parent/generation/round, deadline, protocol, vault, credential, checker-slot and worker eligibility still apply. The limit of 8, admission accounting, hold creation/disposition and capture quotas are unchanged (#1296, #2445).
+
 ### Changed
 
 - **Eligible cancelled runs and earlier terminal generations can publish held work to a fetchable forge ref.**
   Mutually negotiated held-publication V2 extends the existing original-custodian path while preserving V1 compatibility. Failed/cancelled runs try held publication before archive fallback; completed runs without an applicable receipt stay archive-first, allowing the held alternative only for a prerequisite-bearing thin archive or structured oversize/quota refusal on the same frozen record. Exact-generation reconciliation and immutable FINAL replay preserve lost-ACK recovery, and cancellation uses one 10-minute attempt budget before retaining protection. The existing cleanup boundary accepts possible loss from an undetected terminal late writer after immutable capture; no new post-release source retention across hosted teardown is provided. Held refs follow repository visibility and existing retention, and deleting a public ref cannot revoke fetched copies. See [run recovery](docs/run-recovery.md#publishing-a-failed-runs-held-work) (#3030).
+
+- **sqlc regeneration uses verified release binaries.**
+  Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
+
+- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
+  Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
+
 
 ## [0.86.0] - 2026-10-06
 

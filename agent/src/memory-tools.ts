@@ -201,6 +201,8 @@ function memoryToolError(err: unknown): ToolTextResult {
 }
 
 export interface MemoryToolsDeps {
+  /** Captured when this claim's handlers are built, never read from a live client. */
+  readonly claimGeneration?: number;
   client: WorkerClient;
   /** The CURRENT run id — save_memory persists for THIS run's claim only (the
    *  server derives (user, repo) from it), never an arbitrary run. */
@@ -215,7 +217,7 @@ export interface MemoryToolHandlers {
 }
 
 export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandlers {
-  const { client, runId, log } = deps;
+  const { client, runId, log, claimGeneration } = deps;
   return {
     async saveMemory(args) {
       // Client-side cap mirror (a clear tool error, NOT a throw): the SDK schema
@@ -247,7 +249,7 @@ export function makeMemoryToolHandlers(deps: MemoryToolsDeps): MemoryToolHandler
         }
       }
       try {
-        const entry = await client.saveMemory(runId, { title, body, basis, evidence });
+        const entry = await client.saveMemory(runId, { title, body, basis, evidence, ...(claimGeneration !== undefined ? { claim_generation: claimGeneration } : {}) });
         // The memory IS saved (isError stays false); this only appends an advisory
         // nudge when the body looks like a fast-decaying tally, never a rejection.
         const snapshotNudge = VOLATILE_SNAPSHOT_RE.test(body)
