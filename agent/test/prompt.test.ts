@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { renderCodexRun } from "../src/codex/render.js";
 import {
   AUTOPILOT_PLAN_NOTE,
   baseCommitNote,
@@ -30,6 +32,7 @@ import {
   REPO_SUBAGENT_UNTRUSTED_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   LEAD_GATE_SEQUENCING_APPEND,
+  LEAD_FAST_CHECK_APPEND,
 } from "../src/prompt.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { assembleAgents } from "../src/agents.js";
@@ -1074,6 +1077,14 @@ describe("buildImplementPrompt", () => {
 
 describe("approved m1 display reconciliation", () => {
   const milestones = [{ id: "m1", title: "Schema" }, { id: "m2", title: "UI" }, { id: "m3", title: "Docs" }];
+  it("lead guidance final milestone finishes in the same turn and checkpoints only between milestones", () => {
+    const note = milestoneStatusNote(milestones, { completed: ["m1", "m2"], in_progress: ["m3"] });
+    assert.match(note, /when no planned milestone remains/i);
+    assert.match(note, /work, review and required validation are complete/);
+    assert.match(note, /call `signal_done` in the same turn/);
+    assert.match(note, /Between milestones/);
+    assert.doesNotMatch(note, /When a milestone's work is\ncommitted locally, call the `checkpoint` tool once and end your turn/);
+  });
   it("combines ACK and local completion, done wins, and unknown IDs never render", () => {
     const progress = { completed: ["m2", "unknown-local"], in_progress: ["m1", "m2", "m3"] };
     const snapshot = structuredClone(progress);
@@ -1332,6 +1343,7 @@ describe("buildLeadSystemPrompt", () => {
         FINDINGS_NUDGE_APPEND,
         SECRET_FIXTURE_HYGIENE_APPEND,
         LEAD_GATE_SEQUENCING_APPEND,
+        LEAD_FAST_CHECK_APPEND,
         PRD_LIFECYCLE_APPEND,
       ].join("\n\n"),
     );
@@ -1342,6 +1354,7 @@ describe("buildLeadSystemPrompt", () => {
         FINDINGS_NUDGE_APPEND,
         SECRET_FIXTURE_HYGIENE_APPEND,
         LEAD_GATE_SEQUENCING_APPEND,
+        LEAD_FAST_CHECK_APPEND,
       ].join("\n\n"),
     );
   });
@@ -1388,6 +1401,7 @@ describe("buildLeadSystemPrompt", () => {
         FINDINGS_NUDGE_APPEND,
         SECRET_FIXTURE_HYGIENE_APPEND,
         LEAD_GATE_SEQUENCING_APPEND,
+        LEAD_FAST_CHECK_APPEND,
       ].join("\n\n"),
     );
   });
@@ -2475,6 +2489,53 @@ describe("M3 captured issue evidence", () => {
     const header = p.split("\n").find((line) => line.startsWith("[1] @"));
     assert.equal(header, `[1] @${"a".repeat(199)}\u{1f680} at ${"\u{1f680}".repeat(200)}:`);
     assert.ok(p.includes("\nELIGIBLE-BODY\n"));
+  });
+});
+
+describe("lead guidance routing", () => {
+  const dispatch = "do not dispatch an agent to ask its role or availability";
+  const fastChecks = "Before committing a unit for review, run its available cheap, check-only static checks";
+  const noChurn = "Do not re-read unchanged output or repeat unchanged status updates";
+  const onePoll = "Keep only one poll call outstanding per command";
+  const child = { description: "review", prompt: "CHILD BODY", tools: { kind: "inherit" as const }, deniedTools: [], toolServers: [], skills: [] };
+
+  it("routes dispatch to the Codex lead, static checks to both leads, and waiting rules per harness", () => {
+    for (const kind of ["issue", "ci_fix", "mr_rework", "self_improve"] as const) {
+      for (const harness of ["claude", "codex"] as const) {
+        const { append } = buildLeadSystemPrompt("CUSTOM LEAD BODY", { kind, harness });
+        assert.ok(append.includes(fastChecks), `${kind}/${harness} static checks`);
+        assert.equal(append.includes(dispatch), harness === "codex");
+        assert.equal(append.includes(noChurn), harness === "codex");
+        assert.equal(append.includes(onePoll), harness === "claude");
+      }
+    }
+    assert.ok(!buildLeadSystemPrompt("body").append.includes(dispatch));
+    const claudeChild = assembleAgents([{ name: "reviewer", description: "review", prompt_body: "CHILD BODY", tools: null }]).subagents.reviewer!.prompt;
+    const codexChild = renderCodexRun({ prompt: "task", systemPrompt: "root", phase: "implement", agents: { reviewer: child }, leadSkills: [], signal: new AbortController().signal }).perRolePrompts.get("reviewer")!;
+    for (const prompt of [claudeChild, codexChild]) {
+      assert.ok(!prompt.includes(dispatch) && !prompt.includes(fastChecks), "lead-only policies stay out of child prompts");
+    }
+    assert.ok(claudeChild.includes(onePoll) && !claudeChild.includes(noChurn));
+    assert.ok(codexChild.includes(noChurn) && !codexChild.includes(onePoll));
+  });
+
+  it("delivers the edited builtin policies to both leads without changing subagent bodies", () => {
+    const body = readFileSync(new URL("../../api/internal/agenttmpl/builtins/lead.md", import.meta.url), "utf8")
+      .replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "");
+    const policies = ["Assign each expensive executable proof", "surviving regression mutation", "map every mandatory requirement", "When a follow-up conflicts"];
+    const assembled = assembleAgents([
+      { name: "lead", description: "lead", prompt_body: body, tools: null },
+      { name: "reviewer", description: "review", prompt_body: "CHILD BODY", tools: null },
+    ]);
+    for (const harness of ["claude", "codex"] as const) {
+      const { append } = buildLeadSystemPrompt(assembled.leadSystemPrompt, { harness });
+      for (const policy of policies) assert.ok(append.includes(policy), `${harness}: ${policy}`);
+    }
+    const codexChild = renderCodexRun({ prompt: "task", systemPrompt: body, phase: "implement", agents: { reviewer: child }, leadSkills: [], signal: new AbortController().signal }).perRolePrompts.get("reviewer")!;
+    for (const policy of policies) {
+      assert.ok(!assembled.subagents.reviewer!.prompt.includes(policy));
+      assert.ok(!codexChild.includes(policy));
+    }
   });
 });
 

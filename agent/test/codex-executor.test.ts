@@ -7584,6 +7584,21 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     ]);
   });
 
+  it("lead guidance checkpoint plus done completes without an extra turn or cooperative checkpoint", async () => {
+    const rig = makeMultiEpochRig([epochResponder("resumed-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(1, "checkpoint", {}, th, tn, "c-checkpoint"))
+        .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    const checkpoints: boolean[] = [];
+    const { ctx } = makeCtx({ checkpoint: async opts => { checkpoints.push(opts.reap); } });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "checkpoint plus done");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 1);
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+    assert.deepEqual(checkpoints, [], "done bypasses the intermediate milestone checkpoint");
+  });
+
   it("(m2-2) a cooperative checkpoint (not done) drives ctx.checkpoint({reap:true}), recreates the epoch, and the next implement turn on the NEW root reaches done", async () => {
     // m4 change: a cooperative checkpoint reap recreates the provider epoch, so the second implement
     // turn runs on a DISTINCT root/transport (the reaped root's registry is permanently closed).
