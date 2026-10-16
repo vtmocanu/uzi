@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
   Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
 
+- **Full submitted plans remain readable after the approval gate ([#2972](https://github.com/vtmocanu/uzi/issues/2972)).**
+  Non-seeded web runs with saved full plan text now offer an initially collapsed, scrollable Full plan panel after leaving the gate, including after reload and on finished runs; the neutral title does not imply approval. Earlier submitted versions include only already-loaded submissions and fetch no extra history. The TUI renders loaded plan messages as full Markdown through the final line instead of a 200-character compact fallback, with paging and controls unchanged. Seeded plans, gate actions and history, summaries, and CLI version/diff behavior are unchanged.
+
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
   Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
 
