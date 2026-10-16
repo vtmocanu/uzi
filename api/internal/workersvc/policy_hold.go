@@ -21,6 +21,9 @@ import (
 // PolicyHoldFeature is intentionally not advertised until the M2 activation.
 const PolicyHoldFeature = "provider_policy_hold"
 
+// PolicyResumeGuidanceMaxBytes bounds decoded owner guidance.
+const PolicyResumeGuidanceMaxBytes = 16000
+
 type PolicyHoldRequest struct {
 	OutcomeID                string  `json:"outcome_id"`
 	SourceGeneration         int64   `json:"source_generation"`
@@ -83,7 +86,7 @@ func (r PolicyHoldRequest) validate() error {
 			return ErrInvalidState
 		}
 		for _, c := range r.Head {
-			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 				return ErrInvalidState
 			}
 		}
@@ -91,7 +94,7 @@ func (r PolicyHoldRequest) validate() error {
 	if r.Published && r.Head == "" {
 		return ErrInvalidState
 	}
-	if r.SessionID != nil && (len(*r.SessionID) > 512 || strings.ContainsAny(*r.SessionID, "\x00\r\n")) {
+	if r.SessionID != nil && (strings.TrimSpace(*r.SessionID) == "" || len(*r.SessionID) > 512 || strings.ContainsAny(*r.SessionID, "\x00\r\n")) {
 		return ErrInvalidState
 	}
 	return nil
@@ -238,7 +241,7 @@ type PolicyResumeRequest struct {
 }
 
 func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest) (store.Run, error) {
-	if req.Mode != "" && req.Mode != "preserve" || len(req.Guidance) > 16000 || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
+	if req.Mode != "" && req.Mode != "preserve" || len(req.Guidance) > PolicyResumeGuidanceMaxBytes || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
 		return store.Run{}, ErrInvalidState
 	}
 	if s.txBeginner == nil {

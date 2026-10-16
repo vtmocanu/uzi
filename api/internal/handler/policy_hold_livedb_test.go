@@ -89,7 +89,7 @@ func TestPolicyHoldStrictAndOwnerResumeLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := workersvc.PolicyHoldActionToken(held)
-	for _, body := range []string{"null", `{"unknown":true}`, `{} {}`, "{}" + strings.Repeat(" ", 17000), `{"guidance":"` + strings.Repeat("a", 16001) + `"}`, `{"mode":"fresh"}`} {
+	for _, body := range []string{"null", `{"unknown":true}`, `{} {}`, "{}" + strings.Repeat(" ", policyResumeBodyMaxBytes), `{"guidance":"` + strings.Repeat("a", 16001) + `"}`, `{"mode":"fresh"}`} {
 		rec := call(false, body, token, true)
 		if rec.Code != 400 {
 			t.Fatalf("owner malformed code=%d body=%s", rec.Code, rec.Body)
@@ -98,8 +98,17 @@ func TestPolicyHoldStrictAndOwnerResumeLiveDB(t *testing.T) {
 	if rec := call(false, `{"guidance":"narrow"}`, "", true); rec.Code != 409 {
 		t.Fatalf("missing token=%d %s", rec.Code, rec.Body)
 	}
-	if rec := call(false, `{"guidance":"narrow"}`, token, true); rec.Code != 200 {
-		t.Fatalf("preserve=%d %s", rec.Code, rec.Body)
+	guidance := strings.Repeat("\"", 16000)
+	resumeBody, err := json.Marshal(workersvc.PolicyResumeRequest{Guidance: guidance})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(false, string(resumeBody), token, true); rec.Code != 200 {
+		t.Fatalf("preserve documented guidance limit=%d %s", rec.Code, rec.Body)
+	}
+	var storedGuidance string
+	if err := e.query("SELECT body FROM run_user_inputs WHERE run_id=$1 AND kind='follow_up'", id).Scan(&storedGuidance); err != nil || storedGuidance != guidance {
+		t.Fatalf("guidance truncated or changed: bytes=%d err=%v", len(storedGuidance), err)
 	}
 	if rec := call(false, `{"guidance":"duplicate"}`, token, true); rec.Code != 409 {
 		t.Fatalf("duplicate=%d", rec.Code)

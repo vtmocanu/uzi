@@ -16,6 +16,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+// JSON escaping can require six encoded bytes for one decoded ASCII byte.
+const policyResumeBodyMaxBytes = 6*workersvc.PolicyResumeGuidanceMaxBytes + 1024
+
 // ResumeRunNow resumes an owner-held pool_wait or paused run, or starts a new
 // worker-recovery episode for recovery_wait/worker_requeue_exhausted. The owner-scoped
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
@@ -43,7 +46,7 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	var policyReq workersvc.PolicyResumeRequest
 	if r.Body != nil {
 		var decoded *workersvc.PolicyResumeRequest
-		err := httpx.DecodeJSONStrictBounded(r, &decoded, 17000)
+		err := httpx.DecodeJSONStrictBounded(r, &decoded, policyResumeBodyMaxBytes)
 		if (err != nil && !errors.Is(err, io.EOF)) || (err == nil && decoded == nil) {
 			httpx.Error(w, http.StatusBadRequest, "invalid request body")
 			return

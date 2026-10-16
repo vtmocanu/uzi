@@ -18,6 +18,10 @@ WITH eligible AS MATERIALIZED (
  AND u.kind IN ('pause', 'pause_cancel') AND u.applied_at IS NULL
 )
 UPDATE runs SET status = 'paused', status_since = now(),
+ budget_paused_seconds = runs.budget_paused_seconds
+  + CASE WHEN runs.status = 'awaiting_approval'
+         THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
+         ELSE 0 END,
  session_id = COALESCE(sqlc.narg('session_id'), runs.session_id),
  hold_reason = 'provider_policy_refusal', hold_captured_head = sqlc.narg('head'),
  checkpoint_contains_latest = sqlc.narg('checkpoint_contains_latest'),
