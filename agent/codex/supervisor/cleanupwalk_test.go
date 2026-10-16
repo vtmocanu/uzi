@@ -56,6 +56,53 @@ func TestCleanupTraversalBeyondObservationLimit(t *testing.T) {
 	}
 }
 
+func TestCleanupTraversalStreamsLargeChildFile(t *testing.T) {
+	root := cleanupFixture(t, 1200)
+	data, err := os.ReadFile(filepath.Join(root, "1", "task", "1", "children"))
+	if err != nil || len(data) <= 4096 {
+		t.Fatalf("fixture must exceed the sampling per-file cap: bytes=%d err=%v", len(data), err)
+	}
+	seen := 0
+	err = visitCleanupChildren(root, 1, time.Now().Add(time.Second), func(row observationRow) error {
+		if row.Pid != 10+seen {
+			t.Fatalf("lost or reordered child: %+v after %d", row, seen)
+		}
+		seen++
+		return nil
+	})
+	if err != nil || seen != 1200 {
+		t.Fatalf("visited=%d err=%v", seen, err)
+	}
+}
+
+func TestCleanupTraversalStreamsAllThreadDirectories(t *testing.T) {
+	root := cleanupFixture(t, 1)
+	for tid := 1; tid <= 300; tid++ {
+		dir := filepath.Join(root, "1", "task", strconv.Itoa(tid))
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		data := ""
+		if tid == 300 {
+			data = "10 "
+		}
+		if err := os.WriteFile(filepath.Join(dir, "children"), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := []processIdentity{}
+	err := visitCleanupChildren(root, 1, time.Now().Add(time.Second), func(row observationRow) error {
+		seen = append(seen, row.processIdentity)
+		return nil
+	})
+	if err != nil || len(seen) != 1 || seen[0] != (processIdentity{10, "10"}) {
+		t.Fatalf("last-thread child=%+v err=%v", seen, err)
+	}
+	if _, err := (&observationProc{root: root}).children(1, observationItems); !errors.Is(err, errObservationOversize) {
+		t.Fatalf("memory observation thread limit changed: %v", err)
+	}
+}
+
 func TestCleanupTraversalRefusesBadIdentityAndMalformedInput(t *testing.T) {
 	for _, mode := range []string{"parent", "malformed", "unreadable", "gone", "deadline"} {
 		t.Run(mode, func(t *testing.T) {
