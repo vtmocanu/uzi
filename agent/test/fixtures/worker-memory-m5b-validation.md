@@ -122,8 +122,11 @@ In both actual reports, raw `memory.pressure` is null because the actual default
 reader's PSI input was absent. Null denotes unavailable input, not measured zero
 pressure or a successful prerequisite; both legs failed before commands or load.
 
-Raw reports, the trusted manifest and cleanup sidecars remain under
+Raw reports, the trusted manifest and cleanup sidecars were retained during the
+earlier execution under
 `.uzi/scratch/memory-calibration-8a61377b82532ea382eb909e2a5f9204`.
+They are unavailable in this reseeded checkout; the results below are historical
+records, not fresh verification of those raw artifacts.
 Independent log parsing confirmed two failure blocks, no command handles and matching
 removed IDs. Bounded read-only metadata checks also confirmed all four exact
 worker-UID journal handles absent (owned dependency volume and three containers);
