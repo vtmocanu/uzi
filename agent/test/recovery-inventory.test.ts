@@ -383,6 +383,49 @@ it("M3 remembered held scan finding survives restart and a later clean scan", as
   } finally { await f.close(); }
 });
 
+it("V1 deferred failed inventory without held policy archives the same frozen record", async () => {
+  const f = await fixture(true);
+  let heldCalls = 0;
+  Object.assign(f.client, {
+    hasHeldPublicationV2: () => false,
+    publishHeld: async () => { heldCalls++; throw new Error("missing policy cannot authorize held publication"); },
+  });
+  // Include a second owed root so archiving only the current head cannot pass.
+  f.state.candidates.push({ sha: H2, pinRef: "refs/owed/b", contexts: [structuredClone(f.context)] });
+  f.state.ancestors.add(H2);
+  try {
+    const record = await f.coordinator.freezeInventory({
+      context: f.context, currentSha: H, defaultBranch: "main",
+    });
+    assert.ok(record);
+    assert.equal(record.heldPolicy, undefined);
+    assert.equal(f.state.produced, 0, "capture was deferred at freeze");
+    const aggregates = structuredClone(f.aggregates);
+    assert.deepEqual(aggregates, [[H, H2]]);
+    const result = await f.coordinator.operateFrozenInventory({
+      record, barePath: f.context.barePath, defaultBranch: "main",
+    }, { foreground: true, terminal: { status: "failed" } });
+    assert.equal(result.state, "uploaded");
+    assert.equal(result.captureId, record.captureId);
+    assert.equal(heldCalls, 0);
+    assert.equal(f.state.produced, 1);
+    assert.equal(f.state.uploads, 1);
+    for (const roots of f.aggregates) assert.deepEqual(roots, aggregates[0], "coverage revalidation keeps every frozen root");
+    assert.deepEqual(f.reserveKeys, [record.captureId]);
+    assert.deepEqual(f.finals, [[record.runId, record.generation, undefined, {
+      kind: "archive", capture_id: "server-1", source_sha: record.sourceSha,
+      coverage_digest: record.coverageDigest,
+    }]]);
+    const [saved] = await f.coordinator.inspect(record.runId);
+    assert.ok(saved);
+    assert.equal(saved.captureId, record.captureId);
+    assert.equal(saved.sourceSha, record.sourceSha);
+    assert.equal(saved.coverageDigest, record.coverageDigest);
+    assert.deepEqual(saved.originalRoots, record.originalRoots);
+    assert.equal(saved.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
 for (const foreground of [false, true]) {
   it(`B exact terminal observation survives ownership drift foreground=${foreground}`, async () => {
     const f = await v2FrozenFixture();

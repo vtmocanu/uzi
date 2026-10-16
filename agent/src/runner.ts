@@ -1806,14 +1806,13 @@ interface RunFlight {
    *  capture (issue #2545); omitted, the pass freezes and captures as before. */
   prepareTerminalInventory: (pending?: PendingTerminal) => Promise<void>;
   /** Issue #2545: the captureId of the frozen record whose archive capture was DEFERRED because the
-   *  pending terminal is a held-eligible failure. Every later settle on this generation runs on that
+   *  pending terminal is eligible for held-publication consideration. Every later settle on this generation runs on that
    *  exact record and never re-freezes (a re-freeze after the send pins a different original source
    *  and would mint a second record). */
   heldDeferredCapture?: string;
-  /** Issue #2545: a `failed` terminal this flight sent and the server ACKed as failed, recorded at the
-   *  report choke point. The held step needs it: step A refuses a run the server has not failed. */
+  /** The terminal status ACKed at the report choke point. V2 exact-custody observation
+   *  revalidates terminal eligibility before publication. */
   heldTerminal?: { status: "failed" | "cancelled" | "completed"; fail_origin?: string };
-  /** Issue #2545: the held step already ran once for this flight (it publishes at most once). */
   /** Issue #2545: the held FINAL was ACKed; the generation is released and cleaned up. */
   heldAcked?: boolean;
   /** True once the latest {@link prepareTerminalInventory} proved this run's clone quiescent. The
@@ -2117,13 +2116,12 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
 }
 
 /** Issue #2545: the terminal a settle is about to be followed by, as far as the held-publication
- *  decision needs it. Only a `failed` terminal can defer its archive capture. */
+ *  decision needs it. V1 considers failed terminals; V2 also considers cancelled/completed.
+ *  Completed inventory still follows archive-first ordering on the frozen record. */
 export interface PendingTerminal {
   status?: string;
   fail_origin?: string;
 }
-
-/** Issue #2545: the raw pack a held publication may upload, matching the api's cap on the route. */
 
 /** The live pack producer of one checkpoint publish request (the first, or a replay after a 5xx). */
 type CheckpointPackProducer = Pick<NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>, "pack" | "exited" | "cancel">;

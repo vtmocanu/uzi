@@ -3116,8 +3116,6 @@ export interface RecoveryHold {
   capture_state?: string;
 }
 
-/** RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349
- *  M1, D3). holds is ALWAYS an array, never null — the server initializes it to []. */
 /** Verified persisted custody facts only; never a release ACK or cleanup authority. */
 export interface RecoveryExactHold {
   run_id: string;
@@ -3140,6 +3138,8 @@ export interface RecoveryExactHold {
   recovery_wait_cause?: string;
 }
 
+/** RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349
+ *  M1, D3). holds is ALWAYS an array, never null — the server initializes it to []. */
 export interface RecoveryHoldsResponse {
   run_id: string;
   holds: RecoveryHold[];

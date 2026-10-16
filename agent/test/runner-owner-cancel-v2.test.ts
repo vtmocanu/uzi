@@ -13,7 +13,7 @@ import {
 
 installHarness();
 
-for (const scenario of ["old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
+for (const scenario of ["wallpark", "clarification", "old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
   const name = scenario === "identical"
     ? "#2901 before-model cancelled identical-tree inventory with no messages or checkpoint"
     : `V2 owner cancellation preserves frozen inventory: ${scenario}`;
@@ -74,6 +74,25 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
       async run(ctx) {
         if (ctx.cancelRequested?.()) throw new Error("run cancelled");
         models++;
+        if (scenario === "wallpark" || scenario === "clarification") {
+          oldRoot = commit(ctx.worktreePath, "before-cancel.txt");
+          fs.writeFileSync(path.join(ctx.worktreePath, "cancel-dirty.txt"), "work before route cancellation\n");
+          dirtyBlob = command(ctx.worktreePath, ["hash-object", "cancel-dirty.txt"]);
+          if (scenario === "wallpark") {
+            api.setWallParkResponse("cancelled");
+            assert.equal(await ctx.parkForWall!({ completedCount: 1 }), "cancelled");
+          } else {
+            api.onState(claim.run_id, state => {
+              if (state.status === "awaiting_input") api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
+            });
+            assert.equal((await ctx.askUser!([{
+              question: "Continue?", header: "Choice", options: [{ label: "Continue", description: "Continue work" }],
+              multiSelect: false,
+            }])).kind, "cancel");
+          }
+          assert.equal(ctx.signal?.aborted, true, "route cancellation stops the model before returning");
+          throw new Error("run cancelled");
+        }
         throw new Error("model must stay stopped");
       },
       killAgentTree() {},
@@ -117,12 +136,12 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
         assert.deepEqual(api.messages(claim.run_id), [], "no messages before cancellation observation");
       }
       if (scenario === "retained") flight.retainedEpisode = true;
-      if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence") r["observeCancellation"](flight);
+      if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence" && scenario !== "wallpark" && scenario !== "clarification") r["observeCancellation"](flight);
       return out;
     };
     const capture = mock.method(recoveryOf(r), "captureAndUpload");
     await r.execute(claim);
-    assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" ? 1 : 0);
+    assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" || scenario === "wallpark" || scenario === "clarification" ? 1 : 0);
     assert.equal(api.states.filter(s => s.body.status === "failed").length, 1);
     if (scenario === "old-generation-foreground") {
       assert.equal(server.heldCalls.length, 0);
@@ -148,7 +167,7 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
       assert.deepEqual(lateReads, [], "late quiescence cannot start fresh source inspection");
       assert.equal(server.failedAcked(), true, "honest terminal status transport remains independent of preservation expiry");
     }
-    const positive = scenario === "identical" || scenario === "dirty";
+    const positive = scenario === "identical" || scenario === "dirty" || scenario === "wallpark" || scenario === "clarification";
     assert.equal(server.heldCalls.length, positive ? 1 : 0);
     assert.equal(capture.mock.callCount(), 0, "no archive before positive exact terminal authority");
     assert.equal(server.archiveReserves(), 0);

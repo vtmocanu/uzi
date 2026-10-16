@@ -72,7 +72,8 @@ const RecoveryCompletedPublicationV1 = "recovery_completed_publication_v1"
 // step B require the worker to report this token.
 const RecoveryHeldPublicationV1 = "recovery_held_publication_v1"
 
-// RecoveryHeldPublicationV2 negotiates exact custody observation; publication policy remains V1.
+// RecoveryHeldPublicationV2 negotiates exact custody observation and terminal held
+// publication for failed, cancelled and completed runs, including earlier generations.
 const RecoveryHeldPublicationV2 = "recovery_held_publication_v2"
 
 // CodexHarnessV1 is the PROTOCOL capability a worker self-reports (PRD #1332 M5A, D3) after a

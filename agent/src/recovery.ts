@@ -1344,10 +1344,6 @@ export class RecoveryCoordinator {
     return outcome;
   }
 
-  /** C -> S -> J -> B -> O. This operation consumes archive observations only;
-   * the callback performs the conditional exact unlink before any boundary releases.
-   * At most 256 journals and their captures are considered; a bad candidate retains
-   * its report, without granting FINAL, capture or cleanup authority. */
   /** ACK-only report retirement never settles or rewrites recovery evidence. */
   async retireAcknowledgedFinalReport(
     runId: string, generation: number,
@@ -1476,6 +1472,10 @@ export class RecoveryCoordinator {
   }
 
 
+  /** C -> S -> J -> B -> O. This operation consumes archive observations only;
+   * the callback performs the conditional exact unlink before any boundary releases.
+   * At most 256 journals and their captures are considered; a bad candidate retains
+   * its report, without granting FINAL, capture or cleanup authority. */
   async retireArchivedReport(
     runId: string, generation: number,
     budget: { signal: AbortSignal; deadline: number },
@@ -2128,7 +2128,8 @@ export class RecoveryCoordinator {
         record.prerequisiteShas.length > 0 && hasJournaledBundle(record);
       if (!thin && !record.archiveRefusal) return archived;
     }
-    if (!record.heldPolicy || !this.client.publishHeld || residueQuarantine() !== undefined) return archived ?? outcome("kept");
+    if (residueQuarantine() !== undefined) return archived ?? outcome("kept");
+    if (!record.heldPolicy || !this.client.publishHeld) return archived ?? this.captureCycle({ ...input, record });
     let publicationId: string | undefined;
     let result: "fallback" | "kept" | "settled" = "fallback";
     const publish = async (prove: () => Promise<boolean>) => {
@@ -2320,18 +2321,6 @@ export class RecoveryCoordinator {
 
   // ── D3/D5: produce + verify + journal-before-manifest + upload ──────────────────
 
-  /**
-   * The model-free capture on a finalization failure: (1) produce and verify an
-   * independently-usable bundle (resolving the prerequisite against a FRESH forge tip),
-   * (2) journal the verified bundle FILE before binding its manifest (D5), then
-   * (3) reserve → bind manifest → stream upload. On any failure the source stays pinned and
-   * the record becomes needs_action; the caller reports the run's execution honestly.
-   *
-   * issue #1995: the whole cycle runs under the per-capture lock (a concurrent foreground
-   * capture, boot-sweep step or live pass on the same record waits or skips), starts from the
-   * authenticated LATEST journaled record rather than the caller's copy, and never re-produces
-   * bytes a record already journaled.
-   */
   /** Positive local capture proof for claim-local adoption, independent of upload/final ACK.
    * This proof grants no cleanup or custody-release authority. */
   async verifiedLocalCapture(record: RecoveryRecord, signal?: AbortSignal): Promise<RecoveryRecord | undefined> {
@@ -2345,6 +2334,18 @@ export class RecoveryCoordinator {
     return local;
   }
 
+  /**
+   * The model-free capture on a finalization failure: (1) produce and verify an
+   * independently-usable bundle (resolving the prerequisite against a FRESH forge tip),
+   * (2) journal the verified bundle FILE before binding its manifest (D5), then
+   * (3) reserve → bind manifest → stream upload. On any failure the source stays pinned and
+   * the record becomes needs_action; the caller reports the run's execution honestly.
+   *
+   * issue #1995: the whole cycle runs under the per-capture lock (a concurrent foreground
+   * capture, boot-sweep step or live pass on the same record waits or skips), starts from the
+   * authenticated LATEST journaled record rather than the caller's copy, and never re-produces
+   * bytes a record already journaled.
+   */
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
