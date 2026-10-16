@@ -26,6 +26,7 @@ async function until(ready: () => boolean) {
 // Active receipt failure is bounded by 30 failures / 60s elapsed; stop drains at most
 // three inclusion requests. Detection is distinct from teardown: executor settlement,
 // source quiescence, message-batcher close and steering stop all precede slot release.
+// Receipt give-up fails server-visibly; only confirmed terminal controls stop without a report.
 // These short-poll fixtures hold quiescence behind an event barrier to prove that
 // ordering. They do not assert a universal 33-second total or spend a gate deadline.
 describe("M2 terminal cancellation real worker custody", () => {
@@ -52,6 +53,7 @@ describe("M2 terminal cancellation real worker custody", () => {
       let source = "";
       let firstSettled = false;
       let gateSettled = false;
+      let gateError: unknown;
       let deadlineAdvanced = false;
       const realNow = Date.now.bind(Date);
       // Only Date advances; Node's timers and both gate deadlines remain unchanged/disabled.
@@ -73,7 +75,10 @@ describe("M2 terminal cancellation real worker custody", () => {
                 : ctx.gatePlan!("# Retained plan\n- preserve source");
               gateEntered.resolve();
               await waiting;
-              assert.fail("terminal fence must reject the real gate");
+              assert.fail("the stopped flight must reject the real gate");
+            } catch (err) {
+              gateError = err;
+              throw err;
             } finally { gateSettled = true; }
           },
         } as Executor,
@@ -138,6 +143,8 @@ describe("M2 terminal cancellation real worker custody", () => {
         heldGet.release();
         await stopEntered.promise;
         assert.equal(gateSettled, true, "the actual plan/question wait rejected");
+        assert.ok(gateError instanceof Error);
+        assert.equal(gateError.name, gate === "receipt deadline" ? "InputReceiptError" : "ClaimFencedSignal");
         assert.equal(firstSettled, false, "retention quiescence still owns execute");
         assert.equal(run.isExecuting(first.run_id), true);
         assert.equal(registry.has(first.run_id), true);
@@ -154,11 +161,25 @@ describe("M2 terminal cancellation real worker custody", () => {
         assert.equal(fs.readFileSync(path.join(source, "README.md"), "utf8"), "dirty retained bytes\n");
         assert.equal(fs.readFileSync(path.join(source, "untracked.txt"), "utf8"), "untracked retained bytes\n");
         const bareConfig = fs.readFileSync(path.join(git.barePathFor(fx.originPath), "config"), "utf8");
-        assert.match(bareConfig, /uzi-stopped/);
+        assert.match(bareConfig, gate === "receipt deadline" ? /\[uzi-recovery "agent\/issue-29071"\]/ : /uzi-stopped/);
         assert.ok(bareConfig.includes(first.run_id), "retention journal names this run");
         assert.deepEqual(fs.readFileSync(unrelatedPath), unrelatedBytes, "unrelated finalize evidence is unchanged");
-        assert.deepEqual(outbox.listPendingTerminals(), []);
-        assert.ok(!api.states.some((s) => s.runId === first.run_id && ["completed", "failed", "cancelled"].includes(s.body.status)));
+        assert.deepEqual(outbox.listPendingTerminals().map(({ run_id, claim_generation, server_settled }) =>
+          ({ run_id, claim_generation, server_settled })), gate === "receipt deadline"
+          ? [{ run_id: first.run_id, claim_generation: 7, server_settled: true }]
+          : [], "an acknowledged failure retains its custody-pending journal without consuming a slot");
+        const terminals = api.states.filter((s) => s.runId === first.run_id && ["completed", "failed", "cancelled"].includes(s.body.status));
+        if (gate === "receipt deadline") {
+          assert.ok(terminals.length > 0, "receipt give-up reports a server-visible failure");
+          assert.match(terminals[0]!.body.failure_reason ?? "", /could not confirm 1 applied operator input/);
+          for (const terminal of terminals) {
+            assert.equal(terminal.body.status, "failed");
+            assert.equal(terminal.body.claim_generation, 7);
+            assert.deepEqual(terminal.body, terminals[0]!.body, "custody-pending retries replay the exact failed journal");
+          }
+        } else {
+          assert.deepEqual(terminals, [], "confirmed terminal controls do not produce a competing report");
+        }
         assert.equal(calls.length, 0, "no forge publication");
         if (gate === "receipt deadline") {
           assert.equal(deadlineAdvanced, true);

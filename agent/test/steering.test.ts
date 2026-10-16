@@ -1618,13 +1618,14 @@ describe("input receipts", () => {
           "the guarded report never goes out as if the input were applied");
         assert.strictEqual(applies, 30, "bounded on the active claim");
         assert.equal(terminal.aborted, true);
-        assert.equal((terminal.reason as Error).name, "ClaimFencedSignal");
+        assert.equal((terminal.reason as Error).name, "InputReceiptError");
+        assert.equal(ch.claimFence(), undefined, "an unconfirmed receipt does not prove loss of the claim");
         const reason = terminal.reason;
         ch.rearmLifecycle();
         assert.equal(ch.terminalLifecycleSignal(), terminal);
         assert.equal(terminal.reason, reason);
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError");
-        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "ClaimFencedSignal");
+        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "InputReceiptError");
       } finally {
         await ch.stop();
       }

@@ -3966,6 +3966,11 @@ export class RunRunner {
             return;
           }
         }
+        if (isInputReceiptError(err)) {
+          // Receipt give-up must fail server-visibly without discarding unfinished source.
+          await this.retainStoppedSource(flight, executor, "input_receipt_unconfirmed",
+            { memo: false, stale: false, record: "none" });
+        }
         await this.reportGenericFailure(claim, flight, err);
       }
     };

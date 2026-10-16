@@ -329,7 +329,7 @@ const ACTIVE_APPLY_ATTEMPTS = 30;
 const ACTIVE_APPLY_DEADLINE_MS = 60_000;
 
 /** Issue #1673: the applied receipt for a routed batch could not be confirmed. State reports
- *  waiting on it reject with this error; parked gates receive ClaimFencedSignal instead.
+ *  waiting on it and parked gates reject with this error so the runner can report failure.
  *  The source rows stay unapplied for a later claim to replay. */
 class InputReceiptError extends Error {
   constructor(message: string) {
@@ -648,14 +648,18 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
   }
 
-  /** Give up the applied receipt of a routed batch on an active claim: reject waiting reports
-   *  with InputReceiptError, then fence parked gates. The rows stay unapplied for a later claim. */
+  /** Give up the applied receipt on an active claim: stop execution and fail server-visibly.
+   *  An unconfirmed receipt is not a server fence. Rows stay unapplied for a later claim. */
   private failReceipts(err: InputReceiptError): void {
-    this.log.error("steering: giving up the applied receipt; stopping this flight", { run_id: this.runId, error: err.message });
+    this.log.error("steering: giving up the applied receipt; failing the run", { run_id: this.runId, error: err.message });
     this.receiptFailure = err;
-    // Unconfirmed input is never evidence permitting a waiting report to resume.
+    this.flightEnded = err;
+    this.held = undefined;
+    this.ready = undefined;
+    this.stopped = true;
+    this.abortLifecycle(err);
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
-    this.endFencedFlight("input_receipt_unconfirmed");
+    this.rejectParkedWaiters(err);
   }
 
   /** End a fenced flight and route nothing more. Receipt waiters are released; runner state

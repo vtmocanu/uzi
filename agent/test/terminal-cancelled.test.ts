@@ -303,7 +303,7 @@ describe("terminal cancelled steering", () => {
     });
   }
 
-  it("receipt timer fences persistent failure at the shortened deadline", async () => {
+  it("receipt timer fails a parked plan with InputReceiptError without claiming a server fence", async () => {
     const applying = deferred<void>();
     const response = deferred<InputReceipt>();
     const c = {
@@ -313,14 +313,15 @@ describe("terminal cancelled steering", () => {
     } as unknown as WorkerClient;
     const ch = new SteeringChannel(c, RUN, 1, nullLogger(), new AbortController(),
       { claimGeneration: 3, receiptDeadlineMs: 20 });
-    const plan = assert.rejects(ch.awaitVerdict(), { name: "ClaimFencedSignal" });
+    const plan = assert.rejects(ch.awaitVerdict(), { name: "InputReceiptError" });
     ch.start();
     try {
       await applying.promise;
       const settlement = ch.awaitReceiptSettlement().catch(() => {});
       await plan;
       await settlement;
-      assert.equal(ch.claimFence(), "input_receipt_unconfirmed");
+      assert.equal(ch.claimFence(), undefined);
+      assert.equal((ch.terminalLifecycleSignal().reason as Error).name, "InputReceiptError");
       assert.equal(ch.isCancelled(), false);
       await assert.rejects(ch.awaitReceiptSettlement(), { name: "InputReceiptError" });
     } finally { response.resolve({ inputs: [], active: true }); await ch.stop(); }
