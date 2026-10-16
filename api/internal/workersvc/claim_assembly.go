@@ -168,7 +168,7 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 		return "awaiting_input"
 	case hasPlan && planApproved:
 		return "implementing"
-	case hasPlan && !planApproved && run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "":
+	case hasPlan && !planApproved && ((run.SessionID.Valid && strings.TrimSpace(run.SessionID.String) != "") || (run.PolicyRefusalCount > 0 && run.GateRevision > 0)):
 		return "awaiting_approval"
 	default:
 		return ""
@@ -665,12 +665,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return nil, err
 	}
 	payload := &ClaimPayload{
-		InventoryGuarded: inventoryGuarded,
-		RunID:            run.ID.String(),
-		Kind:             run.Kind,
-		IssueIID:         issueIID,
-		IssueTitle:       run.IssueTitle,
-		IssueDescription: run.IssueDescription,
+		InventoryGuarded:       inventoryGuarded,
+		PolicyHoldResume:       run.PolicyRefusalCount > 0,
+		PolicyHoldFreshSession: run.PolicyRefusalCount > 0 && run.PolicyFreshClaimGeneration.Valid && run.PolicyFreshClaimGeneration.Int64 == run.ClaimGeneration,
+		RunID:                  run.ID.String(),
+		Kind:                   run.Kind,
+		IssueIID:               issueIID,
+		IssueTitle:             run.IssueTitle,
+		IssueDescription:       run.IssueDescription,
 		// PRD #381: the structured comments snapshot, decoded above. omitempty keeps a
 		// comment-less run's claim byte-identical to today's.
 		IssueComments: issueComments,

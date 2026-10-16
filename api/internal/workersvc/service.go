@@ -1103,6 +1103,7 @@ type Store interface {
 	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
 	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
 	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingPolicyHold(ctx context.Context, arg store.CountOnlineWorkersSatisfyingPolicyHoldParams) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
@@ -1395,6 +1396,9 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
+	// Policy hold activation is reserved for M2; tests explicitly negotiate the seam.
+	PolicyHoldNegotiated       bool
+	PolicyHoldSnapshotEnabled  bool
 	PlanCrossCheckMaxRevisions int32
 	// Presence distinguishes an explicitly disabled budget from an unwired service.
 	PlanCrossCheckMaxRevisionsSet bool

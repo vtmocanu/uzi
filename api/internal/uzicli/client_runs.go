@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 
@@ -224,12 +225,44 @@ func (c *HTTPClient) SetRunPriority(ctx context.Context, id string, expedite boo
 	return env.Run, nil
 }
 
+type RunResumeOptions struct {
+	Guidance string `json:"guidance,omitempty"`
+}
+
 func (c *HTTPClient) ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	var env struct {
 		Run apitypes.RunDTO `json:"run"`
 	}
-	// No request body — resume-now is a payload-less POST verb.
 	if err := c.postJSON(ctx, "/api/runs/"+url.PathEscape(id)+"/resume-now", nil, &env); err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	return env.Run, nil
+}
+
+// ResumeRunNowWithOptions fetches the presented hold, then binds the action to it.
+// A concurrent new hold returns a conflict; the client never refreshes and retries.
+func (c *HTTPClient) ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error) {
+	presented, err := c.GetRun(ctx, id)
+	if err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	var body any
+	headers := http.Header{}
+	if presented.PolicyRefusal != nil && presented.PolicyRefusal.CanResume {
+		headers.Set("If-Match", presented.PolicyRefusal.ActionIfMatch)
+	}
+	if opts.Guidance != "" {
+		body = opts
+	}
+	path := "/api/runs/" + url.PathEscape(id) + "/resume-now"
+	resp, raw, err := c.doJSONReadHeaders(ctx, http.MethodPost, path, body, headers)
+	if err != nil {
+		return apitypes.RunDTO{}, err
+	}
+	var env struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if err := decode2xx(resp, raw, path, &env); err != nil {
 		return apitypes.RunDTO{}, err
 	}
 	return env.Run, nil

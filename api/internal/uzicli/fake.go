@@ -248,9 +248,10 @@ type FakeClient struct {
 	// ResumedRun is the canned success reply; ResumeRunNowErr wins over the blanket Err so
 	// a test can model the non-held 409 (ExitConflict) precisely while the capture still
 	// proves the write was reached.
-	LastResumeRunID string
-	ResumedRun      apitypes.RunDTO
-	ResumeRunNowErr error
+	LastResumeRunID    string
+	ResumedRun         apitypes.RunDTO
+	ResumeRunNowErr    error
+	LastResumeGuidance string
 
 	// SetRunCredential capture (PRD #1247 M4). LastSetTokenRunID is the run id `uzi run
 	// set-token` targeted; LastSetTokenOverride is the resolved override it sent (a label

@@ -114,6 +114,7 @@ type Client interface {
 	// /api/runs/{id}/resume-now, RequireUser so a CLI token can reach it. A non-held run
 	// is a 409 → ExitConflict (5); a foreign/absent run is 404 → 4. No request body.
 	ResumeRunNow(ctx context.Context, id string) (apitypes.RunDTO, error)
+	ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error)
 	// SetRunCredential is the `uzi run set-token` verb (PRD #1247 M4, D4/D12): POST
 	// /api/runs/{id}/credential {mode, secret_id?}, RequireUser so a uzc_ CLI Bearer reaches
 	// it. It re-points which Anthropic token a queued or parked run spends (promoting a
@@ -929,6 +930,10 @@ func isLoopbackURL(u *url.URL) bool {
 // HTTP-status classification, since some callers (the poll loop) branch on
 // non-error statuses like 202/410 that others treat as failures.
 func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBody any) (*http.Response, []byte, error) {
+	return c.doJSONReadHeaders(ctx, method, path, reqBody, nil)
+}
+
+func (c *HTTPClient) doJSONReadHeaders(ctx context.Context, method, path string, reqBody any, headers http.Header) (*http.Response, []byte, error) {
 	var body io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
@@ -940,6 +945,11 @@ func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBod
 	req, err := c.newRequest(ctx, method, path, body)
 	if err != nil {
 		return nil, nil, err
+	}
+	for key, values := range headers {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

@@ -34,7 +34,9 @@ type healthFakeStore struct {
 	ownerErr   error
 	ownerCalls []uuid.UUID
 	// onlineErr forces CountOnlineWorkersForUser to fail.
-	onlineErr error
+	onlineErr       error
+	policyHoldCount *int64
+	policyHoldCalls []store.CountOnlineWorkersSatisfyingPolicyHoldParams
 
 	Store
 	liveCrossCheck        map[uuid.UUID]bool
@@ -1584,4 +1586,12 @@ func TestHealthQueuedWorkersUpgrading(t *testing.T) {
 			}
 		})
 	}
+}
+
+func (f *healthFakeStore) CountOnlineWorkersSatisfyingPolicyHold(_ context.Context, arg store.CountOnlineWorkersSatisfyingPolicyHoldParams) (int64, error) {
+	f.policyHoldCalls = append(f.policyHoldCalls, arg)
+	if f.policyHoldCount != nil {
+		return *f.policyHoldCount, nil
+	}
+	return 1, nil
 }

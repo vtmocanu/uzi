@@ -209,6 +209,7 @@ func credentialSwitchState(r store.Run) *string {
 func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, extensionCapSeconds int, forgeParkMax int, now time.Time, automaticRequeueLimit int) apitypes.RunDTO {
 	dto := apitypes.RunDTO{
 		ID:               r.ID.String(),
+		PolicyRefusal:    policyRefusalDTO(r),
 		Kind:             r.Kind,
 		IssueTitle:       r.IssueTitle,
 		IssueDescription: r.IssueDescription,
@@ -801,4 +802,32 @@ func deriveProgress(dto *apitypes.RunDTO) {
 func applyRevising(dto *apitypes.RunDTO, revising bool) {
 	dto.IsRevising = revising
 	deriveProgress(dto)
+}
+
+func policyRefusalDTO(r store.Run) *apitypes.PolicyRefusalDTO {
+	if r.PolicyRefusalCount == 0 && !r.PolicyLastOutcomeID.Valid {
+		return nil
+	}
+	dto := &apitypes.PolicyRefusalDTO{
+		Count:             r.PolicyRefusalCount,
+		LastTag:           textPtrValue(r.PolicyLastTag.Valid, r.PolicyLastTag.String),
+		LastPhase:         textPtrValue(r.PolicyLastPhase.Valid, r.PolicyLastPhase.String),
+		LastCorrelationID: textPtrValue(r.PolicyLastCorrelationID.Valid, r.PolicyLastCorrelationID.String),
+		Detail:            textPtrValue(r.PolicyHoldDetail.Valid, r.PolicyHoldDetail.String),
+		Provenance:        textPtrValue(r.PolicyHoldProvenance.Valid, r.PolicyHoldProvenance.String),
+		CanResume:         r.Status == "paused" && r.HoldReason.String == "provider_policy_refusal",
+		CanCancel:         r.Status != "completed" && r.Status != "failed" && r.Status != "cancelled",
+	}
+	if r.PolicyLastRefusedAt.Valid {
+		t := r.PolicyLastRefusedAt.Time
+		dto.LastRefusedAt = &t
+	}
+	if r.PolicyHoldPublished.Valid {
+		v := r.PolicyHoldPublished.Bool
+		dto.Published = &v
+	}
+	if dto.CanResume {
+		dto.ActionIfMatch = workersvc.PolicyHoldActionToken(r)
+	}
+	return dto
 }

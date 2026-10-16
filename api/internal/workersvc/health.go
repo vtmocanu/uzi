@@ -200,6 +200,7 @@ const (
 	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
 	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
 	// leaves the run queued until a worker that enforces the guard comes online.
+	reasonNoPolicyHoldCapableWorker    = "no online worker supports preserving policy-hold continuation (provider_policy_hold_v1); provision a capable worker"
 	reasonNoCIConfigGuardCapableWorker = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
@@ -1202,9 +1203,38 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			return reasonNoCompletionCapableWorker
 		}
 	}
-	// PRD #2865: a GUARDED run (ci_config_guard) whose owner has NO online worker reporting
-	// ci_config_guard_v1 is genuinely UNPLACEABLE: ClaimRun's standalone guard clause can never be
-	// satisfied. Same placement and degrade rules as the completion-protocol rung above.
+	// Policy continuation requires protocol support under the run's own static placement,
+	// affinity and ephemeral binding, independently of ordinary capability scheduling.
+	if r.PolicyRefusalCount > 0 || r.HoldReason.String == "provider_policy_refusal" {
+		allowlist := []uuid.UUID{}
+		if s.dockerAllowlist != nil {
+			var err error
+			allowlist, err = s.dockerAllowlist.DockerRepoAllowlist(ctx)
+			if err != nil {
+				slog.Error("health: policy hold allowlist", "error", err)
+				return reasonNoEligibleWorker
+			}
+		}
+		if allowlist == nil {
+			allowlist = []uuid.UUID{}
+		}
+		count, err := s.q.CountOnlineWorkersSatisfyingPolicyHold(ctx, store.CountOnlineWorkersSatisfyingPolicyHoldParams{
+			RunID: r.ID, HeartbeatCutoff: pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
+			AffinityCutoff:           pgconv.Time(s.now().Add(-s.p.WorkerAffinityCeiling)),
+			StaleRequeueCutoff:       StaleRequeueCutoff(s.now(), s.p.WorkerStaleRequeueGrace),
+			CrossCheckEvaluatedAt:    pgconv.Time(s.now()),
+			CrossCheckAffinityCutoff: pgconv.Time(s.now().Add(-s.p.WorkerAffinityGrace)),
+			DockerRepoAllowlist:      allowlist, WorkerDockerEnabled: s.effectiveDockerTier,
+			CapabilityAware: capAware, CodexCuratedModels: codexCuratedModelsSlice(),
+			EphemeralLease: LeaseInterval(s.ephemeralLease),
+		})
+		if err != nil {
+			slog.Error("health: policy capable workers", "error", err)
+		} else if count == 0 {
+			return reasonNoPolicyHoldCapableWorker
+		}
+	}
+	// A guarded run needs ci_config_guard_v1 independently of the scheduling preference.
 	if r.CiConfigGuard {
 		g, gerr := s.q.CountOnlineWorkersSatisfyingCIConfigGuard(ctx, r.UserID)
 		if gerr != nil {

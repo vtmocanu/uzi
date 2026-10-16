@@ -1061,6 +1061,17 @@ type Run struct {
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 	CiConfigGuard               bool               `json:"ci_config_guard"`
+	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
+	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
+	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
+	PolicyLastCorrelationID     pgtype.Text        `json:"policy_last_correlation_id"`
+	PolicyLastRefusedAt         pgtype.Timestamptz `json:"policy_last_refused_at"`
+	PolicyHoldProvenance        pgtype.Text        `json:"policy_hold_provenance"`
+	PolicyHoldPublished         pgtype.Bool        `json:"policy_hold_published"`
+	PolicyHoldDetail            pgtype.Text        `json:"policy_hold_detail"`
+	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
+	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
+	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
 }
 
 type RunCompletionAttempt struct {

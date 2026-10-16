@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -20,8 +21,7 @@ import (
 // read returns 404 for foreign/absent runs. Each status-scoped write refuses races
 // and ineligible holds with 409; successful transitions write a resume audit row.
 //
-// A POST verb with no payload: there is nothing to configure (unlike expedite's expedite/clear),
-// so it deliberately reads NO request body.
+// Policy holds require the presented If-Match; ordinary bodyless callers remain compatible.
 func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -37,6 +37,41 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 	run, err := h.q.GetRunByIDForUser(r.Context(), store.GetRunByIDForUserParams{ID: runID, UserID: user.ID})
 	if err != nil {
 		httpx.Error(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var policyReq workersvc.PolicyResumeRequest
+	if r.Body != nil {
+		var decoded *workersvc.PolicyResumeRequest
+		err := httpx.DecodeJSONStrictBounded(r, &decoded, 17000)
+		if (err != nil && !errors.Is(err, io.EOF)) || (err == nil && decoded == nil) {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if decoded != nil {
+			policyReq = *decoded
+		}
+	}
+	policyHold := run.HoldReason.String == "provider_policy_refusal"
+	if !policyHold && (policyReq.Mode != "" || policyReq.Guidance != "") {
+		httpx.Error(w, http.StatusConflict, "policy guidance requires a policy hold")
+		return
+	}
+	if policyHold {
+		run, err = h.wsvc.ResumePolicyHold(r.Context(), user.ID, runID, r.Header.Get("If-Match"), policyReq)
+		if err != nil {
+			if errors.Is(err, workersvc.ErrInvalidState) {
+				httpx.Error(w, http.StatusBadRequest, "invalid preserving resume")
+				return
+			}
+			if errors.Is(err, workersvc.ErrStaleClaim) {
+				httpx.Error(w, http.StatusConflict, "policy hold changed; refresh the presented action")
+				return
+			}
+			httpx.Error(w, http.StatusInternalServerError, "policy resume unavailable")
+			return
+		}
+		httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
 		return
 	}
 

@@ -1,0 +1,279 @@
+package workersvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// PolicyHoldFeature is intentionally not advertised until the M2 activation.
+const PolicyHoldFeature = "provider_policy_hold"
+
+type PolicyHoldRequest struct {
+	OutcomeID                string  `json:"outcome_id"`
+	SourceGeneration         int64   `json:"source_generation"`
+	ClaimGeneration          int64   `json:"claim_generation"`
+	Detail                   string  `json:"detail"`
+	Tag                      *string `json:"tag,omitempty"`
+	Phase                    *string `json:"phase,omitempty"`
+	CorrelationID            *string `json:"correlation_id,omitempty"`
+	SessionID                *string `json:"session_id,omitempty"`
+	Head                     string  `json:"head"`
+	Published                bool    `json:"published"`
+	CheckpointContainsLatest *bool   `json:"checkpoint_contains_latest,omitempty"`
+	ExpectedGateRevision     *int64  `json:"expected_gate_revision,omitempty"`
+}
+
+type PolicyHoldDisposition string
+
+const (
+	PolicyHoldApplied        PolicyHoldDisposition = "applied"
+	PolicyHoldAlreadyApplied PolicyHoldDisposition = "already_applied"
+	PolicyHoldResolvedNewer  PolicyHoldDisposition = "resolved_newer_policy"
+	PolicyHoldTerminal       PolicyHoldDisposition = "terminal"
+	PolicyHoldPending        PolicyHoldDisposition = "pending"
+)
+
+var policyCorrelation = regexp.MustCompile(`^pr-[0-9a-f]{32}-[1-9][0-9]{0,15}$`)
+
+func ValidPolicyCorrelation(v string) bool {
+	if !policyCorrelation.MatchString(v) {
+		return false
+	}
+	n, err := strconv.ParseUint(v[36:], 10, 64)
+	return err == nil && n <= 9007199254740991
+}
+
+func (r PolicyHoldRequest) validate() error {
+	id, err := uuid.Parse(r.OutcomeID)
+	if err != nil || id == uuid.Nil || id.String() != r.OutcomeID ||
+		r.SourceGeneration <= 0 || r.ClaimGeneration <= 0 || r.SourceGeneration > r.ClaimGeneration ||
+		(r.Detail != "refused" && r.Detail != "resume_rejected") {
+		return ErrInvalidState
+	}
+	if r.Detail == "refused" && (r.Tag == nil || r.Phase == nil || r.CorrelationID == nil) {
+		return ErrInvalidState
+	}
+	if r.Tag != nil && *r.Tag != "cyberPolicy" && *r.Tag != "misalignmentPolicyViolation" {
+		return ErrInvalidState
+	}
+	if r.Phase != nil && *r.Phase != "planning" && *r.Phase != "implementation" {
+		return ErrInvalidState
+	}
+	if r.CorrelationID != nil && !ValidPolicyCorrelation(*r.CorrelationID) {
+		return ErrInvalidState
+	}
+	if r.ExpectedGateRevision != nil && *r.ExpectedGateRevision <= 0 {
+		return ErrInvalidState
+	}
+	if r.Head != "" {
+		if len(r.Head) != 40 && len(r.Head) != 64 {
+			return ErrInvalidState
+		}
+		for _, c := range r.Head {
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return ErrInvalidState
+			}
+		}
+	}
+	if r.Published && r.Head == "" {
+		return ErrInvalidState
+	}
+	if r.SessionID != nil && (len(*r.SessionID) > 512 || strings.ContainsAny(*r.SessionID, "\x00\r\n")) {
+		return ErrInvalidState
+	}
+	return nil
+}
+
+func policyEligible(r store.Run) bool {
+	return r.Harness == "codex" && !r.Interactive && slices.Contains([]string{"issue", "task", "prompt", "self_improve"}, r.Kind)
+}
+
+// ReportPolicyHold authorizes the exact current unreleased claim before reconciling
+// immutable evidence or converting an older local outcome.
+func (s *Service) ReportPolicyHold(ctx context.Context, w store.Worker, id uuid.UUID, req PolicyHoldRequest) (store.Run, PolicyHoldDisposition, error) {
+	if err := req.validate(); err != nil {
+		return store.Run{}, PolicyHoldPending, err
+	}
+	if !s.p.PolicyHoldNegotiated || !s.p.PolicyHoldSnapshotEnabled || s.p.TerminalPendingLease <= 0 ||
+		!slices.Contains(w.ProtocolCapabilities, capability.ProviderPolicyHoldV1) ||
+		!slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return store.Run{}, PolicyHoldPending, ErrInvalidState
+	}
+	if s.txBeginner == nil {
+		return store.Run{}, PolicyHoldPending, fmt.Errorf("policy hold requires transaction")
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return store.Run{}, PolicyHoldPending, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	if _, err = q.GetWorkerForUpdate(ctx, w.ID); err != nil {
+		return store.Run{}, PolicyHoldPending, err
+	}
+	r, err := q.GetRunByIDForUpdate(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Run{}, PolicyHoldPending, ErrRunNotOwned
+	}
+	if err != nil {
+		return r, PolicyHoldPending, err
+	}
+	if r.UserID != w.UserID {
+		return store.Run{}, PolicyHoldPending, ErrRunNotOwned
+	}
+	if !r.WorkerID.Valid || r.WorkerID.Bytes != w.ID || r.ClaimGeneration != req.ClaimGeneration {
+		return store.Run{}, PolicyHoldPending, ErrRunNotOwned
+	}
+	if r.Status == "cancelled" || r.Status == "failed" || r.Status == "completed" {
+		return r, PolicyHoldTerminal, nil
+	}
+	if validateReconciledGeneration(r, &req.ClaimGeneration) != nil {
+		return r, PolicyHoldPending, nil
+	}
+	outcome, _ := uuid.Parse(req.OutcomeID)
+	if r.PolicyLastOutcomeID.Valid && r.PolicyLastOutcomeID.Bytes == outcome {
+		return r, PolicyHoldAlreadyApplied, nil
+	}
+	if r.PolicyLastSourceGeneration.Valid && r.PolicyLastSourceGeneration.Int64 > req.SourceGeneration {
+		return r, PolicyHoldResolvedNewer, nil
+	}
+	if !policyEligible(r) {
+		return r, PolicyHoldPending, ErrInvalidState
+	}
+	if r.StopKind.Valid && r.StopKind.String != "" {
+		_, err := q.CancelRunByWorker(ctx, store.CancelRunByWorkerParams{ID: id, WorkerID: pgconv.UUID(w.ID)})
+		if err != nil {
+			return r, PolicyHoldPending, err
+		}
+		cancelled, err := q.GetRunByIDForUpdate(ctx, id)
+		if err != nil {
+			return r, PolicyHoldPending, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return r, PolicyHoldPending, err
+		}
+		return cancelled, PolicyHoldTerminal, err
+	}
+	// A bounded last-id slot cannot establish whether another outcome from the same
+	// original source was applied. Keep that evidence blocking rather than count twice.
+	if r.PolicyLastSourceGeneration.Valid && r.PolicyLastSourceGeneration.Int64 == req.SourceGeneration {
+		return r, PolicyHoldPending, nil
+	}
+	if req.Detail == "resume_rejected" && r.PolicyRefusalCount == 0 {
+		return r, PolicyHoldPending, ErrInvalidState
+	}
+	provenance := "unverified"
+	if req.Head != "" {
+		provenance = "verified"
+	}
+	held, err := q.SetRunPolicyHold(ctx, store.SetRunPolicyHoldParams{
+		ID: id, WorkerID: pgconv.UUID(w.ID), ClaimGeneration: req.ClaimGeneration,
+		OutcomeID: pgconv.UUID(outcome), SourceGeneration: pgtype.Int8{Int64: req.SourceGeneration, Valid: true}, Detail: policyText(&req.Detail),
+		Tag: policyText(req.Tag), Phase: policyText(req.Phase), CorrelationID: policyText(req.CorrelationID),
+		SessionID: policyText(req.SessionID), Head: policyTextNonempty(req.Head), Provenance: pgtype.Text{String: provenance, Valid: true},
+		Published: pgtype.Bool{Bool: req.Published, Valid: true}, CheckpointContainsLatest: policyBool(req.CheckpointContainsLatest),
+		ExpectedGateRevision: policyInt(req.ExpectedGateRevision),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, PolicyHoldPending, nil
+	}
+	if err != nil {
+		return r, PolicyHoldPending, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return r, PolicyHoldPending, err
+	}
+	return held, PolicyHoldApplied, nil
+}
+
+func policyText(v *string) pgtype.Text {
+	if v == nil {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: *v, Valid: true}
+}
+func policyTextNonempty(v string) pgtype.Text {
+	if v == "" {
+		return pgtype.Text{}
+	}
+	return policyText(&v)
+}
+func policyBool(v *bool) pgtype.Bool {
+	if v == nil {
+		return pgtype.Bool{}
+	}
+	return pgtype.Bool{Bool: *v, Valid: true}
+}
+func policyInt(v *int64) pgtype.Int8 {
+	if v == nil {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: *v, Valid: true}
+}
+
+// PolicyHoldActionToken binds an owner action to the presented outcome and claim.
+func PolicyHoldActionToken(r store.Run) string {
+	if !r.PolicyLastOutcomeID.Valid {
+		return ""
+	}
+	return fmt.Sprintf("\"policy-%s-%d\"", uuid.UUID(r.PolicyLastOutcomeID.Bytes), r.ClaimGeneration)
+}
+
+type PolicyResumeRequest struct {
+	Mode     string `json:"mode,omitempty"`
+	Guidance string `json:"guidance,omitempty"`
+}
+
+func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest) (store.Run, error) {
+	if req.Mode != "" && req.Mode != "preserve" || len(req.Guidance) > 16000 || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
+		return store.Run{}, ErrInvalidState
+	}
+	if s.txBeginner == nil {
+		return store.Run{}, fmt.Errorf("policy resume requires transaction")
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return store.Run{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	r, err := q.GetRunByIDForUpdate(ctx, id)
+	if err != nil {
+		return r, err
+	}
+	if r.UserID != owner {
+		return store.Run{}, ErrRunNotOwned
+	}
+	if r.Status != "paused" || r.HoldReason.String != "provider_policy_refusal" || token == "" || token != PolicyHoldActionToken(r) {
+		return r, ErrStaleClaim
+	}
+	if strings.TrimSpace(req.Guidance) != "" {
+		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: id, Kind: "follow_up", Body: policyText(&req.Guidance)}); err != nil {
+			return r, err
+		}
+	}
+	if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: id, Kind: "resume", Body: policyTextNonempty("policy hold: preserve conversation")}); err != nil {
+		return r, err
+	}
+	r, err = q.ResumePolicyHold(ctx, store.ResumePolicyHoldParams{ID: id, UserID: owner, OutcomeID: r.PolicyLastOutcomeID, ClaimGeneration: r.ClaimGeneration})
+	if err != nil {
+		return r, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return r, err
+	}
+	return r, nil
+}

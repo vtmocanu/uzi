@@ -110,11 +110,12 @@ const statusPaused = "paused"
 // enabled again (or, where the CLI and web offer a per-run override, once the owner points
 // the run at another token); uzi never substitutes a credential on its own (D2).
 const (
-	holdProviderUnavailable = "provider_unavailable"
-	providerOutageCause     = "provider_outage"
-	holdBudgetExhausted     = "budget_exhausted"
-	holdCompletionBlocked   = "completion_blocked"
-	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdProviderPolicyRefusal = "provider_policy_refusal"
+	holdProviderUnavailable   = "provider_unavailable"
+	providerOutageCause       = "provider_outage"
+	holdBudgetExhausted       = "budget_exhausted"
+	holdCompletionBlocked     = "completion_blocked"
+	holdCredentialDisabled    = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls

@@ -90,6 +90,7 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // that a round-trip must not be added just for that wording — so the plain form is what a CLI
 // resume prints today. --json emits the run object for the agent contract.
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
+	var guidance string
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
 		Short: "Resume a paused or worker recovery exhausted run",
@@ -109,7 +110,7 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.ResumeRunNow(cmd.Context(), args[0])
+			run, err := c.ResumeRunNowWithOptions(cmd.Context(), args[0], uzicli.RunResumeOptions{Guidance: guidance})
 			if err != nil {
 				return err
 			}
@@ -129,6 +130,7 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+	resume.Flags().StringVar(&guidance, "guidance", "", "Guidance for the resumed policy-held conversation (maximum 16000 bytes)")
 	return resume
 }
 

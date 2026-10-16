@@ -195,6 +195,7 @@ type WorkerRecoveryDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	PolicyRefusal                                  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
 	ResetStateDigest                               string             `json:"reset_state_digest,omitempty"`
 	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
 	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
@@ -2372,4 +2373,19 @@ type RunJobFindingDTO struct {
 	URL       *string `json:"url"`
 	File      *string `json:"file"`
 	Line      *int    `json:"line"`
+}
+
+// PolicyRefusalDTO contains only typed policy metadata and preservation evidence.
+type PolicyRefusalDTO struct {
+	Count             int32      `json:"count"`
+	LastTag           *string    `json:"last_tag"`
+	LastPhase         *string    `json:"last_phase"`
+	LastCorrelationID *string    `json:"last_correlation_id"`
+	LastRefusedAt     *time.Time `json:"last_refused_at"`
+	Detail            *string    `json:"detail"`
+	Provenance        *string    `json:"provenance"`
+	Published         *bool      `json:"published"`
+	ActionIfMatch     string     `json:"action_if_match"`
+	CanResume         bool       `json:"can_resume"`
+	CanCancel         bool       `json:"can_cancel"`
 }

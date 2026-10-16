@@ -499,7 +499,7 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	}
 	// Resume retains this marker through queued/claimed until the running report.
 	// Only the paused state is still an owner hold.
-	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
+	if (*r.HoldReason == holdProviderUnavailable || *r.HoldReason == holdProviderPolicyRefusal) && r.Status != statusPaused {
 		return nil
 	}
 	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
@@ -511,6 +511,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
 		clauses = append(clauses, credentialDisabledAction(r))
+	case holdProviderPolicyRefusal:
+		clauses = append(clauses, policyHoldAction(r))
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
 	}
@@ -527,6 +529,8 @@ func holdReasonLabel(reason string) string {
 		return "completion blocked"
 	case holdCredentialDisabled:
 		return "credential disabled"
+	case holdProviderPolicyRefusal:
+		return "provider policy refusal"
 	case holdProviderUnavailable:
 		return "provider unavailable"
 	default:
@@ -584,6 +588,8 @@ func pausedHoldNotice(r apitypes.RunDTO) string {
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	case holdProviderPolicyRefusal:
+		return "held, provider policy refusal; " + policyHoldAction(r)
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
 	default:
@@ -2517,4 +2523,17 @@ func fmtUntil(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
 	}
+}
+
+func policyHoldAction(r apitypes.RunDTO) string {
+	detail := "preservation unknown"
+	if policy := r.PolicyRefusal; policy != nil {
+		detail = strOr(policy.Detail, "unknown") + "; " + strOr(policy.Provenance, "unverified")
+		if policy.Published == nil || !*policy.Published {
+			detail += "; local-only checkpoint"
+		}
+	}
+	return detail + "; resume same conversation: uzi run resume " + cellText(r.ID) +
+		" --guidance <text>; Cancel: uzi run cancel " + cellText(r.ID) +
+		"; holds retain worker/custody and can delay upgrades; if wall budget is exhausted, extend first"
 }

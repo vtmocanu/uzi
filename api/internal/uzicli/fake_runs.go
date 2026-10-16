@@ -421,3 +421,8 @@ func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, e
 	}
 	return NewRunStream(ctx, f.StreamEvents), nil
 }
+
+func (f *FakeClient) ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error) {
+	f.LastResumeGuidance = opts.Guidance
+	return f.ResumeRunNow(ctx, id)
+}

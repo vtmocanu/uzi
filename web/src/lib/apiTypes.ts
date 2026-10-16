@@ -2860,6 +2860,7 @@ export interface RunPrDescription {
 }
 
 export interface Run {
+  policy_refusal?: PolicyRefusal;
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
   repo_id: string | null;
@@ -5080,4 +5081,18 @@ export interface MilestoneResetOptions {
     expected_completion_revision: number | null;
   };
   expected_reset_state_digest: string;
+}
+
+export interface PolicyRefusal {
+ count: number;
+ last_tag: "cyberPolicy" | "misalignmentPolicyViolation" | null;
+ last_phase: "planning" | "implementation" | null;
+ last_correlation_id: string | null;
+ last_refused_at: string | null;
+ detail: "refused" | "resume_rejected" | null;
+ provenance: "verified" | "unverified" | null;
+ published: boolean | null;
+ action_if_match: string;
+ can_resume: boolean;
+ can_cancel: boolean;
 }
