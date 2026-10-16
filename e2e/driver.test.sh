@@ -49,8 +49,6 @@ db_psql() {
       printf '%s\n' "$1" >> "${FAKE_DB_LOG:-/dev/null}" ;;
     *"from runs order by"*)
       printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
-    *"trigger_source"*)
-      printf %s "${FAKE_DB_WHAT:-}" ;;
     *"group by status"*)
       printf 'FAKE_DB_COUNTS running issue 1\n' ;;
   esac
@@ -169,7 +167,6 @@ mkphase() {
 # --- results.tsv readers (exact-field via awk, so ugrep quirks never apply) ---
 TSV=""
 has_row() { awk -F'\t' -v s="$1" -v st="$2" '$1==s && $2==st{f=1} END{exit !f}' "$TSV"; }
-any_status() { awk -F'\t' -v st="$1" '$2==st{f=1} END{exit !f}' "$TSV"; }
 row_msg() { awk -F'\t' -v s="$1" -v st="$2" '$1==s && $2==st{print $4; exit}' "$TSV"; }
 
 # --- case harness ------------------------------------------------------------
@@ -184,7 +181,7 @@ begin() { cur="$1"; case_fail=0
   FAKE_READ_LOG="$TMP/reads-$2"; : > "$FAKE_READ_LOG"
   unset FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_DB_STALL FAKE_HISTORY 2>/dev/null || true
   export FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_BODY_MARK FAKE_BODY_FAIL FAKE_DB_STALL
-  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_DB_WHAT FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
+  unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
 }
 bad() { printf '  - %s\n' "$1"; case_fail=1; }
 contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
@@ -341,7 +338,7 @@ end
 # Case 6 — undeclared runs must settle; cancellation rejection is a hard
 # boundary failure and never writes SQL status.
 begin "case6a: undeclared run leaks and is cancelled" 6a
-export FAKE_DB_IDS="00000000-0000-0000-0000-000000000014" FAKE_CANCEL_CODE=200 FAKE_DB_WHAT="mr_rework via poller, status queued, age 3s"
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000014" FAKE_CANCEL_CODE=200
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
 pass "left a run behind"
 BODY
@@ -352,14 +349,14 @@ contains "$(row_msg leaky FAIL)" 00000000-0000-0000-0000-000000000014 || bad "bo
 contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000014/inputs" || bad "cancel was not attempted via the API"
 end
 
-begin "case6b: handoff-declared id is not a leak" 6b
+begin "case6b: declared handoff avoids cancellation and boundary failure" 6b
 export FAKE_DB_IDS="00000000-0000-0000-0000-000000000015" FAKE_CANCEL_CODE=200
 mkphase "$PHASES_DIR/10-held.sh" "hands a run forward" no "" RUN_B RUN_B <<'BODY'
 RUN_B=00000000-0000-0000-0000-000000000015
 pass "declared handoff RUN_B"
 BODY
 run_driver 6b
-any_status LEAK && bad "handoff id was wrongly recorded as a LEAK"
+contains "$(row_msg held PASS)" 'boundary FAIL' && bad "declared handoff wrongly caused a boundary failure"
 [ -s "$FAKE_API_LOG" ] && bad "a cancel was attempted for a declared handoff id"
 has_row held PASS || bad "held phase not PASS"
 end
