@@ -22,7 +22,7 @@ func TestParseWorkerOutboxValid(t *testing.T) {
 		t.Fatalf("len = %d, want 1", len(out))
 	}
 	e := out[0]
-	if e.RunID != r1 || e.PendingMessages != 3 || e.PendingTerminal != 0 || e.StaleRetired != 1 {
+	if e.RunID != r1 || e.PendingMessages != 3 || e.PendingTerminal != 0 || e.PendingPolicy != 0 || e.StaleRetired != 1 {
 		t.Fatalf("entry = %+v", e)
 	}
 	if e.Since.UnixMilli() != 1699999999999 {
@@ -151,5 +151,40 @@ func TestParseWorkerOutboxSanitizesBlockedReason(t *testing.T) {
 	}
 	if got := out[0].BlockedReason; got != "abc" {
 		t.Fatalf("blocked_reason = %q, want %q (control + format chars stripped)", got, "abc")
+	}
+}
+
+func TestParseWorkerOutboxPendingPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		want        int
+		valid       bool
+	}{
+		{"legacy", "", 0, true},
+		{"zero", `,"pending_policy":0`, 0, true},
+		{"policy only", `,"pending_policy":2`, 2, true},
+		{"ceiling", `,"pending_policy":1073741824`, 1073741824, true},
+		{"negative", `,"pending_policy":-1`, 0, false},
+		{"fractional", `,"pending_policy":1.5`, 0, false},
+		{"overflow", `,"pending_policy":9223372036854775808`, 0, false},
+		{"absurd", `,"pending_policy":2000000000000`, 0, false},
+		{"null", `,"pending_policy":null`, 0, false},
+		{"quoted", `,"pending_policy":"2"`, 0, false},
+		{"boolean", `,"pending_policy":true`, 0, false},
+		{"object", `,"pending_policy":{}`, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, sibling := uuid.New(), uuid.New()
+			raw := `[{"run_id":"` + id.String() + `","pending_messages":0,"pending_terminal":0,"stale_retired":0,"since":1` + tc.field + `},` +
+				`{"run_id":"` + sibling.String() + `","pending_messages":3,"pending_terminal":0,"stale_retired":0,"since":1}]`
+			out := parseWorkerOutbox(json.RawMessage(raw), uuid.New())
+			if tc.valid {
+				if len(out) != 2 || out[0].RunID != id || out[0].PendingPolicy != tc.want || out[0].PendingMessages != 0 || out[0].PendingTerminal != 0 {
+					t.Fatalf("out = %+v, want independent policy count %d and valid sibling", out, tc.want)
+				}
+			} else if len(out) != 1 || out[0].RunID != sibling || out[0].PendingMessages != 3 {
+				t.Fatalf("out = %+v, want only valid sibling", out)
+			}
+		})
 	}
 }

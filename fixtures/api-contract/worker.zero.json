@@ -48,6 +48,7 @@
   "anthropic_bind_mode": "",
   "outbox_pending_messages": null,
   "outbox_pending_terminal": null,
+  "outbox_pending_policy": null,
   "outbox_stale_retired": null,
   "outbox_blocked": null,
   "outbox_blocked_run_id": null,

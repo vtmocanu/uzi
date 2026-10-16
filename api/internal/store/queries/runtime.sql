@@ -4084,7 +4084,7 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
-  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  -- Provider availability and policy holds retain this protection through owner resume.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
@@ -4196,7 +4196,7 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- PRD #1733: a late report from the parking flight must not turn an owner-facing provider hold
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
-  -- Only provider_unavailable: every other hold reason keeps today's behaviour.
+  -- Provider availability and policy holds retain this protection through owner resume.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE));
 
 -- name: SetRunCompleted :execrows

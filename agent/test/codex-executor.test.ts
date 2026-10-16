@@ -48,6 +48,7 @@ import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.j
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 
 import { RunRunner } from "../src/runner.js";
+import { Outbox } from "../src/outbox.js";
 import { resolveRunKind } from "../src/run-kind.js";
 import { GitCache } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
@@ -470,7 +471,7 @@ function tokenUsageUpdated(
 }
 
 describe("M1 policy hold executor transport (#3068)", () => {
-  for (const kind of [undefined, "ci_fix", "job", "chat", "judge", "mr_rework"] as const) {
+  for (const kind of [undefined, "ci_fix", "job", "chat", "judge", "mr_rework", "cross_check"] as const) {
     it(`excludes unadmitted kind ${String(kind)} from refusal precedence`, async () => {
       let mode: "wall" | null = null;
       let interrupt: (() => void) | undefined;
@@ -492,6 +493,21 @@ describe("M1 policy hold executor transport (#3068)", () => {
       assert.equal(rig.transport.turnStartCount, 1);
     });
   }
+  it("excludes interactive issue roots from negotiated refusal precedence", async () => {
+    let mode: "wall" | null = null;
+    let parks = 0;
+    let interrupt: (() => void) | undefined;
+    const rig = makeRig();
+    rig.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+      turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } }).end();
+    const { ctx, emitted } = makeCtx({ kind: "issue", interactive: true, policyHoldSupported: true,
+      onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode, parkForWall: async () => { parks++; return "parked"; } });
+    ctx.emit = message => { emitted.push(message); if (message.payload.event === "provider_policy_refusal") { mode = "wall"; interrupt?.(); } };
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "interactive exclusion");
+    assert.ok(result.walled);
+    assert.equal(parks, 1);
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
   for (const phase of ["plan", "implement"] as const) {
     for (const mode of ["missing", "rejected", "substituted", "preserved", "unmarked"] as const) {
       it(`${phase} ${mode} resume authority`, async () => {
@@ -522,7 +538,8 @@ describe("M1 policy hold executor transport (#3068)", () => {
       });
     }
     for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
-      for (const control of ["none", "now", "wall", "cancel"] as const) it(`${phase} ${tag} precedence ${control}`, async () => {
+      for (const kind of ["issue", "task", "prompt", "self_improve"] as const)
+      for (const control of ["none", "now", "wall", "cancel"] as const) it(`${kind} ${phase} ${tag} precedence ${control}`, async () => {
         let interrupt: (() => void) | undefined;
         let mode: "now" | "wall" | null = null;
         let cancelled = false;
@@ -536,7 +553,7 @@ describe("M1 policy hold executor transport (#3068)", () => {
           }
           return {};
         } });
-        const { ctx, emitted } = makeCtx({ kind: "issue", policyHoldSupported: true, planApproved: phase !== "plan",
+        const { ctx, emitted } = makeCtx({ kind, policyHoldSupported: true, planApproved: phase !== "plan",
           gatePlan: async () => { throw new Error("unexpected gate"); },
           onPauseNow: cb => { interrupt = cb; }, pauseModeRequested: () => mode, cancelRequested: () => cancelled,
           parkForWall: async () => { parks++; return "parked"; }, parkForPause: async () => { parks++; return true; } });
@@ -1244,6 +1261,51 @@ describe("Codex usage-limit wall and vault precedence #2360", () => {
     assert.equal(rig.transport.turnStartCount, 1);
     assert.equal(rig.client.releaseCalls.length, 1);
   });
+});
+
+describe("M1 observed policy refusal versus vault latch", () => {
+  for (const negotiated of [false, true]) for (const cancel of [false, true]) {
+    it(`observed refusal competes with vault: negotiated=${negotiated} cancel=${cancel}`, async () => {
+      let cancelled = false, refreshes = 0;
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push({ ...turnCompleted("failed"), params: { threadId: "th-1",
+            turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: "cyberPolicy" } } } });
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      } });
+      rig.client.refreshCodex = async () => {
+        refreshes++;
+        if (cancel) cancelled = true;
+        throw vaultLocked409("refresh");
+      };
+      const { ctx, emitted } = makeCtx({ kind: "issue", policyHoldSupported: negotiated,
+        cancelRequested: () => cancelled });
+      const emit = ctx.emit;
+      ctx.emit = async message => {
+        emit(message);
+        if (message.payload.event !== "provider_policy_refusal") return;
+        // The terminal is already observed. Deliver a real intercepted app-server request
+        // while its publication is awaiting us, so the actual refresh bridge latches the vault.
+        rig.transport.deliverServerRequest({ kind: "activity", method: "account/chatgptAuthTokens/refresh",
+          requestId: 91, params: { reason: "unauthorized", previousAccountId: null } });
+        await waitFor(() => refreshes === 1, "vault refresh reached the API");
+        await tick();
+      };
+      const error = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+        3000, "observed policy/vault precedence").then(() => undefined, (e: unknown) => e);
+      assert.equal(refreshes, 1);
+      assert.equal(emitted.filter(m => m.payload.event === "provider_policy_refusal").length, 1);
+      if (cancel) {
+        assert.ok(error instanceof Error && /cancel/i.test(error.message));
+        assert.ok(!(error instanceof ProviderPolicyRefusal));
+      } else if (negotiated) assert.ok(error instanceof ProviderPolicyRefusal, String(error));
+      else assert.ok(error instanceof CodexCredentialDeferredError, String(error));
+      assert.equal(rig.transport.turnStartCount, 1);
+    });
+  }
 });
 
 describe("#2493 initial credential release", () => {
@@ -2875,6 +2937,330 @@ describe("m1 credential-free owner cancel", () => {
           fx.cleanup();
           await fs.rm(recovery.root, { recursive: true, force: true });
         }
+      }
+    });
+});
+
+
+describe("M1 composed policy guidance delivery", () => {
+  async function negotiateComposedPolicy(api: FakeApi, client: WorkerClient): Promise<void> {
+    api.setRegisterProtocolFeatures(["provider_policy_hold", "claim_generation_fence", "active_run_snapshot", "gate_revision_v1"]);
+    await client.register("m1-composed", undefined, 1, undefined, [
+      "provider_policy_hold_v1", "credential_switch_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1",
+    ]);
+    assert.equal(client.supportsPolicyHold(), true);
+  }
+
+  // Each claim owns a fresh executor/transport; the API, worker home and session store survive.
+  async function preservingFixture(atGate = false) {
+    const diagnostics = recordingLog();
+    const api = new FakeApi("m1-replay-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const homeDir = path.join(fx.dataDir, "m1-replay-home");
+    await fs.mkdir(homeDir, { recursive: true });
+    const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const prior = path.join(fx.dataDir, "prior");
+    await fs.mkdir(path.join(prior, "sessions"), { recursive: true });
+    await fs.writeFile(path.join(prior, "sessions", `rollout-${thread}.jsonl`),
+      JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
+    await CodexSessionStore.persist(prior, path.join(homeDir, "codex-session-store"));
+    const claim = makeClaim({
+      kind: "issue", interactive: false, claim_generation: 1, session_id: thread,
+      policy_hold_resume: true,
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+      ...(atGate ? { plan_approved: false, plan_source: "agent", plan_md: "persisted original plan",
+        resume_phase: "awaiting_approval", resume_plan_at: "2026-10-01T00:00:00Z" } : {}),
+    });
+    api.inclusionTracking = true;
+    api.gateRevisions = true;
+    if (atGate) {
+      api.seedGate(claim.run_id, { revision: 7,
+        presentationId: "0f5c2d4e-1111-4a2b-8c3d-000000000001",
+        payload: { plan_md: claim.plan_md ?? undefined, milestones: claim.milestones } });
+      Object.assign(claim, api.gateResumeFields(claim.run_id));
+    }
+    const client = new WorkerClient(url, "m1-replay-worker", "test", noopLog,
+      { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+    await negotiateComposedPolicy(api, client);
+    const outbox = new Outbox({ root: path.join(fx.dataDir, "outbox"), log: noopLog,
+      runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+    await outbox.init();
+    const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    const forge = fakeGitlab();
+    let finalPushes = 0;
+    git.pushBranch = async () => { finalPushes++; throw new Error("unexpected final branch push"); };
+    const owned: { runner: RunRunner; running: Promise<void> }[] = [];
+    function start(generation = 1) {
+      api.setInputClaimGeneration(claim.run_id, generation);
+      api.setOwnershipStatus(claim.run_id, "running", generation);
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/resume") return { thread: { id: thread } };
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        sessionStore: { ...rig.deps.sessionStore!, inspect: async () => "present" } };
+      const executor = new CodexExecutor(diagnostics.log, homeDir,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
+      const runner = new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+        pollMs: 5, outbox, recoveryRetryMs: 1, gitlab: forge.gitlab,
+        quiesceRun: async () => ({
+          process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      });
+      const running = runner.execute({ ...claim, claim_generation: generation });
+      owned.push({ runner, running });
+      return { rig, runner, running };
+    }
+    async function cancel(running: Promise<void>) {
+      api.appendInputs(claim.run_id, [{ id: 99, kind: "cancel" }]);
+      await withTimeout(running, 5000, "M1 owner cancellation");
+      assert.ok(api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(99)));
+    }
+    async function cleanup() {
+      // At most two claims; stop every owned runner before joining either execution.
+      for (const entry of owned) entry.runner.shutdown();
+      try {
+        await withTimeout(Promise.all(owned.map(entry => entry.running)), 5000, "M1 replay cleanup");
+        assert.equal(finalPushes, 0);
+        assert.equal(forge.calls.length, 0);
+      } finally {
+        await api.close();
+        fx.cleanup();
+      }
+    }
+    return { api, claim, thread, start, cancel, cleanup, diagnostics };
+  }
+
+  it("M1 two-claim crash after ACK replays unincluded guidance before model evidence", async () => {
+    const f = await preservingFixture();
+    try {
+      f.api.setInputs(f.claim.run_id, [{ id: 11, kind: "follow_up", body: "old ACKed unincluded guidance" }]);
+      const first = f.start();
+      await waitFor(() => first.rig.transport.turnStartCount === 1, "first claim initialized turn");
+      assert.equal(f.api.isAcked(f.claim.run_id, 11), true);
+      assert.ok(JSON.stringify(first.rig.transport.requests.find(r => r.method === "turn/start")?.params)
+        .includes("old ACKed unincluded guidance"));
+      assert.equal(f.api.inclusionCalls.length, 0);
+      first.runner.shutdown();
+      await withTimeout(first.running, 5000, "first claim actual shutdown");
+      assert.equal(f.api.states.some(row => ["failed", "completed", "cancelled"].includes(String(row.body.status))), false);
+      assert.equal(f.api.isInputIncluded(f.claim.run_id, 11), false);
+      f.api.appendInputs(f.claim.run_id, [{ id: 12, kind: "follow_up", body: "next claim narrowing guidance" }]);
+      const second = f.start(2);
+      await waitFor(() => second.rig.transport.turnStartCount === 1, "second claim first root").catch(error => {
+        throw new Error(`${String(error)}\n${f.diagnostics.lines.join("\n")}\n${JSON.stringify(f.api.states)}`);
+      });
+      const prompt = JSON.stringify(second.rig.transport.requests.find(r => r.method === "turn/start")?.params);
+      assert.ok(prompt.includes("old ACKed unincluded guidance"), prompt);
+      assert.ok(prompt.includes("next claim narrowing guidance"), prompt);
+      for (const { rig } of [first, second]) {
+        assert.equal(rig.transport.threadStartCount, 0);
+        assert.equal(rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+        assert.ok(JSON.stringify(rig.transport.requests.find(r => r.method === "thread/resume")?.params).includes(f.thread));
+      }
+      assert.equal(f.api.inclusionCalls.length, 0, "neither claim initialization proves model inclusion");
+      second.rig.transport.push(agentMessage("model processed replay", f.thread));
+      await waitFor(() => f.api.isInputIncluded(f.claim.run_id, 11) && f.api.isInputIncluded(f.claim.run_id, 12),
+        "replayed guidance inclusion");
+      assert.deepEqual(f.api.inclusionCalls, [{ runId: f.claim.run_id, ids: [11, 12], generation: 2 }]);
+      await f.cancel(second.running);
+    } finally { await f.cleanup(); }
+  });
+
+  it("M1 verified persisted gate without feedback re-presents old plan without a planning turn", async () => {
+    const f = await preservingFixture(true);
+    try {
+      const { rig, running } = f.start();
+      await waitFor(() => f.api.states.some(row => row.body.status === "awaiting_approval"), "old gate re-presentation");
+      const gates = f.api.states.filter(row => row.body.status === "awaiting_approval");
+      assert.equal(gates.length, 1);
+      assert.equal(gates[0]!.body.plan_md, "persisted original plan");
+      assert.equal(f.api.gateOf(f.claim.run_id).revision, 7);
+      assert.equal(f.api.gateOf(f.claim.run_id).presentationId, f.claim.resume_gate_presentation_id);
+      assert.equal(rig.transport.threadStartCount, 0);
+      assert.equal(rig.transport.turnStartCount, 0);
+      assert.equal(f.api.humanPlanApproved(f.claim.run_id), false);
+      await f.cancel(running);
+    } finally { await f.cleanup(); }
+  });
+
+  it("M1 verified pending revision settles feedback only after new plan gate ACK 7 to 8", async () => {
+    const f = await preservingFixture(true);
+    let release!: () => void;
+    const ack = new Promise<void>(resolve => { release = resolve; });
+    try {
+      f.api.setInputs(f.claim.run_id, [{ id: 13, kind: "revise_plan", body: "pending revision feedback",
+        gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }]);
+      f.api.afterPersistState(f.claim.run_id, body => body.status === "awaiting_approval", ack);
+      const { rig, running } = f.start();
+      await waitFor(() => rig.transport.turnStartCount === 1, "revision first root");
+      assert.ok(JSON.stringify(rig.transport.requests.find(r => r.method === "turn/start")?.params)
+        .includes("pending revision feedback"));
+      assert.equal(f.api.states.filter(row => row.body.status === "awaiting_approval").length, 0);
+      assert.equal(f.api.isApplied(f.claim.run_id, 13), false);
+      rig.transport.push(toolCall(713, "submit_plan", { plan_md: "new revised plan" }, f.thread, "tn-1", "revision-plan"));
+      await waitFor(() => rig.transport.responses.some(row => row.requestId === 713), "actual submit_plan response");
+      assert.equal(f.api.isApplied(f.claim.run_id, 13), false, "submit_plan alone cannot settle feedback");
+      rig.transport.push(turnCompleted("completed", f.thread, "tn-1"));
+      await waitFor(() => f.api.gateOf(f.claim.run_id).revision === 8, "new gate persisted");
+      assert.equal(f.api.states.filter(row => row.body.status === "awaiting_approval").at(-1)?.body.plan_md, "new revised plan");
+      assert.equal(f.api.inputReceiptCalls.some(row => row.kind === "applied" && row.ids.includes(13)), false,
+        "persisted new gate waits for its ACK before settling revision feedback");
+      release();
+      await waitFor(() => f.api.isApplied(f.claim.run_id, 13), "original revise input settled after new gate ACK");
+      assert.equal(f.api.inputReceiptCalls.filter(row => row.kind === "applied" && row.ids.includes(13)).length, 1);
+      assert.equal(f.api.humanPlanApproved(f.claim.run_id), false);
+      assert.equal(rig.transport.threadStartCount, 0);
+      assert.equal(rig.transport.turnStartCount, 1, "new gate awaits owner action before implementation");
+      await f.cancel(running);
+    } finally { release(); await f.cleanup(); }
+  });
+
+  for (const [scenario, tag] of [
+    ["delayed GET", "cyberPolicy"], ["delayed GET", "misalignmentPolicyViolation"],
+    ["delayed ACK", "cyberPolicy"], ["delayed ACK", "misalignmentPolicyViolation"],
+    ["verified revision", "cyberPolicy"], ["verified revision", "misalignmentPolicyViolation"],
+    ["failed GET", "cyberPolicy"], ["failed ACK", "cyberPolicy"], ["failed reload", "cyberPolicy"],
+    ["missing session", "cyberPolicy"], ["Docker path", "cyberPolicy"], ["provider rejected", "cyberPolicy"],
+  ] as const)
+    it(`M1 composed ${scenario} ${tag} preserves guidance and policy custody`, async () => {
+      const api = new FakeApi("m1-worker");
+      const url = await api.listen();
+      const fx = makeFixture();
+      const homeDir = path.join(fx.dataDir, "m1-home");
+      await fs.mkdir(homeDir, { recursive: true });
+      const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+      const prior = path.join(fx.dataDir, "prior");
+      await fs.mkdir(path.join(prior, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(prior, "sessions", `rollout-${thread}.jsonl`),
+        JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
+      await CodexSessionStore.persist(prior, path.join(homeDir, "codex-session-store"));
+      const revision = scenario === "verified revision";
+      const claim = makeClaim({
+        kind: "issue", interactive: false, claim_generation: 1, session_id: thread,
+        policy_hold_resume: true,
+        ...(scenario === "delayed ACK" ? { plan_approved: true, plan_md: "approved implementation plan" } : {}),
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+        ...(revision ? { plan_approved: false, plan_md: "persisted original plan",
+          resume_phase: "awaiting_approval", resume_plan_at: "2026-10-01T00:00:00Z",
+          resume_gate_revision: 7 } : {}),
+      });
+      api.inclusionTracking = true;
+      const client = new WorkerClient(url, "m1-worker", "test", noopLog,
+        { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+      await negotiateComposedPolicy(api, client);
+      api.setInputs(claim.run_id, [
+        { id: 11, kind: "follow_up", body: "old consumed guidance" },
+        { id: 12, kind: "follow_up", body: "new narrowing guidance" },
+        ...(revision ? [{ id: 13, kind: "revise_plan" as const, body: "pending revision feedback",
+          gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }] : []),
+      ]);
+      await client.ackInputs(claim.run_id, [11], 1);
+      await client.applyInputs(claim.run_id, [11], 1);
+      if (scenario === "missing session") claim.session_id = null;
+      const rejected = scenario.startsWith("failed") || ["missing session", "Docker path", "provider rejected"].includes(scenario);
+      if (scenario === "failed GET") api.failInputGets(claim.run_id, Infinity, 400);
+      if (scenario === "failed ACK") api.failInputReceipts("ack", 400);
+      if (scenario === "failed reload") api.overrideFollowUps(claim.run_id, 400, { error: "definitive reload rejection" });
+      const get = api.holdNextInputGet(claim.run_id);
+      const releaseAck = scenario === "delayed ACK" ? api.holdNextInputReceipt("ack") : () => {};
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/resume") {
+          if (scenario === "provider rejected") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
+          return { thread: { id: thread } };
+        }
+        if (c.method === "turn/start") return { turn: { id: "tn-1" } };
+        return {};
+      } });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+        sessionStore: { ...rig.deps.sessionStore!, inspect: async () => "present" } };
+      const outbox = new Outbox({ root: path.join(fx.dataDir, "outbox"), log: noopLog,
+        runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+      await outbox.init();
+      const executor = new CodexExecutor(noopLog, homeDir,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
+      const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+      const forge = fakeGitlab();
+      let finalPushes = 0;
+      git.pushBranch = async () => { finalPushes++; throw new Error("unexpected final branch push"); };
+      const running = new RunRunner(client, git, () => ({ executor, homeDir }), noopLog, 20, undefined, {
+        pollMs: 5, outbox, recoveryRetryMs: 1, gitlab: forge.gitlab,
+        dockerHost: scenario === "Docker path" ? "tcp://docker:2375" : undefined,
+        quiesceRun: async () => ({
+          process: { state: scenario === "Docker path" ? "quiescent" : "unverified", processes: [], killed: [], detail: "retain fixture" },
+          docker: { state: "not_wired", removed: [], detail: "not wired" },
+        }),
+      }).execute(claim);
+      try {
+        if (rejected) {
+          get.release();
+          await withTimeout(running, 5000, "bounded resume delivery rejection");
+          assert.equal(api.policyHoldRequests.length, 1);
+          const body = api.policyHoldRequests[0]!.body;
+          assert.equal(body.detail, "resume_rejected");
+          assert.equal(body.tag, undefined);
+          assert.equal(body.correlation_id, undefined);
+          assert.equal(rig.transport.turnStartCount, 0);
+          assert.equal(rig.transport.threadStartCount, 0);
+          assert.equal(api.inclusionCalls.length, 0);
+          assert.equal(api.states.some(row => ["failed", "completed"].includes(String(row.body.status))), false);
+          assert.equal(outbox.listPendingPolicies(claim.run_id).length, 1);
+          return;
+        }
+        await withTimeout(get.entered, 3000, "held input GET");
+        assert.equal(rig.transport.turnStartCount, 0, "GET must complete before root turn");
+        assert.equal(api.inclusionCalls.length, 0);
+        get.release();
+        if (scenario === "delayed ACK") {
+          await waitFor(() => api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(12)), "held ACK entered");
+          assert.equal(rig.transport.turnStartCount, 0, "ACK must complete before root turn");
+          assert.equal(api.inclusionCalls.length, 0);
+          releaseAck();
+        }
+        await waitFor(() => rig.transport.turnStartCount === 1, "first resumed root turn");
+        const request = rig.transport.requests.find(row => row.method === "turn/start");
+        const prompt = JSON.stringify(request?.params);
+        assert.ok(prompt.includes("old consumed guidance"), prompt);
+        assert.ok(prompt.includes("new narrowing guidance"), prompt);
+        if (revision) {
+          assert.ok(prompt.includes("pending revision feedback"), prompt);
+          assert.equal(api.states.filter(row => row.body.status === "awaiting_approval").length, 0,
+            "pending revise enters revision directly without a duplicate original gate");
+        }
+        assert.equal(rig.transport.threadStartCount, 0);
+        assert.equal(api.inclusionCalls.length, 0, "thread/turn initialization is not model evidence");
+        rig.transport.push(agentMessage("model processed guidance", thread));
+        await waitFor(() => api.isInputIncluded(claim.run_id, 11) && api.isInputIncluded(claim.run_id, 12),
+          "both guidance rows included after model evidence");
+        rig.transport.push({ ...turnCompleted("failed", thread, "tn-1"), params: {
+          threadId: thread, turn: { id: "tn-1", status: "failed", error: { codexErrorInfo: tag } },
+        } });
+        await withTimeout(running, 5000, "composed policy guidance settlement");
+        assert.equal(rig.transport.turnStartCount, 1);
+        assert.equal(api.policyHoldRequests.length, 1);
+        assert.equal(api.policyHoldRequests[0]!.body.detail, "refused");
+        assert.equal(api.policyHoldRequests[0]!.body.tag, tag);
+        assert.equal(api.policyHoldRequests[0]!.body.session_id, thread);
+        assert.equal(api.states.some(row => ["failed", "completed"].includes(String(row.body.status))), false);
+        assert.equal(outbox.listPendingPolicies(claim.run_id).length, 1);
+        assert.equal(rig.transport.requests.filter(row => row.method === "thread/resume").length, 1);
+        assert.ok(JSON.stringify(rig.transport.requests.find(row => row.method === "thread/resume")?.params).includes(thread));
+        if (revision) assert.equal(api.inputReceiptCalls.some(row => row.kind === "applied" && row.ids.includes(13)), false,
+          "refused revision feedback remains unsettled");
+      } finally {
+        get.release();
+        releaseAck();
+        rig.transport.push(turnCompleted("failed", thread, "tn-1"));
+        await withTimeout(running, 5000, "composed cleanup");
+        assert.equal(finalPushes, 0, "policy holds never publish a final branch");
+        assert.equal(forge.calls.length, 0, "policy holds never create or update an MR");
+        await api.close();
+        fx.cleanup();
       }
     });
 });

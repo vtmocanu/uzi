@@ -2535,6 +2535,8 @@ export interface Worker {
   // api-contract parity check pins the null/value shape against the recorded fixtures.
   outbox_pending_messages?: number | null;
   outbox_pending_terminal?: number | null;
+  // Retained policy outcomes, including acknowledged custody evidence; not message backlog.
+  outbox_pending_policy?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
   // The worker's own self-reported run id for the oldest blocked outcome (the entry

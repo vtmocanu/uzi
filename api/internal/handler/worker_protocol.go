@@ -749,12 +749,13 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 	out := make([]workersvc.OutboxEntry, 0, len(rawItems))
 	for _, rawItem := range rawItems {
 		var it struct {
-			RunID           string       `json:"run_id"`
-			PendingMessages *json.Number `json:"pending_messages"`
-			PendingTerminal *json.Number `json:"pending_terminal"`
-			StaleRetired    *json.Number `json:"stale_retired"`
-			BlockedReason   string       `json:"blocked_reason"`
-			Since           *json.Number `json:"since"`
+			RunID           string          `json:"run_id"`
+			PendingMessages *json.Number    `json:"pending_messages"`
+			PendingTerminal *json.Number    `json:"pending_terminal"`
+			PendingPolicy   json.RawMessage `json:"pending_policy"`
+			StaleRetired    *json.Number    `json:"stale_retired"`
+			BlockedReason   string          `json:"blocked_reason"`
+			Since           *json.Number    `json:"since"`
 		}
 		if err := json.Unmarshal(rawItem, &it); err != nil {
 			continue // wrong-typed entry → drop only this entry
@@ -771,6 +772,15 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 		if !ok {
 			continue
 		}
+		// Older workers omit pending_policy. When present it uses the same count bounds.
+		pp := 0
+		if len(it.PendingPolicy) != 0 {
+			var n *int64
+			if err := json.Unmarshal(it.PendingPolicy, &n); err != nil || n == nil || *n < 0 || *n > maxOutboxCount {
+				continue
+			}
+			pp = int(*n)
+		}
 		sr, ok := outboxCountOrDrop(it.StaleRetired)
 		if !ok {
 			continue
@@ -783,6 +793,7 @@ func parseWorkerOutbox(raw json.RawMessage, workerID uuid.UUID) []workersvc.Outb
 			RunID:           id,
 			PendingMessages: pm,
 			PendingTerminal: pt,
+			PendingPolicy:   pp,
 			StaleRetired:    sr,
 			// Sanitize (strip control + format chars, bound) rather than reject: the
 			// reason reaches a CLI column and the web, and a register/heartbeat must never

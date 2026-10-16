@@ -4,7 +4,7 @@ import type {
   ActiveSnapshotPhase,
   FinalizeResumeEntry,
 } from "./protocol.js";
-import type { PendingTerminal } from "./outbox.js";
+import type { PendingTerminal, PendingPolicy } from "./outbox.js";
 
 /** PRD #1391 Run B M4: the outbox pending-terminal lister the registry reads (a function seam so the
  *  registry never imports the concrete Outbox, keeping its unit tests light). Returns every run with
@@ -98,6 +98,7 @@ export class ActiveRunRegistry {
   constructor(
     private readonly pendingLister?: PendingTerminalLister,
     private readonly capGetter?: OutboxCapGetter,
+    private readonly policyLister?: () => PendingPolicy[],
   ) {}
 
   /** Register a run as executing at `running`, at the generation it was claimed at.
@@ -157,7 +158,7 @@ export class ActiveRunRegistry {
    * whenever anything is pending).
    */
   claimsPausedByPendingOverflow(): boolean {
-    const count = this.leasable(this.pendingOutcomes()).length;
+    const count = this.pendingOutcomes(false).length;
     if (count === 0) return false;
     return count > this.effectiveCap();
   }
@@ -180,8 +181,20 @@ export class ActiveRunRegistry {
     return cap !== undefined && Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : 0;
   }
 
-  private pendingOutcomes(): PendingTerminal[] {
-    return this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+  private pendingOutcomes(includeNotOwned = true): PendingTerminal[] {
+    const entries: PendingTerminal[] = this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
+    for (const p of this.policyLister?.() ?? []) {
+      if (p.server_settled) continue;
+      entries.push({ run_id: p.run_id, claim_generation: p.delivery.inventory_generation,
+        phase: "running", blocked: false, since: p.since });
+    }
+    // Delivery authority, never original source generation, determines the single wire slot.
+    const byRun = new Map<string, PendingTerminal>();
+    for (const p of includeNotOwned ? entries : this.leasable(entries)) {
+      const previous = byRun.get(p.run_id);
+      if (!previous || p.claim_generation > previous.claim_generation) byRun.set(p.run_id, p);
+    }
+    return [...byRun.values()];
   }
 
   /**
@@ -219,7 +232,7 @@ export class ActiveRunRegistry {
    */
   build(): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.leasable(this.pendingOutcomes());
+    const pending = this.pendingOutcomes(false);
     const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
 
     const active: ActiveSnapshotEntry[] = [];
@@ -249,9 +262,7 @@ export class ActiveRunRegistry {
       });
     }
 
-    // Issue #2009: preserve active construction, including duplicate run IDs across generations.
-    // pending_all provides coverage only if the API accepts the enclosing snapshot; duplicate
-    // active runs still reject the whole snapshot and therefore provide no pending_all coverage.
+    // pendingOutcomes deduplicates before cap selection and overflow accounting.
     return {
       snapshot_epoch: this.epoch,
       active,

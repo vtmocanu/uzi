@@ -72,6 +72,7 @@
   "anthropic_bind_mode": "x",
   "outbox_pending_messages": 1,
   "outbox_pending_terminal": 1,
+  "outbox_pending_policy": 1,
   "outbox_stale_retired": 1,
   "outbox_blocked": "x",
   "outbox_blocked_run_id": "x",

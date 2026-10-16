@@ -233,10 +233,12 @@ type WorkerDTO struct {
 	// is the oldest permanent-refusal reason across the worker's runs (never set in Run
 	// A; forward-compat for Run B's blocked terminal journals), or null when nothing is
 	// blocked.
-	OutboxPendingMessages *int    `json:"outbox_pending_messages"`
-	OutboxPendingTerminal *int    `json:"outbox_pending_terminal"`
-	OutboxStaleRetired    *int    `json:"outbox_stale_retired"`
-	OutboxBlocked         *string `json:"outbox_blocked"`
+	OutboxPendingMessages *int `json:"outbox_pending_messages"`
+	OutboxPendingTerminal *int `json:"outbox_pending_terminal"`
+	// OutboxPendingPolicy counts retained policy outcomes, including acknowledged custody evidence.
+	OutboxPendingPolicy *int    `json:"outbox_pending_policy"`
+	OutboxStaleRetired  *int    `json:"outbox_stale_retired"`
+	OutboxBlocked       *string `json:"outbox_blocked"`
 	// OutboxBlockedRunID is the worker's own self-reported run id for the oldest blocked
 	// outcome (the entry OutboxBlocked describes), shown to the worker's owner so they can
 	// tell which run is held. Untrusted worker text: never joined to a run's title or status.

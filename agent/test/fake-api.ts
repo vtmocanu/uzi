@@ -360,6 +360,10 @@ export class FakeApi {
   // claim_generation) and answers a configurable {run:{status}} at a configurable HTTP status — the
   // worker keys its park order off the RETURNED status (paused ⇒ parked), reading it off both a 200
   // and a 409. A 404/5xx httpStatus makes the client THROW (an UNDELIVERABLE park, D17).
+  readonly policyHoldRequests: Array<{ runId: string; body: Record<string, unknown> }> = [];
+  policyHoldDisposition: "applied" | "already_applied" | "resolved_newer_policy" | "terminal" | "pending" = "applied";
+  policyHoldLoseReplies = 0;
+
   readonly wallParkRequests: Array<{
     runId: string;
     body: Record<string, unknown>;
@@ -1490,6 +1494,21 @@ export class FakeApi {
     // PRD #1497 M2: the wall-park endpoint. Records the request and answers the configured
     // {run:{status}} at the configured HTTP status (200 landed / 409 refused / 404|5xx undeliverable).
     // On an undeliverable status the RunDTO is still shaped but the client throws on the non-200/409.
+    const policyMatch = /^\/api\/worker\/runs\/([^/]+)\/policy-hold$/.exec(p);
+    if (req.method === "POST" && policyMatch) {
+      const allowed = ["outcome_id", "source_generation", "claim_generation", "detail", "tag", "phase",
+        "correlation_id", "session_id", "head", "published", "checkpoint_contains_latest", "expected_gate_revision"];
+      if (Object.keys(json).some(key => !allowed.includes(key)) || typeof json.outcome_id !== "string" ||
+          !Number.isSafeInteger(json.source_generation) || !Number.isSafeInteger(json.claim_generation) ||
+          !["refused", "resume_rejected"].includes(String(json.detail)) || typeof json.head !== "string" ||
+          typeof json.published !== "boolean") return send(res, 400, { error: "invalid policy hold" });
+      this.policyHoldRequests.push({ runId: policyMatch[1]!, body: json });
+      if (this.policyHoldLoseReplies-- > 0) { req.socket.destroy(); return; }
+      const disposition = this.policyHoldDisposition;
+      return send(res, 200, { disposition, outcome_id: json.outcome_id, claim_generation: json.claim_generation,
+        status: disposition === "terminal" ? "cancelled" : disposition === "applied" ? "paused" : "claimed",
+        ...(disposition === "applied" ? { hold_reason: "provider_policy_refusal" } : {}) });
+    }
     const wallParkMatch = /^\/api\/worker\/runs\/([^/]+)\/wall-park$/.exec(p);
     if (req.method === "POST" && wallParkMatch) {
       const runId = wallParkMatch[1] as string;

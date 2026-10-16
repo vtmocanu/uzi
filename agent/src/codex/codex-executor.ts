@@ -367,7 +367,8 @@ class CodexVaultLockState {
   /** True once a refresh was deferred by a locked vault; never cleared within one run() call. */
   latched = false;
   /** True from the first plan-gate submission until approval: the server row is awaiting_approval
-   *  and can never park, so a lock seen in that window is not latched (see onVaultLocked). */
+   *  and cannot credential-park, so a vault lock there is not latched. Negotiated policy
+   *  refusal holds use their separate sink (see onVaultLocked). */
   gateOpen = false;
   /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
   activeTurnTrip: ((reason: string) => void) | undefined;
@@ -2833,6 +2834,22 @@ export class CodexExecutor implements Executor {
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
         return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
+      // Policy resumes drain the bounded delivered backlog together: older un-included input
+      // must not postpone the owner narrowing the refused request. Keep it until model evidence.
+      let policyFollowUps: Array<{ id: number; body: string }> = [];
+      const policyGuidance = (prompt: string): { prompt: string; included?: () => void } => {
+        if (ctx.policyHoldResume !== true) return { prompt };
+        for (let next = ctx.pullFollowUp?.(); next; next = ctx.pullFollowUp?.()) policyFollowUps.push(next);
+        const riding = [...policyFollowUps];
+        return {
+          prompt: riding.length ? [prompt, ...riding.flatMap(row => renderFollowUpBlock(row.body)), "", FOLLOW_UP_TRAILER].join("\n") : prompt,
+          included: riding.length ? () => {
+            const included = riding.filter(row => policyFollowUps.includes(row));
+            policyFollowUps = policyFollowUps.filter(row => !riding.includes(row));
+            for (const row of included) ctx.followUpIncluded?.(row.id);
+          } : undefined,
+        };
+      };
       const drivePlan = async (initialPrompt: string) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
@@ -2844,7 +2861,8 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
+          const guidance = policyGuidance(prompt);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", guidance.prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, false, undefined, guidance.included);
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
           // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
           if (turn.kind === "paused") throw new PauseNowSignal();
@@ -2898,10 +2916,21 @@ export class CodexExecutor implements Executor {
         // PRD #1497 M2: drive the plan turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run instead of failing it, even
         // during planning (the completion interlock cannot have attempted completion yet).
-        const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
-        if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-        if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
-        let planResult = planTurn.result;
+        const restorePolicyGate = ctx.policyHoldResume === true && ctx.resumePhase === "awaiting_approval" && !!ctx.approvedPlan?.trim();
+        let resumedVerdict = restorePolicyGate ? await ctx.takeResumedGateEvent?.(ctx.signal) : undefined;
+        if (resumedVerdict && !["revise", "reject", "cancel"].includes(resumedVerdict.kind)) {
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: "ignoring unmatched carried plan verdict" } });
+          resumedVerdict = undefined;
+        }
+        let planResult: ReducedTurnResult;
+        if (restorePolicyGate) {
+          planResult = { done: false, plan: ctx.approvedPlan!, milestones: ctx.frozenMilestones ?? undefined };
+        } else {
+          const planTurn = await drivePlan(this.planPrompt(ctx, environmentFacts));
+          if (planTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+          if (planTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: planTurn.reason } };
+          planResult = planTurn.result;
+        }
         let planMd = planResult.plan;
         if (planMd === undefined || planMd.trim().length === 0) {
           throw new TrustedExecutionRefusal("codex plan turn produced no plan");
@@ -2910,9 +2939,10 @@ export class CodexExecutor implements Executor {
         // report as rejectedMilestones, so the server rejects the candidate as a unit instead of
         // reading "no milestones" (or a narrowed list) as the completion contract.
         // Issue #1789: from the first gate submission until approval the server row is
-        // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
+        // awaiting_approval and cannot credential-park. An admitted policy hold remains possible;
+        // a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary());
+        let verdict = resumedVerdict ?? await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary());
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -3218,7 +3248,7 @@ export class CodexExecutor implements Executor {
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
         const systemFollowUp = clarificationPrompt ?? completionFollowUp;
-        if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
+        if (systemFollowUp === undefined && ctx.policyHoldResume !== true) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
         const onOwnerFirstEvent = ownerRides
           ? () => {
@@ -3244,9 +3274,10 @@ export class CodexExecutor implements Executor {
         const implementBody = systemFollowUp !== undefined
           ? withMilestoneNote(systemFollowUp, milestoneNote())
           : basePrompt;
+        const guidance = policyGuidance(implementBody);
         const turnPrompt = safetySteer
-          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
-          : implementBody;
+          ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${guidance.prompt}`
+          : guidance.prompt;
         completionFollowUp = undefined;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
@@ -3260,7 +3291,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? guidance.included ?? onOwnerFirstEvent : undefined);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -3924,8 +3955,9 @@ export class CodexExecutor implements Executor {
   /**
    * Drive ONE Codex turn, reimplementing the run-lane PRECEDENCE from sdk-executor.ts
    * driveTurn:
-   *   (a) a watchdog/cancel trip is FIRST-WINS — checked before/after the loop and in the
-   *       catch, so it beats a raw AbortError AND a later terminal;
+   *   (a) Cancel wins. An admitted root policy outcome survives watchdog/pause/wall/vault
+   *       trips. Otherwise the first watchdog/cancel trip beats a raw AbortError or
+   *       a later terminal, preserving the ordinary run-lane precedence;
    *   (b) a query/iteration/close THROW propagates (the harness's own unexpected-EOF is a
    *       `protocol` throw, NEVER a fabricated success);
    *   (c) a `turn_finished` `outcome:"failed"` is classified ONCE and materialized+thrown
@@ -4109,7 +4141,7 @@ export class CodexExecutor implements Executor {
         const pending = ctx.cancelRequested?.() ? REASON_CANCEL : this.pendingInterruption(ctx, pauseNow, wall);
         if (pending !== undefined) trip(pending);
       }
-      // (a) FIRST-WINS trip.
+      // (a) Ordinary FIRST-WINS after the admitted policy outcome check above.
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       // (c) a failed terminal is classified ONCE and materialized+thrown here.
       if (sawTerminal && terminal && terminal.outcome === "failed") {

@@ -41,11 +41,13 @@ import (
 // bounded by parseWorkerOutbox before it ever reaches here.
 type OutboxEntry struct {
 	RunID uuid.UUID
-	// PendingMessages/PendingTerminal/StaleRetired are non-negative counts (the
+	// PendingMessages/PendingTerminal/PendingPolicy/StaleRetired are non-negative counts (the
 	// handler drops any entry that is negative or absurd). In Run A PendingTerminal
 	// is always 0 (terminal journaling is Run B); StaleRetired counts frames a
 	// re-claim forced this worker to retire locally (D11).
 	PendingMessages int
+	// PendingPolicy counts retained policy outcomes, including acknowledged custody evidence.
+	PendingPolicy   int
 	PendingTerminal int
 	StaleRetired    int
 	// BlockedReason is the oldest permanent-refusal reason on this run's outbox, or
@@ -213,18 +215,19 @@ func (t *outboxTracker) runDepth(runID uuid.UUID) (entry OutboxEntry, workerID u
 // blocked is the oldest non-empty BlockedReason (or nil) and blockedRunID the run id the
 // worker reported on that same entry (or nil). Returns all zero / nil
 // when the worker has no tracked set, so a worker with no outbox shows nulls.
-func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked, blockedRunID *string) {
+func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, pendingPolicy, staleRetired int, blocked, blockedRunID *string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st, ok := t.workers[workerID]
 	if !ok {
-		return 0, 0, 0, nil, nil
+		return 0, 0, 0, 0, nil, nil
 	}
 	var oldest *OutboxEntry
 	for runID := range st.runs {
 		e := st.runs[runID]
 		pendingMessages += e.PendingMessages
 		pendingTerminal += e.PendingTerminal
+		pendingPolicy += e.PendingPolicy
 		staleRetired += e.StaleRetired
 		if e.BlockedReason != "" && (oldest == nil || e.Since.Before(oldest.Since)) {
 			cp := e
@@ -237,7 +240,7 @@ func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pe
 		id := oldest.RunID.String()
 		blockedRunID = &id
 	}
-	return pendingMessages, pendingTerminal, staleRetired, blocked, blockedRunID
+	return pendingMessages, pendingTerminal, pendingPolicy, staleRetired, blocked, blockedRunID
 }
 
 // evict drops a worker's whole set — called when the worker is deleted, so a removed

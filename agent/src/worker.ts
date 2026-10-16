@@ -16,6 +16,7 @@ import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, Sta
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
+import { resolvePendingPolicy } from "./policy-resolve.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
 import type { DiskPressureController } from "./disk-reclaim.js";
@@ -235,7 +236,7 @@ export class Worker {
         const key = finalizeKey(entry);
         if (finalizeAuthorities.has(key)) continue;
         try {
-          if (this.isFinalizeRunLive(entry.run_id)) continue;
+          if (this.isFinalizeRunLive(entry.run_id) || outbox.hasUnresolvedPolicy(entry.run_id)) continue;
           this.finalizeAttempts.set(key, ++this.finalizeAttemptSequence);
           tasks.push(this.retryPendingFinalize(outbox, entry, key, identities.get(key)!, pass.signal, deadline,
             registrationLower?.has(identities.get(key)!) ?? false));
@@ -262,7 +263,8 @@ export class Worker {
     const outbox = this.outbox;
     if (!outbox || typeof outbox.finalizeRecordIdentity !== "function") return [];
     return outbox.listPendingFinalizeGenerations(runId !== undefined)
-      .filter(entry => runId === undefined || (entry.run_id === runId && entry.claim_generation <= through!))
+      .filter(entry => !outbox.hasUnresolvedPolicy(entry.run_id) &&
+        (runId === undefined || (entry.run_id === runId && entry.claim_generation <= through!)))
       .flatMap(entry => {
         const identity = outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation);
         return identity ? [{ entry, identity }] : [];
@@ -374,6 +376,12 @@ export class Worker {
     let heartbeat = Promise.resolve();
     let rejections = Promise.resolve();
     let registered = false;
+    // Reconcile surviving policy identities before the one-shot finalize attestation
+    // is frozen. This endpoint uses the persisted bearer and server capabilities;
+    // uncertainty keeps exclusion, without manufacturing another registration.
+    await this.outbox?.refreshPolicyInventory?.(signal);
+    await this.sweepPendingPolicies(signal, undefined, true);
+    if (signal.aborted) return;
     await this.registerWithRetry(signal, (workerId) => {
       if (registered) return;
       registered = true;
@@ -420,6 +428,7 @@ export class Worker {
     // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
     // background above. The heartbeat promise is created once and awaited alongside the claim loops.
     await this.resolveBootTerminals(signal);
+    await this.sweepPendingPolicies(signal, undefined, true);
     try {
       await this.crossCheckRunner?.cleanupBootCodeSnapshots?.(bootCodeSnapshots, signal);
     } catch {
@@ -520,9 +529,11 @@ export class Worker {
    */
   private replaySend(runId: string, gen: number): SendTerminalState {
     return async (body: StateRequest, sig?: AbortSignal): Promise<StateAck> => {
+      const policy = typeof this.runner.preparePolicyTerminalAck === "function"
+        ? await this.runner.preparePolicyTerminalAck(runId, gen, body) : undefined;
       const ack = await this.client.reportState(runId, { ...body, claim_generation: gen }, sig);
       try {
-        await this.runner.observeSettlementTerminalAck(runId, gen, body, ack);
+        await this.runner.observeSettlementTerminalAck(runId, gen, body, ack, policy);
       } catch (err) {
         this.log.warn("recovery settlement: replayed terminal ACK not applied", { run_id: runId, error: errMessage(err) });
       }
@@ -678,7 +689,8 @@ export class Worker {
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. Freeze each original identity before the request, including existing lower records.
     // Only exact offered identities gain lifetime handoff; captured lower originals gain batch-only authority.
-    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    const offeredFinalizes = (this.outbox?.listPendingFinalizes() ?? [])
+      .filter(entry => !this.outbox?.hasUnresolvedPolicy(entry.run_id));
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
     const frozenFinalizes = this.captureFinalizes().filter(({ entry }) =>
@@ -969,6 +981,9 @@ export class Worker {
         void this.sweepPendingTerminals(signal).catch((err) => {
           this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
         });
+        void this.sweepPendingPolicies(signal).catch(() => {
+          this.log.warn("policy hold sweep interrupted; evidence retained");
+        });
         void this.sweepPendingFinalizes(signal).catch((err) => {
           this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
@@ -988,16 +1003,33 @@ export class Worker {
     }
   }
 
-  /** PRD #1391 M5: assemble the per-run outbox depth for the heartbeat, mapping every
-   *  run with pending outbox depth to the wire {@link OutboxHeartbeatEntry} shape
-   *  (`pending_terminal` counts the run's journaled terminals; a terminal-only run, with no message
-   *  records, is listed too, issue #1512). Undefined when there is no outbox or
-   *  nothing pending, so the heartbeat wire stays byte-identical. */
+  /** Each pass visits the captured records once; HTTP attempts have client deadlines. A failure
+   * leaves siblings eligible, and the existing heartbeat interval spaces subsequent passes.
+   * Live runners own delivery and phase transitions; background ACKs must not race that ownership. */
+  private async sweepPendingPolicies(signal?: AbortSignal, runId?: string, waitForInFlight = false): Promise<void> {
+    if (!this.outbox) return;
+    for (const p of this.outbox.listPendingPolicies(runId)) {
+      if (signal?.aborted) return;
+      if (this.activeRuns?.has(p.run_id) || this.admittedRunIds.has(p.run_id) ||
+          (typeof this.runner.isExecuting === "function" && this.runner.isExecuting(p.run_id))) continue;
+      if (!p.server_settled) {
+        await resolvePendingPolicy({ outbox: this.outbox, client: this.client, log: this.log },
+          { runId: p.run_id, sourceGeneration: p.outcome.source_generation, signal, waitForInFlight });
+      }
+      if (typeof this.runner.retirePolicyReport === "function") {
+        await this.runner.retirePolicyReport(p.run_id, p.outcome.source_generation, { signal });
+      }
+    }
+  }
+
+  /** Physical policy evidence is counted separately, including ACKed records retained for custody.
+   * Empty policy counts are omitted to preserve the ordinary heartbeat wire. */
   private outboxEntries(): OutboxHeartbeatEntry[] | undefined {
     if (!this.outbox) return undefined;
     const entries: OutboxHeartbeatEntry[] = [];
     const runIds = new Set(this.outbox.runsWithPending());
     for (const t of this.outbox.listPendingTerminals()) runIds.add(t.run_id);
+    for (const p of this.outbox.listPendingPolicies()) runIds.add(p.run_id);
     for (const runId of runIds) {
       const d = this.outbox.depthFor(runId);
       if (!d) continue;
@@ -1005,6 +1037,7 @@ export class Worker {
         run_id: d.runId,
         pending_messages: d.pendingMessages,
         pending_terminal: d.pendingTerminal,
+        ...(d.pendingPolicy ? { pending_policy: d.pendingPolicy } : {}),
         stale_retired: d.staleRetired,
         since: d.since,
         ...(d.blockedReason ? { blocked_reason: d.blockedReason } : {}),
@@ -1044,7 +1077,7 @@ export class Worker {
     if (!this.outbox) return undefined;
     // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
     // finalize_resume), even with no pending terminal journal.
-    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    if (this.outbox.listPendingTerminals().length === 0 && this.outbox.listPendingPolicies().length === 0 && finalizes.length === 0) return undefined;
     return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 
@@ -1075,6 +1108,7 @@ export class Worker {
             // that deferred any pending terminal journal no longer holds — re-resolve it here so a
             // finish-during-outage outcome lands without waiting for a restart / re-claim (PRD #1391).
             await this.resolveRunTerminal(runId, signal);
+            await this.sweepPendingPolicies(signal, runId);
           }
         } catch (err) {
           this.log.warn("outbox drain failed for a run; will retry next heartbeat", {

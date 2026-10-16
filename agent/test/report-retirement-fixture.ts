@@ -31,9 +31,11 @@ export async function reportRetirementFixture(t: TestContext, options: {
   priorPendingArchiveFinal?: boolean;
   priorArchiveWithoutFinal?: boolean;
   coverPriorFinal?: boolean;
+  policyCustody?: boolean;
+  policyLegacyCurrent?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
-  const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
+  const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: options.policyLegacyCurrent !== true });
   const token = "report-retirement-journal-key";
   const captureId = "00000000-0000-4000-8000-000000002652";
   const holdId = "33333333-3333-4333-8333-333333333333";
@@ -45,6 +47,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const capture = { mode: "healthy" as "healthy" | "throw" | "expired" | "unbound" | "checksum" };
   const originalFetch = globalThis.fetch;
   let workerId = "";
+  const policyCustody = { openGeneration: undefined as number | undefined, unknown: false, generations: [] as number[] };
   api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report"]);
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
@@ -52,7 +55,20 @@ export async function reportRetirementFixture(t: TestContext, options: {
         url.pathname !== `/api/worker/runs/${claim.run_id}/terminal-rejection-custody`) {
       return originalFetch(input, init);
     }
-    assert.equal(Number(url.searchParams.get("generation")), generation);
+    const requestedGeneration = Number(url.searchParams.get("generation"));
+    if (options.policyCustody) {
+      assert.ok(Number.isSafeInteger(requestedGeneration) && requestedGeneration > 0);
+      policyCustody.generations.push(requestedGeneration);
+      const open = policyCustody.openGeneration === requestedGeneration;
+      return Response.json({
+        run_id: claim.run_id, worker_id: workerId, generation: requestedGeneration,
+        exact_holds: policyCustody.unknown ? [] : [{ id: holdId, state: open ? "open" : "released" }],
+        sibling_holds: [], exact_count: policyCustody.unknown ? 0 : 1, sibling_count: 0,
+        complete: true, exact_complete: true, sibling_complete: true,
+        outcome: policyCustody.unknown ? "unknown" : open ? "retained" : "settled",
+      });
+    }
+    assert.equal(requestedGeneration, generation);
     assert.ok(workerId);
     return Response.json({
       run_id: claim.run_id, worker_id: workerId, generation,
@@ -72,7 +88,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     const beforePriorFinal = options.priorArchiveWithoutFinal && ownership.generation === 1 &&
       captures.has("00000000-0000-4000-8000-000000002651");
     return { status: ownership.mode === "unknown" || beforePriorFinal ? "unknown" : status,
-      claim_generation: ownership.generation, inventory_guarded: true };
+      claim_generation: ownership.generation, inventory_guarded: options.policyLegacyCurrent !== true };
   };
   const captures = new Map<string, { manifest: RecoveryUploadManifest; bytes: Buffer }>();
   client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased || (options.priorPendingArchiveFinal && ownership.generation < generation) ? [] : [{
@@ -318,6 +334,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
       };
     },
   });
+  // Keep the ordinary terminal control pending independently of the policy proof.
+  if (options.policyLegacyCurrent) r.recoveryInventoryPending = async () => true;
   const flight = r.execute(claim);
   // Every test has bounded node-test timeout; cleanup releases both event barriers on assertion failure.
   t.after(async () => { leave.resolve(); await flight; });
@@ -570,6 +588,6 @@ export async function reportRetirementFixture(t: TestContext, options: {
             docker: { state: "not_wired", removed: [], detail: "" } };
         } }) };
   };
-  return { historyEvents, predecessorH1, predecessorH2, priorFinal, predecessorClone, successorAdmission, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  return { policyCustody, historyEvents, predecessorH1, predecessorH2, priorFinal, predecessorClone, successorAdmission, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }

@@ -61,7 +61,8 @@ import { constants as fsConstants, type Dir } from "node:fs";
 import path from "node:path";
 
 import type { Logger } from "./log.js";
-import type { TerminalRejectionCustodyResponse, OutgoingMessage } from "./protocol.js";
+import type { TerminalRejectionCustodyResponse, OutgoingMessage, PolicyHoldRequest, ImmutablePolicyOutcome } from "./protocol.js";
+import { validPolicyCorrelation, isPolicyRefusalTag } from "./provider-policy-refusal.js";
 import type { DiskFullVerdict } from "./disk-full.js";
 
 /** The worker-local HMAC secret is exactly this many random bytes. */
@@ -107,6 +108,13 @@ const FINALIZE_RESUME_MAX_ENTRIES = 256;
 /** Issue #1742: the finalize-pending record's own domain label, so its MAC can never be replayed as
  *  a terminal journal (or any other kind) under the same worker-local key. */
 const MAC_DOMAIN_FINALIZE = "uzi.outbox.finalize.v1";
+const MAC_DOMAIN_POLICY = "uzi.outbox.policy.v1";
+const POLICY_FILE_PREFIX = "policy-";
+// Independent control admission: never charged to the evictable segment map.
+// 256 records, at most 16 KiB each, across this worker. Unknown files consume slots too.
+const POLICY_MAX_BYTES = 16 * 1024;
+const POLICY_MAX_RECORDS = 256;
+const POLICY_MAX_CONTROL_BYTES = POLICY_MAX_BYTES * POLICY_MAX_RECORDS;
 
 const MANIFEST_FILE = "manifest.json";
 const KEY_FILE = ".key";
@@ -267,6 +275,54 @@ interface RunState {
   terminals: Map<number, TerminalMeta>;
   /** Issue #1742: the run's pending finalize-pending records keyed by claim generation. */
   finalizes: Map<number, FinalizeMeta>;
+  policies: Map<number, PolicyMeta>;
+  policyProtection: boolean;
+}
+
+export interface PendingPolicy {
+  run_id: string;
+  outcome: ImmutablePolicyOutcome;
+  delivery: Readonly<{ claim_generation: number; inventory_generation: number }>;
+  since: number;
+  server_settled?: true;
+}
+
+interface PolicyRecord {
+  version: 1;
+  run_id: string;
+  outcome: ImmutablePolicyOutcome;
+  delivery: { claim_generation: number; inventory_generation: number };
+  since: number;
+}
+
+interface PolicyMeta {
+  record: PolicyRecord;
+  payload: string;
+  lifetime: string;
+  fileVersion: string;
+  identity: Readonly<object>;
+  serverSettled?: true;
+}
+
+type PolicyBindingResult =
+  | { bound: true; winner: PendingPolicy; context: ReportRetirementContext }
+  | { bound: false; reason: string };
+
+export type PolicyJournalResult =
+  | { journaled: true; written: boolean; winner: PendingPolicy; context: ReportRetirementContext }
+  | { journaled: false; reason: string };
+
+/** Proof covers every original-through-current inventory generation. No source is deleted here.
+ * The coordinator obtains fresh source/custody proof outside O, under its existing lock order. */
+export interface PolicyRetirementContext extends ReportRetirementContext {
+  freshProof?: (observation: PendingPolicy, budget: { signal: AbortSignal; deadline: number }) => Promise<{
+    outcome_id: string;
+    source_generation: number;
+    claim_generation: number;
+    inventory_complete: boolean;
+    sources_safe: boolean;
+    custody_settled: boolean;
+  } | undefined>;
 }
 
 /** Issue #1742: in-memory metadata for one finalize-pending record. It records only that the
@@ -307,6 +363,7 @@ export interface OutboxDepth {
   runId: string;
   pendingMessages: number;
   pendingTerminal: number;
+  pendingPolicy?: number;
   staleRetired: number;
   blockedReason?: string;
   since: number;
@@ -317,7 +374,7 @@ export interface OutboxDepth {
  *  seam that throws `ENOSPC` to exercise the reserve path. */
 export type RawWriteSeam = (
   write: () => Promise<void>,
-  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" },
+  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" | "policy" },
 ) => Promise<void>;
 
 /** Content-free physical evidence. Unknown files never enter the pending inventory. */
@@ -446,6 +503,12 @@ export class Outbox {
   /** The configured `.reserve` byte size (Run B's terminal-sized reserve, or the
    *  Run A default when no `reserveBytes` was supplied). */
   private readonly reserveBytes: number;
+  private policyReserveEnabled = false;
+  private get reserveTargetBytes(): number {
+    // Separate policy install/rebind headroom; releasing it never spends terminal fallback capacity.
+    return this.reserveBytes + (this.policyReserveEnabled ? 2 * POLICY_MAX_BYTES + OUTBOX_RANGE_RESERVE_BYTES : 0);
+  }
+  private policyAdmissionTail: Promise<unknown> = Promise.resolve();
   private readonly terminalReadMaxBytes: number;
   private terminalScanRoot?: Dir;
   private terminalScanRun?: { id: string; dir: Dir };
@@ -562,6 +625,10 @@ export class Outbox {
     for (const runId of runDirs) {
       try {
         for (const entry of await fs.readdir(this.runDir(runId), { withFileTypes: true })) {
+          if (entry.name.startsWith(POLICY_FILE_PREFIX)) {
+            hasRecords = true;
+            this.ensureInMemoryRun(runId, this.now()).policyProtection = true;
+          }
           if (parseTerminalFileName(entry.name) === undefined) continue;
           if (entry.isSymbolicLink()) symlinkJournals++;
           else if (entry.isFile()) physicalJournals++;
@@ -595,6 +662,7 @@ export class Outbox {
       authenticated += result.authenticated;
       rejected += result.rejected;
       await this.loadFinalizes(runId);
+      await this.loadPolicies(runId);
     }
 
     this.log.info("outbox terminal journal load", {
@@ -701,7 +769,7 @@ export class Outbox {
         recordBytes.set(rec.file, 0); // referenced file missing/gone; accounts as 0
       }
     }
-    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map() });
+    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map(), policies: new Map(), policyProtection: false });
     if (manifest.spilledUnclean) this.uncleanAtInit.push(runId);
   }
 
@@ -768,6 +836,312 @@ export class Outbox {
       meta.lifetime = this.authenticatedLifetimes.get(parsed!);
       this.ensureInMemoryRun(runId, meta.since).finalizes.set(meta.claimGeneration, meta);
     }
+  }
+
+  // ── nonterminal policy control records ───────────────────────────────────────
+
+  /** One finite physical scan per admission. Errors, aliases, exhaustion and unknown
+   * records retain custody and reject new admission; sibling records are never evicted. */
+  private async policyCapacityAvailable(extraBytes: number): Promise<boolean> {
+    let count = 0;
+    let bytes = 0;
+    let scanned = 0;
+    try {
+      const root = await fs.opendir(this.root);
+      try {
+        for await (const run of root) {
+          if (++scanned > 16384) return false;
+          if (run.name.startsWith(".")) continue;
+          if (!run.isDirectory() || run.isSymbolicLink() || !await this.terminalDirectorySafe(run.name)) return false;
+          const dir = await fs.opendir(this.runDir(run.name));
+          for await (const entry of dir) {
+            if (++scanned > 16384) return false;
+            if (!entry.name.startsWith(POLICY_FILE_PREFIX)) continue;
+            const stat = await fs.lstat(path.join(this.runDir(run.name), entry.name));
+            if (!stat.isFile() || stat.isSymbolicLink() || stat.size > POLICY_MAX_BYTES) return false;
+            count++;
+            bytes += stat.size;
+            if (count >= POLICY_MAX_RECORDS || bytes + extraBytes > POLICY_MAX_CONTROL_BYTES) return false;
+          }
+        }
+      } finally { /* for-await closes directory handles, including early returns */ }
+      return count < POLICY_MAX_RECORDS && bytes + extraBytes <= POLICY_MAX_CONTROL_BYTES;
+    } catch { return false; }
+  }
+
+  private async policyBlocksFinalize(runId: string, budget?: ProofBudget): Promise<boolean> {
+    // Finalize bookkeeping can retire independently of retained source evidence, but only
+    // after a complete reauthentication has ruled out unknown or replaced policy controls.
+    checkProofBudget(budget);
+    await this.loadPolicies(runId, budget);
+    checkProofBudget(budget);
+    return this.hasUnresolvedPolicy(runId);
+  }
+
+  /** One scan of at most 16384 entries; failed authentication protects the run
+   * while sibling entries continue. Directory failure or exhaustion retains protection. */
+  private async loadPolicies(runId: string, budget?: ProofBudget): Promise<void> {
+    if (!this.validRunId(runId)) return;
+    let protection = false;
+    const authenticated = new Set<number>();
+    try {
+      if (!await this.terminalDirectorySafe(runId)) throw new Error("unsafe policy directory");
+      const dir = await fs.opendir(this.runDir(runId));
+      let scanned = 0;
+      for await (const entry of dir) {
+        checkProofBudget(budget);
+        if (++scanned > 16384) {
+          protection = true;
+          break;
+        }
+        if (!entry.name.startsWith(POLICY_FILE_PREFIX)) continue;
+        this.policyReserveEnabled = true;
+        this.ensureInMemoryRun(runId, this.now());
+        const generation = parsePolicyFileName(entry.name);
+        if (generation === undefined || !await this.authenticatePolicy(runId, generation, budget)) protection = true;
+        else authenticated.add(generation);
+      }
+      if (!await this.terminalDirectorySafe(runId)) protection = true;
+    } catch { protection = true; }
+    // Publish absence of unknown controls only after the complete anchored scan.
+    const run = this.runs.get(runId);
+    if (run) run.policyProtection = protection || [...run.policies.keys()].some(source => !authenticated.has(source));
+    else if (protection) this.ensureInMemoryRun(runId, this.now()).policyProtection = true;
+  }
+
+  /** Reauthentication is the only route to an adopted winner or a fresh opaque identity. */
+  private async authenticatePolicy(runId: string, source: number, budget?: ProofBudget): Promise<PolicyMeta | undefined> {
+    const rs = this.runs.get(runId);
+    const previous = rs?.policies.get(source);
+    if (this.disabled || !this.validRunId(runId) || !positiveSafe(source)) return undefined;
+    const fail = async () => {
+      if (previous) {
+        previous.serverSettled = undefined;
+        previous.identity = Object.freeze({});
+      }
+      // Keep the last authenticated logical evidence until an authorized exact unlink.
+      // A later unrelated scan or successful write cannot explain its disappearance.
+      // A failed read is not absence. Probe only through the anchored filesystem
+      // check, and preserve protection for both stale metadata and unknown evidence.
+      if (previous || !await this.terminalPositivelyAbsent(runId, policyFileName(source))) {
+        this.ensureInMemoryRun(runId, this.now()).policyProtection = true;
+      }
+      return undefined;
+    };
+    try {
+      if (!await this.terminalDirectorySafe(runId, budget)) return fail();
+      const parsed = await this.readAuthed(path.join(this.runDir(runId), policyFileName(source)), MAC_DOMAIN_POLICY, budget);
+      const record = parsed && coercePolicyRecord(parsed, runId, source);
+      const lifetime = parsed && this.authenticatedLifetimes.get(parsed);
+      const version = parsed && this.authenticatedFileVersions.get(parsed);
+      if (!record || !lifetime || !version) return fail();
+      // Also attest adoption after an earlier install/rename whose fsync failed.
+      await this.fsyncDir(this.runDir(runId), true);
+      if (!await this.terminalDirectorySafe(runId, budget) ||
+          !await this.installedLifetimeMatches(path.join(this.runDir(runId), policyFileName(source)), lifetime, budget, version)) return fail();
+      checkProofBudget(budget);
+      const payload = canonicalJson(record);
+      if (previous && previous.payload === payload && previous.lifetime === lifetime && previous.fileVersion === version) return previous;
+      let count = 0;
+      for (const run of this.runs.values()) count += run.policies.size;
+      if (!previous && count >= POLICY_MAX_RECORDS) return fail();
+      const meta: PolicyMeta = { record, payload, lifetime, fileVersion: version, identity: Object.freeze({}) };
+      const run = this.ensureInMemoryRun(runId, record.since);
+      run.policies.set(source, meta);
+      return meta;
+    } catch { return fail(); }
+  }
+
+  private pendingPolicy(meta: PolicyMeta): PendingPolicy {
+    return {
+      run_id: meta.record.run_id, outcome: Object.freeze({ ...meta.record.outcome }),
+      delivery: Object.freeze({ ...meta.record.delivery }), since: meta.record.since,
+      ...(meta.serverSettled ? { server_settled: true as const } : {}),
+    };
+  }
+
+  /** A failure supplies no send request. Different UUIDs return the actual authenticated winner. */
+  async journalPolicy(runId: string, outcome: ImmutablePolicyOutcome): Promise<PolicyJournalResult> {
+    if (!this.writable() || !this.validRunId(runId) || !validPolicyOutcome(outcome)) return { journaled: false, reason: "invalid_or_disabled" };
+    // Snapshot caller-owned data before waiting for either lock.
+    const record: PolicyRecord = { version: 1, run_id: runId, outcome: { ...outcome },
+      delivery: { claim_generation: outcome.source_generation, inventory_generation: outcome.source_generation }, since: this.now() };
+    const operation = this.policyAdmissionTail.then(() => this.withRunLock(runId, async (): Promise<PolicyJournalResult> => {
+      try {
+        const source = record.outcome.source_generation;
+        const dst = path.join(this.runDir(runId), policyFileName(source));
+        const serialized = this.seal(MAC_DOMAIN_POLICY, record);
+        if (Buffer.byteLength(serialized) > POLICY_MAX_BYTES) return { journaled: false, reason: "record_too_large" };
+        const existing = await this.authenticatePolicy(runId, source);
+        if (existing) {
+          await this.fsyncDir(this.runDir(runId), true);
+          await this.loadPolicies(runId);
+          return { journaled: true, written: false, winner: this.pendingPolicy(existing), context: { expectedIdentity: existing.identity } };
+        }
+        if (!await this.terminalPositivelyAbsent(runId, policyFileName(source))) {
+          this.ensureInMemoryRun(runId, record.since).policyProtection = true;
+          return { journaled: false, reason: "winner_unavailable" };
+        }
+        if (!await this.policyCapacityAvailable(Buffer.byteLength(serialized))) return { journaled: false, reason: "control_capacity" };
+        this.policyReserveEnabled = true;
+        await this.ensureReserve();
+        if ((await fs.lstat(this.reservePath())).size < this.reserveTargetBytes) return { journaled: false, reason: "reserve_unavailable" };
+        this.ensureInMemoryRun(runId, record.since);
+        const adopted = await this.withReserveOnEnospc(async () => {
+          await this.rawWrite(() => fs.mkdir(this.runDir(runId), { recursive: true, mode: 0o700 }).then(() => undefined),
+            { path: this.runDir(runId), kind: "policy" });
+          if (!await this.terminalDirectorySafe(runId)) throw new Error("unsafe policy directory");
+          await this.fsyncDir(this.root, true);
+          return this.installExclusive(dst, serialized, "policy");
+        }, this.reserveBytes);
+        const winner = await this.authenticatePolicy(runId, source);
+        if (!winner) return { journaled: false, reason: "winner_unavailable" };
+        await this.loadPolicies(runId);
+        return { journaled: true, written: !adopted, winner: this.pendingPolicy(winner), context: { expectedIdentity: winner.identity } };
+      } catch {
+        this.ensureInMemoryRun(runId, record.since).policyProtection = true;
+        return { journaled: false, reason: "not_durable" };
+      }
+    }));
+    this.policyAdmissionTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  listPendingPolicies(runId?: string): PendingPolicy[] {
+    const entries: PendingPolicy[] = [];
+    for (const rs of this.runs.values()) {
+      if (runId !== undefined && rs.runId !== runId) continue;
+      for (const meta of rs.policies.values()) entries.push(this.pendingPolicy(meta));
+    }
+    return entries.sort((a, b) => a.run_id.localeCompare(b.run_id) || a.outcome.source_generation - b.outcome.source_generation);
+  }
+
+  hasPendingPolicy(runId: string): boolean {
+    const rs = this.runs.get(runId);
+    return !!rs && (rs.policyProtection || rs.policies.size > 0);
+  }
+
+  /** Boot refresh precedes the one-shot finalize snapshot. A complete scan is needed even
+   * when all cached policies were ACKed: unknown physical siblings still block admission. */
+  async refreshPolicyInventory(signal?: AbortSignal): Promise<void> {
+    // oxlint-disable-next-line unicorn/no-useless-spread -- Freeze a bounded set across awaited filesystem scans.
+    for (const runId of [...this.runs.keys()]) {
+      signal?.throwIfAborted();
+      await this.withRunLock(runId, () => this.loadPolicies(runId, { signal }), signal);
+    }
+  }
+
+  /** Finalize-only admission: settlement grants no source deletion authority. */
+  hasUnresolvedPolicy(runId: string): boolean {
+    const rs = this.runs.get(runId);
+    return !!rs && (rs.policyProtection || [...rs.policies.values()].some(p => p.serverSettled !== true));
+  }
+
+  /** Inclusive source-through-current interval; server settlement never removes physical protection. */
+  hasPendingPolicyForGeneration(runId: string, generation: number): boolean {
+    const rs = this.runs.get(runId);
+    if (!rs) return false;
+    if (rs.policyProtection) return true;
+    return [...rs.policies.values()].some(p => p.record.outcome.source_generation <= generation && generation <= p.record.delivery.claim_generation);
+  }
+
+  async bindPolicyDelivery(runId: string, source: number, current: number, expectedIdentity: Readonly<object>): Promise<PolicyBindingResult> {
+    if (this.disabled || !positiveSafe(current) || !positiveSafe(source) || source > current) return { bound: false, reason: "invalid_or_disabled" };
+    return this.withRunLock<PolicyBindingResult>(runId, async () => {
+      const meta = await this.authenticatePolicy(runId, source);
+      if (!meta || !expectedIdentity || meta.identity !== expectedIdentity || current < meta.record.delivery.claim_generation) return { bound: false, reason: "identity_or_generation" };
+      try {
+        if (current === meta.record.delivery.claim_generation) {
+          await this.fsyncDir(this.runDir(runId), true);
+          await this.loadPolicies(runId);
+          return { bound: true, winner: this.pendingPolicy(meta), context: { expectedIdentity: meta.identity } };
+        }
+        const next: PolicyRecord = { ...meta.record, delivery: { claim_generation: current, inventory_generation: current } };
+        const serialized = this.seal(MAC_DOMAIN_POLICY, next);
+        if (Buffer.byteLength(serialized) > POLICY_MAX_BYTES) return { bound: false, reason: "record_too_large" };
+        // Invalidate old observations before IO, including an uncertain rename/fsync result.
+        this.runs.get(runId)!.policyProtection = true;
+        meta.serverSettled = undefined;
+        meta.identity = Object.freeze({});
+        await this.withReserveOnEnospc(() => this.writeFileAtomic(path.join(this.runDir(runId), policyFileName(source)), serialized, "policy", { runId, lifetime: meta.lifetime, version: meta.fileVersion }), this.reserveBytes);
+        const winner = await this.authenticatePolicy(runId, source);
+        if (!winner) return { bound: false, reason: "winner_unavailable" };
+        await this.loadPolicies(runId);
+        return { bound: true, winner: this.pendingPolicy(winner), context: { expectedIdentity: winner.identity } };
+      } catch {
+        this.runs.get(runId)!.policyProtection = true;
+        return { bound: false, reason: "not_durable" };
+      }
+    });
+  }
+
+  async readPolicyForRetirement(runId: string, source: number, context: Omit<ReportRetirementContext, "expectedIdentity"> = {}): Promise<
+    { request: PolicyHoldRequest; policy: PendingPolicy; lifetime: string; context: ReportRetirementContext } | undefined
+  > {
+    if (this.disabled) return undefined;
+    return this.withRunLock(runId, async () => {
+      const meta = await this.authenticatePolicy(runId, source, context);
+      if (!meta || !policyContextEligible(context)) return undefined;
+      return { request: { ...meta.record.outcome, claim_generation: meta.record.delivery.claim_generation },
+        policy: this.pendingPolicy(meta), lifetime: meta.lifetime, context: { ...context, expectedIdentity: meta.identity } };
+    }, context.signal);
+  }
+
+  async markPolicyServerSettled(runId: string, source: number, context?: ReportRetirementContext): Promise<void> {
+    if (this.disabled || !context?.expectedIdentity) return;
+    await this.withRunLock(runId, async () => {
+      const meta = await this.authenticatePolicy(runId, source, context);
+      if (meta && meta.identity === context.expectedIdentity && policyContextEligible(context)) meta.serverSettled = true;
+    }, context.signal);
+  }
+
+  /** Proof is obtained once outside O; under O reauthenticate the complete exact observation
+   * and recheck eligibility after every awaited filesystem proof. Only this report is unlinked. */
+  async retirePolicyIfEligible(runId: string, source: number, context: PolicyRetirementContext): Promise<boolean> {
+    if (this.disabled || !context.expectedIdentity || !context.freshProof || !context.eligible || !policyContextEligible(context)) return false;
+    try {
+      const observation = await this.readPolicyForRetirement(runId, source, context);
+      if (!observation || observation.policy.server_settled !== true ||
+          observation.context.expectedIdentity !== context.expectedIdentity || !policyContextEligible(context)) return false;
+      // One proof attempt, bounded to the caller's remaining budget or 30 seconds
+      // (one second by default). A failed proof blocks only this report's retirement.
+      const deadline = Math.min(context.deadline ?? Date.now() + 1_000, Date.now() + 30_000);
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let abort: (() => void) | undefined;
+      let proof: Awaited<ReturnType<NonNullable<PolicyRetirementContext["freshProof"]>>>;
+      try {
+        proof = await Promise.race([
+          context.freshProof(observation.policy, { signal: controller.signal, deadline }),
+          new Promise<never>((_, reject) => {
+            abort = () => { controller.abort(); reject(new Error("policy proof cancelled")); };
+            context.signal?.addEventListener("abort", abort, { once: true });
+            timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+            if (context.signal?.aborted) abort();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (abort) context.signal?.removeEventListener("abort", abort);
+        controller.abort();
+      }
+      if (!proof || proof.outcome_id !== observation.request.outcome_id || proof.source_generation !== source ||
+          proof.claim_generation !== observation.request.claim_generation || proof.inventory_complete !== true ||
+          proof.sources_safe !== true || proof.custody_settled !== true || !policyContextEligible(context)) return false;
+      return await this.withRunLock(runId, async () => {
+        const meta = await this.authenticatePolicy(runId, source, context);
+        if (!meta || meta.serverSettled !== true || meta.identity !== context.expectedIdentity || !policyContextEligible(context)) return false;
+        const file = path.join(this.runDir(runId), policyFileName(source));
+        if (!await this.installedLifetimeMatches(file, meta.lifetime, context, meta.fileVersion) || !policyContextEligible(context)) return false;
+        // Keep conservative physical protection before unlink, including fsync failure.
+        this.runs.get(runId)!.policyProtection = true;
+        await fs.unlink(file);
+        this.runs.get(runId)!.policies.delete(source);
+        await this.fsyncDir(this.runDir(runId), true);
+        await this.loadPolicies(runId);
+        return true;
+      }, context.signal);
+    } catch { return false; }
   }
 
   // ── writes ──────────────────────────────────────────────────────────────────
@@ -1142,7 +1516,7 @@ export class Outbox {
       if (
         rs.manifest.records.length === 0 &&
         rs.terminals.size === 0 &&
-        rs.finalizes.size === 0 &&
+        rs.finalizes.size === 0 && rs.policies.size === 0 && !rs.policyProtection &&
         now - rs.manifest.updatedAt > this.retentionMs
       ) {
         toRemove.push(runId);
@@ -1176,6 +1550,7 @@ export class Outbox {
     if (!rs) return false; // no longer tracked (already removed / retired)
     if (rs.manifest.records.length !== 0) return false; // a record was appended after the decision
     if (rs.terminals.size !== 0) return false; // a terminal journal was installed after the decision
+    if (rs.policies.size !== 0 || rs.policyProtection) return false;
     if (rs.finalizes.size !== 0) return false; // a finalize record was installed after the decision
     if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
     if (await this.hasPhysicalTerminalProtection(runId)) return false;
@@ -1188,7 +1563,7 @@ export class Outbox {
     // separator/NUL) would escape the root, so refuse it here — the last line of
     // defense before `fs.rm(..., { recursive: true })` (H1).
     if (!this.validRunId(runId)) return;
-    if (await this.hasPhysicalTerminalProtection(runId)) return;
+    if (this.hasPendingPolicy(runId) || await this.hasPhysicalTerminalProtection(runId)) return;
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
     this.runs.delete(runId);
   }
@@ -1248,6 +1623,7 @@ export class Outbox {
       pendingMessages,
       // Run B: every installed, un-retired terminal journal for this run (blocked or not).
       pendingTerminal: rs.terminals.size,
+      ...(rs.policies.size ? { pendingPolicy: rs.policies.size } : {}),
       staleRetired: m.staleRetired,
       // The run's oldest blocked terminal reason, if any (D13) — omitted when none is blocked.
       ...(blockedReason !== undefined ? { blockedReason } : {}),
@@ -1535,7 +1911,7 @@ export class Outbox {
   async confirmTerminalAbsent(runId: string, claimGeneration: number): Promise<boolean> {
     if (this.disabled || !this.validRunId(runId)) return false;
     return this.withRunLock(runId, async () => {
-      if (this.hasPendingTerminal(runId, claimGeneration)) return false;
+      if (this.hasPendingTerminal(runId, claimGeneration) || this.hasPendingPolicy(runId)) return false;
       // Unknown or noncanonical physical aliases cannot prove absence.
       if (await this.hasPhysicalTerminalProtection(runId)) return false;
       try {
@@ -1552,7 +1928,7 @@ export class Outbox {
     const signal = AbortSignal.timeout(1_000);
     try {
       return await this.withRunLock(runId, async () => {
-        if (this.disabled || signal.aborted || this.hasPendingTerminal(runId, claimGeneration) ||
+        if (this.disabled || signal.aborted || this.hasPendingTerminal(runId, claimGeneration) || this.hasPendingPolicy(runId) ||
             this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
         try {
           const root = await fs.lstat(this.root);
@@ -1578,6 +1954,7 @@ export class Outbox {
           for (let n = 0; n < 256 && !signal.aborted; n++) {
             const entry = await dir.read();
             if (!entry) return !signal.aborted;
+            if (entry.name.startsWith(POLICY_FILE_PREFIX)) return false;
             const terminal = entry.name.startsWith(TERMINAL_FILE_PREFIX);
             const finalize = entry.name.startsWith(FINALIZE_FILE_PREFIX);
             if (!terminal && !finalize) continue;
@@ -1760,7 +2137,7 @@ export class Outbox {
    *  The reserve/ENOSPC handling now lives in {@link journalTerminal} (and {@link journalFinalize}), wrapping this call AND the
    *  run-dir mkdir together, so the whole sequence uses (and replenishes) the reserve exactly once
    *  on a full volume — the temp write and the `link()` both ride that single release. */
-  private async installExclusive(dst: string, serialized: string, kind: "terminal" | "finalize"): Promise<boolean> {
+  private async installExclusive(dst: string, serialized: string, kind: "terminal" | "finalize" | "policy"): Promise<boolean> {
     const tmp = `${dst}.${randomUUID()}.tmp`;
     const doWrite = async () => {
       const fh = await fs.open(
@@ -1795,7 +2172,7 @@ export class Outbox {
       }
     }
     try {
-      await this.fsyncDir(path.dirname(dst), kind === "finalize");
+      await this.fsyncDir(path.dirname(dst), kind === "finalize" || kind === "policy");
     } finally {
       // The installed destination stays intact even when strict directory fsync fails.
       await fs.rm(tmp, { force: true }).catch(() => undefined);
@@ -1878,7 +2255,7 @@ export class Outbox {
   listPendingFinalizes(): PendingFinalize[] {
     const best: { run_id: string; claim_generation: number; since: number }[] = [];
     for (const rs of this.runs.values()) {
-      if (rs.terminals.size > 0) continue;
+      if (rs.terminals.size > 0 || this.hasUnresolvedPolicy(rs.runId)) continue;
       let top: FinalizeMeta | undefined;
       for (const f of rs.finalizes.values()) {
         if (!top || f.claimGeneration > top.claimGeneration) top = f;
@@ -1902,7 +2279,7 @@ export class Outbox {
   listPendingFinalizeGenerations(includeTerminal = false): PendingFinalize[] {
     const entries: PendingFinalize[] = [];
     for (const rs of this.runs.values()) {
-      if (!includeTerminal && rs.terminals.size > 0) continue;
+      if (this.hasUnresolvedPolicy(rs.runId) || (!includeTerminal && rs.terminals.size > 0)) continue;
       for (const generation of rs.finalizes.keys()) {
         entries.push({ run_id: rs.runId, claim_generation: generation });
       }
@@ -1932,7 +2309,8 @@ export class Outbox {
       const rs = this.runs.get(runId);
       if (!expectedIdentity || rs?.finalizes.get(claimGeneration) !== expectedIdentity ||
           !this.validRunId(runId) || !rs?.finalizes.has(claimGeneration) ||
-          rs.terminals.size > 0 || signal.aborted || !eligible()) return false;
+          rs.terminals.size > 0 || this.hasUnresolvedPolicy(runId) || signal.aborted || !eligible()) return false;
+      if (await this.policyBlocksFinalize(runId, proofBudget ?? { signal }) || signal.aborted || !eligible()) return false;
       const file = path.join(this.runDir(runId), finalizeFileName(claimGeneration));
       if (reauthenticate) {
         const parsed = await this.readAuthed(file, MAC_DOMAIN_FINALIZE, proofBudget);
@@ -1959,7 +2337,8 @@ export class Outbox {
   async retireFinalize(runId: string, claimGeneration: number): Promise<boolean> {
     if (this.disabled) return false;
     return this.withRunLock(runId, async () => {
-      if (!this.validRunId(runId) || !this.runs.get(runId)?.finalizes.has(claimGeneration)) return false;
+      if (!this.validRunId(runId) || !this.runs.get(runId)?.finalizes.has(claimGeneration) ||
+          this.hasUnresolvedPolicy(runId) || await this.policyBlocksFinalize(runId)) return false;
       try {
         await fs.unlink(path.join(this.runDir(runId), finalizeFileName(claimGeneration)));
       } catch { return false; }
@@ -1999,7 +2378,7 @@ export class Outbox {
       since,
       updatedAt: since,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map(), policies: new Map(), policyProtection: false };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -2119,7 +2498,7 @@ export class Outbox {
       since: t,
       updatedAt: t,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map(), policies: new Map(), policyProtection: false };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -2317,6 +2696,10 @@ export class Outbox {
   /** Physical terminals protect the entire run subtree, including unknown/unsafe aliases.
    * A directory read failure conservatively protects it, independent of authenticated counts. */
   async hasPhysicalTerminalProtection(runId: string): Promise<boolean> {
+    return this.hasPhysicalControlProtection(runId);
+  }
+
+  private async hasPhysicalControlProtection(runId: string, policiesOnly = false): Promise<boolean> {
     if (!this.validRunId(runId)) return true;
     // Only initial path checks may establish ordinary absence. Once scanning starts,
     // all errors protect the run, including a directory read reporting ENOENT.
@@ -2341,7 +2724,7 @@ export class Outbox {
         while (true) {
           const entry = await dir.read();
           if (!entry) return false;
-          if (entry.name.startsWith(TERMINAL_FILE_PREFIX)) return true;
+          if (entry.name.startsWith(POLICY_FILE_PREFIX) || (!policiesOnly && entry.name.startsWith(TERMINAL_FILE_PREFIX))) return true;
         }
       } finally {
         await dir.close();
@@ -2495,7 +2878,7 @@ export class Outbox {
 
   /** Read and authenticate through a no-follow descriptor; finalize reads also bind its physical lifetime. */
   private async readAuthed(filePath: string, domain: string,
-    proofBudget?: { signal: AbortSignal; deadline: number },
+    proofBudget?: ProofBudget,
   ): Promise<Record<string, unknown> | null> {
     if (!this.key) return null;
     let raw: Buffer;
@@ -2505,10 +2888,10 @@ export class Outbox {
       const check = () => checkProofBudget(proofBudget);
       check();
       const fh = await fs.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
-        (proofBudget ? fsConstants.O_NONBLOCK : 0));
+        (proofBudget || domain === MAC_DOMAIN_POLICY ? fsConstants.O_NONBLOCK : 0));
       try {
         check();
-        if (!proofBudget) {
+        if (!proofBudget && domain !== MAC_DOMAIN_POLICY) {
           if (domain === MAC_DOMAIN_FINALIZE) {
             const before = await fh.stat({ bigint: true });
             if (!before.isFile()) return null;
@@ -2520,7 +2903,7 @@ export class Outbox {
             version = fileVersion(before);
           } else raw = await fh.readFile();
         } else {
-          const cap = 1024 * 1024;
+          const cap = domain === MAC_DOMAIN_POLICY ? POLICY_MAX_BYTES : 1024 * 1024;
           const before = await fh.stat({ bigint: true });
           check();
           if (!before.isFile() || before.size > BigInt(cap)) return null;
@@ -2648,7 +3031,7 @@ export class Outbox {
       } catch {
         size = -1; // absent
       }
-      if (size >= this.reserveBytes) return; // already at/above the configured size
+      if (size >= this.reserveTargetBytes) return; // already at/above the configured size
       await this.growReserveAtomic();
     } catch (err) {
       this.log.warn("outbox: could not (pre)allocate reserve (range/terminal writes may fail on a full volume)", {
@@ -2671,7 +3054,7 @@ export class Outbox {
         0o600,
       );
       try {
-        await fh.writeFile(Buffer.alloc(this.reserveBytes));
+        await fh.writeFile(Buffer.alloc(this.reserveTargetBytes));
         await fh.sync();
       } finally {
         await fh.close();
@@ -2684,8 +3067,18 @@ export class Outbox {
     await this.fsyncDir(path.dirname(dst));
   }
 
-  private async releaseReserve(): Promise<void> {
-    await fs.rm(this.reservePath(), { force: true }).catch(() => undefined);
+  private async releaseReserve(preserveBytes = 0): Promise<void> {
+    if (preserveBytes === 0) {
+      await fs.rm(this.reservePath(), { force: true }).catch(() => undefined);
+      return;
+    }
+    const fh = await fs.open(this.reservePath(), fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const stat = await fh.stat();
+      if (!stat.isFile() || stat.size < preserveBytes) throw new Error("policy reserve unavailable");
+      await fh.truncate(preserveBytes);
+      await fh.sync();
+    } finally { await fh.close(); }
   }
 
   private async replenishReserve(): Promise<void> {
@@ -2700,7 +3093,7 @@ export class Outbox {
         0o600,
       );
       try {
-        await fh.writeFile(Buffer.alloc(this.reserveBytes));
+        await fh.writeFile(Buffer.alloc(this.reserveTargetBytes));
       } finally {
         await fh.close();
       }
@@ -2734,13 +3127,13 @@ export class Outbox {
 
   /** Run `fn`, and on `ENOSPC` release the reserve to free space, retry once, then
    *  replenish the reserve. Used for reserve-backed range and terminal writes (D2). */
-  private async withReserveOnEnospc<T>(fn: () => Promise<T>): Promise<T> {
+  private async withReserveOnEnospc<T>(fn: () => Promise<T>, preserveBytes = 0): Promise<T> {
     try {
       return await fn();
     } catch (err) {
       if (!isENOSPC(err)) throw err;
       this.log.warn("outbox: ENOSPC on a reserve-backed write; releasing reserve to admit it", {});
-      await this.releaseReserve();
+      await this.releaseReserve(preserveBytes);
       try {
         return await fn();
       } finally {
@@ -2757,7 +3150,8 @@ export class Outbox {
   private async writeFileAtomic(
     dstPath: string,
     data: string,
-    kind: RecordFileKind | "manifest" | "terminal",
+    kind: RecordFileKind | "manifest" | "terminal" | "policy",
+    expected?: { runId: string; lifetime: string; version: string },
   ): Promise<string | undefined> {
     const dir = path.dirname(dstPath);
     const tmp = `${dstPath}.${randomUUID()}.tmp`;
@@ -2782,8 +3176,17 @@ export class Outbox {
       await fs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
     }
-    await fs.rename(tmp, dstPath);
-    await this.fsyncDir(dir);
+    try {
+      if (expected && (!await this.terminalDirectorySafe(expected.runId) ||
+          !await this.installedLifetimeMatches(dstPath, expected.lifetime, undefined, expected.version))) {
+        throw new Error("policy binding observation changed");
+      }
+      await fs.rename(tmp, dstPath);
+      await this.fsyncDir(dir, kind === "policy");
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+      throw err;
+    }
     return lifetime;
   }
 
@@ -2817,6 +3220,60 @@ export class Outbox {
     }
     return true;
   }
+}
+
+function positiveSafe(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function closedObject(value: unknown, allowed: readonly string[], required = allowed): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).every(key => allowed.includes(key)) &&
+    required.every(key => Object.hasOwn(value, key));
+}
+
+function validPolicyOutcome(value: unknown): value is ImmutablePolicyOutcome {
+  const required = ["outcome_id", "source_generation", "detail", "head", "published"];
+  const optional = ["tag", "phase", "correlation_id", "session_id", "checkpoint_contains_latest", "expected_gate_revision"];
+  if (!closedObject(value, [...required, ...optional], required)) return false;
+  const v = value;
+  if (typeof v.outcome_id !== "string" || v.outcome_id.length !== 36 ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v.outcome_id) ||
+      v.outcome_id === "00000000-0000-0000-0000-000000000000" || !positiveSafe(v.source_generation) ||
+      (v.detail !== "refused" && v.detail !== "resume_rejected")) return false;
+  if (v.detail === "refused" && !["tag", "phase", "correlation_id"].every(key => Object.hasOwn(v, key))) return false;
+  if (Object.hasOwn(v, "tag") && !isPolicyRefusalTag(v.tag)) return false;
+  if (Object.hasOwn(v, "phase") && v.phase !== "planning" && v.phase !== "implementation") return false;
+  if (Object.hasOwn(v, "correlation_id") && !validPolicyCorrelation(v.correlation_id)) return false;
+  if (Object.hasOwn(v, "session_id") && (typeof v.session_id !== "string" || !v.session_id.trim() ||
+      Buffer.byteLength(v.session_id) > 512 || v.session_id.includes("\0") || /[\r\n]/.test(v.session_id))) return false;
+  if (typeof v.head !== "string" || (v.head !== "" &&
+      ((v.head.length !== 40 && v.head.length !== 64) || /[^0-9a-f]/.test(v.head)))) return false;
+  if (typeof v.published !== "boolean" || (v.published && !v.head)) return false;
+  if (Object.hasOwn(v, "checkpoint_contains_latest") && typeof v.checkpoint_contains_latest !== "boolean") return false;
+  return !Object.hasOwn(v, "expected_gate_revision") || positiveSafe(v.expected_gate_revision);
+}
+
+function policyFileName(source: number): string { return `policy-${source}.json`; }
+function parsePolicyFileName(name: string): number | undefined {
+  const match = /^policy-([1-9][0-9]*)\.json$/.exec(name);
+  const source = match && Number(match[1]);
+  return positiveSafe(source) && name === policyFileName(source) ? source : undefined;
+}
+
+function coercePolicyRecord(value: unknown, runId: string, source: number): PolicyRecord | undefined {
+  if (!closedObject(value, ["version", "run_id", "outcome", "delivery", "since"]) ||
+      value.version !== 1 || value.run_id !== runId || !validPolicyOutcome(value.outcome) ||
+      value.outcome.source_generation !== source || !closedObject(value.delivery, ["claim_generation", "inventory_generation"]) ||
+      !positiveSafe(value.delivery.claim_generation) || value.delivery.claim_generation < source ||
+      value.delivery.inventory_generation !== value.delivery.claim_generation ||
+      typeof value.since !== "number" || !Number.isSafeInteger(value.since) || value.since < 0) return undefined;
+  return value as unknown as PolicyRecord;
+}
+
+function policyContextEligible(context: ReportRetirementContext): boolean {
+  return !context.signal?.aborted && (context.deadline === undefined || Date.now() < context.deadline) &&
+    context.eligible?.() !== false;
 }
 
 interface ManifestPatch {

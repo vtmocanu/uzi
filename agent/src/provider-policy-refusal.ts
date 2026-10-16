@@ -39,7 +39,7 @@ export function isPolicyRefusalTag(tag: unknown): tag is PolicyRefusalTag {
   return tag === "cyberPolicy" || tag === "misalignmentPolicyViolation";
 }
 
-function validCorrelation(value: unknown): value is string {
+export function validPolicyCorrelation(value: unknown): value is string {
   return typeof value === "string" && value.length >= 37 && value.length <= 52
     && /^pr-[0-9a-f]{32}-[1-9][0-9]{0,15}(?![\s\S])/.test(value)
     && Number.isSafeInteger(Number(value.slice(36)));
@@ -53,7 +53,7 @@ export function validatePolicyRefusal(value: unknown): PolicyRefusalPayload | un
   if (!required.every(key => Object.hasOwn(p, key))) return undefined;
   if (p.event !== "provider_policy_refusal" || p.provider !== "codex" || p.category !== "policy_refusal"
     || !isPolicyRefusalTag(p.policy_tag) || (p.phase !== "planning" && p.phase !== "implementation")
-    || !validCorrelation(p.correlation_id)) return undefined;
+    || !validPolicyCorrelation(p.correlation_id)) return undefined;
   const common = {
     event: p.event, provider: p.provider, category: p.category, policy_tag: p.policy_tag,
     phase: p.phase, correlation_id: p.correlation_id,
@@ -62,7 +62,7 @@ export function validatePolicyRefusal(value: unknown): PolicyRefusalPayload | un
     return Object.freeze({ ...common, origin: "root" });
   }
   if (p.origin === "child" && Object.keys(p).length === 9
-    && Object.hasOwn(p, "role") && Object.hasOwn(p, "parent_correlation_id") && validCorrelation(p.parent_correlation_id)
+    && Object.hasOwn(p, "role") && Object.hasOwn(p, "parent_correlation_id") && validPolicyCorrelation(p.parent_correlation_id)
     && p.parent_correlation_id !== p.correlation_id && typeof p.role === "string"
     && p.role.length >= 1 && p.role.length <= 64 && !/[^a-zA-Z0-9_.-]/.test(p.role)) {
     return Object.freeze({

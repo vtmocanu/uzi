@@ -12,6 +12,32 @@ import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
 
+/** Flat policy-hold contract; transport is wired in M1, capability activation waits for M2. */
+export interface PolicyHoldRequest {
+  outcome_id: string;
+  source_generation: number;
+  claim_generation: number;
+  detail: "refused" | "resume_rejected";
+  tag?: "cyberPolicy" | "misalignmentPolicyViolation";
+  phase?: "planning" | "implementation";
+  correlation_id?: string;
+  session_id?: string;
+  head: string;
+  published: boolean;
+  checkpoint_contains_latest?: boolean;
+  expected_gate_revision?: number;
+}
+
+export type ImmutablePolicyOutcome = Readonly<Omit<PolicyHoldRequest, "claim_generation">>;
+
+export interface PolicyHoldAck {
+  disposition: "applied" | "already_applied" | "resolved_newer_policy" | "terminal" | "pending";
+  outcome_id: string;
+  status: string;
+  hold_reason?: string;
+  claim_generation: number;
+}
+
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
 
@@ -506,6 +532,7 @@ export interface OutboxHeartbeatEntry {
   run_id: string;
   pending_messages: number;
   pending_terminal: number;
+  pending_policy?: number;
   stale_retired: number;
   blocked_reason?: string;
   since: number;

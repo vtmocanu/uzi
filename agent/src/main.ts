@@ -492,6 +492,7 @@ async function main(): Promise<void> {
   const activeRuns = new ActiveRunRegistry(
     () => outbox.listPendingTerminals(),
     () => client.workerOutboxMaxPending,
+    () => outbox.listPendingPolicies(),
   );
   // Pin the SDK's HOME (session transcripts under $HOME/.claude/projects) onto
   // the persistent data volume so `docker compose down && up` doesn't wipe

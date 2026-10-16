@@ -509,7 +509,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// milestone ISSUE run with >= 1 completed milestone and the finalize allowance unused. Read
 	// after MilestonesCompleted is decoded above so len() is the real completed count.
 	dto.CanStopAtWall = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted" &&
-		r.Kind == "issue" && !r.Interactive && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
+		r.Kind == "issue" && !r.Interactive && r.PolicyRefusalCount == 0 && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
 	// PRD #1733: the server-derived Stop gate for a provider hold — a paused 'provider_unavailable'
 	// milestone ISSUE run with >= 1 completed milestone (Stop is the scope ceiling plus the owner's
 	// resume, which would finalize nothing otherwise; SubmitInput refuses the same case).

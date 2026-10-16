@@ -924,8 +924,8 @@ var workerDTOKeys = []string{
 	// PRD #1391 M5: the worker's last-reported outbox depth, summed across its runs.
 	// Null until it reports a non-empty outbox (re-nulled once drained). Overlaid from
 	// an in-process, restart-losing tracker, never stored — this tag set is the only
-	// wire contract these five fields have.
-	"outbox_pending_messages", "outbox_pending_terminal", "outbox_stale_retired", "outbox_blocked", "outbox_blocked_run_id",
+	// wire contract these six fields have.
+	"outbox_pending_messages", "outbox_pending_terminal", "outbox_pending_policy", "outbox_stale_retired", "outbox_blocked", "outbox_blocked_run_id",
 	// Issue #2213: the worker's heartbeat-reported residue quarantine latch (when it latched
 	// and why). Both null unless the last heartbeat reported it; overlaid from an in-process
 	// tracker, never stored. The cause is untrusted text.

@@ -2528,9 +2528,18 @@ func fmtUntil(d time.Duration) string {
 func policyHoldAction(r apitypes.RunDTO) string {
 	detail := "preservation unknown"
 	if policy := r.PolicyRefusal; policy != nil {
-		detail = strOr(policy.Detail, "unknown") + "; " + strOr(policy.Provenance, "unverified")
-		if policy.Published == nil || !*policy.Published {
+		detail = strOr(policy.Detail, "unknown") + "; " + strOr(policy.Provenance, "preservation unknown")
+		switch {
+		case policy.Published == nil:
+			detail += "; checkpoint publication unknown"
+		case *policy.Published:
+			detail += "; published checkpoint"
+		case policy.Provenance != nil && *policy.Provenance == "verified":
 			detail += "; local-only checkpoint"
+		case policy.Provenance != nil && *policy.Provenance == "unverified":
+			detail += "; latest local work unverified"
+		default:
+			detail += "; no verified checkpoint"
 		}
 	}
 	return detail + "; resume same conversation: uzi run resume " + cellText(r.ID) +
