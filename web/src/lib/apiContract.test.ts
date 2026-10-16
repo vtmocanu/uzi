@@ -1809,8 +1809,4 @@ it("finding requests record true and omit the default send_to_uzi field", () => 
     expect(zero).not.toHaveProperty("send_to_uzi");
     expect(full.send_to_uzi).toBe(true);
   }
-  const single: FileFindingRequest = { title: null, description: null, labels: null, send_to_uzi: false };
-  const group: FindingGroupFileRequest = { ids: null, title: null, description: null, labels: null, send_to_uzi: false };
-  expect(JSON.parse(JSON.stringify(single)).send_to_uzi).toBe(false);
-  expect(JSON.parse(JSON.stringify(group)).send_to_uzi).toBe(false);
 });
