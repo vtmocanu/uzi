@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -31,6 +32,11 @@ func TestPolicyOwnerChoiceAvailability(t *testing.T) {
 			want := reason != "budget_exhausted"
 			if spent.PolicyRefusal.CanResume != want || spent.CanStopAtProviderHold != want {
 				t.Fatalf("spent %s availability: %+v", reason, spent.PolicyRefusal)
+			}
+			r.ClaimGeneration = math.MaxInt64
+			overflow := runToDTO(r, "normal", time.Hour, 3600, 3, time.Now(), 3)
+			if overflow.PolicyRefusal.CanResume || overflow.CanStopAtProviderHold {
+				t.Fatal("unadvanceable claim advertised resume or Stop")
 			}
 			if dto.CanStopAtWall || !dto.CanStopAtProviderHold || dto.PolicyRefusal == nil || !dto.PolicyRefusal.CanResume {
 				t.Fatalf("policy owner choices missing: %+v", dto.PolicyRefusal)

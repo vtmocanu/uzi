@@ -84,20 +84,24 @@ func TestPolicyOwnerSpentOrdinaryHoldLiveDB(t *testing.T) {
 }
 
 func TestPolicyOwnerOverflowLiveDB(t *testing.T) {
-	e := setupPolicyHold(t)
-	_, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET claim_generation=$2 WHERE id=$1", e.runID, int64(math.MaxInt64)); err != nil {
-		t.Fatal(err)
-	}
-	held := mustRun(t, e.codexTestEnv, e.runID)
-	if _, err := e.svc.ResumePolicyHold(e.ctx, e.userID, e.runID, PolicyHoldActionToken(held), PolicyResumeRequest{Mode: "fresh", Guidance: "must not write"}); err == nil {
-		t.Fatal("overflow accepted")
-	}
-	var n int
-	if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('resume','follow_up')", e.runID).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("inputs=%d err=%v", n, err)
+	for _, mode := range []string{"fresh", "preserve"} {
+		t.Run(mode, func(t *testing.T) {
+			e := setupPolicyHold(t)
+			_, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET claim_generation=$2 WHERE id=$1", e.runID, int64(math.MaxInt64)); err != nil {
+				t.Fatal(err)
+			}
+			held := mustRun(t, e.codexTestEnv, e.runID)
+			if _, err := e.svc.ResumePolicyHold(e.ctx, e.userID, e.runID, PolicyHoldActionToken(held), PolicyResumeRequest{Mode: mode, Guidance: "must not write"}); err == nil {
+				t.Fatal("overflow accepted")
+			}
+			var n int
+			if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('resume','follow_up')", e.runID).Scan(&n); err != nil || n != 0 {
+				t.Fatalf("inputs=%d err=%v", n, err)
+			}
+		})
 	}
 }

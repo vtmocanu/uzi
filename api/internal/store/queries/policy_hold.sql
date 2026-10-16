@@ -55,7 +55,7 @@ WHERE id = @id AND user_id = @user_id AND status = 'paused'
  AND (policy_refusal_count > 0 OR hold_reason = 'provider_policy_refusal')
  AND (hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
  AND hold_reason IS DISTINCT FROM 'credential_disabled'
- AND (NOT @fresh::boolean OR claim_generation < 9223372036854775807)
+ AND claim_generation < 9223372036854775807
  AND (hold_reason IS DISTINCT FROM 'budget_exhausted' OR started_at IS NULL OR
    (COALESCE(budget_wall_seconds, @global_timeout_seconds::int)::bigint + budget_extension_seconds + budget_finalize_seconds)
    - (GREATEST(0, EXTRACT(EPOCH FROM (status_since - started_at))::bigint) - budget_paused_seconds) > 0)

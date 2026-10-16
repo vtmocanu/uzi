@@ -291,7 +291,7 @@ func PolicyOwnerConstrained(r store.Run) bool {
 
 // PolicyOwnerResumable excludes holds with a separate owner decision mechanism.
 func PolicyOwnerResumable(r store.Run) bool {
-	return PolicyOwnerConstrained(r) && r.Status == "paused" &&
+	return PolicyOwnerConstrained(r) && r.Status == "paused" && r.ClaimGeneration < math.MaxInt64 &&
 		r.HoldReason.String != "completion_blocked" && r.HoldReason.String != "credential_disabled"
 }
 
@@ -341,7 +341,7 @@ func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, 
 		return r, ErrInvalidState
 	}
 	fresh := req.Mode == "fresh"
-	if fresh && r.ClaimGeneration == math.MaxInt64 {
+	if r.ClaimGeneration == math.MaxInt64 {
 		return r, ErrInvalidState
 	}
 	if stopReason != nil {
