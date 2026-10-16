@@ -19,9 +19,10 @@
 #
 # NOR DOES "EVERY MERGE MUST TOUCH CHANGELOG.md" ON ITS OWN. That was the first
 # version of this script: it passed the case it was written for and failed #149,
-# whose entry existed and was simply written elsewhere. Entries are now written in
-# each PR under `[Unreleased]`, and scripts/check-changelog-entry.sh (gate:repo)
-# enforces that at PR time with the same exemptions plus a dependency-manifest one.
+# whose entry existed and was simply written elsewhere. Ordinary PRs now add UUID
+# fragments under changelog.d/; legacy `[Unreleased]` additions remain accepted.
+# scripts/check-changelog-entry.sh (gate:repo) checks PR entries with the same
+# exemptions plus a dependency-manifest one.
 # This oracle stays the final check: it also accepts citations written at cut time
 # and covers merges that reached main without a PR.
 #

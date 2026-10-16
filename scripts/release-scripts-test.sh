@@ -772,7 +772,7 @@ MD
   git -C "$d" add agent/templates/base/runtime.txt; gcommit "$d" "Update worker template (#1466)"
   run_rc "$d" 0.3.0 --promote
   assert_eq "templates-only empty Unreleased refuses next RC" "3" "$RC_RC"
-  assert_contains "templates-only reaches main-half empty refusal" "[Unreleased] is empty and no --changelog-file given" "$RC_OUT"
+  assert_contains "templates-only reaches main-half empty refusal" "pending notes (legacy [Unreleased] plus fragments) are empty and no --changelog-file given" "$RC_OUT"
   if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
     fail "templates-only empty refusal rolls stable tag back"
   else

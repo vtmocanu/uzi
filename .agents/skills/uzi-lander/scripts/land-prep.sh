@@ -251,8 +251,8 @@ rebase_in_progress() {
 delta_paths() {
   printf '%s\n' "$1" | sed -e '/^$/d' -e 's|^api/internal/store/migrations/.*|api/internal/store/migrations/|' | LC_ALL=C sort -u
 }
-# union_continue: a rebase has stopped. Nearly every PR adds a CHANGELOG.md bullet under
-# the same heading, so while CHANGELOG.md is the ONLY conflicted path, resolve it as a union
+# union_continue: a rebase has stopped. Legacy direct CHANGELOG.md additions can share
+# a heading, so while CHANGELOG.md is the ONLY conflicted path, resolve it as a union
 # (changelog-union.sh), stage it and continue; a later commit may stop again, hence the loop.
 # Returns 0 once the rebase completes, 1 on any other stop (the rebase is left in progress).
 union_continue() {

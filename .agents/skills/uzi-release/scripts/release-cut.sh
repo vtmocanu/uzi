@@ -34,7 +34,8 @@
 #     --stable        cut a plain vX.Y.Z from main's tip (the old one-step model). An
 #                     escape for a docs-only release; REFUSED while an RC is in flight.
 #
-#   --changelog-file  a drafted `## [X.Y.Z]` section that REPLACES the [Unreleased] fold.
+#   --changelog-file  a drafted `## [X.Y.Z]` section replacing the legacy fold;
+#                     refused before mutation when changelog.d/ fragments are pending.
 #   --no-commit       stage every edit but do not commit (and so do not run the oracle).
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
@@ -806,10 +807,11 @@ EOF
   # Dependency-only shipping work also requires notes here; plain cuts still autocite it.
   if [ "$OP" = promote ] && [ "$merges" -gt 0 ] && [ -z "$unrel" ] && [ -z "$CL_FILE" ]; then
     {
-      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but [Unreleased] is empty and no --changelog-file given."
+      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but pending notes (legacy [Unreleased] plus fragments) are empty and no --changelog-file given."
       echo "  Shipping SHAs:"
       printf '    %s\n' "$SHIPPING_SHAS"
-      echo "  Either write next candidate entries under [Unreleased] OR pass --changelog-file with a drafted ## [$BASE] section, then re-run."
+      echo "  Add cited next-candidate UUID-v4 fragments under changelog.d/ and commit them, then re-run."
+      echo "  With no pending fragments, legacy [Unreleased] entries or --changelog-file with a drafted ## [$BASE] section remain supported."
     } >&2
     exit 3
   fi
