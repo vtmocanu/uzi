@@ -225,7 +225,7 @@ func (s *Service) resumeCompletionBlocked(ctx context.Context, q Store, run stor
 		}
 		_, err := s.resumePolicyHoldLocked(ctx, lockedQueries, run, token, PolicyResumeRequest{
 			Mode: "preserve", Guidance: followupGuidance, completionDecision: true,
-		}, nil)
+		})
 		return err
 	}
 	if paused {

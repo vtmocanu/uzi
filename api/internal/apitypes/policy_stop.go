@@ -213,6 +213,17 @@ func policyStopClosedJSON(b []byte, dst any) error {
 	return d.Decode(dst)
 }
 
+// PolicyStopReceipt acknowledges one durable Stop decision; it is not plan approval.
+type PolicyStopReceipt struct {
+	Disposition         string              `json:"disposition"`
+	ResolutionID        string              `json:"resolution_id"`
+	ScopeInputID        PolicyStopDecimal   `json:"scope_input_id"`
+	ScopeCeiling        int                 `json:"scope_ceiling"`
+	AcceptedAt          time.Time           `json:"accepted_at"`
+	ReviewGeneration    PolicyStopDecimal   `json:"review_generation"`
+	SupersededRevisions []PolicyRevisionRef `json:"superseded_revisions"`
+}
+
 type PolicyStopReview struct {
 	Manifest    PolicyStopManifest `json:"manifest"`
 	StopIfMatch string             `json:"stop_if_match"`

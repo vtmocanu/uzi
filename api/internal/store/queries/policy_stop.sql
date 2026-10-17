@@ -8,3 +8,34 @@ ORDER BY id;
 
 -- name: GetPolicyStopCrossCheck :one
 SELECT * FROM cross_checks WHERE id = $1;
+
+-- name: SettlePolicyStopRevisionInput :execrows
+-- Caller holds the parent run lock and visits manifest input IDs in ascending order.
+UPDATE run_user_inputs
+SET disposition = 'superseded_by_stop', settled_at = now(),
+    superseded_by_stop_input_id = @scope_input_id::bigint
+WHERE run_id = @run_id AND id = @input_id::bigint AND kind = 'revise_plan'
+  AND applied_at IS NULL AND included_at IS NULL AND settled_at IS NULL
+  AND disposition IS NULL AND superseded_by_stop_input_id IS NULL;
+
+-- name: SettlePolicyStopCrossCheck :execrows
+-- Approve association witnesses are deliberately excluded.
+UPDATE cross_checks
+SET revision_disposition = 'superseded_by_stop', revision_settled_at = now(),
+    revision_superseded_by_stop_input_id = @scope_input_id::bigint
+WHERE lead_run_id = @run_id AND id = @cross_check_id AND stage = 'plan'
+  AND verdict = 'revise' AND decided_at IS NOT NULL
+  AND revision_disposition IS NULL AND revision_settled_at IS NULL
+  AND revision_superseded_by_stop_input_id IS NULL;
+
+-- name: AcceptPolicyStopResolution :one
+-- Source evidence and candidate approval are deliberately not updated.
+UPDATE runs SET policy_stop_resolution = @resolution::jsonb, updated_at = now()
+WHERE id = @run_id AND user_id = @owner_id
+  AND status = 'paused' AND kind = 'issue' AND harness = 'codex' AND NOT interactive
+  AND policy_last_outcome_id = @outcome_id
+  AND policy_last_source_generation = @source_generation::bigint
+  AND claim_generation = @claim_generation::bigint AND claim_generation > 0
+  AND policy_last_source_generation > 0
+  AND policy_stop_resolution IS NULL
+RETURNING *;

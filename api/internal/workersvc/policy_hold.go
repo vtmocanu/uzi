@@ -288,10 +288,6 @@ type PolicyResumeRequest struct {
 }
 
 func (s *Service) ResumePolicyHold(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest) (store.Run, error) {
-	return s.resumePolicyOwnerAction(ctx, owner, id, token, req, nil, nil)
-}
-
-func (s *Service) resumePolicyOwnerAction(ctx context.Context, owner, id uuid.UUID, token string, req PolicyResumeRequest, stopReason *string, observed *store.Run) (store.Run, error) {
 	if req.Mode != "" && req.Mode != "preserve" && req.Mode != "fresh" || len(req.Guidance) > PolicyResumeGuidanceMaxBytes || !utf8.ValidString(req.Guidance) || strings.ContainsRune(req.Guidance, 0) {
 		return store.Run{}, ErrInvalidState
 	}
@@ -311,14 +307,7 @@ func (s *Service) resumePolicyOwnerAction(ctx context.Context, owner, id uuid.UU
 	if r.UserID != owner {
 		return store.Run{}, ErrRunNotOwned
 	}
-	if observed != nil {
-		priorFrozen, _ := canonicalRawJSON(observed.MilestonesFrozen)
-		currentFrozen, _ := canonicalRawJSON(r.MilestonesFrozen)
-		if r.ContractRevision != observed.ContractRevision || r.GateRevision != observed.GateRevision || string(priorFrozen) != string(currentFrozen) {
-			return r, ErrReconciliationConflict
-		}
-	}
-	r, err = s.resumePolicyHoldLocked(ctx, q, r, token, req, stopReason)
+	r, err = s.resumePolicyHoldLocked(ctx, q, r, token, req)
 	if err != nil {
 		return r, err
 	}
@@ -370,15 +359,12 @@ func PolicyOwnerCanStop(r store.Run, timeout time.Duration) bool {
 
 // resumePolicyHoldLocked requires the caller's transaction and run lock. Stop and
 // credential reassignment reuse it without starting a nested transaction.
-func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, r store.Run, token string, req PolicyResumeRequest, stopReason *string) (store.Run, error) {
+func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, r store.Run, token string, req PolicyResumeRequest) (store.Run, error) {
 	if r.Status != "paused" || !PolicyOwnerConstrained(r) || token == "" || token != PolicyHoldActionToken(r) {
 		return r, fmt.Errorf("%w: policy action changed; upgrade your client and refetch the presented action", ErrStaleClaim)
 	}
 	if r.HoldReason.String == "budget_exhausted" && !PolicyOwnerBudgetAvailable(r, s.p.RunTimeout) {
 		return r, fmt.Errorf("%w: this run is out of time; extend it before resuming", ErrWallParkStopUnavailable)
-	}
-	if stopReason != nil && !PolicyOwnerCanStop(r, s.p.RunTimeout) {
-		return r, ErrProviderHoldStopUnavailable
 	}
 	canResume := PolicyOwnerResumable(r) || (req.completionDecision && r.HoldReason.String == "completion_blocked")
 	if !canResume {
@@ -387,22 +373,6 @@ func (s *Service) resumePolicyHoldLocked(ctx context.Context, q *store.Queries, 
 	fresh := req.Mode == "fresh"
 	if r.ClaimGeneration == math.MaxInt64 {
 		return r, ErrInvalidState
-	}
-	if stopReason != nil {
-		completed, _ := DecodeMilestoneIDs(r.MilestonesCompleted)
-		completedCount := len(completed)
-		if completedCount < 1 || completedCount > math.MaxInt32 {
-			return r, ErrProviderHoldStopUnavailable
-		}
-		body := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", completedCount)
-		if reason := strings.TrimSpace(*stopReason); reason != "" {
-			body += ": " + reason
-		}
-		if _, err := q.CreateScopeCeilingInput(ctx, store.CreateScopeCeilingInputParams{
-			RunID: r.ID, ScopeCeiling: pgtype.Int4{Int32: int32(completedCount), Valid: true}, Body: policyTextNonempty(body),
-		}); err != nil {
-			return r, err
-		}
 	}
 	if strings.TrimSpace(req.Guidance) != "" {
 		if _, err := q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: r.ID, Kind: "follow_up", Body: policyText(&req.Guidance)}); err != nil {

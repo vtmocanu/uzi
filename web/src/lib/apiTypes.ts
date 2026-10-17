@@ -2847,6 +2847,26 @@ export interface PolicyStopReview {
   stop_if_match: string;
 }
 
+export interface PolicyStopReceipt {
+  disposition: "accepted" | "already_accepted";
+  resolution_id: string;
+  scope_input_id: string;
+  scope_ceiling: number;
+  accepted_at: string;
+  review_generation: string;
+  superseded_revisions: PolicyRevisionRef[] | null;
+}
+
+export interface RunInputResponse {
+  server_side: boolean;
+  id?: number;
+  created_at?: string;
+  extension_seconds?: number;
+  deadline_at?: string;
+  resumed?: boolean;
+  policy_stop?: PolicyStopReceipt;
+}
+
 // MilestoneAgent is one entry of a run's per-in-progress-milestone agent attribution
 // (PRD #1224): the milestone id, the acting agent's validated kebab-case identifier
 // (byte-exact so it matches current_activity.agent for the live-enrichment join), and an

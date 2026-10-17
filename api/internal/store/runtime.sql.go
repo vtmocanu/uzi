@@ -4067,6 +4067,7 @@ const createRunReviseInputIfUnderCap = `-- name: CreateRunReviseInputIfUnderCap 
 WITH bumped AS (
     UPDATE runs SET revise_count = runs.revise_count + 1
     WHERE runs.id = $2 AND runs.revise_count < $3::int
+      AND runs.policy_stop_resolution IS NULL
       AND ($4::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = $4::bigint))
     RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
@@ -4198,6 +4199,7 @@ WITH capped AS (
     UPDATE runs SET scope_ceiling = $2, updated_at = now()
     WHERE runs.id = $3
       AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+      AND runs.policy_stop_resolution IS NULL
     RETURNING runs.id
 ),
 superseded AS (

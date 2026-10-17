@@ -407,7 +407,7 @@ func (s *Service) setPausedCredential(ctx context.Context, observed store.Run, r
 			return err
 		}
 		if PolicyOwnerConstrained(current) {
-			if _, err := s.resumePolicyHoldLocked(ctx, q, current, token, PolicyResumeRequest{Mode: "preserve"}, nil); err != nil {
+			if _, err := s.resumePolicyHoldLocked(ctx, q, current, token, PolicyResumeRequest{Mode: "preserve"}); err != nil {
 				return err
 			}
 		} else {

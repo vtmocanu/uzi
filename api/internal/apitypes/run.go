@@ -2258,6 +2258,8 @@ type RunInputResponse struct {
 	// step (extend-and-resume, or stop). omitempty — absent (false) on every other path, including a
 	// plain extend of a running run — so the CLI can say the run resumed, not merely that time was added.
 	Resumed bool `json:"resumed,omitempty"`
+	// PolicyStop is the immutable acceptance receipt for an exact reviewed Stop.
+	PolicyStop *PolicyStopReceipt `json:"policy_stop,omitempty"`
 }
 
 // SteerInputDTO is one steer-queue entry (PRD #95, #634), served by

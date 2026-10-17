@@ -3,6 +3,8 @@ import type { PlanCrossCheckSummary } from "./apiTypes";
 import { readFileSync } from "node:fs";
 import type {
   PolicyStopReview,
+  PolicyStopReceipt,
+  RunInputResponse,
   Run,
   RunListItem,
   RunSummaryItem,
@@ -85,6 +87,10 @@ import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
 import buildInfoFull from "../../../fixtures/api-contract/build_info.full.json";
 import releaseCheckStatusZero from "../../../fixtures/api-contract/release_check_status.zero.json";
 import releaseCheckStatusFull from "../../../fixtures/api-contract/release_check_status.full.json";
+import policyStopReceiptZero from "../../../fixtures/api-contract/policy_stop_receipt.zero.json";
+import policyStopReceiptFull from "../../../fixtures/api-contract/policy_stop_receipt.full.json";
+import runInputResponseZero from "../../../fixtures/api-contract/run_input_response.zero.json";
+import runInputResponseFull from "../../../fixtures/api-contract/run_input_response.full.json";
 import policyStopReviewZero from "../../../fixtures/api-contract/policy_stop_review.zero.json";
 import policyStopReviewFull from "../../../fixtures/api-contract/policy_stop_review.full.json";
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -304,6 +310,19 @@ void _releaseCheckStatusMissing;
 void _releaseCheckStatusExtra;
 void _releaseCheckStatusZero;
 void _releaseCheckStatusFull;
+
+{
+  const missingReceipt: never = null as unknown as Exclude<keyof PolicyStopReceipt, keyof typeof policyStopReceiptFull>;
+  const extraReceipt: never = null as unknown as Exclude<keyof typeof policyStopReceiptFull, keyof PolicyStopReceipt>;
+  const zeroReceipt: ZeroOf<PolicyStopReceipt> = policyStopReceiptZero;
+  const fullReceipt: Widen<PolicyStopReceipt> = policyStopReceiptFull;
+  const missingResponse: never = null as unknown as Exclude<keyof RunInputResponse, keyof typeof runInputResponseFull>;
+  const extraResponse: never = null as unknown as Exclude<keyof typeof runInputResponseFull, keyof RunInputResponse>;
+  const zeroResponse: ZeroOf<RunInputResponse> = runInputResponseZero;
+  const fullResponse: Widen<RunInputResponse> = runInputResponseFull;
+  void missingReceipt; void extraReceipt; void zeroReceipt; void fullReceipt;
+  void missingResponse; void extraResponse; void zeroResponse; void fullResponse;
+}
 
 // Exact owner Stop review contract: nested nil slices remain nullable.
 {
@@ -1576,6 +1595,8 @@ function hasNull(v: unknown): boolean {
 // `nullable: false` rather than guarded, per the PRD.
 const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "policy_stop_review", nullable: true },
+  { stem: "policy_stop_receipt", nullable: true },
+  { stem: "run_input_response", nullable: false },
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
   { stem: "run_summary_item", nullable: true },

@@ -7741,6 +7741,7 @@ func (s *Service) AdminRunOutcomesPerUser(ctx context.Context) ([]store.AdminRun
 
 // SubmitInputResult reports how a steering input was handled.
 type SubmitInputResult struct {
+	PolicyStop *apitypes.PolicyStopReceipt
 	// ServerSide is true when a cancel/reject was applied directly because no
 	// live poller would ever consume it.
 	ServerSide bool

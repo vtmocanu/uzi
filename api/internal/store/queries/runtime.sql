@@ -8523,6 +8523,7 @@ SELECT count(*) FROM run_user_inputs WHERE run_id = @run_id AND kind = 'revise_p
 WITH bumped AS (
     UPDATE runs SET revise_count = runs.revise_count + 1
     WHERE runs.id = @run_id AND runs.revise_count < @max_revisions::int
+      AND runs.policy_stop_resolution IS NULL
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
     RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind
@@ -8744,6 +8745,7 @@ WITH capped AS (
     UPDATE runs SET scope_ceiling = @scope_ceiling, updated_at = now()
     WHERE runs.id = @run_id
       AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+      AND runs.policy_stop_resolution IS NULL
     RETURNING runs.id
 ),
 superseded AS (

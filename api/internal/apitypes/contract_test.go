@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes/apitypestest"
 )
@@ -146,6 +147,39 @@ func policyStopReviewContractCase() contractCase {
 	check.RevisionDisposition = text("applied")
 	check.RevisionSupersededByStopInputID = decimal(large)
 	full.StopIfMatch = "policy-stop-review-match"
+	c.full = full
+	return c
+}
+
+// fullPolicyStopReceipt records acceptance of the atomic owner decision.
+func fullPolicyStopReceipt() PolicyStopReceipt {
+	humanInputID := PolicyStopDecimal("9007199254740993")
+	crossCheckID := "22222222-2222-4222-8222-222222222222"
+	return PolicyStopReceipt{
+		Disposition:      "accepted",
+		ResolutionID:     "11111111-1111-4111-8111-111111111111",
+		ScopeInputID:     "9007199254740995",
+		ScopeCeiling:     1,
+		AcceptedAt:       time.Date(2026, time.October, 17, 5, 30, 0, 0, time.UTC),
+		ReviewGeneration: "9007199254740997",
+		SupersededRevisions: []PolicyRevisionRef{
+			{Source: "run_user_input", InputID: &humanInputID},
+			{Source: "plan_cross_check", CrossCheckID: &crossCheckID},
+		},
+	}
+}
+
+func policyStopReceiptContractCase() contractCase {
+	c := newContractCase[PolicyStopReceipt]("policy_stop_receipt")
+	c.full = fullPolicyStopReceipt()
+	return c
+}
+
+func runInputResponseContractCase() contractCase {
+	c := newContractCase[RunInputResponse]("run_input_response")
+	full := c.full.(RunInputResponse)
+	receipt := fullPolicyStopReceipt()
+	full.PolicyStop = &receipt
 	c.full = full
 	return c
 }
@@ -308,6 +342,8 @@ func contractCases() []contractCase {
 		// its own nullability surface (origin members, result).
 		newContractCase[RunJobDTO]("run_job"),
 		policyStopReviewContractCase(),
+		policyStopReceiptContractCase(),
+		runInputResponseContractCase(),
 	}
 }
 

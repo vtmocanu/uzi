@@ -9,7 +9,230 @@ import (
 	"context"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+const acceptPolicyStopResolution = `-- name: AcceptPolicyStopResolution :one
+UPDATE runs SET policy_stop_resolution = $1::jsonb, updated_at = now()
+WHERE id = $2 AND user_id = $3
+  AND status = 'paused' AND kind = 'issue' AND harness = 'codex' AND NOT interactive
+  AND policy_last_outcome_id = $4
+  AND policy_last_source_generation = $5::bigint
+  AND claim_generation = $6::bigint AND claim_generation > 0
+  AND policy_last_source_generation > 0
+  AND policy_stop_resolution IS NULL
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, policy_refusal_count, policy_last_tag, policy_last_phase, policy_last_correlation_id, policy_last_refused_at, policy_hold_provenance, policy_hold_published, policy_hold_detail, policy_last_outcome_id, policy_last_source_generation, policy_fresh_claim_generation, policy_stop_resolution, policy_revision_source
+`
+
+type AcceptPolicyStopResolutionParams struct {
+	Resolution       []byte      `json:"resolution"`
+	RunID            uuid.UUID   `json:"run_id"`
+	OwnerID          uuid.UUID   `json:"owner_id"`
+	OutcomeID        pgtype.UUID `json:"outcome_id"`
+	SourceGeneration int64       `json:"source_generation"`
+	ClaimGeneration  int64       `json:"claim_generation"`
+}
+
+// Source evidence and candidate approval are deliberately not updated.
+func (q *Queries) AcceptPolicyStopResolution(ctx context.Context, arg AcceptPolicyStopResolutionParams) (Run, error) {
+	row := q.db.QueryRow(ctx, acceptPolicyStopResolution,
+		arg.Resolution,
+		arg.RunID,
+		arg.OwnerID,
+		arg.OutcomeID,
+		arg.SourceGeneration,
+		arg.ClaimGeneration,
+	)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.RepoID,
+		&i.IssueIid,
+		&i.IssueTitle,
+		&i.IssueDescription,
+		&i.Status,
+		&i.RequeueCount,
+		&i.WorkerID,
+		&i.SessionID,
+		&i.LastSeq,
+		&i.Branch,
+		&i.MrIid,
+		&i.FailureReason,
+		&i.PlanMd,
+		&i.IterationCount,
+		&i.ClaimedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.OriginColumn,
+		&i.BoardColumn,
+		&i.MovePendingSince,
+		&i.MrState,
+		&i.AutoApprove,
+		&i.AutopilotCommentedAt,
+		&i.Kind,
+		&i.PipelineID,
+		&i.PipelineRef,
+		&i.FailureSnapshot,
+		&i.FixVerdict,
+		&i.StopKind,
+		&i.AgentSource,
+		&i.AgentExclusions,
+		&i.RepoAgents,
+		&i.Title,
+		&i.ResumeOfRunID,
+		&i.LastActivityAt,
+		&i.Health,
+		&i.HealthReason,
+		&i.HealthSince,
+		&i.HealthNotifiedAt,
+		&i.TargetRunID,
+		&i.MrWebUrl,
+		&i.PrdDonePath,
+		&i.PrdPatchSettledAt,
+		&i.AnthropicSecretID,
+		&i.AnthropicSecretLabel,
+		&i.AnthropicSelectReason,
+		&i.AnthropicHeadroomPct,
+		&i.WaitOnLimit,
+		&i.LimitResetsAt,
+		&i.RetryNotBefore,
+		&i.LimitWaitCount,
+		&i.RateLimitType,
+		&i.OpenQuestionID,
+		&i.ReviseCount,
+		&i.PlanSource,
+		&i.PlannedBaseCommit,
+		&i.RequireBaseMatch,
+		&i.MilestonesCandidate,
+		&i.MilestonesFrozen,
+		&i.MilestonesCompleted,
+		&i.MilestonesInProgress,
+		&i.BudgetMaxIterations,
+		&i.BudgetWallSeconds,
+		&i.ScheduleID,
+		&i.LimitDeadSecretID,
+		&i.ReportOnly,
+		&i.ReportMd,
+		&i.CiConfigPaths,
+		&i.Model,
+		&i.OverrideSubagentModel,
+		&i.FailOrigin,
+		&i.Priority,
+		&i.SummaryIntent,
+		&i.SummaryPlan,
+		&i.SummaryDeltas,
+		&i.IssueComments,
+		&i.BaseBranch,
+		&i.OpenMr,
+		&i.DispatchedAt,
+		&i.ReviewTargetRunID,
+		&i.ReviewRequested,
+		&i.ThenFixRequested,
+		&i.ThenFixOfRunID,
+		&i.PreservedPatch,
+		&i.RequiredCapabilities,
+		&i.StopReason,
+		&i.RequiredTools,
+		&i.SizeClass,
+		&i.Interactive,
+		&i.OpenFollowupID,
+		&i.PlanChangedFiles,
+		&i.ScopeCeiling,
+		&i.StatusSince,
+		&i.ReviewComments,
+		&i.BudgetPausedSeconds,
+		&i.MrReworkEnabled,
+		&i.TriggerSource,
+		&i.CheckpointTip,
+		&i.UsageRefolded,
+		&i.CodexSecretID,
+		&i.CodexAuthMode,
+		&i.CodexSecretLabel,
+		&i.CodexAccountKey,
+		&i.CodexMaterialRevision,
+		&i.CodexAccountRevision,
+		&i.CodexClaimEpoch,
+		&i.CodexCapHash,
+		&i.PauseRequestedAt,
+		&i.PauseMode,
+		&i.PauseAfterCount,
+		&i.CheckpointTipAt,
+		&i.RecoveryWaitCount,
+		&i.RecoveryRetryNotBefore,
+		&i.CompletionContractVersion,
+		&i.ContractRevision,
+		&i.CompletionContract,
+		&i.CompletionAttempts,
+		&i.LatestCompletionAttempt,
+		&i.MilestonesAgents,
+		&i.HoldReason,
+		&i.HoldCapturedHead,
+		&i.CompletionBudgetExhaustedAt,
+		&i.CompletionQuestionAt,
+		&i.BudgetExtensionSeconds,
+		&i.ClaimGeneration,
+		&i.Harness,
+		&i.RecoveryWaitCause,
+		&i.ForgeParkCount,
+		&i.CredentialOverrideMode,
+		&i.CredentialOverrideSecretID,
+		&i.ClaimReleasedAt,
+		&i.CredentialSwitchRequestedAt,
+		&i.CredentialSwitchGeneration,
+		&i.StaleRequeueGeneration,
+		&i.BudgetFinalizeSeconds,
+		&i.ReleasedWorkerID,
+		&i.ReleasedWorkerNonce,
+		&i.GateRevision,
+		&i.GatePresentationID,
+		&i.GatePresentedPayload,
+		&i.GatePayloadDigest,
+		&i.GateRefusalCount,
+		&i.GateRefusalGeneration,
+		&i.DiskParkCount,
+		&i.CheckpointContainsLatest,
+		&i.EgressProfileID,
+		&i.EgressSnapshot,
+		&i.JobType,
+		&i.FinalizeResumeGeneration,
+		&i.JobProtocol,
+		&i.FirstStartedAt,
+		&i.PlanCrossCheckRequired,
+		&i.PlanCrossCheckGateReason,
+		&i.IssueRawDigest,
+		&i.IssueSavedBody,
+		&i.IssueInputReason,
+		&i.AutoApproveBlockedReasons,
+		&i.PlanCrossCheckDiffRefusal,
+		&i.WorkerRecoveryEpisode,
+		&i.RequeueEpisodeBaseline,
+		&i.WorkerRecoveryEvidence,
+		&i.CrossCheckLane,
+		&i.CrossCheckLaneGeneration,
+		&i.CompletionFinalHead,
+		&i.CodeCrossCheckRequired,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
+		&i.CiConfigGuard,
+		&i.PolicyRefusalCount,
+		&i.PolicyLastTag,
+		&i.PolicyLastPhase,
+		&i.PolicyLastCorrelationID,
+		&i.PolicyLastRefusedAt,
+		&i.PolicyHoldProvenance,
+		&i.PolicyHoldPublished,
+		&i.PolicyHoldDetail,
+		&i.PolicyLastOutcomeID,
+		&i.PolicyLastSourceGeneration,
+		&i.PolicyFreshClaimGeneration,
+		&i.PolicyStopResolution,
+		&i.PolicyRevisionSource,
+	)
+	return i, err
+}
 
 const getPolicyStopCrossCheck = `-- name: GetPolicyStopCrossCheck :one
 SELECT id, lead_run_id, stage, round, lead_claim_generation, plan_md, milestones, required_capabilities, required_tools, size_class, base_commit, planning_diff, candidate_digest, checker_run_id, checker_harness, checker_model, checker_effort, verdict, reason_class, findings, decided_at, deadline_at, created_at, checker_model_source, checker_effort_source, automatic_revision_limit, automatic_rounds_enabled, interrupted_at, wait_credited, head_commit, outcome, code_context, guidance_snapshot, guidance_text, guidance_digest, repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, dispositions, finalized_at, repo_instructions_commit, revision_disposition, revision_settled_at, revision_superseded_by_stop_input_id FROM cross_checks WHERE id = $1
@@ -112,4 +335,53 @@ func (q *Queries) ListPolicyStopRevisionInputs(ctx context.Context, runID uuid.U
 		return nil, err
 	}
 	return items, nil
+}
+
+const settlePolicyStopCrossCheck = `-- name: SettlePolicyStopCrossCheck :execrows
+UPDATE cross_checks
+SET revision_disposition = 'superseded_by_stop', revision_settled_at = now(),
+    revision_superseded_by_stop_input_id = $1::bigint
+WHERE lead_run_id = $2 AND id = $3 AND stage = 'plan'
+  AND verdict = 'revise' AND decided_at IS NOT NULL
+  AND revision_disposition IS NULL AND revision_settled_at IS NULL
+  AND revision_superseded_by_stop_input_id IS NULL
+`
+
+type SettlePolicyStopCrossCheckParams struct {
+	ScopeInputID int64     `json:"scope_input_id"`
+	RunID        uuid.UUID `json:"run_id"`
+	CrossCheckID uuid.UUID `json:"cross_check_id"`
+}
+
+// Approve association witnesses are deliberately excluded.
+func (q *Queries) SettlePolicyStopCrossCheck(ctx context.Context, arg SettlePolicyStopCrossCheckParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settlePolicyStopCrossCheck, arg.ScopeInputID, arg.RunID, arg.CrossCheckID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const settlePolicyStopRevisionInput = `-- name: SettlePolicyStopRevisionInput :execrows
+UPDATE run_user_inputs
+SET disposition = 'superseded_by_stop', settled_at = now(),
+    superseded_by_stop_input_id = $1::bigint
+WHERE run_id = $2 AND id = $3::bigint AND kind = 'revise_plan'
+  AND applied_at IS NULL AND included_at IS NULL AND settled_at IS NULL
+  AND disposition IS NULL AND superseded_by_stop_input_id IS NULL
+`
+
+type SettlePolicyStopRevisionInputParams struct {
+	ScopeInputID int64     `json:"scope_input_id"`
+	RunID        uuid.UUID `json:"run_id"`
+	InputID      int64     `json:"input_id"`
+}
+
+// Caller holds the parent run lock and visits manifest input IDs in ascending order.
+func (q *Queries) SettlePolicyStopRevisionInput(ctx context.Context, arg SettlePolicyStopRevisionInputParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settlePolicyStopRevisionInput, arg.ScopeInputID, arg.RunID, arg.InputID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

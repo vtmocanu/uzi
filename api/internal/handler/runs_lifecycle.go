@@ -937,7 +937,12 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		var mismatch *workersvc.GateRevisionMismatchError
+		var stopConflict *workersvc.PolicyStopReviewConflict
 		switch {
+		case errors.As(err, &stopConflict):
+			httpx.ErrorReason(w, http.StatusConflict, "Stop requires the exact reviewed feedback confirmation; upgrade your client if needed, refetch the review and confirm again", stopConflict.Reason)
+		case errors.Is(err, workersvc.ErrRunNotOwned):
+			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrStaleClaim):
 			httpx.Error(w, http.StatusConflict, "policy hold changed; upgrade your client and refetch the presented action")
 		case errors.Is(err, workersvc.ErrReconciliationRequired):
@@ -1068,7 +1073,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	if len(res.ExcludedGuardRoles) > 0 {
 		h.notifyGuardRoleExcluded(r.Context(), user.ID, id, res.ExcludedGuardRoles)
 	}
-	resp := apitypes.RunInputResponse{ServerSide: res.ServerSide}
+	resp := apitypes.RunInputResponse{ServerSide: res.ServerSide, PolicyStop: res.PolicyStop}
 	// A follow_up write returns the created row (PRD #95 S2) so the web's optimistic
 	// queue entry adopts the real id + timestamp. follow_up is never server-side (only
 	// cancel/reject are), so res.ID/CreatedAt are the freshly-inserted row here.

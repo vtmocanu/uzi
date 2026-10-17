@@ -101,6 +101,28 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if err != nil {
 		return SubmitInputResult{}, err
 	}
+	// A Stop token always identifies this transaction, including an accepted replay
+	// after the run moved. Never fall through to an ordinary scope write.
+	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || PolicyOwnerConstrained(run)) {
+		if opts.ExpectedGateRevision != nil {
+			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
+		}
+		if sel != nil {
+			return SubmitInputResult{}, ErrInvalidSelection
+		}
+		if opts.Reconciliation != nil || opts.OverrideCapabilities || opts.DiscardPendingOutcome || opts.ExpectedResetStateDigest != "" {
+			return SubmitInputResult{}, stopReviewConflict("policy_stop_options_invalid")
+		}
+		accepted, err := s.confirmPolicyStop(ctx, userID, runID, opts.ActionIfMatch, body)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		ceiling := accepted.ScopeCeiling
+		return SubmitInputResult{ScopeCeiling: &ceiling, Resumed: accepted.Resumed, PolicyStop: accepted.Receipt}, nil
+	}
+	if len(run.PolicyStopResolution) != 0 && (gateVerdictKind(kind) || kind == "scope") {
+		return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
+	}
 	if opts.Reconciliation != nil {
 		if kind != "approve_plan" {
 			return SubmitInputResult{}, ErrReconciliationConflict
@@ -136,15 +158,6 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 	if sel != nil && kind != "approve_plan" {
 		return SubmitInputResult{}, fmt.Errorf("%w: an agent selection is only valid when approving a plan", ErrInvalidSelection)
-	}
-	if kind == "stop" && run.Status == "paused" && PolicyOwnerConstrained(run) {
-		reason, _ := stripNUL(body)
-		resumed, err := s.resumePolicyOwnerAction(ctx, userID, runID, opts.ActionIfMatch, PolicyResumeRequest{Mode: "preserve"}, &reason, &run)
-		if err != nil {
-			return SubmitInputResult{}, err
-		}
-		c := int(resumed.ScopeCeiling.Int32)
-		return SubmitInputResult{ScopeCeiling: &c, Resumed: true}, nil
 	}
 	// PRD #84 M4 4c: the AUTHORITATIVE capability approval gate runs here for EVERY
 	// approve_plan — both the selection-bearing dispatch and the nil-selection plain-enqueue
@@ -1137,6 +1150,9 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		}
 		if current.UserID != run.UserID {
 			return SubmitInputResult{}, ErrRunNotFound
+		}
+		if len(current.PolicyStopResolution) != 0 {
+			return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
 		}
 		priorFrozen, _ := canonicalRawJSON(run.MilestonesFrozen)
 		currentFrozen, _ := canonicalRawJSON(current.MilestonesFrozen)

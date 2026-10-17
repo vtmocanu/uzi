@@ -61,19 +61,22 @@ func checkExpectedGateRevision(run store.Run, expected int64) error {
 	return &GateRevisionMismatchError{Expected: expected, Current: run.GateRevision}
 }
 
-// reviseNotWritten resolves a revise_plan write that affected no row, where a second cause
-// (the revision cap) can refuse a verdict whose expected revision still matches. With no expected
-// revision it returns ErrReviseCapReached (the only refusal then). With one it re-reads the run: a
+// reviseNotWritten resolves a revise_plan write that affected no row. An accepted Stop
+// refuses later revision writes, including callers without an expected revision. Otherwise,
+// an unbound request returns ErrReviseCapReached. A bound request re-reads the run: a
 // mismatch is answered as *GateRevisionMismatchError; a run that matches answers the cap only when
 // the cap is actually spent. A matching run whose cap is NOT spent lost a race with a
 // re-presentation at the same revision (the write did not happen), so it is a mismatch too.
 func (s *Service) reviseNotWritten(ctx context.Context, userID, runID uuid.UUID, expected *int64) error {
-	if expected == nil {
-		return ErrReviseCapReached
-	}
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return err
+	}
+	if len(run.PolicyStopResolution) != 0 {
+		return stopReviewConflict("policy_stop_gate_resolved")
+	}
+	if expected == nil {
+		return ErrReviseCapReached
 	}
 	if err := checkExpectedGateRevision(run, *expected); err != nil {
 		return err
