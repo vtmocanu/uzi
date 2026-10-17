@@ -187,7 +187,7 @@ func TestActionTransportMetadataExcludedFromJSON(t *testing.T) {
 
 func TestActionTransportAuthAndUnprocessableError(t *testing.T) {
 	posts := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		posts++
 		cookie, err := r.Cookie("session")
 		if r.Method != http.MethodPost || r.URL.Path != "/api/runs/r1/credential" ||
@@ -210,7 +210,7 @@ func TestActionTransportAuthAndUnprocessableError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jar.SetCookies(u, []*http.Cookie{{Name: "session", Value: "cookie-fixture"}})
+	jar.SetCookies(u, []*http.Cookie{{Name: "session", Value: "cookie-fixture", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode}})
 	c.HTTP.Jar = jar
 	_, _, err = c.SetRunCredential(context.Background(), "r1", SetRunCredentialOverride{Mode: "auto", ActionIfMatch: `"captured"`})
 	if ExitCodeFor(err) != ExitUsage || posts != 1 {

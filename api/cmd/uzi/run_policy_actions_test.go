@@ -301,6 +301,7 @@ func TestRunPolicyServerErrorsAndSanitizedWarnings(t *testing.T) {
 			}
 		})
 	}
+	// #nosec G101 -- SetTokenWarning is untrusted display text, not a credential.
 	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": policyCommandFixture()}, SetTokenWarning: "warning\x1b[31m text\x00"}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "set-token", "r1", "--auto", "--json")
 	if code != 0 || !json.Valid([]byte(out)) || strings.ContainsAny(stderr, "\x1b\x00") {
