@@ -150,6 +150,7 @@ func TestHealthCodeCrossCheckStableTicksAndTransitions(t *testing.T) {
 			r.Kind = runkind.Issue
 			// An expired cooldown makes a mistaken leftPin classification observable.
 			r.HealthNotifiedAt = ago(24 * time.Hour)
+			originalNotifiedAt := r.HealthNotifiedAt
 			st := defaultHealthSettings()
 			st.toolCall = 60
 			fs, svc, b := nudgeSvc(t, r, st)
@@ -161,16 +162,30 @@ func TestHealthCodeCrossCheckStableTicksAndTransitions(t *testing.T) {
 				t.Fatalf("first=%+v nudges=%v", first, b.healthNudges)
 			}
 			r.Health, r.HealthReason, r.HealthSince = first.Health, first.HealthReason, first.HealthSince
+			// Model SetRunHealth's COALESCE(new stamp, persisted stamp).
+			if first.HealthNotifiedAt.Valid {
+				r.HealthNotifiedAt = first.HealthNotifiedAt
+			}
 			fs.active[0] = r
 			if n := svc.detectRunHealth(context.Background(), t0.Add(30*time.Second)); n != 0 || len(fs.writes) != 1 {
 				t.Fatalf("stable tick changed=%d writes=%d", n, len(fs.writes))
 			}
-			if !fs.active[0].HealthNotifiedAt.Time.Equal(r.HealthNotifiedAt.Time) {
+			if !fs.active[0].HealthNotifiedAt.Valid || !fs.active[0].HealthNotifiedAt.Time.Equal(originalNotifiedAt.Time) {
 				t.Fatal("prior notification lost")
 			}
 			now := t0.Add(time.Minute)
+			if exit == "removal" || exit == "error" {
+				now = t0.Add(45 * time.Second)
+				if !deadline.Time.After(now) {
+					t.Fatal("removal/error must terminate waiting before deadline expiry")
+				}
+			}
 			want, reason := healthStalled, reasonStalled
 			switch exit {
+			case "expiry":
+				if !deadline.Time.Equal(now) {
+					t.Fatal("expiry must terminate waiting at deadline equality")
+				}
 			case "removal":
 				delete(fs.liveCodeCrossCheckDeadlines, r.ID)
 			case "error":
@@ -196,6 +211,13 @@ func TestHealthCodeCrossCheckStableTicksAndTransitions(t *testing.T) {
 			w := lastWrite(t, fs, r.ID)
 			if w.Health != want || (reason != "" && w.HealthReason.String != reason) || w.HealthNotifiedAt.Valid || b.healthNudges[len(b.healthNudges)-1] {
 				t.Fatalf("transition=%+v nudges=%v", w, b.healthNudges)
+			}
+			r.Health, r.HealthReason, r.HealthSince = w.Health, w.HealthReason, w.HealthSince
+			if w.HealthNotifiedAt.Valid {
+				r.HealthNotifiedAt = w.HealthNotifiedAt
+			}
+			if !r.HealthNotifiedAt.Valid || !r.HealthNotifiedAt.Time.Equal(originalNotifiedAt.Time) {
+				t.Fatalf("transition notification=%+v want preserved %+v", r.HealthNotifiedAt, originalNotifiedAt)
 			}
 			switch want {
 			case healthWaitingWorker:
