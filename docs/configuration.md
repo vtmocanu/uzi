@@ -544,7 +544,7 @@ recovery limitations.
 
 To disable operationally, turn off the worker flag and restart/roll workers;
 preserve existing holds, episode accounting and retained source. Migration
-00341 Down is destructive schema rollback: it fails memory-held runs as
+00342 Down is destructive schema rollback: it fails memory-held runs as
 `worker_lost` and drops intervention history and episode columns. It is not
 an operational disable procedure.
 
