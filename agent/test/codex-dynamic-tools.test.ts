@@ -34,6 +34,21 @@ describe("Codex runtime discovery", () => {
   });
 });
 
+describe("issue3089 owner request dynamic schema", () => {
+  for (const isRoot of [true, false]) for (const ownerDecisionRequested of [true, false]) {
+    it(`advertises only eligible root request ${isRoot}/${ownerDecisionRequested}`, () => {
+      const spec = buildCodexDynamicTools({ ...grants(["signal_done"]), isRoot, ownerDecisionRequested })[0]!;
+      const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+      const request = props.owner_decision_requested;
+      assert.equal(Boolean(request), isRoot && ownerDecisionRequested);
+      if (request) {
+        assert.equal(request.additionalProperties, false);
+        assert.deepEqual(request.required, ["reason"]);
+      }
+    });
+  }
+});
+
 describe("m1 non-closing dynamic schema", () => {
   it("requires a string reason structurally without a raw maxLength cap", () => {
     const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;

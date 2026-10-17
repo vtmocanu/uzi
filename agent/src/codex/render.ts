@@ -453,6 +453,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const lead: ResolvedCodexModel = { model: requestModel, modelReasoningEffort: requestEffort };
 
   const leadGrants: RunGrants = {
+    ownerDecisionRequested: request.ownerDecisionRequested,
     role: LEAD_ROLE,
     phase: request.phase,
     allowedTools: sortedSet([

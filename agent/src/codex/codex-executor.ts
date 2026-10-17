@@ -80,6 +80,7 @@ import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
   completionAttemptFingerprint,
   updateCompletionStreak,
@@ -108,7 +109,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3064,9 +3065,11 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       let completionAttempted = false;
       let completionHeld: { reason: string } | undefined;
+      let walledAtRequest = false;
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
+      let completionAnswered = false;
       // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
@@ -3242,11 +3245,14 @@ export class CodexExecutor implements Executor {
         // implement prompt only. It is a per-turn prefix (outside the owner follow-up's fence) so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
-        // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
-        // the clarification continuation below) carries the shared milestone tracker guidance.
+        // Ordinary work and clarification turns retain the milestone tracker. A completion
+        // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
-        const systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        let systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
+          systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}`;
+        }
         if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
         const onOwnerFirstEvent = ownerRides
@@ -3271,12 +3277,13 @@ export class CodexExecutor implements Executor {
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = systemFollowUp !== undefined
-          ? withMilestoneNote(systemFollowUp, milestoneNote())
+          ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
           : implementBody;
         completionFollowUp = undefined;
+        completionAnswered = false;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
@@ -3448,12 +3455,15 @@ export class CodexExecutor implements Executor {
           reapedSinceLastPersist = true;
           await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const { unmet } = await ctx.recordCompletionAttempt!({
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
           });
           completionAttempted = true;
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           if (unmet.length === 0) {
             const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
             if (codeDecision?.action === "repair") {
@@ -3466,22 +3476,82 @@ export class CodexExecutor implements Executor {
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;
-          let guidance: string | undefined;
-          if (completionStallStreak >= STALL_LIMIT) {
-            const decision = await ctx.askCompletionQuestion?.(unmet);
+          let answer: { kind: "answered"; guidance?: string } | undefined;
+          const leadRequest = result.ownerDecisionRequested;
+          const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
+            if (!leadRequest) return false;
+            const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
+            liftWall(wall, fresh?.totalWallSeconds ?? fresh?.wallSeconds);
+            // Preserve Codex's budget-before-pause precedence.
+            const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
+              : iteration >= maxIterations ? REASON_MAX_ITERATIONS
+              : wall.remainingMs <= 0 || ctx.pauseModeRequested?.() === "wall" ? REASON_WALL : undefined;
+            if (bound) {
+              if (await routeHold(bound, true)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: bound };
+                return true;
+              }
+              if (bound === REASON_WALL) {
+                const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+                const pauseToken = pauseNow.capture();
+                const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
+                if (outcome === "parked") {
+                  walledAtRequest = true;
+                  return true;
+                }
+                if (outcome === "refused") {
+                  refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
+                  return false;
+                }
+              }
+              throw new Error(bound);
+            }
+            if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
+              const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+              const pauseToken = pauseNow.capture();
+              if (await this.requestPause(ctx, at)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                pausedAt = at;
+                return true;
+              }
+              pauseNow.consume(pauseToken);
+            }
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            return false;
+          };
+          if (await checkRequestBoundary()) {
+            if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+            break;
+          }
+          if (leadRequest || completionStallStreak >= STALL_LIMIT) {
+            const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
+            const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
+              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            // A timeout keeps the question open; do not report running to resolve it.
+            if (await checkRequestBoundary(decision?.outcome === "continue")) {
+              if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+              break;
+            }
             if (decision?.outcome === "continue") {
-              guidance = decision.guidance;
+              answer = { kind: "answered", guidance: decision.guidance };
               lastCompletionFingerprint = undefined;
               completionStallStreak = 0;
             } else {
-              if (await routeHold(REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
-                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+              if (await routeHold(holdReason, completionAttempted)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: holdReason };
                 break;
               }
-              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+              throw new Error(holdReason);
             }
           }
-          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
+          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, answer,
+            ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
+          completionAnswered = answer !== undefined;
           if (iteration >= maxIterations) pendingIterationExhaustion = true;
           // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
           epochNeedsRecreate = true;
@@ -4735,6 +4805,7 @@ export class CodexExecutor implements Executor {
       prompt,
       systemPrompt,
       phase,
+      ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
       nonInteractiveIssue: parkRunEligible(ctx, phase),
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
@@ -4838,7 +4909,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${body}\n\n${review}` : body;
     const restoredState = ctx.reviewedPlanResume === true && !ctx.sessionId ? `${CURRENT_EXECUTION_STATE_GUIDANCE}\n\n` : "";
-    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}`;
+    const completionGuidance = ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive
+      ? `\n\n${COMPLETION_CONTRACT_GUIDANCE}` : "";
+    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}${completionGuidance}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);

@@ -130,6 +130,7 @@ import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
   completionAttemptFingerprint,
   updateCompletionStreak,
@@ -602,6 +603,7 @@ interface TurnResult {
   decisionsMemo?: string;
   /** Latest accepted declaration that an issue delivery leaves the issue open. */
   nonClosing?: { reason: string };
+  ownerDecisionRequested?: { reason: string };
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -1535,6 +1537,7 @@ export class SdkExecutor implements Executor {
     let signalParkRun = false;
     const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
       buildSignalMcpServer({
+        ownerDecisionRequested: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -2602,6 +2605,7 @@ export class SdkExecutor implements Executor {
       // remediation): worker-authored turn prompts that own the next implement turn outright.
       // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
       let followUp: string | undefined;
+      let completionRework: { text: string; answered: boolean } | undefined;
       // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
       // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
@@ -2882,8 +2886,10 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
-        if (followUp === undefined) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
-        const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
+        const reworkForTurn = completionRework;
+        completionRework = undefined;
+        if (followUp === undefined && !reworkForTurn) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
+        const ownerRides = followUp === undefined && !reworkForTurn ? ownerFollowUp : undefined;
         const onFirstEvent = ownerRides
           ? () => {
               if (ownerFollowUp?.id !== ownerRides.id) return;
@@ -2928,7 +2934,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          checkedContext + buildImplementPrompt({
+          (reworkForTurn?.answered ? "" : checkedContext) + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -2961,6 +2967,8 @@ export class SdkExecutor implements Executor {
             // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
             followUp: followUp ?? ownerRides?.body,
+            completionRework: reworkForTurn,
+            ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn
             // could not have. Correct on the revise path too: the join runs after the LAST
@@ -3196,6 +3204,7 @@ export class SdkExecutor implements Executor {
               state.tripReason = undefined;
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
             throw err;
@@ -3206,6 +3215,7 @@ export class SdkExecutor implements Executor {
               total: frozenMilestones?.length,
             };
             if (await handlePauseNow(at)) break;
+            completionRework = reworkForTurn;
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3248,6 +3258,7 @@ export class SdkExecutor implements Executor {
               this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
           }
@@ -3471,6 +3482,8 @@ export class SdkExecutor implements Executor {
             //    use; the session transcript survives on disk so the SAME session resumes.
             await this.closeAndSettlePlanSummary();
             await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
             //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
             //    fingerprint is unresolvable — then head is null too, which the server accepts).
@@ -3485,6 +3498,8 @@ export class SdkExecutor implements Executor {
             //    milestones_completed, recomputes unmet over the merged set (server authoritative)
             //    and records a bounded attempt. Pass only this turn's declaration — the server
             //    unions it with prior report_progress.
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const { unmet } = await ctx.recordCompletionAttempt({
               declared: turn.milestonesCompleted ?? [],
               head,
@@ -3494,6 +3509,8 @@ export class SdkExecutor implements Executor {
             // arms once at least one attempt has actually completed. A thrown attempt call leaves
             // this false, so the run fails legacy-style (no hold), which is correct.
             completionAttempted = true;
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
             if (unmet.length === 0) {
@@ -3521,15 +3538,81 @@ export class SdkExecutor implements Executor {
               completionStallStreak,
             );
             lastCompletionFingerprint = completionFingerprint;
-            if (completionStallStreak >= STALL_LIMIT) {
-              // No progress across STALL_LIMIT identical completion attempts. The run is
-              // STRUCTURALLY blocked (not resource-exhausted): this is the completion-question
+            const leadRequest = turn.ownerDecisionRequested;
+            const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
+              if (!leadRequest) return false;
+              // Refresh the running ACK at the current iteration; this is not another model turn.
+              const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
+              const wallSeconds = fresh?.totalWallSeconds ?? fresh?.wallSeconds;
+              if (typeof wallSeconds === "number" && wallSeconds * 1000 > maxServedWallMs) {
+                state.wallRemainingMs += wallSeconds * 1000 - maxServedWallMs;
+                maxServedWallMs = wallSeconds * 1000;
+              }
+              const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: frozenMilestones?.length };
+              // Preserve Claude's pause-before-budget precedence.
+              if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
+                if (ctx.pauseModeRequested?.() === "wall") {
+                  const stopped = await handlePauseNow(at);
+                  if (!stopped && !ctx.parkForWall) throw new Error(REASON_WALL);
+                  return stopped;
+                }
+                if (await this.requestPause(ctx, at)) {
+                  if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  pausedAt = at;
+                  return true;
+                }
+              }
+              const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
+                : iteration >= maxIterations ? REASON_MAX_ITERATIONS
+                : state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
+              if (bound) {
+                if (await this.routeSummaryHold(ctx, bound, true)) {
+                  if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  completionHeld = { reason: bound };
+                  return true;
+                }
+                if (bound === REASON_WALL) {
+                  const outcome = await this.parkForWall(ctx, at);
+                  if (outcome === "parked" || outcome === "undeliverable") {
+                    walled = { reason: REASON_WALL };
+                    return true;
+                  }
+                  if (outcome === "cancelled" || ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  if (outcome === "refused") {
+                    ctx.clearWallMode?.();
+                    this.throwIfTerminal(ctx);
+                    state.tripReason = undefined;
+                    throwIfDiskStop(ctx);
+                    return false;
+                  }
+                }
+                throw new Error(bound);
+              }
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              return false;
+            };
+            if (await checkRequestBoundary()) break;
+            if (leadRequest || completionStallStreak >= STALL_LIMIT) {
+              const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
+              // An explicit lead request or STALL_LIMIT identical completion attempts opens
+              // the completion-question window with the actual trigger. This is the completion-question
               // moment (PRD #1226 M5 D6) — "completion is blocked; owner, continue with guidance or
               // let it park?". When the LIVE-window seam is wired, ask the owner and give them up to
               // completion_hold_window_seconds (default 900s) to answer BEFORE parking; when it is
               // NOT wired the behaviour is byte-for-byte the M4 direct-park below.
               if (completionAttempted && ctx.askCompletionQuestion) {
-                const decision = await ctx.askCompletionQuestion(unmet);
+                this.throwIfTerminal(ctx);
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                const decision = await ctx.askCompletionQuestion(unmet, leadRequest
+                  ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+                this.throwIfTerminal(ctx);
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                // A timeout keeps the question open; do not report running to resolve it.
+                if (await checkRequestBoundary(decision.outcome === "continue")) break;
                 if (decision.outcome === "continue") {
                   // The owner answered within the window: resume the SAME session for another
                   // completion attempt, folding any guidance into the rework follow-up, and RESET
@@ -3540,16 +3623,15 @@ export class SdkExecutor implements Executor {
                     kind: "status",
                     agent: "worker",
                     payload: {
-                      text: decision.guidance
-                        ? "owner chose to continue with guidance — resuming for another completion attempt"
-                        : "owner chose to continue — resuming for another completion attempt",
+                      text: "owner answered — resuming for a server-authoritative completion recheck",
                     },
                   });
-                  followUp = buildCompletionReworkFollowUp(
-                    unmet,
-                    frozenMilestones,
-                    decision.guidance,
-                  );
+                  followUp = undefined;
+                  completionRework = {
+                    text: buildCompletionReworkFollowUp(unmet, frozenMilestones,
+                      { kind: "answered", guidance: decision.guidance }),
+                    answered: true,
+                  };
                   resetStallState(); // owner input is new input → breaks any #281 refusal streak
                   lastCompletionFingerprint = undefined;
                   completionStallStreak = 0;
@@ -3567,20 +3649,21 @@ export class SdkExecutor implements Executor {
                 kind: "status",
                 agent: "worker",
                 payload: {
-                  text: `completion blocked: ${unmet.length} frozen milestone(s) still not complete after ${completionStallStreak} attempts with no progress`,
+                  text: leadRequest ? `completion blocked: lead requested an owner decision with ${unmet.length} unmet frozen milestone(s)` : `completion blocked: ${unmet.length} frozen milestone(s) still not complete after ${completionStallStreak} attempts with no progress`,
                 },
               });
               if (
                 await this.routeSummaryHold(
                   ctx,
-                  REASON_COMPLETION_NO_PROGRESS,
+                  holdReason,
                   completionAttempted,
                 )
               ) {
-                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                completionHeld = { reason: holdReason };
                 break;
               }
-              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+              throw new Error(holdReason);
             }
             // Progress is still possible: inject the unmet ids as an AUTONOMOUS same-session
             // follow-up (like a queued owner follow-up, NOT the interactive owner
@@ -3595,7 +3678,12 @@ export class SdkExecutor implements Executor {
                 text: `completion check: ${unmet.length} frozen milestone(s) not yet complete (${unmet.join(", ")}) — returning to the lead`,
               },
             });
-            followUp = buildCompletionReworkFollowUp(unmet, frozenMilestones);
+            followUp = undefined;
+            completionRework = {
+              text: buildCompletionReworkFollowUp(unmet, frozenMilestones, undefined,
+                ctx.completionInterlock === true && isIssueRun && !ctx.interactive),
+              answered: false,
+            };
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
             continue;
@@ -4255,6 +4343,7 @@ export class SdkExecutor implements Executor {
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
       const request: RunTurnRequest = {
+        ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
         // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which

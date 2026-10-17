@@ -35,6 +35,7 @@ import {
   type PrDescriptionVersionDTO,
   type RawPrDescriptionFields,
   type ClaimRequest,
+  type ClaimConfig,
   type PublishResponse,
   type HeldPublicationResponse,
   type PublishResult,
@@ -1022,6 +1023,7 @@ export interface CompletionPermit {
   head: string;
   issuedAt: string;
   findingIds: string[];
+  completionScope?: ClaimConfig["completion_scope"];
 }
 
 /** The completion-permit endpoint's decision (PRD #1226 M4, D5), mapped from
@@ -3354,6 +3356,8 @@ export class WorkerClient {
         head: res.permit.head,
         issuedAt: res.permit.issued_at,
         findingIds: res.permit.finding_ids ?? [],
+        ...(res.permit.completion_scope !== undefined
+          ? { completionScope: res.permit.completion_scope } : {}),
       };
     }
     return result;

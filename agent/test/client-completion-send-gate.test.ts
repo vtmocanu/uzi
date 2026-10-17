@@ -119,6 +119,14 @@ const ATTEMPT_ARGS = (claimGeneration?: number): {
   claimGeneration?: number;
 } => ({ milestonesCompleted: ["m1"], head: "head-sha", worktreeFingerprint: "fp-1", claimGeneration });
 
+const PERMIT_GRANTED = {
+  granted: true,
+  permit: {
+    id: "permit-test", contract_revision: 2, branch: "agent/issue-1", head: "head-sha",
+    issued_at: "2026-10-17T00:00:00Z", finding_ids: [], completion_scope: {},
+  },
+};
+
 const PERMIT_ARGS = (claimGeneration?: number): {
   contractRevision: number;
   branch: string;
@@ -263,7 +271,7 @@ describe("recordCompletionAttempt send-gate (PRD #1247 fix round)", () => {
 // ── requestCompletionPermit ──────────────────────────────────────────────────────────
 describe("requestCompletionPermit send-gate (PRD #1247 fix round)", () => {
   it("a credential_switch_v1 worker (no cached feature) STAMPS a gen>0 permit request", async () => {
-    const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: { granted: true } }));
+    const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: PERMIT_GRANTED }));
     try {
       const client = await capabilityClient(srv.url);
       const r = await client.requestCompletionPermit("run-1", PERMIT_ARGS(3));
@@ -277,7 +285,7 @@ describe("requestCompletionPermit send-gate (PRD #1247 fix round)", () => {
   });
 
   it("a non-capability worker (no feature) OMITS the field even for gen>0", async () => {
-    const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: { granted: true } }));
+    const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: PERMIT_GRANTED }));
     try {
       const client = await bareClient(srv.url);
       await client.requestCompletionPermit("run-1", PERMIT_ARGS(5));
@@ -296,7 +304,7 @@ describe("requestCompletionPermit send-gate (PRD #1247 fix round)", () => {
     const srv = await completionServer({ worker_id: "w1" }, (_endpoint, body) => {
       if (!rolledForward && "claim_generation" in body) return STRICT_DECODE_400;
       issued += 1;
-      return { status: 200, body: { granted: true } };
+      return { status: 200, body: PERMIT_GRANTED };
     });
     try {
       const client = await capabilityClient(srv.url);
@@ -331,7 +339,7 @@ describe("requestCompletionPermit send-gate (PRD #1247 fix round)", () => {
       (_endpoint, body) => {
         if ("claim_generation" in body) return STRICT_DECODE_400;
         issued += 1;
-        return { status: 200, body: { granted: true } };
+        return { status: 200, body: PERMIT_GRANTED };
       },
     );
     try {
@@ -528,7 +536,7 @@ describe("requestCompletionHold send-gate (PRD #1247 fix round)", () => {
 describe("completion permit scope opt-in", () => {
   for (const scopeCapped of [undefined, false, true]) {
     it(`serializes scope_capped only for true (input ${scopeCapped})`, async () => {
-      const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: { granted: true } }));
+      const srv = await completionServer({ worker_id: "w1" }, () => ({ status: 200, body: PERMIT_GRANTED }));
       try {
         const c = await bareClient(srv.url);
         await c.requestCompletionPermit("run-1", { ...PERMIT_ARGS(), scopeCapped });
@@ -545,7 +553,7 @@ describe("completion permit scope opt-in", () => {
   for (const fenced of [false, true]) {
     it(`never downgrades when an older strict server rejects scope_capped (fenced ${fenced})`, async () => {
       const srv = await completionServer({ worker_id: "w1" }, (_endpoint, body) =>
-        "scope_capped" in body ? STRICT_DECODE_400 : { status: 200, body: { granted: true } });
+        "scope_capped" in body ? STRICT_DECODE_400 : { status: 200, body: PERMIT_GRANTED });
       try {
         const c = fenced ? await capabilityClient(srv.url) : await bareClient(srv.url);
         await assert.rejects(

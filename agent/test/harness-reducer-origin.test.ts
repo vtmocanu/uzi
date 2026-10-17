@@ -27,7 +27,7 @@ function assistant(text: string, markers: Record<string, unknown> = {}): Record<
   };
 }
 
-async function reduceRaw(frames: Record<string, unknown>[]) {
+async function reduceRaw(frames: Record<string, unknown>[], ownerDecisionRequested = false) {
   const queryFn = (() => (async function* () { for (const frame of frames) yield frame; })()) as unknown as SdkQueryFn;
   const harness = new ClaudeHarness({
     queryFn, spawn: () => ({ pid: undefined }), kill: () => true, log: nullLogger(),
@@ -41,12 +41,30 @@ async function reduceRaw(frames: Record<string, unknown>[]) {
   let contextRequests = 0;
   reducer.beginTurn();
   const messages = [];
-  for await (const event of harness.startTurn(request).events) {
+  for await (const event of harness.startTurn({ ...request, ownerDecisionRequested }).events) {
     messages.push(...(await reducer.accept(event)).messages);
   }
   return { result: reducer.finish({ kind: "exhausted" }).result, messages, contextRequests };
 }
 
+
+test("issue3089 stream admission and accepted-done request fold", async () => {
+  const done = (input: unknown, markers = {}) => ({ type: "assistant", ...markers, message: {
+    content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input }],
+  } });
+  const accepted = done({ owner_decision_requested: { reason: " first " } });
+  const rejected = done({ owner_decision_requested: null, summary: "LEAK" });
+  const kept = await reduceRaw([accepted, rejected], true);
+  assert.equal(kept.result.done, true);
+  assert.deepEqual(kept.result.ownerDecisionRequested, { reason: "first" });
+  assert.equal(kept.result.summary, undefined);
+  assert.equal((await reduceRaw([accepted, done({})], true)).result.ownerDecisionRequested, undefined);
+  assert.equal((await reduceRaw([accepted])).result.ownerDecisionRequested, undefined);
+  assert.equal((await reduceRaw([rejected])).result.done, true);
+  assert.equal((await reduceRaw([done({ owner_decision_requested: { reason: "child" } },
+    { parent_tool_use_id: "child" })], true)).result.done, false);
+  assert.equal((await reduceRaw([done({})], true)).result.ownerDecisionRequested, undefined, "new turn starts empty");
+});
 
 test("m1 non-closing reducer keeps latest valid reason through omission and rejection", async () => {
   const done = (input: unknown) => ({ type: "assistant", message: { content: [{ type: "tool_use", name: "mcp__uzi__signal_done", input }] } });

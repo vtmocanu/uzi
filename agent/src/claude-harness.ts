@@ -343,7 +343,7 @@ export class ClaudeHarness implements RunHarness {
       msg: unknown,
       latest: RateLimitObservation | undefined,
       leg: UsageLeg | undefined,
-    ): HarnessEvent | undefined => this.decode(msg, latest, leg);
+    ): HarnessEvent | undefined => this.decode(msg, latest, leg, request.ownerDecisionRequested === true);
     const setReader = (qi: SdkQueryInstance): void => {
       this.ctxReader = () => readLeadContext(qi, deps.contextUsageTimeoutMs);
     };
@@ -399,6 +399,7 @@ export class ClaudeHarness implements RunHarness {
     msg: unknown,
     latest: RateLimitObservation | undefined,
     leg: UsageLeg | undefined,
+    ownerDecisionRequested: boolean,
   ): HarnessEvent | undefined {
     const rec = asRecord(msg);
     if (rec?.["type"] === "stream_event") {
@@ -444,7 +445,7 @@ export class ClaudeHarness implements RunHarness {
         model: assistantModelOf(msg),
         // Main-thread-gated raw signal envelope (scanSignals returns {} for a
         // subagent frame); the reducer additionally gates the fold on origin.
-        signals: scanSignals(msg) as Readonly<Partial<TurnSignals>>,
+        signals: scanSignals(msg, { ownerDecisionRequested }) as Readonly<Partial<TurnSignals>>,
         assistantAuthored: true,
         sessionId,
         orphanInstanceFrameKind,
@@ -469,7 +470,7 @@ export class ClaudeHarness implements RunHarness {
         attribution: decodeAttribution(rec),
         items,
         // Non-assistant frames carry no signals (scanSignals returns {}).
-        signals: scanSignals(msg) as Readonly<Partial<TurnSignals>>,
+        signals: scanSignals(msg, { ownerDecisionRequested }) as Readonly<Partial<TurnSignals>>,
         sessionId,
         orphanInstanceFrameKind,
       };

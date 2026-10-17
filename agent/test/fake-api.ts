@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
+  CompletionPermitResponse,
   OutgoingMessage,
   RunOrphanClassificationResponse,
   StateRequest,
@@ -382,13 +383,18 @@ export class FakeApi {
   // Issue #1600: the budget_total_seconds / budget_used_seconds the wall-park RunDTO carries.
   private wallParkBudget: { total?: number; used?: number } | undefined;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
-  // a configurable decision — {granted:true} by default, or {granted:false, deny_reason} — at a
+  // a configurable decision — a revision-bound grant by default, or {granted:false, deny_reason} — at a
   // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
   // from the granted:false denial which is a normal 200 body).
   readonly completionPermitRequests: Array<{
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  /** Opt-in raw HTTP fixtures; exercise the real WorkerClient mapping, not a patched result. */
+  completionPermitWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
+  completionAttemptWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
+  readonly completionAttemptRequests: Record<string, unknown>[] = [];
+  completionPermitScope: NonNullable<CompletionPermitResponse["permit"]>["completion_scope"] = {};
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
@@ -1477,6 +1483,12 @@ export class FakeApi {
     // PRD #1226 M4 (D5): the completion-permit endpoint. Records the request and answers the
     // configured decision. A non-200 httpStatus models a transport/HTTP error (the client throws);
     // otherwise {granted} rides a 200, with deny_reason on a denial.
+    const attemptMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/attempt$/.exec(p);
+    if (req.method === "POST" && attemptMatch && this.completionAttemptWire) {
+      this.completionAttemptRequests.push(json);
+      return send(res, 200, this.completionAttemptWire(json));
+    }
+
     const permitMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/permit$/.exec(p);
     if (req.method === "POST" && permitMatch) {
       const runId = permitMatch[1] as string;
@@ -1487,7 +1499,13 @@ export class FakeApi {
       if (this.completionPermitHttpStatus !== 200 && failing) {
         return send(res, this.completionPermitHttpStatus, { error: "injected permit failure" });
       }
+      if (this.completionPermitWire) return send(res, 200, this.completionPermitWire(json));
       const body: Record<string, unknown> = { granted: this.completionPermitGranted };
+      if (this.completionPermitGranted) body.permit = {
+        id: `permit-${runId}`, contract_revision: json.contract_revision,
+        branch: json.branch, head: json.head, issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
+        ...(this.completionPermitScope !== undefined ? { completion_scope: this.completionPermitScope } : {}),
+      };
       if (!this.completionPermitGranted && this.completionPermitDenyReason !== undefined) {
         body["deny_reason"] = this.completionPermitDenyReason;
       }

@@ -42,16 +42,19 @@ it again.
 
 ## Why a run holds
 
-An interlocked run signals done only after every milestone in its frozen plan
-is declared complete. If it signals done with milestones still missing, the
-run does not immediately fail and does not open a pull/merge request either:
+Before an interlocked run can finalize, the server checks that every required
+frozen milestone is declared complete or its criteria are formally accepted
+as met. A completion attempt with unmet milestones does not immediately fail
+or open a pull/merge request:
 
-1. The lead checkpoints its work, then gets the missing milestone(s) named
-   back to it **in the same session** — no re-planning, no new run. Most runs
-   resolve here on the next attempt.
-2. If several attempts in a row make no real progress on the same missing set,
-   the run asks you directly: a **Completion blocked** question naming what's
-   still missing, with a window to answer before it parks.
+1. The lead checkpoints its work and the server checks the frozen contract.
+   If the lead requested an owner decision with `signal_done` (see below),
+   the first authoritative unmet result opens the **Completion blocked**
+   question directly, with a window to answer before the run parks.
+2. Without that request, missing milestones are named back to the lead
+   **in the same session** — no re-planning, no new run. Three identical
+   consecutive completion attempts (same unmet IDs, branch head and worktree
+   fingerprint) open the same question.
 3. If that window passes with no answer, the run parks in a **completion
    hold** — a `paused` run, but held for this structural reason rather than
    because you asked it to pause.
@@ -61,6 +64,28 @@ also never discards a run's work to get there: the worker verifies its Git
 work is safely captured before it parks, and if that verification can't be
 confirmed, the run stays live and keeps trying rather than parking on
 uncertain ground.
+
+## Requesting an owner decision
+
+On an interlocked, noninteractive issue run, both Claude and Codex advertise
+this optional `signal_done` input:
+
+```js
+signal_done({ owner_decision_requested: { reason: "The remaining milestone needs an owner scope decision." } })
+```
+
+The request object accepts only a string `reason`: after trimming, it must
+contain 1–500 Unicode code points. Invalid values and extra keys (including
+scope or decision keys) are refused, not truncated. This input is not
+advertised outside those eligible runs.
+
+This is a model request for a decision, not a scope change. It opens the
+window only when the server finds unmet criteria; if the criteria are met,
+the request does not block normal finalization. Requesting a decision does
+not reset the iteration or wall budget, extend the deadline, or bypass
+cancellation, pause or completion-budget bounds. Leads needing an owner
+scope decision should use this request rather than `park_run`, retries
+without progress, or an announcement of publication.
 
 ## What you'll see
 
@@ -78,9 +103,11 @@ disagree about which one applies:
   question live, or has parked in the completion hold. Same label either way,
   since both mean the same thing: the run needs a decision.
 
-None of these panels show raw model output, repository text, credentials, or
-arbitrary logs — only the bounded unmet-milestone list, the attempt count, and
-the hold reason.
+The completion panels show the bounded server-provided unmet-milestone list,
+the attempt count and the hold reason. The durable question feed also shows
+an explicit lead request's reason, escaped and labelled **Lead reason
+(untrusted display)**. That display text supplies no decision authority; the
+unmet IDs come from the server, not the lead's reason.
 
 ## Answering the completion question
 
@@ -91,12 +118,20 @@ can act on your answer immediately, with no restart. If the window elapses
 with no answer, the run parks in the hold instead; it never fails outright
 for this reason.
 
+An ordinary answer in the question box (or `uzi run answer <id>`) continues
+with guidance only: it defers or waives nothing. Repository docs and
+`non_closing` on `signal_done` likewise cannot change the frozen scope.
+Only the owner decision endpoints apply formal completion decisions.
+
 ## Deciding on a held run
 
-The owner has three decisions, all through `uzi run decide <id>` (exactly one
-is required):
+The owner has three formal decisions through the run view or
+`uzi run decide <id>` (exactly one is required). Each is available both in
+the **live completion-question window** and in the existing
+`completion_blocked` hold. An ordinary clarification or plain owner pause
+is ineligible; requesting a decision does not widen that admission:
 
-**Continue** — resume past the completion check unchanged:
+**Continue** — continue with guidance, keeping the frozen contract unchanged:
 
 ```
 uzi run decide <id> --continue [--guidance "<text>"]
@@ -109,7 +144,7 @@ uzi run decide <id> --continue [--guidance "<text>"]
   your guidance to the run's next session as a follow-up.
 
 Guidance is optional: `uzi run decide <id> --continue` with no `--guidance`
-simply tells the run to carry on past the check.
+simply tells the run to carry on with the required work.
 
 **Partial** — reduce scope by naming the exact milestone ids to keep, with a
 required reason:
@@ -118,24 +153,47 @@ required reason:
 uzi run decide <id> --partial m1,m2 --reason "<why>"
 ```
 
-The run delivers only the kept milestones; the rest are deferred. Its closing
-pull/merge request does **not** close the issue and lists the deferred
-milestone ids, so the remaining work stays visible for a later run.
+The named milestones remain required; the rest are deferred with your
+reason. If publication succeeds, the `[partial]` pull/merge request is
+**non-closing** and lists the deferred milestone IDs and reason, so the
+remaining work stays visible for a later run.
 
-**Accept** — waive the exact unmet criteria by id, with a required reason:
+**Accept** — accept exact unmet criterion IDs as met, with a required reason:
 
 ```
 uzi run decide <id> --accept m2.c1,m2.c3 --reason "<why>"
 ```
 
-The named criteria are accepted as met and the run continues to finalize. A
-closing pull/merge request then names the accepted criteria in a warning
-block, so a reviewer sees exactly what was waived and why.
+Use the exact criterion IDs from the run view or `uzi run get`. The named
+criteria are accepted as met, not deferred. A published pull/merge request
+names them and your reason in a warning block. Closing remains possible
+only if the run is otherwise eligible; a decision does not promise
+publication or override the remaining completion and publication checks.
 
 Partial and accept each require `--reason` and send the run's current contract
 revision, which the server fences: if someone has already recorded a decision
 (the revision moved), your command is refused with a conflict rather than
 silently overwriting theirs. `--guidance` is valid only with `--continue`.
+
+After any answer, the worker supplies a neutral follow-up asking the lead to
+call `signal_done` again for a server-authoritative completion recheck. It
+does not require the old unmet list or infer a formal decision from prose.
+
+## Mixed-version limits
+
+A new API includes `completion_scope` in each granted worker permit, derived
+from the same locked run revision that authorized the permit. It is `{}`
+when there is no scope decision. A new worker uses this permit scope for
+partial/accept rendering, title, body, `Closes` and finalization guards.
+
+With a new worker and an old API, an absent field falls back to claim scope
+when the permit is at the same claim revision. If the permit revision is
+newer than the claim and the field is missing, finalization fails closed
+into the existing hold without opening a pull/merge request. An old worker
+ignores the new API's additive field and retains its previous behavior:
+live-window decisions can still render claim-time scope. Upgrade **both API
+and worker** for the permit-scope guarantee. This adds no capability, state,
+endpoint, migration or claim field, and does not expand decision admission.
 
 ## The honest limitation: same-worker-only context
 
@@ -221,11 +279,13 @@ something goes wrong or a human has touched the request in between:
 A completion hold and [an owner-requested pause](run-pause.md) both leave a
 run sitting in `paused`, but for a different reason. An owner pause is
 something you asked for; a completion hold is something the run's own
-structural check produced after it couldn't get anywhere on a missing
-milestone. The **live** completion question (before the run has actually
-parked) is not a `paused` run at all, so the ordinary **Resume** control
-doesn't apply to it — only `uzi run decide <id>` (continue, partial or accept)
-answers it. Once a run has parked in the hold, plain `uzi run resume` will
+structural check produced for unmet milestones, following either a lead
+request or repeated attempts without progress. The **live** completion
+question (before the run has actually parked) is not a `paused` run at all,
+so the ordinary **Resume** control
+doesn't apply to it. An ordinary answer continues with guidance; use the run
+view or `uzi run decide <id>` for a formal continue, partial or accept
+decision. Once a run has parked in the hold, plain `uzi run resume` will
 technically move it back to `queued` too, but `uzi run decide <id>` is the
 right tool: it's the one path that can carry a decision — guidance on a
 continue, or a scope change on a partial/accept — to the resumed run and that
