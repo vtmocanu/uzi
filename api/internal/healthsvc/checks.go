@@ -450,6 +450,11 @@ func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Ti
 	evidence := waitEvidence{rows: c.Evidence}
 	for _, r := range rows {
 		evidence.append(r.RunID, r.UserID, r.HealthReason, r.HealthSince, now)
+	}
+	// Read display-only blocker facts before the first confirmation starts its
+	// shared capacity/queue deadline. Diagnostic latency must not spend that budget.
+	s.enrichCapacityBlockers(ctx, &evidence, workers, workersErr)
+	for _, r := range rows {
 		confirmed, overlap := confirm.confirm(s, ctx, now, r.RunID, r.HealthReason, r.HealthSince)
 		if confirmed {
 			rolling[r.UserID] = true
@@ -473,7 +478,6 @@ func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Ti
 			}
 		}
 	}
-	s.enrichCapacityBlockers(ctx, &evidence, workers, workersErr)
 	c.Evidence = evidence.finish()
 	// Only owners whose every waiting row was confirmed can be described as rolling.
 	for owner := range unconfirmed {
