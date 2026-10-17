@@ -553,7 +553,12 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
         pauseRequested: scenario === "pause" || scenario === "pause before budget" || (scenario === "question pause" && asked),
       } : undefined;
       probe.ctx.pauseModeRequested = () => scenario === "wall" && probe.attemptCalls.length ? "wall" : scenario === "question pause" && asked ? "now" : scenario === "pending milestone" && probe.attemptCalls.length ? "milestone" : null;
-      probe.ctx.parkForPause = async () => { paused = true; return true; };
+      probe.ctx.parkForPause = async () => {
+        // SetRunPaused refuses awaiting_input; expiry must keep the completion hold.
+        if (scenario === "question pause") return false;
+        paused = true;
+        return true;
+      };
       const question = probe.ctx.askCompletionQuestion!;
       probe.ctx.askCompletionQuestion = async (unmet, trigger) => {
         asked = true;
@@ -571,11 +576,15 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
       } else {
         const result = await running;
         assert.equal(turns.length, 1);
-        if (scenario.includes("pause")) {
+        if (scenario.includes("pause") && scenario !== "question pause") {
           assert.equal(paused, true);
           assert.ok(result.pausedAt);
           assert.deepEqual(probe.holdReasons, []);
         } else {
+          if (scenario === "question pause") {
+            assert.equal(paused, false);
+            assert.equal(result.pausedAt, undefined);
+          }
           assert.ok(result.completionHeld);
           assert.match(result.completionHeld.reason, scenario === "final iteration" ? /iteration/ :
             scenario === "wall" ? /wall/ : scenario.includes("budget") ? /budget exhausted/ : /lead requested/);

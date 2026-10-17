@@ -10915,7 +10915,12 @@ describe("Codex completion interlock", () => {
           pauseRequested: scenario === "pause" || scenario === "budget before pause" || (scenario === "question pause" && asked),
         } : undefined,
         pauseModeRequested: () => scenario === "wall" && attempts ? "wall" : scenario === "question pause" && asked ? "now" : scenario === "pending milestone" && attempts ? "milestone" : null,
-        parkForPause: async () => { paused = true; return true; },
+        parkForPause: async () => {
+          // SetRunPaused refuses awaiting_input; expiry must keep the completion hold.
+          if (scenario === "question pause") return false;
+          paused = true;
+          return true;
+        },
         askCompletionQuestion: async (_unmet, trigger) => {
           asked = true;
           assert.deepEqual(trigger, { kind: "lead_request", reason: "PRIVATE reason" });
@@ -10933,11 +10938,15 @@ describe("Codex completion interlock", () => {
         if (scenario === "checkpoint cancel" || scenario === "fingerprint cancel") assert.equal(attempts, 0);
       } else {
         const result = await running;
-        if (scenario === "pause" || scenario === "question pause") {
+        if (scenario === "pause") {
           assert.equal(paused, true);
           assert.ok(result.pausedAt);
           assert.deepEqual(holds, []);
         } else {
+          if (scenario === "question pause") {
+            assert.equal(paused, false);
+            assert.equal(result.pausedAt, undefined);
+          }
           assert.ok(result.completionHeld);
           assert.match(result.completionHeld.reason, scenario === "final iteration" ? /iteration/ :
             scenario === "wall" ? /wall/ : scenario.includes("budget") ? /budget exhausted/ : /lead requested/);
