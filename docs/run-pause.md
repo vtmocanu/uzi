@@ -9,7 +9,27 @@ audience: user
 A run's owner can park it on demand — not because anything went wrong, just
 because it's an inconvenient time to keep spending — and pick it back up
 later from its preserved session or published checkpoint. No model turns run
-while it is paused.
+while it is paused. The run's lead can also request an ordinary pause while
+waiting on a dependency during approved issue implementation. Both wait for
+owner resume. System holds also use `paused`, with their own next steps.
+
+## Reading the pause label
+
+The run detail in the CLI, TUI and web can distinguish **paused by the run's
+lead** from an owner pause (**paused by its owner** in `run get`, **paused by
+you** in the TUI and web). These labels describe the path that parked the
+run: `park_run` is the lead path; `uzi run pause` and the owner's `/park`
+answer are owner paths. They do not identify a particular person or explain
+why the run paused.
+
+When current pause evidence is unavailable, the label stays **paused**.
+Older workers, missing messages, a read failure, replay gaps or a status
+refresh can leave it neutral temporarily. The TUI and web use messages
+already loaded for the run; they do not search older history just to name
+the path. A pause time can still appear without enough evidence to name it.
+Follow notices can also remain neutral. Use the activity feed for context
+and **Resume** when ready; a neutral label does not change how an ordinary
+pause resumes. System holds keep their hold-specific labels and remedies.
 
 ## Requesting a pause
 
@@ -116,8 +136,8 @@ already resumes a run held for a pooled token).
 
 No model turns run while a run is paused. The time it spends
 parked is banked separately and doesn't count against its budget, so the
-remaining budget on resume is exactly what it was at the moment you paused
-it — unlike a usage-limit wait, whose resume gives the run a fresh full
+remaining budget on resume is exactly what it was when the ordinary pause
+landed — unlike a usage-limit wait, whose resume gives the run a fresh full
 clock.
 
 ## Held after provider outages
@@ -153,8 +173,8 @@ apart.
 
 ## Not the same as a usage-limit wait
 
-A pause (this page) is something *you* asked for; [a usage-limit
-wait](run-limit-wait.md) is something that happened to the run because a
+An ordinary pause is requested by you or the run's lead; [a usage-limit
+wait](run-limit-wait.md) happens to the run because a
 provider usage window was exhausted (Claude or Codex subscription). They look
 similar — both are non-terminal parks that keep the run's session and worker affinity — but
 resolve differently: a usage-limit wait resumes on its own after the reset or
