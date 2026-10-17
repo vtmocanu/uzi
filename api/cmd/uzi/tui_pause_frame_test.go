@@ -38,7 +38,7 @@ func pauseFrameRuns() []struct {
 		run  apitypes.RunDTO
 		want []string
 	}{
-		{"paused", paused, []string{"paused by you"}},
+		{"paused", paused, []string{"‖ paused"}},
 		{"running with pending pause", pending, []string{"pause requested"}},
 		{"limit_wait with pending pause", limit, []string{"waiting: usage limit", "pause requested"}},
 		{"vault park with pending pause", vault, []string{"waiting for vault unlock", "pause requested"}},
