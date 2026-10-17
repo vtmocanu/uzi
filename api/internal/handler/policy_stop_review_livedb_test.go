@@ -298,8 +298,8 @@ func TestPolicyStopReviewRoute(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/api/runs/00000000-0000-0000-0000-000000000001/policy-stop-review", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, r)
-	if rec.Code == http.StatusNotFound {
-		t.Fatalf("preview GET route is absent: status=%d", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("preview GET must require owner authentication: status=%d", rec.Code)
 	}
 	found := false
 	err := chi.Walk(router.(chi.Routes), func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
