@@ -560,11 +560,17 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
       [submitPlan("v2"), resultSuccess()],
       [submitPlan("v3"), resultSuccess()],
       [submitPlan("v4"), resultSuccess()],
+      [submitPlan("v5"), resultSuccess()],
+      [submitPlan("v6"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
+    const items = (round: number) => [{ file: `round-${round}.md`, severity: "warning" as const,
+      summary: `CURRENT-FINDING-${round}`, rationale: `INSPECTABLE-EVIDENCE-${round}` }];
     const verdicts: PlanVerdict[] = [
-      { kind: "revise", automatic: true, round: 1, feedback: "auto one", inputId: 901 } as unknown as PlanVerdict,
-      { kind: "revise", automatic: true, round: 2, feedback: "auto two" },
+      { kind: "revise", automatic: true, round: 1, feedback: "auto one", items: items(1), inputId: 901 } as unknown as PlanVerdict,
+      { kind: "revise", automatic: true, round: 2, feedback: "auto two", items: items(2) },
+      { kind: "revise", automatic: true, round: 3, feedback: "auto three", items: items(3) },
+      { kind: "revise", automatic: true, round: 4, feedback: "auto four", items: items(4) },
       { kind: "revise", feedback: "human rollback", inputId: 902 },
       { kind: "revise", feedback: "over cap", inputId: 903 },
       approve,
@@ -579,20 +585,33 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
       },
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
-    assert.equal(turns.length, 5);
-    assert.deepEqual(settlements, [undefined, undefined, undefined, 902, 903]);
+    assert.equal(turns.length, 7);
+    assert.deepEqual(settlements, [undefined, undefined, undefined, undefined, undefined, 902, 903]);
+    for (let round = 1; round <= 4; round++) {
+      const text = turns[round]!.promptText!;
+      const advice = text.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(advice, "current findings stay inside advice DATA");
+      assert.deepEqual(JSON.parse(advice[2]!).items, items(round), "older items cannot substitute for current findings");
+      const trusted = text.replace(/^<([a-z_]+_[a-f0-9]{16})>\n[\s\S]*?^<\/\1>$/gm, "");
+      assert.match(trusted, /Cross-check dispositions/);
+      assert.match(trusted, /(?:each|every|one per)[\s\S]{0,140}(?:immediately preceding|latest|most recent|current)[\s\S]{0,100}(?:item|finding)/i);
+    }
     assert.match(turns[1]!.promptText!, /automated checker/);
     assert.match(turns[2]!.promptText!, /automated checker/);
-    assert.match(turns[3]!.promptText!, /human rollback/);
-    assert.doesNotMatch(turns[3]!.promptText!, /automated checker|<advice_/);
+    assert.match(turns[5]!.promptText!, /human rollback/);
+    assert.doesNotMatch(turns[5]!.promptText!, /automated checker|<advice_/);
     assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_revising").map((m) => m.payload), [
       { automatic: true, cross_check_round: 1 },
       { automatic: true, cross_check_round: 2 },
+      { automatic: true, cross_check_round: 3 },
+      { automatic: true, cross_check_round: 4 },
       { round: 1 },
     ]);
-    assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_feedback").slice(0, 2).map((m) => m.payload), [
+    assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_feedback").slice(0, 4).map((m) => m.payload), [
       { feedback: "auto one", automatic: true, cross_check_round: 1 },
       { feedback: "auto two", automatic: true, cross_check_round: 2 },
+      { feedback: "auto three", automatic: true, cross_check_round: 3 },
+      { feedback: "auto four", automatic: true, cross_check_round: 4 },
     ]);
   });
 

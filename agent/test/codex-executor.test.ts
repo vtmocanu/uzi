@@ -6842,6 +6842,8 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
   it("PRD #2460: automatic rounds revise the plan thread without spending the human budget, even at plan_max_revisions 0", async () => {
     const rig = planThenImplementRig();
     const settled: unknown[] = [];
+    const items = (round: number) => [{ file: `round-${round}.md`, severity: "warning" as const,
+      summary: `CURRENT-FINDING-${round}`, rationale: `INSPECTABLE-EVIDENCE-${round}` }];
     let call = 0;
     const { ctx, emitted } = makeCtx({
       planApproved: false,
@@ -6851,7 +6853,7 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
         settled.push(settles);
         call++;
         return call <= 4
-          ? { kind: "revise", automatic: true, round: call, feedback: `checker advice ${call}`, items: [] }
+          ? { kind: "revise", automatic: true, round: call, feedback: `checker advice ${call}`, items: items(call) }
           : humanApprove;
       },
     });
@@ -6861,6 +6863,13 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     for (let round = 1; round <= 4; round++) {
       assert.match(planTurns[round]!, new RegExp(`checker advice ${round}`));
       assert.match(planTurns[round]!, /automated checker suggested revisions/, "the automatic revision prompt, not the human one");
+      const text = rig.epochs[0]!.transport.requests.filter((r) => r.method === "turn/start")[round]!.params!.input[0].text as string;
+      const advice = text.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(advice, "current findings stay inside advice DATA");
+      assert.deepEqual(JSON.parse(advice[2]!).items, items(round), "older items cannot substitute for current findings");
+      const trusted = text.replace(/^<([a-z_]+_[a-f0-9]{16})>\n[\s\S]*?^<\/\1>$/gm, "");
+      assert.match(trusted, /Cross-check dispositions/);
+      assert.match(trusted, /(?:each|every|one per)[\s\S]{0,140}(?:immediately preceding|latest|most recent|current)[\s\S]{0,100}(?:item|finding)/i);
     }
     assert.deepEqual(emitted.filter((m) => m.kind === "plan_feedback").map((m) => m.payload),
       [1, 2, 3, 4].map((round) => ({ feedback: `checker advice ${round}`, automatic: true, cross_check_round: round })));
