@@ -7,6 +7,7 @@
 // presets translate to it, editing the raw cron flips the preset to "Custom", and
 // only the cron string is ever sent — never a preset label.
 
+import { normalizeCIArtifacts } from "../lib/ciArtifacts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
@@ -278,6 +279,16 @@ export function ScheduleModal({
   // ci_watch workflow selector, one per line; blank = every workflow in the listed window.
   const [ciWorkflowsText, setCiWorkflowsText] = useState<string>((editing?.ci_workflows ?? []).join("\n"));
   const ciWorkflows = parseCIWorkflows(ciWorkflowsText);
+  const [ciArtifactsText, setCiArtifactsText] = useState(() => (editing?.ci_artifacts ?? []).join("\n"));
+  const [ciArtifactsTouched, setCiArtifactsTouched] = useState(false);
+  // Newlines delimit entries; empty lines are ignored, but whitespace inside an
+  // entry reaches the shared validator before trimming (controls must be rejected).
+  const ciArtifacts = normalizeCIArtifacts(
+    ciArtifactsText.split("\n").filter((line) => !/^\p{Z}*$/u.test(line)),
+  );
+  const artifactsPatch = () => target === "ci_watch" && (!editing || ciArtifactsTouched)
+    ? ciArtifacts.selectors : undefined;
+
   // Create-only enabled/disabled toggle (PRD #344 Feature B): lets a schedule be created
   // already paused. Edit-mode enable/disable stays the job of pause/resume, so this state
   // seeds from editing but is only ever SENT on create (see buildInput).
@@ -619,7 +630,7 @@ export function ScheduleModal({
     if (isEdit ? !repoId : selectedRepoIds.length === 0) return false;
     // A catalog default is always recurring: only its cron and model gate submit; the
     // catalog-owned target fields are read-only and always valid.
-    if (target === "ci_watch" && ciWorkflows.error !== "") return false;
+    if (target === "ci_watch" && (ciWorkflows.error !== "" || ciArtifacts.error !== "")) return false;
     if (isDefault) {
       if (cron.trim() === "") return false;
       if (modelWarning !== "") return false;
@@ -693,6 +704,7 @@ export function ScheduleModal({
           : guidance
         : undefined,
     ci_workflows: target === "ci_watch" ? ciWorkflows.workflows : undefined,
+    ci_artifacts: artifactsPatch(),
   });
 
   const buildInput = (): ScheduleInput => ({
@@ -719,6 +731,7 @@ export function ScheduleModal({
     // PRD #2865: the ci_watch workflow selector, replace-semantics ([] = all workflows).
     // Omitted on every other target, which the server rejects it on.
     ci_workflows: target === "ci_watch" ? ciWorkflows.workflows : undefined,
+    ci_artifacts: artifactsPatch(),
     timing,
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
     run_at: timing === "once" ? fromLocalInput(runAtLocal) : undefined,
@@ -870,6 +883,29 @@ export function ScheduleModal({
     </Field>
   );
 
+  const ciArtifactsField = (
+    <Field label="Artifact names or globs (optional)" htmlFor="sched-ci-artifacts">
+      <Textarea
+        id="sched-ci-artifacts"
+        rows={3}
+        className="font-mono"
+        value={ciArtifactsText}
+        onChange={(e) => {
+          setCiArtifactsText(e.target.value);
+          setCiArtifactsTouched(true);
+        }}
+        placeholder={"test-results-*\nreports-*"}
+        aria-invalid={ciArtifacts.error !== "" || undefined}
+        aria-describedby="sched-ci-artifacts-help sched-ci-artifacts-error"
+      />
+      <p id="sched-ci-artifacts-help" className="mt-1 text-[11px] text-faint">
+        One artifact name or glob per line, up to 20. Leave blank to fetch no artifacts.
+        Fetching is GitHub-only; unsupported providers remain logs-only.
+      </p>
+      <p id="sched-ci-artifacts-error" className="mt-1 text-[11px] text-danger">{ciArtifacts.error}</p>
+    </Field>
+  );
+
   const footerSummarySegments = [
     timing === "once" ? "One time" : "Recurring",
     target === "sweep"
@@ -1017,7 +1053,12 @@ export function ScheduleModal({
                   (issue #675) are owner-editable: the baked prompt/guidance stays read-only
                   above, but this OVERLAY is appended to it at fire time. issue/self_improve
                   defaults keep their guidance catalog-owned (baked, shown read-only). */}
-              {target === "ci_watch" && ciWorkflowsField}
+              {target === "ci_watch" && (
+                <>
+                  {ciWorkflowsField}
+                  {ciArtifactsField}
+                </>
+              )}
               {(target === "prompt" || target === "sweep" || target === "ci_watch") && guidanceField}
             </>
           ) : (
@@ -1149,6 +1190,7 @@ export function ScheduleModal({
                     smallest fix. No issue is needed.
                   </p>
                   {ciWorkflowsField}
+                  {ciArtifactsField}
                   <Field label="Prompt (optional)" htmlFor="sched-prompt">
                     <Textarea
                       id="sched-prompt"
