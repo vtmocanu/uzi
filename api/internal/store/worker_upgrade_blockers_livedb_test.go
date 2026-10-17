@@ -74,7 +74,7 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 		case "ci_fix":
 			r = repo
 			pipeline = int64(1)
-			ref = "main"
+			ref = "agent/" + id.String()
 		case "prompt":
 			r = repo
 		case "task":
@@ -82,7 +82,7 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			branch = "agent/" + id.String()
 		case "mr_rework":
 			r = repo
-			ref = "main"
+			ref = "agent/" + id.String()
 			target = id
 		case "judge":
 			target = id
