@@ -941,7 +941,7 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
    ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
-   ↳ (owner pause) → paused → queued, resume on demand (no limit on count) → running
+   ↳ (owner or lead pause) → paused → queued, resume on demand (no limit on count) → running
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
@@ -1064,7 +1064,7 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
-- **running → paused** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+- **running → paused (owner request)** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
   and the worker parks only after it publishes a checkpoint — a failed
@@ -1081,7 +1081,13 @@ chain in the diagram above, with no intervening `running`.
   [adr/1190-run-pause-invariants.md](adr/1190-run-pause-invariants.md) for
   the negative-space rules — the run-status lists `paused` must never enter,
   and the guards that must not be relaxed — that a future edit could break
-  silently.
+  silently. Approved issue implementation can also enter an ordinary pause
+  through the lead's `park_run` tool or an owner's `/park` clarification
+  answer. Both share the lead-park execution path (`origin: lead_park`);
+  `uzi run pause` uses the owner path (`origin: owner`). Both paths wait for
+  owner resume. Current message evidence can distinguish these execution
+  paths in CLI/TUI/web run detail, not identify the requester; missing evidence
+  leaves the label neutral (see [pause labels](docs/run-pause.md#reading-the-pause-label)).
 
 - **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),
   rollout switch `completion_interlock_rollout`, **on by default** for a new `issue`

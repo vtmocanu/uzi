@@ -1,4 +1,6 @@
 import { describe, it } from "node:test";
+import { MessageBatcher } from "../src/batcher.js";
+import { Outbox } from "../src/outbox.js";
 import { RequestError } from "../src/client.js";
 import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { isParkAnswer } from "../src/park-run.js";
@@ -110,8 +112,12 @@ function spyPublishHttpError(httpStatus: number): { restore: () => void } {
 function runnerWithGit(
   factory: ExecutorFactory,
   gitlab: ReturnType<typeof fakeGitlab>["gitlab"],
+  outbox?: Outbox,
 ): RunRunner {
   return new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
+    outbox,
+    outboxTerminalMaxBytes: 1 << 20,
+    gapFillMax: 100,
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
@@ -299,6 +305,7 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       const claim = gitlabClaim(1102);
       await runnerWithGit(factory, gitlab).execute(claim);
 
+      assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no completed pause marker");
       assert.deepEqual(parkResults, [false], "the park was declined (publish failed)");
       const statuses = stateStatuses(claim.run_id);
       assert.ok(statuses.includes("pause_failed"), `a pause_failed report was sent, got ${JSON.stringify(statuses)}`);
@@ -331,6 +338,7 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       api.overrideStateStatus(claim.run_id, "running");
       await runnerWithGit(factory, gitlab).execute(claim);
 
+      assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no completed pause marker");
       assert.deepEqual(parkResults, [false], "the park did not take (ack status != paused)");
       const statuses = stateStatuses(claim.run_id);
       assert.ok(statuses.includes("paused"), "a paused report WAS attempted");
@@ -361,6 +369,7 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       const claim = gitlabClaim(1105);
       await runnerWithGit(factory, gitlab).execute(claim);
 
+      assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no completed pause marker");
       assert.deepEqual(parkResults, [false], "an empty/unpublishable pack does NOT park");
       assert.equal(
         calls.length,
@@ -446,6 +455,117 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+});
+
+describe("accepted pause delivery", () => {
+  for (const mode of ["milestone", "now", "postclone", "emit-error", "flush-error", "fatal", "refused", "report-error"] as const) {
+    it(`${mode}: only an accepted durable owner pause emits; delivery cannot replace the park`, async () => {
+      const { gitlab } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-pause-delivery-"));
+      const outbox = new Outbox({ root: path.join(homeRoot, "outbox"), log: nullLogger(),
+        runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 86_400_000 });
+      await outbox.init();
+      const claim = gitlabClaim(2992, { claim_generation: 1 });
+      const publish = spyPublish();
+      const report = client.reportState.bind(client);
+      const emit = MessageBatcher.prototype.emit;
+      const flush = MessageBatcher.prototype.flush;
+      let ackAccepted = false;
+      let pinned = false;
+      let deliveryAttempts = 0;
+      let reaps = 0;
+      let reapsAtDelivery = 0;
+      let clonePath = "";
+      let signal: AbortSignal | undefined;
+      let parked: boolean | undefined;
+      let batcher: MessageBatcher | undefined;
+      const at = mode === "now" ? { completedCount: 0 } : { completedCount: 2, total: 3 };
+      const payloads: unknown[] = [];
+      const factory: ExecutorFactory = runId => ({
+        homeDir: path.join(homeRoot, runId),
+        executor: {
+          killAgentTree: () => { reaps++; },
+          run: async ctx => {
+            fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+            clonePath = ctx.worktreePath;
+            signal = ctx.signal;
+            commitInTree(ctx.worktreePath, "WORK.txt", "durable pause work\n");
+            if (mode === "postclone") throw new PauseNowSignal();
+            parked = await ctx.parkForPause!(at);
+            return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+          },
+        },
+      });
+      const run = runnerWithGit(factory, gitlab, outbox);
+      const hooks = run as unknown as { pinRecoveryGeneration: (...args: unknown[]) => Promise<void> };
+      const pin = hooks.pinRecoveryGeneration.bind(run);
+      hooks.pinRecoveryGeneration = async (...args) => {
+        await pin(...args);
+        batcher = (args[1] as { batcher: MessageBatcher }).batcher;
+        pinned = true;
+      };
+      client.reportState = async (...args) => {
+        if (args[1].status !== "paused") return report(...args);
+        assert.equal(deliveryAttempts, 0, "no marker before report or ACK");
+        if (mode === "report-error") throw new Error("pause report unavailable");
+        const ack = await report(...args);
+        assert.equal(deliveryAttempts, 0, "no marker while ACK is in flight");
+        pinned = false;
+        ackAccepted = ack.status === "paused";
+        if (mode === "fatal") api.failMessagesNext(100, 401);
+        return ack;
+      };
+      if (mode === "refused") api.overrideStateStatus(claim.run_id, "running");
+      MessageBatcher.prototype.emit = function(message) {
+        if (message.kind === "paused") {
+          deliveryAttempts++;
+          assert.equal(ackAccepted, true);
+          assert.equal(pinned, true, "recovery pin precedes delivery");
+          reapsAtDelivery = reaps;
+          payloads.push(message.payload);
+          if (mode === "emit-error") throw new Error("synchronous emit failure");
+        }
+        return emit.call(this, message);
+      };
+      MessageBatcher.prototype.flush = function(...args) {
+        if (this === batcher && deliveryAttempts > 0 && mode === "flush-error") return Promise.reject(new Error("flush failure"));
+        return flush.apply(this, args);
+      };
+      try {
+        await run.execute(claim);
+        const accepted = mode !== "refused" && mode !== "report-error";
+        assert.equal(deliveryAttempts, accepted ? 1 : 0);
+        if (!accepted) {
+          assert.equal(parked, false);
+          assert.equal(messageKinds(claim.run_id).includes("paused"), false);
+          return;
+        }
+        assert.deepEqual(payloads, [{ origin: "owner", completed: mode === "postclone" ? 0 : at.completedCount,
+          ...(mode !== "now" && mode !== "postclone" ? { total: 3 } : {}) }]);
+        if (mode !== "postclone") assert.equal(parked, true);
+        await batcher!.awaitPermanentFailureSettled();
+        assert.equal(batcher!.isTripped(), mode === "fatal", "fatal response must trip the REAL breaker");
+        assert.equal(signal?.aborted, false, "accepted park must not cancel the executor");
+        assert.equal(outbox.hasPendingTerminal(claim.run_id, 1), false);
+        assert.equal(await outbox.readTerminalJournal(claim.run_id, 1), undefined);
+        assert.deepEqual(stateStatuses(claim.run_id).filter(s => s === "failed" || s === "completed"), []);
+        assert.equal(stateStatuses(claim.run_id).filter(s => s === "paused").length, 1, "no extra park");
+        // Normal return reaps at handoff, phasePublish, and terminal_retire; the signal path only retires.
+        assert.equal(reaps, reapsAtDelivery + (mode === "postclone" ? 1 : 3), "no transport-failure reap");
+        assert.equal(fs.existsSync(path.join(homeRoot, claim.run_id)), true, "parked HOME preserved");
+        assert.equal(fs.existsSync(clonePath), false, "existing verified-clone retirement is unchanged");
+        const bare = await git.ensureClone(fx.originPath);
+        assert.equal(execFileSync("git", ["-C", bare, "show", "refs/uzi-runner/agent/issue-2992:WORK.txt"],
+          { env: GIT_ENV }).toString(), "durable pause work\n", "checkpoint tracking source retained");
+      } finally {
+        client.reportState = report;
+        MessageBatcher.prototype.emit = emit;
+        MessageBatcher.prototype.flush = flush;
+        publish.restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("RunRunner — M2 explicit park callback", () => {
@@ -554,9 +674,13 @@ describe("RunRunner — M2 explicit park callback", () => {
       // Model the API no-write replay response; the real client must retry the exact body.
       return Response.json({ run: { status: "awaiting_input" } });
     };
-    if (options.lostAck || options.interruptReconcile === "pause_failed") client.reportState = async (...args) => {
+    client.reportState = async (...args) => {
+      if (args[1].status === "paused")
+        assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no marker before paused ACK");
       const ack = await report(...args);
-      if (args[1].status === "pause_failed") interruptReconcile();
+      if (args[1].status === "paused")
+        assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no marker until ACK returned");
+      if (options.interruptReconcile === "pause_failed" && args[1].status === "pause_failed") interruptReconcile();
       if (options.lostAck && args[1].status === "paused") throw new Error("lost paused ACK");
       return ack;
     };
@@ -651,6 +775,8 @@ describe("RunRunner — M2 explicit park callback", () => {
           })
         : runnerWithGit(factory, gitlab);
       await runner.execute(claim);
+      if (options.lostAck || options.publishFailure || publish.calls.length === 0)
+        assert.equal(messageKinds(claim.run_id).includes("paused"), false, "no completed marker without an accepted checkpoint park");
       const workPreserved = !!clonePath && fs.existsSync(path.join(clonePath, "DIRTY.txt")) &&
         fs.existsSync(path.join(homeRoot, claim.run_id));
       return { claim, result, turns, questions, callbackReads, published: publish.calls.length,
@@ -752,6 +878,8 @@ describe("RunRunner — M2 explicit park callback", () => {
   it("parks through the real checkpoint sink without finalizing", async () => {
     const outcome = await exercise();
     assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.deepEqual(api.messages(outcome.claim.run_id).filter(m => m.kind === "paused").map(m => m.payload),
+      [{ origin: "lead_park", completed: 1, total: 2 }]);
     assert.equal(outcome.published, 1);
     assert.deepEqual(api.workerPauseRequests, [{ runId: outcome.claim.run_id, generation: 1 }]);
     assert.equal(outcome.callbackReads, 0);

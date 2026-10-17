@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 )
 
 // The CLOSED frame-type set the hub emits (apitypes.RunEventDTO.Type), plus the
@@ -186,10 +187,85 @@ type RunStream struct {
 	// goroutine (live frames, replay) and any consumer goroutine (NoteSeen, e.g. the
 	// TUI) raise it; a plain load-then-store would race and could lose an update,
 	// which -race in gate:api catches.
-	lastSeq atomic.Int32
+	lastSeq  atomic.Int32
+	coverage MessageCoverage
 	// lastStatus is the last run status emitted, so the reconcile emits only on a
 	// real change rather than every tick.
 	lastStatus string
+}
+
+// MessageCoverage is local read evidence; it never changes transport cursors or delivery.
+// After bounds unresolved coverage; Through includes messages awaiting UI delivery.
+// Failed requires a successful read at its floor; later replay above it cannot erase it.
+type MessageCoverage struct {
+	Busy        bool
+	Failed      bool
+	Gapped      bool
+	FailedAfter int32
+	After       int32
+	Through     int32
+	Revision    uint64 // failed-read epoch; message holes do not advance it
+	Generation  uint64 // coverageBusy writes on disconnect; Coverage exposes it to displays
+}
+
+// Coverage is safe to sample from the display goroutine while the pump runs.
+func (s *RunStream) Coverage() MessageCoverage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coverage
+}
+
+func (s *RunStream) coverageGap(after, through int32, failed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := &s.coverage
+	if through > after {
+		if !c.Gapped || after < c.After {
+			c.After = after
+		}
+		c.Gapped = true
+	}
+	if through > c.Through {
+		c.Through = through
+	}
+	if failed && (!c.Failed || after > c.FailedAfter) {
+		c.FailedAfter = after
+	}
+	c.Failed = c.Failed || failed
+	if failed {
+		c.Revision++
+	}
+}
+
+// coverageReplay records only evidence from the existing read. A successful replay
+// can retire a failed read at the same or an earlier floor, never above a hole.
+func (s *RunStream) coverageReplay(floor int32, messages []apitypes.MessageDTO) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := &s.coverage
+	through := c.Through
+	for _, message := range messages {
+		through = max(through, message.Seq)
+	}
+	c.Through = through
+	if c.Failed && floor <= c.FailedAfter && runpresentation.ContiguousMessages(messages, floor, through) {
+		c.Failed = false
+	}
+}
+
+func (s *RunStream) coverageThrough(seq int32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.coverage.Through = max(s.coverage.Through, seq)
+}
+
+func (s *RunStream) coverageBusy(busy bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if busy && !s.coverage.Busy {
+		s.coverage.Generation++
+	}
+	s.coverage.Busy = busy
 }
 
 // Events is the receive side. It is closed when the stream ends (context cancelled,
@@ -454,6 +530,11 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 				}
 				ev = NormalizeRunEvent(ev)
 				if ev.Type == RunEventTypeMessage {
+					previous := s.lastSeq.Load()
+					if previous > 0 && ev.Seq > previous+1 {
+						s.coverageGap(previous, ev.Seq, false)
+					}
+					s.coverageThrough(ev.Seq)
 					s.raiseLastSeq(ev.Seq)
 				}
 				if ev.Type == RunEventTypeState && ev.Status != "" {
@@ -471,6 +552,7 @@ func (s *RunStream) pump(ctx context.Context, c *HTTPClient, runID string, conn 
 		// Socket died. Drop it and let the top of the loop back off, redial and
 		// replay — one reconnect path, whether this is the first failure or the
 		// twentieth.
+		s.coverageBusy(true)
 		connCancel()
 		_ = conn.CloseNow()
 		conn = nil
@@ -502,8 +584,24 @@ func readFrames(connCtx context.Context, conn *websocket.Conn, out chan<- []byte
 // which carries NO seq — nothing in the message replay would reveal that the run
 // finished while the socket was down.
 func (s *RunStream) replay(ctx context.Context, c *HTTPClient, runID string) bool {
-	msgs, err := c.RunLogs(ctx, runID, s.lastSeq.Load())
+	s.coverageBusy(true)
+	floor := s.lastSeq.Load()
+	msgs, err := c.RunLogs(ctx, runID, floor)
+	if err != nil {
+		s.coverageGap(floor, floor, true)
+	}
+	previous := floor
+	for _, m := range msgs {
+		if m.Seq > previous+1 {
+			s.coverageGap(previous, m.Seq, false)
+		}
+		if m.Seq > previous {
+			previous = m.Seq
+		}
+	}
+	defer s.coverageBusy(false)
 	if err == nil {
+		s.coverageReplay(floor, msgs)
 		for _, m := range msgs {
 			if m.Seq <= s.lastSeq.Load() {
 				continue

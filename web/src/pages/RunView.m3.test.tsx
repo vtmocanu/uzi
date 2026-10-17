@@ -95,7 +95,7 @@ async function mountPage(current: Run, owner = true) {
   vi.mocked(useRunStream).mockReturnValue({
     run: current, messages: [], connected: true, error: "", submit, refreshRun: vi.fn().mockResolvedValue(undefined),
     inputs: [], refreshInputs: vi.fn(), canSteer: owner, confirmedOwner: owner,
-  } as ReturnType<typeof useRunStream>);
+  } as unknown as ReturnType<typeof useRunStream>);
   const view = render(<MemoryRouter initialEntries={["/runs/m3"]}><Routes><Route path="/runs/:id" element={<RunView />} /></Routes></MemoryRouter>);
   await act(async () => {});
   return { ...view, submit };
@@ -121,7 +121,7 @@ it.each(["awaiting_approval", "completed", "failed", "cancelled"] as const)(
   });
 
 it.each([
-  ["paused", null, /Paused by you/],
+  ["paused", null, /Paused(?: at|$)/],
   ["paused", "credential_disabled", "Waiting: credential disabled"],
   ["limit_wait", null, /Paused on .*usage limit/],
   ["pool_wait", null, /Waiting for a pooled token/],

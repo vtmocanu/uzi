@@ -440,7 +440,8 @@ A few worth knowing:
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
   naming the reason. This existing command is also the compatibility path
   when dependency parking requires an API or worker upgrade.
-- **`run resume <id>`** resumes a run the owner paused: it moves the run
+- **`run resume <id>`** resumes an ordinary pause requested by the owner or
+  the run's lead: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
   remaining budget (the clock stopped while paused, so resuming does not
   reset it). The claim then continues the same SDK session if that worker
@@ -2872,9 +2873,12 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   no backoff or cap, and it resumes when the account is usable again, or fails
   if the run's credential binding changed — see [Codex
   account unavailable](run-recovery-wait.md#codex-account-unavailable).
-- `paused`: an owner-requested hold (`uzi run pause`), resumed on demand from
-  the run page or `uzi run resume <id>`. See [Pausing and resuming a
-  run](run-pause.md). It does **not** auto-resume. A `paused` run can instead
+- `paused`: an ordinary pause requested by the owner (`uzi run pause` or
+  `/park`) or the run's lead (`park_run`), resumed on demand from the run
+  page or `uzi run resume <id>`. The requester does not determine the display
+  path: `park_run` and the owner's `/park` answer share the lead-park execution
+  path; `uzi run pause` uses the owner path. See [Pausing and resuming a
+  run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can instead
   be a **completion-blocked hold** on a run whose [structural completion
   interlock](run-completion-hold.md) couldn't finish a frozen milestone —
   same status, a different reason, and a different resume path
@@ -2882,7 +2886,7 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   distinction as a `COMPLETION` row reading `Completion blocked`, alongside
   emit-only-when-set `COMPLETION_UNMET`/`COMPLETION_ATTEMPTS`/`HOLD_CONTEXT`
   rows (the same fields under `--json`: `completion_phase`, `hold_reason`,
-  `completion_unmet`, `completion_attempts`, `hold_context`) — a plain owner
+  `completion_unmet`, `completion_attempts`, `hold_context`) — an ordinary
   pause carries none of them. Before it parks that way, an interlocked run
   also passes through two running-state `COMPLETION` labels of its own —
   **Checking completion** and **Reworking unmet milestones** — still `status:
@@ -2895,6 +2899,32 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+
+For an ordinary pause, human `run get` makes one supplemental message read
+(`tail=100`). Its pause detail reads **paused by the run's lead** for
+`origin: lead_park` (including an owner's `/park` answer), **paused by its
+owner** for `origin: owner` (`uzi run pause`), or neutral **paused** without
+sufficient current evidence. The worker best-effort emits
+this optional `origin` in a `paused` message after the server accepts the
+park; delivery failure does not undo it. There is no new run DTO field:
+`--json`, `--field` and raw `status: paused` stay unchanged, and these output
+modes do not make the supplemental read.
+
+Attribution considers the newest available `paused` marker first. It needs
+a currently `paused` run with no `hold_reason`, a valid nonzero
+`status_since`, a marker with a positive sequence and valid nonzero
+`created_at >= status_since`, a known origin, and complete current message
+coverage. An unusable newest marker leaves the label neutral rather than
+falling back to an older marker. Failed reads also leave it neutral.
+Pending pause fields and message prose do not establish origin. The label
+names an execution path, not a person's identity or the reason for pausing.
+
+The TUI and web run detail use their loaded messages without extra history
+scans. Replay, gaps, read failures and status refreshes can temporarily leave
+them neutral; follow notices without evidence can stay neutral too. Pause
+time display has its own fallback and does not establish origin. System
+hold presentation and remedies are unchanged. See
+[Reading the pause label](run-pause.md#reading-the-pause-label).
 
 `limit_wait` and timed `recovery_wait` causes auto-resume on a timer.
 `worker_requeue_exhausted` instead requires owner Resume or Cancel; the Codex
@@ -3021,7 +3051,7 @@ rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`pau
 except a default wait also stops at `recovery_wait` with cause
 `worker_requeue_exhausted` for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
-and owner pauses need `uzi run resume`. A bare `run wait` means
+and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,
 worker recovery exhaustion, **or** the end".
 

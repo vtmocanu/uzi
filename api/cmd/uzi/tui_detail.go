@@ -87,6 +87,29 @@ type detailState struct {
 	runLoaded  bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded bool // the newest transcript page has landed
 
+	// Attribution evidence is independent of transcript loading and the transport cursor.
+	// pauseSuffixAfter fixes the start of the first successful current tail or completed catch-up: older
+	// backfill may remain absent, while later cursor advancement cannot erase a hole.
+	// Read revisions acknowledge stream failures only after a successful loaded read.
+	pauseSuffixAfter  int32
+	pauseSuffixSet    bool
+	pauseEpoch        uint64
+	pauseRetiredSince time.Time
+	pauseLastSince    time.Time
+	// pauseTailReady is origin-only readiness from a current tail or catch-up EOF.
+	pauseTailReady     bool
+	pauseReadRevision  uint64
+	pauseCatchupFailed bool
+	pauseMetaReady     bool
+	// Writers: current page errors/nonadvancing catch-up and socket fallback invalidate
+	// pending proof. Readers: loadTailCmd/catchupCmd capture into detailPageMsg;
+	// successful tail/EOF accept readiness and read acknowledgement only on a match.
+	// Older backfill never writes this epoch; stream revisions and metadata stay separate.
+	pausePageEpoch uint64
+	// GetRun dispatch captures the coverage generation; applyRun/applyMeta store it,
+	// and pauseOrigin requires it to match the current stream generation.
+	pauseMetaGeneration uint64
+
 	questionCollapsed bool // session preference; only z toggles, reopening restores expanded
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
 	// cursor: the background walk requests the newest page strictly below it and the reply
@@ -205,14 +228,17 @@ func (m tuiModel) identitiesSig() string {
 // applyRun folds the first GetRun in: the header, the crew-rail milestones/accounts and
 // the "now" line render from this alone, one round trip before the transcript. Status is
 // taken wholesale (nothing to preserve yet, unlike applyMeta).
-func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
+func (d *detailState) applyRun(run apitypes.RunDTO, err error, coverageGeneration ...uint64) {
 	if err != nil {
 		d.loadErr = err
 		d.runLoaded = true
 		return
 	}
 	d.loadErr = nil
+	d.pauseMetaGeneration = d.pauseCoverageGeneration(coverageGeneration...)
 	d.run = run
+	d.pauseMetaReady = d.pauseEpochMatches(run)
+	d.rememberPauseEpoch()
 	d.runLoaded = true
 }
 
@@ -220,15 +246,45 @@ func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
 // deduped by seq (addFrame), so a live frame that beat the tail is not doubled. A page
 // error is recorded in pageErr — NOT loadErr — so it stays scoped to the transcript pane
 // and never swallows (or is swallowed by) the concurrent run-load result.
-func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error) {
+func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error, readRevision ...uint64) {
 	if err != nil {
 		d.pageErr = err
+		d.invalidatePausePage()
 		d.tailLoaded = true
 		return
 	}
 	d.pageErr = nil
 	d.addFrames(framesFromMessages(msgs))
 	d.tailLoaded = true
+	// Direct fixture applications may omit the capture and represent a fresh read.
+	// Production always supplies both the stream revision and local dispatch epoch.
+	pageEpoch := d.pausePageEpoch
+	if len(readRevision) > 1 {
+		pageEpoch = readRevision[1]
+	}
+	if pageEpoch != d.pausePageEpoch {
+		d.rebuild()
+		return
+	}
+	if !d.pauseSuffixSet && len(msgs) == 0 {
+		d.pauseSuffixSet = true
+		d.pauseSuffixAfter = 0
+	}
+	if !d.pauseSuffixSet && len(msgs) > 0 {
+		low := msgs[0].Seq
+		for _, message := range msgs {
+			if message.Seq < low {
+				low = message.Seq
+			}
+		}
+		if low > 0 {
+			d.pauseSuffixAfter = low - 1
+			d.pauseSuffixSet = true
+		}
+	}
+	d.pauseTailReady = true
+	d.pauseCatchupFailed = false
+	d.notePauseRead(readRevision...)
 	d.rebuild()
 }
 
@@ -302,19 +358,27 @@ func (d *detailState) applyCatchupPage(msgs []apitypes.MessageDTO) {
 // keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
 // running. While POLLING (the D8 fallback, M7) the stream is gone and the DTO is the only status
 // source, so it is adopted wholesale instead.
-func (d *detailState) applyMeta(run apitypes.RunDTO) {
+func (d *detailState) applyMeta(run apitypes.RunDTO, coverageGeneration ...uint64) {
 	if !d.runLoaded {
 		return
 	}
+	d.pauseMetaGeneration = d.pauseCoverageGeneration(coverageGeneration...)
 	if d.polling {
+		if d.run.Status == statusPaused && run.Status != statusPaused && d.pauseLastSince.After(d.pauseRetiredSince) {
+			d.pauseRetiredSince = d.pauseLastSince
+		}
 		// The live stream that normally owns status is gone; while polling the DTO is the only
 		// status source, so adopt it wholesale (PRD #1137 M7). Streaming keeps preserving it below.
 		d.run = run
+		d.pauseMetaReady = d.pauseEpochMatches(run)
+		d.rememberPauseEpoch()
 		return
 	}
 	status := d.run.Status
+	d.pauseMetaReady = run.Status == status && d.pauseEpochMatches(run)
 	d.run = run
 	d.run.Status = status
+	d.rememberPauseEpoch()
 }
 
 // applyEvents folds a batch in and reports whether the steer queue was signalled
@@ -330,7 +394,12 @@ func (d *detailState) applyEvents(evs []apitypes.RunEventDTO) bool {
 			// indistinguishable from a live one here, which is the point — the recovery
 			// path must not need its own branch.
 			if ev.Status != "" {
+				if d.run.Status == statusPaused && ev.Status != statusPaused && d.pauseLastSince.After(d.pauseRetiredSince) {
+					d.pauseRetiredSince = d.pauseLastSince
+				}
 				d.run.Status = ev.Status
+				d.pauseMetaReady = false
+				d.pauseEpoch++
 			}
 		case uzicli.RunEventTypeInput:
 			// Carries no data by design (the steer text is owner-gated and never rides
@@ -712,6 +781,9 @@ func (m tuiModel) detailHeaderLines() []string {
 		if label := runpresentation.HumanStopLabel(d.run.Status, strOr(d.run.StopKind, "")); label != "" {
 			tok.word = label
 		}
+		if d.run.Status == statusPaused && strOr(d.run.HoldReason, "") == "" {
+			tok.word = tuiPauseLabel(d.run, m.width, d.pauseOrigin())
+		}
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)
@@ -907,7 +979,7 @@ func (m tuiModel) renderDetail() string {
 		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
 	} else if d.run.Status == statusPaused && !isProviderUnavailableHold(d.run) {
-		line := pausedLine(d.run, time.Now(), m.width)
+		line := pausedLine(d.run, time.Now(), m.width, d.pauseOrigin())
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
 	} else if d.run.PauseRequestedAt != nil && !isProviderUnavailableHold(d.run) {
 		line := pauseRequestedLine(d.run, m.width)
@@ -1116,4 +1188,68 @@ func (m tuiModel) attentionBanner(head, body string, withKeys bool) string {
 		return clampVisual(padSeg(left, m.width-visualWidth(right), amber)+right, m.width)
 	}
 	return clampVisual(padSeg(left, m.width, amber), m.width)
+}
+
+func (d *detailState) invalidatePausePage() {
+	d.pausePageEpoch++
+	d.pauseTailReady = false
+}
+
+func (d *detailState) notePauseRead(revision ...uint64) {
+	if len(revision) > 0 {
+		d.pauseReadRevision = max(d.pauseReadRevision, revision[0])
+	}
+}
+
+func (d *detailState) pauseCoverageRevision() uint64 {
+	if d.stream != nil {
+		return d.stream.Coverage().Revision
+	}
+	return 0
+}
+
+// pauseOrigin uses the merged log, never lane selection or older-history completion.
+// Checking the entire held suffix preserves holes even if a later page raises highSeq.
+func (d *detailState) pauseOrigin() string {
+	ready := d.pauseTailReady && d.pauseSuffixSet && d.pauseMetaReady && !d.tailInFlight && d.catchupWaitID == 0 && !d.pauseCatchupFailed
+	messages := make([]apitypes.MessageDTO, 0, len(d.frames))
+	for _, frame := range d.frames {
+		messages = append(messages, apitypes.MessageDTO{Seq: frame.Seq, Kind: frame.Kind, Payload: frame.Payload, CreatedAt: frame.CreatedAt})
+	}
+	through := d.highSeq
+	if d.stream != nil {
+		coverage := d.stream.Coverage()
+		through = max(through, coverage.Through)
+		ready = ready && !coverage.Busy && d.pauseMetaGeneration == coverage.Generation
+		if coverage.Failed {
+			ready = ready && d.pauseReadRevision >= coverage.Revision
+		}
+		if coverage.Gapped {
+			ready = ready && runpresentation.ContiguousMessages(messages, coverage.After, max(coverage.Through, d.highSeq))
+		}
+	}
+	ready = ready && runpresentation.ContiguousMessages(messages, d.pauseSuffixAfter, through)
+	return runpresentation.PauseOrigin(d.run, messages, ready)
+}
+
+// Direct DTO applications without a dispatch capture represent a fresh authoritative read.
+// Production GetRun commands always supply their captured generation.
+func (d *detailState) pauseCoverageGeneration(captured ...uint64) uint64 {
+	if len(captured) > 0 {
+		return captured[0]
+	}
+	if d.stream != nil {
+		return d.stream.Coverage().Generation
+	}
+	return 0
+}
+
+func (d *detailState) pauseEpochMatches(run apitypes.RunDTO) bool {
+	return run.Status != statusPaused || d.pauseRetiredSince.IsZero() || (run.StatusSince != nil && run.StatusSince.After(d.pauseRetiredSince))
+}
+
+func (d *detailState) rememberPauseEpoch() {
+	if d.pauseMetaReady && d.run.Status == statusPaused && d.run.StatusSince != nil {
+		d.pauseLastSince = *d.run.StatusSince
+	}
 }
