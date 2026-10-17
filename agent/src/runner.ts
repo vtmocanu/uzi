@@ -1796,6 +1796,8 @@ type MemoryFlight = {
   hold?: Readonly<{ context: MemoryContext; deadline: number; humanRevision: boolean }>;
   operation?: Promise<void>;
   settled?: boolean;
+  /** A rejected ownership probe cannot be revived by a later pause input. */
+  ownershipRejected?: boolean;
   closing?: Promise<void>;
   closingSettled?: boolean;
   closingDeadline?: number;
@@ -17615,12 +17617,21 @@ export class RunRunner {
         const check = async () => {
           identity();
           signal.throwIfAborted();
-          const own = await this.getObservedRunOwnership(flight, signal);
+          let own: RunOwnershipResponse;
+          try { own = await this.getObservedRunOwnership(flight, signal); }
+          catch (error) {
+            if (isRunOwnershipLost(error, flight.runId)) memory.ownershipRejected = true;
+            throw error;
+          }
+          // Remember the rejection before a concurrent pause makes identity()
+          // throw: settling this operation does not restore its lost authority.
+          if ((own.status !== "running" && !(hold.humanRevision && own.status === "awaiting_approval")) ||
+              own.claim_generation !== context.claim_generation || own.claim_released === true) {
+            memory.ownershipRejected = true;
+            throw new RetainedRecoveryStop();
+          }
           identity();
           signal.throwIfAborted();
-          if ((own?.status !== "running" && !(hold.humanRevision && own?.status === "awaiting_approval")) ||
-              own.claim_generation !== context.claim_generation)
-            throw new RetainedRecoveryStop();
         };
         await check();
         // Memory parking already stopped the model; settle under the independent owner deadline.
@@ -17666,7 +17677,7 @@ export class RunRunner {
     const memory = flight.workerMemory;
     const pause = flight.steering.getPauseMode();
     if (!memory?.hold || (pause !== "now" && pause !== "milestone") ||
-        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true ||
+        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true || memory.ownershipRejected ||
         flight.parked || flight.holdOrWallParkConfirmed || flight.stoppedSourceKept ||
         flight.active?.shuttingDown || this.shuttingDownGlobal ||
         flight.steering.isCancelled() || flight.steering.claimFence() !== undefined ||

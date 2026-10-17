@@ -1292,3 +1292,67 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
     }
   });
 }
+
+for (const rejection of ["generation", "non-running", "released", "not-owned"] as const) {
+  test(`memory pause cannot revive ownership rejected before the pause (${rejection})`, async () => {
+    const f = await setup(1);
+    const monitoring = f.memory.run();
+    let captured: MemoryFlightProof | undefined, executorError: unknown;
+    let rejectedProbe = false, laterMutations = 0;
+    const probe = client.getRunOwnership.bind(client);
+    const marker = git.commitWipMarker.bind(git);
+    const fetch = git.fetchAgentBranch.bind(git);
+    const publish = client.publishCheckpoint.bind(client);
+    const executor: Executor = {
+      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      run: async ctx => {
+        try {
+          const command = enroll(ctx);
+          captured = command.captured.context.flight as unknown as MemoryFlightProof;
+          client.getRunOwnership = async (...args: Parameters<typeof probe>) => {
+            if (!rejectedProbe) {
+              if (rejection === "not-owned") api.setOwnershipNotOwned(f.claim.run_id);
+              else api.setOwnershipStatus(f.claim.run_id, rejection === "non-running" ? "queued" : "running",
+                rejection === "generation" ? 8 : 7);
+              rejectedProbe = true;
+            }
+            const own = await probe(...args);
+            return rejection === "released" ? { ...own, claim_released: true } : own;
+          };
+          git.commitWipMarker = async (...args) => {
+            if (rejectedProbe) laterMutations++;
+            return marker(...args);
+          };
+          git.fetchAgentBranch = async (...args) => {
+            if (rejectedProbe) laterMutations++;
+            return fetch(...args);
+          };
+          client.publishCheckpoint = async (...args) => {
+            if (rejectedProbe) laterMutations++;
+            return publish(...args);
+          };
+          f.pressure(950);
+          await command.captured.commands.watchOutcome(command.entry);
+          await until(() => captured?.workerMemory?.settled === true);
+          assert.equal(rejectedProbe, true);
+          api.appendInputs(f.claim.run_id, [input("pause", "now")]);
+          await until(() => ctx.pauseModeRequested?.() === "now");
+          assert.equal(captured.steering.claimFence(), undefined,
+            "this is an ownership-response rejection, not an input receipt fence");
+          assert.equal(ctx.signal!.reason instanceof PauseNowSignal, false);
+        } catch (error) { executorError = error; throw error; }
+        throw ctx.signal!.reason;
+      },
+    };
+    try {
+      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(f.claim);
+      if (executorError) throw executorError;
+      assert.equal(api.messages(f.claim.run_id).some(message => message.kind === "paused"), false,
+        "a later pause cannot authorize a new sink after observed ownership rejection");
+      assert.equal(laterMutations, 0, "no WIP, fetch or publish may start after the rejected ownership probe");
+      assert.equal(captured?.retainedLocalCustody, true);
+      assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+    } finally { await f.memory.stop(); await monitoring; }
+  });
+}
