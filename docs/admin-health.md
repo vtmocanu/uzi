@@ -165,7 +165,7 @@ except `forge.sync`, whose windows follow the effective forge poll interval.
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
 | `fleet.roll` | Whether hosted worker pods are rolling cleanly to their target image tag, from the controller's per-pod roll signal | some hosted workers are stuck | every hosted worker is stuck | `unknown` when the newest roll signal is older than the controller-signal freshness window *and* `controller.report` is not `ok` (a genuinely silent controller, not just an idle fleet); `na` when no hosted workers are configured |
-| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility; runs held for a returning worker (see below) are excluded | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `fleet.capacity` | Owners waiting without a fresh non-draining worker; stored upgrade reasons are confirmed against current composed eligibility; runs held for a returning worker or an expected code cross-check (see below) are excluded | — | genuine wait at least 5 minutes, or confirmed upgrade-wait overlap at least 24 hours | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `fleet.disk` | Whether any worker is under sustained disk pressure | any worker with a fresh heartbeat has a disk-pressure streak of 2+ consecutive polls | — | — |
 | `fleet.rundisk` | Whether one run is close to filling its worker's data volume (PRD #1809 M6, D8) | a fresh worker's largest reported run HOME is 40%+ of the data volume's total bytes, or the volume has less than 5% of its inodes free | — | `unknown` when the largest-run-size lookup itself fails |
 | `fleet.quarantine` | Whether any worker has latched a [residue quarantine](worker-setup.md#quarantined-worker) (an unreadable, unattributed runner-uid process was found, so it claims nothing until its container restarts) | any worker with a fresh heartbeat reports a quarantine; the evidence names at most 10 workers (the summary carries the full count), each with how long ago it latched and the run that detected it (the worker's reported cause is not shown here: read `residue_quarantine_cause` in `uzi admin workers --json` or the worker view in `uzi tui`) | — | — |
@@ -196,11 +196,11 @@ union, so an owner in both groups is counted once.
 
 | Check | What it means | `warn` | `danger` | `unknown` / `na` |
 |---|---|---|---|---|
-| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains and runs held for a returning worker | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
+| `queue.waiting` | Oldest genuine wait across the full `waiting_worker` population, excluding confirmed upgrade drains, runs held for a returning worker and expected code cross-check waits | oldest genuine wait is 10+ minutes | oldest genuine wait is 30+ minutes | `unknown` when the run-health detector is off/unreadable, the query fails, or a genuine wait has unavailable age unless a valid wait establishes danger |
 | `queue.undispatched` | A queued task run that never got dispatched (the [#1367](https://github.com/vtmocanu/uzi/issues/1367) failure class) | — | any `kind = 'task'`, `status = 'queued'` run with no dispatch for 10+ minutes | — |
 
 The queue evaluates the full waiting population, including owners with usable
-workers. Exclusion requires the exact stored `workersvc.ReasonWorkersUpgrading`
+workers. Upgrade-drain exclusion requires the exact stored `workersvc.ReasonWorkersUpgrading`
 value ("your workers are finishing their current runs before an upgrade; this
 run starts after"), valid non-null, finite, nonzero, nonfuture `health_since`
 and latest suitable drain timestamp,
@@ -235,6 +235,25 @@ neither sends a run-health nudge, contributes to `queue.waiting` or `fleet.capac
 nor triggers ordinary ephemeral capacity provisioning. Adding capacity or expediting
 the run does not bypass the hold. Moving between these two reasons keeps the expected
 wait episode; leaving both for a genuine wait restamps `health_since`.
+
+A running lead awaiting a required code cross-check also uses `waiting_worker`,
+with the reason "waiting until <UTC deadline> for code cross-check". The deadline
+is the persisted check deadline, formatted as RFC3339 UTC; it stays stable across
+health evaluations. This applies to a pending, non-interrupted, unexpired code
+check matching the lead's current unreleased claim, with a valid associated
+checker child that is queued, claimed or running. The child must target that
+lead, share its owner and worker, and use the recorded opposite harness.
+`report_only` leads and `not_code` fixes are excluded.
+
+A queued or running checker, including one facing child-capacity problems, does
+not make the lead a silent model; the child's own health remains separate.
+This expected wait sends no per-run worker-pickup or stall nudge. Both
+`queue.waiting` and `fleet.capacity` exclude it through their existing
+`waiting until %` reason exclusion. Persistence failures and tool loops still
+take precedence; plan cross-check behavior is unchanged. Ordinary health
+classification resumes when no live code check remains, including at deadline
+equality, or when the lookup fails. This classification does not refresh activity
+timestamps or extend run budgets or deadlines.
 
 Capacity runs first with a shared per-evaluation confirmation coordinator,
 memoized by run (including failed reads). It permits at most 200 distinct
