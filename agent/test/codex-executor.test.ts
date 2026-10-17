@@ -3196,6 +3196,61 @@ describe("M1 composed policy guidance delivery", () => {
     return { api, client, fx, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
   }
 
+  for (const session of ["usable", "missing", "exact fresh retry"] as const)
+  for (const recovered of [true, false])
+    it(`M2 unapproved frozen Stop session=${session} recovered=${recovered}`, async () => {
+      const f = await preservingFixture(true);
+      try {
+        // The server retains the execution contract when an unapproved replacement is gated.
+        // Leave the gate's candidate absent so it cannot stand in for the frozen definitions.
+        Object.assign(f.claim, {
+          policy_hold_fresh_session: session === "exact fresh retry",
+          session_id: session === "exact fresh retry" ? null : f.thread,
+          execution_milestones: [{ id: "m1", title: "delivered" }, { id: "m2", title: "remaining" }],
+        });
+        f.api.setStateAckScope(f.claim.run_id, { scope_ceiling: 1, milestones_completed: ["m1"] });
+        f.api.setInputs(f.claim.run_id, [{ id: 13, kind: "revise_plan", body: "pending revision feedback",
+          gate_binding: "bound", gate_revision: 7, created_at: "2026-10-02T00:00:00Z" }]);
+        if (session === "missing") {
+          await fs.rm(path.join(f.homeDir, "codex-session-store"), { recursive: true, force: true });
+        }
+        if (recovered) {
+          const branch = `agent/issue-${f.claim.issue_iid}`;
+          const checkout = spawnSync("git", ["-C", f.fx.originPath, "checkout", "-b", branch]);
+          assert.equal(checkout.status, 0, checkout.stderr.toString());
+          commitInTree(f.fx.originPath, "delivered.txt", "completed milestone\n");
+          assert.equal(spawnSync("git", ["-C", f.fx.originPath, "checkout", "main"]).status, 0);
+        }
+        const { rig, running } = f.start(session === "exact fresh retry" ? 3 : 2);
+        await waitFor(() => rig.transport.turnStartCount > 0 || f.api.policyHoldRequests.length > 0 ||
+          f.api.states.some(row => row.body.status === "awaiting_approval"), "Stop gate, hold, or forbidden revision", 15000);
+        // Capture observations before cancellation; cancellation legitimately closes the gate.
+        const turns = rig.transport.turnStartCount;
+        const revisionPrompt = JSON.stringify(rig.transport.requests.find(row => row.method === "turn/start")?.params);
+        const gates = f.api.states.filter(row => row.body.status === "awaiting_approval");
+        const feedbackApplied = f.api.isApplied(f.claim.run_id, 13);
+        const approved = f.api.humanPlanApproved(f.claim.run_id);
+        const holds = f.api.policyHoldRequests.map(row => row.body.detail);
+        if (holds.length) await withTimeout(running, 5000, "unavailable Stop source re-parks");
+        else await f.cancel(running);
+        if (turns > 0) assert.ok(revisionPrompt.includes("pending revision feedback"),
+          "the forbidden turn is revision work, rather than a new initial plan");
+        assert.equal(turns, 0, "reached frozen Stop must suppress revision startTurn before approval");
+        assert.equal(approved, false, "Stop must never infer plan approval");
+        assert.equal(feedbackApplied, false, "unexecuted revision feedback stays pending");
+        assert.equal(f.api.states.some(row => row.body.seeded_from_default), false);
+        assert.equal(f.api.states.some(row => ["completed", "failed"].includes(String(row.body.status))), false);
+        if (recovered) {
+          assert.deepEqual(holds, [], "a missing session cannot block a model-free Stop gate");
+          assert.equal(gates.length, 1, "unapproved candidate must await its normal gate");
+          assert.equal(gates[0]!.body.plan_md, "persisted original plan");
+        } else {
+          assert.deepEqual(holds, ["resume_rejected"], "a session never substitutes for delivery source");
+          assert.equal(gates.length, 0);
+        }
+      } finally { await f.cleanup(); }
+    });
+
   for (const full of [false, true]) for (const fresh of [false, true])
   for (const boundary of ["failure", "missing ceiling", "missing count", "missing IDs"] as const)
     it(`M2 required Stop ACK full=${full} fresh=${fresh} boundary=${boundary}`, async (t) => {
