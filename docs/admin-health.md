@@ -221,6 +221,21 @@ When the hold ends (the grace elapses, `WORKER_AFFINITY_CEILING` releases the ru
 row is deleted) the wait becomes a new episode, `health_since` is restamped, and it counts as a
 genuine wait again.
 
+A queued run whose previous worker is draining or in active maintenance instead shows
+"waiting until <time, RFC3339 UTC> for its previous worker <name> to finish draining or
+maintenance; another worker may take it after that" (the name is omitted when empty).
+This independent hold lasts through `updated_at + WORKER_AFFINITY_CEILING` (default 2h),
+including the exact deadline; peers are released strictly past it. It needs no fresh
+heartbeat or stale-requeue grace. Deleting the owner row or clearing its draining and
+active maintenance flags ends this hold early. Cross-check runs are exempt.
+When both holds apply, the draining/maintenance explanation takes precedence.
+Both holds are explained even below the queued-health age threshold, while queued
+health remains disabled when `health_queued_seconds` is zero. Both are expected waits:
+neither sends a run-health nudge, contributes to `queue.waiting` or `fleet.capacity`,
+nor triggers ordinary ephemeral capacity provisioning. Adding capacity or expediting
+the run does not bypass the hold. Moving between these two reasons keeps the expected
+wait episode; leaving both for a genuine wait restamps `health_since`.
+
 Capacity runs first with a shared per-evaluation confirmation coordinator,
 memoized by run (including failed reads). It permits at most 200 distinct
 confirmation calls, two seconds per call and a shared four-second budget,

@@ -9458,6 +9458,8 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- from the status_since and updated_at already projected here. COALESCE keeps a NULL
 -- stale_requeue_generation false rather than NULL. The name is the owner worker's, an empty string when the
 -- owner row is gone (COALESCE keeps the scan target a plain string).
+-- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
+-- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -9469,6 +9471,10 @@ SELECT id, user_id, status, auto_approve,
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+       COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
+                AND runs.worker_id IS NOT NULL
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id
+                            AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
@@ -10104,6 +10110,12 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10311,6 +10323,12 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10999,7 +11017,7 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
 -- queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
--- 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+-- 'waiting until ' stale-requeue or draining/maintenance reason) are excluded below.
 -- Expected plan cross-check waits are excluded:
 -- an owned check finishing is not a lead waiting for worker admission.
 SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
@@ -11008,13 +11026,11 @@ FROM runs r
 WHERE r.health = 'waiting_worker'
   AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
-  -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
-  -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
-  -- yet. The pin reason is flagged from the first detector tick after the requeue (below the queued
-  -- threshold), so without this the 5m danger threshold would fire inside the grace, clear at the
-  -- pin exit and fire again. Excluding the pin row keeps today's timing: the age runs from the first
-  -- non-pin flag, about max(grace, health_queued_seconds) after the requeue. A NULL health_reason
-  -- must stay included, hence the COALESCE.
+  -- Issues #2705/#3000: both the stale-requeue and draining/maintenance holds use
+  -- workersvc reasonStaleRequeuePinPrefix. They are expected waiting, explained from the
+  -- first detector tick even below the queued threshold. Capacity age starts at the first
+  -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
+  -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -11032,7 +11048,7 @@ FROM runs
 WHERE health = 'waiting_worker'
   AND kind <> 'cross_check'
   AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
-  -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
+  -- Issues #2705/#3000: either owner hold (workersvc reasonStaleRequeuePinPrefix,
   -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
   -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
   -- included: the LIKE is wrapped in COALESCE(..., false) under the NOT rather than written as a
