@@ -100,6 +100,9 @@ type detailState struct {
 	pauseReadRevision  uint64
 	pauseCatchupFailed bool
 	pauseMetaReady     bool
+	// GetRun dispatch captures the coverage generation; applyRun/applyMeta store it,
+	// and pauseOrigin requires it to match the current stream generation.
+	pauseMetaGeneration uint64
 
 	questionCollapsed bool // session preference; only z toggles, reopening restores expanded
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
@@ -219,13 +222,14 @@ func (m tuiModel) identitiesSig() string {
 // applyRun folds the first GetRun in: the header, the crew-rail milestones/accounts and
 // the "now" line render from this alone, one round trip before the transcript. Status is
 // taken wholesale (nothing to preserve yet, unlike applyMeta).
-func (d *detailState) applyRun(run apitypes.RunDTO, err error) {
+func (d *detailState) applyRun(run apitypes.RunDTO, err error, coverageGeneration ...uint64) {
 	if err != nil {
 		d.loadErr = err
 		d.runLoaded = true
 		return
 	}
 	d.loadErr = nil
+	d.pauseMetaGeneration = d.pauseCoverageGeneration(coverageGeneration...)
 	d.run = run
 	d.pauseMetaReady = d.pauseEpochMatches(run)
 	d.rememberPauseEpoch()
@@ -246,7 +250,7 @@ func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error, readR
 	d.pageErr = nil
 	d.addFrames(framesFromMessages(msgs))
 	d.tailLoaded = true
-	if !d.pauseSuffixSet && len(msgs) == 0 && d.highSeq == 0 {
+	if !d.pauseSuffixSet && len(msgs) == 0 {
 		d.pauseSuffixSet = true
 		d.pauseSuffixAfter = 0
 	}
@@ -338,10 +342,11 @@ func (d *detailState) applyCatchupPage(msgs []apitypes.MessageDTO) {
 // keys the instant a run enters awaiting_approval, or flipping a just-finished run back to
 // running. While POLLING (the D8 fallback, M7) the stream is gone and the DTO is the only status
 // source, so it is adopted wholesale instead.
-func (d *detailState) applyMeta(run apitypes.RunDTO) {
+func (d *detailState) applyMeta(run apitypes.RunDTO, coverageGeneration ...uint64) {
 	if !d.runLoaded {
 		return
 	}
+	d.pauseMetaGeneration = d.pauseCoverageGeneration(coverageGeneration...)
 	if d.polling {
 		if d.run.Status == statusPaused && run.Status != statusPaused && d.pauseLastSince.After(d.pauseRetiredSince) {
 			d.pauseRetiredSince = d.pauseLastSince
@@ -1194,7 +1199,7 @@ func (d *detailState) pauseOrigin() string {
 	if d.stream != nil {
 		coverage := d.stream.Coverage()
 		through = max(through, coverage.Through)
-		ready = ready && !coverage.Busy
+		ready = ready && !coverage.Busy && d.pauseMetaGeneration == coverage.Generation
 		if coverage.Failed {
 			ready = ready && d.pauseReadRevision >= coverage.Revision
 		}
@@ -1204,6 +1209,18 @@ func (d *detailState) pauseOrigin() string {
 	}
 	ready = ready && runpresentation.ContiguousMessages(messages, d.pauseSuffixAfter, through)
 	return runpresentation.PauseOrigin(d.run, messages, ready)
+}
+
+// Direct DTO applications without a dispatch capture represent a fresh authoritative read.
+// Production GetRun commands always supply their captured generation.
+func (d *detailState) pauseCoverageGeneration(captured ...uint64) uint64 {
+	if len(captured) > 0 {
+		return captured[0]
+	}
+	if d.stream != nil {
+		return d.stream.Coverage().Generation
+	}
+	return 0
 }
 
 func (d *detailState) pauseEpochMatches(run apitypes.RunDTO) bool {

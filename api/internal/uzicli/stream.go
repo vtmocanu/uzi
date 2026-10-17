@@ -204,7 +204,8 @@ type MessageCoverage struct {
 	FailedAfter int32
 	After       int32
 	Through     int32
-	Revision    uint64
+	Revision    uint64 // failed-read epoch; message holes do not advance it
+	Generation  uint64 // coverageBusy writes on disconnect; Coverage exposes it to displays
 }
 
 // Coverage is safe to sample from the display goroutine while the pump runs.
@@ -218,10 +219,12 @@ func (s *RunStream) coverageGap(after, through int32, failed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := &s.coverage
-	if !c.Gapped || after < c.After {
-		c.After = after
+	if through > after {
+		if !c.Gapped || after < c.After {
+			c.After = after
+		}
+		c.Gapped = true
 	}
-	c.Gapped = true
 	if through > c.Through {
 		c.Through = through
 	}
@@ -229,7 +232,9 @@ func (s *RunStream) coverageGap(after, through int32, failed bool) {
 		c.FailedAfter = after
 	}
 	c.Failed = c.Failed || failed
-	c.Revision++
+	if failed {
+		c.Revision++
+	}
 }
 
 // coverageReplay records only evidence from the existing read. A successful replay
@@ -257,6 +262,9 @@ func (s *RunStream) coverageThrough(seq int32) {
 func (s *RunStream) coverageBusy(busy bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if busy && !s.coverage.Busy {
+		s.coverage.Generation++
+	}
 	s.coverage.Busy = busy
 }
 

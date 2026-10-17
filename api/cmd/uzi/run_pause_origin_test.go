@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -91,6 +92,41 @@ func TestRunGetPauseOrigin(t *testing.T) {
 			}
 			if tc.want == "paused ·" && strings.Contains(out, "paused by") {
 				t.Fatalf("unsupported origin: %s", out)
+			}
+		})
+	}
+}
+
+func TestPauseOriginNotice(t *testing.T) {
+	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name, marker, hold, want string
+	}{
+		{"lead", "lead_park", "", "paused by the run's lead; resume with uzi run resume r1"},
+		{"owner", "owner", "", "paused by its owner; resume with uzi run resume r1"},
+		{"neutral", "", "", "paused; resume with uzi run resume r1"},
+		{"malicious", "owner\x1b[31m\ninjected", "", "paused; resume with uzi run resume r1"},
+		{"budget", "lead_park", holdBudgetExhausted, "parked at its time limit; extend: uzi run extend r1 --by 2h"},
+		{"credential", "owner", holdCredentialDisabled, ""},
+		{"provider", "lead_park", holdProviderUnavailable, ""},
+		{"unknown hold", "owner", "unknown", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := apitypes.RunDTO{ID: "r1", Status: "paused", StatusSince: &at}
+			messages := []apitypes.MessageDTO{pauseMarker(1, at, tc.marker)}
+			origin := runpresentation.PauseOrigin(run, messages, true)
+			if tc.hold != "" {
+				run.HoldReason = &tc.hold
+			}
+			got := pausedHoldNotice(run, origin)
+			if tc.want != "" && got != tc.want {
+				t.Fatalf("notice %q want %q", got, tc.want)
+			}
+			if tc.hold != "" && got != pausedHoldNotice(run) {
+				t.Fatalf("origin changed system hold notice: %q", got)
+			}
+			if strings.Contains(got, "injected") || strings.ContainsAny(got, "\n\x1b") {
+				t.Fatalf("unsafe notice %q", got)
 			}
 		})
 	}

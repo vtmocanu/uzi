@@ -196,10 +196,11 @@ type brewInfoMsg struct{ owner string }
 // detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
 // crew-rail milestones/accounts and now-line render from it, before the transcript.
 type detailRunMsg struct {
-	pauseEpoch uint64
-	runID      string
-	run        apitypes.RunDTO
-	err        error
+	coverageGeneration uint64
+	pauseEpoch         uint64
+	runID              string
+	run                apitypes.RunDTO
+	err                error
 	// gen is the detail SESSION generation the request was issued under (detailState.gen).
 	// exitToBoard cannot cancel an in-flight command, and reopening the SAME run passes the
 	// runID guard, so a reply from the previous session is rejected on gen instead.
@@ -271,10 +272,11 @@ type pollFallbackMsg struct {
 // without this the milestone checklist is frozen at open-time — the board badge polls, the
 // detail did not.
 type detailMetaMsg struct {
-	pauseEpoch uint64
-	runID      string
-	run        apitypes.RunDTO
-	err        error
+	coverageGeneration uint64
+	pauseEpoch         uint64
+	runID              string
+	run                apitypes.RunDTO
+	err                error
 	// reqID is the per-run request-generation id this reply belongs to (PRD #1130 M1 D2). The
 	// detail honours it only when reqID == m.detail.metaWaitID AND runID matches the current
 	// run, so a stale/superseded meta poll cannot clear a newer poll's guard. metaSeq restarts
@@ -822,9 +824,11 @@ var (
 func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	pauseEpoch := m.detail.pauseEpoch
+	// Capture at dispatch so a queued DTO cannot certify a later reconnect.
+	coverageGeneration := m.detail.pauseCoverageGeneration()
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
-		return detailRunMsg{pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, gen: gen}
+		return detailRunMsg{coverageGeneration: coverageGeneration, pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, gen: gen}
 	}
 }
 
@@ -875,13 +879,15 @@ func (m *tuiModel) startDetailCatchupReq() tea.Cmd {
 func (m tuiModel) refreshRunMetaCmd(runID string, reqID, gen uint64) tea.Cmd {
 	c, parent := m.client, m.ctx
 	pauseEpoch := m.detail.pauseEpoch
+	// Capture at dispatch so a queued DTO cannot certify a later reconnect.
+	coverageGeneration := m.detail.pauseCoverageGeneration()
 	return func() tea.Msg {
 		// Per-poll deadline (PRD #1130 D3): same short bound as the board poll, derived
 		// inside the closure so defer cancel() fires on return rather than immediately.
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
 		run, err := c.GetRun(ctx, runID)
-		return detailMetaMsg{pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, reqID: reqID, gen: gen}
+		return detailMetaMsg{coverageGeneration: coverageGeneration, pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, reqID: reqID, gen: gen}
 	}
 }
 
@@ -1382,7 +1388,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		status := m.detail.run.Status
 		pauseLastSince := m.detail.pauseLastSince
-		m.detail.applyRun(msg.run, msg.err)
+		m.detail.applyRun(msg.run, msg.err, msg.coverageGeneration)
 		if msg.pauseEpoch != m.detail.pauseEpoch {
 			m.detail.run.Status = status
 			m.detail.pauseLastSince = pauseLastSince
@@ -1481,7 +1487,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil // failed poll: guard cleared above so the next tick retries (D2)
 		}
 		pauseLastSince := m.detail.pauseLastSince
-		m.detail.applyMeta(msg.run)
+		m.detail.applyMeta(msg.run, msg.coverageGeneration)
 		if msg.pauseEpoch != m.detail.pauseEpoch {
 			m.detail.pauseLastSince = pauseLastSince
 			m.detail.pauseMetaReady = false
@@ -1552,6 +1558,8 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the same 2s REST poll `uzi run logs --follow` uses and say so on screen.
 			m.detail.streamErr = msg.err
 			m.detail.pauseCatchupFailed = true
+			m.detail.pauseMetaReady = false
+			m.detail.pauseEpoch++
 			m.detail.polling = true
 			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
@@ -1591,6 +1599,8 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err
 			m.detail.pauseCatchupFailed = true
+			m.detail.pauseMetaReady = false
+			m.detail.pauseEpoch++
 			m.detail.polling = true
 			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}

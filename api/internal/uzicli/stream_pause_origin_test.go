@@ -30,8 +30,9 @@ func TestRunStreamPauseCoverageReplayFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
+		deadline := time.Now().Add(5 * time.Second)
 		stream.Close()
-		if !stream.waitStopped(5 * time.Second) {
+		if !stream.waitStopped(time.Until(deadline)) {
 			t.Error("stream did not stop")
 		}
 	}()
@@ -60,7 +61,7 @@ func TestRunStreamPauseCoverageReplayFailure(t *testing.T) {
 		}
 	}
 	first := waitCoverage(func(c MessageCoverage) bool { return c.Failed && !c.Busy })
-	if first.After != 100 {
+	if first.FailedAfter != 100 || first.Gapped || first.Generation != 1 || first.Revision != 1 {
 		t.Fatalf("failed replay floor %+v", first)
 	}
 	pushFrame(t, conn, apitypes.RunEventDTO{Type: RunEventTypeMessage, Seq: 102, Kind: "paused"})
@@ -68,7 +69,7 @@ func TestRunStreamPauseCoverageReplayFailure(t *testing.T) {
 		t.Fatal(event)
 	}
 	gap := stream.Coverage()
-	if gap.After != 100 || gap.Through != 102 {
+	if gap.After != 100 || gap.Through != 102 || gap.Revision != first.Revision {
 		t.Fatalf("gap %+v", gap)
 	}
 	fail.Store(false)

@@ -115,7 +115,7 @@ func TestTUIPauseOriginHiddenReplayFailure(t *testing.T) {
 			connections <- connection
 		case "/api/runs/r1/messages":
 			if fail.Load() {
-				http.Error(w, "offline", 503)
+				http.Error(w, "offline", http.StatusServiceUnavailable)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []apitypes.MessageDTO{}})
@@ -202,8 +202,12 @@ func TestTUIPauseOriginHiddenReplayFailure(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	wait(func() bool { return replayed.Load() > 0 && !stream.Coverage().Busy })
+	if got := m.detail.pauseOrigin(); got != "" {
+		t.Fatalf("replay without current metadata attributed %q", got)
+	}
+	m.detail.applyMeta(run)
 	if got := m.detail.pauseOrigin(); got != "owner" {
-		t.Fatalf("same-floor replay did not restore readiness: %q", got)
+		t.Fatalf("same-floor replay plus current metadata did not restore readiness: %q", got)
 	}
 	replayed.Store(0)
 	// Live seq 102 raises the transport cursor across missing 101.
@@ -226,8 +230,9 @@ func TestTUIPauseOriginHiddenReplayFailure(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 	wait(func() bool { return replayed.Load() > 0 && !stream.Coverage().Busy })
+	m.detail.applyMeta(run) // current generation metadata still cannot cover the hole
 	if got := m.detail.pauseOrigin(); got != "" {
 		t.Fatalf("replay above hole attributed %q", got)
 	}
@@ -321,7 +326,7 @@ func TestTUIPauseOriginStreamAhead(t *testing.T) {
 	}
 	defer stream.Close()
 	conn := <-connections
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "r1")
 	m = applyDetail(m, apitypes.RunDTO{ID: "r1", Status: "paused", StatusSince: &at}, []apitypes.MessageDTO{pauseMarker(100, at, "owner")})
 	m.detail.stream = stream
@@ -371,5 +376,116 @@ func TestTUIPauseOriginTailFailure(t *testing.T) {
 	m.detail.applyCatchupPage([]apitypes.MessageDTO{{Seq: 101}})
 	if got := m.detail.pauseOrigin(); got != "lead_park" {
 		t.Fatal(got)
+	}
+}
+
+func TestTUIPauseOriginEmptyTailAfterLive(t *testing.T) {
+	at := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		seq  int32
+		want string
+	}{
+		{"complete", 1, "lead_park"},
+		{"gap2", 2, ""},
+		{"gap100", 100, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := tuiTestModel(t, &uzicli.FakeClient{}, "r1")
+			update := func(msg any) { next, _ := m.Update(msg); m = next.(tuiModel) }
+			update(detailRunMsg{runID: "r1", run: apitypes.RunDTO{ID: "r1", Status: "paused", StatusSince: &at}})
+			update(streamEventsMsg{runID: "r1", events: []apitypes.RunEventDTO{{Type: uzicli.RunEventTypeMessage, Seq: tc.seq, Kind: "paused", Payload: pauseMarker(tc.seq, at, "lead_park").Payload, CreatedAt: &at}}})
+			// The first tail read was empty; its response arrives after the live marker.
+			update(detailPageMsg{runID: "r1", kind: pageTail})
+			if got := m.detail.pauseOrigin(); got != tc.want {
+				t.Fatalf("origin %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTUIPauseOriginInitialReplayFailureThenCurrentTail(t *testing.T) {
+	at := time.Now().UTC()
+	run := apitypes.RunDTO{ID: "r1", Kind: "prompt", Status: "paused", StatusSince: &at}
+	connections := make(chan *websocket.Conn, 4)
+	var fail atomic.Bool
+	var replayed atomic.Int32
+	fail.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ws":
+			connection, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			connections <- connection
+		case "/api/runs/r1/messages":
+			if fail.Load() {
+				http.Error(w, "offline", http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"messages": []apitypes.MessageDTO{}})
+			replayed.Add(1)
+		case "/api/runs/r1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"run": run})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	client := uzicli.NewHTTPClient(uzicli.Settings{URL: server.URL, Token: "test"})
+	stream, err := client.StreamRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	var conn *websocket.Conn
+	select {
+	case conn = <-connections:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "r1")
+	m.detail.applyRun(run, nil)
+	m.detail.stream = stream
+
+	_ = conn.CloseNow()
+	select {
+	case conn = <-connections:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case event := <-stream.Events():
+		next, _ := m.Update(streamEventsMsg{runID: "r1", events: []apitypes.RunEventDTO{event}})
+		m = next.(tuiModel)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	wait := func(predicate func() bool) {
+		t.Helper()
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for !predicate() {
+			select {
+			case <-tick.C:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+	}
+	wait(func() bool { return !stream.Coverage().Busy && stream.Coverage().Failed })
+	defer func() { _ = conn.CloseNow() }()
+	m.detail.applyMeta(run)
+	tail := make([]apitypes.MessageDTO, 0, detailPageSize)
+	for seq := int32(801); seq <= 1000; seq++ {
+		tail = append(tail, apitypes.MessageDTO{Seq: seq, Kind: "text", CreatedAt: at})
+	}
+	tail[len(tail)-1] = pauseMarker(1000, at, "owner")
+	m.detail.applyTailPage(tail, nil, stream.Coverage().Revision)
+	if got := m.detail.pauseOrigin(); got != "owner" {
+		t.Fatalf("successful current tail with older history absent: origin=%q coverage=%+v", got, stream.Coverage())
 	}
 }
