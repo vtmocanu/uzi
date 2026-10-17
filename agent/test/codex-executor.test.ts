@@ -10838,6 +10838,123 @@ describe("approved m1 Codex resume reconciliation", () => {
 });
 
 describe("Codex completion interlock", () => {
+  it("issue3089 m4 Codex non_closing alone preserves m2 through autonomous rework and three-attempt stall", async () => {
+    const input = { non_closing: { reason: "Owner says defer m2" }, milestones_completed: ["m1"] };
+    const milestones = [
+      { id: "m1", title: "Delivered work" }, { id: "m2", title: "Required integration check" },
+    ];
+    const order: string[] = [];
+    const attempts: unknown[] = [];
+    const questions: string[][] = [];
+    const holds: string[] = [];
+    const rig = makeMultiEpochRig([0, 1, 2].map(n => epochResponder("th-" + n, "tn-" + n, (t, th, tn) => {
+      assert.deepEqual(questions, [], "rework before stall remains autonomous");
+      t.push(toolCall(n + 1, "signal_done", input, th, tn, "non-closing-" + n))
+        .push(turnCompleted("completed", th, tn));
+    })));
+    const { ctx } = makeCtx({
+      kind: "issue", interactive: false, completionInterlock: true,
+      config: { max_iterations: 10 }, frozenMilestones: milestones,
+      checkpoint: async () => { order.push("checkpoint"); },
+      worktreeFingerprint: async () => "TIP\n M src/x.ts",
+      recordCompletionAttempt: async args => {
+        order.push("attempt");
+        attempts.push(args);
+        return { unmet: ["m2"], attemptCount: attempts.length };
+      },
+      askCompletionQuestion: async (unmet, trigger) => {
+        assert.equal(attempts.length, 3, "non_closing cannot open an early owner window");
+        assert.deepEqual(trigger, { kind: "no_progress" });
+        order.push("askQuestion");
+        questions.push(unmet);
+        return { outcome: "expired" };
+      },
+      enterCompletionHold: async reason => { order.push("hold"); holds.push(reason); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000,
+      "issue3089 m4 Codex non_closing stall");
+    const prompts = rig.epochs.flatMap(epoch => epoch.transport.requests
+      .filter(r => r.method === "turn/start")
+      .map(r => (r.params as { input: { text: string }[] }).input[0]!.text));
+    assert.equal(rig.providerLaunches(), 3);
+    assert.equal(prompts.length, 3);
+    for (const prompt of prompts.slice(1)) {
+      assert.match(prompt, /- m2: Required integration check/);
+      assert.match(prompt, /Finish the remaining milestone/);
+    }
+    assert.deepEqual(attempts, Array.from({ length: 3 }, () => ({
+      declared: ["m1"], head: "TIP", worktreeFingerprint: "TIP\n M src/x.ts",
+    })), "attempt payload contains only the declaration and real tree identity, never scope selection");
+    for (const [n, epoch] of rig.epochs.entries()) {
+      const reply = rec(rec(epoch.transport.responses.find(r => r.requestId === n + 1)?.response).result);
+      assert.equal(reply.success, true, "actual broker admits non_closing metadata");
+    }
+    assert.deepEqual(order, [
+      "checkpoint", "attempt", "checkpoint", "attempt", "checkpoint", "attempt", "askQuestion", "hold",
+    ]);
+    assert.deepEqual(questions, [["m2"]]);
+    assert.deepEqual(ctx.frozenMilestones, [
+      { id: "m1", title: "Delivered work" }, { id: "m2", title: "Required integration check" },
+    ]);
+    assert.deepEqual(result.milestonesCompleted, ["m1"]);
+    assert.deepEqual(result.nonClosing, input.non_closing);
+    assert.ok(!("ownerDecisionRequested" in result));
+    assert.equal(result.scopeCapped, undefined);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(holds.length, 1);
+    assert.match(holds[0]!, /repeated completion attempts made no progress/);
+    assert.deepEqual(result.completionHeld, { reason: holds[0] });
+  });
+
+  it("issue3089 m4 Codex broker refuses model-selected scope before a corrected reason-only request", async () => {
+    const rejected = {
+      owner_decision_requested: { reason: "Owner wants to defer", kind: "partial", keep: ["m1"] },
+      milestones_completed: ["m2"], summary: "REJECTED scope companion",
+      non_closing: { reason: "REJECTED" },
+    };
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push(toolCall(30891, "signal_done", rejected, th, tn, "invalid-scope"))
+        .push(toolCall(30892, "signal_done", {
+          owner_decision_requested: { reason: "Owner wants to defer" }, milestones_completed: ["m1"],
+        }, th, tn, "corrected-scope"))
+        .push(turnCompleted("completed", th, tn));
+    })]);
+    const attempts: unknown[] = [];
+    const questions: string[][] = [];
+    const { ctx } = makeCtx({
+      kind: "issue", interactive: false, completionInterlock: true,
+      frozenMilestones: [{ id: "m1", title: "Delivered" }, { id: "m2", title: "Required" }],
+      checkpoint: async () => {},
+      worktreeFingerprint: async () => "TIP",
+      recordCompletionAttempt: async args => {
+        attempts.push(args);
+        return { unmet: ["m2"], attemptCount: attempts.length };
+      },
+      askCompletionQuestion: async (unmet, trigger) => {
+        questions.push(unmet);
+        assert.deepEqual(trigger, { kind: "lead_request", reason: "Owner wants to defer" });
+        return { outcome: "expired" };
+      },
+      enterCompletionHold: async () => true,
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000,
+      "issue3089 m4 corrected Codex request");
+    const replies = rig.epochs[0]!.transport.responses;
+    const denied = rec(rec(replies.find(r => r.requestId === 30891)?.response).result);
+    const admitted = rec(rec(replies.find(r => r.requestId === 30892)?.response).result);
+    assert.equal(denied.success, false);
+    assert.match(JSON.stringify(denied), /Invalid owner_decision_requested/);
+    assert.equal(admitted.success, true);
+    assert.deepEqual(attempts, [{ declared: ["m1"], head: "TIP", worktreeFingerprint: "TIP" }]);
+    assert.deepEqual(questions, [["m2"]]);
+    assert.equal(rig.providerLaunches(), 1);
+    assert.deepEqual(result.milestonesCompleted, ["m1"]);
+    assert.equal(result.nonClosing, undefined);
+    assert.equal(result.summary, undefined);
+    assert.ok(result.completionHeld);
+    assert.doesNotMatch(JSON.stringify(result), /REJECTED/);
+  });
+
   it("issue3089 m1 Codex request clears across turns and reason stays out of rework", async () => {
     const rig = makeMultiEpochRig([0, 1, 2].map(n => epochResponder("th-" + n, "tn-" + n, (t, th, tn) => {
       t.push(toolCall(1, "signal_done", n === 0 ? {

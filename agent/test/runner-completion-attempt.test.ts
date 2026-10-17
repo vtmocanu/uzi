@@ -379,6 +379,69 @@ describe("approved m1 resume reconciliation", () => {
 });
 
 describe("issue3089 m1 integrated SDK completion admission", () => {
+  it("issue3089 m4 Claude non_closing alone preserves m2 through autonomous rework and three-attempt stall", { timeout: 10_000 }, async () => {
+    const probe = makeCompletionCtx({
+      unmetScript: [["m2"]], askQuestionScript: [{ outcome: "expired" }],
+    });
+    const milestones = [
+      { id: "m1", title: "Delivered work" }, { id: "m2", title: "Required integration check" },
+    ];
+    Object.assign(probe.ctx, {
+      kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "Deliver m1 and m2", sessionId: "sess-1", frozenMilestones: milestones,
+    });
+    const ask = probe.ctx.askCompletionQuestion!;
+    probe.ctx.askCompletionQuestion = async (unmet, trigger) => {
+      assert.equal(probe.attemptCalls.length, 3, "non_closing cannot open an early owner window");
+      assert.deepEqual(trigger, { kind: "no_progress" });
+      return ask(unmet, trigger);
+    };
+    const prompts: string[] = [];
+    const input = { non_closing: { reason: "Owner says defer m2" }, milestones_completed: ["m1"] };
+    const queryFn: SdkQueryFn = params => (async function* () {
+      assert.ok(prompts.length < 3, "unchanged completion is bounded to three attempts");
+      for await (const message of params.prompt) {
+        prompts.push(String((message as { message: { content: unknown } }).message.content));
+      }
+      assert.deepEqual(probe.askQuestionCalls, [], "rework before stall remains autonomous");
+      const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
+      try {
+        const admitted = await rpc.request("tools/call", { name: "signal_done", arguments: input });
+        assert.equal(admitted.error, undefined);
+        assert.notEqual((admitted.result as { isError?: boolean }).isError, true,
+          "non_closing is valid metadata, even though it cannot revise scope");
+        yield signalDone(input);
+        yield resultSuccess();
+      } finally {
+        await rpc.close();
+      }
+    })();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(prompts.length, 3);
+    for (const prompt of prompts.slice(1)) {
+      assert.match(prompt, /- m2: Required integration check/);
+      assert.match(prompt, /Finish the remaining milestone/);
+    }
+    assert.deepEqual(probe.attemptCalls, Array.from({ length: 3 }, () => ({
+      declared: ["m1"], head: "TIP", worktreeFingerprint: "TIP\n M src/x.ts",
+    })), "attempt payload contains only the declaration and real tree identity, never scope selection");
+    assert.deepEqual(probe.order, [
+      "checkpoint", "attempt", "checkpoint", "attempt", "checkpoint", "attempt", "askQuestion", "hold",
+    ]);
+    assert.deepEqual(probe.askQuestionCalls, [["m2"]]);
+    assert.deepEqual(probe.ctx.frozenMilestones, [
+      { id: "m1", title: "Delivered work" }, { id: "m2", title: "Required integration check" },
+    ]);
+    assert.deepEqual(result.milestonesCompleted, ["m1"]);
+    assert.deepEqual(result.nonClosing, input.non_closing);
+    assert.ok(!("ownerDecisionRequested" in result));
+    assert.equal(result.scopeCapped, undefined);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(probe.holdReasons.length, 1);
+    assert.match(probe.holdReasons[0]!, /repeated completion attempts made no progress/);
+    assert.deepEqual(result.completionHeld, { reason: probe.holdReasons[0] });
+  });
+
   it("rejects malformed then admits corrected tools/call into the first owner window", async () => {
     const probe = makeCompletionCtx({
       unmetScript: [["m1"]], askQuestionScript: [{ outcome: "expired" }],
@@ -430,12 +493,18 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
           proposal: { title: "REJECTED", body: "REJECTED" },
           pr_summary: { what: "REJECTED" }, non_closing: { reason: "REJECTED" },
         };
-        const denied = await rpc.request("tools/call", { name: "signal_done", arguments: rejected });
-        assert.equal(denied.error, undefined);
-        assert.equal((denied.result as { isError?: boolean }).isError, true);
-        yield signalDone(rejected);
-        assert.deepEqual(probe.order, [], "rejected frame cannot checkpoint or attempt completion");
-        assert.deepEqual(probe.askQuestionCalls, []);
+        for (const ownerRequest of [
+          { reason: " " },
+          { reason: "Owner wants to defer", kind: "partial", keep: ["m1"] },
+        ]) {
+          const invalid = { ...rejected, owner_decision_requested: ownerRequest };
+          const denied = await rpc.request("tools/call", { name: "signal_done", arguments: invalid });
+          assert.equal(denied.error, undefined);
+          assert.equal((denied.result as { isError?: boolean }).isError, true);
+          yield signalDone(invalid);
+          assert.deepEqual(probe.order, [], "rejected frame cannot checkpoint or attempt completion");
+          assert.deepEqual(probe.askQuestionCalls, []);
+        }
         const accepted = {
           owner_decision_requested: { reason: "  Owner wants to defer  " },
           milestones_completed: ["m2"],
@@ -650,11 +719,21 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
 
   for (const satisfied of [false, true]) {
     it(`issue3089 Claude owner decision request ${satisfied ? "finalizes when satisfied" : "asks on the first attempt"}`, async () => {
-      const { queryFn, turns } = fakeTurns([
-        [signalDone({
-          owner_decision_requested: { reason: "Owner wants to defer" },
-        }), resultSuccess()],
-      ]);
+      const input = { owner_decision_requested: { reason: "Owner wants to defer" } };
+      const scripted = fakeTurns([[signalDone(input), resultSuccess()]]);
+      const { turns } = scripted;
+      const queryFn: SdkQueryFn = params => (async function* () {
+        const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
+        try {
+          const admitted = await rpc.request("tools/call", { name: "signal_done", arguments: input });
+          assert.equal(admitted.error, undefined);
+          assert.notEqual((admitted.result as { isError?: boolean }).isError, true,
+            "actual SDK handler accepts a reason-only completion request");
+          yield* scripted.queryFn(params);
+        } finally {
+          await rpc.close();
+        }
+      })();
       const probe = makeCompletionCtx({
         unmetScript: [satisfied ? [] : ["m1"]],
         askQuestionScript: [{ outcome: "expired" }],
