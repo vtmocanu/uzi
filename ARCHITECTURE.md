@@ -1090,9 +1090,11 @@ chain in the diagram above, with no intervening `running`.
   (a versioned, frozen structural completion contract stamped before its first
   claim) that signals done with a frozen milestone still undeclared is checkpointed
   and returned to the **same lead session** first — no forge call happens while
-  anything is unmet. Only after repeated no-progress does the worker capture a
-  verified same-worker restore point and call the dedicated `SetRunCompletionHold`
-  transition (a sibling of `SetRunPaused`, not a widening of it) requiring a
+  anything is unmet. The completion question opens on a lead's
+  `owner_decision_requested` after an authoritative unmet result, or after three
+  unchanged no-progress attempts without that request. If its live window expires,
+  the worker captures a verified same-worker restore point and calls the dedicated
+  `SetRunCompletionHold` transition (a sibling of `SetRunPaused`, not a widening of it) requiring a
   positive `paused` acknowledgement before releasing anything. Only a worker that
   self-reports the `completion_interlock_v1` protocol capability can claim an
   interlocked run at all — a **non-bypassable** `ClaimRun` clause deliberately
