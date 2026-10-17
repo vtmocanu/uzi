@@ -31,6 +31,16 @@ func newAutomaticRoundsFixture(t *testing.T, limit int32) (codexTestEnv, *Servic
 	return env, svc, store.Worker{ID: worker, UserID: user}, lead, c
 }
 
+func newAutomaticRoundsHarnessFixture(t *testing.T, limit int32, harness string) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
+	t.Helper()
+	env, svc, worker, lead, candidate := newAutomaticRoundsFixture(t, limit)
+	// Keep both credentials usable so a same-family checker cannot hide a direction bug.
+	seedDefaultAnthropicToken(t, env, worker.UserID)
+	env.exec("UPDATE workers SET protocol_capabilities=ARRAY['cross_check_v1','cross_check_rounds_v1','cross_check_codex_lead_v1'] WHERE id=$1", worker.ID)
+	env.exec("UPDATE runs SET harness=$2 WHERE id=$1", lead, harness)
+	return env, svc, worker, lead, candidate
+}
+
 func TestPlanCrossCheckAutomaticRoundsBudgetLiveDB(t *testing.T) {
 	for limit := int32(0); limit <= 4; limit++ {
 		t.Run(fmt.Sprintf("budget%d", limit), func(t *testing.T) {
