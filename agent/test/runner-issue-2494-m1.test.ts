@@ -183,6 +183,10 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
     const workerId = registration.worker_id;
     assert.ok(workerId);
     const server = heldServer(claim, features);
+    client.getRunOwnership = async () => ({
+      status: server.failedAcked() ? "cancelled" : "running",
+      claim_generation: 71, inventory_guarded: true,
+    });
     const holdId = "00000000-0000-4000-8000-000000000071";
     client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: server.holdOpen() ? [{
       hold_id: holdId, generation: 71, inventory_guarded: true, has_available_capture: server.archiveUploads() > 0,
@@ -231,6 +235,7 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
     assert.equal(models, 0);
     const original = await frozenRecords(claim);
     assert.ok(original[0]?.exactHoldBinding, "cancellation starts with frozen exact authority");
+    assert.equal((await client.getRunOwnership(claim.run_id)).status, "cancelled");
     const passes = [], start = now;
     for (const elapsed of [0, 30_000, 60_000, 120_000, 150_000, 180_000]) {
       now = start + elapsed;
@@ -242,10 +247,19 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
       finals: server.finals, pending: !!(await outbox.readTerminalJournal(claim.run_id, 71)), events }));
     if (cancellation === "unknown") {
       assert.equal(server.acked(), 0, "unknown exact custody cannot create a release");
+      const retained = await frozenRecords(claim);
+      assert.equal(retained.length, original.length);
+      assert.equal(retained[0]!.captureId, original[0]!.captureId);
+      assert.deepEqual(retained[0]!.exactHoldBinding, original[0]!.exactHoldBinding);
+      assert.notEqual(retained[0]!.finalAcknowledged, true);
+      assert.ok(await outbox.readTerminalJournal(claim.run_id, 71), "unknown custody keeps the protected terminal");
       // Unknown custody forbids release; retaining an archive is still permitted.
     } else {
       assert.equal(original.length, 1);
       assert.equal(server.acked(), 1, "LIVE settles cancellation after execution tail closes");
+      assert.equal(server.heldCalls.length, 1, "live recovery does not create another publication");
+      assert.equal(server.finals.length, 1, "the original FINAL settles once");
+      if (original[0]!.finalRequest) assert.deepEqual(server.finals[0]!.disposition, original[0]!.finalRequest.disposition);
       if (cancellation === "archive") {
         assert.equal(original[0]!.state, "uploaded");
         assert.equal(original[0]!.selfContained, true);

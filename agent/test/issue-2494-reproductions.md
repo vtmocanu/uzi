@@ -1,5 +1,7 @@
 # #2494 reproduction evidence
 
+This report lives with the test fixtures; it is not part of the top-level embedded CLI documentation corpus.
+
 M1 observation base: `ce36a79f` (includes #3058, `0c4c7287`). This milestone changes tests only, plus this evidence report. Product code is unchanged. #3101 was still open when checked; no matching landing commit was present in this checkout.
 
 The two historical incidents were **not reproduced in the bounded fixtures below**. This does not establish the cause of the historical snapshots or rule out an untested interleaving. The permanent-refusal reconciliation cases have independent failing regressions. The approved plan requires retaining that distinction.
@@ -26,7 +28,7 @@ The receipt variant returns an authenticated completed-publication receipt and r
 
 Discovery returns an exact positive generation/kind/default identity and an owed candidate for the completing head. During outage the hold/ownership reads fail; after transport recovery they succeed. Neither boot nor live reconstruction rejects this context. No missing reconstruction authority or skipping predicate for the historical outage record has been established. Its discovery context was absent from the historical snapshot. These positive controls therefore do not authorize an incident-specific predicate repair or a new discovery producer.
 
-The ci_fix fixture first observes `inventory_source_not_quiescent:execution_tail_present` on its uploaded self-contained archive. Actual execute-tail and maintenance-reservation states are recorded separately. Once those tails clear, heartbeat recovery ACKs the same capture/source/coverage identity with one total upload. The cancelled controls distinguish the existing held-first route, typed held refusal with archive fallback, and unknown exact custody after a valid freeze. Unknown custody is not treated as an ACK; archive upload itself is not categorically forbidden.
+The ci_fix fixture first observes `inventory_source_not_quiescent:execution_tail_present` on its uploaded self-contained archive. Actual execute-tail and maintenance-reservation states are recorded separately. Once those tails clear, heartbeat recovery ACKs the same capture/source/coverage identity with one total upload. The cancelled controls distinguish the existing held-first route, typed held refusal with archive fallback, and unknown exact custody after a valid freeze. Ownership and exact-hold observations both report cancelled after the terminal ACK. The tests assert no second publication/FINAL; unknown custody preserves the original capture identity, exact binding, unacknowledged state and installed protected terminal. Unknown custody is not treated as an ACK; archive upload itself is not categorically forbidden.
 
 ## Contention and timing qualifications
 
@@ -50,7 +52,7 @@ Existing backlog controls remain green: production spacing reaches the unchanged
 
 At elapsed milliseconds [0, 30000, 60000, 90000, 180000, 420000, 900000, 1800000, 2700000], binding-less 403/409 resend counts are [1,2,3,4,5,6,7,8,9], rather than the capped-backoff expectation [1,1,2,2,3,4,5,6,7]. The saved FINAL, archive bytes and one-upload identity remain protected. Binding-less suppression remains outside this issue, assigned to #3105.
 
-The saved request in the differing-receipt cases is archive(capture/source/digest); the server observation is held_publication(publication ID/source/digest). The differing disposition is explicit, not inferred digest recomputation. No holdSettlement is preseeded in the fresh-read matrix. Healthy-bound cases already suppress FINAL resend; their red is repeated work. The persisted-observation case begins with a MAC-authenticated discard observation and still increments status counts on later passes.
+The saved request in the differing-receipt cases is archive(capture/source/digest); the server observation is held_publication(publication ID/source/digest) with matching held_publication release evidence. Open controls contain neither release evidence nor a receipt, preserving the real client validation contract. The differing disposition is explicit, not inferred digest recomputation. No holdSettlement is preseeded in the fresh-read matrix. Healthy-bound cases already suppress FINAL resend; their red is repeated work. The persisted-observation case begins with a MAC-authenticated discard observation and still increments status counts on later passes.
 
 Relevant unchanged base mechanisms: recovery.ts finalizeInventoryWithinBoundary checks capture status before heldOperationState; unhealthy or failed reads enter reconcileInventory first. Differing reconciliation receipts are rejected without persisting exact closure. Persisted observations are reached after avoidable source/status checks. The 403/409 catch emits raw error text and classifies the result without per-record backoff. These observations justify the approved M3 investigation/repair, not expanded suppression or cleanup authority.
 
@@ -61,11 +63,11 @@ All logs are run-local under `.uzi/scratch/`; no logs or scratch data are tracke
 | Check | Recorded result | Log |
 | --- | --- | --- |
 | Final outage selection, six cases | EXIT=0, six pass, 27.362s | gate-log.m1bDq7 |
-| Three corrected cancellation controls | EXIT=0, three pass, 13.960s | gate-log.PMsaBA |
+| Final cancellation controls with cancelled ownership and retention assertions | EXIT=0, three pass, 12.106s | gate-log.vcEd8Z |
 | ci_fix after/during-exit controls with reservation barriers | Both pass in a larger run; that run exited 1 for the subsequently corrected cancellation fixture | gate-log.KrOX1D |
 | Final report-before-reservation control | EXIT=0, one pass, 7.332s | gate-log.9fp64P |
-| Final inventory selection plus backlog controls | EXIT=1, 18 pass / 12 expected regression failures, no cancellations, 7.165s | gate-log.gFf3MG |
-| npm --prefix agent run lint; npm --prefix agent run typecheck; git diff --check HEAD | EXIT=0; initial test typing errors corrected | gate-log.4iSflQ |
+| Final inventory selection plus backlog controls, valid proof shapes and bounded diagnostic assertions | EXIT=1, 18 pass / 12 expected regression failures, no cancellations, 6.410s | gate-log.T5YwvL |
+| npm --prefix agent run lint; npm --prefix agent run typecheck; git diff --check HEAD | EXIT=0; initial test typing errors corrected | gate-log.K8JESX |
 
 Focused Node invocations ran from `agent/`, with `TMPDIR` pointing to the worktree's `.uzi/scratch/`, using:
 
@@ -74,5 +76,7 @@ node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=1
 ```
 
 Selections: `M1 completion outage restart before sweep`; `M1 cancelled gated issue LIVE`; `M1 completed ci_fix uploaded archive live report-before-reservation`; and `M1 R2987|M1 C\(skip\)|handoff receipt pacing`. The initial ci_fix evidence used the whole runner fixture file before the added report variant. All cases are bounded by injected clocks/barriers and existing per-test timeout; no production timer changes were made.
+
+Review of 373bd30d identified invalid differing/open proof fixture shapes and top-level documentation placement; both were corrected. Reviewer/auditor assertion notes were addressed with hostile/oversized diagnostic payload checks across every emitted warning, plus explicit unknown-custody record/report retention assertions. A lead review also corrected the inherited failed ownership response to cancelled. The focused selections in the table were rerun after those test fixes. The tester mentioned the absence of a coverage-instrumentation gate; adding instrumentation/dependencies is deferred under the approved focused-evidence scope, not presented as executed coverage measurement.
 
 No full gate, compose phase, LiveDB, hosted acceptance, CI run, or full-suite before/after runtime measurement is claimed in M1. Final gates and delivery validation remain M4 obligations. Test type narrowing after the recorded controls does not alter their runtime assertions. M2 applicability must preserve the independent non-reproduction decisions; M3 must turn the named refusal reds green without weakening immutable FINAL, authority, source-boundary or cleanup constraints.

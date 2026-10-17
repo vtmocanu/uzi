@@ -62,13 +62,21 @@ for (const status of [403, 409]) {
       const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
       f.log.warn = (message, fields) => { warnings.push({ message, fields }); };
       f.git.discoverOwedCandidates = async () => [];
+      const unsafe = "diagnostic-untrusted-body" + "\u001b[31m\n" + "x".repeat(24_000);
       f.state.finalError = new RequestError("POST", "/api/worker/recovery/release", status,
-        JSON.stringify({ error: "FINAL refused", reason: "not_authorized" }));
+        JSON.stringify({ error: unsafe, reason: "not_authorized" }));
       await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
-      t.diagnostic(JSON.stringify({ status, capture: before.captureId, warnings }));
+      t.diagnostic(JSON.stringify({ status, capture: before.captureId,
+        warnings: warnings.map(warning => ({ message: warning.message,
+          fields: Object.keys(warning.fields ?? {}), size: JSON.stringify(warning).length })) }));
       assert.ok(warnings.some(w => w.fields?.reason === "not_authorized" &&
         w.fields?.capture_id === before.captureId && !w.fields?.error),
         "emit the bounded structured reason for this record rather than only raw RequestError text");
+      for (const warning of warnings) {
+        const serialized = JSON.stringify(warning);
+        assert.ok(!serialized.includes("diagnostic-untrusted-body"), "no additional warning exposes response payload");
+        assert.ok(serialized.length <= 4096, "each diagnostic has bounded output");
+      }
     } finally { await f.close(); }
   });
 }
@@ -128,11 +136,15 @@ for (const closure of ["discarded", "different-receipt", "matching-receipt", "op
         if (closure === "discarded") {
           closed.state = "discarded"; closed.release_evidence = "owner_discard"; delete closed.final_receipt;
         }
-        if (closure === "different-receipt") closed.final_receipt = {
-          kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
-          source_sha: before.sourceSha, coverage_digest: before.coverageDigest!,
-        };
-        if (closure !== "open") { delete closed.live_worker_id; delete closed.live_run_id; }
+        if (closure === "different-receipt") {
+          closed.release_evidence = "held_publication";
+          closed.final_receipt = {
+            kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
+            source_sha: before.sourceSha, coverage_digest: before.coverageDigest!,
+          };
+        }
+        if (closure === "open") { delete closed.release_evidence; delete closed.final_receipt; }
+        else { delete closed.live_worker_id; delete closed.live_run_id; }
         if (closure === "matching-receipt" || closure === "different-receipt") {
           f.committedReceipts.set(7, Object.freeze(structuredClone(closed.final_receipt!)) as Readonly<RecoveryFinalDisposition>);
           f.state.open = false;
