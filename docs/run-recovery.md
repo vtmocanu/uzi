@@ -121,6 +121,63 @@ it before publishing anywhere, and if it exposed a real credential, revoke
 and rotate it and remove it from the affected history — deleting the
 archive alone does not undo that exposure.
 
+## Policy-hold preservation and replay limits
+
+Negotiated noninteractive root Codex issue/task/prompt/self-improve policy
+refusals hold for their owner. Capture retains clone/HOME, session identity,
+generation pins, custody and normal affinity, even when checkpoint publication
+fails. Published, verified local-only and unverified sources mean different
+things: local proof does not establish remote durability or latest-content
+coverage. Worker storage loss can lose unpublished work or conversation.
+
+A hold journal is a nonterminal pending outcome, distinct from an API-confirmed
+hold. Snapshots/heartbeats advertise `terminal_pending` while delivery is
+unresolved; an immutable outcome UUID survives retries and generations.
+Before the same worker executes another claim it reconciles surviving journal
+evidence at any generation. Unapplied evidence re-parks; `already_applied`
+retires the record without undoing the owner's later Resume/fresh choice;
+a newer applied policy outcome resolves older evidence without resurrecting it.
+Generation supersession alone is not proof of delivery. Journal failure keeps
+the flight/source blocked rather than returning to a model turn.
+
+Two replay limits are explicitly accepted:
+
+- If the original worker is absent past `TerminalPendingLease` (default **1h**)
+  and another worker claims before journal evidence returns, replay can occur.
+  The other worker cannot read that local journal.
+- The server wall sweep can release G before refusal evidence reaches the API.
+  Owner extension/resume can allow another worker to claim G+1 while count is
+  zero and replay with a fresh conversation. Normal live/capable worker grace
+  is 600 seconds; stale/incapable backstops can act sooner and delivery delay
+  is not bounded by that grace. G+1 is not retroactively cancelled.
+
+Late reporting without the current claim requires the exact non-discarded G
+custody row, original-worker provenance and matching owner, locked through
+mutation. Missing/discarded or foreign provenance records no policy constraint
+and produces a content-free refusal notice. An authenticated late G report
+records bounded metadata/count for future reclaims; it does not alter G+1's
+session, status, scope, gate or fresh grant. A current worker converting its
+own surviving older local evidence under its exact current claim needs no old
+custody row. Neither path supplies global exactly-once execution.
+
+Until terminal, refusal count > 0 requires explicit fresh consent for each
+later fresh claim. Changed Docker/retained-recovery attempt paths, missing or
+unknown transcripts, #3045 session suppression and provider resume rejection
+re-park `resume_rejected` without that exact grant. Attempt isolation and
+source/verdict protections remain; preserving resume is no promise of provider
+acceptance. [CLI choices](./cli.md#codex-policy-refusal-owner-hold) include
+guidance, fresh retry, eligible Stop and Cancel; web/TUI/Slack controls are M3.
+Stop finalizes recovered completed scope through normal guards without a lead
+turn, and cannot claim successful publication when work is local-only/unverified.
+
+The hold has no expiry or refusal cap and keeps the issue lock/normal affinity.
+Open custody counts toward admission (default 8); a nonterminal hosted run stays
+busy and can pin upgrades until drain deadlines. Eviction and storage loss still
+happen. Cancel and explicit custody discard are distinct. API rollback with
+holds, pending policy intents or constrained queued/running work is unsafe;
+quiesce workers before guarded Down. See [ADR-3068](../adr/3068-provider-policy-hold.md)
+for the approved M2 contract, rollback states and both accepted residuals.
+
 ## Retained-source failure and local proof
 
 A claim discovers retained source before forge refresh or disk preflight

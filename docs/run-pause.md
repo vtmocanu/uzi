@@ -89,7 +89,7 @@ not just on one worker's disk. The run's session and its HOME (skills, git
 credentials, in-progress state) stay on the worker that was running it,
 freeing its slot for other work in the meantime.
 
-**If the checkpoint can't be published, the run does not park.** The
+**If the checkpoint can't be published, an ordinary owner pause does not park.** The
 pending request is cleared without changing the status to `paused`, and the
 run's activity feed carries the reason (*"Could not pause: the checkpoint
 could not be published. The run is still running and has restarted the
@@ -102,15 +102,19 @@ DM because it is not a status transition; its reason is in the activity feed.
 **Resume** on the run page, or `uzi run resume <id>`, moves the run from
 `paused` back to `queued` with its worker pin kept:
 
-- If that same worker is still alive, it picks the run back up and
-  **continues the same session where it stopped — no re-planning.**
+- On an ordinary unwired resume with usable conversation context, the same
+  worker can continue the session. Docker attempt paths and retained-source
+  recovery normally start fresh model sessions; committed/recovered work
+  carries forward.
 - If the worker is gone, another worker claims the run, **recovers the
   branch from the pushed checkpoint, and re-plans only the milestones that
   weren't finished yet** — the ones already done stay done, from the plan
   you already approved.
 
 `uzi run resume-now` also resumes a paused run (it's the same endpoint that
-already resumes a run held for a pooled token).
+already resumes a run held for a pooled token). A run with prior policy-refusal
+context follows the stricter consent rule below, even after another hold or
+a successful continuation.
 
 ## The clock stops
 
@@ -139,6 +143,40 @@ hold. Losing the worker's storage can lose unpublished work; another worker
 needs published work or an available verified recovery copy. See
 [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for progress resets, detection timing and compatibility.
+
+## Held after a Codex policy refusal
+
+With negotiated support, a noninteractive root Codex issue, task, prompt or
+self-improve refusal holds `paused` / `provider_policy_refusal`. It has no
+expiry or refusal cap and does not automatically retry or switch harness.
+Unlike an owner pause, failed checkpoint publication still holds; provenance
+must say published, local-only or unverified truthfully.
+
+1. Inspect `uzi run get <id>` and the preservation evidence.
+2. Use `uzi run resume <id> --guidance "narrow the scope"` to request the
+   original conversation, or explicitly choose `--fresh-session` to discard
+   conversation context while keeping recovered files and contract scope.
+3. Use `uzi run stop <id>` to finalize completed work when the server permits
+   it (noninteractive milestone issue, at least one completed milestone), or
+   `uzi run cancel <id>` to terminate. Policy Stop atomically sets the ceiling
+   and queues normal finalization without a lead turn or another milestone.
+
+For a nonterminal run with refusal count > 0, missing/unknown conversation,
+a changed Docker attempt path, another worker or rejected provider resume
+re-parks `resume_rejected` unless this exact claim has fresh consent. Each
+later fresh claim needs new consent, including after a successful resume.
+Attempt isolation remains in place. Guidance and credential changes are not
+fresh consent. `run set-token` retains its Anthropic-only eligibility and
+rejects Codex (422); an otherwise eligible policy-context promotion preserves.
+
+A spent budget means **extend first**; a server-wall hold can keep
+`budget_exhausted` plus refusal context, and extension does not authorize a
+fresh conversation. Normal affinity, issue lock and custody remain; open
+custody counts toward admission (default 8) and can keep a hosted worker
+busy through an upgrade drain. Cancel and custody discard are distinct.
+Web/TUI/Slack choices remain pending M3. See the
+[CLI contract](./cli.md#codex-policy-refusal-owner-hold) and
+[recovery/race limits](./run-recovery.md#policy-hold-preservation-and-replay-limits).
 
 ## Not the same as a completion hold
 

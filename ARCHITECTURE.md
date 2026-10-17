@@ -1010,7 +1010,10 @@ chain in the diagram above, with no intervening `running`.
   A failed park sink makes no latest-work checkpoint claim; failed capture retains
   the source clone for recovery, so durability is conditional on successful capture
   and publish. Codex resumes a resolvable thread on non-Docker workers; Docker
-  attempt paths keep the existing fresh-thread lineage break with recovered work.
+  attempt paths normally keep the fresh-thread lineage break with recovered work.
+  A nonterminal Codex run with policy-refusal count > 0 instead requires
+  exact-claim owner fresh consent or re-parks `resume_rejected`; attempt
+  isolation remains. See [ADR-3068](adr/3068-provider-policy-hold.md).
   `RUN_LIMIT_MAX_PARK` bounds each park (8 days by default), during which the issue
   lock and a run-bound hosted worker/PVC can remain held. Missing resets use the
   bounded fallback and can exhaust `RUN_LIMIT_MAX_WAITS` before a weekly reset.
@@ -1135,6 +1138,48 @@ chain in the diagram above, with no intervening `running`.
   merge request), or cancels; the park has no expiry and the behavior is not
   configurable. Both harnesses park; none fails at the wall. See
   [docs/run-pause.md](docs/run-pause.md) and [docs/run-health.md](docs/run-health.md).
+
+- **Eligible Codex root refusal → owner policy hold**
+  ([ADR-3068](adr/3068-provider-policy-hold.md), [PRD #3068](prds/3068-codex-policy-refusal-hold.md)).
+  Negotiated `provider_policy_hold` / `provider_policy_hold_v1` admits only
+  noninteractive root Codex issue/task/prompt/self_improve turns classified
+  `cyberPolicy` or `misalignmentPolicyViolation`. Capture-first parking retains
+  custody, session and normal affinity; publication failure still holds with
+  truthful local-only/unverified provenance. Verified planning-revision source
+  preserves its unapproved gate and #1604 verdict matching; unseen-plan approval
+  is never inferred. #3045 predecessor-session suppression remains authoritative.
+  Children, other fleet/kinds and historical terminal records retain behavior.
+  Nonterminal count > 0 constrains later claims until terminal, including after
+  successful continuation. Missing conversation, changed Docker attempt paths or
+  rejected provider resume re-park unless the exact claim has explicit fresh
+  consent. Attempt isolation stays; a one-generation grant is not refreshed on
+  reclaim. Owner mutations bind the presented outcome UUID and generation via
+  `If-Match`; retry cannot silently refresh consent. Stop atomically queues normal
+  completed-scope finalization without a lead turn, retaining publication guards.
+  API/CLI are the M2 control surface; web/TUI/Slack controls remain pending M3.
+
+  The typed local hold journal advertises `terminal_pending` and reconciles
+  immutable outcome identities before same-worker execution. Already-applied
+  evidence cannot undo a later owner choice. Two accepted replay residuals remain:
+  absent worker past the default 1h pending lease plus another-worker claim before
+  evidence, and server-wall release followed by owner resume/G+1 before refusal
+  evidence arrives. Late foreign/historical evidence needs exact non-discarded
+  original-worker G custody provenance locked through mutation; missing/discarded
+  records add no constraint. Accepted late evidence constrains future reclaims
+  without retroactively cancelling or rewriting G+1. There is no global exactly-once
+  or real-provider resume-acceptance guarantee.
+
+  Deploy API first, workers second; activation requires snapshots, generation
+  fencing and a positive pending lease, and constrained claims require capability
+  despite scheduling overrides. No hold expiry, refusal cap, automatic refusal
+  retry or harness switch is introduced. Open custody counts toward admission
+  (default 8), the issue lock/normal affinity remain, and hosted workers stay busy
+  through normal drain handling. Eviction/storage loss remain possible; Cancel
+  and discard are separate. API rollback with holds, pending intents/outcomes or
+  constrained queued/running work is unsafe. Quiesce workers before guarded Down,
+  which refuses protected rows and converts documented parked states to terminal
+  failures with session/custody preserved. See the ADR for the complete boundary,
+  rollback states and integration/verification status.
 
 - **Affinity holds through a worker roll** ([PRD #1030](prds/done/1030-worker-resume-durability.md)).
   The fix distinguishes a **roll** (sets `draining_since`, keeps the worker row)

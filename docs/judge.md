@@ -202,7 +202,9 @@ prose. The reason is a fixed literal, with no provider message, details,
 content, or prompt reflected. It records the provider's classification,
 not independent proof of a policy violation. See
 [provider safety-policy refusals](./run-activity.md#when-codex-reports-a-provider-safety-policy-refusal)
-for the literals and bounded root/child provenance.
+for the literals and bounded root/child provenance. Negotiated eligible
+root refusals instead pause for owner action; this nonterminal hold is not
+a finished failure and does not trigger a retrospective.
 
 ## Reading a review from the CLI
 
@@ -401,10 +403,14 @@ that started and then crashed early is *not* in this set; it carries agent
 behaviour and is still judged.)
 
 A run with `fail_origin = provider_policy_refusal` has the same eligibility
-as `agent_failure`, including a resumed run. The judge may review substantial
-work completed before the refusal; retrospective review does not retry the
-terminal execution. A child refusal is an observation, not a separate failed
-run or a new reason to skip judging; the parent's outcome still governs.
+as `agent_failure`, including historical terminal refusals. A negotiated
+`paused` / `provider_policy_refusal` hold is not eligible as a finished run.
+After owner continuation, the eventual actual terminal outcome follows the
+ordinary rules above. The judge may review substantial work preceding a
+terminal refusal; retrospective review does not retry that execution.
+M2 owner actions are documented in the [CLI reference](./cli.md#codex-policy-refusal-owner-hold);
+web/TUI/Slack controls remain pending M3. A child refusal is an observation,
+not a separate failed run or a new reason to skip judging; the parent's outcome still governs.
 
 ## Admins: the All users view
 

@@ -102,7 +102,7 @@ uzi run stop <id> [--message <text>]
 uzi run scope <id> --through <n>
 uzi run extend <id> --by <duration>
 uzi run pause <id> [--now|--cancel]
-uzi run resume <id>
+uzi run resume <id> [--guidance <text>] [--fresh-session]
 uzi run resume-now <id>
 uzi run decide <id> (--continue [--guidance <text>] | --partial <ids> --reason <text> | --accept <ids> --reason <text>)
 uzi run follow-up <id> [--message <text>]
@@ -382,7 +382,9 @@ A few worth knowing:
   below instead to let the run complete through a later milestone before
   finalizing. An optional `-m`/`--message` (or piped stdin) rides along with
   the stop. A foreign or unknown run id is exit 4; a run that has already
-  finished is exit 5.
+  finished is exit 5. For a policy-context hold, Stop atomically records the
+  completed-scope ceiling and queues normal finalization, without a lead turn;
+  see [Codex policy refusal owner hold](#codex-policy-refusal-owner-hold).
 - **`run scope <id> --through N`** (PRD #634) sets an operator **scope
   ceiling** on an in-flight milestone-structured issue run: the run
   completes through milestone `N` (1-based, over the approved, frozen
@@ -433,14 +435,18 @@ A few worth knowing:
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
   naming the reason. This existing command is also the compatibility path
   when dependency parking requires an API or worker upgrade.
-- **`run resume <id>`** resumes a run the owner paused: it moves the run
+- **`run resume <id> [--guidance <text>] [--fresh-session]`** resumes a run the owner paused: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
   remaining budget (the clock stopped while paused, so resuming does not
   reset it). The claim then continues the same SDK session if that worker
   is still alive, or recovers the branch from the checkpoint and re-plans
   the remaining milestones if it's gone. A run that isn't paused is a 409
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
-  now also resumes a paused run in addition to a pool-held one.
+  now also resumes a paused run in addition to a pool-held one. Docker attempt
+  paths ordinarily start a fresh model session. A run with policy-refusal
+  context follows the stricter [consent contract](#codex-policy-refusal-owner-hold):
+  guidance and fresh-session flags require a paused policy context (exit 2
+  otherwise); preserving resume is the default and can re-park.
 - **`run decide <id>`** (PRD #1226/#1227) records the owner's decision on a
   run the [structural completion interlock](./run-completion-hold.md) has
   blocked — either a live completion question or a run already parked in the
@@ -2930,6 +2936,83 @@ that unpublished latest edits are available on another worker.
 through `paused` unless `--until paused` is selected.
 See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
 for both harnesses, verified-capture limits and mixed-fleet compatibility.
+
+### Codex policy refusal owner hold
+
+Negotiated API feature `provider_policy_hold` and worker capability
+`provider_policy_hold_v1` hold noninteractive root Codex `issue`, `task`,
+`prompt` and `self_improve` runs after exactly `cyberPolicy` or
+`misalignmentPolicyViolation`. Other kinds, children and unnegotiated fleet
+behavior remain; historical terminal refusals stay terminal. A verified
+planning-revision refusal preserves its unapproved plan and gate. Full plan
+readability and CLI plan version/diff behavior remain; viewing a plan is not
+approval. Web/TUI/Slack policy controls remain pending M3.
+
+1. Inspect `uzi run get <id>` (or `--json`) for `policy_refusal`, count,
+   last tag/phase/time/correlation, hold detail, preservation and server-derived
+   action availability. Unknown provenance does not mean published or latest.
+2. Choose `uzi run resume <id>` to request the original conversation. Add
+   `--guidance "narrow the scope"` to persist guidance as a follow-up before
+   queuing; the first resumed root turn receives it, including planning.
+   Guidance accepts valid UTF-8 without NUL, at most **16000 bytes**.
+3. Choose `uzi run resume <id> --fresh-session` explicitly when discarding
+   conversation context is intended; optional guidance works here too.
+   Verified/recovered files, contract scope and Stop ceiling remain. This
+   grants the exact next claim a fresh session; a reclaim needs new consent.
+4. Or `uzi run stop <id> [-m <text>]` to finalize recovered completed work.
+   The server requires a noninteractive milestone issue and at least one
+   completed milestone. Partial and fully completed scopes use the normal
+   executor and publication guards, with no lead turn or further milestone.
+   Policy Stop atomically records its ceiling and queues; no second Resume
+   command is needed. Failed publication is reported as local-only/unverified,
+   not successful remote delivery. Stop does not authorize a fresh lead thread.
+5. Or `uzi run cancel <id>` to terminate. Pending outcomes retain the existing
+   `--discard-pending-outcome` confirmation when required. Cancellation and
+   later explicit custody discard are separate; discard does not resume work.
+
+The nonterminal constraint lasts while refusal count > 0, including after
+successful continuation, token changes and another hold reason. A changed
+Docker attempt path, missing id/transcript, different worker, #3045-suppressed
+predecessor session or provider-rejected resume re-parks `resume_rejected`
+without another refusal count. Attempt isolation stays intact. Each later
+fresh claim needs explicit new consent; guidance, extension and Stop confer
+none. Provider acceptance of a preserving resume is not guaranteed.
+
+`run set-token <id> [<label>]` with its existing `--auto`, `--default` or
+`--inherit` choices uses preserving resume for an otherwise eligible paused
+policy context, retaining the constraint and clearing unconsumed fresh consent.
+It remains **Anthropic-only**: a Codex run is 422, not a new credential-switch
+path. A credential change never grants a fresh conversation.
+
+Owner API clients use `POST /api/runs/{id}/resume-now` with an optional strict
+object: `{"mode":"preserve","guidance":"narrow the scope"}` or
+`{"mode":"fresh"}`; mode defaults to preserve. Ordinary bodyless resumes
+remain compatible. Policy actions send `If-Match` equal to the presented
+`policy_refusal.action_if_match` token, binding outcome UUID and claim
+generation (`"policy-<UUID>-<generation>"`, including the quotes). The CLI
+retains that read's binding for Resume, Stop and eligible credential promotion.
+A missing/stale binding conflicts (409, exit 5): inspect the changed state and
+make a new decision. Do not silently refresh the token and retry old consent.
+Guidance, audit, grant/session and queue transition are atomic; malformed
+options are 400 and foreign/unknown runs are 404 (exit 4).
+
+A spent wall budget means **extend first**. A server-wall race can retain
+`budget_exhausted` alongside refusal context; it requires extension before
+Resume/Stop, drops old affinity on resume and will normally lack the original
+conversation. `run extend <id> --by 2h` is not fresh consent. Ordinary policy
+resume can queue with no remaining time, so heed the warning rather than
+assuming resume adds budget.
+
+The hold has no expiry, refusal cap, automatic refusal retry or harness
+switch. Normal affinity and the issue lock remain; open custody counts against
+admission (default 8). A held hosted worker stays busy and can delay an upgrade
+until its drain deadline; eviction/storage loss can still lose local-only work
+or conversation. See [recovery limits](./run-recovery.md#policy-hold-preservation-and-replay-limits)
+for both accepted replay races. Deploy API first, then capable workers;
+activation requires snapshots, generation fencing and a positive pending lease.
+Rollback with holds, pending policy intents/outcomes or constrained queued/running
+work is unsafe; quiesce workers before the guarded Down described in
+[ADR-3068](../adr/3068-provider-policy-hold.md#rollout-resources-and-rollback).
 
 ### Worker recovery exhaustion
 

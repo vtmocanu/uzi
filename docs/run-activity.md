@@ -875,9 +875,13 @@ turn. Codex runs are unaffected.
 
 A failed Codex turn classified as exactly `cyberPolicy` or
 `misalignmentPolicyViolation` has harness category `policy_refusal`.
-When that root failure determines the run's outcome, the run fails with
-`fail_origin = provider_policy_refusal` (shown as **provider safety-policy
-refusal**). Its failure reason is one of two fixed literals:
+With negotiated API/worker support, a noninteractive root `issue`, `task`,
+`prompt` or `self_improve` run holds for its owner: `paused` with
+`hold_reason: provider_policy_refusal`. A verified current-claim planning
+revision can hold at its existing unapproved gate. Other fleet/kind cases
+retain their existing behavior; historical terminal refusals stay terminal.
+When a root refusal determines a terminal failure, its
+`fail_origin = provider_policy_refusal` reason is one of two fixed literals:
 
 - `Codex provider safety-policy refusal (cyberPolicy)`
 - `Codex provider safety-policy refusal (misalignmentPolicyViolation)`
@@ -887,11 +891,29 @@ content, or prompts. This records the provider's classification, not an
 independent attestation that the task violated a policy. Unknown and
 non-policy errors keep their existing mapping.
 
-The refused execution is terminal: it does not automatically retry,
-requeue, park, defer for disk recovery, or switch harnesses.
-[Judge eligibility](./judge.md#which-runs-are-judged) is unchanged from
-`agent_failure`; a retrospective may review substantial earlier work,
-but that review does not retry execution.
+For the owner hold, use the [CLI choices](./cli.md#codex-policy-refusal-owner-hold):
+preserving Resume with optional guidance, explicit `--fresh-session`,
+eligible Stop, or Cancel. Web, TUI and Slack controls remain pending M3.
+There is no hold expiry, refusal cap, automatic refusal retry or harness
+switch. A further actual refusal holds again and increments the count once.
+Missing/unknown conversation context, changed Docker attempt paths or a
+provider-rejected resume re-park `resume_rejected`, retaining the count and
+last metadata. Once count > 0, the nonterminal run requires fresh consent
+for each later fresh claim, even after successful continuation.
+
+A preserved unapproved plan and gate stay unapproved until a matching owner verdict acts;
+only verified revision source/gate context can carry verdicts forward.
+Unmatched carried verdicts are ignored or rejected with notice; a fresh
+conversation choice never approves an unseen plan. Full submitted plans
+remain readable after the gate, with existing CLI version/diff behavior.
+
+Capture/publication failure still holds: check whether work is published,
+local-only or unverified. Holding identity does not guarantee that local
+files or the conversation survive worker loss. See
+[policy-hold recovery limits](./run-recovery.md#policy-hold-preservation-and-replay-limits).
+A paused hold is not a finished failure for the Judge; later actual terminal
+outcomes follow [ordinary eligibility](./judge.md#which-runs-are-judged).
+Unnegotiated terminal refusal execution is not automatically retried.
 
 A dedicated durable worker status event carries
 `event: provider_policy_refusal`, `provider: codex`,
@@ -909,17 +931,21 @@ A refused child returns callback code `child_policy_refused`, preserving
 error, result, and worker diagnostic. A refused child does not force its
 parent to fail: a successful parent stays successful, an unrelated later
 parent failure keeps its own origin, and a later root policy refusal carries
-the root's provenance. The observation is separate from any winning cancel,
-pause, wall-clock, or quiescence outcome.
+the root's provenance. Cancel wins; on the negotiated hold path a pending
+pause or worker wall trip is satisfied by the policy hold. A server wall
+release can retain `budget_exhausted` with refusal context: extend first.
+Other paths keep their existing precedence and quiescence requirements.
 
 Failure totals and the failure-origin bucket count run rows once; child
 observations are not run outcomes. Analysis of refusal occurrences should
 deduplicate by run ID, so a child observation and eventual run failure count
 as one run. This adds no public metric or denominator.
 
-The API allowlist and database migration must ship before workers' new origin
-can be accepted. Historical refusals cannot be reconstructed if they were not
-observed or durably recorded. Provenance travels with run-log retrieval and
+Deploy the API/migration before capable workers; activation requires
+snapshots, generation fencing and pending-outcome lease protection. See
+[ADR-3068](../adr/3068-provider-policy-hold.md) for the completed M2 contract,
+rollout/rollback and both accepted replay races. Historical refusals cannot
+be reconstructed if they were not observed or durably recorded. Provenance travels with run-log retrieval and
 is deleted with the run's history.
 
 ## From the CLI
