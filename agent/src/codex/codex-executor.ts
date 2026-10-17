@@ -3244,7 +3244,10 @@ export class CodexExecutor implements Executor {
         // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
-        const systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        let systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
+          systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}`;
+        }
         if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
         const onOwnerFirstEvent = ownerRides

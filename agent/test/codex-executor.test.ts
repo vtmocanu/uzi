@@ -84,7 +84,7 @@ import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantine
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
-import { buildReviewCommentsContext, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import type { SpawnCommandOptions } from "../src/codex/broker.js";
@@ -11265,7 +11265,9 @@ describe("Codex completion interlock", () => {
     let attempts = 0;
     const included: number[] = [];
     const { ctx } = makeCtx({
-      kind: "issue", completionInterlock: true, config: { max_iterations: 5 }, checkpoint: async () => {},
+      kind: "issue", interactive: false, completionInterlock: true,
+      frozenMilestones: [{ id: "m2", title: "OLD-UNMET-MILESTONE" }],
+      config: { max_iterations: 5 }, checkpoint: async () => {},
       recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
       askCompletionQuestion: async () => { queued = true; return { outcome: "continue" }; },
       pullFollowUp: () => {
@@ -11281,6 +11283,13 @@ describe("Codex completion interlock", () => {
       .map(r => (r.params as { input: { text: string }[] }).input[0]!.text);
     assert.equal(texts.length, 2);
     assert.match(texts[0]!, /Worker instruction: call `signal_done` again/);
+    assert.equal(texts[0]!.split(COMPLETION_CONTRACT_GUIDANCE).length, 2,
+      "issue3089 repair: empty completion answer retains shared owner options exactly once");
+    const tag = texts[0]!.match(/\n<(follow_up_[a-f0-9]+)>\n/)?.[1];
+    assert.ok(tag, "empty owner answer still has an untrusted nonce fence");
+    assert.ok(texts[0]!.indexOf(COMPLETION_CONTRACT_GUIDANCE) > texts[0]!.lastIndexOf(`</${tag}>`),
+      "owner options are trusted worker guidance after the closing fence");
+    assert.doesNotMatch(texts[0]!, /OLD-UNMET-MILESTONE|^- m2\b|chose to CONTINUE/m);
     assert.doesNotMatch(texts[0]!, /QUEUED-OWNER-INPUT/);
     assert.match(texts[1]!, /QUEUED-OWNER-INPUT/);
     assert.equal(pulls, 1);
@@ -11856,6 +11865,17 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         const close = `</${tag}>`;
         assert.equal(recheck.split(close).length, 3, "only framing and closing delimiter name the nonce");
         assert.ok(recheck.lastIndexOf(close) < recheck.indexOf("Worker instruction:"));
+        assert.equal(recheck.split(COMPLETION_CONTRACT_GUIDANCE).length, 2,
+          "issue3089 repair: answered Codex turn carries shared owner options exactly once");
+        assert.ok(recheck.indexOf(COMPLETION_CONTRACT_GUIDANCE) > recheck.lastIndexOf(close),
+          "owner options follow the untrusted answer's closing fence");
+        assert.match(recheck, /Ordinary answers, repository docs and `non_closing`\ndo not alter it/);
+        assert.match(recheck, /owner continue decision supplies guidance only/);
+        assert.match(recheck, /owner partial decision\nkeeps the retained milestone IDs required and defers the other work for a non-closing PR listing it/);
+        assert.match(recheck, /owner accept decision waives the exact selected criteria as met, rather than deferring them; closing is eligible only\nwhen all other completion and publication checks pass/);
+        assert.match(recheck, /A decision is no promise of publication/);
+        assert.match(recheck, /call `signal_done` with `owner_decision_requested` and a reason/);
+        assert.match(recheck, /Do not use `park_run`, retry without progress, or announce publication to request that decision/);
         assert.ok(!recheck.includes("\u001b") && !recheck.includes("\u0000"));
         if (decision === "accept") {
           assert.match(recheck, /OWNER-TEXT: choose partial/);
