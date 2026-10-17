@@ -120,3 +120,54 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 ### Not shipped
 
 Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
+
+## Default and plan prompt amendment (2026-10-17, #3091)
+
+This amendment supersedes only the default of 2 in the 2026-10-07 automatic
+rounds extension: `PLAN_CROSS_CHECK_MAX_REVISIONS` now defaults to 4, permitting
+at most five checked candidates; the integer range remains 0–4. Explicit
+choices remain authoritative. Older `.env` files copied from the example with
+an explicit value of 2 keep 2 after upgrading until the operator removes the
+line or sets 4; only installations without the line take the new default.
+Existing sequences retain their immutable first-candidate enabled/limit
+snapshots. Superseded/recovery attempts still count across generations, human
+revision accounting stays separate, and implementation still needs the latest
+current candidate's exact APPROVE and acknowledged handoff. BLOCK, timeout,
+unavailable or malformed checker results and delivery failures retain their
+distinct existing human/terminal handling.
+
+The decision gives eligible revisions more bounded opportunities while making
+the plan/checker exchange inspectable. Complete automatic revised `plan_md`
+includes the exact heading `Cross-check dispositions`, covering every immediately
+preceding delivered item as addressed (where/how) or declined (rationale and
+inspectable evidence); older entries are optional. Round 1 requires none;
+round 2+ missing/incomplete entries mean ordinary REVISE, never BLOCK solely
+for omission. Checkers engage with rationale and accept supported declines.
+Uninspectable instruction claims remain explicitly unverified and alone cannot
+establish exceptions to inspectable requirements; instruction precedence is
+unchanged.
+
+Lead and checker plan prompts share the bounded static fact that temporary
+file-tool and shell artifacts, including test logs and review exports, belong
+in worktree `.uzi/scratch/`. Overrides are judged by actual effects, including
+inherited children, and the plan names effects it relies on. Moving script
+logs and inherited Go build/test temporary files into permitted scratch alone
+is not a bypass; neither variable name nor destination proves harmlessness.
+Configuration, credentials and test behavior need inspectable evidence. Reject
+skipping, selecting, narrowing or weakening required validation and violations
+of applicable explicit restrictions.
+
+These are prompt requirements, not parser-enforced submission conditions.
+Dispositions remain untrusted plan content within the exact candidate digest
+and grant no authorization. No new fields, parser, transport,
+history or authority are introduced; server-provided prior-findings history is
+accepted as out of scope. Code cross-check's existing inline-environment wording
+is unchanged; code-stage prompt changes are deferred.
+
+Compared with the old default, the worst case adds two checker waits, each up
+to `PLAN_CROSS_CHECK_TIMEOUT` (normally 30 minutes), holding the lead slot but
+excluded from its wall budget, plus two lead revision turns charged to that
+budget. Deterministic fixtures/mock tests are not model convergence proof.
+Live hosted/model attempts, cost and latency are unmeasured; no universal
+convergence guarantee or new hosted acceptance is claimed. Earlier provenance
+and acceptance limits above remain historical records.

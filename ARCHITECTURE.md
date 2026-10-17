@@ -595,7 +595,9 @@ are excluded. Required leads and `cross_check` children need a worker with
 A Claude or Codex lead submits bounded, normalized candidates in explicit rounds with
 an immutable base commit and scanned planning diff. The first candidate
 snapshots automatic-round enablement and `PLAN_CROSS_CHECK_MAX_REVISIONS`
-(default 2, range 0–4); later rounds copy that snapshot. The server counts at
+(default 4, range 0–4, at most five checked candidates by default); later rounds
+copy that snapshot. Explicit settings remain authoritative; configuration changes
+affect new checks only. The server counts at
 most limit + 1 candidates globally across generations, including supersession.
 Automatic leads and later-round children require `cross_check_rounds_v1`;
 claimability/provisioning enforce the durable protocol capability independently
@@ -635,7 +637,20 @@ The SDK and stub executors keep automatic-round feed identity separate from
 human counters; human input cannot forge automatic provenance. A stage-neutral
 prompt builder nonce-fences checker advice and prior-plan context separately,
 requires verification against code/issue/uzi rules and declining conflicts,
-and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
+and preserves the separate human-revision builder. The shared static scratch
+placement fact and actual-effect review cover inherited child processes;
+permitted scratch relocation alone is not a validation bypass or proof of
+harmlessness. Complete automatic revisions include `Cross-check dispositions`
+for every immediately preceding delivered item, with addressed location/method
+or declined rationale and inspectable evidence. The checker considers supported
+declines; round 2+ omissions mean REVISE, never BLOCK solely for omission.
+Uninspectable instruction claims remain explicitly unverified and cannot alone
+establish an exception to inspectable requirements; precedence is unchanged.
+This prompt contract adds no parser, fields, transport, history or authority:
+dispositions are untrusted content within the exact candidate digest. See
+[Cross-check](docs/cross-check.md#automatic-plan-revision-contract) and the dated
+[#3091 amendment](adr/2149-cross-check.md#default-and-plan-prompt-amendment-2026-10-17-3091).
+Exhaustion, BLOCK, timeout
 and other failures keep their fallbacks. A Codex lead consumes automatic
 rounds without spending its human revision budget and implements exactly the
 acknowledged checked plan; its submit requires its worker to advertise
