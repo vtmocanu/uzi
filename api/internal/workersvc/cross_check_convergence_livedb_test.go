@@ -7,20 +7,20 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Each subtest has at most five serial candidates, with no retries or timer waits.
 // A failed candidate stops that subtest; sibling outcomes remain independent.
 func TestPlanCrossCheckAutomaticRoundsConvergenceLiveDB(t *testing.T) {
-	outcomes := []struct {
+	type convergenceOutcome struct {
 		name, verdict, reason string
 		last                  int32
-	}{}
+		defaultLimit          bool
+	}
+	outcomes := []convergenceOutcome{}
 	for candidate := int32(1); candidate <= 5; candidate++ {
-		outcomes = append(outcomes, struct {
-			name, verdict, reason string
-			last                  int32
-		}{fmt.Sprintf("approve%d", candidate), "approve", "approve", candidate})
+		outcomes = append(outcomes, convergenceOutcome{fmt.Sprintf("approve%d", candidate), "approve", "approve", candidate, false})
 	}
 	for _, pair := range [][2]string{
 		{"revise", "revise"},
@@ -32,15 +32,33 @@ func TestPlanCrossCheckAutomaticRoundsConvergenceLiveDB(t *testing.T) {
 		{"failed", "checker_unavailable"},
 		{"failed", "confinement_failed"},
 	} {
-		outcomes = append(outcomes, struct {
-			name, verdict, reason string
-			last                  int32
-		}{pair[1], pair[0], pair[1], 5})
+		outcomes = append(outcomes, convergenceOutcome{pair[1], pair[0], pair[1], 5, false})
 	}
+	outcomes = append(outcomes,
+		convergenceOutcome{"default/approve5", "approve", "approve", 5, true},
+		convergenceOutcome{"default/revise", "revise", "revise", 5, true},
+	)
 	for _, direction := range []struct{ lead, checker string }{{"claude", "codex"}, {"codex", "claude"}} {
 		for _, outcome := range outcomes {
 			t.Run(direction.lead+"/"+outcome.name, func(t *testing.T) {
-				env, svc, w, lead, candidate := newAutomaticRoundsHarnessFixture(t, 4, direction.lead)
+				var (
+					env       codexTestEnv
+					svc       *Service
+					w         store.Worker
+					lead      uuid.UUID
+					candidate PlanCrossCheckCandidate
+				)
+				if outcome.defaultLimit {
+					p := testParams()
+					p.PlanCrossCheckMaxRevisions = 0
+					p.PlanCrossCheckMaxRevisionsSet = false
+					if p.PlanCrossCheckMaxRevisions != 0 || p.PlanCrossCheckMaxRevisionsSet {
+						t.Fatal("default revision limit must be unset before New")
+					}
+					env, svc, w, lead, candidate = newAutomaticRoundsHarnessFixtureWithParams(t, p, direction.lead)
+				} else {
+					env, svc, w, lead, candidate = newAutomaticRoundsHarnessFixture(t, 4, direction.lead)
+				}
 				for round := int32(1); round <= outcome.last; round++ {
 					candidate.PlanMd = fmt.Sprintf("Candidate %d\n\n## Cross-check dispositions\n- Prior finding: addressed in this candidate.", round)
 					cc, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, candidate, round)
@@ -98,8 +116,10 @@ func TestPlanCrossCheckAutomaticRoundsConvergenceLiveDB(t *testing.T) {
 						metadata.NextRound != nil || metadata.FallbackReason != want {
 						t.Fatalf("final metadata: %+v err=%v want=%s", metadata, err, want)
 					}
+					// Round 6 checks the protocol bound, not the revision budget independently.
+					// Metadata fallback above and lower-limit budget tests prove accounting.
 					if _, err := svc.SubmitPlanCrossCheck(env.ctx, w, lead, 1, candidate, 6); !errors.Is(err, ErrCrossCheckRefused) {
-						t.Fatalf("sixth candidate accepted: %v", err)
+						t.Fatalf("round 6 protocol-bound refusal: got %v, want %v", err, ErrCrossCheckRefused)
 					}
 					_, applied, err := svc.SetState(env.ctx, w, lead, req)
 					if applied || !errors.Is(err, ErrInvalidState) {
