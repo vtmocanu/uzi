@@ -123,11 +123,17 @@ test("both checker families wire the shared plan brief into trusted instructions
 
 test("checker DATA retains complete candidate and explicit round context 1 through 5", () => {
   for (let round = 1; round <= 5; round++) {
-    const candidate = { stage: "plan", round, lead_run_id: "lead", candidate_digest: "digest",
+    const candidate = { stage: "plan" as const, round, lead_run_id: "lead", candidate_digest: "digest",
       deadline_at: "2099-01-01T00:00:00Z", base_commit: "a".repeat(40), planning_diff: "FULL-DIFF",
       plan_md: "# COMPLETE-CANDIDATE\n## Cross-check dispositions\nCURRENT-ITEM addressed in validation",
       milestones: [{ title: "ALL-MILESTONES", done: false }], required_capabilities: [], required_tools: [], size_class: "s" };
-    const prompt = crossCheckPrompt({ issue_title: "issue", issue_description: "body", cross_check: candidate } as ClaimResponse);
+    const claim: ClaimResponse = {
+      kind: "cross_check", run_id: "check", issue_iid: null, issue_title: "issue", issue_description: "body",
+      repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/owner/repo",
+        clone_url: "https://example.test/owner/repo.git", default_branch: "main" },
+      secrets: { forge_pat: "" }, last_seq: 0, agents: [], cross_check: candidate,
+    };
+    const prompt = crossCheckPrompt(claim);
     const match = prompt.match(/^<candidate_([a-f0-9]{32})>\n([^\n]+)\n<\/candidate_\1>$/m);
     assert.ok(match, "complete candidate inside a nonce DATA fence");
     const expected = JSON.parse(JSON.stringify({ ...candidate, planning_diff: undefined }));

@@ -6863,7 +6863,8 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     for (let round = 1; round <= 4; round++) {
       assert.match(planTurns[round]!, new RegExp(`checker advice ${round}`));
       assert.match(planTurns[round]!, /automated checker suggested revisions/, "the automatic revision prompt, not the human one");
-      const text = rig.epochs[0]!.transport.requests.filter((r) => r.method === "turn/start")[round]!.params!.input[0].text as string;
+      const request = rig.epochs[0]!.transport.requests.filter((r) => r.method === "turn/start")[round]!;
+      const text = (request.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
       const advice = text.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
       assert.ok(advice, "current findings stay inside advice DATA");
       assert.deepEqual(JSON.parse(advice[2]!).items, items(round), "older items cannot substitute for current findings");

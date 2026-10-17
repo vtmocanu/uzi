@@ -268,7 +268,7 @@ describe("ClaudeCrossCheck.run", () => {
     let brief = "";
     const probe = new ClaudeCrossCheck(nullLogger(), { secretPaths: ["/run/secrets/"], queryFn: ((p: { options: SdkOptions }) => {
       const system = p.options.systemPrompt;
-      assert.ok(typeof system === "object" && system.type === "preset");
+      assert.ok(system && typeof system === "object" && !Array.isArray(system) && system.type === "preset");
       brief = system.append ?? "";
       assert.equal(brief, crossCheckBrief("Read, Grep and Glob"), "shared plan policy is the trusted system append");
       return (async function* () { yield initFrame(); yield resultFrame(APPROVE); })();
