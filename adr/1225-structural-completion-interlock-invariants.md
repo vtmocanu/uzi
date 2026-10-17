@@ -263,6 +263,18 @@ preauthorization or semantic activation. Live deployment acceptance has not
 been performed; mocked tests and PR existence establish neither that
 acceptance nor full end-to-end coverage.
 
+## Planned amendment — semantic default-on (2026-10-17, #1230/#1231)
+
+This section records the refreshed design, **not implemented behavior**. The accepted structural invariants above stay in force; current user docs remain the runtime authority until the semantic implementation ships.
+
+- #1230 builds dormant source-backed criteria and tool-less coverage review at the exact approval decision point, not every intermediate Plan cross-check revision. #1231 activates coverage and final audit together for new eligible unseeded issue runs on both harnesses. Instance `semantic_completion_rollout` defaults on; an explicit admin disable affects future runs only. Model/cost ceilings are instance-admin configured and frozen per run; repo overrides are deferred.
+- Enrollment freezes before the first claim, independent of the later detailed contract freeze. Semantic claims require `completion_audit_v1` plus existing structural/Codex/harness predicates outside ordinary overrides. Missing compatible capacity queues the semantic run and names the protocol; no fleet-based downgrade. Existing structural/legacy/seeded runs retain their declared enrollment, and an explicit structural disable remains respected.
+- An unknown effective policy with no valid cached snapshot refuses eligible creation retriably, rather than silently disabling semantics. Supported rollback changes future enrollment and retains semantic-aware readers/claim/permit enforcement for stored contracts. A pre-semantic API downgrade with semantic authority present is unsupported and prohibited; an old binary cannot enforce the new guarantee. Preserve schema/data, and do not strip contracts to accommodate old workers. Pair activating API/worker releases with tested capability evidence, not merely a published tag.
+- Maintainer-only acceptance requires exact IDs/conditions authorized in a human-approved plan or owner contract revision; auto-approval/prose/checkboxes cannot waive worker code/test/security/review. Already-authorized pending acceptance may deliver non-closing without another equivalent decision, using the single scope ledger and merged #3089/#3090 authority/publication protections. Actual call order and merged interfaces must be checked before dispatch; those issues are not implemented by this refresh.
+- Coverage and audit budgets stay independently bounded (default coverage 120k normalized tokens/three reviews, audit 100k/two verdict-bearing passes). Exhaustion/outage never certifies uncertain work. #1232 proves integrated rollout/rollback; it does not retire the admin kill-switch or promise unimplemented cross-worker provider-context portability (#1229 remains not planned).
+
+Exact-diff peer and independent architecture review is pending; no live setting, run profile or dispatch changes are made here.
+
 ## Linked from ARCHITECTURE.md
 
 Linked from ARCHITECTURE.md's Run lifecycle section (the `running → paused` completion-hold note) and its capability-aware eligibility bullet, per repo convention.
