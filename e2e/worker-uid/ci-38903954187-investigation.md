@@ -1,8 +1,11 @@
 # Worker UID calibration: preload regression and open validation blockers
 
 **Status: partial repair only. The canonical task still fails; M3 is incomplete.**
-The original hosted first error is unknown. This note does not establish repaired
-CI or merge readiness; the failed canonical lane remains an unresolved blocker.
+The landing owner's later retrieval of the hosted log established an unexpected
+primary exit with Node worker-heap errors in the first calibration leg. The
+preload explanation is supported by the bounded local reproduction below; it
+was not separately instrumented in that hosted leg. This note does not establish
+repaired CI or merge readiness; the canonical lane remains an unresolved blocker.
 
 ## Preload regression and bounded repair
 
@@ -80,7 +83,16 @@ Docker client 29.5.3/server 29.8.0, cgroup v2 with cgroupfs, and Task 3.54.0.
 Published pipeline 38903954187 tested
 `104faf8060190ba19e5a74ee83b5753b703cba9b`: its image build passed, then
 “Require worker UID leaves” failed with underlying exit 1 / task exit 201.
-Full hosted logs returned 403, so the same cause has not been established.
+Full hosted logs returned 403 during the worker investigation. The landing owner
+subsequently retrieved [the failed job log](https://github.com/vtmocanu/uzi/actions/runs/38903954187/job/116983050340):
+the 38 worker and two command leaves passed, then the 1 GiB report failed with an
+unexpected primary exit. Both broker outputs contained `ERR_WORKER_OUT_OF_MEMORY`;
+the cgroup `oom`, `oom_kill` and `oom_group_kill` counter deltas were zero. PSI was
+available in this hosted leg. The 2 GiB leg was aborted after the first failure;
+both host cleanups were confirmed. Neither report is accepted calibration proof.
+The loader inheritance mechanism is independently reproduced locally, while the
+hosted report itself establishes the Node worker-heap failure, not its exact heap
+or preload internals.
 The published revision's local canonical baseline timed out during its cold
 image build; a full-target before/after comparison is therefore inconclusive.
 Real PSI-capable validation and hosted failure evidence or a subsequent hosted
