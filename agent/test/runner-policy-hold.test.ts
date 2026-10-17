@@ -3,6 +3,7 @@ import { test } from "node:test";
 import path from "node:path";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
+import { CodexSessionStore } from "../src/codex/session-state.js";
 import { Outbox } from "../src/outbox.js";
 import { StaleClaimError } from "../src/runner.js";
 import { PolicyHoldUnsupported } from "../src/client.js";
@@ -10,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
-import { installHarness, api, client, homeDir, git, gitlabClaim, fakeGitlab, runner, worktreeDirFor, fx } from "./runner-harness.js";
+import { installHarness, api, client, homeDir, git, gitlabClaim, fakeGitlab, runner, runnerWith, worktreeDirFor, fx } from "./runner-harness.js";
 
 installHarness();
 
@@ -81,6 +82,88 @@ for (const full of [false, true]) for (const fresh of [false, true]) for (const 
     }
   });
 }
+
+test("M2 required Stop callback rejects a failed ACK before continuing", async (t) => {
+  const { outbox, claim } = await setup();
+  Object.assign(claim, { policy_hold_resume: true, policy_hold_fresh_session: true,
+    session_id: null, plan_approved: true, plan_md: "approved delivery",
+    milestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }] });
+  api.setStateAckScope(claim.run_id, { scope_ceiling: 1, milestones_completed: ["m1"] });
+  const runGit = (...args: string[]) => execFileSync("git", ["-C", fx.originPath, ...args], { encoding: "utf8" }).trim();
+  runGit("checkout", "-b", "agent/issue-3068");
+  fs.writeFileSync(path.join(fx.originPath, "delivered.txt"), "completed milestone\n");
+  runGit("add", "delivered.txt");
+  runGit("-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "completed work");
+  const head = runGit("rev-parse", "HEAD");
+  runGit("checkout", "main");
+  const report = client.reportState.bind(client);
+  let boundaries = 0;
+  t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
+    if (args[1].iteration_count !== undefined) {
+      boundaries++;
+      throw new Error("iteration transport unavailable");
+    }
+    return report(...args);
+  });
+  let crossedBoundary = false;
+  const executor: Executor = { async run(ctx) {
+    await ctx.reportIteration?.(1);
+    crossedBoundary = true;
+    throw refusal();
+  } };
+  await runner(executor, fakeGitlab({ head }).gitlab, undefined, { outbox }).execute(claim);
+  assert.equal(boundaries, 1);
+  assert.equal(crossedBoundary, false);
+  assert.equal(api.policyHoldRequests[0]?.body.detail, "resume_rejected");
+  assert.equal(api.states.some(s => s.body.status === "completed" || s.body.status === "failed"), false);
+});
+
+for (const fresh of [false, true]) {
+  test(`M2 constrained lost tree below Stop fresh=${fresh}`, async (t) => {
+    const { outbox, claim } = await setup();
+    Object.assign(claim, { policy_hold_resume: true, policy_hold_fresh_session: fresh,
+      session_id: fresh ? null : "usable-session", plan_approved: true, plan_md: "approved delivery",
+      milestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }] });
+    // A usable transcript does not recover completed delivery files.
+    t.mock.method(CodexSessionStore, "inspectSession", async () => "present" as const);
+    api.setStateAckScope(claim.run_id, { scope_ceiling: 2, milestones_completed: ["m1"] });
+    let calls = 0;
+    const forge = fakeGitlab();
+    await runnerWith(() => ({ executor: { async run() { calls++; throw new Error("forbidden model"); } }, homeDir }),
+      forge.gitlab, undefined, nullLogger(), { outbox }).execute(claim);
+    assert.equal(calls, 0);
+    assert.equal(api.states.some(s => s.body.seeded_from_default), false);
+    assert.equal(api.policyHoldRequests[0]?.body.detail, "resume_rejected");
+    assert.equal(forge.calls.length, 0);
+    assert.equal(api.states.some(s => s.body.status === "completed" || s.body.status === "failed"), false);
+    assert.equal(fs.existsSync(worktreeDirFor(3068)), true, "hold retains custody");
+  });
+}
+
+test("M2 constrained recovered WIP keeps completed scope", async (t) => {
+  const { outbox, claim } = await setup();
+  Object.assign(claim, { policy_hold_resume: true, policy_hold_fresh_session: true,
+    session_id: null, plan_approved: true, plan_md: "approved delivery",
+    milestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }] });
+  api.setStateAckScope(claim.run_id, { scope_ceiling: 2, milestones_completed: ["m1"] });
+  const clone = git.runnerCloneForBranch.bind(git);
+  t.mock.method(git, "runnerCloneForBranch", async (...args: Parameters<typeof clone>) => {
+    const recovered = await clone(...args);
+    assert.equal(recovered.seededFrom, "default");
+    fs.writeFileSync(path.join(recovered.path, "delivered.txt"), "recovered WIP\n");
+    return { ...recovered, wipRecovered: true };
+  });
+  let calls = 0;
+  const executor: Executor = { async run(ctx) {
+    calls++;
+    assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "delivered.txt"), "utf8"), "recovered WIP\n");
+    throw refusal();
+  } };
+  await runner(executor, fakeGitlab().gitlab, undefined, { outbox }).execute(claim);
+  assert.equal(calls, 1);
+  assert.equal(api.states.some(s => s.body.seeded_from_default), false);
+  assert.equal(api.policyHoldRequests[0]?.body.detail, "refused");
+});
 
 test("degraded capture retains the clone and retries ACK loss with the same outcome UUID", async () => {
   const { outbox, claim } = await setup();

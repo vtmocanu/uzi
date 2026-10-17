@@ -1775,6 +1775,8 @@ function logScratchPublicationRefused(
 interface RunFlight {
   /** Scope from the initial authoritative running ACK, before resume can reset progress. */
   resumeScope?: StateAck;
+  /** A reached policy Stop needs a fresh authoritative scope ACK before execution. */
+  policyStopAtResume?: boolean;
   policyHoldSupported?: boolean;
   policyHoldIntent?: PolicyResumeRejected | ProviderPolicyRefusal;
   policyReconciliationPending?: boolean;
@@ -9875,10 +9877,13 @@ export class RunRunner {
       claim.interactive !== true && claim.plan_approved === true && !!claim.milestones?.length &&
       typeof scope?.scopeCeiling === "number" && typeof scope.completedCount === "number" &&
       scope.completedCount > 0 && scope.completedCount >= scope.scopeCeiling;
+    flight.policyStopAtResume = reachedPolicyStop;
+    const hasPolicyCompletedWork = claim.policy_hold_resume === true &&
+      typeof scope?.completedCount === "number" && scope.completedCount > 0;
     const recoveredWork = runnerClone.priorCommits > 0 || runnerClone.wipRecovered === true;
-    if (reachedPolicyStop && !recoveredWork) {
+    if (hasPolicyCompletedWork && !recoveredWork) {
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: "completed work is unavailable on this worker — Stop cannot deliver it; keeping completion and scope unchanged",
+        text: "completed work is unavailable on this worker — continuation cannot deliver it; keeping completion and scope unchanged",
       } });
       throw new PolicyResumeRejected();
     }
@@ -9977,7 +9982,7 @@ export class RunRunner {
     // feed message at ~:603: a brand-new first attempt has no prior milestones to clear,
     // so it must NOT emit a spurious extra run-start report (that perturbs the status-report
     // sequence other runner tests assert, e.g. runner-push-mr).
-    if (!reachedPolicyStop && claim.session_id != null && runnerClone.seededFrom === "default") {
+    if (!hasPolicyCompletedWork && claim.session_id != null && runnerClone.seededFrom === "default") {
       try {
         await reportState({ status: "running", seeded_from_default: true });
       } catch (e) {
@@ -11498,6 +11503,11 @@ export class RunRunner {
                 : {}),
             }),
           );
+          if (flight.policyStopAtResume &&
+              (typeof ack.scopeCeiling !== "number" || typeof ack.completedCount !== "number" ||
+               !Array.isArray(ack.completedIds))) {
+            throw new PolicyResumeRejected();
+          }
           const b: IterationBudget = {};
           if (typeof ack.budgetMaxIterations === "number")
             b.maxIterations = ack.budgetMaxIterations;
@@ -11548,6 +11558,11 @@ export class RunRunner {
           // report error) would let the flight keep running a whole turn on a run the sweep already
           // parked; the fence rejects every write, but the wasted turn is avoided by stopping now.
           if (e instanceof ServerWallParkedError) throw e;
+          if (flight.policyStopAtResume) {
+            this.policyControlGuard(flight);
+            if (e instanceof StaleClaimError || e instanceof PolicyResumeRejected) throw e;
+            throw new PolicyResumeRejected();
+          }
           runLog.warn("could not report iteration", { error: errMessage(e) });
           return undefined;
         }

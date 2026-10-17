@@ -2958,7 +2958,8 @@ approval. Web/TUI/Slack policy controls remain pending M3.
 3. Choose `uzi run resume <id> --fresh-session` explicitly when discarding
    conversation context is intended; optional guidance works here too.
    Verified/recovered files, contract scope and Stop ceiling remain. This
-   grants the exact next claim a fresh session; a reclaim needs new consent.
+   grants the exact next claim a fresh session. A later claim cannot reuse
+   that grant, but may resume a durably recorded conversation.
 4. Or `uzi run stop <id> [-m <text>]` to finalize recovered completed work.
    The server requires a noninteractive milestone issue and at least one
    completed milestone. Partial and fully completed scopes use the normal
@@ -2977,6 +2978,11 @@ predecessor session or provider-rejected resume re-parks `resume_rejected`
 without another refusal count. Attempt isolation stays intact. Each later
 fresh claim needs explicit new consent; guidance, extension and Stop confer
 none. Provider acceptance of a preserving resume is not guaranteed.
+
+If completed work is recorded but its delivery tree was not recovered, a
+constrained continuation re-parks without resetting completion or repeating
+that work, including after fresh consent. A reached Stop also re-parks when
+its boundary report cannot verify the current scope; it starts no lead turn.
 
 `run set-token <id> [<label>]` with its existing `--auto`, `--default` or
 `--inherit` choices uses preserving resume for an otherwise eligible paused

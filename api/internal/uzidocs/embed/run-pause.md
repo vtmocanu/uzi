@@ -169,6 +169,11 @@ Attempt isolation remains in place. Guidance and credential changes are not
 fresh consent. `run set-token` retains its Anthropic-only eligibility and
 rejects Codex (422); an otherwise eligible policy-context promotion preserves.
 
+Completed work must have recovered source before continuation. If that source
+is unavailable, the run re-parks without clearing completion or repeating
+work, including with fresh consent. A reached Stop with an unavailable or
+incomplete scope acknowledgement also re-parks before any lead turn.
+
 A spent budget means **extend first**; a server-wall hold can keep
 `budget_exhausted` plus refusal context, and extension does not authorize a
 fresh conversation. Normal affinity, issue lock and custody remain; open

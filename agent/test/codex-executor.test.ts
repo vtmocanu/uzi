@@ -3166,7 +3166,7 @@ describe("M1 composed policy guidance delivery", () => {
       const executor = new CodexExecutor(diagnostics.log, homeDir,
         { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
       const runner = new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
-        pollMs: 5, outbox, recoveryRetryMs: 1, gitlab: forge.gitlab,
+        pollMs: 5, outbox, recoveryRetryMs: 1, codexBoundaryDeadlineMs: 200, gitlab: forge.gitlab,
         quiesceRun: async () => ({
           process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
           docker: { state: "not_wired", removed: [], detail: "not wired" },
@@ -3193,8 +3193,52 @@ describe("M1 composed policy guidance delivery", () => {
         fx.cleanup();
       }
     }
-    return { api, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
+    return { api, client, fx, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
   }
+
+  for (const full of [false, true]) for (const fresh of [false, true])
+  for (const boundary of ["failure", "missing ceiling", "missing count", "missing IDs"] as const)
+    it(`M2 required Stop ACK full=${full} fresh=${fresh} boundary=${boundary}`, async (t) => {
+      const f = await preservingFixture();
+      let boundaries = 0;
+      try {
+        Object.assign(f.claim, { plan_approved: true, plan_md: "approved delivery", plan_source: "seeded",
+          policy_hold_fresh_session: fresh, session_id: fresh ? null : f.thread,
+          milestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }] });
+        // Recover real delivery before preflight; this test targets the subsequent ACK seam.
+        const branch = `agent/issue-${f.claim.issue_iid}`;
+        const checkout = spawnSync("git", ["-C", f.fx.originPath, "checkout", "-b", branch]);
+        assert.equal(checkout.status, 0, checkout.stderr.toString());
+        commitInTree(f.fx.originPath, "delivered.txt", "completed milestone\n");
+        assert.equal(spawnSync("git", ["-C", f.fx.originPath, "checkout", "main"]).status, 0);
+        f.api.setStateAckScope(f.claim.run_id, { scope_ceiling: full ? 2 : 1,
+          milestones_completed: full ? ["m1", "m2"] : ["m1"] });
+        const report = f.client.reportState.bind(f.client);
+        t.mock.method(f.client, "reportState", async (...args: Parameters<typeof report>) => {
+          if (args[1].iteration_count !== undefined) {
+            boundaries++;
+            if (boundary === "failure") throw new Error("iteration transport unavailable");
+            const ack = await report(...args);
+            if (boundary === "missing ceiling") delete ack.scopeCeiling;
+            if (boundary === "missing count") delete ack.completedCount;
+            if (boundary === "missing IDs") delete ack.completedIds;
+            return ack;
+          }
+          return report(...args);
+        });
+        const { rig, running } = f.start();
+        await waitFor(() => f.api.policyHoldRequests.length > 0 || rig.transport.turnStartCount > 0,
+          "required ACK rejection or forbidden turn");
+        if (rig.transport.turnStartCount > 0) await f.cancel(running);
+        else await withTimeout(running, 5000, "required Stop ACK hold");
+        assert.equal(boundaries, 1);
+        assert.equal(rig.providerLaunches(), 0, "no lead root may start without the required ACK");
+        assert.equal(rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests[0]?.body.detail, "resume_rejected");
+        assert.equal(f.api.states.some(s => s.body.seeded_from_default), false);
+        assert.equal(f.api.states.some(s => s.body.status === "completed"), false);
+      } finally { await f.cleanup(); }
+    });
 
   for (const persisted of [false, true]) it(`M2 fresh claim crash persisted=${persisted} cannot replay grant`, async () => {
     const f = await preservingFixture();
