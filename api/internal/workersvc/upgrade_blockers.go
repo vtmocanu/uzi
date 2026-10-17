@@ -103,11 +103,21 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "limit_wait":
 		return fmt.Sprintf("retry_not_before %s gates promotion; limit reset %s is informational; owner may inspect or resume; no roll time promised", blockerTime(r.RetryNotBefore), blockerTime(r.LimitResetsAt))
 	case "recovery_wait":
+		cause := blockerFact(r.RecoveryWaitCause)
+		switch r.RecoveryWaitCause.String {
+		case recoveryCauseCodexAccountUnavailable:
+			return fmt.Sprintf("recorded cause %s; wait for the same Codex account to become available; inspect account recovery; no timer", cause)
+		case "worker_requeue_exhausted":
+			return fmt.Sprintf("recorded cause %s; owner reviews recovery evidence and chooses Resume; no timer", cause)
+		}
 		action := "owner action if needed: inspect run"
 		if r.RecoveryWaitCause.Valid && r.RecoveryWaitCause.String == recoveryCauseVaultLocked {
 			action = "owner unlocks the vault"
 		}
-		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), blockerFact(r.RecoveryWaitCause), action)
+		if !r.RecoveryRetryNotBefore.Valid || r.RecoveryRetryNotBefore.InfinityModifier != pgtype.Finite || r.RecoveryRetryNotBefore.Time.IsZero() {
+			return fmt.Sprintf("retry timing unavailable; recorded cause %s; %s", cause, action)
+		}
+		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), cause, action)
 	case "queued":
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:

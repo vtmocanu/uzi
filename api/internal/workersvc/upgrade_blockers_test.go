@@ -29,7 +29,7 @@ func TestUpgradeBlockerStatuses(t *testing.T) {
 			w, owner, run := uuid.New(), uuid.New(), uuid.New()
 			rows := []store.ListWorkerUpgradeBlockersRow{{
 				WorkerID: w, WorkerOwner: owner, SafeCount: 1, RunID: pgtype.UUID{Bytes: run, Valid: true},
-				Kind: blockerText("chat"), Status: blockerText(tc.status), HealthReason: blockerText("vault_locked"),
+				Kind: blockerText("chat"), Status: blockerText(tc.status), RecoveryRetryNotBefore: pgtype.Timestamptz{Valid: true, Time: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)}, HealthReason: blockerText("vault_locked"),
 				HoldReason: blockerText("credential_disabled"), RecoveryWaitCause: blockerText("forge_unreachable"),
 			}}
 			got := GroupUpgradeBlockers(rows)[w].Summary()
@@ -54,7 +54,7 @@ func TestUpgradeBlockerStatuses(t *testing.T) {
 func TestUpgradeBlockerRecoveryRetryActions(t *testing.T) {
 	for _, cause := range []string{"", "vault_locked", "forge_unreachable"} {
 		t.Run(cause, func(t *testing.T) {
-			row := store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait"), RecoveryWaitCause: blockerText(cause)}
+			row := store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait"), RecoveryWaitCause: blockerText(cause), RecoveryRetryNotBefore: pgtype.Timestamptz{Valid: true, Time: time.Now().Add(time.Hour)}}
 			action := blockerAction(row)
 			if !strings.Contains(action, "automatic retry") || strings.Contains(action, "owner makes the recovery decision") {
 				t.Fatalf("recovery wait misstates automatic retry: %s", action)
@@ -63,6 +63,26 @@ func TestUpgradeBlockerRecoveryRetryActions(t *testing.T) {
 				t.Fatalf("missing known owner action: %s", action)
 			}
 		})
+	}
+}
+
+func TestUpgradeBlockerRecoveryHoldsHaveNoTimer(t *testing.T) {
+	for _, cause := range []string{"codex_account_unavailable", "worker_requeue_exhausted"} {
+		for _, retry := range []pgtype.Timestamptz{{}, {Valid: true, Time: time.Now().Add(time.Hour)}} {
+			row := store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait"), RecoveryWaitCause: blockerText(cause), RecoveryRetryNotBefore: retry}
+			action := blockerAction(row)
+			if strings.Contains(action, "automatic retry") || !strings.Contains(action, "no timer") || !strings.Contains(action, cause) {
+				t.Fatalf("hold advertises timer: %s", action)
+			}
+		}
+	}
+	row := store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait")}
+	if action := blockerAction(row); strings.Contains(action, "automatic retry") || !strings.Contains(action, "retry timing unavailable") {
+		t.Fatalf("NULL timing invented: %s", action)
+	}
+	row.RecoveryRetryNotBefore = pgtype.Timestamptz{Valid: true, Time: time.Now().Add(time.Hour)}
+	if action := blockerAction(row); !strings.Contains(action, "automatic retry") || !strings.Contains(action, "cause unavailable") {
+		t.Fatalf("SQL NULL cause lost timed recovery: %s", action)
 	}
 }
 

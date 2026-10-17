@@ -189,6 +189,22 @@ func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
 	}
 }
 
+func TestCapacityBlockerRecoveryHoldCauseSurvivesBounds(t *testing.T) {
+	for _, cause := range []string{"codex_account_unavailable", "worker_requeue_exhausted"} {
+		owner, worker, run := uuid.New(), uuid.New(), uuid.New()
+		stamp := pgtype.Timestamptz{Valid: true, Time: fixedNow.Add(time.Hour)}
+		f := &fakeStore{
+			capacityRows: []store.ListOwnersWaitingNoCapacityRow{{RunID: uuid.New(), UserID: owner, HealthSince: stamp}},
+			workers:      []store.ListAllWorkersRow{{Worker: store.Worker{ID: worker, UserID: owner, Kind: "hosted", DrainingSince: stamp}}},
+			blockerRows:  []store.ListWorkerUpgradeBlockersRow{{WorkerID: worker, WorkerOwner: owner, SafeCount: 5, RunID: pgtype.UUID{Valid: true, Bytes: run}, Kind: pgtype.Text{Valid: true, String: "chat"}, Status: pgtype.Text{Valid: true, String: "recovery_wait"}, RecoveryWaitCause: pgtype.Text{Valid: true, String: cause}, RecoveryRetryNotBefore: stamp}},
+		}
+		value := newSvc(f, nil).checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled).Evidence[0].Value
+		if !strings.Contains(value, run.String()) || !strings.Contains(value, cause) || !strings.Contains(value, "no timer") || strings.Contains(value, "automatic retry") || !strings.Contains(value, "4 other safe blocker(s) omitted") || len([]rune(value)) > 512 {
+			t.Fatalf("lost recovery hold under bounds: %s", value)
+		}
+	}
+}
+
 func TestCapacityBlockersEvaluateReusesWorkerSnapshot(t *testing.T) {
 	o, w := uuid.New(), uuid.New()
 	f := &fakeStore{

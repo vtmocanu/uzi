@@ -39,22 +39,22 @@ func (s *Service) enrichCapacityBlockers(ctx context.Context, evidence *waitEvid
 	}
 	// Facts have the existing safe96 ceiling. A tighter per-fact budget leaves
 	// room for the retained waiting UUID/owner/age and one complete blocker action.
-	fact := func(t pgtype.Text) pgtype.Text {
+	fact := func(t pgtype.Text, limit int) pgtype.Text {
 		if t.Valid {
 			r := []rune(safe(t.String))
-			if len(r) > 24 {
-				r = append(r[:23], '…')
+			if len(r) > limit {
+				r = append(r[:limit-1], '…')
 			}
 			t.String = string(r)
 		}
 		return t
 	}
 	for i := range rows {
-		rows[i].Kind = fact(rows[i].Kind)
-		rows[i].Status = fact(rows[i].Status)
-		rows[i].HealthReason = fact(rows[i].HealthReason)
-		rows[i].HoldReason = fact(rows[i].HoldReason)
-		rows[i].RecoveryWaitCause = fact(rows[i].RecoveryWaitCause)
+		rows[i].Kind = fact(rows[i].Kind, 24)
+		rows[i].Status = fact(rows[i].Status, 24)
+		rows[i].HealthReason = fact(rows[i].HealthReason, 24)
+		rows[i].HoldReason = fact(rows[i].HoldReason, 24)
+		rows[i].RecoveryWaitCause = fact(rows[i].RecoveryWaitCause, 32)
 	}
 	grouped := workersvc.GroupUpgradeBlockers(rows)
 	type ownerBlockers struct {
