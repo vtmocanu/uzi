@@ -1330,6 +1330,12 @@ Tracked as issue vtmocanu/uzi#2865; PRD at `prds/done/2865-default-branch-ci-rep
 - CI-config changes are never pushed in this lane: the worker refuses unconditionally, human-approved runs included and also when the diff cannot be computed, and the claim is gated by the `ci_config_guard_v1` worker capability so older workers cannot claim a guarded run (D9). (AI-synced 2026-10-14)
 - `ci-repair` is created with auto-approve OFF, with the reason shown in the UI; the owner may turn it on. [user, 2026-10-13] (D10) This is an explicit exception to the catalog sweeps' auto-approve-ON pattern. (AI-synced 2026-10-14)
 
+## Feature #2866 — CI artifacts as repair evidence
+
+- CI-watch artifact selection is opt-in and shared by default/user schedules: up to 20 names/globs, one per UI line; blank fetches none (blank workflows watch all). CLI `--artifact` repeats; edit `--clear-artifacts` is exclusive with it and leaves workflows unchanged. API edit omission preserves; `null`/`[]` clears. (AI-synced 2026-10-17)
+- Dispatched M1 source implements GitHub UTF-8 text inputs for the exact observed execution; unknown/rerun attempt provenance stays logs-only. Caps are 50 files / 16 MiB per run (lowerable) / fixed 4 MiB per file, scrubbed before hashing, with bounded manifest/refusal reporting and unknown counts for uninspected omissions. Missing, expired, unsupported or budget-refused inputs permit logs-only repair. GitLab/Forgejo artifact providers remain deferred M2. (AI-synced 2026-10-17)
+- Repair inputs share sealed job-file quotas and retention (default 168h after repair end); workers get private 0700 directories/0400 files outside clones through read-only mediated tools for both harnesses/resumes, without collection URLs/tokens. File-bearing claims require `ci_artifacts_v1` plus `ci_config_guard_v1`. Existing default-branch, human-merge, no CI-config publication and initial auto-approve-OFF decisions remain in force. Final acceptance is pending as recorded in `prds/2866-ci-artifacts-repair-evidence.md`; source presence is not delivery acceptance. (AI-synced 2026-10-17)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is

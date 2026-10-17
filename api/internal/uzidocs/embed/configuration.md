@@ -651,18 +651,22 @@ See [Jobs](jobs.md#job-files) for what a job file is and [Agent skills](skills.m
 
 | Var | Default | Notes |
 |---|---|---|
+| `UZI_CI_ARTIFACT_MAX_FILES` | `50` | UTF-8 text files admitted per CI-watch repair run. Can be lowered; values above the fixed worker ceiling of 50 are clamped at boot. |
+| `UZI_CI_ARTIFACT_MAX_BYTES` | `16777216` (16 MiB) | Total extracted text bytes admitted per CI-watch repair run. Can be lowered; values above 16 MiB are clamped at boot. The per-file ceiling is fixed at 4 MiB, with no environment override. |
 | `UZI_JOB_INPUT_FILE_MAX_BYTES` | `26214400` (25 MiB) | The largest single input file `POST /api/v1/files` accepts (413 `file_too_large` over it). Clamped to the worker's fixed ceiling of 256 MiB: a higher value is lowered at boot with a warning, because a worker refuses any job input over its own ceiling and a higher limit would accept jobs every worker then refuses. |
 | `UZI_JOB_INPUTS_MAX_FILES` | `10` | Input files one job may carry. Clamped to the worker ceiling of 64. |
 | `UZI_JOB_INPUTS_MAX_BYTES` | `52428800` (50 MiB) | Total input bytes one job may carry. Clamped to the worker ceiling of 1 GiB. |
 | `UZI_JOB_OUTPUT_FILE_MAX_BYTES` | `26214400` (25 MiB) | The largest single output file the api stores. A larger one is refused and listed in the result's `refused_files`; the job still completes. |
 | `UZI_JOB_OUTPUTS_MAX_FILES` | `50` | Output files stored per job. |
 | `UZI_JOB_OUTPUTS_MAX_BYTES` | `104857600` (100 MiB) | Total output bytes stored per job. |
-| `UZI_JOB_FILES_PER_OWNER_BYTES` | `268435456` (256 MiB) | Retained job-file bytes (every state except expired, reservations included) per owner. Over it, an upload is refused 507 `storage_quota_exceeded`. |
+| `UZI_JOB_FILES_PER_OWNER_BYTES` | `268435456` (256 MiB) | Retained job-file bytes, including CI repair inputs (every state except expired, reservations included), per owner. Over it, an upload is refused 507 `storage_quota_exceeded`. |
 | `UZI_JOB_FILES_INSTANCE_BYTES` | `1073741824` (1 GiB) | Retained job-file bytes across the whole deployment. |
 | `UZI_STORED_FILES_BUDGET_BYTES` | `4294967296` (4 GiB) | The shared ceiling on **job-file bytes plus recovery-archive bytes**, reservations included. Both stores admit against it, and recovery wins a conflict: see [Recovering unpublished work](run-recovery.md#shared-stored-file-budget). |
-| `UZI_JOB_FILES_RETENTION` | `168h` (7 days) | How long a finished job's files stay downloadable, counted from when the job ends. After it the bytes are deleted and the file row stays as an expired record (a download is 410 `file_expired`). |
+| `UZI_JOB_FILES_RETENTION` | `168h` (7 days) | How long a finished job's files or CI repair inputs stay downloadable, counted from when the job or repair run ends. After it the bytes are deleted and the file row stays as an expired record (a download is 410 `file_expired`). |
 | `UZI_JOB_UPLOAD_TTL` | `1h` | How long an uploaded input that no job has attached stays before it expires. |
 | `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for a product's skills repo URL; every entry must be an absolute `https://` URL or boot fails. A **separate** list from `AGENT_SOURCE_ALLOWED_BASE_URLS`, so enabling one never widens the other. An **empty** list is not a boot error: it turns product skill sets **off**. No product skills repo URL can be saved, a sync is refused, and claim-time delivery stops too, so skills a product already has applied stay in the database but no job receives them until you set an entry again. |
+
+CI-watch artifact inputs reuse sealed job-file storage, the per-owner and instance quotas above, and the shared stored-files budget; they do not use the job upload size limits. See [Artifact repair evidence](./scheduling.md#artifact-repair-evidence) for GitHub-only fetching, manifest and logs-only fallbacks, worker capabilities and pending acceptance.
 
 **Sizing the database volume.** Job files are stored in Postgres (sealed 1 MiB chunks), on the same volume as everything else. The 4 GiB `UZI_STORED_FILES_BUDGET_BYTES` default equals the recovery-archive instance quota the database volume was already sized for (the chart's default install, `database.mode: simple`, gives it 8Gi; the CNPG cluster, off by default, 5Gi), so turning job files on never lets stored files exceed that quota. The budget is a fixed number, not scaled to the volume (the api cannot reliably know the volume size). If you raise `UZI_STORED_FILES_BUDGET_BYTES`, `UZI_JOB_FILES_INSTANCE_BYTES` or the recovery quotas, size the database volume for the budget plus your ordinary data. Deleted chunk space is reused after vacuum rather than returned to the filesystem, so the quota, not the disk size, is the control.
 
