@@ -876,7 +876,8 @@ export class RecoveryCoordinator {
   /** Automatic saved-FINAL retries remain eligible indefinitely, paced independently of peers.
    * Process-local only: restart permits one fresh attempt. Counts saturate at the delay cap. */
   private readonly finalRetry = new Map<string, { identity: string; failures: number; nextAt: number }>();
-  private readonly finalRefusalLogged = new Map<string, { identity: string; reason: string; transition: string }>();
+  /** Latest transition per fixed retainFinal predicate; bounded to four entries per capture. */
+  private readonly finalRefusalLogged = new Map<string, { identity: string; transitions: Map<string, string> }>();
 
   private finalRetryIdentity(record: RecoveryRecord): string | undefined {
     return record.inventoryGuarded && record.finalRequest && !record.finalAcknowledged && !record.completionReceipt
@@ -915,8 +916,10 @@ export class RecoveryCoordinator {
       ? err.status : undefined;
     const transition = canonicalJson([reason, code, status]);
     const prior = this.finalRefusalLogged.get(record.captureId);
-    if (prior?.identity === identity && (prior.transition === transition || (err === undefined && prior.reason === reason))) return;
-    this.finalRefusalLogged.set(record.captureId, { identity, reason, transition });
+    const transitions = prior?.identity === identity ? prior.transitions : new Map<string, string>();
+    if (transitions.get(reason) === transition || (err === undefined && transitions.has(reason))) return;
+    transitions.set(reason, transition);
+    this.finalRefusalLogged.set(record.captureId, { identity, transitions });
     this.log.warn("recovery: FINAL retry retained", {
       run_id: current.runId.slice(0, 160), generation: current.generation,
       capture_id: current.captureId.slice(0, 160),

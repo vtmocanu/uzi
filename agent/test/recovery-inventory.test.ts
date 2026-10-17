@@ -327,6 +327,65 @@ it("M3 binding-less restart retries once then paces repeated boot and live work"
   } finally { await f.close(); }
 });
 
+it("M3 FINAL refusal and failed reconciliation log once per predicate transition", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    f.git.discoverOwedCandidates = async () => [];
+    const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+    f.log.warn = (message, fields) => { warnings.push({ message, fields }); };
+    const hostile = "paired-refusal-secret-sentinel" + "\u001b[31m\n" + "x".repeat(24_000);
+    f.state.finalError = new RequestError("POST", "/release", 403,
+      JSON.stringify({ reason: "not_authorized", error: hostile }));
+    let reconciliations = 0;
+    f.client.reconcileRecoveryCapture = async () => { reconciliations++; throw new Error(hostile); };
+    const restarted = f.make();
+    const bundle = await fs.readFile(before.bundlePath!);
+    const costs = { produced: f.state.produced, uploads: f.state.uploads, reserves: f.reserves() };
+    const initialFinals = f.finals.length;
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initialFinals + 1);
+    assert.equal(reconciliations, 1);
+    assert.deepEqual(warnings.map(w => w.fields?.refusing_predicate),
+      ["final_retry_refused", "final_retry_unknown"], "distinct predicates each get their first diagnostic");
+    for (const [elapsed, boot] of [[60_000, true], [180_000, false], [420_000, true]] as const) {
+      f.state.now = 1000 + elapsed;
+      if (boot) await restarted.resumePending();
+      else await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      assert.equal(warnings.length, 2, "unchanged refusal/reconciliation pair adds no warnings");
+    }
+    assert.equal(f.finals.length, initialFinals + 4, "due boot/live attempts still retry FINAL");
+    assert.equal(reconciliations, 4);
+    f.state.finalError = new RequestError("POST", "/release", 409,
+      JSON.stringify({ reason: "manifest_conflict", error: hostile }));
+    f.state.now += 900_000;
+    await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+    assert.equal(warnings.length, 3, "a changed protocol refusal emits a new diagnostic");
+    assert.equal(warnings[2]!.fields?.reason, "manifest_conflict");
+    assert.equal(warnings[2]!.fields?.refusal_code, 409);
+    f.state.finalError = new RequestError("POST", "/release", 403,
+      JSON.stringify({ reason: "not_authorized", error: hostile }));
+    f.state.now += 900_000;
+    await restarted.resumePending();
+    assert.equal(warnings.length, 4, "returning to an earlier protocol refusal is a real transition");
+    assert.equal(warnings[3]!.fields?.refusal_code, 403);
+    const after = (await restarted.inspect(before.runId))[0]!;
+    assert.equal(after.reason, "final_retry_unknown", "transport uncertainty stays retained");
+    assert.equal(after.finalAcknowledged, undefined);
+    assert.deepEqual(after.finalRequest, before.finalRequest);
+    assert.deepEqual(after.originalRoots, before.originalRoots);
+    assert.equal(after.serverCaptureId, before.serverCaptureId);
+    assert.equal(after.reserveIdempotencyKey, before.reserveIdempotencyKey);
+    assert.deepEqual(await fs.readFile(before.bundlePath!), bundle);
+    assert.deepEqual({ produced: f.state.produced, uploads: f.state.uploads, reserves: f.reserves() }, costs);
+    assert.equal(f.state.pinDeletes, 0);
+    assert.equal(f.state.open, true);
+    for (const warning of warnings) {
+      assert.ok(!JSON.stringify(warning).includes("paired-refusal-secret-sentinel"));
+      assert.ok(JSON.stringify(warning).length <= 4096);
+    }
+  } finally { await f.close(); }
+});
+
 for (const authority of ["unknown", "wrong-binding", "api-absent"] as const) {
   it(`M3 failed reconciliation remains retryable with ${authority} exact authority`, async () => {
     const f = await v2FrozenFixture("ci_fix", true);
