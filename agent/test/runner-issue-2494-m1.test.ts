@@ -8,7 +8,7 @@ import { Outbox } from "../src/outbox.js";
 import { resolvePendingTerminal, makeTerminalOutboxDeps } from "../src/terminal-resolve.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, baseUrl, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
-import { JOIN_TOKEN, commit, frozenRecords, heldServer, recoveryOf, skipCheckpoints } from "./runner-held-publication-fixture.js";
+import { HELD_LINUX_ONLY, JOIN_TOKEN, commit, frozenRecords, heldServer, recoveryOf, skipCheckpoints } from "./runner-held-publication-fixture.js";
 
 installHarness();
 
@@ -21,7 +21,7 @@ async function outboxAt(root: string) {
 }
 
 for (const entry of ["boot", "live"] as const) for (const ack of ["receipt", "reason", "neither"] as const) {
-  it(`M1 completion outage restart before sweep ${entry} ${ack}`, async t => {
+  it(`M1 completion outage restart before sweep ${entry} ${ack}`, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(2494, { claim_generation: 71, inventory_guarded: true });
     claim.repo.id = "00000000-0000-4000-8000-000000000072";
     const features = ["claim_generation_fence", "recovery_inventory_v1", "recovery_completed_publication_v1", "terminal_rejection_report"];
@@ -173,7 +173,7 @@ for (const entry of ["boot", "live"] as const) for (const ack of ["receipt", "re
 }
 
 for (const cancellation of ["archive", "held", "unknown"] as const) {
-  it(`M1 cancelled gated issue LIVE ${cancellation}`, async t => {
+  it(`M1 cancelled gated issue LIVE ${cancellation}`, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(2496, { claim_generation: 71, inventory_guarded: true });
     claim.repo.id = "00000000-0000-4000-8000-000000000072";
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
@@ -271,7 +271,7 @@ for (const cancellation of ["archive", "held", "unknown"] as const) {
 }
 
 for (const overlap of ["after-exit", "during-exit", "report-before-reservation"] as const) {
-  it(`M1 completed ci_fix uploaded archive live ${overlap}`, async t => {
+  it(`M1 completed ci_fix uploaded archive live ${overlap}`, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(2495, { kind: "ci_fix", claim_generation: 71, inventory_guarded: true });
     const server = heldServer(claim, ["recovery_inventory_v1"]);
     let completed = false, now = Date.now();

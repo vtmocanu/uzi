@@ -8,7 +8,7 @@ The two historical incidents were **not reproduced in the bounded fixtures below
 
 ## Incident controls
 
-The real Runner, protected Outbox, authenticated on-disk journals and real GitCache are exercised in `agent/test/runner-issue-2494-m1.test.ts`. RPC answers and quiescence observations are test doubles; no live API or compose environment was exercised.
+The real Runner, protected Outbox, authenticated on-disk journals and real GitCache are exercised in `agent/test/runner-issue-2494-m1.test.ts`. RPC answers and quiescence observations are test doubles; no live API or compose environment was exercised. These Runner source-boundary controls use the existing HELD_LINUX_ONLY guard because the production physical-source proof refuses non-Linux hosts. The coordinator-only protocol controls remain platform-independent. Recorded Runner results are Linux results; no non-Linux execution is claimed.
 
 | Scenario | Observed result on unchanged product code |
 | --- | --- |
@@ -67,7 +67,7 @@ All logs are run-local under `.uzi/scratch/`; no logs or scratch data are tracke
 | ci_fix after/during-exit controls with reservation barriers | Both pass in a larger run; that run exited 1 for the subsequently corrected cancellation fixture | gate-log.KrOX1D |
 | Final report-before-reservation control | EXIT=0, one pass, 7.332s | gate-log.9fp64P |
 | Final inventory selection plus backlog controls, valid proof shapes and bounded diagnostic assertions | EXIT=1, 18 pass / 12 expected regression failures, no cancellations, 6.410s | gate-log.T5YwvL |
-| npm --prefix agent run lint; npm --prefix agent run typecheck; git diff --check HEAD | EXIT=0; initial test typing errors corrected | gate-log.K8JESX |
+| npm --prefix agent run lint; npm --prefix agent run typecheck; git diff --check HEAD | EXIT=0; initial test typing errors corrected | gate-log.JcBOlC |
 
 Focused Node invocations ran from `agent/`, with `TMPDIR` pointing to the worktree's `.uzi/scratch/`, using:
 
@@ -79,4 +79,4 @@ Selections: `M1 completion outage restart before sweep`; `M1 cancelled gated iss
 
 Review of 373bd30d identified invalid differing/open proof fixture shapes and top-level documentation placement; both were corrected. Reviewer/auditor assertion notes were addressed with hostile/oversized diagnostic payload checks across every emitted warning, plus explicit unknown-custody record/report retention assertions. A lead review also corrected the inherited failed ownership response to cancelled. The focused selections in the table were rerun after those test fixes. The tester mentioned the absence of a coverage-instrumentation gate; adding instrumentation/dependencies is deferred under the approved focused-evidence scope, not presented as executed coverage measurement.
 
-No full gate, compose phase, LiveDB, hosted acceptance, CI run, or full-suite before/after runtime measurement is claimed in M1. Final gates and delivery validation remain M4 obligations. Test type narrowing after the recorded controls does not alter their runtime assertions. M2 applicability must preserve the independent non-reproduction decisions; M3 must turn the named refusal reds green without weakening immutable FINAL, authority, source-boundary or cleanup constraints.
+No full gate, compose phase, LiveDB, hosted acceptance, CI run, or full-suite before/after runtime measurement is claimed in M1. Final gates and delivery validation remain M4 obligations. Test type narrowing and the non-Linux guard were added after the recorded Linux controls; their Linux assertion bodies are unchanged. Lint/typecheck were repeated after the guard change. The reused guard evaluates false on the Linux host, so it does not turn these recorded Linux cases into skips. M2 applicability must preserve the independent non-reproduction decisions; M3 must turn the named refusal reds green without weakening immutable FINAL, authority, source-boundary or cleanup constraints.
