@@ -34,6 +34,8 @@ func newAutomaticRoundsFixture(t *testing.T, limit int32) (codexTestEnv, *Servic
 func newAutomaticRoundsHarnessFixture(t *testing.T, limit int32, harness string) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
 	t.Helper()
 	env, svc, worker, lead, candidate := newAutomaticRoundsFixture(t, limit)
+	// Other LiveDB tests sweep global health state in this shared database.
+	t.Cleanup(func() { env.exec(`DELETE FROM users WHERE id=$1`, worker.UserID) })
 	// Keep both credentials usable so a same-family checker cannot hide a direction bug.
 	seedDefaultAnthropicToken(t, env, worker.UserID)
 	env.exec("UPDATE workers SET protocol_capabilities=ARRAY['cross_check_v1','cross_check_rounds_v1','cross_check_codex_lead_v1'] WHERE id=$1", worker.ID)
