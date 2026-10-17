@@ -16,7 +16,7 @@ import {
   type ReconcileBeforeBoundary,
   type SpawnedBoundaryProcess,
 } from "../src/codex/safety.js";
-import { buildRunLaneReconcile } from "../src/codex/codex-executor.js";
+import { createRunLaneInstallerReconcile } from "../src/codex/codex-executor.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { BoundaryProcessRequest, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
@@ -30,7 +30,7 @@ import { api, client, fakeGitlab, fx, git, gitlabClaim, runnerWith } from "./run
 // optional Codex `withBoundary` reap facade, per-sink auth-mode reconcile, the pause-sink
 // designation, and the F1 dispose relocation. Driven with a FAKE Codex executor whose `.safety`
 // is a REAL {@link createCodexExecutionSafety} (over a real registry + a tracked provider root +
-// the real {@link buildRunLaneReconcile} run-lane reconcile) wrapped to RECORD every withBoundary/
+// the real {@link createRunLaneInstallerReconcile} run-lane reconcile) wrapped to RECORD every withBoundary/
 // dispose call. The runner stays harness-agnostic — it only ever sees `executor.safety`.
 
 export const GIT_ENV = {
@@ -119,6 +119,7 @@ function registerRoot(reg: ExecutionRegistry, root: RegisteredRoot): void {
 }
 
 export interface CodexRig {
+  installer: ReturnType<typeof createRunLaneInstallerReconcile>;
   registry: ExecutionRegistry;
   safety: CodexExecutionSafety;
   /** Every withBoundary(req.boundary) recorded, in order. */
@@ -204,6 +205,8 @@ export const delay = (ms: number): Promise<void> => new Promise((resolve) => set
 export function codexRig(
   opts: {
     authMode?: "subscription" | "api_key";
+    /** Genuine runner lifecycle, joined from RunContext by lifecycle-sensitive scenarios. */
+    lifecycleSignal?: AbortSignal;
     credentialClient?: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
     blockReconcile?: boolean;
     /** Forwarded to createCodexExecutionSafety (issue #1513): event-gates a boundary deadline. */
@@ -258,12 +261,17 @@ export function codexRig(
   const registeredTokens: string[] = [];
   let processSpawns = 0;
   const processArgv: (readonly string[])[] = [];
-  const reconcile: ReconcileBeforeBoundary = buildRunLaneReconcile(
-    "run-codex-sink",
-    opts.credentialClient ?? fakeClient as never,
-    binding,
-    (t) => registeredTokens.push(t),
+  const lifecycleSignal = opts.lifecycleSignal ?? new AbortController().signal;
+  const installer = createRunLaneInstallerReconcile(
+    lifecycleSignal,
+    {
+      runId: "run-codex-sink",
+      client: opts.credentialClient ?? fakeClient as never,
+      binding,
+      registerToken: (t) => registeredTokens.push(t),
+    },
   );
+  const reconcile: ReconcileBeforeBoundary = installer.reconcile;
 
   const inner = createCodexExecutionSafety(
     registry,
@@ -316,6 +324,7 @@ export function codexRig(
     },
   };
   return {
+    installer,
     registry,
     safety,
     boundaries,

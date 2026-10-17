@@ -402,15 +402,25 @@ export type BoundaryStep =
   | "checkpoint_upload"
   | "checkpoint_report";
 
-export interface BoundaryRequest {
-  boundary: SafeBoundary;
+/** Runner-supplied cause for the actual shutdown checkpoint; credential reauthorization is still required. */
+export interface GracefulShutdownCheckpoint {
+  readonly stopSignal: AbortSignal;
+  readonly deadlineAt: number;
+}
+
+type BoundaryRequestBase = {
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
   /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
   sink?: BoundarySink;
   /** Issue #1900: optional probe of the caller's active step. Diagnostic only: the safety
    *  owner reads it synchronously when the boundary deadline fires, to name that step. */
   activeStep?: () => BoundaryStep | undefined;
-}
+};
+
+export type BoundaryRequest = BoundaryRequestBase & (
+  | { boundary: "shutdown"; gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint }
+  | { boundary: SafeBoundary; gracefulShutdownCheckpoint?: never }
+);
 
 export type ChildQuiescence =
   | { kind: "quiescent"; epoch: number }
