@@ -94,12 +94,12 @@ func tickSupervisor(t *testing.T, children []int, reap func(int) (int, error)) (
 	sup.control = &controlReader{r: reader}
 	sup.seams.childReady = ready
 	var cleared atomic.Bool
-	sup.seams.directChildren = func() []int {
+	sup.seams.directChildren = listedChildren(func() ([]observationRow, error) {
 		if cleared.Load() {
-			return nil
+			return nil, nil
 		}
-		return children
-	}
+		return testChildRows(children), nil
+	})
 	sup.seams.adoptedTick = func() (<-chan time.Time, func()) { return ticks, func() {} }
 	sup.seams.reapAdopted = func(pid int) (int, error) {
 		got, err := reap(pid)
@@ -125,6 +125,31 @@ func TestAdoptedTickReservesPrimaryUntilReapAndAllowsReusedPID(t *testing.T) {
 	awaitPID(t, calls, 10)
 	cleared.Store(true)
 	if _, err := io.WriteString(control, `{"op":"dispose","id":1}`+"\n"); err != nil {
+		t.Fatal(err)
+	}
+	awaitRun(t, done, 0)
+}
+
+func TestAdoptedTickVisitsPastLargeLivePrefix(t *testing.T) {
+	children := []int{9}
+	for pid := 10; pid < 610; pid++ {
+		children = append(children, pid)
+	}
+	sup, ticks, _, calls, control, obs, cleared := tickSupervisor(t, children, func(pid int) (int, error) {
+		if pid == 609 {
+			return pid, nil // A zombie beyond a stable prefix of live children.
+		}
+		return 0, nil
+	})
+	done := make(chan int, 1)
+	go func() { done <- sup.run(9, procStatus{}) }()
+	awaitEvent(t, obs.events, "started")
+	sendTick(t, ticks, done)
+	for pid := 10; pid < 610; pid++ {
+		awaitPID(t, calls, pid)
+	}
+	cleared.Store(true)
+	if _, err := io.WriteString(control, "{\"op\":\"dispose\",\"id\":1}\n"); err != nil {
 		t.Fatal(err)
 	}
 	awaitRun(t, done, 0)

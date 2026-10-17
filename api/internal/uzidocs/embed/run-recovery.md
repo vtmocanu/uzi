@@ -44,6 +44,54 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+## Memory-pressure holds
+
+With the [proactive memory guard](./worker-setup.md#proactive-memory-guard)
+enabled, allowance exhaustion, uncertain drainage or unconfirmed outcome
+reporting invokes capture and attempts to park the affected run at `recovery_wait` with cause
+`worker_memory_pressure`. An accepted park is **owner-held**, with no automatic
+retry time. An unconfirmed capture or park retains local custody. It is separate
+from recovery after an actual OOM kills a worker.
+
+1. Check the run's intervention outcome and current recovery archive status.
+   A historical **Available** report may be outdated: an archive can expire or
+   be discarded. Verify availability by exporting it. Neither that report nor
+   an export proves that the latest work was captured, that the command drained,
+   or that the memory hold's custody may be released.
+2. Resolve the memory/custody problem, then use owner **Resume** to queue a
+   fresh memory episode. The previous episode's persisted maximum and spent
+   allowance survive ordinary redispatch; Resume renews the memory episode
+   subject to remaining run budget, custody, claim and cross-check lifecycle
+   fences. Unknown drain evidence remains retained across Resume.
+3. Use **Cancel** to end the run instead. Cancel is terminal; it does not
+   prove retained work has been archived or authorize deleting uncertain
+   local source.
+
+Credential changes, Codex account changes, budget extension, approval,
+follow-up and pause do not release a held memory episode. Extending a timed
+run can supply budget for a subsequent owner Resume, but does not itself
+queue the run. An available archive does not automatically release this
+hold's retained custody. After discarded/released precedence, an OPEN hold at
+`recovery_wait` for either `worker_memory_pressure` or
+`worker_requeue_exhausted` reports `needs_action` when its latest capture failed,
+otherwise `source_only`, before available unguarded archives or capture progress.
+Other custody attention decisions retain their existing ordering.
+
+The worker attempts preservation using its existing recovery path. Failed
+or uncertain capture keeps local source custody; there is no archive or
+latest-work guarantee, and loss of that worker's retained storage can lose
+uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
+the quiet threshold for the configured dwell are required before another
+intervention/retry. Transport retries do not provide an exactly-once
+delivery guarantee.
+
+Source boundaries: [captured-context reconciliation](../agent/src/runner.ts),
+[memory reservation and outcomes](../api/internal/workersvc/memory.go),
+[owner Resume](../api/internal/store/queries/memory.sql) and
+[custody release](../api/internal/store/queries/recovery.sql). Automatic and
+credential-driven promotion exclude this cause in the
+[runtime queries](../api/internal/store/queries/runtime.sql).
+
 ## When plan-revision retries expire
 
 After bounded inner retries exhaust a provider transient during a human plan
@@ -977,7 +1025,10 @@ trusted unsent outcome protected against a second execution.
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
 `worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
-capture failed, before archive readiness or capture progress is considered. An
+capture failed, before archive readiness or capture progress is considered.
+The same narrow OPEN-hold exception applies to `worker_memory_pressure` at
+`recovery_wait`; this worker-loss example does not make a rejected record
+memory-intervention evidence. Discarded/released precedence remains unchanged. An
 available archive remains exportable; a latest preparing/uploading capture is not
 yet downloadable, and an earlier archive may omit latest worker-local work. These
 capture facts do not settle the owner decision or implicitly release custody.

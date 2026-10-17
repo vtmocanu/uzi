@@ -1,0 +1,19 @@
+{
+  "extends": "../../agent/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": [
+      "../../agent/node_modules/@types"
+    ]
+  },
+  "include": [
+    "../../agent/test/codex-launcher.test.ts",
+    "../../agent/test/codex-executor.test.ts",
+    "../../agent/test/codex-shared-dir.test.ts",
+    "../../agent/test/entrypoint-migration.test.ts",
+    "../../agent/test/git-planning-diff.test.ts",
+    "./**/*.mts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

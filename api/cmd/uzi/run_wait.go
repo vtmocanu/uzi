@@ -76,7 +76,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		}
 		consecutiveUnreachable = 0
 		cause := strOr(run.RecoveryWaitCause, "")
-		if isWorkerRecoveryExhausted(run) && (run.Status != lastStatus || cause != lastRecoveryCause) {
+		if isOwnerRequiredWorkerHold(run) && (run.Status != lastStatus || cause != lastRecoveryCause) {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
 		}
 		if line := providerParkLine(run); line != "" && (run.Status != lastStatus || cause != lastRecoveryCause) {
@@ -134,7 +134,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && isWorkerRecoveryExhausted(run)) {
+		if targets[run.Status] || (defaultUntil && isOwnerRequiredWorkerHold(run)) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,
@@ -232,7 +232,7 @@ func newRunWaitCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Block until a run reaches a chosen state",
 		Long: "Poll a run until its status enters the `--until` set, then exit 0 (PRD #264).\n\n" +
 			"With no `--until`, it stops on any state that needs you or ends the run: " +
-			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted (recovery_wait; owner Resume or Cancel). " +
+			strings.Join(defaultWaitStates, ", ") + ", or worker recovery exhausted / worker memory pressure (recovery_wait; owner Resume or Cancel). " +
 			"Explicit --until uses only the named statuses. Ordinary transient recovery_wait keeps polling. It does NOT stop " +
 			"on queued/claimed/running (still working), limit_wait (auto-resumes), pool_wait " +
 			"(an auto run held on an empty token pool; resumes when a token is pooled), or paused " +

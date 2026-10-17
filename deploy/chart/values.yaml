@@ -679,6 +679,17 @@ workers:
   # it for burst capacity on one worker no longer risks piling two simultaneously
   # queued runs onto whichever worker happens to poll first while a sibling sits idle.
   maxConcurrentRuns: 1
+  # Explicit opt-in; supply all six positive decimal settings when enabled.
+  # No calibrated production settings are supplied. The worker checks thresholds
+  # against its actual finite cgroup limit; the controller has no live limit.
+  memoryGuard:
+    enabled: false
+    reserveBytes: ""
+    sampleMs: ""
+    hysteresisBytes: ""
+    rearmMs: ""
+    responseBudgetMs: ""
+    maxInterventions: ""
   # Dedicated cross-check lane slots; 0 disables the lane. Accepted range [0, 16].
   # Relayed through UZI_WORKER_CROSS_CHECK_SLOTS to WORKER_CROSS_CHECK_SLOTS.
   crossCheckSlots: 1

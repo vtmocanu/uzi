@@ -740,6 +740,15 @@ func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// ReleaseCustodyHoldExact locks the run before updating custody. Take that
+	// lock before resolution too, so v1 cannot invert the lifecycle's run/hold order.
+	var lockedRun uuid.UUID
+	if err := tx.QueryRow(ctx, "SELECT id FROM runs WHERE id=$1 FOR UPDATE", runID).Scan(&lockedRun); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apitypes.RecoveryReleaseResponse{RunID: runID.String()}, nil
+		}
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
 	_, generation, err := s.resolveSoleOpenHold(ctx, tx, runID, wkr.ID)
 	switch {
 	case errors.Is(err, ErrNotAuthorized):
