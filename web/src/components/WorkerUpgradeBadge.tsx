@@ -258,11 +258,14 @@ export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
   // successful copy from a no-op clipboard — and this command is the one thing they are
   // meant to carry to a terminal.
   const [copied, setCopied] = useState(false);
-  if (!needsAttention(worker) && worker.upgrade_status !== "provisioning") return null;
+  const drainingDetail = worker.kind === "hosted" && worker.draining_since && worker.upgrade_detail;
+  if (!needsAttention(worker) && worker.upgrade_status !== "provisioning" && !drainingDetail) return null;
   const failed = workerFailed(worker);
   const cause = failed ? workerFailureCause(worker) : null;
   const presentation = upgradePresentation(worker.upgrade_status);
-  const tone = TONE_CLASS[presentation?.tone ?? "warning"];
+  const tone = drainingDetail && !needsAttention(worker) && worker.upgrade_status !== "provisioning"
+    ? "border-edge text-faint"
+    : TONE_CLASS[presentation?.tone ?? "warning"];
   return (
     <div className={`mt-2 rounded border p-2 text-xs ${tone}`}>
       <div className="font-medium">

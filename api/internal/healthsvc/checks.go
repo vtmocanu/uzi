@@ -414,6 +414,11 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 }
 
 func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
+	workers, err := s.cfg.Store.ListAllWorkers(ctx)
+	return s.checkFleetCapacityWithWorkers(ctx, now, health, workers, err, shared...)
+}
+
+func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Time, health healthDetectorState, workers []store.ListAllWorkersRow, workersErr error, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
 	case healthDetectorDisabled:
@@ -468,6 +473,7 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 			}
 		}
 	}
+	s.enrichCapacityBlockers(ctx, &evidence, workers, workersErr)
 	c.Evidence = evidence.finish()
 	// Only owners whose every waiting row was confirmed can be described as rolling.
 	for owner := range unconfirmed {
