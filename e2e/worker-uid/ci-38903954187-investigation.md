@@ -115,5 +115,16 @@ awaits ordinary termination after memory feedback (the `cleanupReason` branch).
 [calibration-fixture.mts](calibration-fixture.mts) also creates abort controllers
 without passing their signals to the broker, disconnecting cleanup aborts.
 
-This seam still needs a real-helper regression and an explicit settlement design
-before a production fix. M3 and the canonical lane remain incomplete.
+The worker investigation did not provide a real-helper regression for this seam.
+On 2026-10-17, the landing owner reproduced it with the actual supervisor under
+the cap-less command-UID profile: the primary's input remained open, disposal
+reported drained with ECHILD authority and the helper exited successfully, but
+no `child_exit` event was emitted. The new control-first regression failed on
+the published source. The user-approved scoped repair preserves the observed
+terminal wait status and reports the primary exactly once through either
+readiness or disposal, independently of drainage authority. The control-first
+real-helper regression then passed. Fixture cleanup also binds separate owned
+broker abort signals; its behavioral isolation regression fails without that
+wiring and passes after restoration. These targeted proofs are not PSI
+calibration or a green canonical lane; M3 and the canonical lane remain incomplete
+until all original composed CI and calibration gates pass.

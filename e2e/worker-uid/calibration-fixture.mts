@@ -5,7 +5,7 @@ import { mkdir, readFile, rename, rm, statfs, writeFile } from "node:fs/promises
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { performance } from "node:perf_hooks";
-import { CodexCallbackBroker, type CapturedMemoryContext } from "../../agent/src/codex/broker.js";
+import { CodexCallbackBroker, type CapturedMemoryContext, type CodexCallbackBrokerOptions } from "../../agent/src/codex/broker.js";
 import { makeDefaultSpawnCommand } from "../../agent/src/codex/codex-executor.js";
 import { launchCodexEffectRoot, type CodexRootHandle, type SpawnSupervisor } from "../../agent/src/codex/launcher.js";
 import { boundedCommandWait } from "../../agent/src/codex/memory-command.js";
@@ -29,6 +29,13 @@ type Available = Extract<Sample, { available: true }>;
 // with SIGKILL and reports 128 + signal; an error exit is not pressure cancellation.
 export function expectedPrimaryExit(disposalRequested: boolean, code: unknown): boolean {
   return disposalRequested && code === 137;
+}
+
+// Each owned producer's cleanup abort belongs only to its broker callback.
+export function createCalibrationBrokers(options: Omit<CodexCallbackBrokerOptions, "signal">,
+  signals: readonly [AbortSignal, AbortSignal]): readonly [CodexCallbackBroker, CodexCallbackBroker] {
+  const create = (signal: AbortSignal) => new CodexCallbackBroker({ ...options, signal });
+  return [create(signals[0]), create(signals[1])];
 }
 function deferred<T>() {
   let resolve!: (v: T) => void, reject!: (e: unknown) => void;
@@ -381,16 +388,17 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     };
     const spawnCommand = makeDefaultSpawnCommand(registry, launch, 5000, root,
       { PATH: "/usr/local/bin:/usr/bin:/bin" }, "off", undefined, undefined, 70000, undefined, captured);
-    const broker = new CodexCallbackBroker({ registry, capturedMemory: captured, worktreePath: root, spawnCommand,
+    const brokers = createCalibrationBrokers({ registry, capturedMemory: captured, worktreePath: root, spawnCommand,
       grants: { role: "coder", phase: "implement", isRoot: true, allowedTools: new Set(["Bash"]), allowedSkills: new Set() },
-      fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }) });
+      fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }) },
+    [aborts[0]!.signal, aborts[1]!.signal]);
     for (let index = 0; index < 2; index++) {
       const dir = dirs[index]!;
       await mkdir(dir.disk, { recursive: true }); await mkdir(dir.shmem, { recursive: true });
       const quote = (v: string) => "'" + v.replaceAll("'", "'\\''") + "'";
       const command = [process.execPath, "--import", "/app/node_modules/tsx/dist/loader.mjs",
         "/app/uzi-worker-uid-proof/e2e/worker-uid/calibration-producer.mts", dir.control, dir.disk, dir.shmem, String(plan.rounds)].map(quote).join(" ");
-      const reply = broker.handleToolCall({ threadId: expected.fixtureId, turnId: expected.legId,
+      const reply = brokers[index]!.handleToolCall({ threadId: expected.fixtureId, turnId: expected.legId,
         callId: "calibration-" + index }, "Bash", { command }, "root");
       void reply.then((value) => { brokerReplies[index] = value; }, (error) => {
         brokerReplies[index] = { failure: String(error) };

@@ -168,8 +168,8 @@ func (root *liveObservationRoot) observation(t *testing.T, id, timeout int) obse
 }
 func (root *liveObservationRoot) dispose(t *testing.T) {
 	t.Helper()
-	// Release payload threads before a lifecycle dispose, whose independent
-	// enumeration cap intentionally refuses to kill an oversized direct child list.
+	// Release payload threads for ordinary observation-fixture teardown. The
+	// disposal regression below keeps input open to exercise control-first exit.
 	_ = root.input.Close()
 	time.Sleep(100 * time.Millisecond)
 	_, err := io.WriteString(root.control, "{\"op\":\"dispose\",\"id\":999,\"timeoutMs\":2000}\n")
@@ -212,6 +212,45 @@ func TestRealObservationSupervisedTrees(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyExecutable(t, os.Args[0], bin)
+	t.Run("dispose-primary-exit", func(t *testing.T) {
+		root := startObservationRoot(t, bin, 0, false)
+		// The primary blocks on its owned input. Disposal must observe its actual
+		// SIGKILL wait status; it cannot rely on the ordinary readiness arm winning.
+		if _, err := io.WriteString(root.control, "{\"op\":\"dispose\",\"id\":991,\"timeoutMs\":2000}\n"); err != nil {
+			t.Fatal(err)
+		}
+		exits, disposed := 0, false
+		for {
+			var ev map[string]any
+			err := root.decoder.Decode(&ev)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch ev["event"] {
+			case "child_exit":
+				exits++
+				if disposed || ev["code"] != float64(137) {
+					t.Fatalf("primary exit must precede disposal with observed SIGKILL status: %v", ev)
+				}
+			case "dispose":
+				if ev["state"] != "drained" || ev["authority"] != authorityECHILD {
+					t.Fatalf("owned disposal not confirmed: %v", ev)
+				}
+				disposed = true
+			default:
+				t.Fatalf("unexpected lifecycle event: %v", ev)
+			}
+		}
+		if err := root.cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if !disposed || exits != 1 {
+			t.Fatalf("real helper lost primary status during disposal: disposed=%v child_exit_count=%d", disposed, exits)
+		}
+	})
 	t.Run("repeat-and-detached-doublefork", func(t *testing.T) {
 		root := startObservationRoot(t, bin, 0, true)
 		time.Sleep(100 * time.Millisecond)

@@ -27,8 +27,15 @@ type (
 	// childReaper is one Wait4(-1, WNOHANG|__WALL) step: (pid>0, nil) reaped a
 	// child; (0, nil) no child is ready right now; (0, ECHILD) no children
 	// remain — the drain authority.
-	childReaper func() (pid int, err error)
+	childReaper func() (childWaitResult, error)
 )
+
+// A positive pid carries its actual normalized terminal wait status. The drain
+// needs the pid; its owning supervisor also owes the primary's exit evidence.
+type childWaitResult struct {
+	pid  int
+	code int
+}
 
 // drain kills and reaps every current descendant until it observes ECHILD, or a
 // bound is hit. drained REQUIRES an observed ECHILD with no remaining children;
@@ -104,7 +111,7 @@ func drain(
 			if !clock().Before(deadline) {
 				return unconfirmed(reasonDeadline, listed)
 			}
-			pid, err := reap()
+			waited, err := reap()
 			if err != nil {
 				if errors.Is(err, syscall.ECHILD) {
 					var remaining []observationRow
@@ -132,10 +139,10 @@ func drain(
 				// reaping this pass and let the deadline gate decide.
 				break
 			}
-			if pid == 0 {
+			if waited.pid == 0 {
 				break
 			}
-			retain(reaped, pid)
+			retain(reaped, waited.pid)
 		}
 		if !clock().Before(deadline) {
 			return unconfirmed(reasonDeadline, listed)

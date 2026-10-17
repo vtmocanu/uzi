@@ -8,9 +8,50 @@ import { runInNewContext } from "node:vm";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { captureEventCounters, calibrationUnits, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { captureEventCounters, calibrationUnits, createCalibrationBrokers, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { ExecutionRegistry, newLocalExecutionEpoch } from "../../agent/src/codex/registry.js";
+import { boundedCommandWait } from "../../agent/src/codex/memory-command.js";
+import type { SpawnCommandResult } from "../../agent/src/codex/broker.js";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+
+test("fixture abort settles only its exact producer callback while its sibling remains live", async () => {
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const controllers = [new AbortController(), new AbortController()] as const;
+  const releases: (() => void)[] = [];
+  const seen: (AbortSignal | undefined)[] = [];
+  const brokers = createCalibrationBrokers({ registry, worktreePath: "/proof",
+    grants: { role: "coder", phase: "implement", isRoot: true, allowedTools: new Set(["Bash"]), allowedSkills: new Set() },
+    fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }),
+    spawnCommand: async (_argv, options) => new Promise<SpawnCommandResult>((resolve, reject) => {
+      seen.push(options.signal);
+      releases.push(() => resolve({ code: 0, stdout: "owned release", stderr: "" }));
+      const abort = () => reject(new Error("owned producer aborted"));
+      if (options.signal?.aborted) abort();
+      else options.signal?.addEventListener("abort", abort, { once: true });
+    }),
+  }, [controllers[0].signal, controllers[1].signal]);
+  const replies = brokers.map((broker, index) => broker.handleToolCall({
+    threadId: "fixture-abort-thread", turnId: "fixture-abort-turn", callId: "fixture-abort-" + index,
+  }, "Bash", { command: "printf fixture" }, "root"));
+  let siblingSettled = false;
+  void replies[1]!.finally(() => { siblingSettled = true; });
+  try {
+    assert.equal(seen.length, 2, "both real brokers reached their owned spawn seam");
+    controllers[0].abort();
+    const result = await boundedCommandWait(replies[0]!, 500);
+    assert.equal(result.ok, false, "the exact aborted callback settles as a broker error");
+    assert.equal(siblingSettled, false, "sibling callback is still live");
+    assert.equal(seen[1]!.aborted, false);
+    releases[1]!();
+    const sibling = await boundedCommandWait(replies[1]!, 500);
+    assert.equal(sibling.ok, true);
+  } finally {
+    for (const controller of controllers) controller.abort();
+    for (const release of releases) release();
+    await Promise.allSettled(replies);
+  }
+});
 
 test("planned charge metadata names four fixed logical budgets without starting load", () => {
   for (const [rounds, budget] of [[16, 33554432], [32, 67108864]] as const) {

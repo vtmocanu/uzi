@@ -195,13 +195,17 @@ func realReapChild(pid int) (int, error) {
 	if got != pid {
 		return 0, errors.New("child was not waitable after pidfd readiness")
 	}
+	return terminalWaitCode(ws)
+}
+
+func terminalWaitCode(ws unix.WaitStatus) (int, error) {
 	if ws.Exited() {
 		return ws.ExitStatus(), nil
 	}
 	if ws.Signaled() {
 		return 128 + int(ws.Signal()), nil
 	}
-	return 1, nil
+	return 0, errors.New("child wait did not report terminal status")
 }
 
 // realReapAdopted checks one current direct child without blocking the control loop.
@@ -470,8 +474,15 @@ func realKill(child processIdentity) error {
 // realReap is one non-blocking Wait4 over ALL children including differently-
 // grouped/threaded descendants (__WALL). ECHILD (no children remain) is the
 // drain authority.
-func realReap() (int, error) {
+func realReap() (childWaitResult, error) {
 	var ws unix.WaitStatus
 	pid, err := unix.Wait4(-1, &ws, unix.WNOHANG|unix.WALL, nil)
-	return pid, err
+	if err != nil || pid == 0 {
+		return childWaitResult{}, err
+	}
+	code, err := terminalWaitCode(ws)
+	if err != nil {
+		return childWaitResult{}, err
+	}
+	return childWaitResult{pid: pid, code: code}, nil
 }

@@ -37,13 +37,13 @@ func listedChildren(list func() ([]observationRow, error)) childVisitor {
 // ECHILD (no children remain) once exhausted.
 func seqReaper(steps ...reapStep) childReaper {
 	i := 0
-	return func() (int, error) {
+	return func() (childWaitResult, error) {
 		if i < len(steps) {
 			s := steps[i]
 			i++
-			return s.pid, s.err
+			return childWaitResult{pid: s.pid}, s.err
 		}
-		return 0, syscall.ECHILD
+		return childWaitResult{}, syscall.ECHILD
 	}
 }
 
@@ -161,7 +161,7 @@ func TestDrainDeadlineUnconfirmed(t *testing.T) {
 	}
 	kill, _ := recordingKiller()
 	children := listedChildren(func() ([]observationRow, error) { return testChildRows([]int{10}), nil }) // never drains
-	reap := func() (int, error) { return 0, nil }                                                         // WNOHANG, never ready
+	reap := func() (childWaitResult, error) { return childWaitResult{}, nil }                             // WNOHANG, never ready
 
 	got := drain(deadline, clock, func() {}, children, kill, reap)
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline {
@@ -238,13 +238,13 @@ func TestDrainContinuousReapsDeadline(t *testing.T) {
 	waits := 0
 	got := drain(deadline, func() time.Time { return now }, func() {},
 		seqChildren(nil), func(processIdentity) error { return nil },
-		func() (int, error) {
+		func() (childWaitResult, error) {
 			waits++
 			if waits > 10000 {
-				return 0, syscall.ECHILD
+				return childWaitResult{}, syscall.ECHILD
 			}
 			now = now.Add(250 * time.Millisecond)
-			return waits, nil
+			return childWaitResult{pid: waits}, nil
 		})
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || waits != 4 {
 		t.Fatalf("waits=%d result=%+v", waits, got)
@@ -259,13 +259,13 @@ func TestDrainCumulativeChurnBound(t *testing.T) {
 	got := drain(deadline, clock, sleep,
 		listedChildren(func() ([]observationRow, error) { passes++; return testChildRows([]int{passes}), nil }),
 		func(processIdentity) error { kills++; return nil },
-		func() (int, error) {
+		func() (childWaitResult, error) {
 			waits++
 			now = now.Add(time.Millisecond)
 			if waits%2 == 0 {
-				return 0, nil
+				return childWaitResult{}, nil
 			}
-			return (waits + 1) / 2, nil
+			return childWaitResult{pid: (waits + 1) / 2}, nil
 		})
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || kills <= 256 || len(got.Killed) != 256 || len(got.Reaped) != 256 || !got.EvidenceTruncated {
 		t.Fatalf("passes=%d kills=%d waits=%d result=%+v", passes, kills, waits, got)
@@ -286,7 +286,7 @@ func TestDrainKillLoopDeadline(t *testing.T) {
 	got := drain(now.Add(time.Second), func() time.Time { return now }, func() {},
 		seqChildren([]int{1, 2, 3}),
 		func(processIdentity) error { kills++; now = now.Add(time.Second); return nil },
-		func() (int, error) { waits++; return 0, syscall.ECHILD })
+		func() (childWaitResult, error) { waits++; return childWaitResult{}, syscall.ECHILD })
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || kills != 1 || waits != 0 {
 		t.Fatalf("kills=%d waits=%d result=%+v", kills, waits, got)
 	}
@@ -314,12 +314,12 @@ func TestDrainExpiredAuditorProbe(t *testing.T) {
 	got := drain(now.Add(-time.Second), func() time.Time { return now }, func() {},
 		seqChildren([]int{10001}),
 		func(processIdentity) error { kills++; return nil },
-		func() (int, error) {
+		func() (childWaitResult, error) {
 			waits++
 			if waits <= 10000 {
-				return waits, nil
+				return childWaitResult{pid: waits}, nil
 			}
-			return 0, syscall.ECHILD
+			return childWaitResult{}, syscall.ECHILD
 		})
 	if got.State != stateUnconfirmed || got.Reason != reasonDeadline || waits != 0 || kills != 0 {
 		t.Fatalf("waits=%d kills=%d result=%+v", waits, kills, got)
@@ -339,12 +339,12 @@ func TestDrainActualProducerWire(t *testing.T) {
 				}
 				return rows, nil
 			})
-			reap := func() (int, error) {
+			reap := func() (childWaitResult, error) {
 				if reason == reasonDeadline {
 					now = deadline
-					return 0, nil
+					return childWaitResult{}, nil
 				}
-				return 0, syscall.ECHILD
+				return childWaitResult{}, syscall.ECHILD
 			}
 			got := drain(deadline, func() time.Time { return now }, func() {}, children,
 				func(processIdentity) error { return nil }, reap)
@@ -391,15 +391,15 @@ func TestDrainCumulativeRetainedEvidenceBound(t *testing.T) {
 					}
 					return nil, nil
 				}), func(processIdentity) error { return nil },
-				func() (int, error) {
+				func() (childWaitResult, error) {
 					waits++
 					if mode == "reaped" && waits <= 257 {
-						return waits, nil
+						return childWaitResult{pid: waits}, nil
 					}
 					if mode == "killed" && passes <= 257 {
-						return 0, nil
+						return childWaitResult{}, nil
 					}
-					return 0, syscall.ECHILD
+					return childWaitResult{}, syscall.ECHILD
 				})
 			if got.State != stateDrained || got.Authority != authorityECHILD || len(got.Killed) > 256 || len(got.Reaped) > 256 || !got.EvidenceTruncated {
 				t.Fatalf("retained evidence bound: state=%s reason=%s authority=%s killed=%d reaped=%d", got.State, got.Reason, got.Authority, len(got.Killed), len(got.Reaped))

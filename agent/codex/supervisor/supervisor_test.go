@@ -17,13 +17,13 @@ import (
 // scriptedReaper yields the scripted results in order, then fallback forever.
 func scriptedReaper(fallback reapStep, steps ...reapStep) childReaper {
 	i := 0
-	return func() (int, error) {
+	return func() (childWaitResult, error) {
 		if i < len(steps) {
 			s := steps[i]
 			i++
-			return s.pid, s.err
+			return childWaitResult{pid: s.pid}, s.err
 		}
-		return fallback.pid, fallback.err
+		return childWaitResult{pid: fallback.pid}, fallback.err
 	}
 }
 
@@ -369,9 +369,9 @@ func TestDisposeCleanupPastDeadlineIsRetainedDeadline(t *testing.T) {
 	// Drain completes at 950ms: before its 1000ms deadline but after the
 	// 900ms cleanup deadline. The real safetree clock also sees it as expired.
 	now := time.Unix(0, 0)
-	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":1000}`+"\n", func() (int, error) {
+	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":1000}`+"\n", func() (childWaitResult, error) {
 		now = now.Add(950 * time.Millisecond)
-		return 0, syscall.ECHILD
+		return childWaitResult{}, syscall.ECHILD
 	})
 	sup.seams.now = func() time.Time { return now }
 	sup.seams.tmpCleanup = tmpCleanupFor(ct)

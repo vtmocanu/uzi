@@ -46,6 +46,77 @@ async function requireCommandProfile() {
   assert.match(status, /^NoNewPrivs:\s+1$/m, "prerequisite: no-new-privileges");
 }
 
+// Real lifecycle/callback proof without cgroup-pressure or calibration claims.
+// Reuse the existing bounded helper build and command profile, adding no leaf
+// or timeout to the required composed lane.
+async function proveLivePrimaryPressureSettlement(bins: string, dir: string) {
+  const commands = new WorkerMemoryCommands(), flight = {};
+  const context = commands.begin({ run_id: randomUUID(), worker_id: randomUUID(), register_nonce: "live-primary-proof",
+    claim_generation: 1, memory_episode: 0, flight, lifecycleRevision: 1 });
+  const captured: CapturedMemoryContext = { commands, context, flight, lifecycleRevision: 1 };
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const abort = new AbortController();
+  let handle: CodexRootHandle | undefined;
+  let entry: NonNullable<ReturnType<WorkerMemoryCommands["eligibleEntries"]>>[number] | undefined;
+  let pressure: WorkerMemoryPressureResult | undefined;
+  let reply: Promise<Awaited<ReturnType<CodexCallbackBroker["handleToolCall"]>>> | undefined;
+  try {
+    const launch = async (spec: Parameters<typeof launchCodexEffectRoot>[0]) => {
+      handle = await launchCodexEffectRoot({ ...spec, command: path.join(bins, "cmdsandbox") }, {
+        env: { UZI_UID_SPLIT: "1" },
+        helperBinsForTest: { supervisor: path.join(bins, "codex-supervisor"), crossCheckSandbox: "" },
+        deadlines: { started: budgetMs },
+      });
+      return handle;
+    };
+    const broker = new CodexCallbackBroker({ registry, capturedMemory: captured, worktreePath: root,
+      spawnCommand: makeDefaultSpawnCommand(registry, launch, budgetMs, root,
+        { PATH: path.dirname(process.execPath) + ":/usr/bin:/bin" }, "off", undefined, undefined, 15000, undefined, captured),
+      signal: abort.signal,
+      grants: { role: "coder", phase: "implement", isRoot: true, allowedTools: new Set(["Bash"]), allowedSkills: new Set() },
+      fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }),
+    });
+    const source = path.join(dir, "live-primary.mjs");
+    await writeFile(source, "setTimeout(() => {}, 20000);\n");
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    reply = broker.handleToolCall({ threadId: "live-primary-thread", turnId: "live-primary-turn", callId: "live-primary-call" },
+      "Bash", { command: [process.execPath, source].map(quote).join(" ") }, "root");
+    let settled = false;
+    void reply.then(() => { settled = true; });
+    await ready(() => handle !== undefined && commands.eligibleEntries()?.length === 1);
+    entry = commands.eligibleEntries()![0]!;
+    commands.prepareOutcome(entry);
+    pressure = {
+      run_id: context.run_id, worker_id: context.worker_id, claim_generation: 1, memory_episode: 0,
+      intervention_id: randomUUID(), tool_id: entry.toolId, attempt_id: entry.attemptId,
+      command_id: entry.commandId, command: entry.command, code: "worker_memory_pressure",
+      observed_total_bytes: 900, limit_bytes: 1000, tree_rss_bytes_approx: 100,
+      outcome: "confirmed_drained", cancellation_confirmed: true, retry_blocked: true,
+      guidance: "Use smaller or serial commands after recovery.",
+    };
+    const actualExit = handle!.waitChild(budgetMs);
+    void actualExit.catch(() => {});
+    await boundedCommandWait(entry.cancel({ remainingMs: budgetMs, signal: new AbortController().signal,
+      authorized: () => true }), budgetMs);
+    assert.equal(commands.hasConfirmedStop(entry), true);
+    assert.equal((await actualExit).code, 137, "the actual live primary was killed and waited by disposal");
+    assert.equal(settled, false, "primary exit before feedback still owes the prepared pressure result");
+    assert.equal(commands.resolveToolOutcome(entry, pressure), true);
+    const result = await boundedCommandWait(reply, budgetMs);
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("live-primary pressure result expected");
+    assert.deepEqual(result.memoryPressure, pressure);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+    assert.equal(registry.isPoisoned(), false);
+  } finally {
+    abort.abort();
+    const disposed = await handle?.dispose(budgetMs);
+    if (entry && pressure && commands.hasConfirmedStop(entry)) commands.resolveToolOutcome(entry, pressure);
+    if (reply) await boundedCommandWait(reply, budgetMs);
+    if (disposed) assert.equal(disposed.clean, true, "owned live-primary proof root must drain");
+  }
+}
+
 test("real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure", { timeout: 110000 }, async () => {
   await requireCommandProfile();
   const scratch = "/proof/.uzi/scratch";
@@ -86,6 +157,7 @@ test("real adopted detached tree: eligibility, identity refusal, concurrent clea
       cwd: path.join(root, "agent/codex/supervisor"), timeout: 30000,
       env: { ...process.env, GOFLAGS: "-buildvcs=false", TMPDIR: dir }, maxBuffer: 64 * 1024,
     });
+    await proveLivePrimaryPressureSettlement(bins, dir);
     const fixture = path.join(dir, "tree.mjs");
     await writeFile(fixture, `
 import { spawn } from "node:child_process";
