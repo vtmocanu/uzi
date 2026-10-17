@@ -59,6 +59,12 @@ func TestOwnerHoldSQLMirrorsClaimRun(t *testing.T) {
 	}
 	sql := string(raw)
 	claim := executableSQL(queryBlock(t, sql, "ClaimRun"))
+	if !strings.Contains(claim, "AND(r.kind='cross_check'ORr.worker_idISNULL") {
+		t.Fatal("ClaimRun affinity predicate lacks cross_check exemption")
+	}
+	if !strings.Contains(claim, "ORr.updated_at<@affinity_cutoff)") {
+		t.Fatal("ClaimRun affinity predicate lacks strict ceiling")
+	}
 	start := strings.Index(claim, "(ow.draining_sinceISNOTNULLOR")
 	if start < 0 {
 		t.Fatal("ClaimRun owner predicate missing")
