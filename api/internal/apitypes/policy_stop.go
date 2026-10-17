@@ -80,7 +80,11 @@ func (v *PolicyRevisionRef) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &keys); err != nil {
 		return err
 	}
-	if len(keys) != 2 {
+	arm := "input_id"
+	if n.Source == "plan_cross_check" {
+		arm = "cross_check_id"
+	}
+	if !policyStopExactKeys(keys, "source", arm) {
 		return errors.New("revision reference is not a closed union")
 	}
 	*v = PolicyRevisionRef(n)
@@ -110,7 +114,7 @@ func ParsePolicyRevisionSourceV1(b []byte) (PolicyRevisionSourceV1, error) {
 	if err := json.Unmarshal(b, &fields); err != nil {
 		return v, err
 	}
-	if len(fields) != 4 || v.Version != 1 || v.AssociatedCrossChecks == nil {
+	if !policyStopExactKeys(fields, "version", "gate", "primary_revision", "associated_cross_checks") || v.Version != 1 || v.AssociatedCrossChecks == nil {
 		return v, errors.New("unknown revision source coverage")
 	}
 	if v.Gate != nil {
@@ -118,7 +122,7 @@ func ParsePolicyRevisionSourceV1(b []byte) (PolicyRevisionSourceV1, error) {
 		if err := json.Unmarshal(fields["gate"], &gateFields); err != nil {
 			return v, err
 		}
-		if len(gateFields) != 3 || v.Gate.Revision.Validate() != nil || !policyStopUUID.MatchString(v.Gate.PresentationID) || !policyStopDigest.MatchString(v.Gate.PayloadDigest) {
+		if !policyStopExactKeys(gateFields, "revision", "presentation_id", "payload_digest") || v.Gate.Revision.Validate() != nil || !policyStopUUID.MatchString(v.Gate.PresentationID) || !policyStopDigest.MatchString(v.Gate.PayloadDigest) {
 			return v, errors.New("invalid revision source gate")
 		}
 	}
@@ -138,6 +142,20 @@ func ParsePolicyRevisionSourceV1(b []byte) (PolicyRevisionSourceV1, error) {
 		}
 	}
 	return v, nil
+}
+
+// policyStopExactKeys rejects encoding/json case aliases as well as absent keys.
+// Field counts alone cannot distinguish missing coverage from a duplicate alias.
+func policyStopExactKeys(fields map[string]json.RawMessage, keys ...string) bool {
+	if len(fields) != len(keys) {
+		return false
+	}
+	for _, key := range keys {
+		if _, present := fields[key]; !present {
+			return false
+		}
+	}
+	return true
 }
 
 // policyStopClosedJSON checks duplicate object keys recursively before strict decoding.

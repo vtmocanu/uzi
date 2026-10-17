@@ -44,6 +44,43 @@ func TestPolicyStopReviewSourceParser(t *testing.T) {
 	}
 }
 
+func TestPolicyStopReviewSourceExactKeys(t *testing.T) {
+	gate := `{"revision":"1","presentation_id":"00000000-0000-0000-0000-000000000001","payload_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	human := `{"source":"run_user_input","input_id":"1"}`
+	cc := `{"source":"plan_cross_check","cross_check_id":"00000000-0000-0000-0000-000000000002"}`
+	source := func(g, primary, associated string) string {
+		return `{"version":1,"gate":` + g + `,"primary_revision":` + primary + `,"associated_cross_checks":` + associated + `}`
+	}
+	canonical := source(gate, human, "["+cc+"]")
+	if _, err := apitypes.ParsePolicyRevisionSourceV1([]byte(canonical)); err != nil {
+		t.Fatalf("canonical positive control: %v", err)
+	}
+	cases := map[string]string{
+		"missing_primary_counted_alias": `{"version":1,"VERSION":1,"gate":` + gate + `,"associated_cross_checks":[]}`,
+	}
+	for _, key := range []string{"version", "gate", "primary_revision", "associated_cross_checks"} {
+		cases["source_"+key] = strings.Replace(canonical, `"`+key+`":`, `"`+strings.ToUpper(key)+`":`, 1)
+	}
+	for _, key := range []string{"revision", "presentation_id", "payload_digest"} {
+		cases["gate_"+key] = source(strings.Replace(gate, `"`+key+`":`, `"`+strings.ToUpper(key)+`":`, 1), human, "["+cc+"]")
+	}
+	for _, key := range []string{"source", "input_id"} {
+		cases["human_"+key] = source(gate, strings.Replace(human, `"`+key+`":`, `"`+strings.ToUpper(key)+`":`, 1), "[]")
+	}
+	for _, key := range []string{"source", "cross_check_id"} {
+		alias := strings.Replace(cc, `"`+key+`":`, `"`+strings.ToUpper(key)+`":`, 1)
+		cases["primary_cc_"+key] = source(gate, alias, "[]")
+		cases["associated_cc_"+key] = source(gate, human, "["+alias+"]")
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := apitypes.ParsePolicyRevisionSourceV1([]byte(raw)); err == nil {
+				t.Fatal("accepted a casing alias or missing exact required key")
+			}
+		})
+	}
+}
+
 func TestPolicyStopReviewZeroMarshal(t *testing.T) {
 	if _, err := json.Marshal(apitypes.PolicyStopReview{}); err != nil {
 		t.Fatalf("zero DTO cannot be recorded: %v", err)

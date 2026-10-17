@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -119,7 +120,7 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		return bad()
 	}
 	completed, err := DecodeMilestoneIDs(r.MilestonesCompleted)
-	if err != nil || len(completed) == 0 {
+	if err != nil || len(completed) == 0 || len(completed) > math.MaxInt32 {
 		return bad()
 	}
 	members := map[string]bool{}
