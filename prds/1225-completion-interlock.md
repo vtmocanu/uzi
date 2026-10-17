@@ -2,7 +2,7 @@
 
 **Issue:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
 **Status:** Epic, not directly runnable. Implementation is split into eight ordered child PRDs.
-**Priority:** High.
+**Priority:** Normal (current issue taxonomy).
 **Origin:** Review of [PR #1220](https://github.com/vtmocanu/uzi/pull/1220) and run `b0ffd0ea` on 2026-09-09.
 **Execution:** Epic is not runnable; retain current taxonomy and do not add `uzi`. Serialize implementation children at dispatch after checking real dependencies and green main CI. #1226/#1227 and structural rollout #1626/#1627 already shipped. This refresh dispatches nothing; #1230/#1231 remain held on their explicit integration prerequisites.
 
@@ -54,7 +54,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 
 ## Issue relationships and queue order
 
-#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The preferred completion-first order is #1226, #1227, #1228, #1230, #1231, #1233, #1232, then #1214. A maintainer may choose #1214 after #1228, but it and #1231/#1233 share runner/resume seams and must still execute one at a time.
+#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The historical completion-first queue preference is #1226, #1227, #1228, #1230, #1231, #1233, #1232, then #1214 (a queue preference, not a semantic technical dependency; see the Refresh note). A maintainer may choose #1214 after #1228, but it and #1231/#1233 share runner/resume seams and must still execute one at a time.
 
 #1088 provider-outage recovery is related but not a prerequisite. #1202 already provides on-demand post-PR rework. #1171 may later supply a verified Codex codec; an unmerged/provisional branch is not production support.
 
