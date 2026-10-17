@@ -16,7 +16,7 @@ import (
 // supported). Its absence is a clean usage error (exit 2) BEFORE any request — the client is
 // never called.
 func TestRunDecideRequiresContinue(t *testing.T) {
-	fc := &uzicli.FakeClient{DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused, HoldReason: strPtrT("completion_blocked")}}, DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1")
 	if code != uzicli.ExitUsage {
 		t.Fatalf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
@@ -35,7 +35,7 @@ func TestRunDecideRequiresContinue(t *testing.T) {
 //
 // MUTATION PROOF: point the verb at any other client method and LastDecideRunID is no longer set.
 func TestRunDecidePostsContinue(t *testing.T) {
-	fc := &uzicli.FakeClient{DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused, HoldReason: strPtrT("completion_blocked")}}, DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -57,7 +57,7 @@ func TestRunDecidePostsContinue(t *testing.T) {
 // TestRunDecideCarriesGuidance: `--guidance <text>` is carried verbatim to the client, and the
 // confirmation notes that guidance was recorded.
 func TestRunDecideCarriesGuidance(t *testing.T) {
-	fc := &uzicli.FakeClient{DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused, HoldReason: strPtrT("completion_blocked")}}, DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue", "--guidance", "focus on M4 first")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -72,7 +72,7 @@ func TestRunDecideCarriesGuidance(t *testing.T) {
 
 // TestRunDecideJSON: `--json` emits the resumed run object (agent contract), not the human line.
 func TestRunDecideJSON(t *testing.T) {
-	fc := &uzicli.FakeClient{DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused, HoldReason: strPtrT("completion_blocked")}}, DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -87,7 +87,7 @@ func TestRunDecideJSON(t *testing.T) {
 
 // TestRunDecideExitCodes: the server's status→exit mapping flows through with no per-command
 // logic — a 409 (not completion-blocked) maps to exit 5, a 404 (foreign/unknown) to exit 4. The
-// write is still reached with the run id before the error surfaces.
+// presentation 404 aborts before the write; a mutation 409 is propagated.
 func TestRunDecideExitCodes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -99,13 +99,24 @@ func TestRunDecideExitCodes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fc := &uzicli.FakeClient{ContinueCompletionDecisionErr: tc.err}
-			_, _, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue")
+			fc := &uzicli.FakeClient{}
+			wantMutation := ""
+			if tc.want == uzicli.ExitNotFound {
+				fc.Err = tc.err
+			} else {
+				fc.RunByID = map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "running"}}
+				fc.ContinueCompletionDecisionErr = tc.err
+				wantMutation = "r1"
+			}
+			_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue")
 			if code != tc.want {
 				t.Fatalf("exit = %d, want %d", code, tc.want)
 			}
-			if fc.LastDecideRunID != "r1" {
-				t.Errorf("decide reached ContinueCompletionDecision with id %q, want %q", fc.LastDecideRunID, "r1")
+			if !strings.Contains(stderr, tc.err.Error()) {
+				t.Errorf("error lost: %q, want %q", stderr, tc.err.Error())
+			}
+			if fc.LastDecideRunID != wantMutation {
+				t.Errorf("decide reached ContinueCompletionDecision with id %q, want %q", fc.LastDecideRunID, wantMutation)
 			}
 		})
 	}
@@ -177,7 +188,7 @@ func TestRunDecidePartialAcceptRequireReason(t *testing.T) {
 // --partial/--accept; the wrong pairing is a usage error (exit 2) before any request.
 func TestRunDecideFlagPairing(t *testing.T) {
 	t.Run("reason with continue", func(t *testing.T) {
-		fc := &uzicli.FakeClient{DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
+		fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused, HoldReason: strPtrT("completion_blocked")}}, DecideRun: apitypes.RunDTO{ID: "r1", Status: "running"}}
 		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "decide", "r1", "--continue", "--reason", "nope")
 		if code != uzicli.ExitUsage {
 			t.Fatalf("exit = %d, want ExitUsage(%d) (stderr: %s)", code, uzicli.ExitUsage, stderr)
@@ -345,7 +356,7 @@ func TestRunDecidePartialExitCodes(t *testing.T) {
 		want int
 	}{
 		{"revision conflict 409", uzicli.Exitf(uzicli.ExitConflict, "completion contract revision conflict"), uzicli.ExitConflict},
-		{"unknown run 404", uzicli.Exitf(uzicli.ExitNotFound, "run not found"), uzicli.ExitNotFound},
+		{"run removed after presentation 404", uzicli.Exitf(uzicli.ExitNotFound, "run not found"), uzicli.ExitNotFound},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

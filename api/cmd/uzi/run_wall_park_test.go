@@ -89,7 +89,7 @@ func TestRunExtendResumedWallParkLineFlowsThroughCLI(t *testing.T) {
 // exit — rather than inventing its own wording.
 func TestRunResumeWallParkPrints409Verbatim(t *testing.T) {
 	const msg = "this run is out of time; extend it to resume: uzi run extend r1 --by 2h"
-	fc := &uzicli.FakeClient{ResumeRunNowErr: uzicli.Exitf(uzicli.ExitConflict, "%s", msg)}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": heldRun("r1", holdBudgetExhausted, time.Now())}, ResumeRunNowErr: uzicli.Exitf(uzicli.ExitConflict, "%s", msg)}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1")
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want %d (409)", code, uzicli.ExitConflict)
@@ -108,7 +108,7 @@ func TestRunResumeWallParkPrints409Verbatim(t *testing.T) {
 // is needed — this pins that it stays that way.
 func TestRunStopWallParkPrints409Verbatim(t *testing.T) {
 	const msg = "this run already used its finalize allowance; extend or cancel it"
-	fc := &uzicli.FakeClient{Err: uzicli.Exitf(uzicli.ExitConflict, "%s", msg)}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": heldRun("r1", holdBudgetExhausted, time.Now())}, SubmitRunInputErr: uzicli.Exitf(uzicli.ExitConflict, "%s", msg)}
 	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "stop", "r1")
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want %d (409)", code, uzicli.ExitConflict)

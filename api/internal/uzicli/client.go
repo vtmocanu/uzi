@@ -147,6 +147,7 @@ type Client interface {
 	// → ExitConflict (5); guidance too long is 400 → ExitUsage (2) — via the shared status→exit
 	// mapping.
 	ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error)
+	ContinueCompletionDecisionWithOptions(ctx context.Context, id string, guidance string, opts RunActionOptions) (apitypes.RunDTO, error)
 	// PartialCompletionDecision records the owner's PARTIAL (scope-reduced) decision on a
 	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
 	// {decision:"partial", keep, reason, contract_revision}, RequireUser so a `uzc_` token reaches
@@ -157,6 +158,7 @@ type Client interface {
 	// revision is 409 → ExitConflict (5); a missing reason, a non-positive revision or an unknown
 	// milestone id is 400 → ExitUsage (2) — via the shared status→exit mapping.
 	PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error)
+	PartialCompletionDecisionWithOptions(ctx context.Context, id string, keep []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error)
 	// AcceptCompletionDecision records the owner's ACCEPT (criteria-waived) decision on a
 	// completion-blocked run (PRD #1227 M5): POST /api/runs/{id}/completion/decision
 	// {decision:"accept", criteria, reason, contract_revision}, RequireUser so a `uzc_` token
@@ -165,6 +167,7 @@ type Client interface {
 	// contract revision the server fences on. Returns the resumed run. It shares
 	// PartialCompletionDecision's status→exit mapping (404/409/400 → 4/5/2).
 	AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error)
+	AcceptCompletionDecisionWithOptions(ctx context.Context, id string, criteria []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error)
 	// SelfRateLimits returns the caller's OWN per-token rate-limit meters, each
 	// carrying the server-computed auto-selection status: GET /api/me/rate-limits.
 	//

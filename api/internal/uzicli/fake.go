@@ -251,6 +251,7 @@ type FakeClient struct {
 	LastResumeRunID    string
 	ResumedRun         apitypes.RunDTO
 	ResumeRunNowErr    error
+	LastResumeOptions  RunResumeOptions
 	LastResumeGuidance string
 
 	// SetRunCredential capture (PRD #1247 M4). LastSetTokenRunID is the run id `uzi run
@@ -290,6 +291,7 @@ type FakeClient struct {
 	// --guidance, "" when none). DecideRun is the canned success reply; ContinueCompletionDecisionErr
 	// wins over the blanket Err so a test can model the 409/404/400 on the write while the
 	// capture still proves it was reached with the right args.
+	LastDecideOptions             RunActionOptions
 	LastDecideRunID               string
 	LastDecideGuidance            string
 	DecideRun                     apitypes.RunDTO

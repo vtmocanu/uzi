@@ -2059,7 +2059,7 @@ func TestRunExpediteJSON(t *testing.T) {
 // PRD #754 M5: `uzi run resume-now <id>` releases a pool_wait hold and renders the
 // returned run (now queued).
 func TestRunResumeNow(t *testing.T) {
-	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "pool_wait"}}, ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
@@ -2074,7 +2074,7 @@ func TestRunResumeNow(t *testing.T) {
 
 // A run that is not held is a 409 → ExitConflict (5); the CLI must propagate it.
 func TestRunResumeNowConflict(t *testing.T) {
-	fc := &uzicli.FakeClient{ResumeRunNowErr: uzicli.Exitf(uzicli.ExitConflict, "run is not waiting for a pooled token")}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "running"}}, ResumeRunNowErr: uzicli.Exitf(uzicli.ExitConflict, "run is not waiting for a pooled token")}
 	_, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1")
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want %d (conflict)", code, uzicli.ExitConflict)
@@ -2086,7 +2086,7 @@ func TestRunResumeNowConflict(t *testing.T) {
 
 // --json emits the RunDTO for agents.
 func TestRunResumeNowJSON(t *testing.T) {
-	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "pool_wait"}}, ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued", Kind: "issue"}}
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "resume-now", "r1", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)

@@ -473,8 +473,17 @@ func gateRevisionMismatchError(runID string, expected *int64, current int64) err
 // cancel/reject applied without a live worker) is surfaced so the caller knows the
 // action took effect immediately rather than being queued. expectedGateRevision binds a
 // plan-gate verdict to a gate revision (PRD #1795 D5; nil for every other kind).
-func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) error {
-	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64, actionIfMatch ...string) error {
+	var res apitypes.RunInputResponse
+	var err error
+	if len(actionIfMatch) > 0 && actionIfMatch[0] != "" {
+		res, err = c.SubmitRunInputWithOptions(cmd.Context(), runID, uzicli.RunInputOptions{
+			Kind: kind, Body: body, Selection: sel, DiscardPendingOutcome: discardPendingOutcome,
+			ExpectedGateRevision: expectedGateRevision, ActionIfMatch: actionIfMatch[0],
+		})
+	} else {
+		res, err = c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
+	}
 	if err != nil {
 		// PRD #1391 Run B M3d (D13): a cancel of a run whose executor journaled a terminal
 		// outcome on its worker, sent WITHOUT --discard-pending-outcome, comes back as a typed 409

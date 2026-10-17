@@ -16,12 +16,13 @@ func TestPolicyResumeGuidanceAndPresentedToken(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					gets++
-					_, _ = w.Write([]byte(`{"run":{"policy_refusal":{"can_resume":true,"action_if_match":"presented"}}}`))
+					t.Error("unexpected GET: action token must come from caller")
+					w.WriteHeader(http.StatusMethodNotAllowed)
 					return
 				}
 				posts++
 				body, _ := io.ReadAll(r.Body)
-				if r.Header.Get("If-Match") != "presented" || string(body) != `{"guidance":"Narrow scope"}` {
+				if r.Header.Get("If-Match") != `"presented"` || string(body) != `{"guidance":"Narrow scope"}` {
 					t.Errorf("resume header=%q body=%s", r.Header.Get("If-Match"), body)
 				}
 				if conflict {
@@ -32,8 +33,8 @@ func TestPolicyResumeGuidanceAndPresentedToken(t *testing.T) {
 				_, _ = w.Write([]byte(`{"run":{"status":"queued"}}`))
 			}))
 			defer srv.Close()
-			_, err := newTestClient(srv).ResumeRunNowWithOptions(context.Background(), "r1", RunResumeOptions{Guidance: "Narrow scope"})
-			if (err != nil) != conflict || gets != 1 || posts != 1 {
+			_, err := newTestClient(srv).ResumeRunNowWithOptions(context.Background(), "r1", RunResumeOptions{Guidance: "Narrow scope", ActionIfMatch: `"presented"`})
+			if (err != nil) != conflict || gets != 0 || posts != 1 {
 				t.Fatalf("err=%v gets=%d posts=%d", err, gets, posts)
 			}
 		})

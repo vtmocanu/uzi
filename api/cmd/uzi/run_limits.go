@@ -62,7 +62,20 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.ResumeRunNow(cmd.Context(), args[0])
+			presented, err := c.GetRun(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			opts := uzicli.RunResumeOptions{}
+			if policyContext(presented) && presented.Status == statusPaused {
+				opts.ActionIfMatch, err = policyActionToken(presented)
+				if err != nil {
+					return err
+				}
+				opts.Mode = "preserve"
+				warnPolicyResume(env, presented, false)
+			}
+			run, err := c.ResumeRunNowWithOptions(cmd.Context(), args[0], opts)
 			if err != nil {
 				return err
 			}
@@ -91,6 +104,7 @@ func newRunResumeNowCmd(env Env, gf *globalFlags) *cobra.Command {
 // resume prints today. --json emits the run object for the agent contract.
 func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 	var guidance string
+	var fresh bool
 	resume := &cobra.Command{
 		Use:   "resume <run-id>",
 		Short: "Resume a paused or worker recovery exhausted run",
@@ -110,7 +124,29 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			run, err := c.ResumeRunNowWithOptions(cmd.Context(), args[0], uzicli.RunResumeOptions{Guidance: guidance})
+			if err := validatePolicyGuidance(guidance); err != nil {
+				return err
+			}
+			presented, err := c.GetRun(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			opts := uzicli.RunResumeOptions{}
+			if policyContext(presented) && presented.Status == statusPaused {
+				opts.ActionIfMatch, err = policyActionToken(presented)
+				if err != nil {
+					return err
+				}
+				opts.Mode = "preserve"
+				if fresh {
+					opts.Mode = "fresh"
+				}
+				opts.Guidance = guidance
+				warnPolicyResume(env, presented, fresh)
+			} else if cmd.Flags().Changed("fresh-session") || cmd.Flags().Changed("guidance") {
+				return uzicli.Exitf(uzicli.ExitUsage, "--fresh-session and --guidance require a paused policy context")
+			}
+			run, err := c.ResumeRunNowWithOptions(cmd.Context(), args[0], opts)
 			if err != nil {
 				return err
 			}
@@ -130,6 +166,7 @@ func newRunResumeCmd(env Env, gf *globalFlags) *cobra.Command {
 			return nil
 		},
 	}
+	resume.Flags().BoolVar(&fresh, "fresh-session", false, "discard conversation context and resume with verified or recovered files and existing contract scope")
 	resume.Flags().StringVar(&guidance, "guidance", "", "Guidance for the resumed policy-held conversation (maximum 16000 bytes)")
 	return resume
 }
@@ -177,6 +214,17 @@ func newRunSetTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 			override, err := setTokenOverride(cmd, args, c)
 			if err != nil {
 				return err
+			}
+			presented, err := c.GetRun(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if presented.Status == statusPaused {
+				override.ActionIfMatch, err = policyActionToken(presented)
+				if err != nil {
+					return err
+				}
+				warnPolicyResume(env, presented, false)
 			}
 			run, warning, err := c.SetRunCredential(cmd.Context(), args[0], override)
 			if err != nil {

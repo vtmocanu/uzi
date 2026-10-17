@@ -2199,8 +2199,10 @@ type MessageDTO struct {
 // RunInputRequest is the POST /api/runs/{id}/inputs body: a steering input
 // (approve/reject/follow-up/cancel).
 type RunInputRequest struct {
-	Kind string `json:"kind"`
-	Body string `json:"body"`
+	// ActionIfMatch is Go-only client transport metadata, excluded from JSON.
+	ActionIfMatch string `json:"-"`
+	Kind          string `json:"kind"`
+	Body          string `json:"body"`
 	// Selection is the PRD #37 agent choice, sent STRUCTURED and legal only with
 	// approve_plan. The client never composes the worker-bound input body itself:
 	// the server validates this against the run's real roster and writes its own

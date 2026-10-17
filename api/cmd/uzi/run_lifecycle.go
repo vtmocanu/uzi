@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -229,7 +230,13 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			// PRD #1795 D5: the revision is fixed at invocation, BEFORE the credential switch,
 			// so the approve names the plan that was at the gate when the owner decided.
-			expected, err := resolveExpectedGateRevision(cmd, c, args[0])
+			var presented apitypes.RunDTO
+			var expected *int64
+			if cmd.Flags().Changed("token") {
+				presented, expected, err = approvalPresentation(cmd, c, args[0])
+			} else {
+				expected, err = resolveExpectedGateRevision(cmd, c, args[0])
+			}
 			if err != nil {
 				return err
 			}
@@ -245,6 +252,13 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if presented.Status == statusPaused {
+					override.ActionIfMatch, err = policyActionToken(presented)
+					if err != nil {
+						return err
+					}
+					warnPolicyResume(env, presented, false)
+				}
 				_, warning, err := c.SetRunCredential(cmd.Context(), args[0], override)
 				if err != nil {
 					return err
@@ -255,6 +269,9 @@ func newRunApproveCmd(env Env, gf *globalFlags) *cobra.Command {
 					_, _ = fmt.Fprintf(env.Stderr, "warning: %s\n", sanitizeTTY(warning))
 				}
 				tokenSwitched = true
+				if presented.Status == statusPaused && policyContext(presented) {
+					return uzicli.Exitf(uzicli.ExitConflict, "credential switch applied; review the plan gate before approving; no plan approval was sent")
+				}
 			}
 			err = submitInput(env, gf, c, cmd, args[0], kindApprovePlan, "", sel, false, expected)
 			// PRD #1795 D5: the revision is read BEFORE the switch (above), so a gate refused as
@@ -373,7 +390,18 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			// The stop message is OPTIONAL, like a cancel reason — no empty check.
 			msg, _ := cmd.Flags().GetString("message")
 			msg = resolveMessage(env, msg)
-			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil)
+			presented, err := c.GetRun(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			token, err := policyActionToken(presented)
+			if err != nil {
+				return err
+			}
+			if policyContext(presented) && (presented.Kind != "issue" || presented.Interactive || len(presented.MilestonesCompleted) == 0) {
+				_, _ = fmt.Fprintln(env.Stderr, "warning: policy Stop requires a noninteractive issue run with completed milestones; the server determines availability.")
+			}
+			return submitInput(env, gf, c, cmd, args[0], kindStop, msg, nil, false, nil, token)
 		},
 	}
 	stop.Flags().StringP("message", "m", "", "an optional message to accompany the stop (or pipe it on stdin)")

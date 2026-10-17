@@ -17,7 +17,7 @@ import (
 // MUTATION PROOF: point the verb at any other client method and LastResumeRunID is no longer
 // set to the target id.
 func TestRunResumePostsToResumeNow(t *testing.T) {
-	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused}}, ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"}}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
@@ -43,14 +43,25 @@ func TestRunResumeExitCodes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			fc := &uzicli.FakeClient{ResumeRunNowErr: tc.err}
-			_, _, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1")
+			fc := &uzicli.FakeClient{}
+			wantMutation := ""
+			if tc.want == uzicli.ExitNotFound {
+				fc.Err = tc.err
+			} else {
+				fc.RunByID = map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: "running"}}
+				fc.ResumeRunNowErr = tc.err
+				wantMutation = "r1"
+			}
+			_, stderr, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1")
 			if code != tc.want {
 				t.Fatalf("exit = %d, want %d", code, tc.want)
 			}
-			// The write was still reached before the error surfaced.
-			if fc.LastResumeRunID != "r1" {
-				t.Errorf("resume reached ResumeRunNow with id %q, want %q", fc.LastResumeRunID, "r1")
+			// A missing presentation must abort before the mutation.
+			if !strings.Contains(stderr, tc.err.Error()) {
+				t.Errorf("error lost: %q, want %q", stderr, tc.err.Error())
+			}
+			if fc.LastResumeRunID != wantMutation {
+				t.Errorf("resume reached ResumeRunNow with id %q, want %q", fc.LastResumeRunID, wantMutation)
 			}
 		})
 	}
@@ -58,7 +69,7 @@ func TestRunResumeExitCodes(t *testing.T) {
 
 // TestRunResumeJSON: `--json` emits the run object (agent contract), not the human line.
 func TestRunResumeJSON(t *testing.T) {
-	fc := &uzicli.FakeClient{ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"}}
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Kind: "issue", Status: statusPaused}}, ResumedRun: apitypes.RunDTO{ID: "r1", Status: "queued"}}
 	stdout, stderr, code := runCLI(t, fakeEnv(fc), "run", "resume", "r1", "--json")
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)

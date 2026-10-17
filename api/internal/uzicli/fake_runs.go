@@ -260,7 +260,12 @@ func (f *FakeClient) RunRework(_ context.Context, runID, guidance string) (apity
 // canned run. It captures BEFORE the error branch (mirroring RunRework) so a test asserting a
 // 409/404/400 still proves the write was reached with the right args; ContinueCompletionDecisionErr
 // wins over the blanket Err.
-func (f *FakeClient) ContinueCompletionDecision(_ context.Context, id string, guidance string) (apitypes.RunDTO, error) {
+func (f *FakeClient) ContinueCompletionDecision(ctx context.Context, id string, guidance string) (apitypes.RunDTO, error) {
+	return f.ContinueCompletionDecisionWithOptions(ctx, id, guidance, RunActionOptions{})
+}
+
+func (f *FakeClient) ContinueCompletionDecisionWithOptions(_ context.Context, id string, guidance string, opts RunActionOptions) (apitypes.RunDTO, error) {
+	f.LastDecideOptions = opts
 	f.LastDecideRunID = id
 	f.LastDecideGuidance = guidance
 	if f.ContinueCompletionDecisionErr != nil {
@@ -277,7 +282,12 @@ func (f *FakeClient) ContinueCompletionDecision(_ context.Context, id string, gu
 // the error branch (mirroring ContinueCompletionDecision) so a test asserting a 409/404/400 still
 // proves the write was reached with the right args; PartialCompletionDecisionErr wins over the
 // blanket Err.
-func (f *FakeClient) PartialCompletionDecision(_ context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+func (f *FakeClient) PartialCompletionDecision(ctx context.Context, id string, keep []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	return f.PartialCompletionDecisionWithOptions(ctx, id, keep, reason, contractRevision, RunActionOptions{})
+}
+
+func (f *FakeClient) PartialCompletionDecisionWithOptions(_ context.Context, id string, keep []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error) {
+	f.LastDecideOptions = opts
 	f.LastDecideRunID = id
 	f.LastDecideKeep = keep
 	f.LastDecideReason = reason
@@ -296,7 +306,12 @@ func (f *FakeClient) PartialCompletionDecision(_ context.Context, id string, kee
 // the error branch (mirroring PartialCompletionDecision) so a test asserting a 409/404/400 still
 // proves the write was reached with the right args; AcceptCompletionDecisionErr wins over the
 // blanket Err.
-func (f *FakeClient) AcceptCompletionDecision(_ context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+func (f *FakeClient) AcceptCompletionDecision(ctx context.Context, id string, criteria []string, reason string, contractRevision int) (apitypes.RunDTO, error) {
+	return f.AcceptCompletionDecisionWithOptions(ctx, id, criteria, reason, contractRevision, RunActionOptions{})
+}
+
+func (f *FakeClient) AcceptCompletionDecisionWithOptions(_ context.Context, id string, criteria []string, reason string, contractRevision int, opts RunActionOptions) (apitypes.RunDTO, error) {
+	f.LastDecideOptions = opts
 	f.LastDecideRunID = id
 	f.LastDecideCriteria = criteria
 	f.LastDecideReason = reason
@@ -423,6 +438,7 @@ func (f *FakeClient) StreamRun(ctx context.Context, runID string) (*RunStream, e
 }
 
 func (f *FakeClient) ResumeRunNowWithOptions(ctx context.Context, id string, opts RunResumeOptions) (apitypes.RunDTO, error) {
+	f.LastResumeOptions = opts
 	f.LastResumeGuidance = opts.Guidance
 	return f.ResumeRunNow(ctx, id)
 }
