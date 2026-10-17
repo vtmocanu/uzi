@@ -1,0 +1,153 @@
+{
+  "manifest": {
+    "version": 1,
+    "run_id": "11111111-1111-4111-8111-111111111111",
+    "outcome_id": "55555555-5555-4555-8555-555555555555",
+    "source_generation": "9007199254740993",
+    "review_generation": "9007199254740993",
+    "source_context": {
+      "version": 1,
+      "gate": {
+        "revision": "9007199254740993",
+        "presentation_id": "33333333-3333-4333-8333-333333333333",
+        "payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "primary_revision": {
+        "source": "run_user_input",
+        "input_id": "9007199254740993"
+      },
+      "associated_cross_checks": [
+        {
+          "source": "plan_cross_check",
+          "cross_check_id": "22222222-2222-4222-8222-222222222222"
+        }
+      ]
+    },
+    "hold": {
+      "reason": "policy_refusal",
+      "policy_detail": "Review the original feedback before stopping.\n",
+      "since": "2020-01-02T03:04:05Z"
+    },
+    "gate": {
+      "revision": "9007199254740993",
+      "presentation_id": "33333333-3333-4333-8333-333333333333",
+      "payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "payload": {
+        "revise_count": 1,
+        "checkpoint_witness": {
+          "source_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "published_checkpoint": "cccccccccccccccccccccccccccccccccccccccc"
+        },
+        "witness_worker_id": "44444444-4444-4444-8444-444444444444",
+        "witness_claim_generation": "9007199254740993",
+        "plan_md": "# Revised plan\n\nKeep the source body exactly.\n",
+        "milestones": [
+          {
+            "id": "m1",
+            "title": "Review source feedback"
+          }
+        ],
+        "required_capabilities": [
+          "go"
+        ],
+        "required_tools": [
+          "go"
+        ],
+        "size_class": "small"
+      }
+    },
+    "execution": {
+      "contract_version": 1,
+      "contract_revision": "9007199254740993",
+      "contract": [
+        {
+          "id": "m1",
+          "title": "Review source feedback"
+        }
+      ],
+      "frozen": [
+        {
+          "id": "m1",
+          "title": "Review source feedback"
+        }
+      ],
+      "completed_ids": [
+        "m1"
+      ],
+      "current_ceiling": 1,
+      "proposed_ceiling": 1
+    },
+    "human_feedback": [
+      {
+        "input_id": "9007199254740993",
+        "body": "  Please preserve this source body.\n\nIncluding the final newline.\n",
+        "created_at": "2020-01-02T03:04:05Z",
+        "gate_binding": "33333333-3333-4333-8333-333333333333",
+        "gate_revision": "9007199254740993",
+        "consumed_at": "2020-01-02T03:04:05Z",
+        "consumed_claim_generation": "9007199254740993",
+        "consumed_worker_id": "44444444-4444-4444-8444-444444444444",
+        "applied_at": "2020-01-02T03:04:05Z",
+        "included_at": "2020-01-02T03:04:05Z",
+        "inclusion_reported": true,
+        "disposition": "applied",
+        "settled_at": "2020-01-02T03:04:05Z",
+        "superseded_by_stop_input_id": "9007199254740993"
+      }
+    ],
+    "cross_check_feedback": [
+      {
+        "cross_check_id": "22222222-2222-4222-8222-222222222222",
+        "lead_run_id": "11111111-1111-4111-8111-111111111111",
+        "stage": "plan",
+        "round": 1,
+        "candidate_generation": "9007199254740993",
+        "candidate_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "candidate": {
+          "plan_md": "# Revised plan\n\nKeep the source body exactly.\n",
+          "milestones": [
+            {
+              "id": "m1",
+              "title": "Review source feedback"
+            }
+          ],
+          "required_capabilities": [
+            "go"
+          ],
+          "required_tools": [
+            "go"
+          ],
+          "size_class": "small",
+          "base_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "planning_diff": "diff --git a/plan.md b/plan.md\n+Review source feedback\n"
+        },
+        "verdict": "revise",
+        "supersede": true,
+        "reason_class": "policy",
+        "findings": [
+          {
+            "body": "Preserve the original feedback.\n",
+            "severity": "warning"
+          }
+        ],
+        "created_at": "2020-01-02T03:04:05Z",
+        "decided_at": "2020-01-02T03:04:05Z",
+        "deadline_at": "2020-01-02T03:04:05Z",
+        "interrupted_at": "2020-01-02T03:04:05Z",
+        "finalized_at": "2020-01-02T03:04:05Z",
+        "automatic_revision_limit": 1,
+        "automatic_rounds_enabled": true,
+        "checker_run_id": "66666666-6666-4666-8666-666666666666",
+        "checker_harness": "codex",
+        "checker_model": "gpt-5",
+        "checker_effort": "high",
+        "checker_model_source": "user",
+        "checker_effort_source": "user",
+        "revision_disposition": "applied",
+        "revision_settled_at": "2020-01-02T03:04:05Z",
+        "revision_superseded_by_stop_input_id": "9007199254740993"
+      }
+    ]
+  },
+  "stop_if_match": "policy-stop-review-match"
+}

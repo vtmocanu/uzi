@@ -1039,6 +1039,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// 409); it resumes the run (paused → queued) or delivers the decision to the live
 				// worker, spending no forge and minting nothing.
 				r.Post("/{id}/completion/decision", h.ContinueCompletionDecision)
+				r.Get("/{id}/policy-stop-review", h.PolicyStopReview)
 				// Per-run MR-rework override (PRD #841 M2, Decision D3). RequireUser — NOT the
 				// cookie-only RequireAuth group where wait-on-limit sits — because this is a
 				// pure preference toggle with no resource-consent dimension (parking a run

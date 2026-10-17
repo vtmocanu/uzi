@@ -8,7 +8,7 @@
 
 ## Context
 
-A terminal root refusal prevented the owner from supplying narrower guidance while retaining the run's work. Silently starting a new conversation would discard context after a provider refusal without informed consent. The approved choice is an owner hold with preserving resume, a separately authorized fresh claim, eligible Stop and Cancel. This records the completed M2 worker/server/CLI contract; web, TUI and Slack controls are M3, pending the next milestone.
+A terminal root refusal prevented the owner from supplying narrower guidance while retaining the run's work. Silently starting a new conversation would discard context after a provider refusal without informed consent. The approved choice is an owner hold with preserving resume, a separately authorized fresh claim, eligible Stop and Cancel. M2 remains in progress while the approved Stop revision-feedback exception below is implemented and validated. Web, TUI and Slack controls are M3.
 
 ## Decision
 
@@ -51,6 +51,20 @@ The [CLI reference](../docs/cli.md#codex-policy-refusal-owner-hold) describes th
 `POST /api/runs/{id}/resume-now` accepts an optional strict object with `mode: preserve|fresh` (default preserve) and string `guidance` (valid UTF-8, no NUL, at most 16000 decoded bytes). Empty-body ordinary callers remain compatible. Policy mutations require `If-Match` from the presented DTO's `policy_refusal.action_if_match`: the quoted token `"policy-<outcome UUID>-<claim generation>"`. Owner/state/token validation, choice, audit, guidance, session/grant and queue transition share the locked transaction. Missing/stale binding is a conflict; clients must present the changed state for a new decision, never silently refetch a token and retry an old intent. Stop and preserving credential promotion retain that binding too. Worker credentials cannot perform owner actions.
 
 Held time is banked; resume adds no wall budget. Warn **extend first** when spent. An ordinary policy hold may queue without remaining time; a retained `budget_exhausted` hold requires extension first. Extension is not fresh-session consent and must preserve the constraint and reviewed action binding.
+
+### Confirmed Stop at an unapproved revision gate
+
+The user approved option 2 on 2026-10-17 against checkpoint `24953157facda688d4db4367081500d175ff9412` (question `ccda85d8-7848-48be-bdbe-85e4dcd56b7a`; [PRD decisions D15–D17](../prds/3068-codex-policy-refusal-hold.md#decision-log)). This precise exception is being implemented; the settlement migration and preview contract do not alone establish executable finalization.
+
+An explicit owner-confirmed Stop may supersede applicable pending human and automatic revision feedback solely to finalize already-completed authoritative frozen execution scope. The candidate remains unapproved. It starts zero root model turns or new milestones and grants no fresh session, milestone reconciliation, completion reset or inferred approval. #1604 source and receipt protections, #3045 suppression and claim generation fences remain binding.
+
+CLI, web, TUI and Slack must show which feedback will be superseded. The read-only Stop review binds the exact hold, gate presentation/revision, completed execution contract and all applicable source-qualified feedback IDs and bodies. A distinct Stop confirmation token binds that complete snapshot. A newer gate or applicable input requires a typed stale refusal with no mutation and renewed owner confirmation. Submission and retries retain the presented token; they cannot silently fetch a newer one.
+
+One transaction in the existing owner Stop path records the accepted completed-scope ceiling, stopped-gate resolution and exact feedback settlement. Durable `superseded_by_stop` preserves bodies and provenance, including automatic revisions; it means settled, never applied or deleted. Audit, receipts, activity readers, server gate readers and claim/replay must honor the accepted disposition. An exact accepted retry returns its prior acceptance and cannot retire newer feedback. Candidate approval remains false; a separate narrowly validated stopped-context authority permits only normal finalization with existing delivery/publication/completion guards.
+
+Unknown revision-source association cannot be inferred from a latest-check lookup or timestamps. The server binds a verified primary human or cross-check source and its associated cross-check witnesses to the persisted candidate/gate. Legacy or incomplete association makes Stop review unavailable rather than authorizing partial supersession. Accepted evidence retains original provenance if a live checker pointer later disappears. Guarded migration Down refuses retained resolution/source/settlement evidence rather than rewriting it as applied or pending.
+
+This decision authorizes implementation within this run's existing budget. It authorizes no actual owner Stop, extension, recovery operation or new run. The composed regression must await actual Stop delivery/ACK and the finalization decision, prove zero root turns, false approval and settled feedback, and retain no-Stop revision, missing-source and stale-claim controls. LiveDB/race proofs, the timing/base uncertainty, M3 surfaces and final gates remain open until observed.
 
 ### Durable delivery and historical authority
 

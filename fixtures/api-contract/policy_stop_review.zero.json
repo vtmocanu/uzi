@@ -1,0 +1,33 @@
+{
+  "manifest": {
+    "version": 0,
+    "run_id": "",
+    "outcome_id": "",
+    "source_generation": "",
+    "review_generation": "",
+    "source_context": {
+      "version": 0,
+      "gate": null,
+      "primary_revision": null,
+      "associated_cross_checks": null
+    },
+    "hold": {
+      "reason": null,
+      "policy_detail": null,
+      "since": "0001-01-01T00:00:00Z"
+    },
+    "gate": null,
+    "execution": {
+      "contract_version": null,
+      "contract_revision": null,
+      "contract": null,
+      "frozen": null,
+      "completed_ids": null,
+      "current_ceiling": null,
+      "proposed_ceiling": 0
+    },
+    "human_feedback": null,
+    "cross_check_feedback": null
+  },
+  "stop_if_match": ""
+}

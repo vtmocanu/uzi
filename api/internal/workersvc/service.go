@@ -1396,6 +1396,7 @@ type Store interface {
 
 // Params are the runtime knobs the service needs, mirrored from config.
 type Params struct {
+	PolicyStopNegotiated bool
 	// Policy hold activation is reserved for M2; tests explicitly negotiate the seam.
 	PolicyHoldNegotiated       bool
 	PolicyHoldSnapshotEnabled  bool

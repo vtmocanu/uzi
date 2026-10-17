@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PlanCrossCheckSummary } from "./apiTypes";
 import { readFileSync } from "node:fs";
 import type {
+  PolicyStopReview,
   Run,
   RunListItem,
   RunSummaryItem,
@@ -84,6 +85,8 @@ import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
 import buildInfoFull from "../../../fixtures/api-contract/build_info.full.json";
 import releaseCheckStatusZero from "../../../fixtures/api-contract/release_check_status.zero.json";
 import releaseCheckStatusFull from "../../../fixtures/api-contract/release_check_status.full.json";
+import policyStopReviewZero from "../../../fixtures/api-contract/policy_stop_review.zero.json";
+import policyStopReviewFull from "../../../fixtures/api-contract/policy_stop_review.full.json";
 import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
@@ -301,6 +304,18 @@ void _releaseCheckStatusMissing;
 void _releaseCheckStatusExtra;
 void _releaseCheckStatusZero;
 void _releaseCheckStatusFull;
+
+// Exact owner Stop review contract: nested nil slices remain nullable.
+{
+  const missing: never = null as unknown as Exclude<keyof PolicyStopReview, keyof typeof policyStopReviewFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof policyStopReviewFull, keyof PolicyStopReview>;
+  const zero: ZeroOf<PolicyStopReview> = policyStopReviewZero;
+  const full: Widen<PolicyStopReview> = policyStopReviewFull;
+  void missing;
+  void extra;
+  void zero;
+  void full;
+}
 
 // ── Run ─────────────────────────────────────────────────────────────────────
 // ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
@@ -1560,6 +1575,7 @@ function hasNull(v: unknown): boolean {
 // hot M1 DTOs have nullable fields; an all-scalar DTO would be declared here with
 // `nullable: false` rather than guarded, per the PRD.
 const dtos: { stem: string; nullable: boolean }[] = [
+  { stem: "policy_stop_review", nullable: true },
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
   { stem: "run_summary_item", nullable: true },

@@ -67,6 +67,89 @@ func newContractCase[T any](name string) contractCase {
 	}
 }
 
+// policyStopReviewContractCase keeps every populated field while replacing the
+// decimal values and closed revision union with valid source-authority values.
+func policyStopReviewContractCase() contractCase {
+	c := newContractCase[PolicyStopReview]("policy_stop_review")
+	full := c.full.(PolicyStopReview)
+	text := func(v string) *string { return &v }
+	decimal := func(v PolicyStopDecimal) *PolicyStopDecimal { return &v }
+	const large PolicyStopDecimal = "9007199254740993"
+	const runID = "11111111-1111-4111-8111-111111111111"
+	const crossCheckID = "22222222-2222-4222-8222-222222222222"
+	const presentationID = "33333333-3333-4333-8333-333333333333"
+	const workerID = "44444444-4444-4444-8444-444444444444"
+	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const plan = "# Revised plan\n\nKeep the source body exactly.\n"
+	m := &full.Manifest
+	m.RunID = runID
+	m.OutcomeID = "55555555-5555-4555-8555-555555555555"
+	m.SourceGeneration = large
+	m.ReviewGeneration = large
+	m.SourceContext = PolicyRevisionSourceV1{
+		Version: 1,
+		Gate: &PolicyStopGateContext{
+			Revision: large, PresentationID: presentationID, PayloadDigest: digest,
+		},
+		PrimaryRevision: &PolicyRevisionRef{Source: "run_user_input", InputID: decimal(large)},
+		AssociatedCrossChecks: []PolicyRevisionRef{
+			{Source: "plan_cross_check", CrossCheckID: text(crossCheckID)},
+		},
+	}
+	m.Hold.Reason = text("policy_refusal")
+	m.Hold.PolicyDetail = text("Review the original feedback before stopping.\n")
+	m.Gate.PolicyStopGateContext = *m.SourceContext.Gate
+	m.Gate.Payload.CheckpointWitness.SourceHead = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	m.Gate.Payload.CheckpointWitness.PublishedCheckpoint = "cccccccccccccccccccccccccccccccccccccccc"
+	m.Gate.Payload.WitnessWorkerID = text(workerID)
+	m.Gate.Payload.WitnessClaimGeneration = decimal(large)
+	m.Gate.Payload.PlanMd = text(plan)
+	m.Gate.Payload.Milestones = json.RawMessage(`[{"id":"m1","title":"Review source feedback"}]`)
+	m.Gate.Payload.RequiredCapabilities = []string{"go"}
+	m.Gate.Payload.RequiredTools = []string{"go"}
+	m.Gate.Payload.SizeClass = text("small")
+	m.Execution.ContractRevision = decimal(large)
+	m.Execution.Contract = m.Gate.Payload.Milestones
+	m.Execution.Frozen = []Milestone{{ID: "m1", Title: "Review source feedback"}}
+	m.Execution.CompletedIDs = []string{"m1"}
+	human := &m.HumanFeedback[0]
+	human.InputID = large
+	human.Body = text("  Please preserve this source body.\n\nIncluding the final newline.\n")
+	human.GateBinding = text(presentationID)
+	human.GateRevision = decimal(large)
+	human.ConsumedClaimGeneration = decimal(large)
+	human.ConsumedWorkerID = text(workerID)
+	human.Disposition = text("applied")
+	human.SupersededByStopInputID = decimal(large)
+	check := &m.CrossCheckFeedback[0]
+	check.CrossCheckID = crossCheckID
+	check.LeadRunID = runID
+	check.Stage = "plan"
+	check.CandidateGeneration = large
+	check.CandidateDigest = digest
+	check.Candidate.PlanMd = text(plan)
+	check.Candidate.Milestones = m.Gate.Payload.Milestones
+	check.Candidate.RequiredCapabilities = []string{"go"}
+	check.Candidate.RequiredTools = []string{"go"}
+	check.Candidate.SizeClass = text("small")
+	check.Candidate.BaseCommit = text("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	check.Candidate.PlanningDiff = text("diff --git a/plan.md b/plan.md\n+Review source feedback\n")
+	check.Verdict = "revise"
+	check.ReasonClass = text("policy")
+	check.Findings = json.RawMessage(`[{"body":"Preserve the original feedback.\n","severity":"warning"}]`)
+	check.CheckerRunID = text("66666666-6666-4666-8666-666666666666")
+	check.CheckerHarness = text("codex")
+	check.CheckerModel = text("gpt-5")
+	check.CheckerEffort = text("high")
+	check.CheckerModelSource = text("user")
+	check.CheckerEffortSource = text("user")
+	check.RevisionDisposition = text("applied")
+	check.RevisionSupersededByStopInputID = decimal(large)
+	full.StopIfMatch = "policy-stop-review-match"
+	c.full = full
+	return c
+}
+
 func contractCases() []contractCase {
 	return []contractCase{
 		newContractCase[BuildInfoDTO]("build_info"),
@@ -224,6 +307,7 @@ func contractCases() []contractCase {
 		// run.zero.json is unchanged) and nested in run.full.json; the standalone pair pins
 		// its own nullability surface (origin members, result).
 		newContractCase[RunJobDTO]("run_job"),
+		policyStopReviewContractCase(),
 	}
 }
 
