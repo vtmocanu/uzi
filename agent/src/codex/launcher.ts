@@ -1144,6 +1144,8 @@ async function createHandle(
   let exited = false;
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let disposeInFlight = false;
+  let disposeRequestId: number | undefined;
+  let providerExitDuringDispose = false;
   let disposalOperation: Promise<DisposeOutcome> | undefined;
   let cleanDisposed = false;
   let lastDrained: DisposeEvidence | undefined;
@@ -1338,7 +1340,14 @@ async function createHandle(
         childExitEvent = ev;
         resolveChildExit(ev);
         if (kind === "provider") {
-          fail(new TrustedExecutionRefusal(`supervised provider child exited unexpectedly (code=${ev.code})`));
+          // A requested drain kills the primary too. Its actual wait status is
+          // terminal evidence, never cleanup authority. Accept it only while
+          // this handle's exact dispose request is still unanswered.
+          if (disposeInFlight && disposeRequestId !== undefined && pending.has(disposeRequestId)) {
+            providerExitDuringDispose = true;
+          } else {
+            fail(new TrustedExecutionRefusal(`supervised provider child exited unexpectedly (code=${ev.code})`));
+          }
         }
         return;
       }
@@ -1465,6 +1474,7 @@ async function createHandle(
       const exitReserve = Math.min(deadlines.exit, Math.max(1, Math.floor(remaining() / 5)));
       const drainBudget = Math.max(0, remaining() - exitReserve);
       let ev: SnapshotEvidence | DisposeEvidence;
+      disposeRequestId = id;
       try {
         ev = await withDeadline(
           sendAndWait(id, { op: "dispose", id, timeoutMs: drainBudget }),
@@ -1473,6 +1483,8 @@ async function createHandle(
         );
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error) };
+      } finally {
+        disposeRequestId = undefined;
       }
       if (ev.event !== "dispose") return { clean: false, reason: `expected dispose evidence, got ${String(ev.event)}` };
       const disposeEv = ev;
@@ -1506,7 +1518,13 @@ async function createHandle(
       lastDrained = disposeEv;
       return { clean: true, event: disposeEv };
     } finally {
+      disposeRequestId = undefined;
       disposeInFlight = false;
+      if (kind === "provider" && providerExitDuringDispose && !cleanDisposed) {
+        // An unconfirmed drain still leaves a dead provider unusable. Preserve
+        // the first failure and retained-tree rule; no status implies drainage.
+        fail(new TrustedExecutionRefusal("provider exited during unconfirmed disposal"));
+      }
     }
   }
 

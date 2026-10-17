@@ -9007,7 +9007,7 @@ describe("production advice data teardown (#2324)", () => {
         diagnostic.mark("dispose_start");
         await handle.dispose();
         diagnostic.mark("dispose_end");
-        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
+        assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), false, "advice provider child exit observed before dispose_start");
         assert.equal(await fs.readFile(path.join(owned, "keep"), "utf8"), "keep");
         await assertGone(handle.cwd);
         assert.ok(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed" && /not owned/.test(String(rec(line).error))));
@@ -9033,7 +9033,7 @@ describe("production advice data teardown (#2324)", () => {
         diagnostic.mark("dispose_start");
         await handle.dispose();
         diagnostic.mark("dispose_end");
-        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
+        assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), false, "advice provider child exit observed before dispose_start");
         assert.ok((await fs.lstat(owned)).isSymbolicLink());
         assert.equal(await fs.readFile(path.join(victim, "keep"), "utf8"), "outside");
         await assertGone(handle.cwd);
@@ -9103,7 +9103,7 @@ describe("production advice data teardown (#2324)", () => {
         diagnostic.mark("dispose_start");
         await handle.dispose();
         diagnostic.mark("dispose_end");
-        assert.equal(diagnostic.providerChildExitObserved(), false, "advice provider child exit observed");
+        assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), false, "advice provider child exit observed before dispose_start");
         await assertGone(owned);
         await assertGone(handle.cwd);
         assert.equal(lines.some((line) => rec(line).msg === "Codex advice data cleanup failed"), false);

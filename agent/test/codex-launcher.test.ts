@@ -156,7 +156,11 @@ class FakeSupervisor extends EventEmitter {
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
       if (this.singleDisposeResponse && this.disposeTimeouts.length > 1) return;
-      if (this.disposeReply) { this.writeEvidence(this.disposeReply(cmd.id)); return; }
+      if (this.disposeReply) {
+        const response = this.disposeReply(cmd.id);
+        if (response !== undefined) this.writeEvidence(response);
+        return;
+      }
       if (this.disposeState === "drained") {
         const emit = (): void => {
           this.writeEvidence({
@@ -1248,6 +1252,49 @@ describe("createHandle: tmpCleanup must carry meaning, not just shape", () => {
 });
 
 describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
+  it("keeps genuine provider exit during requested disposal separate from clean-drain authority", async () => {
+    let fake: FakeSupervisor;
+    fake = newFake({ disposeReply: (id) => {
+      fake.emitChildExit(137);
+      setImmediate(() => fake.exitWith(0));
+      return { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [4243], reaped: [4243] };
+    } });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true, "genuine primary status must not invalidate separately confirmed requested disposal");
+    assert.deepEqual(await handle.waitChild(), { event: "child_exit", code: 137 });
+    assert.equal(handle.failed, undefined);
+  });
+
+  for (const scenario of ["unconfirmed", "duplicate", "malformed", "unmatched", "nonzero", "after-response", "timeout"] as const) {
+    it(`provider exit during disposal stays failed and retains data after ${scenario}`, async () => {
+      let fake: FakeSupervisor;
+      fake = newFake({ disposeReply: (id) => {
+        const drained = { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [4243], reaped: [4243] };
+        if (scenario === "after-response") {
+          fake.writeEvidence(drained);
+          fake.emitChildExit(137);
+          setImmediate(() => fake.exitWith(0));
+          return undefined;
+        }
+        fake.emitChildExit(137);
+        if (scenario === "duplicate") fake.emitChildExit(137);
+        if (scenario === "malformed") fake.writeEvidence({ event: "child_exit", code: "137" });
+        if (scenario === "timeout") return undefined;
+        if (scenario === "unconfirmed") {
+          return { event: "dispose", id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [] };
+        }
+        setImmediate(() => fake.exitWith(scenario === "nonzero" ? 2 : 0));
+        return scenario === "unmatched" ? { ...drained, id: id + 1 } : drained;
+      } });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(100);
+      assert.equal(outcome.clean, false);
+      assert.ok(handle.failed, "a dead provider after unsuccessful disposal must never appear healthy");
+      assert.equal(treeRemoveCalls.length, 0, "unconfirmed or invalid evidence never authorizes tree removal");
+    });
+  }
+
   it("treats a provider primary-child exit as a root failure", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
