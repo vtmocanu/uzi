@@ -1082,9 +1082,11 @@ chain in the diagram above, with no intervening `running`.
   the negative-space rules — the run-status lists `paused` must never enter,
   and the guards that must not be relaxed — that a future edit could break
   silently. Approved issue implementation can also enter an ordinary pause
-  through the lead's `park_run` tool; an owner's `/park` clarification answer
-  uses the owner path. Both wait for owner resume. Current message evidence
-  can distinguish these paths in CLI/TUI/web run detail; missing evidence
+  through the lead's `park_run` tool or an owner's `/park` clarification
+  answer. Both share the lead-park execution path (`origin: lead_park`);
+  `uzi run pause` uses the owner path (`origin: owner`). Both paths wait for
+  owner resume. Current message evidence can distinguish these execution
+  paths in CLI/TUI/web run detail, not identify the requester; missing evidence
   leaves the label neutral (see [pause labels](docs/run-pause.md#reading-the-pause-label)).
 
 - **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),

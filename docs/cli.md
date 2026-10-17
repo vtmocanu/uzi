@@ -2875,7 +2875,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   account unavailable](run-recovery-wait.md#codex-account-unavailable).
 - `paused`: an ordinary pause requested by the owner (`uzi run pause` or
   `/park`) or the run's lead (`park_run`), resumed on demand from the run
-  page or `uzi run resume <id>`. See [Pausing and resuming a
+  page or `uzi run resume <id>`. The requester does not determine the display
+  path: `park_run` and the owner's `/park` answer share the lead-park execution
+  path; `uzi run pause` uses the owner path. See [Pausing and resuming a
   run](run-pause.md). An ordinary pause does **not** auto-resume. A `paused` run can instead
   be a **completion-blocked hold** on a run whose [structural completion
   interlock](run-completion-hold.md) couldn't finish a frozen milestone —
@@ -2900,8 +2902,9 @@ A run's raw `status` (in `run get --json`, `run list --json` and
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
-`origin: lead_park`, **paused by its owner** for `origin: owner`, or neutral
-**paused** without sufficient current evidence. The worker best-effort emits
+`origin: lead_park` (including an owner's `/park` answer), **paused by its
+owner** for `origin: owner` (`uzi run pause`), or neutral **paused** without
+sufficient current evidence. The worker best-effort emits
 this optional `origin` in a `paused` message after the server accepts the
 park; delivery failure does not undo it. There is no new run DTO field:
 `--json`, `--field` and raw `status: paused` stay unchanged, and these output

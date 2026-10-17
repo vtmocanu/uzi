@@ -403,10 +403,12 @@ uzi version
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;
   ordinary pauses do not auto-resume). System holds also use `paused`; follow
-  their hold-specific remedy. Human `run get` may distinguish the lead from
-  the owner using current pause evidence, otherwise it says `paused`.
-  This identifies the execution path, not a person or reason; `--json` and
-  `--field` are unchanged. So to
+  their hold-specific remedy. Human `run get` may distinguish execution paths
+  using current pause evidence, otherwise it says `paused`. `park_run` and
+  the owner's `/park` answer share the lead-park execution path and can display
+  **paused by the run's lead**; `uzi run pause` uses the owner path and can
+  display **paused by its owner**. These labels do not identify the requester,
+  a person or reason; `--json` and `--field` are unchanged. So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
   below) — relying on `--follow` there blocks until the run truly finishes, which
   may be never if it is waiting on you. (If you ever see a `status` outside this list,

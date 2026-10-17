@@ -15,12 +15,13 @@ owner resume. System holds also use `paused`, with their own next steps.
 
 ## Reading the pause label
 
-The run detail in the CLI, TUI and web can distinguish **paused by the run's
-lead** from an owner pause (**paused by its owner** in `run get`, **paused by
-you** in the TUI and web). These labels describe the path that parked the
-run: `park_run` is the lead path; `uzi run pause` and the owner's `/park`
-answer are owner paths. They do not identify a particular person or explain
-why the run paused.
+The run detail in the CLI, TUI and web can distinguish the lead-park path
+(**paused by the run's lead**) from the owner path (**paused by its owner**
+in `run get`, **paused by you** in the TUI and web). `park_run` and the
+owner's `/park` answer share the lead-park execution path; `uzi run pause`
+uses the owner path. An owner-requested `/park` can therefore display
+**paused by the run's lead**. These labels describe the execution path;
+they do not identify the requester, a particular person or why the run paused.
 
 When current pause evidence is unavailable, the label stays **paused**.
 Older workers, missing messages, a read failure, replay gaps or a status
