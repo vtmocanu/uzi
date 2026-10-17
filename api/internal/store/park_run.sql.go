@@ -53,7 +53,7 @@ WITH paused_req AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT paused_req.id, 'pause', 'now' FROM paused_req
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id
 `
 
 type CreateWorkerPauseInputParams struct {
@@ -83,6 +83,8 @@ func (q *Queries) CreateWorkerPauseInput(ctx context.Context, arg CreateWorkerPa
 		&i.GateRevision,
 		&i.IncludedAt,
 		&i.InclusionReported,
+		&i.SettledAt,
+		&i.SupersededByStopInputID,
 	)
 	return i, err
 }

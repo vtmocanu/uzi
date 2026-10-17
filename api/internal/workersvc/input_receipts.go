@@ -25,10 +25,11 @@ const (
 	ReceiptSwitchPending = "switch_pending"
 	ReceiptReleased      = "released"
 	ReceiptStale         = "stale"
+	ReceiptSettledByStop = "superseded_by_stop"
 )
 
 // InputReceiptConflictError is ErrInputReceiptConflict with the claim's inactive
-// reason, empty when the claim is active and the rows themselves conflict.
+// reason or ReceiptSettledByStop. Other row conflicts may have an empty reason.
 type InputReceiptConflictError struct{ Reason string }
 
 func (e *InputReceiptConflictError) Error() string { return ErrInputReceiptConflict.Error() }
@@ -131,6 +132,11 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	}
 	if len(rows) != len(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
+	}
+	// Preflight the entire batch before transferring receipts or returning bodies.
+	// The run lock serializes this read with confirmed Stop settlement.
+	if slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.SettledAt.Valid }) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: ReceiptSettledByStop}
 	}
 	// Issue #1604: only an approve_plan can be discarded. Every other kind is either acted on
 	// (APPLIED) or replayed to the next claim; settling it without acting would drop it.
@@ -312,6 +318,13 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 	}
 	if reconciled && (generation <= 0 || run.ClaimReleasedAt.Valid) {
 		return InputReceiptResult{Inputs: []InputDTO{}, Active: false, Reason: ReceiptStale}, nil
+	}
+	rows, err := q.ListInputReceiptRows(ctx, store.ListInputReceiptRowsParams{RunID: runID, Ids: ids})
+	if err != nil {
+		return InputReceiptResult{}, err
+	}
+	if slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.SettledAt.Valid }) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: ReceiptSettledByStop}
 	}
 	stamped, err := q.IncludeRunInputRows(ctx, store.IncludeRunInputRowsParams{RunID: runID, Ids: ids})
 	if err != nil {

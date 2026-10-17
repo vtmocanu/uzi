@@ -9109,7 +9109,7 @@ WITH pending AS (
     -- worker must never drain or route it either. 'pause' and
     -- 'pause_cancel' are NOT excluded — the worker DOES consume them (the `now` abort and the
     -- flag clear). Everything else consumes as before.
-    WHERE p.run_id = @run_id AND p.applied_at IS NULL AND p.disposition IS DISTINCT FROM 'superseded'
+    WHERE p.run_id = @run_id AND p.applied_at IS NULL AND p.settled_at IS NULL AND p.disposition IS DISTINCT FROM 'superseded'
       AND NOT (p.kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=p.run_id AND p.id<=a.stop_cutoff))
       AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
     ORDER BY p.id ASC
@@ -9118,7 +9118,7 @@ WITH pending AS (
 ),
 consumed AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
-    FROM pending WHERE u.id = pending.id
+    FROM pending WHERE u.id = pending.id AND u.settled_at IS NULL
     RETURNING u.id, u.kind, u.body, u.created_at, u.gate_binding, u.gate_revision
 )
 SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption,
@@ -9127,7 +9127,7 @@ FROM consumed JOIN pending USING (id) ORDER BY consumed.id ASC;
 
 -- name: ListReplayRunInputs :many
 SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inputs
-WHERE run_user_inputs.run_id = @run_id AND applied_at IS NULL AND disposition IS DISTINCT FROM 'superseded'
+WHERE run_user_inputs.run_id = @run_id AND applied_at IS NULL AND settled_at IS NULL AND disposition IS DISTINCT FROM 'superseded'
   AND NOT (kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=run_user_inputs.run_id AND run_user_inputs.id<=a.stop_cutoff))
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC
@@ -9169,7 +9169,7 @@ FOR UPDATE OF runs;
 
 -- name: ListInputReceiptRows :many
 SELECT id, kind, body, created_at, consumed_at, consumed_claim_generation, consumed_worker_id, applied_at,
-       disposition, gate_binding, gate_revision
+       disposition, gate_binding, gate_revision, settled_at, superseded_by_stop_input_id
 FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
 ORDER BY id ASC;
@@ -9180,7 +9180,9 @@ UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_
     -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
     -- reports inclusion (input_inclusion_v1), but never downgrades a row already stamped included.
     inclusion_reported = (included_at IS NOT NULL OR @inclusion_reported::boolean)
-WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
+WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint[]) AND applied_at IS NULL AND settled_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = @run_id
+    AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL)
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: IncludeRunInputRows :many
@@ -9190,15 +9192,19 @@ RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 -- No per-row claim fence: a follow-up recovered after a resume was consumed by an earlier
 -- claim; the service fences the CALLER's claim instead. run_id scopes the ids to this run.
 UPDATE run_user_inputs SET included_at = now(), inclusion_reported = true
-WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'follow_up'
-  AND consumed_at IS NOT NULL AND included_at IS NULL
+WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint[]) AND kind = 'follow_up'
+  AND consumed_at IS NOT NULL AND included_at IS NULL AND settled_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = @run_id
+    AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL)
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
-WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
-  AND consumed_claim_generation = @claim_generation AND consumed_worker_id = @worker_id
-  AND consumed_at IS NOT NULL AND applied_at IS NULL;
+WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint[])
+  AND run_user_inputs.consumed_claim_generation = @claim_generation AND run_user_inputs.consumed_worker_id = @worker_id
+  AND run_user_inputs.consumed_at IS NOT NULL AND run_user_inputs.applied_at IS NULL AND run_user_inputs.settled_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = @run_id
+    AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL);
 
 -- name: DiscardRunInputRows :execrows
 -- Issue #1604: settle approve_plan rows the worker DISCARDED as stale (a replayed verdict sent
@@ -9250,7 +9256,7 @@ ORDER BY id ASC;
 -- model instead of minting a query-specific row type. Dropping a column here is not a
 -- local edit: it re-types this query and breaks the workersvc.Store interface, the
 -- service signature, the handler and its fake.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id FROM run_user_inputs
 WHERE run_id = @run_id AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC;
 
