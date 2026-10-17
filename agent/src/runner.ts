@@ -6193,6 +6193,7 @@ export class RunRunner {
       });
     };
 
+    let completionScope = claim.config?.completion_scope;
     // Both capped-empty and MR completion use the same bounded client retry and hold paths.
     const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
       const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
@@ -6236,6 +6237,17 @@ export class RunRunner {
         });
         await holdOrFailInterlocked("completion permit denied");
         return false;
+      }
+      // A grant's scope belongs to its revision. An explicit empty object clears stale
+      // claim decisions; older APIs may omit scope only while the claim remains current.
+      const grantRevision = permit.permit?.contractRevision ?? contractRevision;
+      if (permit.permit?.completionScope !== undefined) {
+        completionScope = permit.permit.completionScope;
+      } else if (grantRevision > (claim.config?.contract_revision ?? 1)) {
+        await holdOrFailInterlocked("completion permit scope missing for updated contract");
+        return false;
+      } else {
+        completionScope = claim.config?.completion_scope;
       }
       return true;
     };
@@ -8049,15 +8061,6 @@ export class RunRunner {
     // a held, unverified-head MR can never carry a closing line (AC: only a verified full delivery
     // contains `Closes #N`).
     const renderCloses = !interlocked;
-    // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
-    // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
-    // verification. It joins nonClosingDelivery below so the verified-head
-    // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
-    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
-    // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
-    // closing-directive scans, strips and fail-closed paths. Absent/empty ⇒ false ⇒ the accept-closing and
-    // full-delivery paths add Closes after verify exactly as before.
-    const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
     // report (`head: completionHead`) and is compared against the created PR's head. Undefined for a
     // legacy run, so JSON.stringify drops it and the legacy completed report is byte-for-byte the same
@@ -8094,6 +8097,15 @@ export class RunRunner {
       completionHead = head!;
     }
 
+    // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
+    // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
+    // verification. It joins nonClosingDelivery below so the verified-head
+    // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
+    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
+    // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
+    // closing-directive scans, strips and fail-closed paths. Absent/empty ⇒ false ⇒ the accept-closing and
+    // full-delivery paths add Closes after verify exactly as before.
+    const isOwnerPartial = (completionScope?.deferred?.length ?? 0) > 0;
     const targetBranch =
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
@@ -8142,7 +8154,7 @@ export class RunRunner {
         result.gatesDiscoveryTruncated,
         result.scopeCapped,
         withCloses,
-        claim.config?.completion_scope,
+        completionScope,
         bridged,
         opts,
         result.codeCrossCheckSummary,
@@ -8283,7 +8295,7 @@ export class RunRunner {
     // they are not refused for a closing commit message (see #2815).
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const titleFor = (): string => {
-      const title = mrTitle(claim, result.scopeCapped, claim.config?.completion_scope);
+      const title = mrTitle(claim, result.scopeCapped, completionScope);
       return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath) : title;
     };
     const mr = await withForgeRetry(
@@ -11843,7 +11855,7 @@ export class RunRunner {
       // enterCompletionHold. The executor calls this on a completion stall or an eligible lead
       // request with authoritative unmet milestones, before parking — it authors an
       // awaiting_input question (marked completion_question so the api stamps completion_question_at
-      // and the owner continue-decision endpoint resolves it) and gives the owner a live window
+      // and the owner completion-decision endpoint resolves it) and gives the owner a live window
       // (completion_hold_window_seconds, default 900s) to continue-with-guidance before the run
       // parks. On expiry (or a park the server won't ACK) it resolves "expired" and the executor
       // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Reached only on an
@@ -18701,7 +18713,7 @@ export class RunRunner {
 
   /**
    * PRD #1226 M5 (D6): the completion-interlock LIVE window. Author a completion-question
-   * (awaiting_input, marked `completion_question`), then await the owner's continue decision for up
+   * (awaiting_input, marked `completion_question`), then await the owner's answer for up
    * to the claim's `completion_hold_window_seconds` (default 900s). Called at the completion-STALL
    * point or on an eligible lead request with authoritative unmet milestones, before routing
    * to the hold.
@@ -18717,7 +18729,7 @@ export class RunRunner {
    *    unaffected (mirroring askUser's settle cleanup).
    *
    * Resolves `{ outcome: "continue", guidance? }` on an owner ANSWER within the window. The API
-   * delivers the owner continue-decision as an `answer` naming the run's open_question_id, carrying
+   * delivers the owner completion decision as an `answer` naming the run's open_question_id, carrying
    * `["continue"]` (the sentinel) for empty guidance or `[guidance]` otherwise — so a lone
    * "continue" is treated as no guidance and any other text as guidance. Resolves
    * `{ outcome: "expired" }` on the window elapsing, on a non-answer verdict (a cancel resolves the
@@ -18841,14 +18853,14 @@ export class RunRunner {
         // throw — this window has no fail-closed path.
         return { outcome: "expired" };
       }
-      // The owner continued. `["continue"]` is the empty-guidance sentinel; any other text is
+      // The owner answered. `["continue"]` is the empty-guidance sentinel; any other text is
       // guidance (the answer is index-aligned with the single question above).
       const answers = verdict.answers;
       const guidance =
         answers.length === 1 && answers[0] === "continue"
           ? undefined
           : answers.join("\n").trim() || undefined;
-      runLog.info("completion question: owner chose continue", {
+      runLog.info("completion question: owner answered", {
         run_id: runId,
         question_id: questionId,
         has_guidance: guidance !== undefined,

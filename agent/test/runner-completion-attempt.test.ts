@@ -385,6 +385,7 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
       budgetExhaustedFromIteration: 2,
     });
     Object.assign(probe.ctx, {
+      pullFollowUp: () => ({ id: 3089, body: "UNTRUSTED-OWNER-CORRECTION" }),
       kind: "issue", interactive: false, planApproved: true,
       approvedPlan: "plan", sessionId: "sess-1",
       frozenMilestones: [
@@ -400,7 +401,18 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
     const queryFn: SdkQueryFn = params => (async function* () {
       queries++;
       assert.equal(queries, 1, "the owner window precedes a second SDK query");
-      for await (const _ of params.prompt) { /* consume the actual implement prompt */ }
+      for await (const message of params.prompt) {
+        const text = String((message as { message: { content: unknown } }).message.content);
+        assert.match(text, /owner_decision_requested/);
+        const close = text.lastIndexOf("</follow_up_");
+        assert.ok(close > text.indexOf("UNTRUSTED-OWNER-CORRECTION"));
+        assert.ok(text.indexOf("If an owner decision is needed") > close, "trusted instructions follow the owner fence");
+        assert.match(text, /Ordinary answers, repository docs and `non_closing`/);
+        assert.match(text, /owner continue decision supplies guidance only/);
+        assert.match(text, /owner partial decision/);
+        assert.match(text, /owner accept decision waives the exact selected criteria/);
+        assert.match(text, /no promise of publication/);
+      }
       const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
       try {
         const listed = await rpc.request("tools/list", {});
@@ -463,7 +475,9 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
       });
       let listings = 0;
       const queryFn: SdkQueryFn = params => (async function* () {
-        for await (const _ of params.prompt) { /* consume the actual implement prompt */ }
+        for await (const message of params.prompt) {
+          assert.doesNotMatch(String((message as { message: { content: unknown } }).message.content), /owner_decision_requested|frozen completion contract is authoritative/);
+        }
         const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
         try {
           const listed = await rpc.request("tools/list", {});
@@ -491,6 +505,41 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
 });
 
 describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
+  it("issue3089 completion recheck retains queued owner input until an ordinary turn", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [signalDone({ owner_decision_requested: { reason: "Need a decision" } }), resultSuccess()],
+      [assistantText("Rechecking"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCompletionCtx({ unmetScript: [["m1"], []],
+      askQuestionScript: [{ outcome: "continue" }] });
+    Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "plan", sessionId: "sess-1" });
+    let queued = false;
+    const ask = probe.ctx.askCompletionQuestion!;
+    probe.ctx.askCompletionQuestion = async (...args) => {
+      const answer = await ask(...args);
+      queued = true;
+      return answer;
+    };
+    let pulls = 0;
+    const included: number[] = [];
+    probe.ctx.pullFollowUp = () => {
+      if (!queued) return undefined;
+      pulls++;
+      queued = false;
+      return { id: 3089, body: "QUEUED-OWNER-INPUT" };
+    };
+    probe.ctx.followUpIncluded = id => included.push(id);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.match(turns[1]!.promptText!, /Worker instruction: call `signal_done` again/);
+    assert.doesNotMatch(turns[1]!.promptText!, /QUEUED-OWNER-INPUT/);
+    assert.match(turns[2]!.promptText!, /QUEUED-OWNER-INPUT/);
+    assert.equal(pulls, 1);
+    assert.deepEqual(included, [3089]);
+  });
+
   it("issue3089 m1 Claude request clears across turns and reason stays out of rework", async () => {
     const { queryFn, turns } = fakeTurns([
       [signalDone({ owner_decision_requested: { reason: "PRIVATE reason" } }), resultSuccess()],
@@ -505,6 +554,10 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     assert.equal(probe.attemptCalls.length, 3);
     assert.deepEqual(probe.askQuestionCalls, [["m1"]], "later plain done does not reuse request");
     for (const turn of turns.slice(1)) assert.ok(!turn.promptText!.includes("PRIVATE reason"));
+    const autonomous = turns[2]!.promptText!;
+    assert.match(autonomous, /Ordinary answers, repository docs and `non_closing`/);
+    assert.match(autonomous, /If an owner decision is needed, call `signal_done` with `owner_decision_requested`/);
+    assert.doesNotMatch(autonomous, /Do not signal done again until every frozen milestone/);
   });
   for (const mode of ["legacy", "interactive", "task", "prompt", "ci_fix", "self_improve"] as const) {
     it(`issue3089 m1 Claude ignores unadvertised malformed request on ${mode}`, async () => {

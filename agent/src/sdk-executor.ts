@@ -2605,6 +2605,7 @@ export class SdkExecutor implements Executor {
       // remediation): worker-authored turn prompts that own the next implement turn outright.
       // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
       let followUp: string | undefined;
+      let completionRework: { text: string; answered: boolean } | undefined;
       // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
       // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
@@ -2885,8 +2886,10 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
-        if (followUp === undefined) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
-        const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
+        const reworkForTurn = completionRework;
+        completionRework = undefined;
+        if (followUp === undefined && !reworkForTurn) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
+        const ownerRides = followUp === undefined && !reworkForTurn ? ownerFollowUp : undefined;
         const onFirstEvent = ownerRides
           ? () => {
               if (ownerFollowUp?.id !== ownerRides.id) return;
@@ -2931,7 +2934,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          checkedContext + buildImplementPrompt({
+          (reworkForTurn?.answered ? "" : checkedContext) + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -2964,6 +2967,8 @@ export class SdkExecutor implements Executor {
             // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
             followUp: followUp ?? ownerRides?.body,
+            completionRework: reworkForTurn,
+            ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn
             // could not have. Correct on the revise path too: the join runs after the LAST
@@ -3602,16 +3607,15 @@ export class SdkExecutor implements Executor {
                     kind: "status",
                     agent: "worker",
                     payload: {
-                      text: decision.guidance
-                        ? "owner chose to continue with guidance — resuming for another completion attempt"
-                        : "owner chose to continue — resuming for another completion attempt",
+                      text: "owner answered — resuming for a server-authoritative completion recheck",
                     },
                   });
-                  followUp = buildCompletionReworkFollowUp(
-                    unmet,
-                    frozenMilestones,
-                    decision.guidance,
-                  );
+                  followUp = undefined;
+                  completionRework = {
+                    text: buildCompletionReworkFollowUp(unmet, frozenMilestones,
+                      { kind: "answered", guidance: decision.guidance }),
+                    answered: true,
+                  };
                   resetStallState(); // owner input is new input → breaks any #281 refusal streak
                   lastCompletionFingerprint = undefined;
                   completionStallStreak = 0;
@@ -3658,7 +3662,12 @@ export class SdkExecutor implements Executor {
                 text: `completion check: ${unmet.length} frozen milestone(s) not yet complete (${unmet.join(", ")}) — returning to the lead`,
               },
             });
-            followUp = buildCompletionReworkFollowUp(unmet, frozenMilestones);
+            followUp = undefined;
+            completionRework = {
+              text: buildCompletionReworkFollowUp(unmet, frozenMilestones, undefined,
+                ctx.completionInterlock === true && isIssueRun && !ctx.interactive),
+              answered: false,
+            };
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
             continue;

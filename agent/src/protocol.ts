@@ -869,7 +869,7 @@ export interface ClaimConfig {
    *  k8s. Absent or <= 0 from an older server ⇒ the worker's own defaults. */
   question_max?: number;
   question_timeout_seconds?: number;
-  /** PRD #1226 M5 (D6): the live owner-continue window (seconds) before a completion-blocked
+  /** PRD #1226 M5 (D6): the live owner-decision window (seconds) before a completion-blocked
    *  run parks. The worker's completion-question timer uses THIS instead of
    *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
    *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
@@ -1908,6 +1908,7 @@ export interface CompletionPermitResponse {
     head: string;
     issued_at: string;
     finding_ids: string[];
+    completion_scope?: ClaimConfig["completion_scope"];
   };
 }
 
@@ -2418,8 +2419,8 @@ export interface StateRequest {
    *  would park and then be unresumable no matter what the user answered. */
   open_question_id?: string;
   /** PRD #1226 M5 (D6): marks an `awaiting_input` report as a COMPLETION-interlock question (the
-   *  live owner-continue window), NOT an ordinary #88 clarification. The api stamps
-   *  runs.completion_question_at and the owner continue-decision endpoint resolves THIS question by
+   *  live owner-decision window), NOT an ordinary #88 clarification. The api stamps
+   *  runs.completion_question_at and the owner completion-decision endpoint resolves THIS question by
    *  delivering an `answer` naming open_question_id. Sent (true) ONLY on the completion-question park
    *  (the worker's askCompletionQuestion); an ordinary ask_user park omits it. Additive + optional
    *  and OMITTED ENTIRELY (never `false`) on every other report, so an old worker's payload and an

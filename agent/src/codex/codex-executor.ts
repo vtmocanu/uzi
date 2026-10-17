@@ -108,7 +108,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3064,6 +3064,7 @@ export class CodexExecutor implements Executor {
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
+      let completionAnswered = false;
       // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
@@ -3239,8 +3240,8 @@ export class CodexExecutor implements Executor {
         // implement prompt only. It is a per-turn prefix (outside the owner follow-up's fence) so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
-        // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
-        // the clarification continuation below) carries the shared milestone tracker guidance.
+        // Ordinary work and clarification turns retain the milestone tracker. A completion
+        // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
         const systemFollowUp = clarificationPrompt ?? completionFollowUp;
@@ -3268,12 +3269,13 @@ export class CodexExecutor implements Executor {
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = systemFollowUp !== undefined
-          ? withMilestoneNote(systemFollowUp, milestoneNote())
+          ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${implementBody}`
           : implementBody;
         completionFollowUp = undefined;
+        completionAnswered = false;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
@@ -3466,7 +3468,7 @@ export class CodexExecutor implements Executor {
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;
-          let guidance: string | undefined;
+          let answer: { kind: "answered"; guidance?: string } | undefined;
           const leadRequest = result.ownerDecisionRequested;
           const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
             if (!leadRequest) return false;
@@ -3508,7 +3510,7 @@ export class CodexExecutor implements Executor {
             // A timeout keeps the question open; do not report running to resolve it.
             if (await checkRequestBoundary(decision?.outcome === "continue")) break;
             if (decision?.outcome === "continue") {
-              guidance = decision.guidance;
+              answer = { kind: "answered", guidance: decision.guidance };
               lastCompletionFingerprint = undefined;
               completionStallStreak = 0;
             } else {
@@ -3520,7 +3522,9 @@ export class CodexExecutor implements Executor {
               throw new Error(holdReason);
             }
           }
-          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
+          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, answer,
+            ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
+          completionAnswered = answer !== undefined;
           if (iteration >= maxIterations) pendingIterationExhaustion = true;
           // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
           epochNeedsRecreate = true;
@@ -4854,7 +4858,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${body}\n\n${review}` : body;
     const restoredState = ctx.reviewedPlanResume === true && !ctx.sessionId ? `${CURRENT_EXECUTION_STATE_GUIDANCE}\n\n` : "";
-    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}`;
+    const completionGuidance = ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive
+      ? `\n\n${COMPLETION_CONTRACT_GUIDANCE}` : "";
+    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}${completionGuidance}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);

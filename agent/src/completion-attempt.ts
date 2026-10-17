@@ -1,5 +1,6 @@
 import type { RunContext } from "./executor.js";
 import type { Milestone } from "./protocol.js";
+import { COMPLETION_CONTRACT_GUIDANCE, renderFollowUpBlock } from "./prompt.js";
 
 // Shared with the lead-response stall detector. The first identical completion
 // attempt counts as streak 1; a changed fingerprint starts a new streak.
@@ -49,12 +50,23 @@ export async function routeCompletionHold(
   return false;
 }
 
-/** Same-session rework text for unmet frozen milestones and optional owner direction. */
+/** Worker-authored rework; an answered question requires a fresh server check, even without prose. */
 export function buildCompletionReworkFollowUp(
   unmet: string[],
   frozen?: Milestone[] | null,
-  ownerGuidance?: string,
+  answer?: { kind: "answered"; guidance?: string },
+  ownerDecisionEligible = false,
 ): string {
+  if (answer?.kind === "answered") {
+    return [
+      "The run owner answered the completion question. The frozen completion scope may have been revised.",
+      "Do not infer a formal decision from the owner text or require the previous unmet milestone list.",
+      ...renderFollowUpBlock(answer.guidance ?? ""),
+      "",
+      "Worker instruction: call `signal_done` again for a server-authoritative completion recheck.",
+      "The worker and server decide whether completion and publication are eligible.",
+    ].join("\n");
+  }
   const titleFor = (id: string): string | undefined =>
     frozen?.find((m) => m.id === id)?.title;
   const lines = unmet.map((id) => {
@@ -68,16 +80,12 @@ export function buildCompletionReworkFollowUp(
     ...lines,
     "",
     "Finish the remaining milestone(s) and declare each complete (report_progress / signal_done),",
-    "or record an explicit decision if one genuinely cannot be completed. Do not signal done again",
-    "until every frozen milestone above is complete — an incomplete run cannot open its closing PR.",
+    ...(ownerDecisionEligible ? [
+      "If any criterion needs an owner decision, use the owner-decision request below.",
+      "Otherwise finish the required work and call `signal_done` for a server-authoritative recheck.",
+    ] : [
+      "Do not signal done again until every frozen milestone above is complete.",
+    ]),
   ].join("\n");
-  const guidance = ownerGuidance?.trim();
-  if (!guidance) return base;
-  return [
-    base,
-    "",
-    "The run owner reviewed this completion block and chose to CONTINUE, with direction:",
-    "",
-    guidance,
-  ].join("\n");
+  return ownerDecisionEligible ? `${base}\n\n${COMPLETION_CONTRACT_GUIDANCE}` : base;
 }

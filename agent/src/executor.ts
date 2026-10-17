@@ -719,7 +719,7 @@ export interface RunContext {
    *  or on an eligible lead request with authoritative unmet milestones, instead of routing straight to the
    *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
    *  `completion_question` so the api stamps runs.completion_question_at and the owner
-   *  continue-decision endpoint resolves THIS question), then awaits the owner's continue decision
+   *  completion-decision endpoint resolves THIS question), then awaits the owner's answer
    *  for up to the claim's `completion_hold_window_seconds` (default 900s).
    *
    *  Resolves `{ outcome: "continue", guidance? }` on an owner answer WITHIN the window — the
