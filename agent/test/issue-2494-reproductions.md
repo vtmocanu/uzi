@@ -2,7 +2,7 @@
 
 This report lives with the test fixtures; it is not part of the top-level embedded CLI documentation corpus.
 
-M1 observation base: `ce36a79f` (includes #3058, `0c4c7287`). This milestone changes tests only, plus this evidence report. Product code is unchanged. #3101 was still open when checked; no matching landing commit was present in this checkout.
+M1 observation base: `ce36a79f` (includes #3058, `0c4c7287`). M1 changed tests only, plus this evidence report; its observations used unchanged product code. The M3 repair and its validation are recorded below. #3101 was still open when checked; no matching landing commit was present in this checkout.
 
 The two historical incidents were **not reproduced in the bounded fixtures below**. This does not establish the cause of the historical snapshots or rule out an untested interleaving. The permanent-refusal reconciliation cases have independent failing regressions. The approved plan requires retaining that distinction.
 
@@ -80,3 +80,31 @@ Selections: `M1 completion outage restart before sweep`; `M1 cancelled gated iss
 Review of 373bd30d identified invalid differing/open proof fixture shapes and top-level documentation placement; both were corrected. Reviewer/auditor assertion notes were addressed with hostile/oversized diagnostic payload checks across every emitted warning, plus explicit unknown-custody record/report retention assertions. A lead review also corrected the inherited failed ownership response to cancelled. The focused selections in the table were rerun after those test fixes. The tester mentioned the absence of a coverage-instrumentation gate; adding instrumentation/dependencies is deferred under the approved focused-evidence scope, not presented as executed coverage measurement.
 
 No full gate, compose phase, LiveDB, hosted acceptance, CI run, or full-suite before/after runtime measurement is claimed in M1. Final gates and delivery validation remain M4 obligations. Test type narrowing and the non-Linux guard were added after the recorded Linux controls; their Linux assertion bodies are unchanged. Lint/typecheck were repeated after the guard change. The reused guard evaluates false on the Linux host, so it does not turn these recorded Linux cases into skips. M2 applicability must preserve the independent non-reproduction decisions; M3 must turn the named refusal reds green without weakening immutable FINAL, authority, source-boundary or cleanup constraints.
+
+## M2 disposition
+
+No incident-specific product repair is justified by M1's bounded non-reproductions. M2's conditional repair deliverables remain unclaimed; no pending-publication state, discovery producer, candidate-selection change, scheduler or source-boundary exemption was introduced. The original outage discovery authority and historical heartbeat interleaving remain unproved. This disposition does not cancel the independently reproduced M3 defects or claim to close the historical incidents. #3101 remained open at the pre-repair recheck, with no matching landing commit in this branch.
+
+## M3 refusal repair and compatibility evidence
+
+The automatic saved-FINAL path now reads validated exact custody before capture-health/coverage work. Authenticated persisted nonmatching closure short-circuits that work. A fresh bound observation uses the existing exact-hold client validation; matching receipts still replay the original FINAL and recover an actual ACK. Closure alone persists `inventory_hold_settled`, never `finalAcknowledged`, and grants no source or report deletion authority.
+
+Binding-less and unresolved refusals keep their immutable FINAL indefinitely eligible with capped per-record process-local backoff. Restart permits one fresh attempt and then re-establishes that delay. The retry identity includes authenticated capture identity, binding and the saved request; disappearance or identity change resets the process-local entry. Credential quarantine and cancellation budgets keep their existing authority. One diagnostic per refusal transition names the run/generation/capture and bound hold when available, structured protocol reason/status, refusing predicate and verified disposition or unknown. Raw response bodies are excluded. The named retryable retained reasons are `final_retry_refused`, `final_retry_unknown` and `inventory_hold_settled`; the last denotes retained sources under a nonmatching exact closure, not successful preservation.
+
+All twelve unchanged M1 regression assertions pass with the repair (included in the focused 90-case run and the 404-case inventory file run below). The baseline red evidence remains `gate-log.T5YwvL` at the M1 product base. The compatibility assertions now permit only the intended `reason` addition to the prior full record, and the wrong-ACK control asserts immediate deferral before advancing its injected clock to the retry deadline. Neither change relaxes immutable FINAL, no-ACK or no-replacement assertions.
+
+| Check | Recorded result | Log |
+| --- | --- | --- |
+| Focused M1/M3 refusal, settlement and cancellation controls | EXIT=0, 90 pass | gate-log.sZD40E |
+| Legacy scheduling and credential controls | EXIT=0, nine pass | gate-log.nkMQOs |
+| Compatibility failures before expectation corrections | EXIT=1, 20 fail; reason-only delta or newly paced immediate retry | gate-log.YVVvpZ |
+| Same compatibility selection after explicit reason/pacing assertions | EXIT=0, 20 pass, 2.992s | gate-log.JDdExK |
+| Entire recovery-inventory test file | EXIT=0, 404 pass, no skips/cancellations, 27.920s | gate-log.FJnSfa |
+| Real Runner/outbox/GitCache incident fixture file after repair | EXIT=0, 12 pass | gate-log.RWengX |
+| Agent lint, typecheck and git diff --check HEAD | EXIT=0 | gate-log.8iE9G2 |
+| Dispatch-base and current authenticated reader control | EXIT=0 | gate-log.QIKoIW |
+| Bounded E2E diagnostic reason projections and unknown-text exclusion | EXIT=0, four pass, 0.571s | gate-log.vqGt3s |
+
+The old-reader control extracted `ce36a79f` under scratch, used its actual RecoveryCoordinator alongside the candidate reader, and authenticated a current-writer record carrying the unchanged `holdSettlement` and `reason` representation. Both readers preserve the same saved FINAL, report cleanup as pending and leave fixture bundle bytes intact. This is a parser/MAC and cleanup-authority control, not a claim that old workers inherit new pacing. No record field, sidecar, API or backup schema was added. Generic signing and parser representation are unchanged; backup stopped-marker validation concerns another record type.
+
+The required literal audit (`gate-log.nSHiBs`) found no stale expectations for the changed FINAL log messages or new retained reasons in e2e/phases, lib.sh, lib.test.sh or forge-fake. The separately audited bounded settlement diagnostic has an explicit reason allowlist, updated and tested for the three new names without admitting arbitrary text. Full E2E library/fake checks and integration gates remain M4 obligations. Binding-less closed-custody suppression remains deferred to #3105 as approved; unknown authority is never relabelled settled.

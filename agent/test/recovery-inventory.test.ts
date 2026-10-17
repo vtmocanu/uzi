@@ -21,7 +21,7 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
-// M1 keeps the repair assertions unchanged on the unmodified production tree.
+// M1 repair assertions were observed red on the unchanged product baseline.
 for (const status of [403, 409, 429, 503, "network"] as const) {
   it(`M1 R2987-05a binding-less immutable FINAL capped retry ${status}`, async t => {
     const { f, before } = await pendingReceiptFixture();
@@ -243,6 +243,198 @@ it("M1 R2987-05c persisted different closure skips repeated coverage and status"
   } finally { await f.close(); }
 });
 
+
+for (const [status, closure] of [[403, "discarded"], [409, "different-receipt"]] as const) {
+  it(`M3 exact refusal survives heartbeat and restart ${status}`, async () => {
+    const f = await v2FrozenFixture("ci_fix", true);
+    try {
+      f.state.finalError = new RequestError("POST", "/release", status, JSON.stringify({ reason: "not_authorized" }));
+      await f.capture(f.record);
+      const before = (await f.coordinator.inspect(f.context.runId))[0]!;
+      const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+      const closed = closedExactFixture(before, (await exact(before.runId, 7, before.exactHoldBinding!))!, "discarded");
+      if (closure === "different-receipt") {
+        closed.state = "released"; closed.release_evidence = "held_publication";
+        closed.final_receipt = { kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
+          source_sha: before.sourceSha, coverage_digest: before.coverageDigest! };
+      }
+      delete closed.live_run_id; delete closed.live_worker_id;
+      if (closed.final_receipt === undefined) delete closed.final_receipt;
+      let reads = 0;
+      Object.assign(f.client, { getExactRecoveryHold: async () => { reads++; return closed; } });
+      f.client.getRecoveryCaptureStatus = async () => { throw new Error("must stop before capture status"); };
+      f.git.discoverOwedCandidates = async () => [];
+      const costs = { produced: f.state.produced, uploads: f.state.uploads, reserves: f.reserves(), coverage: f.aggregates.length };
+      const bundle = await fs.readFile(before.bundlePath!);
+      await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const firstReads = reads;
+      const restarted = f.make(true);
+      await restarted.resumePending();
+      f.state.now += 900_000;
+      await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+      const after = (await restarted.inspect(before.runId))[0]!;
+      assert.deepEqual(after.holdSettlement, closed);
+      assert.equal(reads, firstReads, "authenticated persisted settlement needs no entry probe");
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.deepEqual(after.originalRoots, before.originalRoots);
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.equal(after.reason, "inventory_hold_settled");
+      assert.equal(f.finals.length, 1);
+      assert.equal(f.state.pinDeletes, 0);
+      assert.deepEqual(await fs.readFile(before.bundlePath!), bundle);
+      assert.deepEqual({ produced: f.state.produced, uploads: f.state.uploads, reserves: f.reserves(), coverage: f.aggregates.length }, costs);
+      assert.deepEqual(Object.keys(after).sort(), [...new Set([...Object.keys(before), "holdSettlement", "reason"])].sort(),
+        "only existing journal fields change");
+    } finally { await f.close(); }
+  });
+}
+
+it("M3 binding-less restart retries once then paces repeated boot and live work", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    f.git.discoverOwedCandidates = async () => [];
+    const warnings: unknown[] = [];
+    f.log.warn = (message, fields) => { warnings.push({ message, fields }); };
+    f.state.finalError = new RequestError("POST", "/release", 403,
+      JSON.stringify({ reason: "hostile-refusal-sentinel" + "\\u001b" + "x".repeat(24_000) }));
+    const restarted = f.make();
+    const initial = f.finals.length;
+    await restarted.resumePending();
+    const costs = [f.state.statusReads, f.aggregates.length, f.finals.length];
+    await restarted.resumePending();
+    await restarted.resumeLive({ isExecuting: () => false, authenticatedAtMs: f.state.now });
+    assert.deepEqual([f.state.statusReads, f.aggregates.length, f.finals.length], costs);
+    assert.equal(f.finals.length, initial + 1);
+    let after = (await restarted.inspect(before.runId))[0]!;
+    assert.equal(after.reason, "final_retry_refused");
+    assert.equal(after.holdSettlement, undefined);
+    assert.deepEqual(after.finalRequest, before.finalRequest);
+    f.state.now += 60_000;
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initial + 2);
+    assert.equal(warnings.length, 1, "one warning per unchanged refusal transition");
+    for (const warning of warnings) {
+      assert.ok(!JSON.stringify(warning).includes("hostile-refusal-sentinel"));
+      assert.ok(JSON.stringify(warning).length <= 4096);
+    }
+    const fresh = f.make();
+    assert.deepEqual((await fresh.inspect(before.runId))[0], (await restarted.inspect(before.runId))[0],
+      "reason remains MAC readable by an unchanged record parser");
+    f.state.finalError = undefined;
+    await fresh.resumePending();
+    after = (await fresh.inspect(before.runId))[0]!;
+    assert.equal(after.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const authority of ["unknown", "wrong-binding", "api-absent"] as const) {
+  it(`M3 failed reconciliation remains retryable with ${authority} exact authority`, async () => {
+    const f = await v2FrozenFixture("ci_fix", true);
+    try {
+      f.state.finalError = new Error("save FINAL");
+      await f.capture(f.record);
+      const before = (await f.coordinator.inspect(f.context.runId))[0]!;
+      const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+      const original = (await exact(before.runId, 7, before.exactHoldBinding!))!;
+      Object.assign(f.client, { getExactRecoveryHold: authority === "api-absent" ? undefined :
+        async () => authority === "unknown" ? undefined : { ...original, hold_id: "00000000-0000-4000-8000-000000000099" } });
+      const warnings: unknown[] = [];
+      f.log.warn = (message, fields) => { warnings.push({ message, fields }); };
+      const status = f.client.getRecoveryCaptureStatus;
+      let reads = 0, reconciliations = 0;
+      const hostile = "reconciliation-secret-sentinel" + "\\u001b[31m\\n" + "x".repeat(24_000);
+      f.client.getRecoveryCaptureStatus = async () => { reads++; throw new Error(hostile); };
+      f.client.reconcileRecoveryCapture = async () => { reconciliations++; throw new Error(hostile); };
+      f.git.discoverOwedCandidates = async () => [];
+      const restarted = f.make(true);
+      await restarted.resumePending();
+      const first = (await restarted.inspect(before.runId))[0]!;
+      assert.equal(first.reason, "final_retry_unknown");
+      assert.equal(first.holdSettlement, undefined);
+      assert.equal(first.finalAcknowledged, undefined);
+      await restarted.resumePending();
+      assert.equal(reads, 1); assert.equal(reconciliations, 1);
+      assert.equal(warnings.length, 1);
+      for (const warning of warnings) {
+        assert.ok(!JSON.stringify(warning).includes("reconciliation-secret-sentinel"));
+        assert.ok(JSON.stringify(warning).length <= 4096);
+      }
+      f.state.now += 60_000;
+      f.state.finalError = undefined;
+      f.client.getRecoveryCaptureStatus = status;
+      await restarted.resumePending();
+      const after = (await restarted.inspect(before.runId))[0]!;
+      assert.equal(after.finalAcknowledged, true);
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(after.holdSettlement, undefined);
+      assert.equal(f.state.produced, 1); assert.equal(f.state.uploads, 1);
+      assert.equal(f.state.pinDeletes, 0);
+    } finally { await f.close(); }
+  });
+}
+
+it("M3 persisted matching receipt still observes cancellation budget before real ACK", async () => {
+  const f = await v2FrozenFixture("ci_fix", true);
+  let budget: MaintenanceBudget | undefined, factories = 0, finals = 0;
+  try {
+    f.state.finalError = new Error("save FINAL");
+    await f.capture(f.record);
+    const before = (await f.coordinator.inspect(f.context.runId))[0]!;
+    const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+    const closed = { ...(await exact(before.runId, 7, before.exactHoldBinding!))!,
+      state: "released" as const, release_evidence: "archive" as const,
+      final_receipt: before.finalRequest!.disposition, run_status: "cancelled" as const };
+    delete closed.live_run_id; delete closed.live_worker_id;
+    await patchAuthenticated(f, before, { holdSettlement: closed });
+    Object.assign(f.client, { getExactRecoveryHold: async () => closed });
+    f.git.discoverOwedCandidates = async () => [];
+    f.state.finalError = undefined;
+    const release = f.client.releaseRecoveryCustody;
+    f.client.releaseRecoveryCustody = async (...args) => {
+      finals++;
+      assert.ok(budget); assert.equal(MaintenanceBudget.current(), budget);
+      assert.equal(args[4], budget.signal);
+      assert.deepEqual(args[3], before.finalRequest!.disposition);
+      return release(...args);
+    };
+    const restarted = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+      factories++; return budget = new MaintenanceBudget();
+    } });
+    await restarted.resumePending();
+    assert.equal(factories, 1); assert.equal(finals, 1);
+    assert.equal((await restarted.inspect(before.runId))[0]!.finalAcknowledged, true);
+  } finally { budget?.dispose(); await f.close(); }
+});
+
+it("M3 changed immutable request and disappeared record reset local retry identity", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    f.git.discoverOwedCandidates = async () => [];
+    f.state.finalError = new RequestError("POST", "/release", 409, JSON.stringify({ reason: "manifest_conflict" }));
+    const restarted = f.make();
+    await restarted.resumePending();
+    const initial = f.finals.length;
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initial, "unchanged request remains delayed");
+    const changed = { ...before.finalRequest!, evidence: "archive" as const };
+    await patchAuthenticated(f, before, { finalRequest: changed });
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initial + 1, "different authenticated request gets its own first attempt");
+    assert.deepEqual(f.finals.at(-1)![3], changed.disposition);
+    assert.equal(f.finals.at(-1)![2], "archive");
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initial + 1, "changed request establishes its own delay");
+    const recordPath = path.join(f.root, "journal", before.runId, before.captureId + ".json");
+    const saved = await fs.readFile(recordPath);
+    await fs.unlink(recordPath);
+    await restarted.resumePending();
+    await fs.writeFile(recordPath, saved);
+    await restarted.resumePending();
+    assert.equal(f.finals.length, initial + 2, "an authoritative absent snapshot prunes process-local delay");
+    assert.equal(f.state.uploads, 1); assert.equal(f.state.produced, 1);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
 
 // V2 records retain original generation and preparation policy across worker drift.
 async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false) {
@@ -2574,7 +2766,7 @@ for (const variant of ["missing", "route", "auth", "transport", "run", "generati
       if (variant === "hold") client.listRecoveryHolds = async () => { throw new Error("hold transport failed"); };
       const finals = f.finals.length;
       await f.make().resumePending(undefined, [before]);
-      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], before);
+      assert.deepEqual((await f.coordinator.inspect("run-1"))[0], { ...before, reason: "final_retry_unknown" });
       assert.equal(f.reserveKeys.length, 1);
       assert.equal(f.finals.length, finals);
     } finally { await f.close(); }
@@ -3215,6 +3407,10 @@ it("lost final ACK replays exact uploaded request after restart with closed hold
     assert.deepEqual(f.finals[1], f.finals[0]);
     assert.equal((await restarted.inspect("run-1"))[0]?.finalAcknowledged, undefined);
     f.state.wrongAck = false;
+    await restarted.resumePending(undefined, snapshot);
+    assert.equal(f.finals.length, 2, "immediate retry after a wrong ACK remains paced");
+    assert.equal((await restarted.inspect("run-1"))[0]?.finalAcknowledged, undefined);
+    f.state.now += 60_000;
     await restarted.resumePending(undefined, snapshot);
     assert.deepEqual(f.finals[2], f.finals[0]);
     assert.equal((await restarted.inspect("run-1"))[0]?.finalAcknowledged, true);
