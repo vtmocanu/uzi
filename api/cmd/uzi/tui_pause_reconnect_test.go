@@ -217,7 +217,7 @@ func TestTUIPauseOriginReconnectFallbackQueuedDTO(t *testing.T) {
 			}
 			// Complete current transcript proof first: metadata alone must remain blocked.
 			m.detail.catchupWaitID = 1
-			update(detailPageMsg{runID: "r1", gen: m.detail.gen, kind: pageCatchup, reqID: 1})
+			update(detailPageMsg{runID: "r1", gen: m.detail.gen, kind: pageCatchup, reqID: 1, pageEpoch: m.detail.pausePageEpoch})
 			update(staleRun)
 			m.detail.metaWaitID = 1
 			update(staleMeta)

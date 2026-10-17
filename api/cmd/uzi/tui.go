@@ -221,6 +221,7 @@ const (
 // detailPageMsg carries one page of transcript messages for the drilled-in run.
 type detailPageMsg struct {
 	coverageRevision uint64
+	pageEpoch        uint64 // loadTailCmd/catchupCmd capture the local page failure epoch at dispatch.
 	runID            string
 	kind             detailPageKind
 	msgs             []apitypes.MessageDTO
@@ -835,9 +836,10 @@ func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
 func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	coverageRevision := m.detail.pauseCoverageRevision()
+	pageEpoch := m.detail.pausePageEpoch
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Tail: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{coverageRevision: coverageRevision, runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
+		return detailPageMsg{pageEpoch: pageEpoch, coverageRevision: coverageRevision, runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -858,9 +860,10 @@ func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
 func (m tuiModel) catchupCmd(runID string, after int32, reqID uint64) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
 	coverageRevision := m.detail.pauseCoverageRevision()
+	pageEpoch := m.detail.pausePageEpoch
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{After: after, Limit: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{coverageRevision: coverageRevision, runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
+		return detailPageMsg{pageEpoch: pageEpoch, coverageRevision: coverageRevision, runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -1414,7 +1417,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Any tail reply — success or error — releases the retry guard, so a failed retry
 			// re-enables the next `r` / fallback tick instead of wedging the stuck state.
 			m.detail.tailInFlight = false
-			m.detail.applyTailPage(msg.msgs, msg.err, msg.coverageRevision)
+			m.detail.applyTailPage(msg.msgs, msg.err, msg.coverageRevision, msg.pageEpoch)
 			// Raise the stream's replay floor to the highest seq now held, so a reconnect replays
 			// only frames after the tail rather than the whole history (PRD #1137 M7).
 			if s := m.detail.stream; s != nil {
@@ -1444,6 +1447,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil // a superseded / stale catch-up reply
 			}
 			if msg.err != nil {
+				m.detail.invalidatePausePage()
 				m.detail.pauseCatchupFailed = true
 				m.detail.catchupWaitID = 0 // chain ends; the next tick may retry
 				return m, nil
@@ -1457,8 +1461,17 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// hostile/broken server or an all-duplicate page — the mirror of the backfill
 			// did-not-advance guard), so the chain can never spin without clearing its guard.
 			if len(msg.msgs) == 0 || m.detail.highSeq <= before {
-				m.detail.pauseCatchupFailed = len(msg.msgs) != 0
-				if len(msg.msgs) == 0 {
+				if len(msg.msgs) != 0 {
+					m.detail.invalidatePausePage()
+					m.detail.pauseCatchupFailed = true
+				} else if msg.pageEpoch == m.detail.pausePageEpoch {
+					// EOF proves the already loaded current suffix, including an empty run.
+					if !m.detail.pauseSuffixSet {
+						m.detail.pauseSuffixAfter = max(0, m.detail.lowSeq-1)
+						m.detail.pauseSuffixSet = true
+					}
+					m.detail.pauseTailReady = true
+					m.detail.pauseCatchupFailed = false
 					m.detail.notePauseRead(msg.coverageRevision)
 				}
 				m.detail.catchupWaitID = 0 // caught up (or cannot advance): chain done
@@ -1557,6 +1570,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// D8: a socket we cannot open is a degradation, not a crash — fall back to
 			// the same 2s REST poll `uzi run logs --follow` uses and say so on screen.
 			m.detail.streamErr = msg.err
+			m.detail.invalidatePausePage()
 			m.detail.pauseCatchupFailed = true
 			m.detail.pauseMetaReady = false
 			m.detail.pauseEpoch++
@@ -1598,6 +1612,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.closed {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err
+			m.detail.invalidatePausePage()
 			m.detail.pauseCatchupFailed = true
 			m.detail.pauseMetaReady = false
 			m.detail.pauseEpoch++

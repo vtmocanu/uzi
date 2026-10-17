@@ -88,18 +88,24 @@ type detailState struct {
 	tailLoaded bool // the newest transcript page has landed
 
 	// Attribution evidence is independent of transcript loading and the transport cursor.
-	// pauseSuffixAfter fixes the start of the first successful current tail: older
+	// pauseSuffixAfter fixes the start of the first successful current tail or completed catch-up: older
 	// backfill may remain absent, while later cursor advancement cannot erase a hole.
 	// Read revisions acknowledge stream failures only after a successful loaded read.
-	pauseSuffixAfter   int32
-	pauseSuffixSet     bool
-	pauseEpoch         uint64
-	pauseRetiredSince  time.Time
-	pauseLastSince     time.Time
+	pauseSuffixAfter  int32
+	pauseSuffixSet    bool
+	pauseEpoch        uint64
+	pauseRetiredSince time.Time
+	pauseLastSince    time.Time
+	// pauseTailReady is origin-only readiness from a current tail or catch-up EOF.
 	pauseTailReady     bool
 	pauseReadRevision  uint64
 	pauseCatchupFailed bool
 	pauseMetaReady     bool
+	// Writers: current page errors/nonadvancing catch-up and socket fallback invalidate
+	// pending proof. Readers: loadTailCmd/catchupCmd capture into detailPageMsg;
+	// successful tail/EOF accept readiness and read acknowledgement only on a match.
+	// Older backfill never writes this epoch; stream revisions and metadata stay separate.
+	pausePageEpoch uint64
 	// GetRun dispatch captures the coverage generation; applyRun/applyMeta store it,
 	// and pauseOrigin requires it to match the current stream generation.
 	pauseMetaGeneration uint64
@@ -243,13 +249,23 @@ func (d *detailState) applyRun(run apitypes.RunDTO, err error, coverageGeneratio
 func (d *detailState) applyTailPage(msgs []apitypes.MessageDTO, err error, readRevision ...uint64) {
 	if err != nil {
 		d.pageErr = err
-		d.pauseTailReady = false
+		d.invalidatePausePage()
 		d.tailLoaded = true
 		return
 	}
 	d.pageErr = nil
 	d.addFrames(framesFromMessages(msgs))
 	d.tailLoaded = true
+	// Direct fixture applications may omit the capture and represent a fresh read.
+	// Production always supplies both the stream revision and local dispatch epoch.
+	pageEpoch := d.pausePageEpoch
+	if len(readRevision) > 1 {
+		pageEpoch = readRevision[1]
+	}
+	if pageEpoch != d.pausePageEpoch {
+		d.rebuild()
+		return
+	}
 	if !d.pauseSuffixSet && len(msgs) == 0 {
 		d.pauseSuffixSet = true
 		d.pauseSuffixAfter = 0
@@ -1172,6 +1188,11 @@ func (m tuiModel) attentionBanner(head, body string, withKeys bool) string {
 		return clampVisual(padSeg(left, m.width-visualWidth(right), amber)+right, m.width)
 	}
 	return clampVisual(padSeg(left, m.width, amber), m.width)
+}
+
+func (d *detailState) invalidatePausePage() {
+	d.pausePageEpoch++
+	d.pauseTailReady = false
 }
 
 func (d *detailState) notePauseRead(revision ...uint64) {

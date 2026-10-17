@@ -65,7 +65,7 @@ func TestTUIPauseOriginEpochAndCoverage(t *testing.T) {
 	update(detailPageMsg{runID: "r1", kind: pageCatchup, reqID: 2, msgs: []apitypes.MessageDTO{pauseMarker(104, at, "owner")}})
 	check("")
 	m.detail.catchupWaitID = 3
-	update(detailPageMsg{runID: "r1", kind: pageCatchup, reqID: 3})
+	update(detailPageMsg{runID: "r1", kind: pageCatchup, reqID: 3, pageEpoch: m.detail.pausePageEpoch})
 	check("owner")
 	// State-only events invalidate the timestamp until matching fresh metadata.
 	update(streamEventsMsg{runID: "r1", events: []apitypes.RunEventDTO{{Type: uzicli.RunEventTypeState, Status: "paused"}}})
