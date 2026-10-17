@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { RunView } from "./RunView";
 import { api, type RunMessage } from "../lib/api";
 import { mockRuns } from "../mocks/data/runs";
@@ -92,7 +92,10 @@ it("cached marker becomes neutral after failed reconnect catchup", async () => {
   mount();
   await screen.findByText(/Paused by the run's lead at/);
   vi.mocked(api.getRunMessages).mockRejectedValue(new Error("offline"));
-  await act(async () => { Socket.last.close(); Socket.last.onopen?.(); });
+  const retired = Socket.last;
+  act(() => retired.close());
+  await waitFor(() => expect(Socket.last).not.toBe(retired), { timeout: 2500 });
+  await act(async () => Socket.last.onopen?.());
   expect(screen.getByText(/Paused at/)).toBeTruthy();
 });
 it.each(["completion_blocked", "credential_disabled", "provider_unavailable"])("keeps %s hold out of the ordinary paused panel", async hold_reason => {
@@ -103,6 +106,32 @@ it.each(["completion_blocked", "credential_disabled", "provider_unavailable"])("
   expect(screen.queryByText(/Paused(?: by| at)/)).toBeNull();
   expect(screen.queryByRole("button", { name: "▶ Resume" })).toBeNull();
 });
+function Navigation() {
+  const navigate = useNavigate();
+  return <>{["b", "pause"].map(id => <button key={id} onClick={() => navigate("/runs/" + id)}>Navigate to {id}</button>)}</>;
+}
+
+it.each([["b"], ["b", "pause"]])("keeps the pause heading isolated after navigation through %j", async (...ids) => {
+  vi.mocked(api.getRun).mockImplementation(async id => ({ run: { ...paused, id } }));
+  render(<MemoryRouter initialEntries={["/runs/pause"]}>
+    <Navigation /><Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
+  </MemoryRouter>);
+  await screen.findByText(/Paused at/);
+  const oldMessage = Socket.last.onmessage!;
+  await act(async () => Socket.last.deliver({ type: "message", ...marker("owner") }));
+  expect(screen.getByText(/Paused by you at/).tagName).toBe("P");
+  for (const id of ids) {
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Navigate to " + id })));
+    await screen.findByText(/Paused at/);
+  }
+  await act(async () => oldMessage({ data: JSON.stringify({ type: "message", ...marker("lead_park") }) } as MessageEvent));
+  const heading = screen.getByText(/Paused.* at/);
+  expect(heading.tagName).toBe("P");
+  expect(heading.textContent).toMatch(/^‖ Paused at /);
+  await act(async () => Socket.last.deliver({ type: "message", ...marker("lead_park") }));
+  expect(screen.getByText(/Paused.* at/).textContent).toMatch(/^‖ Paused by the run's lead at /);
+});
+
 it("retains the resume action with validated lead evidence", async () => {
   vi.mocked(api.getRunMessages).mockResolvedValue({ messages: [marker("lead_park")] });
   vi.spyOn(api, "resumeRun").mockResolvedValue({ run: paused });

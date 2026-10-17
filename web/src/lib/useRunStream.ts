@@ -132,8 +132,14 @@ export function useRunStream(runId: string) {
     try {
       const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
       if (gen !== genRef.current) return;
-      commit(ingestMany(streamRef.current, batch).state);
-      if (epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current) {
+      const merged = ingestMany(streamRef.current, batch).state;
+      const current = epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current;
+      // Preserve transcript merges, but a superseded read that adds messages or
+      // pending coverage cannot certify the log through commit or a later publish.
+      // Duplicate-only outcomes leave an existing current proof intact.
+      if (!current && merged !== streamRef.current) evidenceRef.current.replay = false;
+      commit(merged);
+      if (current) {
         evidenceRef.current.replay = true;
         publishReadiness();
       }
@@ -187,6 +193,7 @@ export function useRunStream(runId: string) {
 
     // Reset for a new run id, invalidating any REST read still in flight for the old one.
     genRef.current += 1;
+    const generation = genRef.current;
     activeRunIdRef.current = runId;
     streamRef.current = emptyStream();
     metadataEpochRef.current = null;
@@ -219,9 +226,14 @@ export function useRunStream(runId: string) {
     };
 
     const connect = () => {
-      if (closed) return;
-      ws = createRunSocket(runId);
-      ws.onopen = () => {
+      if (closed || generation !== genRef.current) return;
+      const socket = createRunSocket(runId);
+      ws = socket;
+      // Retained callbacks must not adopt the shared stream of a later effect or
+      // reconnect. onclose retires this identity before scheduling its replacement.
+      const isActive = () => !closed && generation === genRef.current && ws === socket;
+      socket.onopen = () => {
+        if (!isActive()) return;
         invalidateEvidence();
         setConnected(true);
         void replay();
@@ -234,7 +246,8 @@ export function useRunStream(runId: string) {
         // this refetch is the source of truth that self-heals it.
         void refreshInputs();
       };
-      ws.onmessage = (ev) => {
+      socket.onmessage = (ev) => {
+        if (!isActive()) return;
         let frame: WsEvent;
         try {
           frame = JSON.parse(String(ev.data)) as WsEvent;
@@ -262,18 +275,19 @@ export function useRunStream(runId: string) {
         // hub dropped the input frame for a slow subscriber.
         if (frame.type === "input" || effects.refreshRun) void refreshInputs();
       };
-      ws.onclose = () => {
+      socket.onclose = () => {
+        if (!isActive()) return;
+        ws = null;
         invalidateEvidence();
         setConnected(false);
-        ws = null;
-        if (closed) return;
         // A terminal run emits nothing more — stop reconnecting.
         if (isTerminalRun(statusRef.current)) return;
         reconnect = window.setTimeout(connect, RECONNECT_MS);
       };
-      ws.onerror = () => {
+      socket.onerror = () => {
+        if (!isActive()) return;
         try {
-          ws?.close();
+          socket.close();
         } catch {
           // close after error is best-effort; onclose handles reconnect.
         }
