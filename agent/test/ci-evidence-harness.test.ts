@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
+import { ENV_PROBE_SCRIPT } from "../src/env-probe.js";
 import { describe, test as nodeTest } from "node:test";
 import * as runnerHarness from "./runner-harness.js";
 import { LimitReachedError } from "../src/limit.js";
@@ -446,6 +447,203 @@ for (const resumed of [false, true]) test(`Codex harness threads prepared ${resu
   assert.equal(finished, true);
   assert.match(JSON.stringify(callbackResponse), /first/);
   assert.ok(methods.includes(resumed ? "thread/resume" : "thread/start"));
+});
+
+// The provider script has one reader call followed by one phase signal per turn.
+// Each response unlocks the next event; executor deadlines bound a missing callback.
+for (const resumed of [false, true]) test(`Codex executor prepares current evidence for successful ${resumed ? "resume" : "fresh plan and implementation"}`, async t => {
+  const f = await fixture(t);
+  await fs.mkdir(f.home);
+  const selected = selectCodexBinding({ codex: { auth_mode: "api_key", access_token: "dummy-key", capability: "dummy-capability" } });
+  assert.equal(selected.kind, "codex");
+  if (selected.kind !== "codex") throw new Error("binding");
+  let prepared: PreparedCIEvidence | undefined;
+  t.after(async () => { await prepared?.dispose(); });
+  const generations: number[] = [];
+  const sessionOps: { op: string; source: string; destination?: string }[] = [];
+  const requests: { method: string; params: Record<string, unknown> }[] = [];
+  const excerpts: string[] = [];
+  let preparations = 0;
+  let launches = 0;
+  let turns = 0;
+  let approved = resumed;
+  let sessionPresent = resumed;
+  const sessionId = "evidence-thread";
+  const store = path.join(f.home, "codex-session-store");
+  // A resumed claim replaces the previous generation's reader, rather than inheriting it.
+  const prior = resumed ? await fixture(t, "previous generation\n") : undefined;
+  const previous = prior ? await prepareCIEvidence({ ...prior.options, runHome: f.home, cloneRoot: f.clone, claimGeneration: 6 }) : undefined;
+  if (previous) {
+    await previous.dispose();
+    await assert.rejects(previous.read({ manifest_id: ID }), /disposed/);
+  }
+  const executor = new CodexExecutor(nullLogger(), f.home, {
+    binding: selected.binding,
+    client: { async releaseCodex() { return { access_token: "dummy-released-key" }; } } as unknown as WorkerClient,
+    provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+  }, {
+    provisionRunTools: async () => ({ toolEnv: {} }),
+    installDeps: async () => ({ results: [], truncated: false }),
+    rootStartTime: pid => pid * 10,
+    idleMs: 5000, wallMs: 5000, boundaryDeadlineMs: 200,
+    spawnCommand: async argv => {
+      assert.deepEqual([...argv], [process.execPath, "-e", ENV_PROBE_SCRIPT]);
+      return { code: 0, stdout: JSON.stringify({ uzi_envprobe: 1, proc: "ok", home: "ok", tmp: "ok" }) + "\n", stderr: "" };
+    },
+    launchEffectRoot: async () => {
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+          nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 200, transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async () => ({ event: "child_exit", code: 0 }),
+        dispose: async () => {
+          stdin.end(); stdout.end(); stderr.end();
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined, whenFailed: new Promise<Error>(() => {}),
+      };
+    },
+    wireFileop: () => ({
+      client: { op: async () => { throw new Error("unexpected file operation"); } },
+      dispose: async () => {},
+    }),
+    sessionStore: {
+      adopt: async (source, destination) => {
+        sessionOps.push({ op: "adopt", source, destination });
+        return { files: sessionPresent ? 1 : 0 };
+      },
+      inspect: async source => {
+        sessionOps.push({ op: "inspect", source });
+        return sessionPresent ? "present" : "absent";
+      },
+      persist: async (source, destination) => {
+        sessionOps.push({ op: "persist", source, destination });
+        sessionPresent = true;
+        return { files: 1, bytes: 1 };
+      },
+      remove: async () => { assert.fail("executor must preserve the session store"); },
+    },
+    launchProviderRoot: async () => {
+      launches++;
+      assert.equal(preparations, 1, "evidence is prepared before any provider launch");
+      const queue: CodexNotification[] = [];
+      let waiting: ReturnType<typeof deferred<IteratorResult<CodexNotification>>> | undefined;
+      let ended = false;
+      let planning = false;
+      const push = (note: CodexNotification) => {
+        if (waiting) { const pending = waiting; waiting = undefined; pending.resolve({ value: note, done: false }); }
+        else queue.push(note);
+      };
+      const call = (id: number, tool: string, args: unknown) => push({
+        kind: "activity", method: "item/tool/call", requestId: id,
+        params: { threadId: sessionId, turnId: "turn", callId: String(id), tool, arguments: args },
+      });
+      const transport: CodexTransport = {
+        installServerRequestInterceptor() { return () => {}; },
+        async request<T = unknown>(method: string, params?: unknown): Promise<T> {
+          const p = (params ?? {}) as Record<string, unknown>;
+          requests.push({ method, params: p });
+          if (method === "initialize") return { userAgent: "codex/0.153.2", codexHome: f.home, platformFamily: "unix", platformOs: "linux" } as T;
+          if (method === "account/login/start") return { type: p.type } as T;
+          if (method === "thread/start") {
+            assert.ok((p.dynamicTools as { name: string }[]).some(tool => tool.name === "uzi_ci_evidence_read"),
+              "executor registers the dynamic evidence reader");
+            return { thread: { id: sessionId } } as T;
+          }
+          if (method === "thread/resume") {
+            assert.equal(p.threadId, sessionId, "resume keeps the stored thread");
+            return { thread: { id: sessionId } } as T;
+          }
+          if (method === "turn/start") {
+            turns++;
+            planning = !approved;
+            assert.equal(p.threadId, sessionId);
+            const prompt = JSON.stringify(p.input);
+            assert.match(prompt, /<ci_evidence_[a-f0-9]{32}>/);
+            assert.ok(prompt.includes(ID), "executor forwards prepared metadata to provider");
+            assert.ok(prompt.includes(f.options.claim.ci_repair.input_files[0]!.sha256));
+            assert.ok(!prompt.includes(f.home));
+            call(1, "uzi_ci_evidence_read", { manifest_id: ID, offset: 2, limit: 1 });
+            return { turn: { id: "turn" } } as T;
+          }
+          return {} as T;
+        },
+        notify() {},
+        respond(id, response) {
+          assert.ok("result" in response, "scripted tool call succeeds");
+          if (id === 1) {
+            const result = response.result as { success: boolean; contentItems: { text: string }[] };
+            assert.equal(result.success, true, "registered reader is callable through the executor broker");
+            const excerpt = JSON.parse(result.contentItems[0]!.text);
+            assert.equal(excerpt.text, "second");
+            excerpts.push(excerpt.text);
+            call(2, planning ? "submit_plan" : "signal_done", planning ? { plan_md: "Read the CI evidence" } : {});
+          } else {
+            assert.equal(id, 2);
+            push({ kind: "turn_completed", method: "turn/completed", threadId: sessionId, turnId: "turn", status: "completed",
+              params: { threadId: sessionId, turn: { id: "turn", status: "completed" } } });
+          }
+        },
+        notifications() {
+          return {
+            next() {
+              const note = queue.shift();
+              if (note) return Promise.resolve({ value: note, done: false as const });
+              if (ended) return Promise.resolve({ value: undefined, done: true as const });
+              assert.equal(waiting, undefined);
+              waiting = deferred<IteratorResult<CodexNotification>>();
+              return waiting.promise;
+            },
+            [Symbol.asyncIterator]() { return this; },
+          };
+        },
+        async close() { ended = true; waiting?.resolve({ value: undefined, done: true }); waiting = undefined; },
+      };
+      return { root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {} }, transport, supervisorPid: 1234 };
+    },
+  });
+  const ctx: RunContext = {
+    runId: RUN, claimGeneration: 7, kind: "prompt", issueIid: null, issueTitle: "repair", issueDescription: "Read CI evidence",
+    worktreePath: f.clone, branch: "repair", emit() {}, config: { ci_config_guard: true }, agents: [],
+    planApproved: resumed, approvedPlan: resumed ? "Read the CI evidence" : undefined,
+    sessionId: resumed ? sessionId : undefined, resumePhase: resumed ? "implement" : undefined,
+    gatePlan: async () => { approved = true; return { kind: "approve", selection: { status: "absent" } }; },
+    prepareCIEvidence: async () => {
+      preparations++;
+      prepared = await prepareCIEvidence({
+        ...f.options, claimGeneration: 7,
+        downloader: { async downloadJobFile(run, file, generation, sink) {
+          assert.equal(run, RUN); assert.equal(file, ID);
+          generations.push(generation);
+          await sink(Readable.from([Buffer.from("first\nsecond\n")]));
+        } },
+      });
+      return prepared;
+    },
+  };
+  const result = await executor.run(ctx);
+  assert.equal(result.branch, "repair");
+  assert.equal(preparations, 1);
+  assert.deepEqual(generations, [7], "the current claim generation downloads its own evidence");
+  assert.equal(turns, resumed ? 1 : 2);
+  assert.deepEqual(excerpts, resumed ? ["second"] : ["second", "second"]);
+  assert.equal(launches, resumed ? 1 : 2);
+  assert.equal(requests.filter(r => r.method === "thread/start").length, resumed ? 0 : 1);
+  assert.equal(requests.filter(r => r.method === "thread/resume").length, 1);
+  const adopted = sessionOps.filter(op => op.op === "adopt");
+  assert.equal(adopted.length, launches);
+  for (const op of adopted) {
+    assert.equal(op.source, store);
+    assert.ok(op.destination?.startsWith(path.join(f.home, "codex-data") + path.sep));
+  }
+  assert.equal(new Set(adopted.map(op => op.destination)).size, launches, "each epoch adopts into a fresh home");
+  assert.ok(sessionOps.some(op => op.op === "persist" && op.destination === store));
+  f.stale();
+  await assert.rejects(prepared!.read({ manifest_id: ID }), /stale|cancelled/);
 });
 
 test("Codex executor preparation failure stops before provider launch", async t => {
