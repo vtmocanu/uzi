@@ -756,6 +756,8 @@ export class Worker {
           // M2: this image reconciles unknown Codex refresh outcomes before recovery capture.
           "codex_refresh_recovery_v1",
           "codex_account_park_v1",
+          // #3068 M2: preserving/fresh policy resume and Stop use the guarded run lane.
+          "provider_policy_hold_v1",
           // PRD #1497 M2 (D13): this image parks a run at its wall-clock limit instead of failing it
           // — BOTH harnesses (Claude and Codex) drop the turn in flight, capture the tree, and report
           // the wall_park transition. Advertised UNCONDITIONALLY: the sweep's RequestWallParks join

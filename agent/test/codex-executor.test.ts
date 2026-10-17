@@ -665,7 +665,7 @@ describe("M1 policy hold executor transport (#3068)", () => {
   });
   for (const phase of ["plan", "implement"] as const) {
     for (const mode of ["missing", "rejected", "substituted", "preserved", "unmarked"] as const) {
-      it(`${phase} ${mode} resume authority`, async () => {
+      for (const fresh of [false, true]) it(`${phase} ${mode} resume authority fresh=${fresh}`, async () => {
         const rig = makeRig({ responder: c => {
           if (c.method === "thread/resume") {
             if (mode === "rejected" || mode === "unmarked") throw new CodexTransportError({ category: "protocol", message: "codex app-server returned a JSON-RPC error (code -32602)" });
@@ -679,17 +679,19 @@ describe("M1 policy hold executor transport (#3068)", () => {
           }
           return {};
         } });
-        const { ctx, emitted } = makeCtx({ policyHoldSupported: true, policyHoldResume: mode !== "unmarked",
+        const { ctx, emitted } = makeCtx({ policyHoldSupported: true, policyHoldResume: mode !== "unmarked", policyHoldFreshSession: fresh,
           sessionId: mode === "missing" ? undefined : "th-1", planApproved: phase !== "plan",
           gatePlan: async () => { throw new Error("plan reached"); } });
         const running = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M1 resume");
-        const blocked = mode === "missing" || mode === "rejected" || mode === "substituted";
+        const lost = mode === "missing" || mode === "rejected" || mode === "substituted";
+        const blocked = !fresh && lost;
         if (blocked) await assert.rejects(running, (err: Error) => err.name === "PolicyResumeRejected");
         else if (phase === "plan") await assert.rejects(running, /plan reached/);
         else await running;
-        assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, mode === "unmarked" ? 1 : 0);
+        assert.equal(rig.transport.requests.filter(r => r.method === "thread/start").length, mode === "unmarked" || fresh && lost ? 1 : 0);
         assert.equal(rig.transport.turnStartCount, blocked ? 0 : 1);
-        assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length, mode === "unmarked" ? 1 : 0);
+        assert.equal(emitted.filter(m => m.payload.event === "resume_lineage_break").length,
+          mode === "unmarked" || fresh && (mode === "rejected" || mode === "substituted") ? 1 : 0);
       });
     }
     for (const tag of ["cyberPolicy", "misalignmentPolicyViolation"] as const) {
@@ -3147,10 +3149,14 @@ describe("M1 composed policy guidance delivery", () => {
     let finalPushes = 0;
     git.pushBranch = async () => { finalPushes++; throw new Error("unexpected final branch push"); };
     const owned: { runner: RunRunner; running: Promise<void> }[] = [];
-    function start(generation = 1) {
+    function start(generation = 1, crashBeforeIdentity = false) {
       api.setInputClaimGeneration(claim.run_id, generation);
       api.setOwnershipStatus(claim.run_id, "running", generation);
       const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") {
+          if (crashBeforeIdentity) runner.shutdown();
+          return { thread: { id: thread } };
+        }
         if (c.method === "thread/resume") return { thread: { id: thread } };
         if (c.method === "turn/start") return { turn: { id: "tn-1" } };
         return {};
@@ -3176,7 +3182,7 @@ describe("M1 composed policy guidance delivery", () => {
       assert.ok(api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(99)));
     }
     async function cleanup() {
-      // At most two claims; stop every owned runner before joining either execution.
+      // At most three claims; stop every owned runner before joining their executions.
       for (const entry of owned) entry.runner.shutdown();
       try {
         await withTimeout(Promise.all(owned.map(entry => entry.running)), 5000, "M1 replay cleanup");
@@ -3187,8 +3193,52 @@ describe("M1 composed policy guidance delivery", () => {
         fx.cleanup();
       }
     }
-    return { api, claim, thread, start, cancel, cleanup, diagnostics };
+    return { api, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
   }
+
+  for (const persisted of [false, true]) it(`M2 fresh claim crash persisted=${persisted} cannot replay grant`, async () => {
+    const f = await preservingFixture();
+    try {
+      f.claim.policy_hold_fresh_session = true;
+      f.claim.session_id = null;
+      f.api.setInputs(f.claim.run_id, [{ id: 21, kind: "follow_up", body: "fresh narrowing: inspect parser only" }]);
+      const first = f.start(2, !persisted);
+      if (persisted) {
+        await waitFor(() => first.rig.transport.turnStartCount === 1, "authorized fresh turn");
+        first.rig.transport.push(agentMessage("processed fresh narrowing", f.thread));
+        await waitFor(() => f.api.states.some(s => s.body.session_id === f.thread), "new identity reported");
+        assert.ok(JSON.stringify(first.rig.transport.requests.find(r => r.method === "turn/start")?.params)
+          .includes("fresh narrowing: inspect parser only"));
+        first.runner.shutdown();
+      }
+      await withTimeout(first.running, 5000, "fresh claim crash");
+      assert.equal(first.rig.transport.threadStartCount, 1);
+      assert.equal(first.rig.transport.turnStartCount, persisted ? 1 : 0);
+      assert.equal(f.api.states.some(s => s.body.session_id === f.thread), persisted);
+      f.claim.policy_hold_fresh_session = false; // Next claim's trusted server equality result.
+      f.claim.session_id = persisted ? f.thread : null;
+      const second = f.start(3);
+      if (persisted) {
+        await waitFor(() => second.rig.transport.turnStartCount === 1, "reclaim preserves new identity");
+        assert.equal(second.rig.transport.requests.filter(r => r.method === "thread/resume").length, 1);
+        second.runner.shutdown();
+      }
+      await withTimeout(second.running, 5000, "reclaimed fresh claim");
+      assert.equal(second.rig.transport.threadStartCount, 0);
+      if (!persisted) {
+        assert.equal(second.rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests.at(-1)?.body.detail, "resume_rejected");
+      } else {
+        await fs.rm(path.join(f.homeDir, "codex-session-store"), { recursive: true, force: true });
+        const third = f.start(4);
+        await withTimeout(third.running, 5000, "later eviction remains constrained");
+        assert.equal(third.rig.transport.threadStartCount, 0);
+        assert.equal(third.rig.transport.turnStartCount, 0);
+        assert.equal(f.api.policyHoldRequests.at(-1)?.body.detail, "resume_rejected");
+      }
+      assert.equal(f.api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
+    } finally { await f.cleanup(); }
+  });
 
   it("M1 two-claim crash after ACK replays unincluded guidance before model evidence", async () => {
     const f = await preservingFixture();
@@ -11522,11 +11572,38 @@ describe("approved m1 Codex resume reconciliation", () => {
 });
 
 describe("Codex completion interlock", () => {
+  for (const full of [false, true]) for (const session of [undefined, "th-1"])
+  for (const fresh of [false, true]) it(`M2 Stop boundary full=${full} session=${session} fresh=${fresh}`, async () => {
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        c.transport.push(signalDone()).push(turnCompleted());
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    } });
+    const { ctx, emitted } = makeCtx({ kind: "issue", completionInterlock: true,
+      policyHoldResume: true, policyHoldFreshSession: fresh, sessionId: session,
+      frozenMilestones: [{ id: "m1", title: "one" }, { id: "m2", title: "two" }],
+      recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+      reportIteration: async () => ({ scopeCeiling: full ? 2 : 1, completedCount: full ? 2 : 1,
+        completedIds: full ? ["m1", "m2"] : ["m1"] }),
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "M2 Stop");
+    assert.equal(rig.transport.turnStartCount, 0);
+    assert.equal(rig.transport.requests.some(r => r.method === "thread/start"), false);
+    assert.equal(rig.providerLaunches(), 0, "lazy lead root stays unopened");
+    assert.deepEqual(result.scopeCapped, full ? undefined : { completedCount: 1, total: 2 });
+    assert.equal(emitted.filter(m => m.kind === "steer_ack").length, 1);
+    assert.equal(result.completionHeld, undefined);
+  });
+
   for (const scenario of [
     { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
     { name: "overshoot", ack: { scopeCeiling: 1, completedCount: 2 }, capped: 2 },
-    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 } },
-    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 } },
+    { name: "full total", ack: { scopeCeiling: 1, completedCount: 3 }, full: true },
+    { name: "above total", ack: { scopeCeiling: 1, completedCount: 4 }, full: true },
     { name: "missing count", ack: { scopeCeiling: 0 } },
     { name: "below ceiling", ack: { scopeCeiling: 2, completedCount: 1 } },
     { name: "absent ceiling", ack: { completedCount: 2 } },
@@ -11547,8 +11624,8 @@ describe("Codex completion interlock", () => {
       });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(c.ctx), 5000, scenario.name);
       assert.deepEqual(result.scopeCapped, scenario.capped === undefined ? undefined : { completedCount: scenario.capped, total: 3 });
-      assert.equal(rig.providerLaunches(), scenario.capped === undefined ? 1 : 0);
-      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined ? 0 : 1);
+      assert.equal(rig.providerLaunches(), scenario.capped === undefined && !scenario.full ? 1 : 0);
+      assert.equal(c.emitted.filter((m) => m.kind === "steer_ack").length, scenario.capped === undefined && !scenario.full ? 0 : 1);
     });
   }
 

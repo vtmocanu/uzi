@@ -1773,6 +1773,8 @@ function logScratchPublicationRefused(
  * would redden knip (deadcode:agent).
  */
 interface RunFlight {
+  /** Scope from the initial authoritative running ACK, before resume can reset progress. */
+  resumeScope?: StateAck;
   policyHoldSupported?: boolean;
   policyHoldIntent?: PolicyResumeRejected | ProviderPolicyRefusal;
   policyReconciliationPending?: boolean;
@@ -9505,6 +9507,7 @@ export class RunRunner {
     // continuing the phase clone would work a claim the run has already left. Throw the non-`failed`
     // stop signal rather than clone-and-run on it.
     const runningAck = await reportState({ status: "running" });
+    flight.resumeScope = runningAck;
     if (!runningAck.applied && runningAck.status !== undefined && TERMINAL_RUN_STATUSES.has(runningAck.status)) {
       runLog.info("first running report refused with a terminal status; stopping the phase clone", {
         run_id: runId,
@@ -9867,7 +9870,19 @@ export class RunRunner {
     // could be recovered" on exactly that successful recovery. With branch 3 ahead of it, the
     // loss notice fires only when NOTHING — committed or WIP — was recovered: the residual
     // #218-M3 loss case.
-    if (claim.policy_hold_resume === true && claim.policy_hold_fresh_session !== true) {
+    const scope = flight.resumeScope;
+    const reachedPolicyStop = claim.policy_hold_resume === true && claim.kind === "issue" &&
+      claim.interactive !== true && claim.plan_approved === true && !!claim.milestones?.length &&
+      typeof scope?.scopeCeiling === "number" && typeof scope.completedCount === "number" &&
+      scope.completedCount > 0 && scope.completedCount >= scope.scopeCeiling;
+    const recoveredWork = runnerClone.priorCommits > 0 || runnerClone.wipRecovered === true;
+    if (reachedPolicyStop && !recoveredWork) {
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: "completed work is unavailable on this worker — Stop cannot deliver it; keeping completion and scope unchanged",
+      } });
+      throw new PolicyResumeRejected();
+    }
+    if (claim.policy_hold_resume === true && claim.policy_hold_fresh_session !== true && !reachedPolicyStop) {
       let present = false;
       if (claim.session_id && !flight.effectiveAttemptPaths && this.dockerHost === undefined && runHome && claim.secrets.codex) {
         try {
@@ -9962,7 +9977,7 @@ export class RunRunner {
     // feed message at ~:603: a brand-new first attempt has no prior milestones to clear,
     // so it must NOT emit a spurious extra run-start report (that perturbs the status-report
     // sequence other runner tests assert, e.g. runner-push-mr).
-    if (claim.session_id != null && runnerClone.seededFrom === "default") {
+    if (!reachedPolicyStop && claim.session_id != null && runnerClone.seededFrom === "default") {
       try {
         await reportState({ status: "running", seeded_from_default: true });
       } catch (e) {

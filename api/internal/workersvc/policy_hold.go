@@ -21,7 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PolicyHoldFeature is intentionally not advertised until the M2 activation.
+// PolicyHoldFeature negotiates the completed policy-hold owner contract.
 const PolicyHoldFeature = "provider_policy_hold"
 
 // PolicyResumeGuidanceMaxBytes bounds decoded owner guidance.

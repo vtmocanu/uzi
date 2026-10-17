@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import path from "node:path";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import { Outbox } from "../src/outbox.js";
 import { StaleClaimError } from "../src/runner.js";
 import { PolicyHoldUnsupported } from "../src/client.js";
@@ -9,7 +10,7 @@ import { randomUUID } from "node:crypto";
 import { ProviderPolicyRefusal, admitPolicyTurn } from "../src/provider-policy-refusal.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
-import { installHarness, api, client, homeDir, git, gitlabClaim, fakeGitlab, runner, worktreeDirFor } from "./runner-harness.js";
+import { installHarness, api, client, homeDir, git, gitlabClaim, fakeGitlab, runner, worktreeDirFor, fx } from "./runner-harness.js";
 
 installHarness();
 
@@ -33,6 +34,53 @@ test("missing preserved session rejects without executor work even with negotiat
   assert.equal(body.correlation_id, undefined);
   assert.equal(api.states.some(s => s.body.status === "failed"), false);
 });
+
+for (const full of [false, true]) for (const fresh of [false, true]) for (const recovered of [false, true]) {
+  test(`M2 Stop full=${full} fresh=${fresh} recovered=${recovered}`, async () => {
+    const { outbox, claim } = await setup();
+    claim.policy_hold_resume = true;
+    claim.policy_hold_fresh_session = fresh;
+    claim.session_id = fresh ? null : "missing-session";
+    claim.plan_approved = true;
+    claim.plan_md = "approved delivery";
+    claim.issue_title = "Deliver approved milestones";
+    claim.milestones = [{ id: "m1", title: "one" }, { id: "m2", title: "two" }];
+    api.setStateAckScope(claim.run_id, { scope_ceiling: full ? 2 : 1,
+      milestones_completed: full ? ["m1", "m2"] : ["m1"] });
+    let recoveredHead: string | undefined;
+    if (recovered) {
+      const runGit = (...args: string[]) => execFileSync("git", ["-C", fx.originPath, ...args],
+        { encoding: "utf8" }).trim();
+      runGit("checkout", "-b", "agent/issue-3068");
+      fs.writeFileSync(path.join(fx.originPath, "delivered.txt"), "completed milestone\n");
+      runGit("add", "delivered.txt");
+      runGit("-c", "user.name=fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "completed work");
+      recoveredHead = runGit("rev-parse", "HEAD");
+      runGit("checkout", "main");
+    }
+    let calls = 0;
+    const forge = fakeGitlab({ head: recoveredHead });
+    const executor: Executor = { async run(ctx) {
+      calls++;
+      assert.equal(ctx.policyHoldResume, true);
+      assert.equal(ctx.policyHoldFreshSession, fresh);
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "delivered.txt"), "utf8"), "completed milestone\n");
+      return { branch: ctx.branch, ...(full ? {} : { scopeCapped: { completedCount: 1, total: 2 } }) };
+    } };
+    await runner(executor, forge.gitlab, undefined, { outbox }).execute(claim);
+    assert.equal(calls, recovered ? 1 : 0, "ordinary executor only receives recovered delivery");
+    assert.equal(api.states.some(s => s.body.seeded_from_default), false, "Stop never clears completion");
+    if (!recovered) {
+      assert.equal(api.policyHoldRequests[0]?.body.detail, "resume_rejected");
+      assert.equal(forge.calls.length, 0);
+      assert.equal(api.states.some(s => s.body.status === "completed" || s.body.status === "failed"), false);
+      assert.ok(JSON.stringify(api.messages(claim.run_id)).includes("completed work is unavailable"));
+    } else {
+      assert.equal(api.policyHoldRequests.length, 0);
+      assert.ok(api.states.some(s => s.body.status === "completed"), JSON.stringify(api.states));
+    }
+  });
+}
 
 test("degraded capture retains the clone and retries ACK loss with the same outcome UUID", async () => {
   const { outbox, claim } = await setup();

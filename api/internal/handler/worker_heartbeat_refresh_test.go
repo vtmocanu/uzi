@@ -42,7 +42,7 @@ func TestWorkerHeartbeatRefreshNegotiationAndSoftInput(t *testing.T) {
 				if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 					t.Fatal(err)
 				}
-				if !reflect.DeepEqual(response.Features, protocolFeatures(!disabled, held)) ||
+				if !reflect.DeepEqual(response.Features, protocolFeatures(!disabled, held, h.cfg.TerminalPendingLease)) ||
 					!slices.Contains(response.Features, "heartbeat_protocol_refresh_v1") || response.Quota != 37 || response.Nonce != nil {
 					t.Fatalf("heartbeat negotiation = %+v", response)
 				}

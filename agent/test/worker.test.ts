@@ -1019,6 +1019,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "milestone_reconciliation_claim_v1",
     "codex_refresh_recovery_v1",
     "codex_account_park_v1",
+    "provider_policy_hold_v1",
     "wall_park_v1",
     "park_run_v1",
     "input_receipts_v1",

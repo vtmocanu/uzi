@@ -74,7 +74,7 @@ it("pre-register delivery precedes registration and claims while heartbeat repor
   assert.equal(registerSnapshot!.pending_overflow, false);
   assert.equal(depths![0]!.pending_policy, 1);
   assert.equal(depths![0]!.pending_terminal, 0);
-  assert.equal(capabilities!.includes("provider_policy_hold_v1"), false);
+  assert.equal(capabilities!.includes("provider_policy_hold_v1"), true);
   assert.equal(box.listPendingPolicies()[0]!.server_settled, true);
   assert.equal(box.hasPendingPolicy("r"), true);
 });

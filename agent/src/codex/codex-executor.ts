@@ -3195,12 +3195,17 @@ export class CodexExecutor implements Executor {
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({ served, frozen: milestones }) : undefined;
-        if (boundaryCap) {
-          scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
+        // A reached Stop ceiling may already cover the whole frozen plan. Use the
+        // ordinary loop result for full delivery; scopeCapAtBoundary remains partial-only.
+        const fullScopeReached = isIssueRun && !!milestones?.length &&
+          typeof served?.scopeCeiling === "number" && typeof served.completedCount === "number" &&
+          served.completedCount >= served.scopeCeiling && served.completedCount >= milestones.length;
+        if (boundaryCap || fullScopeReached) {
+          if (boundaryCap) scopeCapped = { completedCount: boundaryCap.completedCount, total: boundaryCap.total };
           ctx.emit({
             kind: "steer_ack",
             agent: "worker",
-            payload: scopeSteerAckPayload(boundaryCap.ceiling, boundaryCap.completedCount),
+            payload: scopeSteerAckPayload(served!.scopeCeiling!, served!.completedCount!),
           });
           break;
         }

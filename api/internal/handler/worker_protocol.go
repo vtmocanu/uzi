@@ -353,7 +353,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.TerminalPendingLease),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
@@ -396,7 +396,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool, pendingLease time.Duration) []string {
 	groups := [][]string{
 		{"heartbeat_protocol_refresh_v1"},
 		{"dind_maintenance_v1"},
@@ -446,6 +446,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+		// Policy outcomes require snapshot protection for a positive pending lease.
+		// Generation fencing is unconditional in this API; workers also negotiate it.
+		if pendingLease > 0 {
+			groups = append(groups, []string{workersvc.PolicyHoldFeature})
+		}
 	}
 	if heldPublicationEnabled {
 		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
@@ -601,7 +606,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{
 		"worker":                    dto,
-		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication, h.cfg.TerminalPendingLease),
 		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
 	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
