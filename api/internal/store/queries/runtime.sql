@@ -4379,9 +4379,9 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND status <> 'paused'
+  -- All paused runs are protected above. Retain provider protection through
+  -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
@@ -4434,9 +4434,9 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-      -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-      -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+      AND status <> 'paused'
+      -- All paused runs are protected above. Retain provider protection through
+      -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
       AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip

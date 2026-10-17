@@ -49,26 +49,41 @@ func TestWallHoldRejectsLateFailuresLiveDB(t *testing.T) {
 			})
 		}
 	}
-	t.Run("ordinary-owner-pause", func(t *testing.T) {
-		id := fx.run(wpRun{worker: &worker, status: "paused"})
-		n, err := fx.q.SetRunFailed(fx.ctx, store.SetRunFailedParams{
-			ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
-			FailureReason: pgtype.Text{String: "failed", Valid: true},
-			FailOrigin:    pgtype.Text{String: "agent_failure", Valid: true},
-		})
-		if err != nil || n != 1 {
-			t.Fatalf("SetRunFailed ordinary pause = (%d,%v), want (1,nil)", n, err)
+	// Owner and lead pauses share the same persisted NULL-hold shape.
+	for _, origin := range []string{"owner", "lead"} {
+		for _, query := range []string{"SetRunFailed", "SetRunFailedPlanRejected"} {
+			for _, stamped := range []bool{false, true} {
+				t.Run("ordinary-"+origin+"-pause/"+query+"/"+map[bool]string{false: "legacy", true: "stamped"}[stamped], func(t *testing.T) {
+					id := fx.run(wpRun{worker: &worker, status: "paused"})
+					gen := pgtype.Int8{}
+					if stamped {
+						gen = pgtype.Int8{Int64: 1, Valid: true}
+					}
+					var n int64
+					var err error
+					if query == "SetRunFailed" {
+						n, err = fx.q.SetRunFailed(fx.ctx, store.SetRunFailedParams{
+							ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+							FailureReason: pgtype.Text{String: "late", Valid: true},
+							FailOrigin:    pgtype.Text{String: "agent_failure", Valid: true}, ClaimGeneration: gen,
+						})
+					} else {
+						n, err = fx.q.SetRunFailedPlanRejected(fx.ctx, store.SetRunFailedPlanRejectedParams{
+							ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
+							FailureReason: pgtype.Text{String: "late", Valid: true},
+							FailOrigin:    pgtype.Text{String: "plan_rejected", Valid: true}, ClaimGeneration: gen,
+						})
+					}
+					if err != nil || n != 0 {
+						t.Fatalf("%s ordinary pause = (%d,%v), want (0,nil)", query, n, err)
+					}
+					if got := fx.status(id); got != "paused" {
+						t.Fatalf("status = %s, want paused", got)
+					}
+				})
+			}
 		}
-		id = fx.run(wpRun{worker: &worker, status: "paused"})
-		n, err = fx.q.SetRunFailedPlanRejected(fx.ctx, store.SetRunFailedPlanRejectedParams{
-			ID: id, WorkerID: pgtype.UUID{Bytes: worker, Valid: true},
-			FailureReason: pgtype.Text{String: "rejected", Valid: true},
-			FailOrigin:    pgtype.Text{String: "plan_rejected", Valid: true},
-		})
-		if err != nil || n != 1 {
-			t.Fatalf("SetRunFailedPlanRejected ordinary pause = (%d,%v), want (1,nil)", n, err)
-		}
-	})
+	}
 }
 
 func TestMissingSnapshotDefersToWallSweepLiveDB(t *testing.T) {
