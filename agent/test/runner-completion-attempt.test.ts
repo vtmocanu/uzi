@@ -615,6 +615,40 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
   }
 
   for (const outcome of ["parked", "undeliverable", "refused"] as const) {
+    it(`issue3089 landing Claude numeric wall exhaustion falls back to wall park ${outcome}`, async t => {
+      let now = Date.now();
+      t.mock.method(Date, "now", () => now);
+      const { queryFn } = fakeTurns([
+        async function* () {
+          try {
+            yield signalDone({ owner_decision_requested: { reason: "Owner input" } });
+            yield resultSuccess();
+          } finally {
+            // Existing SDK cleanup-time fixture pattern: disarmWall debits this
+            // without yielding to a timer or setting a wall pause mode.
+            now += 20_000;
+          }
+        },
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCompletionCtx({ unmetScript: [["m2"], []], holdReturns: false,
+        config: { max_iterations: 10, run_timeout_seconds: 10 },
+        askQuestionScript: [{ outcome: "continue" }] });
+      let parks = 0;
+      Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+        approvedPlan: "plan", sessionId: "sess-1", pauseModeRequested: () => null,
+        // A refused wall park represents an owner extension; the next ACK applies it.
+        reportIteration: async () => parks ? { totalWallSeconds: 30 } : undefined,
+        parkForWall: async () => { parks++; return outcome; } });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(parks, 1);
+      assert.equal(result.completionHeld, undefined);
+      assert.equal(Boolean(result.walled), outcome !== "refused");
+      assert.equal(probe.attemptCalls.length, outcome === "refused" ? 2 : 1);
+    });
+  }
+
+  for (const outcome of ["parked", "undeliverable", "refused"] as const) {
     it(`issue3089 landing Claude refused completion hold falls back to wall park ${outcome}`, async () => {
       const { queryFn } = fakeTurns([
         [signalDone({ owner_decision_requested: { reason: "Owner input" } }), resultSuccess()],
