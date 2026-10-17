@@ -399,6 +399,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
 		{"heartbeat_protocol_refresh_v1"},
+		{"completion_non_closing_v1"},
 		{"dind_maintenance_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
@@ -1933,9 +1934,29 @@ func (h *Handler) WorkerRunCompletionPermit(w http.ResponseWriter, r *http.Reque
 	httpx.JSON(w, http.StatusOK, res)
 }
 
-// WorkerRunCompletionAttempt is the same-lead nudge endpoint (PRD #1226 M2, D4; M3 caller): the
-// worker reports the current head + worktree fingerprint, the server recomputes the unmet set
-// and records a bounded attempt, and returns the server-authoritative unmet set + attempt count.
+// completionAttemptNonClosing preserves presence through the outer strict decoder.
+// Decoding this value field invokes UnmarshalJSON for explicit null; omission leaves Value nil.
+type completionAttemptNonClosing struct {
+	Value *workersvc.CompletionNonClosing
+}
+
+func (n *completionAttemptNonClosing) UnmarshalJSON(data []byte) error {
+	var body struct {
+		Reason *string `json:"reason"`
+	}
+	dec := json.NewDecoder(strings.NewReader(string(data)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		return err
+	}
+	if body.Reason == nil {
+		return workersvc.ErrInvalidNonClosing
+	}
+	n.Value = &workersvc.CompletionNonClosing{Reason: *body.Reason}
+	return nil
+}
+
+// WorkerRunCompletionAttempt records a bounded attempt and returns the server-authoritative unmet set.
 func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -1947,6 +1968,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body struct {
+		NonClosing completionAttemptNonClosing `json:"non_closing"`
 		// PRD #1226 M3: the lead's signal_done declaration. The service subset-validates it
 		// against the frozen list and union-merges it into runs.milestones_completed before
 		// recomputing unmet. Omitted/null ⇒ nothing declared this attempt (union no-op).
@@ -1963,6 +1985,7 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	res, err := h.wsvc.RecordCompletionAttempt(r.Context(), wkr, runID, workersvc.CompletionAttemptRequest{
+		NonClosing:          body.NonClosing.Value,
 		MilestonesCompleted: body.MilestonesCompleted,
 		Head:                strings.TrimSpace(body.Head),
 		WorktreeFingerprint: strings.TrimSpace(body.WorktreeFingerprint),
@@ -1978,6 +2001,8 @@ func (h *Handler) WorkerRunCompletionAttempt(w http.ResponseWriter, r *http.Requ
 			// PRD #1247 M5: a CAPABILITY worker omitted claim_generation, so the fence could not
 			// engage. Refuse (409) rather than record an unfenced attempt, mirroring WorkerRunState.
 			httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation on the completion attempt")
+		case errors.Is(err, workersvc.ErrInvalidNonClosing):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrCompletionNotInterlocked):
 			httpx.Error(w, http.StatusBadRequest, "run is not interlocked")
 		default:

@@ -175,6 +175,13 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 	}
 }
 
+func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
+	if !run.CompletionNonClosingReason.Valid {
+		return nil
+	}
+	return &CompletionNonClosing{Reason: run.CompletionNonClosingReason.String}
+}
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -870,6 +877,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
 			CompletionScope: CompletionScopeClaim(run.CompletionContract),
+			NonClosing:      completionNonClosingClaim(run),
 		},
 	}
 

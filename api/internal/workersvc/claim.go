@@ -703,6 +703,7 @@ type ClaimConfig struct {
 	// CompletionScopeClaim; it carries milestone TITLES (looked up from the contract's criteria),
 	// which the owner-facing CompletionScopeView DTO does not.
 	CompletionScope *CompletionScopeConfig `json:"completion_scope,omitempty"`
+	NonClosing      *CompletionNonClosing  `json:"non_closing,omitempty"`
 	// JobInputFileMaxBytes, JobInputsMaxFiles and JobInputsMaxBytes are the server's job-input
 	// limits (PRD #1909 D1: one file, files per job, total bytes per job), delivered on a JOB
 	// claim only so the worker can refuse an oversized manifest before it downloads anything. The

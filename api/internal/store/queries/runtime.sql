@@ -10789,6 +10789,7 @@ WITH ins AS (
       -- ErrCompletionStaleClaim). A legacy worker (NULL generation) records unconditionally, unchanged.
       -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim
       -- is rejected even for a generation-less (legacy) report; a live claim still honours a NULL gen.
+      AND (sqlc.narg('completion_non_closing_reason')::text IS NULL OR r.kind = 'issue')
       AND r.claim_released_at IS NULL
       -- Match SetRunCompleted: compare the fields approval does not mutate;
       -- the owner's capability override clears required_capabilities after approval.
@@ -10823,6 +10824,7 @@ pruned AS (
     RETURNING a.id
 )
 UPDATE runs SET
+    completion_non_closing_reason = COALESCE(runs.completion_non_closing_reason, sqlc.narg('completion_non_closing_reason')::text),
     completion_attempts = runs.completion_attempts + 1,
     -- PRD #1226 M3: union-merge the lead's declaration (verbatim SetRunRunning semantics).
     milestones_completed = CASE
@@ -10845,6 +10847,21 @@ WHERE runs.id = @run_id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross
   -- the insert, but pinning the same predicate here keeps the whole statement stale-safe.
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
+  AND (sqlc.narg('completion_non_closing_reason')::text IS NULL OR runs.kind = 'issue')
+      AND (NOT runs.plan_cross_check_required OR
+           (runs.plan_md IS NOT NULL AND (runs.auto_approve OR
+               (runs.gate_presented_payload->>'plan_md' = runs.plan_md
+                AND runs.gate_presented_payload->'milestones' = COALESCE(runs.milestones_candidate, 'null'::jsonb)
+                AND runs.gate_presented_payload->'required_tools' = to_jsonb(ARRAY(
+                    SELECT DISTINCT tool FROM unnest(runs.required_tools) AS tool ORDER BY tool))
+                AND runs.gate_presented_payload->'size_class' = COALESCE(to_jsonb(NULLIF(runs.size_class, '')), 'null'::jsonb)
+                AND EXISTS (
+                   SELECT 1 FROM run_user_inputs i
+                   WHERE i.run_id = runs.id AND i.kind = 'approve_plan'
+                     AND i.applied_at IS NOT NULL
+                     AND i.disposition IS DISTINCT FROM 'superseded'
+                     AND i.gate_binding = 'bound'
+                     AND i.gate_revision = runs.gate_revision)))))
   AND runs.claim_released_at IS NULL
   AND (sqlc.narg('claim_generation')::bigint IS NULL
        OR runs.claim_generation = sqlc.narg('claim_generation')::bigint)

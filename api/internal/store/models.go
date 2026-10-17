@@ -1061,6 +1061,7 @@ type Run struct {
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 	CiConfigGuard               bool               `json:"ci_config_guard"`
+	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 }
 
 type RunCompletionAttempt struct {
