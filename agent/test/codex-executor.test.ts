@@ -6192,6 +6192,8 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
   it("run-lane reconciliation propagates boundary cancellation to the credential HTTP seam", async () => {
     const controller = new AbortController();
     let seenSignal: AbortSignal | undefined;
+    let refreshCalls = 0;
+    let abortEvents = 0;
     const client = {
       refreshCodex: async (
         _runId: string,
@@ -6199,18 +6201,30 @@ describe("CodexExecutor: run-lane reconcile ⟷ advice bridge — differential (
         _expected: unknown,
         signal?: AbortSignal,
       ): Promise<never> => {
+        refreshCalls += 1;
         seenSignal = signal;
         return new Promise<never>((_, reject) => {
-          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+          signal?.addEventListener("abort", () => {
+            abortEvents += 1;
+            reject(signal.reason);
+          });
         });
       },
       releaseCodex: async (): Promise<never> => { throw new Error("unused"); },
     };
     const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {});
     const pending = reconcile(RECONCILE_REQ, controller.signal);
-    controller.abort();
+    assert.ok(seenSignal, "credential HTTP receives a cancellation signal");
+    assert.equal(seenSignal.aborted, false);
+    assert.equal(abortEvents, 0);
+    assert.equal(refreshCalls, 1);
+    const reason = new Error("boundary cancelled");
+    controller.abort(reason);
     assert.equal((await pending).kind, "blocked");
-    assert.equal(seenSignal, controller.signal);
+    assert.equal(seenSignal.aborted, true);
+    assert.equal(seenSignal.reason, reason);
+    assert.equal(abortEvents, 1, "boundary cancellation reaches HTTP exactly once");
+    assert.equal(refreshCalls, 1, "cancelled reconciliation does not retry");
   });
 
   it("subscription: BOTH reuse the operation id across a retry AND advance the generation on success", async () => {
