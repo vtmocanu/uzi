@@ -354,6 +354,9 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
 		(dec.ExpectedCompletionRevision != nil && int(run.ContractRevision.Int32) != *dec.ExpectedCompletionRevision) {
 		return SubmitInputResult{}, ErrReconciliationConflict
 	}
+	if err := requireNoPendingRevision(ctx, tx, run); err != nil {
+		return SubmitInputResult{}, err
+	}
 	payload, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload)
 	if err != nil || !ok {
 		return SubmitInputResult{}, ErrReconciliationConflict

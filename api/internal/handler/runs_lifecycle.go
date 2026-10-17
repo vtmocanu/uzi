@@ -937,6 +937,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var mismatch *workersvc.GateRevisionMismatchError
 		switch {
+		case errors.Is(err, workersvc.ErrPlanRevisionPending):
+			httpx.ErrorReason(w, http.StatusConflict, "Pending plan feedback must finish or be replaced by a new revision before approval. You can cancel, reject, or request another revision (within the revision limit). Approval cannot resume an expired revision.", "plan_revision_pending")
 		case errors.Is(err, workersvc.ErrReconciliationRequired):
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "milestone_reconciliation_required")
 		case errors.Is(err, workersvc.ErrReconciliationConflict):

@@ -134,6 +134,9 @@ func TestGateVerdictBindingLiveDB(t *testing.T) {
 		if r := f.row(run); r.status != "awaiting_approval" || r.revision != 2 {
 			t.Fatalf("revision turn: %+v", r)
 		}
+		// This binding test approves after feedback has been settled. Pending
+		// feedback refusal is covered separately by TestApprovalGuardPendingRevisionLiveDB.
+		f.exec("UPDATE run_user_inputs SET applied_at=now() WHERE run_id=$1 AND kind='revise_plan'", run)
 		for _, k := range []string{"approve_plan", "reject_plan"} {
 			if _, err := f.submit(run, k, nil, SubmitInputOptions{}); err != nil {
 				t.Fatal(err)

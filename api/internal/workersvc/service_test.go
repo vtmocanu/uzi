@@ -1460,7 +1460,10 @@ func (f *fakeStore) RequeueRunsOfStaleWorkers(_ context.Context, arg store.Reque
 	f.callOrder = append(f.callOrder, "stale_requeue")
 	return f.sweptRequeued, nil
 }
-func (f *fakeStore) GetRunByIDForUser(context.Context, store.GetRunByIDForUserParams) (store.Run, error) {
+func (f *fakeStore) GetRunByIDForUser(_ context.Context, arg store.GetRunByIDForUserParams) (store.Run, error) {
+	if f.runByID.UserID == uuid.Nil {
+		f.runByID.UserID = arg.UserID
+	}
 	return f.runByID, f.runByIDErr
 }
 

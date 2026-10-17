@@ -457,6 +457,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	GetRunByIDForUpdate(context.Context, uuid.UUID) (store.Run, error)
 	PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error)
 	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)

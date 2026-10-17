@@ -144,6 +144,7 @@ func TestEphemeralDockerLatePlanApprovalLiveDB(t *testing.T) {
 			// The actual provisioned worker owns the gate; Docker was inferred only after provisioning.
 			cliMustExec(t, fx.pool, `UPDATE runs SET status='awaiting_approval',worker_id=$2,plan_md='Build and smoke-test the container',required_capabilities=ARRAY['docker'],gate_revision=1 WHERE id=$1`, run, worker.ID)
 			svc := workersvc.New(fx.q, fx.box, workersvc.Params{})
+			svc.SetTxBeginner(fx.pool)
 			result, err := svc.SubmitInput(fx.ctx, fx.userID, run, "approve_plan", "", nil)
 			if preference {
 				if err != nil {

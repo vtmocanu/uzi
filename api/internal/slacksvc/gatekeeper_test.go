@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -244,6 +245,38 @@ func TestGatekeeperApproveRejectedLeavesGateOpen(t *testing.T) {
 	}
 	if len(fp.ephemerals) != 1 || !strings.Contains(strings.ToLower(fp.ephemerals[0].text), "no longer valid") {
 		t.Fatalf("a rejected selection must get a retry ephemeral: %+v", fp.ephemerals)
+	}
+}
+
+func TestGatekeeperApprovePlanRevisionPendingLeavesGateOpen(t *testing.T) {
+	for _, actionID := range []string{ActionGateApprove, ActionGateApproveOwn, ActionGateApproveRepo} {
+		t.Run(actionID, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
+			sub := &fakeSubmitter{
+				run:        awaitingRun(runID, user.ID),
+				approveErr: fmt.Errorf("submit: %w", ErrPlanRevisionPending),
+			}
+			fp := &fakePoster{}
+			g := NewGatekeeper(gs, sub, fp, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(actionID, runID))
+
+			if len(sub.approvals) != 1 || sub.approvals[0].runID != runID || sub.approvals[0].userID != user.ID {
+				t.Fatalf("approval was not attempted for the owner/run: %+v", sub.approvals)
+			}
+			if len(gs.gateSet) != 0 || len(gs.gateSetIf) != 0 || len(fp.updateBlocks) != 0 {
+				t.Fatalf("pending feedback must preserve the gate: clears=%v transitions=%v edits=%v", gs.gateSet, gs.gateSetIf, fp.updateBlocks)
+			}
+			if len(fp.ephemerals) != 1 {
+				t.Fatalf("want one owner notice: %+v", fp.ephemerals)
+			}
+			for _, hint := range []string{"feedback must finish or be replaced", "cancel", "reject", "revision limit", "Approval cannot resume an expired revision"} {
+				if !strings.Contains(fp.ephemerals[0].text, hint) {
+					t.Errorf("notice %q missing %q", fp.ephemerals[0].text, hint)
+				}
+			}
+		})
 	}
 }
 

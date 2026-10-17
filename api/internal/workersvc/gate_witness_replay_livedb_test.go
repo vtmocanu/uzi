@@ -72,22 +72,23 @@ func TestPlanRevisionWitnessRestorationLiveDB(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, "SELECT applied_at IS NULL FROM run_user_inputs WHERE id=$1", inputID).Scan(&pending); err != nil || !pending {
 		t.Fatalf("restoration settled unanswered feedback: pending=%v err=%v", pending, err)
 	}
-	// Ordinary approval cannot silently replace the frozen milestone contract.
+	// Ordinary approval must wait for unanswered feedback.
 	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil,
-		SubmitInputOptions{ExpectedGateRevision: i64(1)}); !errors.Is(err, ErrReconciliationRequired) {
-		t.Fatalf("ordinary approval of changed contract: %v", err)
+		SubmitInputOptions{ExpectedGateRevision: i64(1)}); !errors.Is(err, ErrPlanRevisionPending) {
+		t.Fatalf("ordinary approval with pending feedback: %v", err)
 	}
 	// Old consent fails the state CAS before the witness-readiness check.
 	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationConflict) {
 		t.Fatalf("stale reset consent accepted: %v", err)
 	}
-	// Fresh consent cannot renew the restored witness's old captured revise count.
+	// Fresh consent still cannot approve unanswered feedback. The standalone
+	// stale-witness test settles feedback before checking witness readiness.
 	var err error
 	opts.ExpectedResetStateDigest, err = ResetStateDigest(restored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrPlanRevisionPending) {
 		t.Fatalf("restored stale witness accepted for reset: %v", err)
 	}
 	if reconciliationRow(t, f, id).ClaimReleasedAt.Valid {
@@ -203,13 +204,25 @@ func TestPlanRevisionWitnessReceiptReplayLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrPlanRevisionPending) {
 		t.Fatalf("receipt replay renewed stale witness readiness: %v", err)
 	}
 	var pending bool
 	if err := f.pool.QueryRow(f.ctx, "SELECT count(*)=1 AND bool_and(applied_at IS NULL AND consumed_at IS NULL) FROM run_user_inputs WHERE run_id=$1 AND kind='revise_plan' AND id<>$2", id, inputID).Scan(&pending); err != nil || !pending {
 		t.Fatalf("receipt replay consumed or applied K: pending=%v err=%v", pending, err)
 	}
+	// Once K is settled, pending feedback must no longer mask stale-witness
+	// readiness. A lost-ACK replay cannot renew the captured revision count.
+	f.exec("UPDATE run_user_inputs SET applied_at=now() WHERE run_id=$1 AND kind='revise_plan' AND id<>$2", id, inputID)
+	opts.ExpectedResetStateDigest, err = ResetStateDigest(reconciliationRow(t, f, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeApproval := reconciliationRaceSnapshot(t, f, id)
+	if _, err := f.svc.SubmitInputWithOptions(f.ctx, f.userID, id, "approve_plan", "", nil, opts); !errors.Is(err, ErrReconciliationNotReady) {
+		t.Fatalf("receipt replay renewed stale witness readiness after settlement: %v", err)
+	}
+	reconciliationRaceUnchanged(t, f, id, beforeApproval)
 }
 
 func TestGateWitnessOrdinaryReplayAfterReviseLiveDB(t *testing.T) {
