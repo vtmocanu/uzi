@@ -133,22 +133,6 @@ func TestSerialUnknownCurrentCannotCoverOld(t *testing.T) {
 	}
 }
 
-type serialConfirmer struct {
-	fakeCordoner
-	fresh        protocol.DesiredWorker
-	confirmErr   error
-	afterConfirm func()
-}
-
-func (f *serialConfirmer) ConfirmImageRollDrain(ctx context.Context, id string) (protocol.DesiredWorker, error) {
-	if err := f.RequestDrainWithReason(ctx, id, "image_roll"); err != nil {
-		return protocol.DesiredWorker{}, err
-	}
-	if f.afterConfirm != nil {
-		f.afterConfirm()
-	}
-	return f.fresh, f.confirmErr
-}
 func TestSerialLegacyOldLiveness(t *testing.T) {
 	m, c, workers, _ := matrixFixture(t, 2)
 	workers[1].RollEvidence.Registered = false
@@ -159,73 +143,79 @@ func TestSerialLegacyOldLiveness(t *testing.T) {
 	}
 }
 
-func TestSerialDeadlineConfirmationFences(t *testing.T) {
+func TestSerialDeadlineRestartThenIdle(t *testing.T) {
 	for _, recycle := range []bool{false, true} {
-		for _, mode := range []string{"expired", "api-clock-offset", "generation", "custody", "lane", "poll-error", "missing-channel", "expired-evidence"} {
-			t.Run(fmt.Sprintf("recycle=%t/%s", recycle, mode), func(t *testing.T) {
-				m, c, workers, _ := matrixFixture(t, 3)
-				for i := range workers {
-					workers[i].Busy = true
-				}
-				if recycle {
-					workers[0].Size = "l"
-				}
-				since := m5Now.Add(-2 * time.Hour)
-				workers[0].DrainingSince = &since
-				workers[0].DrainingReason = token("image_roll")
-				fresh := workers[0]
-				confirmer := &serialConfirmer{fresh: fresh}
-				switch mode {
-				case "api-clock-offset":
-					p := *fresh.RollEvidence
-					p.EvaluatedAt = m5Now.Add(24 * time.Hour)
-					p.ValidUntil = p.EvaluatedAt.Add(time.Minute)
-					p.LivenessValidUntil = &p.ValidUntil
-					shifted := p.EvaluatedAt.Add(-2 * time.Hour)
-					confirmer.fresh.RollEvidence = &p
-					confirmer.fresh.DrainingSince = &shifted
-				case "generation":
-					confirmer.fresh.Generation++
-				case "custody":
-					confirmer.fresh.CustodyHeld = true
-				case "lane":
-					confirmer.fresh.Docker = true
-				case "expired-evidence":
-					confirmer.afterConfirm = func() { m.now = func() time.Time { return m5Now.Add(2 * time.Minute) } }
-				case "poll-error":
-					confirmer.confirmErr = fmt.Errorf("poll uncertain")
-				}
-				m.cordoner = confirmer
-				if mode == "missing-channel" {
-					m.cordoner = &noConfirmCordoner{}
-				}
-				if mode == "expired" || mode == "api-clock-offset" {
-					rollTickTest(t, m, workers)
-					if len(templatePatches(c)) != 1 {
-						t.Fatalf("fresh expired proof did not permit turn: %v", templatePatches(c))
-					}
-				} else {
-					matrixUnknownTick(t, m, workers)
-					if len(templatePatches(c)) != 0 {
-						t.Fatalf("uncertain fresh proof mutated deployment: %v", templatePatches(c))
-					}
-					if len(confirmer.calls) > 1 {
-						t.Fatalf("uncertainty did not halt siblings: %v", confirmer.calls)
-					}
-				}
-			})
-		}
+		t.Run(fmt.Sprintf("recycle=%t", recycle), func(t *testing.T) {
+			m, c, workers, _ := matrixFixture(t, 3)
+			for i := range workers {
+				workers[i].Busy = true
+			}
+			if recycle {
+				workers[0].Size = "l"
+			}
+			since := m5Now.Add(-48 * time.Hour)
+			workers[0].DrainingSince = &since
+			workers[0].DrainingReason = token("image_roll")
+			before, err := c.AppsV1().Deployments(m.cfg.Namespace).Get(context.Background(), deploymentName("w1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rollTickTest(t, m, workers)
+			rollTickTest(t, matrixRestart(m), workers)
+			assertBusyDriftUnchanged(t, c, before)
+			// Idle still obeys serial admission: only the reserved canary may
+			// install a template; its unproven replacement fences siblings.
+			for i := range workers {
+				workers[i].Busy = false
+			}
+			rollTickTest(t, matrixRestart(m), workers)
+			if len(templatePatches(c)) != 1 {
+				t.Fatalf("idle canary did not roll: %v", templatePatches(c))
+			}
+			rollTickTest(t, matrixRestart(m), workers)
+			matrixNoSibling(t, c)
+		})
 	}
 }
 
-type noConfirmCordoner struct{}
-
-func (*noConfirmCordoner) RequestDrain(context.Context, string) error { return nil }
-func (*noConfirmCordoner) ClearDrain(context.Context, string) error   { return nil }
-func (*noConfirmCordoner) RequestDrainWithReason(context.Context, string, ...string) error {
-	return nil
+func TestSerialIdleRestartDesiredFences(t *testing.T) {
+	for _, mode := range []string{"generation", "custody"} {
+		t.Run(mode, func(t *testing.T) {
+			m, c, workers, _ := matrixFixture(t, 3)
+			for i := range workers {
+				workers[i].Busy = true
+			}
+			rollTickTest(t, m, workers)
+			data, err := c.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Get(context.Background(), dataPVCName("w1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			workers[0].Busy = false
+			if mode == "generation" {
+				workers[0].Generation = 1
+			} else {
+				workers[0].CustodyHeld = true
+			}
+			rollTickTest(t, matrixRestart(m), workers)
+			if patches := templatePatches(c); len(patches) != 1 || patches[0] != deploymentName("w1") {
+				t.Fatalf("idle reservation failed serial turn: %v", patches)
+			}
+			dep, err := c.AppsV1().Deployments(m.cfg.Namespace).Get(context.Background(), deploymentName("w1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "generation" && dep.Spec.Template.Annotations[AnnotationGeneration] != "1" {
+				t.Fatal("restart installed the obsolete reserved generation")
+			}
+			retained, err := c.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Get(context.Background(), data.Name, metav1.GetOptions{})
+			if err != nil || retained.UID != data.UID {
+				t.Fatalf("idle custody/generation turn replaced protected data: %v", err)
+			}
+			rollTickTest(t, matrixRestart(m), workers)
+			matrixNoSibling(t, c)
+		})
+	}
 }
-func (*noConfirmCordoner) ClearDrainWithReason(context.Context, string, ...string) error { return nil }
 
 func TestSerialOldWorkerDeadlineWithoutPromotionProof(t *testing.T) {
 	m, c, workers, _ := matrixFixture(t, 2)
@@ -238,15 +228,19 @@ func TestSerialOldWorkerDeadlineWithoutPromotionProof(t *testing.T) {
 	since := m5Now.Add(-2 * time.Hour)
 	workers[0].DrainingSince = &since
 	workers[0].DrainingReason = token("image_roll")
-	m.cordoner = &serialConfirmer{fresh: workers[0]}
+	before, err := c.AppsV1().Deployments(m.cfg.Namespace).Get(context.Background(), deploymentName("w1"), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	obs, err := m.Observe(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = m.Reconcile(context.Background(), workers, obs)
-	if err != nil || len(templatePatches(c)) != 1 {
-		t.Fatalf("fresh old-worker drain incorrectly required promotion proof: err=%v patches=%v", err, templatePatches(c))
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertBusyDriftUnchanged(t, c, before)
 }
 
 func TestSerialSameImageLegacyTemplateCapacity(t *testing.T) {
@@ -333,16 +327,21 @@ func TestSerialFreshDeadline(t *testing.T) {
 			if recycle {
 				workers[0].Size = "l"
 			}
-			since := m5Now.Add(-2 * time.Hour)
-			workers[0].DrainingSince = &since
+			workers[0].DrainingSince = &m5Now
 			workers[0].DrainingReason = token("image_roll")
-			fresh := workers[0]
-			fresh.DrainingSince = &m5Now
-			m.cordoner = &serialConfirmer{fresh: fresh}
-			rollTickTest(t, m, workers)
-			if len(templatePatches(c)) != 0 {
-				t.Fatalf("fresh re-cordon reused expired snapshot: %v", templatePatches(c))
+			before, err := c.AppsV1().Deployments(m.cfg.Namespace).Get(context.Background(), deploymentName("w1"), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
 			}
+			rollTickTest(t, m, workers)
+			rollTickTest(t, matrixRestart(m), workers)
+			assertBusyDriftUnchanged(t, c, before)
+			workers[0].Busy = false
+			rollTickTest(t, matrixRestart(m), workers)
+			if patches := templatePatches(c); len(patches) != 1 || patches[0] != before.Name {
+				t.Fatalf("idle worker failed guarded turn after fresh drain: %v", patches)
+			}
+			matrixNoSibling(t, c)
 		})
 	}
 }

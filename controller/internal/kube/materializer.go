@@ -706,19 +706,9 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	if vols.DinD {
 		return nil
 	}
-	// Phase 0: drain-if-busy. Identical guard to reconcileWorker's roll path — a busy
-	// worker is cordoned + deferred rather than having its volumes torn out from under a
-	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
-	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
-	if w.Busy && rollDespiteBusy {
-		allowed, err := m.confirmExpiredImageDrain(ctx, w)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-	}
+	// Phase 0: busy drift waits for idle or force-roll. Independent maintenance
+	// may also proceed after its own drain deadline.
+	rollDespiteBusy := m.maintenanceDespiteBusy(ctx, w, obs)
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			if m.cordoner != nil {
@@ -1045,21 +1035,9 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// No-drift alone proves neither API health nor ownership of a drain.
 		return nil
 	}
-	// Drift. PRD #422 M5: a busy worker is normally cordoned + deferred (M4), BUT two
-	// overrides roll it anyway (accepting today's requeue-resume): an operator force-roll
-	// (emergency, e.g. a CVE), and the bounded drain deadline (a worker parked at an
-	// approval gate must not hold the old image forever). Both measured/flagged controller-
-	// side; the deadline elapses from the api-supplied draining_since (this loop is stateless).
-	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
-	if w.Busy && rollDespiteBusy {
-		allowed, err := m.confirmExpiredImageDrain(ctx, w)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-	}
+	// Busy template drift waits for idle; only an operator force-roll bypasses it.
+	// An unchanged retained deployment may resume after the paused guards above.
+	rollDespiteBusy := m.drain.ForceRoll || (paused && obs.Generation == w.Generation && obs.SpecHash == wantHash)
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			// not yet cordoned — request the cordon (fail-safe: any failure still defers)
@@ -1080,13 +1058,8 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 		return nil
 	}
-	if w.Busy {
-		// rolling a busy worker: its in-flight run(s) will requeue (Decision 4 fallback).
-		reason := "drain deadline exceeded"
-		if m.drain.ForceRoll {
-			reason = "operator force-roll"
-		}
-		m.log.Warn("rolling a BUSY hosted worker anyway; its in-flight run will requeue", "worker_id", w.ID, "reason", reason)
+	if w.Busy && m.drain.ForceRoll {
+		m.log.Warn("rolling a BUSY hosted worker anyway; its in-flight run will requeue", "worker_id", w.ID, "reason", "operator force-roll")
 	}
 	// Idle (or an override fired): safe to roll now (whether or not it was ever draining —
 	// a cordoned worker that has since gone idle rolls on this tick).
