@@ -667,16 +667,18 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 		}
 	}
 
-	if reader, ok := s.q.(liveCodeCrossCheckReader); ok {
-		deadline, err := reader.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
-			LeadRunID: r.ID, ServerNow: pgconv.Time(now),
-		})
-		if err != nil {
-			if !errors.Is(err, pgx.ErrNoRows) {
-				slog.Error("health: read live code cross-check", "run_id", r.ID, "error", err)
+	if runkind.CodeCrossCheckable(r.Kind) {
+		if reader, ok := s.q.(liveCodeCrossCheckReader); ok {
+			deadline, err := reader.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
+				LeadRunID: r.ID, ServerNow: pgconv.Time(now),
+			})
+			if err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					slog.Error("health: read live code cross-check", "run_id", r.ID, "error", err)
+				}
+			} else if deadline.Valid && deadline.InfinityModifier == pgtype.Finite && deadline.Time.After(now) {
+				return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 			}
-		} else if deadline.Valid && deadline.InfinityModifier == pgtype.Finite && deadline.Time.After(now) {
-			return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 		}
 	}
 

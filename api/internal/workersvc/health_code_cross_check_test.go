@@ -52,6 +52,47 @@ func TestHealthCodeCrossCheckWaitingRegression(t *testing.T) {
 	}
 }
 
+func TestHealthCodeCrossCheckKinds(t *testing.T) {
+	for _, tc := range []struct {
+		kind  string
+		reads int
+	}{
+		{kind: "issue", reads: 1},
+		{kind: "prompt", reads: 1},
+		{kind: "self_improve", reads: 1},
+		{kind: "ci_fix", reads: 1},
+		{kind: "mr_rework", reads: 1},
+		{kind: "task", reads: 1},
+		{kind: "chat"},
+		{kind: "judge"},
+		{kind: "job"},
+		{kind: "cross_check"},
+		{kind: "unknown"},
+		{kind: ""},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			r := stalledRunRow()
+			r.Kind = tc.kind
+			fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
+			fs.liveCodeCrossCheckDeadlines = map[uuid.UUID]pgtype.Timestamptz{
+				r.ID: pgconv.Time(t0.Add(time.Minute)),
+			}
+			svc.detectRunHealth(context.Background(), t0)
+			w := lastWrite(t, fs, r.ID)
+			want, reason := healthStalled, reasonStalled
+			if tc.reads == 1 {
+				want, reason = healthWaitingWorker, "waiting until 2026-07-12T12:01:00Z for code cross-check"
+			}
+			if w.Health != want || w.HealthReason.String != reason {
+				t.Errorf("health=%s/%q, want %s/%q", w.Health, w.HealthReason.String, want, reason)
+			}
+			if len(fs.liveCodeCrossCheckCalls) != tc.reads {
+				t.Errorf("deadline lookups=%d, want %d", len(fs.liveCodeCrossCheckCalls), tc.reads)
+			}
+		})
+	}
+}
+
 func TestHealthCodeCrossCheckPriority(t *testing.T) {
 	for _, name := range []string{"task", "silent", "no updates", "long tool", "near budget", "plan wins", "persistence wins", "tool loop wins"} {
 		t.Run(name, func(t *testing.T) {
@@ -125,6 +166,7 @@ func TestHealthCodeCrossCheckFallback(t *testing.T) {
 			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 			defer slog.SetDefault(previous)
 			r := stalledRunRow()
+			r.Kind = runkind.Issue
 			fs, svc, _ := nudgeSvc(t, r, defaultHealthSettings())
 			fs.liveCodeCrossCheckErr = tc.err
 			fs.liveCodeCrossCheckDeadlines = map[uuid.UUID]pgtype.Timestamptz{r.ID: tc.deadline}
@@ -135,6 +177,13 @@ func TestHealthCodeCrossCheckFallback(t *testing.T) {
 			w := lastWrite(t, fs, r.ID)
 			if w.Health != healthStalled || w.HealthReason.String != reasonStalled {
 				t.Fatalf("write=%+v", w)
+			}
+			reads := 1
+			if tc.unavailable {
+				reads = 0
+			}
+			if len(fs.liveCodeCrossCheckCalls) != reads {
+				t.Fatalf("deadline lookups=%d, want %d", len(fs.liveCodeCrossCheckCalls), reads)
 			}
 			if got := strings.Contains(logs.String(), "health: read live code cross-check"); got != tc.logged {
 				t.Fatalf("logged=%v want=%v logs=%s", got, tc.logged, &logs)
@@ -239,10 +288,14 @@ func TestHealthCodeCrossCheckStableTicksAndTransitions(t *testing.T) {
 
 func TestHealthCodeCrossCheckDoesNotBurnCooldown(t *testing.T) {
 	r := stalledRunRow()
+	r.Kind = runkind.Issue
 	fs, svc, b := nudgeSvc(t, r, defaultHealthSettings())
 	fs.liveCodeCrossCheckDeadlines = map[uuid.UUID]pgtype.Timestamptz{r.ID: pgconv.Time(t0.Add(time.Minute))}
 	svc.detectRunHealth(context.Background(), t0)
 	w := lastWrite(t, fs, r.ID)
+	if w.Health != healthWaitingWorker || w.HealthReason.String != "waiting until 2026-07-12T12:01:00Z for code cross-check" || len(fs.liveCodeCrossCheckCalls) != 1 {
+		t.Fatalf("code wait=%+v deadline lookups=%d", w, len(fs.liveCodeCrossCheckCalls))
+	}
 	if w.HealthNotifiedAt.Valid || b.healthNudges[0] {
 		t.Fatal("code wait burned cooldown")
 	}
