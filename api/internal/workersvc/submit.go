@@ -502,8 +502,8 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 					// failed fan-out (PublishState, notify, judge, scope settle, checkpoint
 					// delete) or report ServerSide success. With an expected revision it is a
 					// mismatch naming the re-read's revision, even if the re-read matches again.
-					// Without one the only predicates are owner + non-terminal, and the owner was
-					// just verified: the run finished (or vanished) under the submit.
+					// Without one, re-read also distinguishes an accepted Stop from a run that
+					// finished (or vanished) under the submit.
 					return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunTerminal)
 				}
 			}
@@ -892,6 +892,9 @@ func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run stor
 			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
 			if gerr != nil {
 				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404
+			}
+			if len(refreshed.PolicyStopResolution) != 0 {
+				return SubmitInputResult{}, store.RunUserInput{}, stopReviewConflict("policy_stop_gate_resolved")
 			}
 			if terminalStatuses[refreshed.Status] {
 				return SubmitInputResult{}, store.RunUserInput{}, ErrRunTerminal

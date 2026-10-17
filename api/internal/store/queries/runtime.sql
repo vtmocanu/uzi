@@ -4908,6 +4908,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.policy_stop_resolution IS NULL
   AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
        OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
 ), parent_mapping AS MATERIALIZED (
@@ -4948,6 +4949,7 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     updated_at = now()
 WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
+  AND runs.policy_stop_resolution IS NULL
   -- PRD #1795 M2 (D5): a reject sent against a revision the run no longer shows does not fail
   -- the run (0 rows; the caller re-reads and answers gate_revision_mismatch).
   AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
@@ -8403,6 +8405,7 @@ WITH locked AS (
     SELECT runs.id, runs.status, runs.gate_revision, runs.kind
     FROM runs
     WHERE runs.id = @run_id
+      AND runs.policy_stop_resolution IS NULL
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
@@ -8610,6 +8613,7 @@ WITH selected AS (
                  ELSE LEAST(sqlc.arg('run_timeout_seconds')::int * LEAST(jsonb_array_length(COALESCE(runs.milestones_frozen, runs.milestones_candidate)), sqlc.arg('milestone_budget_cap')::int), sqlc.arg('budget_wall_ceiling_seconds')::int) END),
         updated_at       = now()
     WHERE runs.id = @run_id
+      AND runs.policy_stop_resolution IS NULL
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
@@ -8700,6 +8704,7 @@ WHERE id = $1;
 WITH stamped AS (
     UPDATE runs SET stop_kind = @stop_kind, stop_reason = @stop_reason, updated_at = now()
     WHERE runs.id = @run_id
+      AND (@kind::text <> 'reject_plan' OR runs.policy_stop_resolution IS NULL)
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
            OR (runs.status = 'awaiting_approval' AND runs.gate_revision = sqlc.narg('expected_gate_revision')::bigint))
     RETURNING runs.id AS run_id, runs.status AS run_status, runs.gate_revision AS run_gate_revision, runs.kind AS run_kind

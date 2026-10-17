@@ -91,7 +91,8 @@ func (s *Service) reviseNotWritten(ctx context.Context, userID, runID uuid.UUID,
 // predicate, the approve and live-poller reject seams can refuse a vanished run, and the
 // no-live-poller server-side reject can refuse a finished run. The selection-bearing approve also
 // has the contract-source refusal described below. It re-reads the run, so a vanished run answers
-// ErrRunNotFound. With an expected revision the answer is ALWAYS a *GateRevisionMismatchError
+// ErrRunNotFound. An accepted Stop answers the typed resolved-gate conflict first.
+// Otherwise, with an expected revision the answer is a *GateRevisionMismatchError
 // carrying the re-read's revision, even when that revision matches again (a publication and a
 // verdict can interleave around the re-read): the verdict was not written, and the client must
 // refetch rather than read success. Without one it returns fallback, the seam's own answer.
@@ -107,6 +108,9 @@ func (s *Service) verdictNotWritten(ctx context.Context, userID, runID uuid.UUID
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return err
+	}
+	if len(run.PolicyStopResolution) != 0 {
+		return stopReviewConflict("policy_stop_gate_resolved")
 	}
 	if expected == nil {
 		return fallback
