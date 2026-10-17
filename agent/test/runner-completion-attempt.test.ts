@@ -6,7 +6,7 @@ import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
-import type { PlanVerdict } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal, type PlanVerdict } from "../src/steering.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #1226 M3: the checkpoint-first same-lead completion attempt loop + post-attempt failure
@@ -574,6 +574,69 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
 });
 
 describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
+  for (const answered of [false, true]) {
+    for (const restart of ["credential gave_up", "pause refused", "wall refused"] as const) {
+      it(`issue3089 landing Claude retains ${answered ? "answered" : "autonomous"} rework after ${restart}`, async () => {
+        const { queryFn, turns } = fakeTurns([
+          [signalDone(answered ? { owner_decision_requested: { reason: "Need owner input" } } : {}), resultSuccess()],
+          async function* () {
+            yield assistantText("Interrupted recheck");
+            if (restart === "credential gave_up") throw new CredentialSwitchSignal();
+            if (restart === "pause refused") throw new PauseNowSignal();
+            throw new Error("run exceeded its wall-clock timeout");
+          },
+          [assistantText("Recheck completed"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCompletionCtx({ unmetScript: [["m2"], []], holdReturns: false,
+          ...(answered ? { askQuestionScript: [{ outcome: "continue" as const }] } : {}) });
+        Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+          approvedPlan: "OBSOLETE_CHECKED_PLAN", sessionId: "sess-1",
+          frozenMilestones: [{ id: "m2", title: "OBSOLETE_MILESTONE" }],
+          attemptCredentialSwitch: async () => "gave_up",
+          parkForPause: async () => false,
+          parkForWall: async () => "refused" });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+        assert.equal(turns.length, 4);
+        for (const turn of turns.slice(1, 3)) {
+          if (answered) {
+            assert.match(turn.promptText!, /Worker instruction: call `signal_done` again/);
+            assert.doesNotMatch(turn.promptText!, /OBSOLETE_CHECKED_PLAN|OBSOLETE_MILESTONE/);
+          } else {
+            assert.match(turn.promptText!, /Completion check \(structural interlock\)/);
+            assert.match(turn.promptText!, /m2: OBSOLETE_MILESTONE/);
+          }
+        }
+        assert.doesNotMatch(turns[3]!.promptText!, /Worker instruction: call `signal_done` again|Completion check \(structural interlock\)/,
+          "a successfully spent rework does not leak into the next ordinary turn");
+        assert.equal(probe.attemptCalls.length, 2, "restart consumes no completion attempt");
+      });
+    }
+  }
+
+  for (const outcome of ["parked", "undeliverable", "refused"] as const) {
+    it(`issue3089 landing Claude refused completion hold falls back to wall park ${outcome}`, async () => {
+      const { queryFn } = fakeTurns([
+        [signalDone({ owner_decision_requested: { reason: "Owner input" } }), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCompletionCtx({ unmetScript: [["m2"], []], holdReturns: false,
+        askQuestionScript: [{ outcome: "continue" }] });
+      let wallPending = true;
+      let parks = 0;
+      Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+        approvedPlan: "plan", sessionId: "sess-1",
+        pauseModeRequested: () => probe.attemptCalls.length && wallPending ? "wall" : null,
+        clearWallMode: () => { wallPending = false; },
+        parkForWall: async () => { parks++; return outcome; } });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(parks, 1);
+      assert.equal(result.completionHeld, undefined);
+      assert.equal(Boolean(result.walled), outcome !== "refused");
+      assert.equal(probe.attemptCalls.length, outcome === "refused" ? 2 : 1);
+    });
+  }
+
   it("issue3089 completion recheck retains queued owner input until an ordinary turn", async () => {
     const { queryFn, turns } = fakeTurns([
       [signalDone({ owner_decision_requested: { reason: "Need a decision" } }), resultSuccess()],

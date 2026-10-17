@@ -52,9 +52,9 @@ describe("shared completion attempt", () => {
       if (guidance.includes("nonce=issue3089")) {
         assert.ok(!followUp.includes("\u001b") && !followUp.includes("\u0000"),
           "issue3089 owner control characters cannot enter the continuation prompt raw");
-        const tag = /<follow_up_([a-f0-9]+)>/.exec(followUp)?.[0];
+        const tag = /<follow_up_([a-f0-9]+)>/.exec(followUp);
         assert.ok(tag, "the worker mints an actual nonce fence");
-        const close = tag.replace("<", "</");
+        const close = `</follow_up_${tag[1]}>`;
         assert.equal(followUp.split(close).length, 3, "only the framing and actual closing tag name the nonce");
         assert.ok(followUp.indexOf("</owner_guidance>") < followUp.lastIndexOf(close));
         assert.ok(followUp.lastIndexOf(close) < followUp.indexOf("Worker instruction:"));

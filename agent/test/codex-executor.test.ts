@@ -11019,6 +11019,32 @@ describe("Codex completion interlock", () => {
       assert.equal(Boolean(tools.find(t => t.name === "signal_done")!.inputSchema.properties.owner_decision_requested), eligible);
     });
   }
+  for (const outcome of ["parked", "undeliverable", "refused"] as const) {
+    it(`issue3089 landing Codex refused completion hold falls back to wall park ${outcome}`, async () => {
+      const rig = makeMultiEpochRig([0, 1].map(n => epochResponder(`th-${n}`, `tn-${n}`, (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", n === 0 ? {
+          owner_decision_requested: { reason: "Owner input" },
+        } : {}, th, tn, `wall-fallback-${n}`)).push(turnCompleted("completed", th, tn));
+      })));
+      let attempts = 0;
+      let parks = 0;
+      let wallPending = true;
+      const { ctx } = makeCtx({ kind: "issue", interactive: false, completionInterlock: true,
+        config: { max_iterations: 10 },
+        recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
+        enterCompletionHold: async () => false,
+        askCompletionQuestion: async () => ({ outcome: "continue" }),
+        pauseModeRequested: () => attempts && wallPending ? "wall" : null,
+        clearWallMode: () => { wallPending = false; },
+        parkForWall: async () => { parks++; return outcome; },
+      });
+      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      assert.equal(parks, 1);
+      assert.equal(result.completionHeld, undefined);
+      assert.equal(Boolean(result.walled), outcome !== "refused");
+      assert.equal(attempts, outcome === "refused" ? 2 : 1);
+    });
+  }
   for (const scenario of ["checkpoint cancel", "fingerprint cancel", "attempt cancel", "question cancel",
     "budget", "final iteration", "wall", "pause", "budget before pause", "question pause", "question budget", "pending milestone", "optional seams", "unwired"] as const) {
     it(`issue3089 m1 Codex boundary ${scenario}`, async () => {

@@ -3061,6 +3061,7 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       let completionAttempted = false;
       let completionHeld: { reason: string } | undefined;
+      let walledAtRequest = false;
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
@@ -3489,6 +3490,19 @@ export class CodexExecutor implements Executor {
                 completionHeld = { reason: bound };
                 return true;
               }
+              if (bound === REASON_WALL) {
+                const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+                const pauseToken = pauseNow.capture();
+                const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
+                if (outcome === "parked") {
+                  walledAtRequest = true;
+                  return true;
+                }
+                if (outcome === "refused") {
+                  refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
+                  return false;
+                }
+              }
               throw new Error(bound);
             }
             if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
@@ -3504,14 +3518,20 @@ export class CodexExecutor implements Executor {
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             return false;
           };
-          if (await checkRequestBoundary()) break;
+          if (await checkRequestBoundary()) {
+            if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+            break;
+          }
           if (leadRequest || completionStallStreak >= STALL_LIMIT) {
             const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
             const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
               ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
             if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
             // A timeout keeps the question open; do not report running to resolve it.
-            if (await checkRequestBoundary(decision?.outcome === "continue")) break;
+            if (await checkRequestBoundary(decision?.outcome === "continue")) {
+              if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+              break;
+            }
             if (decision?.outcome === "continue") {
               answer = { kind: "answered", guidance: decision.guidance };
               lastCompletionFingerprint = undefined;

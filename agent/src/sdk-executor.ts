@@ -3204,6 +3204,7 @@ export class SdkExecutor implements Executor {
               state.tripReason = undefined;
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
             throw err;
@@ -3214,6 +3215,7 @@ export class SdkExecutor implements Executor {
               total: frozenMilestones?.length,
             };
             if (await handlePauseNow(at)) break;
+            completionRework = reworkForTurn;
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3256,6 +3258,7 @@ export class SdkExecutor implements Executor {
               this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
           }
@@ -3552,11 +3555,9 @@ export class SdkExecutor implements Executor {
               // Preserve Claude's pause-before-budget precedence.
               if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
                 if (ctx.pauseModeRequested?.() === "wall") {
-                  if (await this.routeSummaryHold(ctx, REASON_WALL, true)) {
-                    completionHeld = { reason: REASON_WALL };
-                    return true;
-                  }
-                  throw new Error(REASON_WALL);
+                  const stopped = await handlePauseNow(at);
+                  if (!stopped && !ctx.parkForWall) throw new Error(REASON_WALL);
+                  return stopped;
                 }
                 if (await this.requestPause(ctx, at)) {
                   if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
@@ -3572,6 +3573,21 @@ export class SdkExecutor implements Executor {
                   if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
                   completionHeld = { reason: bound };
                   return true;
+                }
+                if (bound === REASON_WALL) {
+                  const outcome = await this.parkForWall(ctx, at);
+                  if (outcome === "parked" || outcome === "undeliverable") {
+                    walled = { reason: REASON_WALL };
+                    return true;
+                  }
+                  if (outcome === "cancelled" || ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  if (outcome === "refused") {
+                    ctx.clearWallMode?.();
+                    this.throwIfTerminal(ctx);
+                    state.tripReason = undefined;
+                    throwIfDiskStop(ctx);
+                    return false;
+                  }
                 }
                 throw new Error(bound);
               }
