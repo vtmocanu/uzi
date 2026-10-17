@@ -202,7 +202,8 @@ import {
   repoPathFromUrl,
   type ReconcileResult,
 } from "./pr-description-publisher.js";
-import { closingDirectiveFor, nonClosingTitle, renderCompletionBlock, type KindSection } from "./pr-description.js";
+import { closingDirectiveFor, escapeInline, nonClosingTitle, renderCompletionBlock, type KindSection } from "./pr-description.js";
+import type { CompletionQuestionTrigger } from "./completion-attempt.js";
 import type { SummaryRunner } from "./summary-runner.js";
 import { NowSummaryController, holdContextCallbacks, nowSummaryCodexClaim } from "./now-summary.js";
 import { runReadOnlyModelPass } from "./model-pass.js";
@@ -11839,8 +11840,8 @@ export class RunRunner {
       enterCompletionHold: (reason) =>
         this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
-      // enterCompletionHold. The executor calls THIS at the completion-STALL point (STALL_LIMIT
-      // identical no-progress completion attempts) INSTEAD of parking straight away — it authors an
+      // enterCompletionHold. The executor calls this on a completion stall or an eligible lead
+      // request with authoritative unmet milestones, before parking — it authors an
       // awaiting_input question (marked completion_question so the api stamps completion_question_at
       // and the owner continue-decision endpoint resolves it) and gives the owner a live window
       // (completion_hold_window_seconds, default 900s) to continue-with-guidance before the run
@@ -11848,7 +11849,7 @@ export class RunRunner {
       // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Reached only on an
       // interlocked run (completionInterlock above true; a legacy run never hits the stall path).
       // Sources its window from claim.config, exactly like askUser sources its deadline.
-      askCompletionQuestion: (unmet) =>
+      askCompletionQuestion: (unmet, trigger) =>
         this.askCompletionQuestion(
           runId,
           unmet,
@@ -11857,6 +11858,7 @@ export class RunRunner {
           reportState,
           runLog,
           claim.config ?? null,
+          trigger,
         ),
     };
     // PRD #2603: no summary call starts, and a result is discarded, while any of these is pending.
@@ -18701,7 +18703,7 @@ export class RunRunner {
    * PRD #1226 M5 (D6): the completion-interlock LIVE window. Author a completion-question
    * (awaiting_input, marked `completion_question`), then await the owner's continue decision for up
    * to the claim's `completion_hold_window_seconds` (default 900s). Called at the completion-STALL
-   * point ONLY (STALL_LIMIT identical no-progress completion attempts), INSTEAD of routing straight
+   * point or on an eligible lead request with authoritative unmet milestones, before routing
    * to the hold.
    *
    * Deliberately SEPARATE from askUser, not a reuse of it — two things it MUST NOT share:
@@ -18729,6 +18731,7 @@ export class RunRunner {
     reportState: (body: StateRequest) => Promise<unknown>,
     runLog: Logger,
     config: ClaimConfig | null,
+    trigger: CompletionQuestionTrigger = { kind: "no_progress" },
   ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }> {
     // Reuse the id this run is already parked on (a resume re-parks on the SAME question); mint one
     // only for a genuinely new question. Same resume-safe map askUser uses.
@@ -18739,8 +18742,14 @@ export class RunRunner {
     }
 
     const milestoneLines = unmet.length
-      ? unmet.map((id) => `- ${id}`).join("\n")
+      ? unmet.map((id) => `- ${escapeInline(id)}`).join("\n")
       : "- (the frozen completion contract is not yet satisfied)";
+    if (trigger.kind === "lead_request") {
+      batcher.emit({
+        kind: "status", agent: "worker",
+        payload: { text: "completion decision requested by the lead; awaiting an owner decision on unmet frozen milestones" },
+      });
+    }
     batcher.emit({
       kind: "question",
       agent: "lead",
@@ -18750,13 +18759,26 @@ export class RunRunner {
           {
             header: "Completion blocked",
             question: [
-              "This run is structurally blocked: it signalled done, but the frozen completion",
-              "contract still has milestone(s) not complete, and repeated completion attempts made",
-              "no progress:",
+              ...(trigger.kind === "lead_request" ? [
+                "The lead requested an owner decision. The authoritative frozen completion contract still has unmet milestones:",
+                "",
+                `Lead reason (untrusted display): ${escapeInline(trigger.reason)}`,
+              ] : [
+                "This run signalled done, but the frozen completion contract still has unmet milestones.",
+                "Repeated completion attempts made no progress:",
+              ]),
               "",
               milestoneLines,
               "",
-              "Continue with guidance (tell it how to finish), or let it park for a later decision?",
+              "This question persists for an owner decision; if the live window expires, the run is held.",
+              "Continue with guidance to finish the remaining work. An ordinary answer in this box is guidance only: it defers or waives nothing.",
+              "For a scope decision, use the run view or the CLI. Only the API applies these decisions:",
+              'uzi run decide <id> --continue [--guidance "<text>"]',
+              'uzi run decide <id> --partial m1,m2 --reason "<why>"',
+              "Partial keeps the exact milestone IDs you select; the nonclosing PR lists the deferred remainder.",
+              'uzi run decide <id> --accept m2.c1,m2.c3 --reason "<why>"',
+              "Accept uses exact criterion IDs shown in the run view or uzi run get. It waives those criteria as met, not deferred; normal closing remains possible if otherwise eligible.",
+              "Decisions do not promise publication or override the remaining checks.",
             ].join("\n"),
           },
         ],
@@ -18783,7 +18805,8 @@ export class RunRunner {
       });
       return { outcome: "expired" };
     }
-    runLog.info("completion question: awaiting owner continue decision", {
+    runLog.info("completion question: awaiting owner decision", {
+      trigger: trigger.kind,
       run_id: runId,
       question_id: questionId,
     });

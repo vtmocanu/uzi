@@ -5,7 +5,13 @@ import type { Milestone } from "./protocol.js";
 // attempt counts as streak 1; a changed fingerprint starts a new streak.
 export const STALL_LIMIT = 3;
 
+export type CompletionQuestionTrigger =
+  | { kind: "lead_request"; reason: string }
+  | { kind: "no_progress" };
+
 // Static, content-free reasons safe to persist on the legacy throw fallback.
+export const REASON_COMPLETION_LEAD_REQUESTED =
+  "completion blocked: the lead requested an owner decision while the frozen completion contract still has unmet milestones. Held for an owner decision rather than shipping an incomplete run.";
 export const REASON_COMPLETION_NO_PROGRESS =
   "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.";
 export const REASON_COMPLETION_BUDGET_EXHAUSTED =

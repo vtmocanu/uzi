@@ -716,7 +716,7 @@ export interface RunContext {
    *  path. */
   enterCompletionHold?(reason: string): Promise<boolean>;
   /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
-   *  ONLY (STALL_LIMIT identical no-progress completion attempts) INSTEAD of routing straight to the
+   *  or on an eligible lead request with authoritative unmet milestones, instead of routing straight to the
    *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
    *  `completion_question` so the api stamps runs.completion_question_at and the owner
    *  continue-decision endpoint resolves THIS question), then awaits the owner's continue decision
@@ -733,6 +733,7 @@ export interface RunContext {
    *  exactly as M4 behaved. Only reached on an interlocked run (see completionInterlock). */
   askCompletionQuestion?(
     unmet: string[],
+    trigger?: import("./completion-attempt.js").CompletionQuestionTrigger,
   ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }>;
 }
 

@@ -10838,6 +10838,167 @@ describe("approved m1 Codex resume reconciliation", () => {
 });
 
 describe("Codex completion interlock", () => {
+  it("issue3089 m1 Codex request clears across turns and reason stays out of rework", async () => {
+    const rig = makeMultiEpochRig([0, 1, 2].map(n => epochResponder("th-" + n, "tn-" + n, (t, th, tn) => {
+      t.push(toolCall(1, "signal_done", n === 0 ? {
+        owner_decision_requested: { reason: "PRIVATE reason" },
+      } : {}, th, tn, "request-" + n)).push(turnCompleted("completed", th, tn));
+    })));
+    let attempts = 0;
+    let questions = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", interactive: false, completionInterlock: true,
+      recordCompletionAttempt: async () => ({ unmet: ++attempts === 3 ? [] : ["m1"], attemptCount: attempts }),
+      askCompletionQuestion: async () => { questions++; return { outcome: "continue", guidance: "finish it" }; },
+    });
+    const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    assert.equal(result.completionHeld, undefined);
+    assert.equal(attempts, 3);
+    assert.equal(questions, 1);
+    for (const epoch of rig.epochs.slice(1)) {
+      const turn = epoch.transport.requests.find(r => r.method === "turn/start")!;
+      assert.ok(!JSON.stringify(turn.params).includes("PRIVATE reason"));
+    }
+  });
+  for (const mode of ["eligible", "legacy", "interactive", "task", "prompt", "ci_fix", "self_improve"] as const) {
+    it(`issue3089 m1 Codex per-run advertisement and malformed admission on ${mode}`, async () => {
+      const eligible = mode === "eligible";
+      let attempts = 0;
+      const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", { owner_decision_requested: null }, th, tn, "malformed"));
+        if (eligible) t.push(toolCall(2, "signal_done", {}, th, tn, "corrected"));
+        t.push(turnCompleted("completed", th, tn));
+      })]);
+      const { ctx } = makeCtx({
+        kind: mode === "eligible" || mode === "legacy" || mode === "interactive" ? "issue" : mode,
+        interactive: mode === "interactive", completionInterlock: mode !== "legacy",
+        recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+      });
+      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      assert.equal(result.completionHeld, undefined);
+      assert.equal(attempts, eligible ? 1 : 0);
+      const start = rig.epochs[0]!.transport.requests.find(r => r.method === "thread/start")!;
+      const tools = (start.params as { dynamicTools: { name: string; inputSchema: { properties: Record<string, unknown> } }[] }).dynamicTools;
+      assert.equal(Boolean(tools.find(t => t.name === "signal_done")!.inputSchema.properties.owner_decision_requested), eligible);
+    });
+  }
+  for (const scenario of ["checkpoint cancel", "fingerprint cancel", "attempt cancel", "question cancel",
+    "budget", "final iteration", "wall", "pause", "budget before pause", "question pause", "question budget", "pending milestone", "optional seams", "unwired"] as const) {
+    it(`issue3089 m1 Codex boundary ${scenario}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", {
+          owner_decision_requested: { reason: "PRIVATE reason" },
+        }, th, tn, "owner-boundary")).push(turnCompleted("completed", th, tn));
+      })]);
+      let cancelled = false;
+      let attempts = 0;
+      let asked = false;
+      let paused = false;
+      const holds: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", interactive: false, completionInterlock: true,
+        config: { max_iterations: scenario === "final iteration" ? 1 : 10 },
+        frozenMilestones: [{ id: "m1", title: "Remaining" }],
+        cancelRequested: () => cancelled,
+        checkpoint: async () => { if (scenario === "checkpoint cancel") cancelled = true; },
+        worktreeFingerprint: async () => {
+          if (scenario === "fingerprint cancel") cancelled = true;
+          return "TIP";
+        },
+        recordCompletionAttempt: async () => {
+          attempts++;
+          if (scenario === "attempt cancel") cancelled = true;
+          return { unmet: ["m1"], attemptCount: attempts };
+        },
+        reportIteration: async () => attempts ? {
+          budgetExhausted: scenario === "budget" || scenario === "budget before pause" || (scenario === "question budget" && asked),
+          pauseRequested: scenario === "pause" || scenario === "budget before pause" || (scenario === "question pause" && asked),
+        } : undefined,
+        pauseModeRequested: () => scenario === "wall" && attempts ? "wall" : scenario === "question pause" && asked ? "now" : scenario === "pending milestone" && attempts ? "milestone" : null,
+        parkForPause: async () => { paused = true; return true; },
+        askCompletionQuestion: async (_unmet, trigger) => {
+          asked = true;
+          assert.deepEqual(trigger, { kind: "lead_request", reason: "PRIVATE reason" });
+          if (scenario === "question cancel") cancelled = true;
+          return scenario === "question budget" ? { outcome: "continue" } : { outcome: "expired" };
+        },
+        enterCompletionHold: async reason => { holds.push(reason); return true; },
+      });
+      if (scenario === "unwired") delete ctx.askCompletionQuestion;
+      if (scenario === "optional seams") { delete ctx.reportIteration; delete ctx.checkpoint; delete ctx.worktreeFingerprint; }
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (scenario.includes("cancel")) {
+        await assert.rejects(running, /run cancelled/);
+        assert.deepEqual(holds, []);
+        if (scenario === "checkpoint cancel" || scenario === "fingerprint cancel") assert.equal(attempts, 0);
+      } else {
+        const result = await running;
+        if (scenario === "pause" || scenario === "question pause") {
+          assert.equal(paused, true);
+          assert.ok(result.pausedAt);
+          assert.deepEqual(holds, []);
+        } else {
+          assert.ok(result.completionHeld);
+          assert.match(result.completionHeld.reason, scenario === "final iteration" ? /iteration/ :
+            scenario === "wall" ? /wall/ : scenario.includes("budget") ? /budget exhausted/ : /lead requested/);
+          assert.doesNotMatch(result.completionHeld.reason, /PRIVATE|repeated completion attempts/);
+        }
+        assert.equal(asked, scenario.startsWith("question") || scenario === "pending milestone" || scenario === "optional seams");
+        assert.equal(rig.providerLaunches(), 1);
+      }
+    });
+  }
+
+  for (const satisfied of [false, true]) {
+    it(`issue3089 Codex owner decision request ${satisfied ? "finalizes when satisfied" : "asks on the first attempt"}`, async () => {
+      const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(1, "signal_done", {
+          owner_decision_requested: { reason: "Owner wants to defer" },
+        }, th, tn, "owner-decision-done")).push(turnCompleted("completed", th, tn));
+      })]);
+      const order: string[] = [];
+      const questions: string[][] = [];
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", interactive: false, completionInterlock: true,
+        config: { max_iterations: 10 },
+        frozenMilestones: [{ id: "m1", title: "Remaining work" }],
+        checkpoint: async (opts) => {
+          assert.equal(opts.sink, "done_checkpoint");
+          order.push("checkpoint");
+        },
+        recordCompletionAttempt: async ({ declared }) => {
+          order.push("attempt");
+          assert.deepEqual(declared, [],
+            "requesting a decision does not declare the remaining milestone complete");
+          return { unmet: satisfied ? [] : ["m1"], attemptCount: ++attempts };
+        },
+        askCompletionQuestion: async (unmet) => {
+          order.push("askQuestion");
+          questions.push(unmet);
+          return { outcome: "expired" };
+        },
+        enterCompletionHold: async () => { order.push("hold"); return true; },
+        // Bound the unfixed path at the next ACK, without a second provider epoch
+        // or a timer. Asking only after repeated attempts must not pass this test.
+        reportIteration: async (n) => n >= 2 ? { budgetExhausted: true } : undefined,
+      });
+
+      const result = await withTimeout(
+        makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "issue3089 first owner window");
+
+      assert.deepEqual(questions, satisfied ? [] : [["m1"]],
+        "an explicit owner decision request asks immediately iff authoritative unmet is nonempty");
+      assert.deepEqual(order, satisfied
+        ? ["checkpoint", "attempt"]
+        : ["checkpoint", "attempt", "askQuestion", "hold"]);
+      assert.equal(attempts, 1, "no retry-to-stall before asking");
+      assert.equal(rig.providerLaunches(), 1, "no additional epoch before the owner window");
+      assert.equal(rig.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(Boolean(result.completionHeld), !satisfied);
+    });
+  }
+
   for (const scenario of [
     { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },
     { name: "overshoot", ack: { scopeCeiling: 1, completedCount: 2 }, capped: 2 },

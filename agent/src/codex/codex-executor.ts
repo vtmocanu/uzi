@@ -79,6 +79,7 @@ import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
   completionAttemptFingerprint,
   updateCompletionStreak,
@@ -3444,12 +3445,15 @@ export class CodexExecutor implements Executor {
           reapedSinceLastPersist = true;
           await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const { unmet } = await ctx.recordCompletionAttempt!({
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
           });
           completionAttempted = true;
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           if (unmet.length === 0) {
             const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
             if (codeDecision?.action === "repair") {
@@ -3463,18 +3467,57 @@ export class CodexExecutor implements Executor {
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;
           let guidance: string | undefined;
-          if (completionStallStreak >= STALL_LIMIT) {
-            const decision = await ctx.askCompletionQuestion?.(unmet);
+          const leadRequest = result.ownerDecisionRequested;
+          const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
+            if (!leadRequest) return false;
+            const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
+            liftWall(wall, fresh?.totalWallSeconds ?? fresh?.wallSeconds);
+            // Preserve Codex's budget-before-pause precedence.
+            const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
+              : iteration >= maxIterations ? REASON_MAX_ITERATIONS
+              : wall.remainingMs <= 0 || ctx.pauseModeRequested?.() === "wall" ? REASON_WALL : undefined;
+            if (bound) {
+              if (await routeHold(bound, true)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: bound };
+                return true;
+              }
+              throw new Error(bound);
+            }
+            if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
+              const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+              const pauseToken = pauseNow.capture();
+              if (await this.requestPause(ctx, at)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                pausedAt = at;
+                return true;
+              }
+              pauseNow.consume(pauseToken);
+            }
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            return false;
+          };
+          if (await checkRequestBoundary()) break;
+          if (leadRequest || completionStallStreak >= STALL_LIMIT) {
+            const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
+            const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
+              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            // A timeout keeps the question open; do not report running to resolve it.
+            if (await checkRequestBoundary(decision?.outcome === "continue")) break;
             if (decision?.outcome === "continue") {
               guidance = decision.guidance;
               lastCompletionFingerprint = undefined;
               completionStallStreak = 0;
             } else {
-              if (await routeHold(REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
-                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+              if (await routeHold(holdReason, completionAttempted)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: holdReason };
                 break;
               }
-              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+              throw new Error(holdReason);
             }
           }
           completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
@@ -4707,6 +4750,7 @@ export class CodexExecutor implements Executor {
       prompt,
       systemPrompt,
       phase,
+      ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
       nonInteractiveIssue: parkRunEligible(ctx, phase),
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),

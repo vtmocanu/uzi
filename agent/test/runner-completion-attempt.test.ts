@@ -12,8 +12,9 @@ import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 // PRD #1226 M3: the checkpoint-first same-lead completion attempt loop + post-attempt failure
 // routing. The SDK boundary is faked (queryFn), and the completion seams
 // (recordCompletionAttempt / enterCompletionHold / checkpoint / worktreeFingerprint) are injected
-// mocks, so the loop's routing is provable with no network and no live SDK. signal_done is scripted
-// as an MCP tool_use block the executor observes in the stream.
+// mocks, so the loop's routing is provable with no network and no live model. Most tests script
+// signal_done as a tool_use block; the integrated SDK admission tests also call the executor's
+// actual in-process MCP server through JSON-RPC before streaming those frames.
 
 const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
@@ -69,6 +70,54 @@ function fakeTurns(scripts: Script[]): { queryFn: SdkQueryFn; turns: Turn[] } {
     })();
   };
   return { queryFn, turns };
+}
+
+// Exercise the executor-provided SDK server, without a transitive MCP dependency.
+// Resolve replies from send() rather than polling or sleeping.
+async function connectSignalRpc(server: unknown) {
+  type Message = Record<string, unknown>;
+  const pending = new Map<number, (message: Message) => void>();
+  const transport: {
+    start(): Promise<void>;
+    send(message: Message): Promise<void>;
+    close(): Promise<void>;
+    onmessage?: (message: Message) => void;
+    onclose?: () => void;
+  } = {
+    async start() {},
+    async send(message) {
+      const id = message.id;
+      if (typeof id === "number") {
+        pending.get(id)?.(message);
+        pending.delete(id);
+      }
+    },
+    async close() { transport.onclose?.(); },
+  };
+  const instance = (server as {
+    instance: { connect(transport: unknown): Promise<void>; close(): Promise<void> };
+  }).instance;
+  let nextId = 0;
+  const request = (method: string, params: Message): Promise<Message> => {
+    const id = ++nextId;
+    return new Promise(resolve => {
+      pending.set(id, resolve);
+      transport.onmessage!({ jsonrpc: "2.0", id, method, params });
+    });
+  };
+  try {
+    await instance.connect(transport);
+    const initialized = await request("initialize", {
+      protocolVersion: "2025-06-18", capabilities: {},
+      clientInfo: { name: "runner-completion-attempt-test", version: "0" },
+    });
+    assert.equal(initialized.error, undefined);
+    transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
+    return { request, close: () => instance.close() };
+  } catch (error) {
+    await instance.close();
+    throw error;
+  }
 }
 
 function hangUntilAbort(signal: AbortSignal): AsyncIterable<unknown> {
@@ -329,7 +378,248 @@ describe("approved m1 resume reconciliation", () => {
   }
 });
 
+describe("issue3089 m1 integrated SDK completion admission", () => {
+  it("rejects malformed then admits corrected tools/call into the first owner window", async () => {
+    const probe = makeCompletionCtx({
+      unmetScript: [["m1"]], askQuestionScript: [{ outcome: "expired" }],
+      budgetExhaustedFromIteration: 2,
+    });
+    Object.assign(probe.ctx, {
+      kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "plan", sessionId: "sess-1",
+      frozenMilestones: [
+        { id: "m1", title: "Remaining work" }, { id: "m2", title: "Delivered work" },
+      ],
+    });
+    const question = probe.ctx.askCompletionQuestion!;
+    probe.ctx.askCompletionQuestion = async (unmet, trigger) => {
+      assert.deepEqual(trigger, { kind: "lead_request", reason: "Owner wants to defer" });
+      return question(unmet, trigger);
+    };
+    let queries = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      queries++;
+      assert.equal(queries, 1, "the owner window precedes a second SDK query");
+      for await (const _ of params.prompt) { /* consume the actual implement prompt */ }
+      const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
+      try {
+        const listed = await rpc.request("tools/list", {});
+        assert.equal(listed.error, undefined);
+        const tools = (listed.result as { tools: {
+          name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] };
+        }[] }).tools;
+        const schema = tools.find(tool => tool.name === "signal_done")!.inputSchema;
+        assert.ok(schema.properties.owner_decision_requested, "actual run advertises the request");
+        assert.ok(!schema.required?.includes("owner_decision_requested"));
+        const rejected = {
+          owner_decision_requested: { reason: " " },
+          milestones_completed: ["m1"], summary: "REJECTED companion prose",
+          prd_done_path: "prds/done/rejected.md",
+          proposal: { title: "REJECTED", body: "REJECTED" },
+          pr_summary: { what: "REJECTED" }, non_closing: { reason: "REJECTED" },
+        };
+        const denied = await rpc.request("tools/call", { name: "signal_done", arguments: rejected });
+        assert.equal(denied.error, undefined);
+        assert.equal((denied.result as { isError?: boolean }).isError, true);
+        yield signalDone(rejected);
+        assert.deepEqual(probe.order, [], "rejected frame cannot checkpoint or attempt completion");
+        assert.deepEqual(probe.askQuestionCalls, []);
+        const accepted = {
+          owner_decision_requested: { reason: "  Owner wants to defer  " },
+          milestones_completed: ["m2"],
+        };
+        const admitted = await rpc.request("tools/call", { name: "signal_done", arguments: accepted });
+        assert.equal(admitted.error, undefined);
+        const ack = admitted.result as { isError?: boolean; content: unknown[] };
+        assert.notEqual(ack.isError, true);
+        assert.ok(ack.content.length > 0, "real SDK handler acknowledges corrected request");
+        yield signalDone(accepted);
+        yield resultSuccess();
+      } finally {
+        await rpc.close();
+      }
+    })();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(queries, 1);
+    assert.deepEqual(probe.order, ["checkpoint", "attempt", "askQuestion", "hold"]);
+    assert.deepEqual(probe.askQuestionCalls, [["m1"]]);
+    assert.equal(probe.attemptCalls.length, 1);
+    assert.deepEqual(probe.attemptCalls[0]!.declared, ["m2"], "rejected m1 declaration never accepted");
+    assert.deepEqual(result.milestonesCompleted, ["m2"]);
+    for (const key of ["summary", "prdDonePath", "proposal", "prSummary", "nonClosing"] as const) {
+      assert.equal(result[key], undefined, `rejected companion ${key} never accepted`);
+    }
+    assert.ok(result.completionHeld);
+    assert.doesNotMatch(JSON.stringify(result), /REJECTED/);
+  });
+
+  for (const mode of ["legacy", "interactive", "task", "prompt", "ci_fix", "self_improve"] as const) {
+    it(`omits request in actual per-run tools/list for ${mode}`, async () => {
+      const probe = makeCompletionCtx();
+      Object.assign(probe.ctx, {
+        kind: mode === "legacy" || mode === "interactive" ? "issue" : mode,
+        completionInterlock: mode !== "legacy", interactive: mode === "interactive",
+        planApproved: true, approvedPlan: "plan", sessionId: "sess-1",
+      });
+      let listings = 0;
+      const queryFn: SdkQueryFn = params => (async function* () {
+        for await (const _ of params.prompt) { /* consume the actual implement prompt */ }
+        const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
+        try {
+          const listed = await rpc.request("tools/list", {});
+          assert.equal(listed.error, undefined);
+          const tools = (listed.result as { tools: {
+            name: string; inputSchema: { properties: Record<string, unknown> };
+          }[] }).tools;
+          const schema = tools.find(tool => tool.name === "signal_done")!.inputSchema;
+          assert.equal(schema.properties.owner_decision_requested, undefined);
+          listings++;
+          const called = await rpc.request("tools/call", { name: "signal_done", arguments: {} });
+          assert.equal(called.error, undefined);
+          assert.notEqual((called.result as { isError?: boolean }).isError, true);
+          yield signalDone();
+          yield resultSuccess();
+        } finally {
+          await rpc.close();
+        }
+      })();
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(listings, 1, "inspected the server supplied to the actual query");
+      assert.deepEqual(probe.askQuestionCalls, []);
+    });
+  }
+});
+
 describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
+  it("issue3089 m1 Claude request clears across turns and reason stays out of rework", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [signalDone({ owner_decision_requested: { reason: "PRIVATE reason" } }), resultSuccess()],
+      [signalDone(), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCompletionCtx({ unmetScript: [["m1"], ["m1"], []],
+      askQuestionScript: [{ outcome: "continue", guidance: "finish it" }] });
+    Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "plan", sessionId: "sess-1" });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(result.completionHeld, undefined);
+    assert.equal(probe.attemptCalls.length, 3);
+    assert.deepEqual(probe.askQuestionCalls, [["m1"]], "later plain done does not reuse request");
+    for (const turn of turns.slice(1)) assert.ok(!turn.promptText!.includes("PRIVATE reason"));
+  });
+  for (const mode of ["legacy", "interactive", "task", "prompt", "ci_fix", "self_improve"] as const) {
+    it(`issue3089 m1 Claude ignores unadvertised malformed request on ${mode}`, async () => {
+      const { queryFn } = fakeTurns([[signalDone({ owner_decision_requested: null }), resultSuccess()]]);
+      const probe = makeCompletionCtx();
+      Object.assign(probe.ctx, { kind: mode === "legacy" || mode === "interactive" ? "issue" : mode,
+        completionInterlock: mode !== "legacy", interactive: mode === "interactive",
+        planApproved: true, approvedPlan: "plan", sessionId: "sess-1" });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(result.completionHeld, undefined);
+      assert.deepEqual(probe.attemptCalls, []);
+    });
+  }
+  for (const scenario of ["checkpoint cancel", "fingerprint cancel", "attempt cancel", "question cancel",
+    "budget", "final iteration", "wall", "pause", "pause before budget", "question pause", "question budget", "pending milestone", "optional seams", "unwired"] as const) {
+    it(`issue3089 m1 Claude boundary ${scenario}`, async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone({
+        owner_decision_requested: { reason: "PRIVATE reason" },
+      }), resultSuccess()]]);
+      const probe = makeCompletionCtx({ unmetScript: [["m1"]],
+        config: { max_iterations: scenario === "final iteration" ? 1 : 10 },
+        askQuestionScript: [{ outcome: "expired" }] });
+      Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+        approvedPlan: "plan", sessionId: "sess-1" });
+      let cancelled = false;
+      let asked = false;
+      let paused = false;
+      probe.ctx.cancelRequested = () => cancelled;
+      const checkpoint = probe.ctx.checkpoint!;
+      probe.ctx.checkpoint = async args => {
+        await checkpoint(args);
+        if (scenario === "checkpoint cancel") cancelled = true;
+      };
+      probe.ctx.worktreeFingerprint = async () => {
+        if (scenario === "fingerprint cancel") cancelled = true;
+        return "TIP";
+      };
+      const attempt = probe.ctx.recordCompletionAttempt!;
+      probe.ctx.recordCompletionAttempt = async args => {
+        const result = await attempt(args);
+        if (scenario === "attempt cancel") cancelled = true;
+        return result;
+      };
+      probe.ctx.reportIteration = async () => probe.attemptCalls.length ? {
+        budgetExhausted: scenario === "budget" || scenario === "pause before budget" || (scenario === "question budget" && asked),
+        pauseRequested: scenario === "pause" || scenario === "pause before budget" || (scenario === "question pause" && asked),
+      } : undefined;
+      probe.ctx.pauseModeRequested = () => scenario === "wall" && probe.attemptCalls.length ? "wall" : scenario === "question pause" && asked ? "now" : scenario === "pending milestone" && probe.attemptCalls.length ? "milestone" : null;
+      probe.ctx.parkForPause = async () => { paused = true; return true; };
+      const question = probe.ctx.askCompletionQuestion!;
+      probe.ctx.askCompletionQuestion = async (unmet, trigger) => {
+        asked = true;
+        assert.deepEqual(trigger, { kind: "lead_request", reason: "PRIVATE reason" });
+        if (scenario === "question cancel") cancelled = true;
+        return scenario === "question budget" ? { outcome: "continue" } : question(unmet, trigger);
+      };
+      if (scenario === "unwired") delete probe.ctx.askCompletionQuestion;
+      if (scenario === "optional seams") { delete probe.ctx.reportIteration; delete probe.ctx.checkpoint; delete probe.ctx.worktreeFingerprint; }
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      if (scenario.includes("cancel")) {
+        await assert.rejects(running, /run cancelled/);
+        assert.deepEqual(probe.holdReasons, []);
+        if (scenario === "checkpoint cancel" || scenario === "fingerprint cancel") assert.equal(probe.attemptCalls.length, 0);
+      } else {
+        const result = await running;
+        assert.equal(turns.length, 1);
+        if (scenario.includes("pause")) {
+          assert.equal(paused, true);
+          assert.ok(result.pausedAt);
+          assert.deepEqual(probe.holdReasons, []);
+        } else {
+          assert.ok(result.completionHeld);
+          assert.match(result.completionHeld.reason, scenario === "final iteration" ? /iteration/ :
+            scenario === "wall" ? /wall/ : scenario.includes("budget") ? /budget exhausted/ : /lead requested/);
+          assert.doesNotMatch(result.completionHeld.reason, /PRIVATE|repeated completion attempts/);
+        }
+        assert.equal(asked, scenario.startsWith("question") || scenario === "pending milestone" || scenario === "optional seams");
+      }
+    });
+  }
+
+  for (const satisfied of [false, true]) {
+    it(`issue3089 Claude owner decision request ${satisfied ? "finalizes when satisfied" : "asks on the first attempt"}`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [signalDone({
+          owner_decision_requested: { reason: "Owner wants to defer" },
+        }), resultSuccess()],
+      ]);
+      const probe = makeCompletionCtx({
+        unmetScript: [satisfied ? [] : ["m1"]],
+        askQuestionScript: [{ outcome: "expired" }],
+        // Baseline ignores the new field. Stop at the next ACK rather than
+        // reaching three attempts (which would conceal the missing first window).
+        budgetExhaustedFromIteration: 2,
+      });
+      Object.assign(probe.ctx, {
+        kind: "issue", interactive: false, planApproved: true, approvedPlan: "plan", sessionId: "sess-1",
+        frozenMilestones: [{ id: "m1", title: "Remaining work" }],
+      });
+
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+
+      assert.deepStrictEqual(probe.askQuestionCalls, satisfied ? [] : [["m1"]],
+        "an explicit owner decision request asks immediately iff authoritative unmet is nonempty");
+      assert.deepStrictEqual(probe.order, satisfied
+        ? ["checkpoint", "attempt"]
+        : ["checkpoint", "attempt", "askQuestion", "hold"]);
+      assert.strictEqual(probe.attemptCalls.length, 1, "no retry-to-stall before asking");
+      assert.deepStrictEqual(probe.attemptCalls[0]!.declared, [],
+        "requesting a decision does not declare the remaining milestone complete");
+      assert.strictEqual(turns.length, 1, "no additional SDK query before the owner window");
+      assert.strictEqual(Boolean(result.completionHeld), !satisfied);
+    });
+  }
+
   it("(a) checkpoints BEFORE the attempt, passing the declaration + head from the worktree fingerprint", async () => {
     const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone({ milestones_completed: ["m1"] }), resultSuccess()]]);
     const probe = makeCompletionCtx({ unmetScript: [[]] }); // empty unmet → finalize after one attempt

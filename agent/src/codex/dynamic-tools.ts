@@ -28,7 +28,8 @@ function objectSchema(
   };
 }
 
-function definition(name: string, isRoot: boolean): Omit<CodexDynamicToolSpec, "type" | "name"> {
+function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec, "type" | "name"> {
+  const isRoot = grants.isRoot;
   switch (name) {
     case CODE_DISPOSITIONS_TOOL:
       return {
@@ -115,8 +116,13 @@ function definition(name: string, isRoot: boolean): Omit<CodexDynamicToolSpec, "
       };
     case "signal_done":
       return {
-        description: "Signal that the root run has completed its current task.",
+        description: "Submit a completion attempt for worker checks and delivery or an owner decision handoff. A request does not defer or waive work.",
         inputSchema: objectSchema({
+          ...(grants.isRoot && grants.ownerDecisionRequested ? {
+            owner_decision_requested: objectSchema({
+              reason: { type: "string", description: "1–500 Unicode code points after trimming; no scope selectors." },
+            }, ["reason"], false),
+          } : {}),
           summary: STRING,
           report_only: { type: "boolean" },
           non_closing: {
@@ -265,7 +271,7 @@ export function buildCodexDynamicTools(grants: RunGrants): readonly CodexDynamic
     .filter((entry): entry is { canonical: string; wire: string } => entry.wire !== undefined)
     .sort((a, b) => a.wire < b.wire ? -1 : a.wire > b.wire ? 1 : 0)
     .map(({ canonical, wire }): CodexDynamicToolSpec => {
-      const spec = definition(canonical, grants.isRoot);
+      const spec = definition(canonical, grants);
       if (canonical === "Skill") {
         const skills = [...grants.allowedSkills].sort();
         return { type: "function", name: wire, ...spec, description: `${spec.description} ${skills.length > 0
