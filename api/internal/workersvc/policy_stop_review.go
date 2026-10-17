@@ -120,7 +120,7 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		return bad()
 	}
 	completed, err := DecodeMilestoneIDs(r.MilestonesCompleted)
-	if err != nil || len(completed) == 0 || len(completed) > math.MaxInt32 {
+	if err != nil || len(completed) == 0 {
 		return bad()
 	}
 	members := map[string]bool{}
@@ -170,7 +170,11 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		}
 		wp.WitnessClaimGeneration = &v
 	}
-	execution := apitypes.PolicyStopExecution{Contract: contract, Frozen: frozen, CompletedIDs: completed, ProposedCeiling: int32(len(completed))}
+	completedCount := len(completed)
+	if completedCount < 1 || completedCount > math.MaxInt32 {
+		return bad()
+	}
+	execution := apitypes.PolicyStopExecution{Contract: contract, Frozen: frozen, CompletedIDs: completed, ProposedCeiling: int32(completedCount)}
 	if r.ScopeCeiling.Valid {
 		v := r.ScopeCeiling.Int32
 		if v < 0 {
