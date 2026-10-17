@@ -103,7 +103,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 	case "limit_wait":
 		return fmt.Sprintf("retry_not_before %s gates promotion; limit reset %s is informational; owner may inspect or resume; no roll time promised", blockerTime(r.RetryNotBefore), blockerTime(r.LimitResetsAt))
 	case "recovery_wait":
-		return fmt.Sprintf("recorded recovery cause %s; retry %s; owner makes the recovery decision", blockerFact(r.RecoveryWaitCause), blockerTime(r.RecoveryRetryNotBefore))
+		action := "owner action if needed: inspect run"
+		if r.RecoveryWaitCause.Valid && r.RecoveryWaitCause.String == recoveryCauseVaultLocked {
+			action = "owner unlocks the vault"
+		}
+		return fmt.Sprintf("automatic retry not before %s; recorded cause %s; %s", blockerTime(r.RecoveryRetryNotBefore), blockerFact(r.RecoveryWaitCause), action)
 	case "queued":
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:

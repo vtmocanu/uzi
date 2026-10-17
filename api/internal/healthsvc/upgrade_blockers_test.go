@@ -182,7 +182,7 @@ func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
 			if status == "queued" && !strings.Contains(v, "exact fence unavailable, inspect run") {
 				t.Fatal(v)
 			}
-			if status == "recovery_wait" && !strings.Contains(v, "owner makes the recovery decision") {
+			if status == "recovery_wait" && !strings.Contains(v, "automatic retry not before") {
 				t.Fatal(v)
 			}
 		})

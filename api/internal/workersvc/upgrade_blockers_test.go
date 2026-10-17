@@ -21,7 +21,7 @@ func TestUpgradeBlockerStatuses(t *testing.T) {
 		{"paused", "owner resumes"},
 		{"claimed", "run must finish"}, {"running", "run must finish"},
 		{"pool_wait", "a pooled token becomes spendable, or the owner adds or selects a usable token / runs `uzi run resume-now`"},
-		{"limit_wait", "gates promotion"}, {"recovery_wait", "owner makes the recovery decision"},
+		{"limit_wait", "gates promotion"}, {"recovery_wait", "automatic retry not before"},
 		{"queued", "exact fence unavailable, inspect run"}, {"new_status", "releasing action unavailable"},
 	}
 	for _, tc := range tests {
@@ -46,6 +46,21 @@ func TestUpgradeBlockerStatuses(t *testing.T) {
 			}
 			if tc.status == "recovery_wait" && !strings.Contains(got, "forge_unreachable") {
 				t.Fatal(got)
+			}
+		})
+	}
+}
+
+func TestUpgradeBlockerRecoveryRetryActions(t *testing.T) {
+	for _, cause := range []string{"", "vault_locked", "forge_unreachable"} {
+		t.Run(cause, func(t *testing.T) {
+			row := store.ListWorkerUpgradeBlockersRow{Status: blockerText("recovery_wait"), RecoveryWaitCause: blockerText(cause)}
+			action := blockerAction(row)
+			if !strings.Contains(action, "automatic retry") || strings.Contains(action, "owner makes the recovery decision") {
+				t.Fatalf("recovery wait misstates automatic retry: %s", action)
+			}
+			if cause == "vault_locked" && !strings.Contains(action, "owner unlocks the vault") {
+				t.Fatalf("missing known owner action: %s", action)
 			}
 		})
 	}
