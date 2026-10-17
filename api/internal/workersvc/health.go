@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -126,10 +128,11 @@ const (
 	reasonHandoffSetup = "handoff setup has not finished"
 	// reasonStaleRequeuePinPrefix (issue #2705) opens the queued reason for a run the stale-worker
 	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
-	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
-	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
+	// siblings it embeds values (the deadline and the worker name). isStaleRequeuePinReason
+	// matches its fixed segments; ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
 	// the same literal in SQL (pinned in sync by a workersvc test,
-	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). No other reason starts with it.
+	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). The fixed previous-worker
+	// segment and terminal suffix distinguish it from the code cross-check wait.
 	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
@@ -308,10 +311,11 @@ const (
 	// pendingOutcomeFlagHeartbeats heartbeat intervals. It maps to the SAME healthStalled enum as
 	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
 	// fail or discard. Same fixed-string contract as its siblings.
-	reasonOutcomeUndelivered    = "the run's outcome is journaled on its worker but has not been delivered"
-	reasonPlanCrossCheckWaiting = "waiting for plan cross-check"
-	reasonNoCrossCheckWorker    = "no eligible cross-check worker"
-	reasonCrossCheckSlotsBusy   = "waiting for a cross-check slot"
+	reasonOutcomeUndelivered          = "the run's outcome is journaled on its worker but has not been delivered"
+	reasonCodeCrossCheckWaitingSuffix = " for code cross-check"
+	reasonPlanCrossCheckWaiting       = "waiting for plan cross-check"
+	reasonNoCrossCheckWorker          = "no eligible cross-check worker"
+	reasonCrossCheckSlotsBusy         = "waiting for a cross-check slot"
 	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
 	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
 	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
@@ -468,10 +472,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if isStaleRequeuePinReason(reason) {
 			nudge = false
 		}
-		// A live plan cross-check is expected waiting. A worker-pickup nudge would
+		// A live plan or code cross-check is expected waiting. A worker-pickup nudge would
 		// describe its already-running lead incorrectly, even with no checker capacity.
 		// Preserve the existing notification stamp and cooldown for ordinary health episodes.
-		if reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
+		if isCodeCrossCheckWaitingReason(reason) || reason == reasonPlanCrossCheckWaiting || reason == reasonCrossCheckSlotsBusy || reason == reasonNoCrossCheckWorker {
 			nudge = false
 		}
 		since := healthSince(now, target, r)
@@ -581,8 +585,12 @@ type livePlanCrossCheckReader interface {
 	HasLivePlanCrossCheck(context.Context, uuid.UUID) (bool, error)
 }
 
+type liveCodeCrossCheckReader interface {
+	GetLiveCodeCrossCheckDeadline(context.Context, store.GetLiveCodeCrossCheckDeadlineParams) (pgtype.Timestamptz, error)
+}
+
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > live plan cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
+// tool-looping > live plan cross-check > live code cross-check > stalled > long tool call > near-timeout (Decision 3, extended by
 // PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
 // pathology, and near-timeout is a budget-relative backstop that must not mask a
 // more specific signal.
@@ -656,6 +664,19 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				}
 				return healthWaitingWorker, reasonPlanCrossCheckWaiting
 			}
+		}
+	}
+
+	if reader, ok := s.q.(liveCodeCrossCheckReader); ok {
+		deadline, err := reader.GetLiveCodeCrossCheckDeadline(ctx, store.GetLiveCodeCrossCheckDeadlineParams{
+			LeadRunID: r.ID, ServerNow: pgconv.Time(now),
+		})
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.Error("health: read live code cross-check", "run_id", r.ID, "error", err)
+			}
+		} else if deadline.Valid && deadline.InfinityModifier == pgtype.Finite && deadline.Time.After(now) {
+			return healthWaitingWorker, "waiting until " + deadline.Time.UTC().Format(time.RFC3339) + reasonCodeCrossCheckWaitingSuffix
 		}
 	}
 
@@ -1758,9 +1779,15 @@ func staleRequeuePinReason(until time.Time, workerName string) string {
 }
 
 // isStaleRequeuePinReason reports whether a stored health reason is the stale-requeue pin
-// explanation. Prefix-matched because the reason embeds the deadline and worker name.
+// explanation. Match the producer's fixed segments around its deadline and worker name.
 func isStaleRequeuePinReason(reason string) bool {
-	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix)
+	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
+		strings.Contains(reason, " for its previous worker") &&
+		strings.HasSuffix(reason, " to return; another worker may take it after that")
+}
+
+func isCodeCrossCheckWaitingReason(reason string) bool {
+	return strings.HasPrefix(reason, "waiting until ") && strings.HasSuffix(reason, reasonCodeCrossCheckWaitingSuffix)
 }
 
 // healthSince decides the health_since to write. It stamps now when a flag is raised
