@@ -587,8 +587,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// plan_approved is computed once here so both the PlanApproved field and the
 	// resume_phase derivation (PRD #1247 M5, D13) read the SAME value — see the payload
-	// literal for the full provenance of the three disjuncts.
-	planApproved := run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded
+	// literal for the full provenance of the three ordinary disjuncts. Constrained
+	// revision/source authority overrides them before resume phase selection.
+	planApproved := policyRevisionPlanApproved(ctx, s.q, run, run.AutoApprove || rc.HumanPlanApproved || run.PlanSource == planSourceSeeded)
 	// PRD #1247 M5, D13: the server-derived phase a resumed claim RESTORES instead of
 	// re-entering the planning turn. Empty for a fresh run (omitted by omitempty).
 	resumePhase := resumePhaseFor(run, planApproved)

@@ -885,10 +885,9 @@ func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run stor
 			if !errors.Is(err, pgx.ErrNoRows) || expected != nil || !refusable {
 				return SubmitInputResult{}, store.RunUserInput{}, err
 			}
-			// An unbound refusal on a refusable attempt is the #2680 source predicate (the
-			// unbound path has no other refusal besides a vanished run, which the re-read below
-			// tells apart). The re-read runs on every refusal, the last included, so a run that
-			// vanished or finished is classified as such rather than as source contention.
+			// Re-read an unbound refusal to distinguish the #2680 source predicate from
+			// accepted Stop, disappearance, or completion. Include the last attempt so
+			// none of these outcomes is misreported as source contention.
 			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
 			if gerr != nil {
 				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404

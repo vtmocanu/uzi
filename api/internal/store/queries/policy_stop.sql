@@ -6,6 +6,18 @@ WHERE run_id = $1 AND kind = 'revise_plan'
   AND disposition IS DISTINCT FROM 'superseded_by_stop'
 ORDER BY id;
 
+-- name: HasPolicyCurrentGateApproval :one
+-- The caller authenticates the current source, presentation and candidate, and
+-- proves absence of applicable pending revision before using this receipt.
+SELECT (EXISTS (
+    SELECT 1 FROM run_user_inputs
+    WHERE run_id = @run_id AND kind = 'approve_plan'
+      AND gate_binding = 'bound' AND gate_revision = @gate_revision::bigint
+      AND applied_at IS NOT NULL
+      AND disposition IS DISTINCT FROM 'superseded'
+      AND disposition IS DISTINCT FROM 'superseded_by_stop'
+))::boolean AS approved;
+
 -- name: GetPolicyStopCrossCheck :one
 SELECT * FROM cross_checks WHERE id = $1;
 

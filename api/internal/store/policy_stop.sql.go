@@ -290,6 +290,31 @@ func (q *Queries) GetPolicyStopCrossCheck(ctx context.Context, id uuid.UUID) (Cr
 	return i, err
 }
 
+const hasPolicyCurrentGateApproval = `-- name: HasPolicyCurrentGateApproval :one
+SELECT (EXISTS (
+    SELECT 1 FROM run_user_inputs
+    WHERE run_id = $1 AND kind = 'approve_plan'
+      AND gate_binding = 'bound' AND gate_revision = $2::bigint
+      AND applied_at IS NOT NULL
+      AND disposition IS DISTINCT FROM 'superseded'
+      AND disposition IS DISTINCT FROM 'superseded_by_stop'
+))::boolean AS approved
+`
+
+type HasPolicyCurrentGateApprovalParams struct {
+	RunID        uuid.UUID `json:"run_id"`
+	GateRevision int64     `json:"gate_revision"`
+}
+
+// The caller authenticates the current source, presentation and candidate, and
+// proves absence of applicable pending revision before using this receipt.
+func (q *Queries) HasPolicyCurrentGateApproval(ctx context.Context, arg HasPolicyCurrentGateApprovalParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasPolicyCurrentGateApproval, arg.RunID, arg.GateRevision)
+	var approved bool
+	err := row.Scan(&approved)
+	return approved, err
+}
+
 const listPolicyStopRevisionInputs = `-- name: ListPolicyStopRevisionInputs :many
 SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'revise_plan'
