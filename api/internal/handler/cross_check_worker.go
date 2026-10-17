@@ -344,9 +344,11 @@ func reconciliationResponse(seq int32, proof *workersvc.LeadReconciliation) lead
 }
 
 type workerReconciledStateAck struct {
-	Run              any `json:"run"`
-	CredentialSwitch any `json:"credential_switch,omitempty"`
-	Disposition      any `json:"disposition,omitempty"`
+	RevisionInputID            *int64   `json:"revision_input_id,omitempty"`
+	SupersededRevisionInputIDs *[]int64 `json:"superseded_revision_input_ids,omitempty"`
+	Run                        any      `json:"run"`
+	CredentialSwitch           any      `json:"credential_switch,omitempty"`
+	Disposition                any      `json:"disposition,omitempty"`
 	leadReconciliationResponse
 }
 

@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 // PRD #1809 D4: which live processes belong to a run, found by ENVIRONMENT, not by process group.
 //
 // The pinned Claude CLI spawns every Bash tool command with `detached: true` (setsid: a new session
@@ -372,6 +373,7 @@ async function passes(
   spawnedPids: readonly number[],
   opts: RunProcsOptions,
 ): Promise<{ attributed: number[]; killed: number[]; complete: boolean }> {
+  const budget = MaintenanceBudget.current();
   const wrappers = opts.wrappers ?? [runnerCommand];
   const budgetMs = opts.budgetMs ?? (mode === "scan" ? SCAN_BUDGET_MS : REAP_BUDGET_MS);
   const spawned = spawnedPids.filter((p) => Number.isSafeInteger(p) && p > 0).slice(0, MAX_SPAWNED);
@@ -379,20 +381,24 @@ async function passes(
   const killed = new Set<number>();
   let complete = true;
   for (const wrap of wrappers) {
+    budget?.check();
+    const duration = budget ? Math.min(budgetMs, budget.remainingMs()) : budgetMs;
     const args = [
       mode,
       opts.procRoot ?? PROC_ROOT,
       home,
       worktree ?? "-",
       String(opts.maxPids ?? MAX_PIDS),
-      String(budgetMs),
+      String(duration),
       String(opts.workerPid ?? process.pid),
       spawned.length > 0 ? spawned.join(",") : "-",
     ];
     let result;
     try {
-      result = await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, budgetMs + HELPER_SLACK_MS);
+      result = await runAgentHelper(wrap, RUN_PROCS_SCRIPT, args, duration + HELPER_SLACK_MS);
+      budget?.check();
     } catch {
+      budget?.check();
       complete = false;
       continue;
     }

@@ -29,6 +29,31 @@ func TestPlanCrossCheckCandidateDigestCanonicalStoredFields(t *testing.T) {
 	if hex.EncodeToString(same) != want {
 		t.Fatalf("equivalent stored candidate digest = %x", same)
 	}
+	// Normalize first: only the reviewer disposition changes in the stored plan.
+	normalized, err := NormalizePlanCrossCheckCandidate(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := normalized.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := NormalizePlanCrossCheckCandidate(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlDigest, err := control.Digest()
+	if err != nil || hex.EncodeToString(controlDigest) != hex.EncodeToString(before) {
+		t.Fatalf("normalization changed canonical digest: %x err=%v", controlDigest, err)
+	}
+	normalized.PlanMd += "\n\n## Cross-check dispositions\n- Prior finding: declined; repository evidence supports the plan."
+	disposition, err := normalized.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hex.EncodeToString(disposition) == hex.EncodeToString(before) {
+		t.Fatal("disposition-only plan change retained approval digest")
+	}
 	c.PlanningDiff = "changed"
 	changed, err := c.Digest()
 	if err != nil {

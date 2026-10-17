@@ -86,7 +86,7 @@ function terminal(runId: string, condition: string) {
 // Runner paths that reach native planning capture walk Linux /proc; Linux CI runs them.
 const LINUX_CAPTURE = process.platform !== "linux" && "Linux /proc capture required";
 describe("U2 real runner checked gate", () => {
-  it("two automatic revisions select explicit rounds and store only round-three canonical approval", { skip: LINUX_CAPTURE }, async () => {
+  it("four automatic revisions select explicit rounds and store only round-five canonical approval", { skip: LINUX_CAPTURE }, async () => {
     const c = claim();
     const seen: PlanVerdict[] = [];
     const events: string[] = [];
@@ -114,24 +114,24 @@ describe("U2 real runner checked gate", () => {
       const round = Number(body.round);
       assert.equal(gates(runId).length, 0);
       assert.equal(api.states.filter((s) => s.runId === runId && s.body.plan_md).length, 0);
-      return { status: 200, body: answer(runId, body, round < 3 ? "revise" : "approve", round < 3 ? "revise" : "approve", {
-        automatic_revision_limit: 2, automatic_rounds_enabled: true,
-        findings: round < 3 ? { summary: `fix round ${round}`, items: [] } : null,
+      return { status: 200, body: answer(runId, body, round < 5 ? "revise" : "approve", round < 5 ? "revise" : "approve", {
+        automatic_revision_limit: 4, automatic_rounds_enabled: true,
+        findings: round < 5 ? { summary: `fix round ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] } : null,
         candidate: { plan_md: NORMALIZED, milestones: [{ title: "canonical", done: false }],
           required_capabilities: [], required_tools: [], size_class: "s",
           base_commit: body.base_commit, planning_diff: body.planning_diff },
       }) };
     };
     const exec: Executor = { run: async (ctx) => {
-      // Three bounded candidates; any wrong verdict fails immediately.
-      for (let round = 1; round <= 3; round++) {
+      // Five bounded candidates; any wrong verdict fails immediately.
+      for (let round = 1; round <= 5; round++) {
         const verdict = await ctx.gatePlan!(`${PLAN} ${round}`);
         events.push(`return:${round}`);
         seen.push(verdict);
         assert.equal(gates(c.run_id).length, 0);
-        if (round < 3) {
+        if (round < 5) {
           assert.deepEqual(verdict, { kind: "revise", automatic: true, round,
-            feedback: `fix round ${round}`, items: [] });
+            feedback: `fix round ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] });
           assert.ok(!("inputId" in verdict));
           assert.equal(ctx.cancelRequested!(), false);
         } else {
@@ -145,18 +145,18 @@ describe("U2 real runner checked gate", () => {
     } };
     try {
       await start(exec, c);
-      assert.equal(captures, 3);
-      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2, 3]);
+      assert.equal(captures, 5);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2, 3, 4, 5]);
       assert.deepEqual(api.crossCheckRequests.map((r) => r.body.planning_diff),
-        ["diff candidate 1", "diff candidate 2", "diff candidate 3"]);
+        [1, 2, 3, 4, 5].map((round) => `diff candidate ${round}`));
       assert.equal(api.crossCheckLatestRequests.length, 0);
-      assert.deepEqual(events, ["release:1", "return:1", "release:2", "return:2", "release:3", "return:3"]);
+      assert.deepEqual(events, [1, 2, 3, 4, 5].flatMap((round) => [`release:${round}`, `return:${round}`]));
       const stored = api.states.filter((s) => s.runId === c.run_id && s.body.plan_md);
       assert.equal(stored.length, 1);
       assert.equal(stored[0]!.body.plan_md, NORMALIZED);
       assert.equal(stored[0]!.body.candidate_digest, digest);
       assert.deepEqual(stored[0]!.body.milestones, [{ title: "canonical", done: false }]);
-      assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "approve"]);
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "revise", "revise", "approve"]);
     } finally {
       MessageBatcher.prototype.reserveCandidateTransport = reserve;
       git.capturePlanningDiff = capture;
@@ -1508,10 +1508,17 @@ describe("U2 real runner checked gate", () => {
     }
   }
 
-  for (const switchBeforeRevision of [false, true]) {
-    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}`, { skip: LINUX_CAPTURE }, async () => {
+  for (const [loseSubmitAck, switchBeforeRevision] of [
+    [false, false], [false, true], [true, false], [true, true],
+  ]) {
+    it(`checked SDK retains absolute human deadline through held revision planning${switchBeforeRevision ? " and switch give-up" : ""}${loseSubmitAck ? " after dropped checker ACK" : ""}`, { skip: LINUX_CAPTURE }, async () => {
       const c = claim();
-      api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body, "revise", "revise") });
+      let storedCandidate: ReturnType<typeof answer> | undefined;
+      api.crossCheckHandler = ({ runId, method, body }) => {
+        storedCandidate ??= answer(runId, body, "revise", "revise");
+        return { status: 200, body: storedCandidate, ...(loseSubmitAck && method === "POST" ? { drop: true } : {}) };
+      };
+      let initialCheckerRequests: typeof api.crossCheckRequests | undefined;
       const budgetMs = 1000;
       let firstPublishedAt = 0;
       let revisedPublishedAt = 0;
@@ -1525,6 +1532,7 @@ describe("U2 real runner checked gate", () => {
       api.onState(c.run_id, (b) => {
         if (b.status === "awaiting_approval" && b.plan_md === PLAN && !firstPublishedAt) {
           firstPublishedAt = Date.now();
+          initialCheckerRequests = structuredClone(api.crossCheckRequests);
           if (switchBeforeRevision) api.requestCredentialSwitch(c.run_id, 1);
           else reviseId = send(c.run_id, row("revise_plan", "slow revision"))[0]!.id;
         }
@@ -1578,7 +1586,18 @@ describe("U2 real runner checked gate", () => {
         assert.equal(turns, 2);
         assert.equal(switches, switchBeforeRevision ? 1 : 0);
         assert.equal(gates(c.run_id).length, 2, "only normal revision publishes a fresh gate");
-        assert.equal(api.crossCheckRequests.length, 1);
+        // HTTP timeout/lost-ACK reconciliation may add GETs or identical POSTs.
+        // A human revision or switch must never initiate another checker request.
+        assert.ok(initialCheckerRequests);
+        assert.deepEqual(api.crossCheckRequests, initialCheckerRequests);
+        const submissions = initialCheckerRequests.filter((request) => request.method === "POST");
+        assert.ok(submissions.length >= 1 && submissions.length <= 3, "bounded original-candidate submission attempts");
+        const first = submissions[0]!;
+        assert.equal(first.body.round, 1);
+        assert.equal(first.body.plan_md, PLAN);
+        assert.equal(first.body.claim_generation, c.claim_generation);
+        for (const submission of submissions) assert.deepEqual(submission.body, first.body);
+        if (loseSubmitAck) assert.ok(initialCheckerRequests.some((request) => request.method === "GET"));
         assert.ok(api.isApplied(c.run_id, reviseId));
       } finally { releaseRevision(); run.shutdown(); await done; }
     });
@@ -2305,26 +2324,27 @@ describe("RunRunner checked gate for a Codex lead (PRD #2460)", () => {
     assert.equal(verdicts[0]!.kind, "approve");
   });
 
-  it("returns an automatic revision and submits round 2 after REVISE (acceptance 2)", { skip: LINUX_CAPTURE }, async () => {
+  it("returns four automatic revisions and approves candidate five for a Codex lead (acceptance 2)", { skip: LINUX_CAPTURE }, async () => {
     const c = codexClaim();
     api.crossCheckHandler = ({ runId, body }) => {
       const round = Number(body.round);
-      return { status: 200, body: answer(runId, body, round < 2 ? "revise" : "approve", round < 2 ? "revise" : "approve", {
-        automatic_revision_limit: 2, automatic_rounds_enabled: true,
-        findings: round < 2 ? { summary: "tighten scope", items: [] } : null, ...canonicalOf(body) }) };
+      return { status: 200, body: answer(runId, body, round < 5 ? "revise" : "approve", round < 5 ? "revise" : "approve", {
+        automatic_revision_limit: 4, automatic_rounds_enabled: true,
+        findings: round < 5 ? { summary: `tighten scope ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] } : null, ...canonicalOf(body) }) };
     };
     const seen: PlanVerdict[] = [];
     const exec: Executor = { run: async (ctx) => {
-      for (let round = 1; round <= 2; round++) {
+      for (let round = 1; round <= 5; round++) {
         const verdict = await ctx.gatePlan!(`${PLAN} ${round}`);
         seen.push(verdict);
-        if (round === 1) assert.deepEqual(verdict, { kind: "revise", automatic: true, round: 1, feedback: "tighten scope", items: [] });
+        if (round < 5) assert.deepEqual(verdict, { kind: "revise", automatic: true, round, feedback: `tighten scope ${round}`, items: [{ file: "plan.md", severity: "warning", summary: `finding ${round}`, rationale: `evidence ${round}` }] });
+        else assert.equal(verdict.kind, "approve");
       }
       return { branch: ctx.branch };
     } };
     await start(exec, c);
-    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
-    assert.deepEqual(seen.map((v) => v.kind), ["revise", "approve"]);
+    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2, 3, 4, 5]);
+    assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "revise", "revise", "approve"]);
     assert.equal(gates(c.run_id).length, 0, "no human gate was published");
   });
 });

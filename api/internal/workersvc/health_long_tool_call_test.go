@@ -310,7 +310,7 @@ func TestHealthLongToolCallPrecedence(t *testing.T) {
 		id := fmt.Sprintf("loop-%d", i)
 		loop = append(loop, fakeMsg(t, 2*i+1, "tool_use", "", map[string]any{"id": id, "name": "Bash", "input": map[string]any{"command": "same"}}))
 		if i < 4 {
-			loop = append(loop, lcRes(t, 2*i+2, id))
+			loop = append(loop, fakeMsg(t, 2*i+2, "tool_result", "", map[string]any{"tool_use_id": id, "content": "same output"}))
 		}
 	}
 	loop[len(loop)-1].createdAt = t0.Add(-25 * time.Minute)

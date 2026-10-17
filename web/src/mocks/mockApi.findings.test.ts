@@ -335,3 +335,36 @@ describe("mockApi grouped filing (issue #1724)", () => {
     await expect(api.findingGroupIssueDraft(many)).rejects.toMatchObject({ status: 400 });
   });
 });
+
+describe("mock finding send_to_uzi requests", () => {
+  it("accepts nullable single edits and send_to_uzi without inventing a run", async () => {
+    const api = await freshApi();
+    const before = (await api.listRuns()).runs.map(r => r.id);
+    const row = (await api.listFindings()).findings.find(f => f.finding_id)!;
+    const result = await api.fileFinding(row.finding_id!, {
+      title: null, description: null, labels: null, send_to_uzi: true,
+    });
+    expect(result.issue.title).toBe(row.last_title);
+    expect(result.issue.iid).toBeGreaterThan(0);
+    expect(result).not.toHaveProperty("run");
+    expect((await api.listRuns()).runs.map(r => r.id)).toEqual(before);
+  });
+
+  it("rejects null or missing group ids, accepts null edits, and never starts a run", async () => {
+    const api = await freshApi();
+    const before = (await api.listRuns()).runs.map(r => r.id);
+    await expect(api.fileFindingGroup({ ids: null, send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
+    // @ts-expect-error IDs are required; deliberately exercise malformed runtime input.
+    await expect(api.fileFindingGroup({ send_to_uzi: true })).rejects.toMatchObject({ status: 400 });
+    const rows = (await api.listFindings()).findings.filter(f => f.finding_id && f.repo_id === "repo-uzi").slice(0, 2);
+    expect(rows).toHaveLength(2);
+    const result = await api.fileFindingGroup({
+      ids: rows.map(f => f.disposition_id!),
+      title: null, description: null, labels: null, send_to_uzi: true,
+    });
+    expect(result.issue?.title).toBe(rows[0].last_title);
+    expect(result.phase).toBe("settled");
+    expect(result).not.toHaveProperty("run");
+    expect((await api.listRuns()).runs.map(r => r.id)).toEqual(before);
+  });
+});

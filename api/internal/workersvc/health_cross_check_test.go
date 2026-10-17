@@ -152,6 +152,8 @@ func TestHealthCrossCheckLoopPriority(t *testing.T) {
 				useMsg(t, 2, "b", "Bash", map[string]any{"command": "true"}),
 				useMsg(t, 1, "a", "Bash", map[string]any{"command": "true"}),
 			}}
+			fs.window[r.ID] = completeLoopUses(t, fs.window[r.ID])
+
 			want := reasonLooping
 			if persist {
 				wedge(svc, r.ID, persistFlagStreak, persistFlagWindow+time.Second)

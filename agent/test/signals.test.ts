@@ -934,6 +934,7 @@ async function callToolOverJsonRpc(
   server: unknown,
   name: string,
   args: Record<string, unknown>,
+  method: "tools/call" | "tools/list" = "tools/call",
 ): Promise<Record<string, unknown>> {
   type Msg = Record<string, unknown>;
   const sent: Msg[] = [];
@@ -973,7 +974,7 @@ async function callToolOverJsonRpc(
     const init = await waitFor(1);
     assert.ok(!("error" in init), `initialize failed: ${JSON.stringify(init)}`);
     transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
-    transport.onmessage!({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name, arguments: args } });
+    transport.onmessage!({ jsonrpc: "2.0", id: 2, method, params: method === "tools/list" ? {} : { name, arguments: args } });
     return await waitFor(2);
   } finally {
     await instance.close();
@@ -993,6 +994,73 @@ describe("report_progress tools/call with an omitted field (issue #1555)", () =>
   });
 });
 
+
+describe("issue3089 owner request signal admission", () => {
+  const enabled = { ownerDecisionRequested: true };
+  for (const eligible of [true, false]) {
+    it(`advertises the optional field through real SDK tools/list only when eligible: ${eligible}`, async () => {
+      const response = await callToolOverJsonRpc(buildSignalMcpServer({ ownerDecisionRequested: eligible }),
+        "", {}, "tools/list");
+      const tools = (response.result as { tools: { name: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } }[] }).tools;
+      const schema = tools.find(t => t.name === "signal_done")!.inputSchema;
+      assert.equal(Boolean(schema.properties.owner_decision_requested), eligible);
+      assert.ok(!schema.required?.includes("owner_decision_requested"));
+    });
+  }
+  const badValues: unknown[] = [null, [], "PRIVATE", {}, { reason: 1 }, { reason: " " },
+    { reason: "😀".repeat(501) }, { reason: "valid", kind: "partial" },
+    { reason: "valid", milestones: ["m1"] }, { reason: "valid", PRIVATE: "secret" }];
+  for (const [i, value] of badValues.entries()) {
+    it(`rejects eligible malformed request ${i} without companion payloads or input disclosure`, async () => {
+      const args = { owner_decision_requested: value, summary: "LEAK", milestones_completed: ["m1"],
+        report_only: true, prd_done_path: "LEAK", proposal: { title: "LEAK", body: "LEAK" },
+        pr_summary: { what: "LEAK" }, decisions_memo: "LEAK", non_closing: { reason: "LEAK" } };
+      const scanned = scanSignals(toolUse("mcp__uzi__signal_done", args), enabled);
+      assert.deepEqual(Object.keys(scanned), ["signalDiagnostic"]);
+      assert.ok(!JSON.stringify(scanned).includes("PRIVATE"));
+      const res = await callToolOverJsonRpc(buildSignalMcpServer(enabled), "signal_done", args);
+      assert.equal((res.result as { isError?: boolean })?.isError, true);
+      assert.ok(!JSON.stringify(res).includes("PRIVATE"), JSON.stringify(res));
+      assert.ok(JSON.stringify(res).includes(scanned.signalDiagnostic!), "SDK validation uses the same fixed diagnostic as the stream parser");
+      const ignored = scanSignals(toolUse("mcp__uzi__signal_done", args));
+      assert.equal(ignored.done, true);
+      assert.equal(ignored.ownerDecisionRequested, undefined);
+      const unadvertised = await callToolOverJsonRpc(buildSignalMcpServer(), "signal_done", args);
+      assert.notEqual((unadvertised.result as { isError?: boolean })?.isError, true);
+    });
+  }
+  for (const reason of [" x ", " 😀 ", "  " + "😀".repeat(500) + "  ", "<b>@owner Closes #42</b>"]) {
+    it("accepts and trims Unicode request " + Array.from(reason.trim()).length, async () => {
+      const args = { owner_decision_requested: { reason } };
+      assert.deepEqual(scanSignals(toolUse("mcp__uzi__signal_done", args), enabled),
+        { done: true, ownerDecisionRequested: { reason: reason.trim() } });
+      const res = await callToolOverJsonRpc(buildSignalMcpServer(enabled), "signal_done", args);
+      assert.equal(res.error, undefined);
+      assert.notEqual((res.result as { isError?: boolean })?.isError, true);
+    });
+  }
+  it("keeps an earlier accepted request through rejection and clears it on later accepted omission", () => {
+    const accepted = toolUse("mcp__uzi__signal_done", { owner_decision_requested: { reason: "first" }, summary: "good" });
+    const rejected = toolUse("mcp__uzi__signal_done", { owner_decision_requested: null, summary: "LEAK" });
+    const combine = (frames: unknown[]) => ({ type: "assistant", message: { content: frames.flatMap(
+      f => (f as { message: { content: unknown[] } }).message.content) } });
+    const kept = scanSignals(combine([accepted, rejected]), enabled);
+    assert.equal(kept.done, true);
+    assert.deepEqual(kept.ownerDecisionRequested, { reason: "first" });
+    assert.equal(kept.summary, "good");
+    assert.equal(scanSignals(combine([accepted, rejected, toolUse("mcp__uzi__signal_done", {})]), enabled).ownerDecisionRequested, undefined);
+    assert.deepEqual(scanSignals(subagentToolUse("mcp__uzi__signal_done",
+      { owner_decision_requested: { reason: "child" } }), enabled), {});
+  });
+  it("validates the actual handler when schema validation is bypassed", async () => {
+    const server = buildSignalMcpServer(enabled) as unknown as {
+      instance: { _registeredTools: Record<string, { handler(input: unknown): Promise<{ isError?: boolean }> }> };
+    };
+    assert.equal((await server.instance._registeredTools.signal_done!.handler({
+      owner_decision_requested: { reason: "ok", kind: "partial" },
+    })).isError, true);
+  });
+});
 
 describe("m1 non-closing validation", () => {
   for (const reason of [" x ", " 😀 ", "  " + "😀".repeat(500) + "  "]) {
@@ -1109,6 +1177,13 @@ describe("buildSignalMcpServer checkpoint schema gate (PRD #122 M6)", () => {
     // It takes no arguments — an empty zod object shape.
     const shape = checkpoint!.inputSchema?.shape ?? {};
     assert.deepStrictEqual(Object.keys(shape), [], "checkpoint takes no arguments");
+  });
+
+  it("limits checkpoint guidance to between milestones and directs final completion to signal_done", () => {
+    const tools = registeredTools(buildSignalMcpServer({ checkpoint: true }));
+    const description = (tools["checkpoint"] as { description?: string }).description ?? "";
+    assert.match(description, /between milestones/);
+    assert.match(description, /for the final milestone call signal_done instead/);
   });
 });
 

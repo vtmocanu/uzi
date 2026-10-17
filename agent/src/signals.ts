@@ -73,8 +73,31 @@ function validateNonClosing(input: unknown): {
   return { nonClosing: { reason: trimmed } };
 }
 
+/** Worker-derived admission, shared by SDK handlers and stream/callback parsing. */
+export interface SignalScanOptions {
+  ownerDecisionRequested?: boolean;
+}
+
+const OWNER_DECISION_DIAGNOSTIC = "Invalid owner_decision_requested: expected only a reason of 1–500 Unicode code points after trimming. Completion was not accepted.";
+
+function validateOwnerDecision(input: unknown, opts: SignalScanOptions): {
+  ownerDecisionRequested?: { reason: string }; diagnostic?: string;
+} {
+  const record = asRecord(input);
+  if (!opts.ownerDecisionRequested || !record || !Object.prototype.hasOwnProperty.call(record, "owner_decision_requested")) return {};
+  const value = asRecord(record["owner_decision_requested"]);
+  if (!value || Array.isArray(value) || Object.keys(value).length !== 1 || !Object.prototype.hasOwnProperty.call(value, "reason") || typeof value["reason"] !== "string") {
+    return { diagnostic: OWNER_DECISION_DIAGNOSTIC };
+  }
+  const reason = value["reason"].trim();
+  let count = 0;
+  for (const _point of reason) if (++count > 500) return { diagnostic: OWNER_DECISION_DIAGNOSTIC };
+  return count === 0 ? { diagnostic: OWNER_DECISION_DIAGNOSTIC } : { ownerDecisionRequested: { reason } };
+}
+
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
+  ownerDecisionRequested?: { reason: string };
   nonClosing?: { reason: string };
   /** Neutral diagnostic for a rejected done call; other blocks remain independent. */
   signalDiagnostic?: string;
@@ -212,7 +235,7 @@ const PR_SUMMARY_ITEM_MAX_BYTES = 1000;
 const PR_SUMMARY_MAX_LIST_ENTRIES = 50;
 
 /** Options for the signal server's tool schemas. */
-export interface SignalServerOptions {
+export interface SignalServerOptions extends SignalScanOptions {
   /** SDK only: supplied during the current repair; the handler revalidates every call. */
   codeCrossCheck?: CodeCrossCheckToolAccess;
   /** PRD #72 M4: expose `prd_done_path` on signal_done. Issue runs only — a
@@ -265,7 +288,7 @@ type SignalAck = { content: Array<{ type: "text"; text: string }>; isError?: boo
  *  built server's `_registeredTools`, and no other module imports the factory, so
  *  exporting it would trip the knip `exports` gate (its `ignoreExportsUsedInFile` covers
  *  only interfaces/types, not functions). The split is achieved either way. */
-function makeSignalToolHandlers(): {
+function makeSignalToolHandlers(opts: SignalScanOptions): {
   submitPlan(): Promise<SignalAck>;
   askUser(): Promise<SignalAck>;
   signalDone(input: unknown): Promise<SignalAck>;
@@ -294,6 +317,8 @@ function makeSignalToolHandlers(): {
       };
     },
     async signalDone(input) {
+      const requested = validateOwnerDecision(input, opts);
+      if (requested.diagnostic) return { isError: true, content: [{ type: "text", text: requested.diagnostic }] };
       const validated = validateNonClosing(input);
       if (validated.diagnostic) {
         return { isError: true, content: [{ type: "text", text: validated.diagnostic }] };
@@ -302,7 +327,7 @@ function makeSignalToolHandlers(): {
         content: [
           {
             type: "text",
-            text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
+            text: "Completion attempt received. The worker will check the completion contract before delivery or an owner decision handoff. A request does not defer or waive any work. With report_only it records your summary and transcript and opens no merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
           },
         ],
       };
@@ -343,6 +368,16 @@ export function buildSignalMcpServer(
   // prds/*.md (a PRD link is optional under the uzi model, PRD #764) in a repo that
   // nonetheless has a prds/ directory invites the model to pick one and declare it.
   const doneShape: Record<string, z.ZodTypeAny> = {
+    ...(opts.ownerDecisionRequested ? {
+      // Preserve unknown keys until our fixed diagnostic validator rejects them.
+      owner_decision_requested: z.object({
+        reason: z.string({ error: OWNER_DECISION_DIAGNOSTIC }),
+      }, { error: OWNER_DECISION_DIAGNOSTIC }).passthrough()
+        .superRefine((value, ctx) => {
+          if (validateOwnerDecision({ owner_decision_requested: value }, opts).diagnostic)
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: OWNER_DECISION_DIAGNOSTIC });
+        }).optional().describe("Request an owner decision if the authoritative completion contract remains unmet. Reason: 1–500 Unicode code points after trimming. This does not defer or waive work."),
+    } : {}),
     non_closing: z.object({ reason: z.string() })
       .superRefine((value, ctx) => {
         const validated = validateNonClosing({ non_closing: value });
@@ -501,7 +536,7 @@ export function buildSignalMcpServer(
           "Omit it entirely for small single-unit work.",
       );
   }
-  const h = makeSignalToolHandlers();
+  const h = makeSignalToolHandlers(opts);
   return createSdkMcpServer({
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
@@ -579,7 +614,7 @@ export function buildSignalMcpServer(
       ),
       tool(
         SIGNAL_DONE_TOOL,
-        "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then finalizes the run — pushing the branch and opening the merge request, UNLESS you set report_only, in which case it records your summary and transcript and opens no merge request; you never push.",
+        "Submit a completion attempt after committing locally and passing review. The worker checks the completion contract before delivery or an owner decision handoff; you never push. An owner decision request does not defer or waive work. With report_only the worker records your summary and transcript and opens no merge request.",
         doneShape,
         (input) => h.signalDone(input),
       ),
@@ -634,7 +669,8 @@ export function buildSignalMcpServer(
             tool(
               CHECKPOINT_TOOL,
               "Save the work you have committed for the current milestone durably, so it survives a worker crash. " +
-                "Call this once a milestone's work is committed locally, then STOP and end your turn — you will be " +
+                "Use this between milestones; for the final milestone call signal_done instead. " +
+                "Between milestones, call this once the work is committed locally, then STOP and end your turn. You will be " +
                 "re-prompted to continue with the next milestone. This is a durability checkpoint, NOT a quality gate: " +
                 "it does not run tests or verify that review passed.",
               {},
@@ -995,7 +1031,7 @@ export function isSubagentFrame(msg: Record<string, unknown>): boolean {
  * claude CLI build, and this scan holds regardless of the SDK's tool gating, so do
  * not treat it as redundant to that layer.
  */
-export function scanSignals(message: unknown): ScannedSignals {
+export function scanSignals(message: unknown, opts: SignalScanOptions = {}): ScannedSignals {
   const msg = asRecord(message);
   if (!msg || msg["type"] !== "assistant") return {};
   if (isSubagentFrame(msg)) return {};
@@ -1038,6 +1074,11 @@ export function scanSignals(message: unknown): ScannedSignals {
         delete out.rejectedMilestones;
       }
     } else if (name === SIGNAL_DONE_QUALIFIED) {
+      const requested = validateOwnerDecision(block["input"], opts);
+      if (requested.diagnostic) {
+        out.signalDiagnostic = requested.diagnostic;
+        continue;
+      }
       const validated = validateNonClosing(block["input"]);
       if (validated.diagnostic) {
         out.signalDiagnostic = validated.diagnostic;
@@ -1045,6 +1086,8 @@ export function scanSignals(message: unknown): ScannedSignals {
       }
       if (validated.nonClosing !== undefined) out.nonClosing = validated.nonClosing;
       out.done = true;
+      if (requested.ownerDecisionRequested) out.ownerDecisionRequested = requested.ownerDecisionRequested;
+      else delete out.ownerDecisionRequested;
       // PRD #72 M4. THE ONLY extraction point for prd_done_path, deliberately.
       // It sits inside this branch so it inherits the main-thread guard above
       // (isSubagentFrame returns {} before the content loop is reached) — the same

@@ -78,12 +78,13 @@ type FindingOccurrenceDTO struct {
 
 // FileFindingRequest is the (all-optional) body of POST /api/findings/{id}/issue (PRD #333 M5,
 // exported in PRD #1183 M3 so the wire lives in apitypes beside the response). Every field is a
-// user EDIT of the server-rendered draft, so none is trusted: the handler re-runs title/description
-// through the field-level sanitisers and UNIONs labels with the server marker.
+// user edit or explicit send-to-uzi opt-in. The handler re-runs title/description through the
+// field-level sanitisers and unions labels with the server marker and any opted-in run labels.
 type FileFindingRequest struct {
 	Title       *string  `json:"title"`
 	Description *string  `json:"description"`
 	Labels      []string `json:"labels"`
+	SendToUzi   bool     `json:"send_to_uzi,omitempty"`
 }
 
 // DismissFindingRequest is the body of POST /api/findings/{id}/dismiss: a required reason from the
@@ -217,6 +218,7 @@ type FindingGroupFileRequest struct {
 	Title       *string  `json:"title,omitempty"`
 	Description *string  `json:"description,omitempty"`
 	Labels      []string `json:"labels,omitempty"`
+	SendToUzi   bool     `json:"send_to_uzi,omitempty"`
 }
 
 type FindingGroupFileResultDTO struct {

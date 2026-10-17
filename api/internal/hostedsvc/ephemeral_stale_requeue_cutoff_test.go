@@ -43,9 +43,10 @@ func (emptyRows) Err() error { return nil }
 func (emptyRows) Next() bool { return false }
 
 // TestProvisionPassPassesStaleRequeueCutoffs pins the #2705 wiring: both provisioning demand
-// queries receive the grace cutoff (now - WorkerStaleRequeueGrace, invalid at grace 0) and the
-// claim affinity cutoff (now - WorkerAffinityCeiling), the first two positional arguments in
-// the generated calls. The LiveDB tests pass these parameters directly, so only this test
+// queries receive the claim affinity cutoff (now - WorkerAffinityCeiling) and the
+// grace cutoff (now - WorkerStaleRequeueGrace, invalid at grace 0), in that order, as the
+// first two positional arguments in the generated calls. The LiveDB tests pass these
+// parameters directly, so only this test
 // fails when ProvisionPass stops setting one.
 func TestProvisionPassPassesStaleRequeueCutoffs(t *testing.T) {
 	now := time.Date(2026, 10, 10, 17, 11, 7, 0, time.UTC)
@@ -73,10 +74,10 @@ func TestProvisionPassPassesStaleRequeueCutoffs(t *testing.T) {
 				if !ok {
 					t.Fatalf("%s was not queried", name)
 				}
-				if got, _ := args[0].(pgtype.Timestamptz); got != tc.wantStale {
+				if got, _ := args[1].(pgtype.Timestamptz); got != tc.wantStale {
 					t.Errorf("%s stale_requeue_cutoff = %+v, want %+v", name, got, tc.wantStale)
 				}
-				if got, _ := args[1].(pgtype.Timestamptz); got != wantCeiling {
+				if got, _ := args[0].(pgtype.Timestamptz); got != wantCeiling {
 					t.Errorf("%s affinity_cutoff = %+v, want %+v", name, got, wantCeiling)
 				}
 			}

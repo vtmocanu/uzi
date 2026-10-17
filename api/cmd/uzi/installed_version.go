@@ -63,6 +63,8 @@ func quietProcess(run processRunner, path string, args []string, env []string) (
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, args...) //nolint:gosec // Internal Brew arguments or a validated absolute formula executable, never PATH uzi.
+	// The caller may still be inside a deleted worktree; probes need no local files.
+	cmd.Dir = "/"
 	cmd.WaitDelay = time.Second
 	cmd.Env = env
 	c := &probeCapture{cancel: cancel}

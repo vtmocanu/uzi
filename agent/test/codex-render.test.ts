@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   renderCodexRun,
+  codexSubagentWriteCapabilities,
   renderCodexAdvice,
   CustomWorkerModelError,
   type CodexRenderDiagnostic,
@@ -23,6 +24,7 @@ import type {
   RunTurnRequest,
 } from "../src/harness.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
+import { buildCodexDynamicTools } from "../src/codex/dynamic-tools.js";
 import {
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
@@ -39,6 +41,36 @@ import {
 // determinism, and Claude-path independence.
 
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
+
+describe("Codex runtime discovery uses effective grants", () => {
+  it("reports implementation writes after alias, denial and unknown-tool filtering", () => {
+    const agents = {
+      inherited: agent(),
+      empty: agent({ tools: { kind: "allow", names: [] } }),
+      reader: agent({ tools: { kind: "allow", names: ["Read", "Bash"] } }),
+      alias: agent({ tools: { kind: "allow", names: ["MultiEdit"] } }),
+      denied: agent({ deniedTools: ["Write"] }),
+      unknown: agent({ tools: { kind: "allow", names: ["InventedWriteTool"] } }),
+    };
+    assert.deepEqual(codexSubagentWriteCapabilities(agents), {
+      inherited: true, empty: false, reader: false, alias: true, denied: false, unknown: false,
+    });
+    const plan = renderCodexRun(runRequest({ agents, phase: "plan" }));
+    assert.equal(plan.perRoleGrants.get("denied")!.allowedTools.has("apply_patch"), false);
+    assert.equal(plan.perRoleGrants.get("alias")!.phase, "plan", "planning retains its independent write refusal");
+    assert.equal(plan.leadPrompt.systemPrompt, "lead system prompt", "the renderer does not rewrite the system prompt");
+  });
+
+  it("advertises normalized root and child skills without granting extra tools", () => {
+    const run = renderCodexRun(runRequest({ leadSkills: ["uzi:root-skill", "root-skill", "bad/name"], agents: {
+      reader: agent({ tools: { kind: "allow", names: ["Skill"] }, skills: ["uzi:child-skill", "bad/name"] }),
+      noTool: agent({ tools: { kind: "allow", names: [] }, skills: ["hidden-skill"] }),
+    } }));
+    assert.match(buildCodexDynamicTools(run.leadGrants).find(s => s.name === "uzi_skill")!.description, /Granted skills: root-skill\./);
+    assert.match(buildCodexDynamicTools(run.perRoleGrants.get("reader")!).find(s => s.name === "uzi_skill")!.description, /Granted skills: child-skill\./);
+    assert.equal(buildCodexDynamicTools(run.perRoleGrants.get("noTool")!).length, 0);
+  });
+});
 
 /** A HarnessAgent with sane defaults, overridable per test. */
 function agent(overrides: Partial<HarnessAgent> = {}): HarnessAgent {

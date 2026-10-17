@@ -105,6 +105,18 @@ open_holds_db() { db_psql "SELECT count(*) FROM recovery_custody_holds WHERE use
 # Leave cross-phase source protection intact. With the real agent online, let
 # pending final receipts settle before seeding this phase's own custody fixture.
 wait_custody_headroom 1
+# Headroom remains owner-wide/all-generation. Separately verify observed older
+# held FINALs without discarding older holds or requiring archive FINALs to be held.
+OLDER_HELD_RECEIPTS="$(db_psql_rows "SELECT h.run_id,h.generation
+  FROM recovery_custody_holds h JOIN runs r ON r.id=h.run_id
+  WHERE h.user_id='$ADMIN_ID' AND r.user_id=h.user_id AND h.state='released'
+    AND h.final_disposition='held_publication' AND h.generation>0 AND h.generation<r.claim_generation
+  ORDER BY h.run_id,h.generation")" || fail "could not observe earlier held receipts"
+# One assertion per row in this finite snapshot, no retries; a failure blocks seeding.
+while IFS='|' read -r older_run older_generation; do
+  [ -n "$older_run" ] || continue
+  assert_earlier_held_custody_receipt "$older_run" "$older_generation"
+done <<< "$OLDER_HELD_RECEIPTS"
 C0="$(open_holds_db)"
 # A suite that arrives already AT/OVER the limit is itself the isolation regression this
 # work guards against (leaked holds from an abrupt kill wedging unrelated later phases).

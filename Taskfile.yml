@@ -424,11 +424,12 @@ tasks:
       # needs the network only then and for the cached oasdiff download; a fetch it cannot
       # make fails the gate closed. Before `scan:secrets`, which is deliberately last.
       - task: check:api-v1-compat
-      # PR-time CHANGELOG entry gate: a branch changing shipping paths must add a CHANGELOG.md
-      # line, carry `Changelog: none`, be docs-typed throughout, or touch only dependency
+      # PR-time entry gate: a branch changing shipping paths adds a valid new fragment or
+      # legacy Unreleased line, carries `Changelog: none`, is docs-typed, or touches dependency
       # manifests (the release oracle's rules, moved to the PR). Needs a merge-base with
       # origin/main, so CI's lint-repo job checks out full history; fails closed (exit 2)
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
+      - task: test:changelog-fragments
       - task: test:changelog-entry
       - task: check:changelog-entry
       - task: test:changelog-rc-bullets
@@ -986,6 +987,11 @@ tasks:
     cmds:
       - ./scripts/check-api-v1-compat.test.sh
 
+  test:changelog-fragments:
+    desc: fragment validation, deterministic assembly, and independent-branch merge contract
+    cmds:
+      - ./scripts/changelog-fragments.test.sh
+
   test:changelog-entry:
     desc: hermetic exit-code contract for check:changelog-entry (throwaway git repos, no network), tally-guarded
     cmds:
@@ -1187,6 +1193,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/net-retry.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/ci-fix.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
@@ -1381,7 +1388,7 @@ tasks:
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
 
   check:changelog-entry:
-    desc: a branch changing shipping paths adds a CHANGELOG.md line or is exempt (Changelog none, docs-typed, manifests only)
+    desc: a shipping branch adds a valid new fragment or legacy Unreleased line, or is exempt (Changelog none, docs-typed, manifests only)
     cmds:
       # See the script header for the exemptions and why each matches the release oracle
       # (scripts/assert-changelog-covers-release.sh), which stays the final check at cut time.
@@ -2565,6 +2572,16 @@ tasks:
       - npm run test:browser
 
   # ----------------------------------------------------------- agent (npm) ----
+  test:stale-worker-cancel-e2e:
+    desc: Real worker reconnect cancellation and retained source proof against authenticated Go routes and PostgreSQL
+    cmds:
+      - task: deps-check:agent
+      - |
+        command -v node >/dev/null || { echo "Node 24 or newer is required" >&2; exit 1; }
+        node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        mkdir -p .uzi/scratch
+        UZI_STALE_WORKER_CANCEL_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+
   test:codex-refresh-lostreply-e2e:
     desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:

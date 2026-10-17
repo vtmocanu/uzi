@@ -77,6 +77,27 @@ See [Autopilot](./autopilot.md).
 A full revision round also works end to end from
 [Slack](./slack.md#using-it), without opening the web UI.
 
+### Reading the full plan after the gate
+
+Outside `awaiting_approval`, a non-seeded run shows an initially collapsed
+**Full plan** when its saved `run.plan_md` is a nonblank Markdown string.
+Expand it and scroll within the bounded panel to read through the final line.
+It remains available after approval and reload, including while the run is
+`running`, `completed`, `failed` or `cancelled`, if that saved text exists.
+The neutral title does not mean a failed or cancelled proposal was approved.
+The run summary stays a summary; neither it nor feed messages substitute for
+missing saved full text. [Seeded runs](./seeded-plans.md) keep their existing
+**Seeded plan** surface. Approval-gate actions and history are unchanged.
+
+**Earlier submitted versions** appears when already-loaded earlier submissions
+are present. It is not approved-plan history or a guaranteed complete history;
+expanding it fetches no additional history.
+
+From a terminal, use `uzi run plan <run-id> [--version N] [--diff] [--json]`
+regardless of run status; see [CLI commands](./cli.md#commands) for version
+selection and diff rules. The [TUI run detail](./cli.md#three-views) renders
+loaded plan messages as full Markdown with normal transcript scrolling.
+
 ### Plan cross-check evidence
 
 The plan panel and run detail show **Plan cross-check** evidence separately

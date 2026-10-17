@@ -197,11 +197,9 @@ func TestHeldPublicationHoldGuardLiveDB(t *testing.T) {
 		status string
 		origin *string
 	}{
-		{"cancelled run", "cancelled", str("agent_failure")},
-		{"cancelled run with NULL fail_origin", "cancelled", nil},
 		{"push_secret_blocked", "failed", str("push_secret_blocked")},
 		{"worker_residue_blocked", "failed", str("worker_residue_blocked")},
-		{"completed run", "completed", nil},
+		{"live run", "running", nil},
 	}
 	for _, tc := range refused {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,9 +210,9 @@ func TestHeldPublicationHoldGuardLiveDB(t *testing.T) {
 			assertHoldOpen(ctx, t, pool, f.hold)
 		})
 	}
-	t.Run("stale generation", func(t *testing.T) {
+	t.Run("future generation", func(t *testing.T) {
 		f := heldNewFixture(ctx, t, pool, true, "failed", str("agent_failure"))
-		mustExec(ctx, t, pool, `UPDATE runs SET claim_generation=2 WHERE id=$1`, f.run)
+		mustExec(ctx, t, pool, `UPDATE runs SET claim_generation=0 WHERE id=$1`, f.run)
 		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
 			t.Fatalf("release: rows=%d err=%v", n, err)
 		}
@@ -243,10 +241,9 @@ func TestHeldPublicationHoldGuardLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status)
 			VALUES($1,$2,'held-other',$3,'online')`, other, f.user, other[:])
 		mustExec(ctx, t, pool, `UPDATE runs SET worker_id=$2 WHERE id=$1`, f.run, other)
-		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 0 {
+		if n, err := f.release(ctx, t, f.pub, heldDigest, heldTip); err != nil || n != 1 {
 			t.Fatalf("release: rows=%d err=%v", n, err)
 		}
-		assertHoldOpen(ctx, t, pool, f.hold)
 	})
 	// The publication's identity columns are immutable, so each mismatch is a differently built row.
 	// A generation mismatch is also caught by the ref binding (the ref carries the generation), so

@@ -21,11 +21,11 @@
 # steering surface, with a LIVE worker so the revise is poller-consumed. Runs at
 # the DEFAULT cap-1 worker, before the PRD #42 phase below reconfigures it.
 #
-# DELIBERATELY NOT asserted here: the stale-approve-discarded race (an approve
-# that arrives interleaved with an in-flight revise being dropped). Over HTTP
-# from bash the interleaving can't be made deterministic, so forcing it would
-# only flake; it is covered by the steering unit tests + the store integration
-# test.
+# DELIBERATELY NOT asserted here: concurrent revise/approve ordering. The API
+# refuses approval while current-gate revision feedback is pending; the worker
+# also prioritizes revisions over approvals already queued. Bash HTTP requests
+# cannot force this interleaving deterministically. LiveDB approval-guard tests
+# cover the run-lock ordering; steering unit tests cover worker precedence.
 say "PRD #41: plan-revision loop (revise_plan → re-plan → re-park → approve → MR)"
 IID_RV="$(apipost "/api/repos/$REPO_ID/issues" \
   '{"title":"E2E revise","description":"implements prds/4-agent-runtime-workers.md"}' | jq -r '.card.iid')"

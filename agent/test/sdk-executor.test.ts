@@ -15,7 +15,7 @@ import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError,
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
-import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
@@ -560,11 +560,17 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
       [submitPlan("v2"), resultSuccess()],
       [submitPlan("v3"), resultSuccess()],
       [submitPlan("v4"), resultSuccess()],
+      [submitPlan("v5"), resultSuccess()],
+      [submitPlan("v6"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
+    const items = (round: number) => [{ file: `round-${round}.md`, severity: "warning" as const,
+      summary: `CURRENT-FINDING-${round}`, rationale: `INSPECTABLE-EVIDENCE-${round}` }];
     const verdicts: PlanVerdict[] = [
-      { kind: "revise", automatic: true, round: 1, feedback: "auto one", inputId: 901 } as unknown as PlanVerdict,
-      { kind: "revise", automatic: true, round: 2, feedback: "auto two" },
+      { kind: "revise", automatic: true, round: 1, feedback: "auto one", items: items(1), inputId: 901 } as unknown as PlanVerdict,
+      { kind: "revise", automatic: true, round: 2, feedback: "auto two", items: items(2) },
+      { kind: "revise", automatic: true, round: 3, feedback: "auto three", items: items(3) },
+      { kind: "revise", automatic: true, round: 4, feedback: "auto four", items: items(4) },
       { kind: "revise", feedback: "human rollback", inputId: 902 },
       { kind: "revise", feedback: "over cap", inputId: 903 },
       approve,
@@ -579,20 +585,33 @@ describe("SdkExecutor plan revision loop (PRD #41)", () => {
       },
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
-    assert.equal(turns.length, 5);
-    assert.deepEqual(settlements, [undefined, undefined, undefined, 902, 903]);
+    assert.equal(turns.length, 7);
+    assert.deepEqual(settlements, [undefined, undefined, undefined, undefined, undefined, 902, 903]);
+    for (let round = 1; round <= 4; round++) {
+      const text = turns[round]!.promptText!;
+      const advice = text.match(/^<advice_([a-f0-9]{16})>\n([^\n]+)\n<\/advice_\1>$/m);
+      assert.ok(advice, "current findings stay inside advice DATA");
+      assert.deepEqual(JSON.parse(advice[2]!).items, items(round), "older items cannot substitute for current findings");
+      const trusted = text.replace(/^<([a-z_]+_[a-f0-9]{16})>\n[\s\S]*?^<\/\1>$/gm, "");
+      assert.match(trusted, /Cross-check dispositions/);
+      assert.match(trusted, /(?:each|every|one per)[\s\S]{0,140}(?:immediately preceding|latest|most recent|current)[\s\S]{0,100}(?:item|finding)/i);
+    }
     assert.match(turns[1]!.promptText!, /automated checker/);
     assert.match(turns[2]!.promptText!, /automated checker/);
-    assert.match(turns[3]!.promptText!, /human rollback/);
-    assert.doesNotMatch(turns[3]!.promptText!, /automated checker|<advice_/);
+    assert.match(turns[5]!.promptText!, /human rollback/);
+    assert.doesNotMatch(turns[5]!.promptText!, /automated checker|<advice_/);
     assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_revising").map((m) => m.payload), [
       { automatic: true, cross_check_round: 1 },
       { automatic: true, cross_check_round: 2 },
+      { automatic: true, cross_check_round: 3 },
+      { automatic: true, cross_check_round: 4 },
       { round: 1 },
     ]);
-    assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_feedback").slice(0, 2).map((m) => m.payload), [
+    assert.deepEqual(probe.emits.filter((m) => m.kind === "plan_feedback").slice(0, 4).map((m) => m.payload), [
       { feedback: "auto one", automatic: true, cross_check_round: 1 },
       { feedback: "auto two", automatic: true, cross_check_round: 2 },
+      { feedback: "auto three", automatic: true, cross_check_round: 3 },
+      { feedback: "auto four", automatic: true, cross_check_round: 4 },
     ]);
   });
 
@@ -4947,7 +4966,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     let hookError: unknown;
     let gates = 0;
     let switches = 0;
-    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { queryFn, turns } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
     const probe = makeCtx({
       agents: [lead, coder], summaryIntentPresent: true,
       signal: switchAbort.signal,
@@ -4972,7 +4991,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       continueExistingPlanGate: async () => {
         const first = stash!.persisted(stash!.md);
         retryDone = opts.callbackTwice ? (await first, stash!.persisted(stash!.md)) : first;
-        // run() failures are swallowed below, so surface an assertion thrown by the retry hook.
+        // run() errors are captured below, so surface an assertion thrown by the retry hook.
         if (opts.duringRetry) await opts.duringRetry(retryDone, ctl).catch(e => { hookError = e; });
         if (opts.awaitRetry !== false) await retryDone;
         return { kind: "approve", selection: { status: "absent" } };
@@ -4982,9 +5001,10 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     executor = new SdkExecutor(nullLogger(), homeDir, {
       queryFn, client: fake.client, summaryRunner: opts.runner ?? fake.runner, intentSettleBoundMs: opts.bound ?? 50,
     });
-    const result = await executor.run(probe.ctx).catch(() => undefined);
+    let error: unknown;
+    const result = await executor.run(probe.ctx).catch(e => { error = e; return undefined; });
     if (hookError) throw hookError;
-    return { fake, probe, result, gates, switches, usage: probe.emits.filter(m => m.kind === "summary_usage") };
+    return { fake, probe, result, error, turns, gates, switches, usage: probe.emits.filter(m => m.kind === "summary_usage") };
   }
 
   it("#2945 a plan accepted on the retry after a credential-switch give-up still gets one summary", async () => {
@@ -5005,17 +5025,17 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
   // Each condition turns true DURING the switch attempt, so the case reaches the give-up (or the
   // release) and proves the retried callback never generates, rather than an early exit.
   interface Flip { on: boolean; terminal: AbortController }
-  const neverGenerated: [string, (flip: Flip) => Partial<RunContext>, "gave_up" | "released"][] = [
-    ["a cancel lands during the switch", f => ({ cancelRequested: () => f.on }), "gave_up"],
-    ["the claim is fenced during the switch", f => ({ claimFenced: () => f.on }), "gave_up"],
-    ["the terminal lifecycle aborts during the switch (claim release)", f => ({ terminalLifecycleSignal: f.terminal.signal }), "gave_up"],
-    ["the live lifecycle stays aborted after the switch", () => ({}), "gave_up"],
-    ["the switch releases the claim", () => ({}), "released"],
+  const neverGenerated: [string, (flip: Flip) => Partial<RunContext>, "gave_up" | "released", boolean][] = [
+    ["a cancel lands during the switch", f => ({ cancelRequested: () => f.on }), "gave_up", true],
+    ["the claim is fenced during the switch", f => ({ claimFenced: () => f.on }), "gave_up", true],
+    ["the terminal lifecycle aborts during the switch (claim release)", f => ({ terminalLifecycleSignal: f.terminal.signal }), "gave_up", true],
+    ["the live lifecycle stays aborted after the switch", () => ({}), "gave_up", false],
+    ["the switch releases the claim", () => ({}), "released", false],
   ];
-  for (const [name, ctxFor, outcome] of neverGenerated) {
+  for (const [name, ctxFor, outcome, expectsCancellation] of neverGenerated) {
     it(`#2945 the retried callback never generates when ${name}`, async () => {
       const flip: Flip = { on: false, terminal: new AbortController() };
-      const { fake, result, usage, gates, switches } = await runSwitchGiveUp({
+      const { fake, result, error, turns, usage, gates, switches } = await runSwitchGiveUp({
         ctx: ctxFor(flip), outcome,
         duringSwitch: ctl => {
           flip.on = true;
@@ -5025,8 +5045,17 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       });
       assert.equal(switches, 1, "the case reached the switch attempt");
       assert.ok(gates >= 1, "the gate ran before the switch");
-      // A cancel legitimately ends the run with REASON_CANCELLED; every other case must return.
-      if (!name.startsWith("a cancel")) assert.ok(result, "the run returned rather than threw");
+      if (expectsCancellation) {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "run cancelled");
+        assert.equal(result, undefined);
+      } else {
+        assert.equal(error, undefined);
+        assert.ok(result, "the run returned rather than threw");
+      }
+      if (expectsCancellation || outcome === "released") {
+        assert.equal(turns.length, 1, "no new turn starts after cancellation or claim release");
+      }
       assert.equal(fake.rec.planCalls.length, 0);
       assert.equal(fake.rec.planPosts.length, 0);
       assert.equal(usage.length, 0);
@@ -6233,6 +6262,58 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
       },
       (e: unknown) => e,
     );
+
+  for (const replace of [false, true]) it(`M2 human revision retries the answered provider turn; replacement=${replace}`, async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("initial"), resultSuccess()],
+      [askUserTurn("Which target?"), resultSuccess()],
+      [resultApiError(429, "API Error: 429", "failed-1")],
+      [resultApiError(429, "API Error: 429", "failed-2")],
+      [submitPlan("revised"), resultSuccess()],
+    ]);
+    let before = 0;
+    let retries = 0;
+    let questions = 0;
+    const probe = makeCtx({
+      config: { plan_max_revisions: 2 },
+      askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
+      beforePlanRevisionTurn: async () => { before++; },
+      retryPlanRevisionTurn: async (cause) => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.providerOrigin);
+        assert.equal(turns.length, 4, "existing inner retries exhausted first");
+        retries++;
+        if (replace) throw new PlanRevisionReplacedError({ kind: "revise", feedback: "replacement J", inputId: 22 });
+      },
+    }, [{ kind: "revise", feedback: "original I", inputId: 11 }, { kind: "reject", reason: "stop", sourceGateRevision: 8 }]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx),
+      (e: unknown) => e instanceof PlanRejectedError && e.sourceGateRevision === 8);
+    assert.equal(questions, 1);
+    assert.equal(retries, 1);
+    assert.equal(before, 3, "revision, answered continuation, and redrive/replacement");
+    assert.equal(turns[4]!.options.resume, "failed-2");
+    assert.equal(turns[3]!.promptText, turns[2]!.promptText);
+    if (replace) {
+      assert.match(turns[4]!.promptText!, /replacement J/);
+      assert.doesNotMatch(turns[4]!.promptText!, /server/);
+    } else assert.equal(turns[4]!.promptText, turns[2]!.promptText);
+    assert.deepEqual(probe.gated, ["initial", "revised"]);
+  });
+
+  for (const mode of ["initial", "automatic", "empty"] as const) it(`M2 no human provider recovery for ${mode}`, async () => {
+    const failure = mode === "empty" ? resultEmpty() : resultApiError(429, "API Error: 429");
+    const { queryFn } = fakeTurns(mode === "initial" ? [[failure]] : [
+      [submitPlan("initial"), resultSuccess()], [failure],
+    ]);
+    let before = 0;
+    let retries = 0;
+    const probe = makeCtx({
+      beforePlanRevisionTurn: async () => { before++; },
+      retryPlanRevisionTurn: async () => { retries++; throw new Error("unexpected hook"); },
+    }, { kind: "revise", feedback: "again", automatic: mode === "automatic", round: 1 });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(probe.ctx), TransientRecoveryError);
+    assert.equal(retries, 0);
+    assert.equal(before, mode === "empty" ? 1 : 0);
+  });
 
   it("parks (TransientRecoveryError), never fails, on a 529 with no in-process retries", async () => {
     // Before the fix this rejected with /agent run failed: success/ (a terminal failure).

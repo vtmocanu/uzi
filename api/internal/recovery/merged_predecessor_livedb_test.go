@@ -32,8 +32,8 @@ func newMergedPredecessorEnv(t *testing.T) (*inventoryEnv, VerifiedMergeSnapshot
 	if err != nil {
 		t.Fatal(err)
 	}
-	// newInventoryEnv's historical fixture has no repo provenance. Create the exact repo-bound
-	// hold from birth, rather than mutating guarded identity.
+	// Use the policy fixture's immutable original identity from birth rather than
+	// mutating the common fixture's guarded provenance.
 	e.exec("DELETE FROM recovery_custody_holds WHERE id=$1", e.hold)
 	insertMergedHold(e, e.hold, b.OwnerID, b.RepoID, b.RunID, e.w.ID, 1, true)
 	b.MRIID, b.CompletedGeneration = 7, 4
@@ -603,7 +603,7 @@ func TestMergedPredecessorConcurrentUploadLiveDB(t *testing.T) {
 				merged = startReconcileOperation(t, func(ctx context.Context) (int64, error) {
 					return e.svc.DiscardMergedPredecessorHolds(ctx, snapshot)
 				})
-				waitReconcileLock(t, e, 0, "LockMergedPredecessorNonReadyCaptures")
+				waitReconcileLock(t, e, 0, "LockMergedPredecessorHolds")
 				reader.release()
 			} else {
 				tx, pid := lockReconcileCapture(t, e, id)
@@ -614,7 +614,7 @@ func TestMergedPredecessorConcurrentUploadLiveDB(t *testing.T) {
 				upload = startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryCaptureStatusResponse, error) {
 					return e.svc.Upload(ctx, e.w, e.run, id, m, bytes.NewReader(body))
 				})
-				waitReconcileLock(t, e, 0, "WHERE c.id = $1 FOR UPDATE OF c")
+				waitReconcileLock(t, e, 0, "WHERE h.id=$1 FOR NO KEY UPDATE OF h")
 				if err := tx.Commit(e.ctx); err != nil {
 					t.Fatal(err)
 				}

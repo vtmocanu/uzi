@@ -1,4 +1,4 @@
--- Issue #2545: the run_held_publications lifecycle and the hold-side queries of a failed run's
+-- Issue #2545: the run_held_publications lifecycle and the hold-side queries of a terminal run's
 -- held-work publication (migration 00333). The held_publication_guard trigger enforces the state
 -- machine; every transition below is a CAS on the expected state, so a lost race reads as 0 rows.
 -- Lock order, wherever more than one is taken: worker, run, hold, publication.
@@ -67,7 +67,7 @@ SELECT count(*) FROM recovery_custody_holds WHERE run_id = @run_id AND state = '
 -- name: ReleaseHeldPublicationHold :execrows
 -- Step B's first write (the hold is updated BEFORE the publication: the hold guard needs the
 -- publication in created and the publication guard needs the hold released). The hold guard
--- makes the final decision (failed run, generation pin, excluded origins, publication binding)
+-- makes the final decision (terminal run, exact generation/custody, excluded origins, publication binding)
 -- and refuses with 0 rows.
 UPDATE recovery_custody_holds h SET
     state = 'released', live_worker_id = NULL, live_run_id = NULL,

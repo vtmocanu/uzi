@@ -57,12 +57,18 @@ func realGit(dir string, args ...string) (string, error) {
 // brew.
 func realBrew(foreground bool, args ...string) (string, error) {
 	if foreground {
-		cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are allowlisted `upgrade vtmocanu/tap/uzi-cli` or `upgrade vtmocanu/tap/uzi-cli-rc` literals.
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return "", cmd.Run()
+		return "", foregroundBrewCommand(args...).Run()
 	}
 	return quietProcess(runProcess, "brew", args, nil)
+}
+
+func foregroundBrewCommand(args ...string) *exec.Cmd {
+	cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are allowlisted `upgrade vtmocanu/tap/uzi-cli` or `upgrade vtmocanu/tap/uzi-cli-rc` literals.
+	// Homebrew refuses to run when its inherited working directory was deleted.
+	cmd.Dir = "/"
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
 }
 
 var errBrewProbeOverflow = errors.New("brew probe output exceeds 64 KiB")

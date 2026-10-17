@@ -59,9 +59,9 @@ func TestPlanCrossCheckRevisionConstructorDefaultAndZero(t *testing.T) {
 		params Params
 		want   int32
 	}{
-		{"default", Params{}, 2},
+		{"default", Params{}, 4},
 		{"explicit zero", Params{PlanCrossCheckMaxRevisionsSet: true}, 0},
-		{"explicit nonzero", Params{PlanCrossCheckMaxRevisions: 4}, 4},
+		{"explicit nonzero", Params{PlanCrossCheckMaxRevisions: 3}, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := New(&roundsMetadataStore{}, nil, tc.params)

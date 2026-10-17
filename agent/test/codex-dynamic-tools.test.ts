@@ -15,6 +15,40 @@ function grants(allowedTools: readonly string[]): RunGrants {
 }
 
 
+describe("Codex runtime discovery", () => {
+  for (const isRoot of [true, false]) {
+    it(`lists only granted skills for ${isRoot ? "root" : "child"}`, () => {
+      const input = { ...grants(["Skill"]), isRoot, allowedSkills: new Set(["zebra", "review"]) };
+      const spec = buildCodexDynamicTools(input).find(s => s.name === "uzi_skill")!;
+      assert.match(spec.description, /Granted skills: review, zebra\./);
+      const empty = buildCodexDynamicTools({ ...input, allowedSkills: new Set<string>() })[0]!;
+      assert.match(empty.description, /No skills are granted/);
+      assert.deepEqual([...input.allowedSkills], ["zebra", "review"], "advertising never changes grants");
+    });
+  }
+  it("advertises the actual shell and POSIX syntax without recommending script execution", () => {
+    const spec = buildCodexDynamicTools(grants(["Bash"]))[0]!;
+    assert.match(spec.description, /\/bin\/sh -c/);
+    assert.match(spec.description, /write POSIX sh syntax/);
+    assert.ok(!spec.description.includes("bash <file>") && !spec.description.includes("script"));
+  });
+});
+
+describe("issue3089 owner request dynamic schema", () => {
+  for (const isRoot of [true, false]) for (const ownerDecisionRequested of [true, false]) {
+    it(`advertises only eligible root request ${isRoot}/${ownerDecisionRequested}`, () => {
+      const spec = buildCodexDynamicTools({ ...grants(["signal_done"]), isRoot, ownerDecisionRequested })[0]!;
+      const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+      const request = props.owner_decision_requested;
+      assert.equal(Boolean(request), isRoot && ownerDecisionRequested);
+      if (request) {
+        assert.equal(request.additionalProperties, false);
+        assert.deepEqual(request.required, ["reason"]);
+      }
+    });
+  }
+});
+
 describe("m1 non-closing dynamic schema", () => {
   it("requires a string reason structurally without a raw maxLength cap", () => {
     const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;

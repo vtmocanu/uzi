@@ -17,6 +17,7 @@
 #   run:<status>            run queued|running|awaiting_input|limit_wait|completed|failed
 #   pr opened               the MR exists
 #   ci pending|green|red    required checks on the head
+#   ci_fix waiting <id>|cancelled <id>|reviewed <id> <sha>  branch ownership/review decision
 #   cr pending|clean|findings(n)|rate-limited(Nm)|skipped
 #   greptile pending|clean|findings(n)
 #   waiting <what>          e.g. "waiting cr reset 57m", "waiting mr_rework", "waiting #1430"

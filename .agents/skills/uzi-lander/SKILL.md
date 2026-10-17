@@ -172,12 +172,32 @@ changes it); trust it over a handover's claim.
 | `ci_red` | read the failing job; fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
+| `ci_fix_active` | follow *CI-fix branch ownership* below before touching the branch |
 | `ci_pending`, `review_pending` | step 2 |
 | `cr_rate_limited` | step 2, choose the review requirement |
 | `no_review` | step 2, choose the review requirement |
 | `findings` | step 4 (live bot findings or any `EVERY_AUTHOR` blocker) |
 | `ready` | step 6 |
 | `merged` | step 7 |
+
+## CI-fix branch ownership
+
+`takeover.sh` and `watch-pr.sh` print `CI_FIX_ACTIVE` and `CI_FIX_RECENT` for the exact
+repo/branch. Recent is the newest terminal run finished within 24 hours, including failed
+and cancelled runs; `unknown` blocks branch work.
+The lookup uses the owner's latest 200 runs; older active runs and other owners' runs
+are outside its visibility, so `none` is not a global exclusion guarantee.
+
+Before any local fix, push or rebase, refresh the snapshot. With an active ci_fix, decide
+with the buddy: stay off the branch until it finishes, or `uzi run cancel ID -m 'REASON'`
+and wait for authoritative terminal state before fixing locally. Never both. Record
+`ci_fix waiting ID` or `ci_fix cancelled ID` with `S/trail.sh '#PR' 'STATE'`, then re-snapshot.
+
+`CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
+merge, even with green CI. Require the same exact-head buddy review as a small local fix;
+record `ci_fix reviewed ID SHA`. The 24-hour advisory never waives review of older changes.
+After recording that review, handle `RESULT=ci_fix_recent` as exit 1: fix the red CI
+locally in step 4. The advisory still prints until the window expires.
 
 ## The loop
 
@@ -222,7 +242,7 @@ changes it); trust it over a handover's claim.
 
    | exit | meaning | next |
    |---|---|---|
-   | 0 | CI green, chosen review requirement satisfied, 0 live findings, no rework | step 6 |
+   | 0 | CI green, chosen review requirement satisfied, 0 live findings, no active branch writer | step 6 |
    | 1 | required CI red | fix locally (step 4) or flake |
    | 2 | timeout | inspect; never merge on it |
    | 3 | live findings: CR, Greptile, any unresolved thread from any author (`threads=`), open code-scanning alerts, unacknowledged comments (`unacked=`) | step 4 |
@@ -232,6 +252,7 @@ changes it); trust it over a handover's claim.
    | 7 | CR says the last commit was already reviewed | step 3, decide whether to request a full review |
    | 8 | PR conflicts with its base (`mergeable=CONFLICTING`): GitHub runs no CI on it | step 5 |
    | 9 | a lookup stayed unreadable for `--max-unknown` polls (default 5; no checks yet on a mergeable head is pending for `--ci-grace`, 15 min); `RESULT` names it | inspect that lookup; never merge on it |
+   | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
 
    Let an auto-review that is already running finish; never re-trigger it. Greptile skips a
    conflicting PR and a head pushed after its trigger: trigger on the final head. `--reviewer` also
@@ -293,9 +314,8 @@ changes it); trust it over a handover's claim.
    (`S/ack-comments.sh OWNER/REPO PR --show ID`, the only view that is complete and prints the
    digest; excerpts are cut and say INCOMPLETE), act on it, then ack the version you read:
    `S/ack-comments.sh OWNER/REPO PR ID@DIGEST ...`. An edit before or after the ack re-blocks. Verify each against the current code and label it **real / inherited
-   / deliberate / mock-only** (references/coderabbit-triage.md). Before touching the branch,
-   check `uzi run list` for an active `ci_fix` with `pipeline_ref` equal to the branch; let it
-   finish or cancel it before a local fix (`land-prep.sh` refuses with exit 4). Also
+   / deliberate / mock-only** (references/coderabbit-triage.md). Follow *CI-fix branch ownership*
+   before touching the branch (`land-prep.sh` also refuses active ci_fix runs with exit 4). Also
    check for an `mr_rework` run and defer if one is coming (references/mr-rework.md; on a
    run created with `--mr-rework=false` none will). Before editing locally or replying to
    skip a finding, DISABLE auto-rework for this PR's run (a finding-thread reply can trigger
@@ -371,7 +391,12 @@ changes it); trust it over a handover's claim.
    signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
    `test-api-store-it` job's `LiveDB: N passed, 0 skipped` line on the exact head, since a test
-   pinned to an older schema can break on the other side's new columns. After a release folds `[Unreleased]`,
+   pinned to an older schema can break on the other side's new columns.
+   Ordinary PRs add their own lowercase UUID-v4 fragment before a PR exists, initially citing
+   the relevant issue; see [fragment guidance](../../../changelog.d/README.md). Do not union
+   independent fragments or build a shared index. Fragment touches are not a release-oracle
+   exemption. Keep inherited fragments intact; release cuts consume incorporated paths.
+   **Legacy CHANGELOG compatibility only:** after a release folds `[Unreleased]`,
    keep only the branch's `CHANGELOG.md` bullets `main` lacks.
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
@@ -399,17 +424,20 @@ changes it); trust it over a handover's claim.
    moved, or the base moved into other branch files or conflicts: restart with `--fresh`; it resets to
    the remote, so cherry-pick back any commit it names under `FRESH_BACKUP=`, but never a
    whole file from that backup: it predates what landed on the base since. Exit 9 = the
-   branch deletes `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
+   branch deletes legacy `CHANGELOG.md` lines the base carries (a stale-copy resolution): restore
    them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
    branch changes workflow files: split the edit out (*Always yours*);
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
-   Exit 11 = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
+   Exit 11 (legacy direct writes) = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
    under a released section after a fold) or missing after the rebase: restore under `[Unreleased]`, `--skip-rebase`.
    Changing only the renamed migration's number inside the branch's own bullet passes.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
-   passed, merge; do not ask (the user opts out per PR or per session by saying so):
+   passed, first check `CI_FIX_RECENT`: if it names a run, require a `ci_fix reviewed ID SHA`
+   trail entry covering its pushed delta at the current head. Without it, stop for review,
+   even on exit 0 or `NEXT=ready`. Then merge; do not ask (the user opts out per PR or per
+   session by saying so):
 
    ```
    S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
@@ -632,7 +660,7 @@ wrapper always completes with 0.
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
 - `scripts/land-prep.sh` rebase / renumber / optional gate / lease push (`scripts/changelog-union.sh`
-  unions a CHANGELOG-only conflict or refuses); `scripts/merge.sh` the
+  unions a legacy CHANGELOG-only conflict or refuses; ordinary PRs use independent UUID fragments); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared
   `scripts/lib/pr-checks-classify.sh`). The sibling and `lib/*.test.sh` scripts are the
