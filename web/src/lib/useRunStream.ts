@@ -62,15 +62,37 @@ export function useRunStream(runId: string) {
   const runReadTicketRef = useRef(0);
   const runReadAppliedRef = useRef(0);
 
+  // Display evidence only: these refs never drive transport, retries or reads.
+  // An epoch fences status/disconnect invalidations; per-read tickets fence
+  // overlapping requests. Only the current replay + current metadata can certify it.
+  const evidenceRef = useRef({ epoch: 0, metadata: false, replay: false });
+  const replayTicketRef = useRef(0);
+  const metadataEpochRef = useRef<Pick<Run, "status" | "status_since"> | null>(null);
+  const [readyProof, setReadyProof] = useState<{ runId: string; generation: number } | null>(null);
+  const publishReadiness = useCallback(() => {
+    const e = evidenceRef.current;
+    setReadyProof(e.metadata && e.replay && streamRef.current.pending.size === 0
+      ? { runId: activeRunIdRef.current, generation: genRef.current } : null);
+  }, []);
+  const invalidateEvidence = useCallback(() => {
+    metadataEpochRef.current = null;
+    evidenceRef.current = { epoch: evidenceRef.current.epoch + 1, metadata: false, replay: false };
+    publishReadiness();
+  }, [publishReadiness]);
+
   const commit = useCallback((s: StreamState) => {
     streamRef.current = s;
     setMessages(s.messages);
-  }, []);
+    publishReadiness();
+  }, [publishReadiness]);
 
   const refreshRun = useCallback(async () => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     const ticket = ++runReadTicketRef.current;
+    const epoch = evidenceRef.current.epoch;
+    evidenceRef.current.metadata = false;
+    publishReadiness();
     try {
       const { run } = await api.getRun(runId);
       if (gen !== genRef.current) return;
@@ -78,31 +100,56 @@ export function useRunStream(runId: string) {
       runReadAppliedRef.current = ticket;
       setRun(run);
       statusRef.current = run.status;
+      if (epoch === evidenceRef.current.epoch && ticket === runReadTicketRef.current) {
+        const previous = metadataEpochRef.current;
+        if (previous && (previous.status !== run.status || previous.status_since !== run.status_since)) {
+          evidenceRef.current.replay = false;
+        }
+        metadataEpochRef.current = run;
+        evidenceRef.current.metadata = true;
+        publishReadiness();
+      }
     } catch (e) {
       if (gen !== genRef.current) return;
       if (ticket < runReadAppliedRef.current) return;
+      if (epoch === evidenceRef.current.epoch && ticket === runReadTicketRef.current) {
+        evidenceRef.current.metadata = false;
+        publishReadiness();
+      }
       if (e instanceof ApiError) setError(e.message);
     }
-  }, [runId]);
+  }, [runId, publishReadiness]);
 
   // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
   // already re-read the run themselves, so they skip it rather than fetch it twice.
   const replay = useCallback(async (refreshOnKinds = false) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
+    const epoch = evidenceRef.current.epoch;
+    const ticket = ++replayTicketRef.current;
+    evidenceRef.current.replay = false;
+    publishReadiness();
     try {
       const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
       if (gen !== genRef.current) return;
       commit(ingestMany(streamRef.current, batch).state);
+      if (epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current) {
+        evidenceRef.current.replay = true;
+        publishReadiness();
+      }
       // A replayed plan/plan_revising/progress_note never arrived as a live frame, so
       // nothing else re-reads the run for it (a revise changes no status, hence no state
       // frame follows): apply the same refresh a live frame of that kind would (issue #2760).
       if (refreshOnKinds && hasRefreshKind(batch)) void refreshRun();
     } catch {
+      if (gen === genRef.current && epoch === evidenceRef.current.epoch && ticket === replayTicketRef.current) {
+        evidenceRef.current.replay = false;
+        publishReadiness();
+      }
       // Transient; the next frame or reconnect retries. The log is durable, so a
       // failed catch-up only delays rendering, never loses a message.
     }
-  }, [runId, commit, refreshRun]);
+  }, [runId, commit, refreshRun, publishReadiness]);
 
   // refreshInputs re-reads the steer queue (PRD #95). Best-effort and SILENT on error:
   // a non-owner viewer (an admin on someone else's run) 404s here, which Decision 8/N2
@@ -142,6 +189,8 @@ export function useRunStream(runId: string) {
     genRef.current += 1;
     activeRunIdRef.current = runId;
     streamRef.current = emptyStream();
+    metadataEpochRef.current = null;
+    invalidateEvidence();
     // The old run's status must not survive: a terminal one would stop the new run's
     // socket from reconnecting before its own status arrives.
     statusRef.current = "";
@@ -173,6 +222,7 @@ export function useRunStream(runId: string) {
       if (closed) return;
       ws = createRunSocket(runId);
       ws.onopen = () => {
+        invalidateEvidence();
         setConnected(true);
         void replay();
         // A reconnect may have missed a plan/plan_revising frame, and a revise changes
@@ -191,12 +241,19 @@ export function useRunStream(runId: string) {
         } catch {
           return;
         }
+        if (frame.type === "state") invalidateEvidence();
         const { state, effects } = applyFrame(streamRef.current, frame);
         commit(state);
         // A state frame (and any message-seq gap) triggers a replay routed through
         // the debounced catch-up, so a hub-dropped tail message is backfilled
         // without a reconnect — and a burst of frames coalesces into one REST call.
-        if (effects.replay) scheduleCatchup();
+        if (effects.replay) {
+          evidenceRef.current.replay = false;
+          // Fence an in-flight replay that began before this gap/state frame.
+          replayTicketRef.current += 1;
+          publishReadiness();
+          scheduleCatchup();
+        }
         if (effects.refreshRun) void refreshRun();
         // Refetch the steer queue on the data-less `input` frame (the fast path) AND
         // on any state/health-driven refresh (PRD #95 S1): consuming a follow-up flips
@@ -206,6 +263,7 @@ export function useRunStream(runId: string) {
         if (frame.type === "input" || effects.refreshRun) void refreshInputs();
       };
       ws.onclose = () => {
+        invalidateEvidence();
         setConnected(false);
         ws = null;
         if (closed) return;
@@ -226,6 +284,7 @@ export function useRunStream(runId: string) {
 
     return () => {
       closed = true;
+      invalidateEvidence();
       if (catchup != null) clearTimeout(catchup);
       if (reconnect != null) clearTimeout(reconnect);
       if (ws) {
@@ -237,7 +296,7 @@ export function useRunStream(runId: string) {
         }
       }
     };
-  }, [runId, replay, refreshRun, refreshInputs, commit]);
+  }, [runId, replay, refreshRun, refreshInputs, commit, invalidateEvidence, publishReadiness]);
 
   const submit = useCallback(
     async (
@@ -315,5 +374,6 @@ export function useRunStream(runId: string) {
   // live triggers and the queue card reads `inputs`. canSteer gates the steer surface
   // for a non-owner viewer (Decision 8/N2).
   const confirmedOwner = ownerProof?.runId === runId && ownerProof.generation === genRef.current;
-  return { run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer, confirmedOwner };
+  const pauseOriginReady = readyProof?.runId === runId && readyProof.generation === genRef.current;
+  return { pauseOriginReady, run, messages, connected, error, submit, refreshRun, inputs, refreshInputs, canSteer, confirmedOwner };
 }

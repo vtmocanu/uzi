@@ -2089,7 +2089,7 @@ describe("PausedPanel (PRD #1190)", () => {
   // role="status" here too would either be silent-on-mount or a duplicate announcement.
   it("the heading carries NO role=\"status\" (parkAnnounce owns the announcement)", () => {
     render(<PausedPanel run={paused()} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
-    const heading = screen.getByText(/Paused by you/);
+    const heading = screen.getByText(/Paused(?: at|$)/);
     expect(heading.getAttribute("role")).toBeNull();
     // The standalone panel declares no live region of its own at all.
     expect(document.querySelectorAll('[role="status"]').length).toBe(0);

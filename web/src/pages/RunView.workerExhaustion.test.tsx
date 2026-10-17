@@ -39,7 +39,7 @@ function held(limit = 3): Run {
 function view(run: Run, proof?: boolean, canSteer = true) {
   vi.mocked(useRunStream).mockReturnValue({ run, messages: [], connected: true, error: "",
     submit, refreshRun, inputs: [], refreshInputs: vi.fn(), canSteer,
-    confirmedOwner: proof } as ReturnType<typeof useRunStream>);
+    confirmedOwner: proof } as unknown as ReturnType<typeof useRunStream>);
   return <MemoryRouter initialEntries={["/runs/held"]}><Routes>
     <Route path="/runs/:id" element={<RunView />} />
   </Routes></MemoryRouter>;
@@ -131,7 +131,7 @@ function navigationView() {
     run: { ...held(), id }, messages: [], connected: true, error: "",
     submit, refreshRun: id === "held" ? refreshA : refreshB, inputs: [],
     refreshInputs: vi.fn(), canSteer: true, confirmedOwner: true,
-  } as ReturnType<typeof useRunStream>));
+  } as unknown as ReturnType<typeof useRunStream>));
   render(<MemoryRouter initialEntries={["/runs/held"]}>
     <NavigationControls /><Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
   </MemoryRouter>);

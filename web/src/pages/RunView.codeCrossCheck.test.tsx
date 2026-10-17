@@ -23,7 +23,7 @@ it.each([true, false, undefined])("mounts code detail only with confirmed owner 
     run: { ...mockRuns[0], status: "queued", code_cross_check_required: true },
     messages: [], connected: true, error: "", submit: vi.fn(), refreshRun: vi.fn(),
     inputs: [], refreshInputs: vi.fn(), canSteer: true, confirmedOwner,
-  } as ReturnType<typeof useRunStream>);
+  } as unknown as ReturnType<typeof useRunStream>);
   render(<MemoryRouter initialEntries={["/runs/test"]}><Routes><Route path="/runs/:id" element={<RunView />} /></Routes></MemoryRouter>);
   expect(screen.queryByRole("region", { name: "Code cross-check" }) !== null).toBe(confirmedOwner === true);
 });
