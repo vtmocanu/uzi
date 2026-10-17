@@ -221,12 +221,12 @@ unknown evidence set to null. No next size starts after incomplete cleanup or
 an active-leg failure. A demonstrated unavailable reader before any command
 launch permits collecting the other size's failed prerequisite evidence.
 
-The current host's real prerequisite probes found `memory.pressure` absent at
-both sizes. Real calibration acceptance remains unverified pending a suitable
-host; this fixture fails before load on that prerequisite. There is no PSI
-substitute or privileged fallback. Docker-free regression data in
-`calibration_synthetic.py` is explicitly synthetic and never accepted as a
-measurement. Focused regressions are:
+Earlier local prerequisite probes lacked `memory.pressure` at both sizes.
+On any such host this fixture fails before load; there is no PSI substitute or
+privileged fallback. CI acceptance requires both complete successful bound
+reports; local prerequisite failures and synthetic regressions provide no
+measurement acceptance. Docker-free regression data lives in
+`calibration_synthetic.py`. Focused regressions are:
 
 ```sh
 python3 -B -m unittest discover -s e2e/worker-uid -p 'calibration*_test.py'

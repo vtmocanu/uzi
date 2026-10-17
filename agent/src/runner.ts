@@ -3354,7 +3354,13 @@ export class RunRunner {
       // The owed-candidate cap stopped this run by aborting its attempt: report the cap, not the
       // executor's abort error. A cancel, a shutdown or a stale claim keeps its own arm.
       if (flight.workerMemory?.hold) await this.reconcileWorkerMemory(flight);
-      const err = flight.workerMemory?.hold !== undefined ? new RetainedRecoveryStop() : flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
+      // Memory can abort first, so the original error alone does not identify a
+      // later owner pause. Hand off only after its original work truly settles.
+      const memoryYieldsToPause = this.canYieldMemoryToOwnerPause(flight, failure);
+      if (memoryYieldsToPause) this.retainWorkerMemoryCustody(flight);
+      const err = flight.workerMemory?.hold !== undefined
+        ? memoryYieldsToPause ? new PauseNowSignal() : new RetainedRecoveryStop()
+        : flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
         !flight.active?.shuttingDown && flight.steering?.claimFence() === undefined
         ? flight.owedLimitStop : failure;
       // PRD #35: a usage-limit death is not an ordinary failure. Handled before the
@@ -3818,7 +3824,11 @@ export class RunRunner {
             "pause could not park this run outside the loop; leaving it for requeue",
           );
         }
-        await batcher.close().catch(() => undefined);
+        const memory = flight.workerMemory;
+        const closed = batcher.close();
+        if (memory?.closing) {
+          await this.joinWorkerMemory(closed, memory.closingDeadline!).catch(() => undefined);
+        } else await closed.catch(() => undefined);
       } else if (err instanceof ForgeUnreachableAtCloneError) {
         // PRD #1392 M2: the forge was unreachable at clone/fetch on a TRANSIENT error. Caught
         // BEFORE the generic terminal path (the LimitReachedError/PauseNowSignal precedent) so a
@@ -17649,6 +17659,26 @@ export class RunRunner {
     } catch {
       flight.runLog.warn("worker memory hold stopped without confirmed disposition; custody retained");
     }
+  }
+
+  /** A caller timeout is not proof of original work completion or park authority. */
+  private canYieldMemoryToOwnerPause(flight: RunFlight, failure: unknown): boolean {
+    const memory = flight.workerMemory;
+    const pause = flight.steering.getPauseMode();
+    if (!memory?.hold || (pause !== "now" && pause !== "milestone") ||
+        Date.now() >= memory.hold.deadline || !memory.operation || memory.settled !== true ||
+        flight.parked || flight.holdOrWallParkConfirmed || flight.stoppedSourceKept ||
+        flight.active?.shuttingDown || this.shuttingDownGlobal ||
+        flight.steering.isCancelled() || flight.steering.claimFence() !== undefined ||
+        flight.steering.pendingCredentialSwitch() !== undefined ||
+        flight.steering.terminalLifecycleSignal().aborted ||
+        this.client.memoryIncarnation !== memory.incarnation ||
+        memory.hold.context.flight !== flight || memory.hold.context.claim_generation !== flight.claimGeneration ||
+        isRunOwnershipLost(failure, flight.runId) || failure instanceof StaleClaimError ||
+        failure instanceof ServerWallParkedError || failure instanceof CredentialSwitchSignal ||
+        failure instanceof CredentialSwitchRetainedStop) return false;
+    return memory.feedback.size === 0 && (!memory.closing || memory.closingSettled === true) &&
+      !this.memoryRuntime!.sinkReceipts.some(receipt => receipt.context.flight === flight);
   }
 
   private async reconcileWorkerMemory(flight: RunFlight): Promise<void> {

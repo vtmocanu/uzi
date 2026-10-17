@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { MessageBatcher } from "../src/batcher.js";
 import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
@@ -86,7 +87,15 @@ type MemoryFlightProof = {
     operation?: Promise<void>; settled?: boolean; closing?: Promise<void>;
     feedback: Map<string, { operation?: Promise<boolean> }>;
   };
-  steering: { terminalLifecycleSignal(): AbortSignal };
+  steering: {
+    terminalLifecycleSignal(): AbortSignal;
+    seedPauseRequested(mode: string): void;
+    requestDiskStop(): void;
+    isCancelled(): boolean;
+    claimFence(): string | undefined;
+    tripCredentialSwitch(generation: number): void;
+    pendingCredentialSwitch(): number | undefined;
+  };
 };
 
 function enroll(ctx: RunContext, toolId = "original-tool") {
@@ -1146,6 +1155,140 @@ for (const phase of ["drain", "feedback", "preserve"] as const) {
       assert.equal(signals, 1); assert.equal(f.reservations.length, 1);
     } finally {
       release.resolve(); await work; await f.memory.stop(); await monitoring;
+    }
+  });
+}
+
+for (const mode of ["now", "milestone"] as const) for (const originalFailure of ["pause-signal", "memory-abort"] as const) {
+  test(`memory preservation yields an owner pause after original work settles (${mode}, ${originalFailure})`, async () => {
+    const f = await setup(1);
+    const monitoring = f.memory.run();
+    let context: RunContext | undefined;
+    let captured: MemoryFlightProof | undefined;
+    let executorError: unknown;
+    let pauseSent = false;
+    fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
+    const executor: Executor = {
+      settleForCredentialFreeCapture: async () => {
+        if (!pauseSent) {
+          pauseSent = true;
+          api.appendInputs(f.claim.run_id, [input("pause", mode)]);
+          await until(() => context?.pauseModeRequested?.() === mode);
+        }
+        return { kind: "observed_empty" };
+      },
+      run: async ctx => {
+        context = ctx;
+        try {
+          const command = enroll(ctx);
+          captured = command.captured.context.flight as unknown as MemoryFlightProof;
+          f.pressure(950);
+          await command.captured.commands.watchOutcome(command.entry);
+          await until(() => captured?.workerMemory?.settled === true);
+          assert.equal(ctx.pauseModeRequested?.(), mode);
+          assert.equal(ctx.signal?.aborted, true);
+          if (originalFailure === "memory-abort") {
+            assert.equal(ctx.signal!.reason instanceof PauseNowSignal, false,
+              "the memory operation aborted first; pause must not depend on the first error class");
+          }
+        } catch (error) { executorError = error; throw error; }
+        throw originalFailure === "pause-signal" ? new PauseNowSignal() : ctx.signal!.reason;
+      },
+    };
+    try {
+      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(f.claim);
+      if (executorError) throw executorError;
+      assert.equal(pauseSent, true);
+      assert.equal(captured?.workerMemory?.settled, true);
+      const disposition = api.states.filter(s => s.body.status === "paused" || s.body.status === "pause_failed");
+      assert.equal(disposition.length, 1, "the existing owner-pause path must report exactly one disposition");
+      assert.equal(f.parkReceipts.length, 0, "owner pause preempts memory parking");
+      assert.equal(api.states.some(s => s.body.status === "failed"), false);
+      assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+      assert.equal(fs.readFileSync(homeDir + "/pause-session-proof", "utf8"), "retained session");
+      assert.equal(captured?.retainedLocalCustody, true);
+    } finally { await f.memory.stop(); await monitoring; }
+  });
+}
+
+for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "claim-fence", "credential-switch", "registration", "unsettled", "expired", "already-parked"] as const) {
+  test(`memory pause handoff retains custody without an owner-pause disposition (${scenario})`, async () => {
+    const f = await setup(1);
+    const monitoring = f.memory.run();
+    const release = releaseGate();
+    let context: RunContext | undefined, captured: MemoryFlightProof | undefined;
+    let executorError: unknown, entered = false;
+    let runner: ReturnType<typeof runnerWith>;
+    fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
+    const executor: Executor = {
+      settleForCredentialFreeCapture: async () => {
+        entered = true;
+        if (scenario !== "already-parked") {
+          api.appendInputs(f.claim.run_id, [input("pause", scenario === "wall" ? "wall" : "now")]);
+          await until(() => context?.pauseModeRequested?.() === (scenario === "wall" ? "wall" : "now"));
+          if (scenario === "disk") captured!.steering.requestDiskStop();
+          if (scenario === "withdrawn") {
+            api.appendInputs(f.claim.run_id, [input("pause_cancel")]);
+            await until(() => context?.pauseModeRequested?.() === null);
+          }
+          if (scenario === "cancel") {
+            api.appendInputs(f.claim.run_id, [input("cancel")]);
+            await until(() => captured!.steering.isCancelled());
+          }
+          if (scenario === "shutdown") runner.shutdown();
+          if (scenario === "claim-fence") {
+            api.setInputClaimGeneration(f.claim.run_id, 8);
+            api.appendInputs(f.claim.run_id, [input("pause", "now")]);
+            await until(() => captured!.steering.claimFence() !== undefined);
+          }
+          if (scenario === "credential-switch") captured!.steering.tripCredentialSwitch(7);
+          if (scenario === "registration") client.revokeMemoryAuthority();
+          if (scenario === "unsettled") await release.promise; // Deliberately ignore cancellation.
+          if (scenario === "expired") await new Promise(resolve => setTimeout(resolve, 250));
+        }
+        return { kind: "observed_empty" };
+      },
+      run: async ctx => {
+        context = ctx;
+        try {
+          if (scenario === "already-parked") {
+            git.worktreeStatus = async () => [];
+            git.commitWipMarker = async () => false;
+          }
+          const command = enroll(ctx);
+          captured = command.captured.context.flight as unknown as MemoryFlightProof;
+          f.pressure(950);
+          await command.captured.commands.watchOutcome(command.entry);
+          await until(() => entered);
+          if (scenario === "unsettled") {
+            assert.notEqual(captured.workerMemory?.settled, true);
+          } else {
+            await until(() => captured?.workerMemory?.settled === true);
+          }
+          if (scenario === "already-parked") {
+            assert.equal(captured.parked, true, "the original memory park must be positively accepted first");
+            assert.equal(f.parkReceipts.length, 1);
+            captured.steering.seedPauseRequested("now");
+          }
+        } catch (error) { executorError = error; throw error; }
+        throw ctx.signal?.reason ?? new PauseNowSignal();
+      },
+    };
+    runner = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: scenario === "unsettled" || scenario === "expired" ? 200 : 5000 });
+    try {
+      await runner.execute(f.claim);
+      if (executorError) throw executorError;
+      const disposition = api.states.filter(s => s.body.status === "paused" || s.body.status === "pause_failed");
+      assert.equal(disposition.length, 0, "unsettled work or a different lifecycle outcome cannot authorize owner pause");
+      assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+      assert.equal(fs.readFileSync(homeDir + "/pause-session-proof", "utf8"), "retained session");
+      assert.equal(captured?.retainedLocalCustody, true);
+    } finally {
+      release.resolve();
+      await captured?.workerMemory?.operation;
+      await f.memory.stop(); await monitoring;
     }
   });
 }
