@@ -2747,6 +2747,7 @@ export class RunRunner {
    *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
    *  Best-effort; never throws to the caller. */
   async resumePendingRecoveries(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
+    signal = signal ? AbortSignal.any([signal, this.shutdownSignal.signal]) : this.shutdownSignal.signal;
     await this.recovery.resumePending(signal, snapshot, true).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
     });
@@ -2757,11 +2758,17 @@ export class RunRunner {
    *  (`authenticatedAtMs` is that heartbeat's send time); the coordinator bounds, spaces and
    *  single-flights the passes, and skips a run this runner is executing. Never throws. */
   async resumeLiveRecoveries(authenticatedAtMs: number, signal?: AbortSignal): Promise<void> {
+    signal = signal ? AbortSignal.any([signal, this.shutdownSignal.signal]) : this.shutdownSignal.signal;
     await this.recovery
       .resumeLive({ isExecuting: (runId) => this.isExecuting(runId), authenticatedAtMs, signal })
       .catch((err) => {
         this.log.warn("recovery: live re-drive failed", { error: errMessage(err) });
       });
+  }
+
+  /** Revoke coordinator authority synchronously, then join its owned passes. */
+  async shutdownRecoveries(): Promise<void> {
+    await this.recovery.shutdown();
   }
 
   /**
@@ -2996,12 +3003,13 @@ export class RunRunner {
       isLivePath: (clonePath: string) => boolean;
     }) => Promise<T>,
   ): Promise<{ entered: false } | { entered: true; value: T }> {
-    if (this.executionTails.has(runId)) return { entered: false };
+    if (this.shutdownSignal.signal.aborted || this.executionTails.has(runId)) return { entered: false };
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
     this.inventoryReservations.add(runId);
-    const open = (): boolean => this.executionTails.get(runId) === tail && residueQuarantine() === undefined &&
+    const open = (): boolean => !this.shutdownSignal.signal.aborted &&
+      this.executionTails.get(runId) === tail && residueQuarantine() === undefined &&
       !clonePaths.some(p => this.liveAttempts.isLivePath(p));
     const quiesce = async (paths: string[]): Promise<boolean> => {
       if (process.platform !== "linux" || !open()) return false;

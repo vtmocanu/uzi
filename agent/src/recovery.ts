@@ -874,6 +874,7 @@ export class RecoveryCoordinator {
   private readonly unadoptedSettleRetryDelaysMs: readonly number[];
   /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
   private readonly passes = new Set<Promise<void>>();
+  private readonly passShutdown = new AbortController();
   /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
   private nextPassAt = 0;
   /** issue #2213: the quarantine skip of a live pass is logged once. */
@@ -3111,16 +3112,26 @@ export class RecoveryCoordinator {
    * One `recovery restart sweep` log line is written per processed record (ids and outcome only).
    */
   resumePending(signal?: AbortSignal, snapshot?: RecoveryRecord[], discover = false): Promise<void> {
-    if (!this.enabled) return Promise.resolve();
+    if (!this.enabled || this.passShutdown.signal.aborted || signal?.aborted) return Promise.resolve();
+    signal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
     // issue #1995: installed SYNCHRONOUSLY (before the first await) so a heartbeat-driven
     // resumeLive can never overlap the boot sweep: it returns at once while any pass is in flight.
     return this.trackPass(() => this.resumePendingPass(signal, snapshot, discover));
   }
 
-  /** Run `fn` as a coordinator pass: {@link resumeLive} is a no-op while any pass is in flight.
-   *  `fn` is invoked synchronously, so its in-flight marker exists before any caller can await. */
+  /** Close admission synchronously, abort owned passes, and join their actual settlement.
+   * No new pass can extend this finite snapshot; a failed pass does not skip its siblings. */
+  async shutdown(): Promise<void> {
+    this.passShutdown.abort();
+    await Promise.allSettled(this.passes);
+  }
+
+  /** Install ownership synchronously before dispatch, including reentrant shutdown from hooks. */
   private trackPass(fn: () => Promise<void>): Promise<void> {
-    const pass = fn();
+    const pass = Promise.resolve().then(() => {
+      if (this.passShutdown.signal.aborted) return;
+      return fn();
+    });
     this.passes.add(pass);
     return pass.finally(() => {
       this.passes.delete(pass);
@@ -3379,7 +3390,8 @@ export class RecoveryCoordinator {
    * on the same record.
    */
   async resumeLive(opts: ResumeLiveOptions): Promise<void> {
-    if (!this.enabled || this.passes.size > 0) return;
+    if (!this.enabled || this.passShutdown.signal.aborted || opts.signal?.aborted || this.passes.size > 0) return;
+    opts = { ...opts, signal: opts.signal ? AbortSignal.any([opts.signal, this.passShutdown.signal]) : this.passShutdown.signal };
     // issue #2213: a quarantined worker re-uploads and releases nothing (an unattributable runner-uid
     // process may read credentials); journaled bundles stay put until the worker restarts.
     if (residueQuarantine() !== undefined) {
