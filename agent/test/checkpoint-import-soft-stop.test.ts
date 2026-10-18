@@ -261,6 +261,38 @@ for (const mode of ["done", "milestone", "bridge"] as const) {
   });
 }
 
+it("m1 cleanup soft stop cannot erase a proven CAS mutation failure", async () => {
+  const f = await fixture();
+  try {
+    const first = f.commit("first"); await f.fetch();
+    const incoming = f.commit("CAS then cleanup stop");
+    const internals = f.cache as unknown as {
+      hasOwedAnchorUnderLock(bare: string, run: string, sha: string): Promise<boolean>;
+    };
+    internals.hasOwedAnchorUnderLock = async () => { throw new CheckpointSoftDeadlineError(); };
+    const spawnReal = realSpawner();
+    let refused = false;
+    const spawner: BoundaryProcessSpawner = async request => {
+      if (request.argv.includes("update-ref") && request.argv.includes("refs/uzi-runner/" + branch)) {
+        refused = true;
+        const argv = [...request.argv]; argv[argv.length - 1] = "0".repeat(40);
+        return spawnReal({ ...request, argv });
+      }
+      return spawnReal(request);
+    };
+    const result = await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+      () => f.fetch());
+    assert.equal(refused, true);
+    assert.deepEqual(result, { kind: "not_updated", reason: "tracking_update_failed" });
+    assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
+    assert.equal(JSON.parse(fs.readFileSync(f.receipt, "utf8")).phase, "pending");
+    for (const sha of [first, incoming]) {
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-owed/" + run + "/" + sha), sha);
+    }
+    assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), incoming);
+  } finally { f.fx.cleanup(); }
+});
+
 it("m1 pending ownership remains refused after a stopped unknown-owner preservation", async () => {
   const f = await fixture();
   try {

@@ -4444,7 +4444,10 @@ export class GitCache {
               await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
             }
           } catch (cause) {
-            if (result.kind === "not_updated" && cause instanceof CheckpointSoftDeadlineError) {
+            // An inconclusive owner with a successfully preserved incoming pin is
+            // not a mutation failure: its cleanup stop must still propagate.
+            if (result.kind === "not_updated" && (observed || result.reason !== "ownership_unknown") &&
+                cause instanceof CheckpointSoftDeadlineError) {
               await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
               return result;
             }
@@ -12340,17 +12343,22 @@ export class GitCache {
   private async spawnCheckpointProcess(boundary: BoundaryProcessScope, request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> {
     let child: BoundaryProcessHandle | undefined;
     let stopped = false;
-    let cancellation: Promise<void> | undefined;
+    let softCancellation: Promise<void> | undefined;
+    const cancellations: Promise<void>[] = [];
     let admittingCancellation = true;
-    const cancel = (): void => {
-      if (!admittingCancellation || !child) return;
-      cancellation ??= Promise.resolve().then(() => child!.cancel());
-      void cancellation.catch(() => undefined);
+    const cancel = (): Promise<void> => {
+      if (!admittingCancellation || !child) return Promise.resolve();
+      // Independent report/recovery callers retain their own settlement promises.
+      // The handle still owns disposal/reap; this wrapper only joins its requests.
+      const pending = Promise.resolve().then(() => child!.cancel());
+      cancellations.push(pending);
+      void pending.catch(() => undefined);
+      return pending;
     };
     const stop = (): void => {
       if (!admittingCancellation) return;
       stopped = true;
-      cancel();
+      if (child) softCancellation ??= cancel();
     };
     boundary.softSignal?.addEventListener("abort", stop, { once: true });
     if (boundary.softSignal?.aborted) stop();
@@ -12372,9 +12380,10 @@ export class GitCache {
       // No await may separate this closure from the cancellation snapshot.
       admittingCancellation = false;
       boundary.softSignal?.removeEventListener("abort", stop);
-      const cancelled = await Promise.allSettled([cancellation]);
-      if (cancelled[0]!.status === "rejected") {
-        throw new CheckpointUnsafeCleanupError("checkpoint child cancellation cleanup unverified", cancelled[0]!.reason);
+      const cancelled = await Promise.allSettled(cancellations);
+      const failedCancellation = cancelled.find(result => result.status === "rejected");
+      if (failedCancellation?.status === "rejected") {
+        throw new CheckpointUnsafeCleanupError("checkpoint child cancellation cleanup unverified", failedCancellation.reason);
       }
       if (terminal[0]!.status === "rejected") {
         if (stopped) throw new CheckpointUnsafeCleanupError("checkpoint child completion cleanup unverified", terminal[0]!.reason);
@@ -12384,10 +12393,7 @@ export class GitCache {
     })();
     void completed.catch(() => undefined);
     return { ...process, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr,
-      cancel: async () => {
-        cancel();
-        await cancellation;
-      }, completed };
+      cancel, completed };
   }
 
   private async execScoped(
