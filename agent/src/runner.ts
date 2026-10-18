@@ -1825,6 +1825,8 @@ interface RunFlight {
   sourceBlockedReport?: boolean;
   sourceNormalBlocked?: boolean;
   sourceGenesis?: SourceGenesis;
+  sourceOriginalInputs?: Readonly<{ barePath: string; branch: string; key: string;
+    kind: RunKind; defaultBranch: string; cloneUrl: string; repoId: string }>;
   sourceJoinFailed?: boolean;
   sourceNormalPark?: boolean;
   sourceExitDenied?: boolean;
@@ -2625,6 +2627,22 @@ export class RunRunner {
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
+        withTerminalSourceBoundary: (runId, paths, action) => {
+          const pressureOpen = () => this.dataVolume?.preflight() !== "data_volume_full";
+          if (!pressureOpen()) return Promise.resolve({ entered: false as const });
+          return this.withRetainedSourceBoundary(runId, paths, async ctx => action({
+            ...ctx,
+            open: () => pressureOpen() && ctx.open(),
+            quiesce: async targets => {
+              for (const target of targets) {
+                if (!pressureOpen() || !ctx.open()) return false;
+                const quiet = await ctx.quiesce([target]);
+                if (!pressureOpen() || !ctx.open() || !quiet) return false;
+              }
+              return true;
+            },
+          }));
+        },
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
@@ -3334,6 +3352,19 @@ export class RunRunner {
     if (!blocked && (genesis.generation !== flight.claimGeneration ||
         genesis.clonePath !== flight.worktreePath || genesis.attemptId !== flight.attemptId ||
         genesis.attemptId !== flight.runnerClone?.attemptId)) return;
+    let originalContext = blocked ? flight.sourceInherited?.originalContext : undefined;
+    if (!blocked && flight.sourceOriginalInputs && flight.owedContext && flight.runnerClone) {
+      try {
+        const context = await flight.owedContext;
+        if (context.generation === genesis.generation && !("legacy" in context) && !("origin" in context)) {
+          const defaultBranch = flight.sourceOriginalInputs.defaultBranch ||
+            context.defaultIdentity.ref.replace(/^refs\/remotes\/origin\//, "");
+          originalContext = Object.freeze({ ...flight.sourceOriginalInputs, defaultBranch,
+            baseCommit: flight.runnerClone.baseCommit,
+            context: Object.freeze({ ...context, defaultIdentity: Object.freeze({ ...context.defaultIdentity }) }) });
+        }
+      } catch { /* Missing original context denies origin admission, never saved replay. */ }
+    }
     const originals = blocked ? flight.sourceInherited?.family?.originals : [genesis];
     const family = originals && flight.barePath && flight.branch
       ? await this.git.matchMaintenanceSourceFamily(flight.barePath, flight.branch, this.cloneCoordinates(claim).key,
@@ -3347,7 +3378,7 @@ export class RunRunner {
     if (blocked && !family) return;
     const terminal = blocked ? "normal_blocked" : normalFailed ? "normal_failed" : "normal_park";
     if (!family) return claim.inventory_guarded === true ? undefined : Object.freeze({ genesis, terminal });
-    return Object.freeze({ genesis, terminal, family: Object.freeze({
+    return Object.freeze({ genesis, terminal, originalContext, family: Object.freeze({
       originals: Object.freeze(family.sources.map(source => Object.freeze({
         ...originals!.find(original => original.clonePath === source.clonePath)!, identity: source.identity,
       }))),
@@ -9488,6 +9519,10 @@ export class RunRunner {
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!(flight.effectiveAttemptPaths ?? this.attemptPaths) || attemptId === undefined) return undefined;
+    const coordinates = this.cloneCoordinates(claim);
+    const originalInputs = Object.freeze({ barePath: this.git.barePathFor(claim.repo.clone_url),
+      branch: coordinates.branch, key: coordinates.key, kind: flight.runKind,
+      defaultBranch: claim.repo.default_branch?.trim() || "", cloneUrl: claim.repo.clone_url, repoId: claim.repo.id });
     // Set when this seed's sweep could not attribute an unreadable process (below): every retention
     // deletion of the same seed is then vetoed, whatever its own re-scan says.
     let retentionVetoed = false;
@@ -9534,6 +9569,7 @@ export class RunRunner {
       onSeeded: (clonePath) => {
         // Called only by GitCache.attemptCloneForBranch after the seed succeeds,
         // inside the bare lock. Canonical reseeds and retained adoption never enter.
+        flight.sourceOriginalInputs = originalInputs;
         flight.sourceGenesis = Object.freeze({
           runId: flight.runId, generation: flight.claimGeneration, clonePath, attemptId,
         });

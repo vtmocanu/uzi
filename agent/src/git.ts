@@ -5782,7 +5782,7 @@ export class GitCache {
   ): Promise<{ sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }>;
     metadata: string } | undefined> {
     try {
-      return await MaintenanceResources.runDiscovery(() => this.withLock(barePath, async () => {
+      const scan = () => this.withLock(barePath, async () => {
         const maxSources = Math.min(128, options.maxSources ?? 128);
         if (!Number.isSafeInteger(maxSources) || maxSources < 1 ||
             !CODE_ID.test(key) || !CODE_ID.test(runId) || !Array.isArray(known) ||
@@ -5813,6 +5813,7 @@ export class GitCache {
         let descriptors = 0;
         const count = () => {
           MaintenanceResources.checkIfActive();
+          if (!MaintenanceResources.discoveryActive()) MaintenanceResources.consumeIfActive("sources", 1);
           if (++descriptors > maxSources) throw new Error("source descriptors exhausted");
         };
         const addJournal = (b: string, journal: RecoveryJournalEntry) => {
@@ -5881,6 +5882,7 @@ export class GitCache {
         }
         // Validate ALL journal members, including foreign ones, before selection.
         for (const { branch: b, journal } of journals) for (const source of this.recoverySources(journal)) {
+          if (!MaintenanceResources.discoveryActive()) MaintenanceResources.consumeIfActive("sources", 1);
           const entry = source.attemptId === undefined ? undefined : ledgers.get(source.attemptId);
           if (!entry || entry.runId !== source.runId || entry.clonePath !== source.clonePath ||
               entry.branch !== b || entry.state === "retired") throw new Error("untracked source member");
@@ -5897,9 +5899,9 @@ export class GitCache {
         const directory = await fs.opendir(path.dirname(canonical), { bufferSize: 1 });
         try {
           for (;;) {
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
             const entry = await directory.read();
             if (!entry) break;
-            MaintenanceResources.consumeIfActive("adminEntries", 1);
             MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
             const artifact = parseRetainedArtifactName(entry.name);
             const clonePath = path.join(path.dirname(canonical),
@@ -5910,6 +5912,7 @@ export class GitCache {
           }
         } finally { await directory.close(); }
         for (const entry of selected) {
+          if (!MaintenanceResources.discoveryActive()) MaintenanceResources.consumeIfActive("sources", 1);
           const original = known.find(s => s.runId === runId && s.clonePath === entry.clonePath && s.attemptId === entry.attemptId);
           if (!original || entry.branch !== branch || entry.state === "retired" ||
               this.clonePathShape(entry.clonePath, canonical)?.attemptId !== entry.attemptId)
@@ -5922,8 +5925,34 @@ export class GitCache {
         }
         if (!journals.some(j => j.branch === branch && j.journal.runId === runId)) throw new Error("missing source journal");
         return { sources, metadata: config };
-      }), { signal: options.signal });
+      });
+      // A paid recheck inherits the slot counters. Discovery itself still refuses
+      // producer tokens; only this shared pure scanner can run in either scope.
+      return await (MaintenanceResources.active() && !MaintenanceResources.discoveryActive()
+        ? scan() : MaintenanceResources.runDiscovery(scan, { signal: options.signal }));
     } catch { return undefined; }
+  }
+
+  /** Pure existing-origin identity. Forge coordinates are not independent repo binding. */
+  async maintenanceOriginDigest(barePath: string, originalUrl: string): Promise<string | undefined> {
+    await this.assertRecoveryBare(barePath);
+    if (this.barePathFor(originalUrl) !== barePath) return undefined;
+    const canonical = (raw: string): string | undefined => {
+      const [host, repo] = splitHostAndPath(raw);
+      if (!repo || raw.length > 4096 || (!host && !path.isAbsolute(raw))) return undefined;
+      if (!host) return JSON.stringify(["", path.normalize(raw)]);
+      return JSON.stringify([host.toLowerCase(), repo.replace(/\/+$/, "").replace(/\.git$/, "")]);
+    };
+    const expected = canonical(originalUrl);
+    if (!expected) return undefined;
+    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    const values = (key: string) => config.split("\0").filter(s => s === key || s.startsWith(key + "\n"));
+    const origins = values("remote.origin.url"), cached = values(BARE_CACHE_ORIGIN_KEY);
+    if (origins.length !== 1 || !origins[0]!.includes("\n") ||
+        canonical(origins[0]!.slice("remote.origin.url\n".length)) !== expected ||
+        cached.length > 1 || (cached.length === 1 &&
+          canonical(cached[0]!.slice(BARE_CACHE_ORIGIN_KEY.length + 1)) !== expected)) return undefined;
+    return createHash("sha256").update(expected).digest("hex");
   }
 
   private recoverySources(journal: RecoveryJournalEntry): RecoverySource[] {

@@ -1,4 +1,41 @@
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceResources } from "./recovery-maintenance.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { Readable } from "node:stream";
+
+/** Reserve raw bytes before removing them from a scoped readable. No short-read refunds.
+ * Each callback retains the admitting scope even for injected emitters outside ALS.
+ * Failure pauses the stream and cancels its owner; settlement remains the owner's close. */
+function pullMaintenance(stream: Readable | null, cap: number, deliver: (chunk: Buffer) => void,
+  failure: () => void): void {
+  if (!stream) return;
+  const within = AsyncLocalStorage.snapshot();
+  let bytes = 0, stopped = false;
+  const pull = () => within(() => {
+    if (stopped) return;
+    try {
+      MaintenanceResources.checkIfActive();
+      while (stream.readableLength > 0) {
+        const length = Math.min(stream.readableLength, 64 * 1024, cap - bytes);
+        if (length <= 0) throw new Error("maintenance output envelope");
+        MaintenanceResources.consumeIfActive("metadataBytes", length);
+        bytes += length;
+        const chunk: unknown = stream.read(length);
+        if (chunk === null) return;
+        if (!Buffer.isBuffer(chunk)) throw new Error("maintenance raw stream required");
+        MaintenanceResources.checkIfActive();
+        deliver(chunk);
+      }
+    } catch {
+      stopped = true;
+      stream.pause();
+      failure();
+    }
+  });
+  stream.on("readable", pull);
+  pull();
+}
+
 // issue #1783 (R0/R3/R5 + Docker teardown) — prove a run's clone is QUIESCENT before the worker
 // parks it, retires it, or finalizes from it.
 //
@@ -198,20 +235,23 @@ export interface ProcTable {
 }
 
 const PROC_ROOT = path.join("/", "proc");
+const meteredProcTables = new WeakSet<ProcTable>();
 
 /** A procfs-shaped table rooted at `root`: `<root>/<pid>/{status,environ,cwd,stat}`. */
 export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; deadline: number }): ProcTable {
-  if (budget) {
+  if (budget || MaintenanceResources.active()) {
     let total = 0;
     const check = () => {
-      budget.signal?.throwIfAborted();
-      if (Date.now() >= budget.deadline) throw new Error("process proof deadline");
+      MaintenanceResources.checkIfActive();
+      budget?.signal?.throwIfAborted();
+      if (budget && Date.now() >= budget.deadline) throw new Error("process proof deadline");
     };
     const read = (pid: number, name: string, cap: number, encoding: BufferEncoding) => {
       check();
       const fd = fs.openSync(path.join(root, String(pid), name), fs.constants.O_RDONLY |
         fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       try {
+        MaintenanceResources.consumeIfActive("metadataBytes", cap + 1);
         const buf = Buffer.alloc(cap + 1);
         let length = 0;
         // Complete EOF, including at the cap; at most cap+1 nonempty reads.
@@ -227,7 +267,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
         return buf.toString(encoding, 0, length);
       } finally { fs.closeSync(fd); }
     };
-    return {
+    const table: ProcTable = {
       listPids: () => {
         check();
         const pids: number[] = [];
@@ -235,6 +275,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
         try {
           for (;;) {
             check();
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
             const entry = directory.readSync();
             if (!entry) break;
             if (!/^[0-9]+$/.test(entry.name)) continue;
@@ -247,8 +288,16 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       readStatus: pid => read(pid, "status", 64 * 1024, "utf8"),
       readStat: pid => read(pid, "stat", 64 * 1024, "utf8"),
       readEnviron: pid => read(pid, "environ", 256 * 1024, "latin1"),
-      readCwd: pid => { check(); return fs.readlinkSync(path.join(root, String(pid), "cwd")); },
+      readCwd: pid => {
+        check();
+        MaintenanceResources.consumeIfActive("metadataBytes", 64 * 1024);
+        const cwd = fs.readlinkSync(path.join(root, String(pid), "cwd"));
+        if (Buffer.byteLength(cwd) > 64 * 1024) throw new Error("process cwd budget");
+        return cwd;
+      },
     };
+    meteredProcTables.add(table);
+    return table;
   }
   return {
     listPids: () =>
@@ -778,8 +827,12 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const remaining = ambient?.cap(deps.deadlineMs ?? REAP_DEADLINE_MS);
   // A test view stands in for the real table only when the caller injected none.
   const view = deps.table === undefined && testView !== undefined ? viewReapDeps(testView) : undefined;
+  const scoped = MaintenanceResources.active();
   const reportBudget: { signal?: AbortSignal; deadline: number } | undefined = deps.reportBudget ??
-    (req.reportDeadline === undefined ? undefined : { deadline: req.reportDeadline });
+    (req.reportDeadline === undefined ? (scoped ? {
+      signal: MaintenanceResources.signalIfActive(),
+      deadline: Date.now() + MaintenanceResources.remainingMsIfActive(),
+    } : undefined) : { deadline: req.reportDeadline });
   const baseTable = deps.table ?? (reportBudget && testView && "procRoot" in testView
     ? procfsTableAt(testView.procRoot, reportBudget) : view?.table) ??
     (reportBudget ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
@@ -788,10 +841,14 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const bounded = <T>(read: () => T, cap?: number): T => {
     try {
       ambient?.check();
+      MaintenanceResources.checkIfActive();
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
       const result = read();
-      if (reportBudget && typeof result === "string" && cap !== undefined) {
+      if (scoped && !meteredProcTables.has(baseTable) && typeof result === "string") {
+        MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(result));
+      }
+      if ((reportBudget || scoped) && typeof result === "string" && cap !== undefined) {
         const length = Buffer.byteLength(result);
         bytes += length;
         if (length > cap || bytes > 32 * 1024 * 1024) throw new Error("process input budget");
@@ -804,9 +861,10 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       throw error;
     }
   };
-  const table: ProcTable = reportBudget || ambient ? {
+  const table: ProcTable = reportBudget || ambient || scoped ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
+      if (!meteredProcTables.has(baseTable)) MaintenanceResources.consumeIfActive("adminEntries", pids.length);
       if (pids.length > 4096) throw new Error("process PID budget");
       return pids;
     }),
@@ -827,6 +885,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
       return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
     }
+    MaintenanceResources.checkIfActive();
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
     if (last.tableError || tableFailure || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
       return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? "process proof deadline") };
@@ -993,7 +1052,11 @@ function runFixedAsRunner(
   budget?: { signal: AbortSignal; deadline: number },
 ): Promise<{ status: number | null; stdout: string }> {
   const ambient = MaintenanceBudget.current();
+  const scoped = MaintenanceResources.active();
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
   ambient?.check();
+  MaintenanceResources.checkIfActive();
   const remaining = ambient?.cap(timeoutMs);
   if (budget) {
     budget.signal.throwIfAborted();
@@ -1005,6 +1068,7 @@ function runFixedAsRunner(
   if (remaining && duration <= 0) return Promise.reject(new Error("maintenance helper operation expired"));
   return new Promise((resolve, reject) => {
     let settled = false;
+    MaintenanceResources.consumeIfActive("launches", 1);
     const child = spawn(w.command, w.args, {
       env: workerSpawnEnv({ PATH: HELPER_PATH }),
       detached: true,
@@ -1016,48 +1080,56 @@ function runFixedAsRunner(
       cancellation = new Error("report helper setup cancelled");
       killRunnerGroup(child.pid);
     };
+    resourceSignal?.addEventListener("abort", cancel, { once: true });
     ambient?.signal.addEventListener("abort", cancel, { once: true });
     budget?.signal.addEventListener("abort", cancel, { once: true });
-    if (budget?.signal.aborted || ambient?.signal.aborted) cancel();
+    if (budget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancel();
     const timer = setTimeout(() => {
       if (settled) return;
       killRunnerGroup(child.pid);
-      if (budget || ambient) cancellation = new Error("report helper setup deadline");
+      if (budget || ambient || scoped) cancellation = new Error("report helper setup deadline");
       else {
         settled = true;
         reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
       }
     }, Math.min(duration, budget ? Math.max(1, Math.min(timeoutMs, budget.deadline - Date.now())) : timeoutMs));
     let out = "";
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (c: string) => {
-      if (budget && Buffer.byteLength(out) + Buffer.byteLength(c) > 64 * 1024) {
-        cancellation = new Error("report helper setup output overflow");
-        killRunnerGroup(child.pid);
-        return;
-      }
-      if (out.length < 64 * 1024) out += c;
-    });
+    const raw: Buffer[] = [];
+    if (scoped) {
+      pullMaintenance(child.stdout, 64 * 1024, chunk => { raw.push(chunk); }, cancel);
+    } else {
+      child.stdout?.setEncoding("utf8");
+      child.stdout?.on("data", (c: string) => {
+        if (budget && Buffer.byteLength(out) + Buffer.byteLength(c) > 64 * 1024) {
+          cancellation = new Error("report helper setup output overflow");
+          killRunnerGroup(child.pid);
+          return;
+        }
+        if (out.length < 64 * 1024) out += c;
+      });
+    }
     child.on("error", (err) => {
       if (settled) return;
-      if (budget || ambient) { cancellation = err; if (ambient) killRunnerGroup(child.pid); return; }
+      if (budget || ambient || scoped) { cancellation = err; if (ambient || scoped) killRunnerGroup(child.pid); return; }
       settled = true;
       clearTimeout(timer);
       reject(err);
     });
-    child.on("close", (status) => {
+    child.on("close", (status) => within(() => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      resourceSignal?.removeEventListener("abort", cancel);
       ambient?.signal.removeEventListener("abort", cancel);
       budget?.signal.removeEventListener("abort", cancel);
       try {
         ambient?.check();
+        MaintenanceResources.checkIfActive();
         if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
       } catch (error) { cancellation = error as Error; }
       if (cancellation) reject(cancellation);
-      else resolve({ status, stdout: out });
-    });
+      else resolve({ status, stdout: scoped ? Buffer.concat(raw).toString("utf8") : out });
+    }));
   });
 }
 
@@ -1115,6 +1187,8 @@ function helperArgv(): string[] {
 function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
+  if (Array.isArray(o.processes)) MaintenanceResources.consumeIfActive("adminEntries", o.processes.length);
+  if (Array.isArray(o.killed)) MaintenanceResources.consumeIfActive("adminEntries", o.killed.length);
   return (
     (o.state === "quiescent" || o.state === "survivors" || o.state === "unverified") &&
     Array.isArray(o.processes) &&
@@ -1172,7 +1246,12 @@ async function reapProcessesViaHelper(
   opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
   const ambient = MaintenanceBudget.current();
+  const scoped = MaintenanceResources.active();
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
   const remaining = ambient?.cap(opts.timeoutMs ?? HELPER_TIMEOUT_MS);
+  if (scoped) req = { ...req, reportDeadline: Math.min(req.reportDeadline ?? Infinity,
+    Date.now() + MaintenanceResources.remainingMsIfActive()) };
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
   try {
@@ -1184,6 +1263,7 @@ async function reapProcessesViaHelper(
   let tmpDir: string;
   try {
     ambient?.check();
+    MaintenanceResources.checkIfActive();
     opts.reportBudget?.signal.throwIfAborted();
     if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
     tmpDir = await helperTmp.make(opts.reportBudget);
@@ -1192,6 +1272,7 @@ async function reapProcessesViaHelper(
   }
   try {
     ambient?.check();
+    MaintenanceResources.checkIfActive();
     if (remaining && Math.floor(remaining()) <= 0) throw new Error("helper setup cap expired");
   } catch { return unverified("maintenance helper setup expired"); }
   // Report-proof temporary cleanup retains its separate wall-clock deadline: an aborted proof signal
@@ -1209,7 +1290,7 @@ async function reapProcessesViaHelper(
     }
   };
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
-    if (!ambient) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    if (!ambient && !scoped) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
   }
   const wrapped = runnerCommand(process.execPath, argv);
@@ -1221,14 +1302,16 @@ async function reapProcessesViaHelper(
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      resourceSignal?.removeEventListener("abort", cancelReport);
       opts.reportBudget?.signal.removeEventListener("abort", cancelReport);
       ambient?.signal.removeEventListener("abort", cancelReport);
-      if (ambient) {
+      if (ambient || scoped) {
         // Only admit private-temp cleanup while this attempt still has time; join it once admitted.
         try {
-          ambient.check();
+          ambient?.check();
+          MaintenanceResources.checkIfActive();
           Promise.resolve(helperTmp.remove(tmpDir, opts.reportBudget)).then(
-            () => { try { ambient.check(); resolve(r); } catch { resolve(unverified("maintenance helper cleanup expired")); } },
+            () => { try { ambient?.check(); MaintenanceResources.checkIfActive(); resolve(r); } catch { resolve(unverified("maintenance helper cleanup expired")); } },
             () => resolve(unverified("maintenance helper cleanup failed")));
         } catch { resolve(unverified("maintenance helper expired")); }
       } else if (opts.reportBudget) {
@@ -1249,6 +1332,7 @@ async function reapProcessesViaHelper(
     try {
       ambient?.check();
       if (remaining && Math.floor(remaining()) <= 0) throw new Error("maintenance helper operation expired");
+      MaintenanceResources.consumeIfActive("launches", 1);
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
         env: workerSpawnEnv(helperEnv),
@@ -1257,40 +1341,47 @@ async function reapProcessesViaHelper(
       done(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
       return;
     }
+    resourceSignal?.addEventListener("abort", cancelReport, { once: true });
     ambient?.signal.addEventListener("abort", cancelReport, { once: true });
     opts.reportBudget?.signal.addEventListener("abort", cancelReport, { once: true });
-    if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted) cancelReport();
+    if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper timed out");
+      if (opts.reportBudget || ambient || scoped) reportFailure = unverified("quiescence helper timed out");
       else done(unverified("quiescence helper timed out"));
     }, Math.min(remaining ? Math.max(1, remaining()) : opts.timeoutMs ?? HELPER_TIMEOUT_MS, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
       opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS));
     const out: Buffer[] = [];
     let outBytes = 0;
-    child.stdout?.on("data", (c: Buffer) => {
-      if (settled) return;
-      outBytes += c.length;
-      if (outBytes > HELPER_STDOUT_MAX) {
-        killRunnerGroup(child.pid);
-        if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
-        else done(unverified("quiescence helper output exceeded 1 MiB"));
-        return;
-      }
-      out.push(c);
-    });
-    child.stderr?.resume();
+    if (scoped) {
+      pullMaintenance(child.stdout, HELPER_STDOUT_MAX, c => { out.push(c); }, cancelReport);
+      pullMaintenance(child.stderr, HELPER_STDOUT_MAX, () => {}, cancelReport);
+    } else {
+      child.stdout?.on("data", (c: Buffer) => {
+        if (settled) return;
+        outBytes += c.length;
+        if (outBytes > HELPER_STDOUT_MAX) {
+          killRunnerGroup(child.pid);
+          if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+          else done(unverified("quiescence helper output exceeded 1 MiB"));
+          return;
+        }
+        out.push(c);
+      });
+      child.stderr?.resume();
+    }
     // A helper that dies before reading its request fails this write (EPIPE); the close handler
     // below reports that exit, so the write error itself is only swallowed here.
     child.stdin?.on("error", () => undefined);
     child.on("error", (err) => {
       const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
-      if (opts.reportBudget || ambient) { reportFailure = failure; if (ambient) killRunnerGroup(child.pid); }
+      if (opts.reportBudget || ambient || scoped) { reportFailure = failure; if (ambient || scoped) killRunnerGroup(child.pid); }
       else done(failure);
     });
-    child.on("close", (code, signal) => {
+    child.on("close", (code, signal) => within(() => {
       try {
         ambient?.check();
+        MaintenanceResources.checkIfActive();
         if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
       } catch { reportFailure = unverified("maintenance helper expired"); }
       if (reportFailure) { done(reportFailure); return; }
@@ -1298,13 +1389,19 @@ async function reapProcessesViaHelper(
         done(unverified(`quiescence helper exited ${code ?? signal ?? "abnormally"}`));
         return;
       }
-      done(parseHelperVerdict(Buffer.concat(out).toString("utf8")));
-    });
-    if (ambient) {
+      try { done(parseHelperVerdict(Buffer.concat(out).toString("utf8"))); }
+      catch { done(unverified("maintenance helper verdict exhausted")); }
+    }));
+    if (ambient || scoped) {
       try {
-        ambient.check();
-        if (remaining!() <= 0) throw new Error("helper input cap expired");
-        child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
+        ambient?.check();
+        MaintenanceResources.checkIfActive();
+        if (remaining && remaining() <= 0) throw new Error("helper input cap expired");
+        MaintenanceResources.consumeIfActive("adminEntries", req.targetPaths.length + req.liveMarkers.length + req.liveRoots.length);
+        const input = JSON.stringify(testView === undefined ? req : { ...req, view: testView });
+        if (Buffer.byteLength(input) > HELPER_REQUEST_MAX) throw new Error("helper request overflow");
+        MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(input));
+        child.stdin?.end(input);
       } catch { cancelReport(); }
     } else child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
   });
@@ -1327,15 +1424,15 @@ function defaultTargetUid(): number {
 /** Reap in-process or through the helper (see {@link reapProcessesViaHelper}). */
 export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = {}): Promise<ProcessQuiescence> {
   const viaHelper = opts.viaHelper ?? uidSplitActive();
-  if (viaHelper) {
-    return reapProcessesViaHelper(req, {
+  try {
+    if (viaHelper) {
+    return await reapProcessesViaHelper(req, {
       spawnHelper: opts.spawnHelper,
       timeoutMs: opts.helperTimeoutMs,
       helperTmp: opts.helperTmp,
       reportBudget: opts.reportBudget,
     });
   }
-  try {
     return await reapProcesses(req, opts);
   } catch (err) {
     return { state: "unverified", processes: [], killed: [], detail: `reap failed: ${(err as Error).message}` };
@@ -1398,6 +1495,7 @@ function dockerRequest(
   signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
   signal?.throwIfAborted();
+  if (MaintenanceResources.active()) return maintenanceDockerRequest(ep, method, urlPath, timeoutMs, maxBodyBytes, signal);
   return new Promise((resolve, reject) => {
     let settled = false;
     let res: http.IncomingMessage | undefined;
@@ -1445,15 +1543,73 @@ function dockerRequest(
   });
 }
 
+/** Scoped HTTP owns request and response through close, including quota-only cancellation. */
+function maintenanceDockerRequest(ep: Endpoint, method: string, urlPath: string, timeoutMs: number,
+  cap: number, signal?: AbortSignal): Promise<{ status: number; body: string }> {
+  MaintenanceResources.checkIfActive();
+  MaintenanceResources.consumeIfActive("rpcAttempts", 1);
+  const duration = Math.max(0, Math.min(timeoutMs, MaintenanceResources.remainingMsIfActive()));
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
+  return new Promise((resolve, reject) => {
+    let response: http.IncomingMessage | undefined;
+    let requestClosed = false, responseClosed = false, ended = false, settled = false;
+    let failure: Error | undefined;
+    const chunks: Buffer[] = [];
+    const finish = () => within(() => {
+      if (settled || !requestClosed || (response && !responseClosed)) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
+      resourceSignal?.removeEventListener("abort", cancel);
+      try {
+        MaintenanceResources.checkIfActive();
+        if (failure) throw failure;
+        if (!ended) throw new Error("maintenance docker incomplete");
+        resolve({ status: response?.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") });
+      } catch (error) { reject(error); }
+    });
+    const abort = (error: Error) => {
+      failure ??= error;
+      response?.destroy();
+      request.destroy();
+    };
+    const cancel = () => abort(new Error("maintenance docker cancelled"));
+    const request = http.request({ ...ep, method, path: urlPath, timeout: timeoutMs }, r => within(() => {
+      response = r;
+      r.on("close", () => { responseClosed = true; finish(); });
+      r.on("error", error => abort(error));
+      r.on("aborted", cancel);
+      r.on("end", () => { ended = true; });
+      if (failure) { r.destroy(); return; }
+      pullMaintenance(r, cap, chunk => chunks.push(chunk), cancel);
+    }));
+    const timer = setTimeout(cancel, duration);
+    timer.unref();
+    request.on("close", () => { requestClosed = true; finish(); });
+    request.on("timeout", cancel);
+    request.on("error", error => abort(error));
+    signal?.addEventListener("abort", cancel, { once: true });
+    resourceSignal?.addEventListener("abort", cancel, { once: true });
+    try {
+      MaintenanceResources.checkIfActive();
+      if (signal?.aborted || resourceSignal?.aborted) cancel();
+      else request.end();
+    } catch { cancel(); }
+  });
+}
+
 function boundContainers(body: string, targetPaths: string[]): string[] {
   const parsed: unknown = JSON.parse(body);
   if (!Array.isArray(parsed)) throw new Error("container listing is not an array");
+  MaintenanceResources.consumeIfActive("adminEntries", parsed.length);
   const ids: string[] = [];
   for (const c of parsed) {
     if (typeof c !== "object" || c === null) continue;
     const id = (c as { Id?: unknown }).Id;
     const mounts = (c as { Mounts?: unknown }).Mounts;
     if (typeof id !== "string" || !Array.isArray(mounts)) continue;
+    MaintenanceResources.consumeIfActive("adminEntries", mounts.length);
     const bound = mounts.some((m) => {
       const src = (m as { Source?: unknown } | null)?.Source;
       return typeof src === "string" && src !== "" && targetPaths.some((t) => isWithinPath(src, t));
@@ -1486,7 +1642,8 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   const reqTimeout = opts.requestTimeoutMs ?? 5_000;
   const ambient = MaintenanceBudget.current();
   const deadline = now() + (opts.deadlineMs ?? 15_000);
-  const remainingTime = ambient?.cap(opts.deadlineMs ?? 15_000) ?? (() => deadline - now());
+  const localRemaining = ambient?.cap(opts.deadlineMs ?? 15_000) ?? (() => deadline - now());
+  const remainingTime = () => Math.min(localRemaining(), MaintenanceResources.remainingMsIfActive());
   const interval = opts.intervalMs ?? 1_000;
   const removed = new Set<string>();
   const expired = (what: string): DockerTeardown => ({
@@ -1497,6 +1654,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   let clean = 0;
   try {
     for (;;) {
+      MaintenanceResources.checkIfActive();
       let remaining = remainingTime();
       if (remaining <= 0) return expired("the container listing");
       const list = await dockerRequest(
@@ -1522,6 +1680,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       } else {
         clean = 0;
         for (const id of ids) {
+          MaintenanceResources.checkIfActive();
           remaining = remainingTime();
           if (remaining <= 0) return expired("a container deletion");
           const del = await dockerRequest(

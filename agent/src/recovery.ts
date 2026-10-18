@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { MaintenanceBudget } from "./maintenance-budget.js";
-import { MaintenanceResources as M1MaintenanceResources } from "./recovery-maintenance.js";
+import { MaintenanceResources as M1MaintenanceResources, RecoveryMaintenance, type MaintenanceAdmission } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
@@ -57,6 +57,10 @@ import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeE
 /** Ephemeral execution metadata only; never custody or production admission authority. */
 export type ClosedSourceObservation = Readonly<{
   genesis: Readonly<{ runId: string; generation: number; clonePath: string; attemptId: string }>;
+  originalContext?: Readonly<{
+    barePath: string; branch: string; key: string; kind: RunKind; defaultBranch: string;
+    cloneUrl: string; repoId: string; baseCommit: string; context: PositiveOwedCandidateContext;
+  }>;
   terminal: "normal_park" | "normal_failed" | "normal_blocked";
   family?: Readonly<{
     originals: ReadonlyArray<ClosedSourceObservation["genesis"] & { identity: string }>;
@@ -243,6 +247,8 @@ export interface RecoveryArchiveClient {
   hasHeldPublicationV2?: WorkerClient["hasHeldPublicationV2"];
   publishHeld?: WorkerClient["publishHeld"];
   getExactRecoveryHold?: WorkerClient["getExactRecoveryHold"];
+  observeTerminalMaintenanceHold?: WorkerClient["observeTerminalMaintenanceHold"];
+  isCurrentTerminalMaintenanceHold?: WorkerClient["isCurrentTerminalMaintenanceHold"];
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
   getRecoveryCaptureStatus(runId: string, captureId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RecoveryCaptureStatusResponse>;
@@ -269,6 +275,10 @@ export interface RecoveryArchiveClient {
 
 /** The bundle-producer subset {@link RecoveryCoordinator} needs — GitCache satisfies it. */
 export interface RecoveryBundleProducer {
+  matchMaintenanceSourceFamily?: GitCache["matchMaintenanceSourceFamily"];
+  maintenanceOriginDigest?: GitCache["maintenanceOriginDigest"];
+  worktreeHead?: GitCache["worktreeHead"];
+  readonly recoveryDecodedLimitBytes?: number;
   resolveCheckpointRange?: HeldGit["resolveCheckpointRange"];
   secretScanCheckpointRange?: HeldGit["secretScanCheckpointRange"];
   rangeTouchesWorkflows?: HeldGit["rangeTouchesWorkflows"];
@@ -405,6 +415,10 @@ function inventorySourceReason(diagnostic?: InventorySourceDiagnostic): string {
 }
 
 export interface RecoveryCoordinatorOptions {
+  withTerminalSourceBoundary?: <T>(runId: string, paths: readonly string[], action: (ctx: {
+    open: () => boolean; quiesce: (paths: string[]) => Promise<boolean>;
+    isLivePath: (clonePath: string) => boolean;
+  }) => Promise<T>) => Promise<{ entered: false } | { entered: true; value: T }>;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,
@@ -863,6 +877,8 @@ export class RecoveryCoordinator {
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
   private readonly pendingGenerationReport: RecoveryCoordinatorOptions["pendingGenerationReport"];
   private readonly onAuthoritativeGenerationReleased: RecoveryCoordinatorOptions["onAuthoritativeGenerationReleased"];
+  private readonly withTerminalSourceBoundary: RecoveryCoordinatorOptions["withTerminalSourceBoundary"];
+  private readonly maintenance: RecoveryMaintenance | undefined;
   private readonly client: RecoveryArchiveClient;
   private readonly git: RecoveryBundleProducer;
   private readonly log: Logger;
@@ -978,6 +994,10 @@ export class RecoveryCoordinator {
   private readonly redundancySettled = new Set<string>();
 
   constructor(opts: RecoveryCoordinatorOptions) {
+    this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
+    this.maintenance = opts.workerToken ? new RecoveryMaintenance({
+      root: path.join(opts.recoveryRoot, "..", "recovery-maintenance"), workerToken: opts.workerToken,
+    }) : undefined;
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.isExecuting = opts.isExecuting ?? (() => false);
@@ -3142,7 +3162,7 @@ export class RecoveryCoordinator {
           !Number.isSafeInteger(family.observedExecution.generation) || family.observedExecution.generation <= 0 ||
           (observation.terminal === "normal_failed" &&
             family.observedExecution.generation !== observation.genesis.generation) ||
-          family.originals.length === 0 || !family.metadata ||
+          family.originals.length === 0 || family.originals.length > 128 || !family.metadata ||
           !family.originals.every(source => source.runId === runId &&
             Number.isSafeInteger(source.generation) && source.generation > 0 && source.generation <= generation && !!source.identity) ||
           !family.originals.some(source => source.generation === observation.genesis.generation &&
@@ -3172,7 +3192,199 @@ export class RecoveryCoordinator {
           }
         });
       } finally { for (const budget of attempts.values()) budget.dispose(); }
+      // Replay gets the first opportunity. A separate COMPLETE view below decides
+      // whether a new origin is admissible; the advisory saved snapshot never does.
+      if (observation.originalContext) await this.admitTerminalOrigin(observation, passSignal);
     });
+  }
+
+  /** Origin only: no capture permit, SOURCE, refs, tracking or owed mutations. */
+  private async admitTerminalOrigin(observation: ClosedSourceObservation, signal: AbortSignal): Promise<void> {
+    const original = observation.originalContext, family = observation.family;
+    const ledger = this.maintenance, boundary = this.withTerminalSourceBoundary;
+    const observe = this.client.observeTerminalMaintenanceHold?.bind(this.client);
+    const current = this.client.isCurrentTerminalMaintenanceHold?.bind(this.client);
+    const scan = this.git.matchMaintenanceSourceFamily?.bind(this.git);
+    const originDigest = this.git.maintenanceOriginDigest?.bind(this.git);
+    const head = this.git.worktreeHead?.bind(this.git);
+    const genesis = observation.genesis;
+    type Reason = "invalid_context" | "source_protected_or_ambiguous" | "origin_mismatch" |
+      "local_binding_mismatch" | "exact_hold_refused" | "boundary_closed" | "metadata_incomplete" |
+      "source_unverified" | "history_refused" | "publication_unverified";
+    let stage: Reason = "invalid_context", reported = false;
+    let knownHold: string | undefined;
+    let chargedSignal: AbortSignal | undefined;
+    const safeId = (id: unknown) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}(?![\s\S])/.test(id) ? id : "redacted";
+    const report = (reason: Reason | import("./recovery-maintenance.js").MaintenanceDenial) => {
+      if (reported) return;
+      reported = true;
+      const cause: unknown = (chargedSignal ?? M1MaintenanceResources.signalIfActive())?.reason;
+      // A helper can return an unverified proof after a quota abort. Preserve only
+      // these fixed counter reasons, including after the live resource scope exits.
+      if (cause instanceof Error && (cause.message === "maintenance_resource_exhausted" ||
+          cause.message === "maintenance_clock_invalid")) reason = cause.message;
+      this.log.warn("recovery: terminal origin refused", { reason, run_id: safeId(genesis.runId),
+        generation: Number.isSafeInteger(genesis.generation) && genesis.generation > 0 ? genesis.generation : undefined,
+        hold_id: knownHold });
+    };
+    const refused = (reason: Reason | import("./recovery-maintenance.js").MaintenanceDenial): never => {
+      report(reason);
+      throw new Error("terminal origin refused");
+    };
+    if (!original || !family || !ledger || !boundary || !observe || !current || !scan || !originDigest || !head ||
+        !validInventoryContext(original.context, genesis.runId, original.barePath) ||
+        "legacy" in original.context || "origin" in original.context ||
+        original.context.generation !== genesis.generation || original.context.branch !== original.branch ||
+        original.context.kind !== original.kind || !isCodePublishingKind(original.kind) ||
+        !original.key || !original.defaultBranch ||
+        original.context.defaultIdentity.ref !== `refs/remotes/origin/${original.defaultBranch}` ||
+        !/^[a-f0-9]{40}$/.test(original.baseCommit) ||
+        signal.aborted || this.isExecuting(genesis.runId)) { report("invalid_context"); return; }
+    const hash = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
+    const records = () => this.checkedRecords(genesis.runId, {
+      signal, deadline: Date.now() + Math.min(10_000, M1MaintenanceResources.remainingMsIfActive()),
+    }, true);
+    const freshFamily = async () => {
+      const fresh = await scan(original.barePath, original.branch, original.key, genesis.runId,
+        family.originals, { signal });
+      return fresh?.metadata === family.metadata;
+    };
+    const localBindingsMatch = (existing: RecoveryRecord[], binding: { holdId: string; repoId: string }) =>
+      existing.every(r => (!r.exactHoldBinding || (r.exactHoldBinding.repoId === binding.repoId &&
+        (r.generation !== genesis.generation || r.exactHoldBinding.holdId === binding.holdId))) &&
+        (r.generation !== genesis.generation || (
+          (!r.bareDir || r.bareDir === path.basename(original.barePath)) &&
+          r.branch === original.branch && r.kind === original.kind &&
+          (!r.coverageContext || canonicalJson(r.coverageContext) === canonicalJson(original.context)))));
+    try {
+      stage = "metadata_incomplete";
+      const discovered = await M1MaintenanceResources.runDiscovery(async () => {
+        const existing = await records();
+        // Every pre-existing producer is immutable. This unit does not resume a
+        // partial producer, mint another ID, or infer continuity from its name.
+        if (existing.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary" ||
+            this.savedSourceCandidate(r))) return refused("source_protected_or_ambiguous");
+        stage = "source_protected_or_ambiguous";
+        if (!await freshFamily()) return refused(stage);
+        stage = "origin_mismatch";
+        const origin = await originDigest(original.barePath, original.cloneUrl);
+        if (!origin) return refused(stage);
+        stage = "exact_hold_refused";
+        const held = await observe(genesis.runId, genesis.generation, undefined, signal);
+        if (!held.ok || held.hold.run_status !== "failed" || !current(held.token)) return refused(stage);
+        if (held.hold.repo_id !== original.repoId) return refused("local_binding_mismatch");
+        knownHold = safeId(held.hold.hold_id);
+        if (!localBindingsMatch(existing, { holdId: held.hold.hold_id, repoId: held.hold.repo_id }))
+          return refused("local_binding_mismatch");
+        return { origin, held };
+      }, { signal });
+      if (!discovered) return refused(stage);
+      const { origin, held } = discovered;
+      const binding = { holdId: held.hold.hold_id, repoId: held.hold.repo_id };
+      // Explicit stable projections: no dev/ino, raw config, later generation,
+      // timestamp, changed tip, producer ID or human worker label in ledger identity.
+      const originalSource = hash([genesis.runId, genesis.generation, genesis.clonePath, genesis.attemptId,
+        original.baseCommit]);
+      const admission: MaintenanceAdmission = {
+        identity: { run: genesis.runId, generation: genesis.generation, hold: binding.holdId,
+          repo: binding.repoId, custodian: held.hold.original_worker_id,
+          bareBasename: path.basename(original.barePath), origin, originalSource,
+          sourceConfig: hash([original.branch, original.key, original.kind, original.defaultBranch,
+            original.context.defaultIdentity]) },
+        config: RecoveryMaintenance.configuration(this.git.recoveryDecodedLimitBytes),
+        source: originalSource, exactCustody: true, terminalNonStopped: true,
+      };
+      stage = "boundary_closed";
+      const entered = await boundary(genesis.runId, family.originals.map(s => s.clonePath), async ctx => {
+        const check = () => {
+          signal.throwIfAborted();
+          M1MaintenanceResources.checkIfActive();
+          MaintenanceBudget.current()?.check();
+          if (!ctx.open() || residueQuarantine() !== undefined || !current(held.token) ||
+              family.originals.some(s => ctx.isLivePath(s.clonePath))) refused("boundary_closed");
+        };
+        // Renew exact custody under discovery counters, outside discovery at charge.
+        stage = "exact_hold_refused";
+        const chargedHold = await M1MaintenanceResources.runDiscovery(async () => {
+          check();
+          if (!await freshFamily()) return refused("source_protected_or_ambiguous");
+          const exact = await observe(genesis.runId, genesis.generation, binding, signal);
+          check();
+          if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token)) return refused("exact_hold_refused");
+          stage = "metadata_incomplete";
+          const beforeCharge = await records();
+          if (!localBindingsMatch(beforeCharge, binding)) return refused("local_binding_mismatch");
+          if (beforeCharge.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary" || this.savedSourceCandidate(r)))
+            return refused("source_protected_or_ambiguous");
+          check();
+          return exact;
+        }, { signal });
+        if (!chargedHold) return refused("exact_hold_refused");
+        check();
+        if (!current(chargedHold.token)) return refused("exact_hold_refused");
+        stage = "history_refused";
+        const admitted = await ledger.admit(admission, { signal });
+        if (!admitted.ok) return refused(admitted.reason);
+        const slot = admitted.value;
+        try {
+          await M1MaintenanceResources.run(slot, () => MaintenanceBudget.runProducer(async () => {
+            chargedSignal = M1MaintenanceResources.signalIfActive();
+            stage = "source_unverified";
+            check();
+            if (!await freshFamily() || !await ctx.quiesce(family.originals.map(s => s.clonePath))) return refused(stage);
+            check();
+            if (!await freshFamily() || await originDigest(original.barePath, original.cloneUrl) !== origin) return refused(stage);
+            const sourceSha = await head(genesis.clonePath);
+            if (!sourceSha || !/^[a-f0-9]{40}$/.test(sourceSha)) return refused(stage);
+            check();
+            const fresh = async () => {
+              check();
+              if (!await freshFamily() || await originDigest(original.barePath, original.cloneUrl) !== origin ||
+                  await head(genesis.clonePath) !== sourceSha) refused("source_unverified");
+              const exact = await observe(genesis.runId, genesis.generation, binding, signal);
+              check();
+              if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token) ||
+                  exact.hold.original_worker_id !== admission.identity.custodian ||
+                  !current(chargedHold.token)) refused("exact_hold_refused");
+            };
+            await this.withJournalLock(genesis.runId, async () => {
+              // A single bounded second view closes replay/publication races.
+              stage = "metadata_incomplete";
+              const existing = await records();
+              if (!localBindingsMatch(existing, binding)) return refused("local_binding_mismatch");
+              if (existing.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary" || this.savedSourceCandidate(r)))
+                return refused("source_protected_or_ambiguous");
+              stage = "source_unverified";
+              await fresh();
+              stage = "history_refused";
+              const validation = await ledger.revalidate(slot, { ...admission, quiescent: true, sourceOutputContinuity: true });
+              if (!validation.ok) return refused(validation.reason);
+              const captureId = "maintenance-v1-" + randomUUID();
+              if (captureId.length !== 51 || classifyRecoveryOrigin(captureId) !== "producer") return refused("invalid_context");
+              const mutation = await ledger.beforeMutation(slot, [hash(captureId)]);
+              if (!mutation.ok) return refused(mutation.reason);
+              await fresh();
+              stage = "publication_unverified";
+              await this.writeProducerOriginUnlocked({
+                version: JOURNAL_VERSION, runId: genesis.runId, generation: genesis.generation,
+                captureId, sourceSha, kind: original.kind, branch: original.branch,
+                createdAt: this.now(), state: "pinned", inventoryGuarded: true,
+                bareDir: path.basename(original.barePath), defaultBranch: original.defaultBranch,
+                exactHoldBinding: binding,
+              }, check, fresh);
+            }, signal);
+          }, { signal, durationMs: Math.min(slot.deadline - Date.now(), M1MaintenanceResources.remainingMsIfActive()) }));
+        } finally {
+          // Publication ambiguity keeps the precharged fence even on readback failure.
+          // All filesystem, quiescence and RPC work above has actually joined.
+          const finished = await ledger.finish(slot, "transient");
+          if (!finished.ok) report(finished.reason);
+        }
+      });
+      if (!entered.entered) report("boundary_closed");
+    } catch {
+      report(stage);
+    }
   }
 
   /** RPCs can finish remotely after cancellation; their late answers grant no local authority.
@@ -4297,6 +4509,59 @@ export class RecoveryCoordinator {
     const tmp = `${dst}.${randomUUID()}.tmp`;
     await ownedRecoveryIO(() => fs.writeFile(tmp, JSON.stringify({ ...record, mac }), { mode: 0o600 }));
     await ownedRecoveryIO(() => fs.rename(tmp, dst));
+  }
+
+  /** Standard journal representation with producer-only durability. Failure preserves evidence.
+   * The caller owns the journal lock and has durably indexed this immutable ID. */
+  private async writeProducerOriginUnlocked(record: RecoveryRecord, check: () => void,
+    fresh: () => Promise<void>): Promise<void> {
+    const sync = async (dir: string) => {
+      check();
+      const handle = await fs.open(dir, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try { check(); await handle.sync(); } finally { await handle.close(); }
+    };
+    const raw = JSON.stringify({ ...record, mac: this.computeMac(record) });
+    // Reserve the complete authenticated representation before opening a temp file.
+    M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(raw));
+    const dir = path.resolve(this.runDir(record.runId));
+    let cursor = path.parse(dir).root;
+    // One bounded ancestor walk, no recursive mkdir following symlinks. Each new
+    // directory and its parent are synced before any journal file is dispatched.
+    const components = dir.slice(cursor.length).split(path.sep).filter(Boolean);
+    if (components.length > 128) throw new Error("terminal origin path depth");
+    for (const part of components) {
+      const parent = cursor;
+      cursor = path.join(cursor, part);
+      check();
+      M1MaintenanceResources.consumeIfActive("adminEntries", 1);
+      try {
+        const stat = await fs.lstat(cursor);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe terminal origin parent");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" ||
+            (cursor !== path.resolve(this.recoveryRoot) && cursor !== dir)) throw error;
+        await fresh(); check();
+        await fs.mkdir(cursor, { mode: 0o700 });
+        await sync(cursor); await sync(parent);
+      }
+    }
+    await fresh(); check();
+    const dst = this.recordPath(record), tmp = dst + "." + randomUUID() + ".tmp";
+    const file = await fs.open(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      check();
+      await file.writeFile(raw);
+      check(); await file.sync();
+    } finally { await file.close(); }
+    await fresh(); check();
+    await fs.rename(tmp, dst);
+    await sync(dir);
+    check();
+    const result = await this.readRecordResult(dst, true, { signal: MaintenanceBudget.signal()!,
+      deadline: Date.now() + M1MaintenanceResources.remainingMsIfActive() }, true);
+    if (result.kind !== "ok" || canonicalJson(result.record) !== canonicalJson(record) ||
+        this.recordPath(result.record) !== dst) throw new Error("terminal origin readback failed");
+    check();
   }
 
   /** Read + AUTHENTICATE one record; null on a missing/tampered/unparseable/unreadable file. */
