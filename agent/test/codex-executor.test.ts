@@ -1,3 +1,4 @@
+import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
@@ -29,6 +30,7 @@ import {
   buildRunLaneReconcile,
   buildAppServerRefreshBridge,
   makeCodexAdviceHarness,
+  makeProductionCodexAdviceHarnessFactory,
   CODEX_PRODUCTION_PROVIDER,
   CODEX_TASK_REVIEW_MODEL,
   makeDefaultSpawnCommand,
@@ -1834,6 +1836,26 @@ describe("#2493 initial credential release", () => {
     const url = await api.listen();
     const fx = makeFixture();
     const rig = makeMultiEpochRig([]);
+    const effect = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps,
+      launchEffectRoot: async (spec, deadline) => {
+        const handle = await effect(spec, deadline);
+        const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+          ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+        if (argv[0] !== "/usr/bin/git") return handle;
+        // Capture now uses the production supervised adapter. The rig's
+        // otherwise-never-ending fileop streams cannot stand in for Git output.
+        const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+        const timer = setTimeout(() => child.kill(), deadline);
+        const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+          child.once("error", error => { clearTimeout(timer); reject(error); });
+          child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+        });
+        return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+          waitChild: async () => exited,
+          dispose: async ms => { await exited; return handle.dispose(ms); } };
+      },
+    };
     const client = new WorkerClient(url, "shutdown-release-worker", "test", noopLog,
       { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
     client.protocolFeatures = ["run_checkpoint_durability"];
@@ -1847,15 +1869,20 @@ describe("#2493 initial credential release", () => {
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
     api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
-    const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    let current = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+    // Runner callbacks always address the current scope, including capture and safety.
+    const executor = new Proxy(current, { get: (_target, key) => {
+      if (key === "run") return runAfterDeclinedPause;
+      const value = Reflect.get(current, key);
+      return typeof value === "function" ? value.bind(current) : value;
+    } });
     const homeDir = path.join(fx.dataDir, "shutdown-home");
-    const original = executor.run.bind(executor);
     let releaseError: unknown;
     let terminal: AbortSignal | undefined;
     let checkpoint: RunContext["checkpoint"];
     let worktree = "";
     let pauseSignal: AbortSignal | undefined;
-    executor.run = async ctx => {
+    const runAfterDeclinedPause = async (ctx: RunContext) => {
       checkpoint = ctx.checkpoint;
       worktree = ctx.worktreePath;
       pauseSignal = ctx.signal;
@@ -1867,7 +1894,10 @@ describe("#2493 initial credential release", () => {
       assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false, "actual runner declines undurable pause");
       api.appendInputs(claim.run_id, [{ id: 2, kind: "pause_cancel" }]);
       await waitFor(() => ctx.pauseModeRequested!() === null, "runner clears declined pause");
-      try { return await original(ctx); } catch (e) { releaseError = e; throw e; }
+      assert.equal((await current.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 })).kind, "disposed");
+      // Capture-before-run permanently closes the old leg. A refused pause continues fresh.
+      current = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION));
+      try { return await current.run(ctx); } catch (e) { releaseError = e; throw e; }
     };
     const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
     const runner = new RunRunner(client, git,
@@ -18658,6 +18688,493 @@ describe("2833 Codex inline summaries", () => {
     });
     return { rig, intents, plans };
   }
+  function ownedAdvice(clean: boolean, entered: ReturnType<typeof m1Barrier>, release: ReturnType<typeof m1Barrier>) {
+    return async (params: Parameters<NonNullable<ConstructorParameters<typeof CodexExecutor>[2]["codexAdviceHarnessFactory"]>>[0]) => {
+      const owner = summaryOwnership.get(params)!;
+      const advice = new FakeTransport(defaultResponder);
+      advice.push(turnCompleted()); // Null advisory, independent of root cleanup evidence.
+      return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+        const handle = await owner.launch(async () => ({
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null },
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+          waitChild: async () => ({ event: "child_exit", code: 0 }),
+          dispose: async () => {
+            entered.resolve(); await release.promise;
+            return clean
+              ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
+              : { clean: false, reason: "survivor" };
+          },
+        }));
+        return { cwd: "/isolated", transport: advice, dispose: async () => {
+          if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+        } };
+      } });
+    };
+  }
+
+  for (const primary of [undefined, new CodexCredentialDeferredError()]) {
+    it(`A summary cleanup preserves ${primary ? "exact primary object and type" : "standalone cleanup refusal"}`, async () => {
+      const entered = m1Barrier(), release = m1Barrier(), body = m1Barrier();
+      const { rig, intents } = summaryRig();
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+        summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(false, entered, release),
+      });
+      const { ctx } = makeCtx({ kind: "issue", codeCrossCheckSummary: async () => {
+        await entered.promise;
+        body.resolve();
+        if (primary) throw primary;
+        return undefined;
+      } });
+      let returned = false;
+      const outcome = executor.run(ctx).then(value => ({ value }), error => ({ error })).then(value => {
+        returned = true; return value;
+      });
+      try {
+        await body.promise;
+        await drain();
+        assert.equal(returned, false, "primary failure still awaits full owned cleanup");
+        release.resolve();
+        const result = await outcome;
+        assert.ok("error" in result);
+        if (primary) { assert.equal(result.error, primary); assert.ok(result.error instanceof CodexCredentialDeferredError); }
+        else { assert.ok(result.error instanceof TrustedExecutionRefusal); assert.equal(result.error.message, "summary cleanup unproven"); }
+        let captured = false;
+        assert.equal((await executor.withCredentialFreeCapture(1000, async () => { captured = true; })).kind, "incomplete");
+        assert.equal(captured, false, "primary error preservation does not grant capture");
+        assert.deepEqual(intents, []);
+      } finally { release.resolve(); await outcome; }
+    });
+  }
+
+  for (const clean of [false, true]) for (const route of ["boundary", "recreation", "reuse", "refresh"] as const) {
+    it(`A summary null clean=${clean} gates ${route} credentials and permits`, async () => {
+      const entered = m1Barrier(), release = m1Barrier();
+      const plan = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(88, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn)));
+      const quiet = epochResponder("th-1", "tn-1", () => {});
+      const rig = makeMultiEpochRig(route === "recreation" ? [plan, done] : route === "refresh" ? [quiet] : [done, done]);
+      let intents = 0, sinks = 0;
+      Object.assign(rig.client, { postIntentSummary: async () => { intents++; }, postPlanSummary: async () => {} });
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+        summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(clean, entered, release),
+      });
+      const { ctx } = makeCtx({ kind: "issue", ...(route === "recreation" ? { planApproved: false, approvedPlan: undefined } : {}),
+        gatePlan: async () => { await entered.promise; release.resolve(); return approve; },
+      });
+      const outcome = executor.run(ctx).then(value => ({ value }), error => ({ error }));
+      try {
+        await entered.promise;
+        if (route === "refresh") {
+          await waitForSummary(() => rig.epochs[0]!.transport.turnStartCount === 1, "lead turn");
+          rig.epochs[0]!.transport.push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 91, params: { reason: "unauthorized", previousAccountId: "verified-account" } });
+          release.resolve();
+          await waitForSummary(() => rig.epochs[0]!.transport.responses.some(r => r.requestId === 91), "refresh reply");
+          rig.epochs[0]!.transport.push(signalDone()).push(turnCompleted());
+        } else release.resolve();
+        const result = await outcome;
+        if (route === "recreation" && !clean) assert.ok("error" in result);
+        else if (route !== "refresh") assert.ok("value" in result, String("error" in result ? result.error : ""));
+        const releases = rig.client.releaseCalls.length, refreshes = rig.client.refreshCalls.length;
+        if (route === "boundary") {
+          const boundary = executor.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => { sinks++; });
+          if (clean) await boundary;
+          else await assert.rejects(boundary, /summary cleanup unproven/);
+          assert.equal(sinks, clean ? 1 : 0);
+          assert.equal(rig.client.refreshCalls.length, refreshes + (clean ? 1 : 0));
+        }
+        if (route === "reuse") {
+          const next = executor.run(makeCtx({ kind: "issue", summaryIntentPresent: true }).ctx);
+          if (clean) await next;
+          else await assert.rejects(next, /summary cleanup unproven/);
+          assert.equal(rig.client.releaseCalls.length, releases + (clean ? 1 : 0));
+        }
+        if (route === "recreation") assert.equal(releases, clean ? 2 : 1, "no release for uncertain prior summary");
+        if (route === "refresh") assert.equal(refreshes, clean ? 1 : 0, "app-server refresh consults summary cleanup first");
+        if (!clean) {
+          let captured = false;
+          assert.equal((await executor.withCredentialFreeCapture(1000, async () => { captured = true; })).kind, "incomplete");
+          assert.equal(captured, false);
+          assert.equal(rig.client.releaseCalls.length, releases);
+          assert.equal(rig.client.refreshCalls.length, refreshes);
+        }
+        assert.equal(intents, 0, "null advisory result never becomes content or cleanup proof");
+      } finally {
+        release.resolve();
+        for (const epoch of rig.epochs) epoch.transport.end();
+        await outcome;
+        await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      }
+    });
+  }
+
+  it("A summary boundary retains its original deadline across the owned join", async t => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", () => {})]);
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+      summarySettleMs: 0, codexAdviceHarnessFactory: ownedAdvice(true, entered, release),
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+    let boundary: Promise<unknown> | undefined;
+    const now = Date.now.bind(Date);
+    let advance = 0, joined = false, sinks = 0;
+    t.mock.method(Date, "now", () => now() + advance);
+    try {
+      await entered.promise;
+      await waitForSummary(() => rig.epochs[0]!.transport.turnStartCount === 1, "lead startup");
+      boundary = executor.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => { sinks++; });
+      void boundary.then(() => { joined = true; }, () => { joined = true; });
+      await drain();
+      assert.equal(joined, false, "credential boundary awaits held full disposal");
+      assert.equal(rig.client.refreshCalls.length, 0);
+      advance = 2000; // Spend the existing deadline while disposal is still held.
+      release.resolve();
+      await assert.rejects(boundary);
+      assert.equal(sinks, 0);
+      assert.equal(rig.client.releaseCalls.length, 1);
+      assert.equal(rig.client.refreshCalls.length, 0, "joining never grants a fresh credential budget");
+    } finally {
+      advance = 0; release.resolve(); rig.epochs[0]!.transport.end();
+      await boundary?.catch(() => undefined); await running;
+      await executor.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    }
+  });
+
+  it("A summary injected retired intent retains generic bounded continuation", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    let calls = 0, oldSignal: AbortSignal | undefined;
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summarySettleMs: 0,
+      summaryRunner: {
+        generateIntentSummary: async input => {
+          if (++calls > 1) return "Fresh intent";
+          oldSignal = input.signal;
+          entered.resolve(); await release.promise;
+          return "Retired intent";
+        },
+        generatePlanSummary: async () => null,
+      },
+    });
+    try {
+      const first = executor.run(makeCtx({ kind: "issue", codeCrossCheckSummary: async () => { await entered.promise; return undefined; } }).ctx);
+      await withTimeout(first, 1000, "generic first run abandons delivery");
+      assert.equal(oldSignal?.aborted, true);
+      // Resetting the current intent retires its still-pending flight; injected policy remains bounded.
+      await withTimeout(executor.run(makeCtx({ kind: "issue" }).ctx), 1000, "generic reuse does not join retired advice");
+      release.resolve(); await drain();
+      assert.deepEqual(intents, ["Fresh intent"]);
+    } finally { release.resolve(); }
+  });
+
+  for (const phase of ["factory", "launch", "dispose"] as const) {
+    it(`A owned summary ${phase} remains joined through both grace races during capture`, async t => {
+      const entered = m1Barrier(), release = m1Barrier(), disposing = m1Barrier(), disposed = m1Barrier();
+      const grace: (() => void)[] = [];
+      const realTimeout = globalThis.setTimeout;
+      t.mock.method(globalThis, "setTimeout", (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        if (ms === 500) { grace.push(fn); return realTimeout(() => {}, 60_000); }
+        return realTimeout(() => fn(...args), ms);
+      });
+      let launches = 0, cleanups = 0, captured = false, callback = false;
+      const { rig, intents } = summaryRig();
+      // Keep the lead in flight independently of the summary.
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+      const native: CodexRootHandle = {
+        started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+          nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+        waitChild: async () => ({ event: "child_exit", code: 0 }),
+        dispose: async () => {
+          cleanups++; disposing.resolve(); await disposed.promise;
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+      };
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        codexAdviceHarnessFactory: async params => {
+          const owner = summaryOwnership.get(params);
+          if (phase === "factory") { entered.resolve(); await release.promise; }
+          const advice = new FakeTransport(c => c.method === "thread/start"
+            ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+          advice.push(turnCompleted());
+          return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+            const start = async () => {
+              launches++;
+              // Primary exit is already known; only full supervisor settlement is held.
+              await native.waitChild(1_000);
+              if (phase === "launch") { entered.resolve(); await release.promise; }
+              return native;
+            };
+            const handle = owner ? await owner.launch(start) : await start();
+            return { cwd: "/isolated", transport: advice, dispose: async () => { await handle.dispose(); } };
+          } });
+        },
+      });
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+      let capture: ReturnType<typeof executor.withCredentialFreeCapture> | undefined;
+      try {
+        if (phase === "dispose") await disposing.promise;
+        else await entered.promise;
+        await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+        capture = executor.withCredentialFreeCapture(5_000, async () => { callback = true; });
+        void capture.then(() => { captured = true; });
+        for (let i = 0; i < 4; i++) { await drain(); grace.splice(0).forEach(fire => fire()); }
+        assert.equal(captured, false, "grace expiry cannot finish owned summary custody");
+        assert.equal(callback, false);
+        if (phase === "factory") {
+          release.resolve(); disposed.resolve();
+        } else {
+          release.resolve(); await disposing.promise; await drain();
+          assert.equal(captured, false, "child exit does not prove full root disposal");
+          disposed.resolve();
+        }
+        assert.equal((await capture).kind, "observed_empty");
+        assert.equal(launches, phase === "factory" ? 0 : 1, "capture fences a late factory's fresh spawn");
+        assert.equal(cleanups, phase === "factory" ? 0 : 1, "full disposal has one owner");
+        assert.deepEqual(intents, [], "aborted advice never delivers");
+      } finally {
+        release.resolve(); disposed.resolve(); rig.transport.end();
+        await capture; await running;
+      }
+    });
+  }
+
+  for (const closure of ["terminal", "explicit close", "rejected admission", "expired capture"] as const) {
+    it(`A owned summary ${closure} joins held full root cleanup before returning`, async t => {
+      const disposing = m1Barrier(), release = m1Barrier();
+      const { rig, intents } = summaryRig();
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+      let rejectNext = false;
+      const rejectedRegistries = new Set<ExecutionRegistry>();
+      const register = ExecutionRegistry.prototype.registerRoot;
+      t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+        this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+      ) {
+        if (rejectNext) {
+          rejectNext = false;
+          rejectedRegistries.add(this);
+          this.cancelReservation(args[0]);
+        }
+        return register.apply(this, args);
+      });
+      let consumes = 0, cleanups = 0, returned = false;
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summarySettleMs: 0,
+        codexAdviceHarnessFactory: async params => {
+          const owner = summaryOwnership.get(params)!;
+          const advice = new FakeTransport(c => {
+            consumes++;
+            return c.method === "thread/start" ? { thread: { id: "th-1" } }
+              : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {};
+          });
+          advice.push(turnCompleted());
+          return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+            const handle = await owner.launch(async () => {
+              rejectNext = closure === "rejected admission";
+              return {
+                started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+                  nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+                supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+                snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+                observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+                waitChild: async () => ({ event: "child_exit", code: 0 }),
+                dispose: async () => {
+                  cleanups++; disposing.resolve(); await release.promise;
+                  return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+                },
+              };
+            });
+            return { cwd: "/isolated", transport: advice, dispose: async () => { await handle.dispose(); } };
+          } });
+        },
+      });
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+      const outcome = running.then(value => { returned = true; return { value }; },
+        error => { returned = true; return { error }; });
+      let closing: Promise<void> | undefined;
+      let capture: ReturnType<typeof executor.withCredentialFreeCapture> | undefined;
+      let captured = false, callback = false;
+      try {
+        await disposing.promise;
+        await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+        if (closure === "rejected admission") {
+          assert.equal([...rejectedRegistries][0]?.rootCount(), 1, "rejected root remains retained");
+          assert.equal(consumes, 0, "rejected admission cannot enter advice consume");
+        }
+        let closed = false;
+        if (closure === "explicit close") {
+          closing = executor.closeAndSettlePlanSummary(0).then(() => { closed = true; });
+        }
+        if (closure === "expired capture") {
+          capture = executor.withCredentialFreeCapture(0, async () => { callback = true; });
+          void capture.then(() => { captured = true; });
+        }
+        rig.transport.push(signalDone()).push(turnCompleted());
+        for (let i = 0; i < 4; i++) await drain();
+        assert.equal(returned, false, "terminal settlement cannot detach a full root cleanup");
+        assert.equal(closed, false, "delivery bound expiration does not end owned custody");
+        assert.equal(captured, false, "capture expiry revokes authority while retaining the cleanup join");
+        assert.equal(callback, false);
+        release.resolve();
+        await closing;
+        const result = await outcome;
+        if (capture) {
+          assert.equal((await capture).kind, "incomplete");
+          assert.equal(callback, false, "cleanup completion cannot renew an expired capture");
+        }
+        if (closure === "rejected admission") {
+          assert.ok("error" in result);
+          assert.match(String(result.error), /cleanup unproven/);
+          let callback = false;
+          assert.equal((await executor.withCredentialFreeCapture(1000, async () => { callback = true; })).kind, "incomplete");
+          assert.equal(callback, false);
+        } else assert.ok("value" in result);
+        assert.equal(cleanups, 1);
+        assert.deepEqual(intents, []);
+      } finally { release.resolve(); rig.transport.end(); await closing; await capture; await outcome; }
+    });
+  }
+
+  it("A owned summary terminal joins an already admitted intent POST", async () => {
+    const posted = m1Barrier(), release = m1Barrier();
+    const { rig } = summaryRig();
+    rig.transport = new FakeTransport(c => c.method === "thread/start"
+      ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+    Object.assign(rig.client, { postIntentSummary: async () => { posted.resolve(); await release.promise; } });
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summarySettleMs: 0,
+      codexAdviceHarnessFactory: async () => {
+        const advice = new FakeTransport(defaultResponder);
+        advice.push(agentMessage("Useful summary")).push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => ({
+          cwd: "/isolated", transport: advice, dispose: async () => {},
+        }) });
+      },
+    });
+    let returned = false;
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+    const observed = running.then(() => { returned = true; });
+    try {
+      await posted.promise;
+      rig.transport.push(signalDone()).push(turnCompleted());
+      for (let i = 0; i < 4; i++) await drain();
+      assert.equal(returned, false, "an already admitted POST remains part of actual flight completion");
+      release.resolve();
+      await observed;
+    } finally { release.resolve(); rig.transport.end(); await observed; }
+  });
+
+  for (const failure of ["unclean disposal", "unknown startup"] as const) it(
+    `A owned summary ${failure} survives advisory null and blocks capture and terminal success`, async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      codexAdviceHarnessFactory: async params => {
+        const owner = summaryOwnership.get(params)!;
+        const advice = new FakeTransport(c => c.method === "thread/start"
+          ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+        advice.push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => {
+          const handle = await owner.launch(async () => {
+            if (failure === "unknown startup") { entered.resolve(); await release.promise; throw new Error("unknown startup"); }
+            return {
+            started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+              nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+            supervisorPid: 200, transport: { stdin: null, stdout: null, stderr: null }, failed: undefined, whenFailed: new Promise(() => {}),
+            snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+            waitChild: async () => ({ event: "child_exit", code: 0 }),
+            dispose: async () => { entered.resolve(); await release.promise; return { clean: false, reason: "survivor" }; },
+          }; });
+          return { cwd: "/isolated", transport: advice, dispose: async () => {
+            if (!(await handle.dispose()).clean) throw new Error("unclean summary");
+          } };
+        } });
+      },
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+    await entered.promise;
+    release.resolve();
+    await assert.rejects(running, /cleanup unproven/);
+    let callback = false;
+    assert.equal((await executor.withCredentialFreeCapture(1_000, async () => { callback = true; })).kind, "incomplete");
+    assert.equal(callback, false);
+    assert.deepEqual(intents, [], "cleanup failure is converted to advisory null");
+    assert.equal((await executor.settleForCredentialFreeCapture(1_000)).kind, "incomplete");
+  });
+
+  it("A owned summary credential await is fenced after capture closes", async () => {
+    const entered = m1Barrier(), release = m1Barrier();
+    const { rig, intents } = summaryRig();
+    const original = rig.client.releaseCodex.bind(rig.client);
+    let calls = 0;
+    rig.client.releaseCodex = async (...args) => {
+      calls++;
+      if (calls === 2) { entered.resolve(); await release.promise; }
+      return original(...args);
+    };
+    rig.transport = new FakeTransport(c => c.method === "thread/start"
+      ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => ({ transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 }) };
+    const log = recordingLog();
+    const executor = makeExecutor(rig, bindingOf(API_KEY), log.log, undefined, provider, {
+      codexAdviceHarnessFactory: makeProductionCodexAdviceHarnessFactory(rig.client as never, log.log, "/unused-summary-home"),
+    });
+    const running = executor.run(makeCtx({ kind: "issue" }).ctx).catch(() => undefined);
+    await entered.promise;
+    await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
+    const before = log.added.length;
+    const capture = executor.withCredentialFreeCapture(5_000, async () => {});
+    release.resolve();
+    try {
+      assert.equal((await capture).kind, "observed_empty");
+      assert.equal(calls, 2);
+      assert.equal(log.added.length, before, "no credential is admitted after the await closes");
+      assert.deepEqual(intents, []);
+    } finally { rig.transport.end(); await running; }
+  });
+
+  it("A owned summary succeeds and cleans each sequential executor use", async () => {
+    const { rig, intents } = summaryRig();
+    let posted = m1Barrier(), cleanups = 0;
+    Object.assign(rig.client, { postIntentSummary: async (_id: string, text: string) => { intents.push(text); posted.resolve(); } });
+    rig.deps = { ...rig.deps, launchProviderRoot: async () => {
+      rig.transport = new FakeTransport(c => c.method === "thread/start"
+        ? { thread: { id: "th-1" } } : c.method === "turn/start" ? { turn: { id: "tn-1" } } : {});
+      return { transport: rig.transport, root: trackedRoot().root, supervisorPid: 100 };
+    } };
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      codexAdviceHarnessFactory: async () => {
+        const advice = new FakeTransport(defaultResponder);
+        advice.push(agentMessage("Useful summary")).push(turnCompleted());
+        return new CodexAdviceHarness({ provider, log: noopLog, launchRoot: async () => ({
+          cwd: "/isolated", transport: advice, dispose: async () => { cleanups++; },
+        }) });
+      },
+    });
+    for (let use = 0; use < 2; use++) {
+      const running = executor.run(makeCtx({ kind: "issue" }).ctx);
+      await posted.promise;
+      rig.transport.push(signalDone()).push(turnCompleted());
+      await running;
+      posted = m1Barrier();
+    }
+    assert.deepEqual(intents, ["Useful summary", "Useful summary"]);
+    assert.equal(cleanups, 2);
+  });
+
   it("B1 Codex retains accepted plan summary after successful done checkpoint", async () => {
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
       t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))

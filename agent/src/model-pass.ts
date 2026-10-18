@@ -27,6 +27,7 @@ import path from "node:path";
 
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 
+import { ownedSummaryFactories, summaryCallDeadlines } from "./codex/summary-ownership.js";
 import { ClaudeAdviceHarness } from "./claude-advice-harness.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { rmTeardownTree, type TeardownTestDeps } from "./rmtree.js";
@@ -353,6 +354,8 @@ async function runCodexAdviceModelPass(
   opts: ReadOnlyModelPassOpts,
   codex: NonNullable<ReadOnlyModelPassOpts["codex"]>,
 ): Promise<string> {
+  const owned = ownedSummaryFactories.has(codex.buildHarness);
+  const deadlineAt = Date.now() + opts.timeoutMs;
   const abort = new AbortController();
   const external = linkExternalAbort(opts.signal, abort, opts.label);
   const usage = usageLatch(opts);
@@ -383,13 +386,16 @@ async function runCodexAdviceModelPass(
     ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
   const runPromise = (async (): Promise<string> => {
-    const harness = await codex.buildHarness({
+    const params = {
       runId: codex.runId,
       binding: codex.binding,
       signal: abort.signal,
       ...(codex.refresh ? { refresh: codex.refresh } : {}),
-    });
-    const result = await harness.run(request, policy);
+    };
+    if (owned) summaryCallDeadlines.set(params, deadlineAt);
+    const harness = await codex.buildHarness(params);
+    const result = await harness.run(owned
+      ? { ...request, timeoutMs: Math.max(0, deadlineAt - Date.now()) } : request, policy);
     return result.text;
   })();
   try {
@@ -397,10 +403,10 @@ async function runCodexAdviceModelPass(
   } finally {
     if (timer) clearTimeout(timer);
     external?.unlink();
-    // PRD #2603: the same bounded settle as the Claude path, so usage the harness observed
-    // while it was winding down is counted and a harness that never settles after abort
-    // cannot hold the caller past graceMs.
-    await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
+    // Executor-owned summaries join setup and full root cleanup. Ordinary advice retains
+    // the bounded grace; ownership is selected only by factory composition.
+    if (owned) await runPromise.then(() => {}, () => {});
+    else await awaitQuerySettled(runPromise, opts.graceMs ?? DEFAULT_ABORT_GRACE_MS);
     usage.flush();
   }
 }

@@ -247,6 +247,39 @@ afterEach(() => {
   if (savedCanary === undefined) delete process.env.CODEX_CANARY_LEAK; else process.env.CODEX_CANARY_LEAK = savedCanary;
 });
 
+describe("A owned summary provider launch", () => {
+  it("checks capture admission synchronously after directory preparation and before spawn", async () => {
+    let open = true, checked = false;
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(newFake(), {
+      makeRunnerTrees: () => { open = false; },
+      beforeSpawn: () => { checked = true; if (!open) throw new Error("capture closed"); },
+    })), /capture closed/);
+    assert.equal(checked, true);
+    assert.equal(spawnCalls.length, 0);
+  });
+
+  it("keeps exact startup cleanup authorization through provider launch and rejects replay", async () => {
+    const fake = newFake({ autoStarted: false });
+    const authorization = { attempt: {}, hardDeadlineAt: Date.now() + 2_000 };
+    let fire!: () => void;
+    const launching = launchCodexRoot(baseSpec(), baseDeps(fake, {
+      startupCleanup: authorization,
+      armStartedDeadlineForTest: callback => { fire = callback; return () => {}; },
+    }));
+    fire();
+    fake.writeEvidence({ event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1,
+      subreaper: true, nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true });
+    await assert.rejects(launching, error => {
+      assert.equal(hasVerifiedStartupCleanup(error, authorization), true);
+      assert.equal(hasVerifiedStartupCleanup(error, { ...authorization, attempt: {} }), false);
+      return true;
+    });
+    const spawned = spawnCalls.length;
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(newFake(), { startupCleanup: authorization })));
+    assert.equal(spawnCalls.length, spawned);
+  });
+});
+
 describe("launchCodexRoot: fail-closed supported-profile gate", () => {
   it("(a) REFUSES to launch when the uid-split is not active", async () => {
     const fake = newFake();

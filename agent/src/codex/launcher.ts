@@ -234,6 +234,8 @@ export interface LauncherDeps {
   readonly armStartedDeadlineForTest?: (fire: () => void, ms: number) => () => void;
   /** Boundary checkpoint only: identity and absolute budget survive every wrapper. */
   readonly startupCleanup?: StartupCleanupAuthorization;
+  /** Executor summary admission, checked synchronously after all directory setup. */
+  readonly beforeSpawn?: () => void;
   /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
    * only a credential-free literal loopback URL and disables WebSockets; production
    * leaves this absent and therefore emits the fixed vendor config byte-for-byte. */
@@ -1017,6 +1019,16 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   // recreation, an advice root). Synchronous, immediately before the spawn; command and worker_pat
   // effect roots are untouched (their PAT is covered by the git belt).
   if (spec.kind === "provider") assertResidueQuarantineOpen("provider_turn");
+  deps.beforeSpawn?.();
+  const startupCleanup = deps.startupCleanup;
+  if (startupCleanup) {
+    const { attempt, hardDeadlineAt } = startupCleanup;
+    if (typeof attempt !== "object" || attempt === null || usedStartupAttempts.has(attempt) ||
+      !Number.isFinite(hardDeadlineAt) || Date.now() >= hardDeadlineAt) {
+      throw new CodexLaunchError("unknown", "unconfirmed", undefined);
+    }
+    usedStartupAttempts.add(attempt);
+  }
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     env: replacedEnv,
@@ -1030,7 +1042,7 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
   const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind,
-    undefined, deps.armStartedDeadlineForTest);
+    startupCleanup, deps.armStartedDeadlineForTest);
   return withOwnedTreeCleanup(
     handle,
     { uid, kind: spec.kind, root: spec.ownedDataRoot },
