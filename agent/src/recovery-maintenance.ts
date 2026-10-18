@@ -7,7 +7,7 @@ import { performance } from "node:perf_hooks";
 import { z } from "zod";
 
 export const MAINTENANCE_VERIFIER_VERSION = 1;
-export const DEFAULT_MAINTENANCE_DECODED_CAP = 8 * 1024 ** 3;
+const DEFAULT_MAINTENANCE_DECODED_CAP = 8 * 1024 ** 3;
 const DAY = 86_400_000, SLOT = 120_000, SPACING = 180_000;
 const TABLE_BYTES = 16 * 1024 * 1024, MARKER_BYTES = 1024 * 1024, CAPACITY = 4096;
 const safe = z.string().regex(/^[A-Za-z0-9_-]{1,128}(?![\s\S])/);
@@ -43,7 +43,7 @@ export type MaintenanceDenial =
   | "maintenance_resource_exhausted" | "maintenance_slot_active";
 export type MaintenanceResult<T> = { ok: true; value: T } | { ok: false; reason: MaintenanceDenial };
 const deny = <T>(reason: MaintenanceDenial): MaintenanceResult<T> => ({ ok: false, reason });
-export class MaintenanceRefusal extends Error {
+class MaintenanceRefusal extends Error {
   constructor(readonly reason: MaintenanceDenial) { super(reason); }
 }
 function refuse(reason: MaintenanceDenial): never { throw new MaintenanceRefusal(reason); }
@@ -118,7 +118,7 @@ export interface MaintenanceSlot {
   readonly deadline: number;
 }
 interface Live {
-  root: string; cycle: string; nonce: string; deadline: number; monotonicDeadline: number; now: () => number;
+  root: string; cycle: string; nonce: string; deadline: number; monotonicDeadline: number; now: () => number; monotonicNow: () => number;
   revoked: boolean; finished: boolean; lastObserved: number; used: Quotas; limits: Quotas; signal?: AbortSignal;
 }
 const tokens = new WeakMap<MaintenanceSlot, Live>();
@@ -130,6 +130,8 @@ export class RecoveryMaintenance {
   constructor(private readonly options: {
     /** Dedicated sibling of recovery/, conventionally dataDir/recovery-maintenance. */
     root: string; workerToken: string; now?: () => number;
+    /** Test-only monotonic clock; production always uses performance.now. */
+    monotonicNow?: () => number;
     /** Fault injection only: exceptions preserve all precharged work. */
     prechargeHook?: (phase: "before" | "after") => void | Promise<void>;
     initializationHook?: (phase: "mkdir" | "table" | "pair" | "installed") => void | Promise<void>;
@@ -224,10 +226,15 @@ export class RecoveryMaintenance {
       refuse("maintenance_state_invalid");
     const ids = new Set<string>(), outputs = new Map<string, string>(), nonces = new Set<string>();
     const holds = new Map<string, Cycle[]>();
+    const sourceBindings = new Map<string, string>();
     for (const cycle of table.cycles) {
       const id = cycleKey(cycle.identity, cycle.config);
       if (ids.has(id)) refuse("maintenance_state_invalid");
       ids.add(id);
+      const source = canonical([cycle.identity.run, cycle.identity.generation, cycle.identity.bareBasename, cycle.identity.originalSource]);
+      const priorBinding = sourceBindings.get(source);
+      if (priorBinding !== undefined && priorBinding !== hash(cycle.identity)) refuse("maintenance_state_invalid");
+      sourceBindings.set(source, hash(cycle.identity));
       const hold = canonical([cycle.identity.run, cycle.identity.generation, cycle.identity.hold]);
       const siblings = holds.get(hold) ?? [];
       if (siblings.some(c => c.identity.repo !== cycle.identity.repo || c.identity.custodian !== cycle.identity.custodian ||
@@ -236,7 +243,7 @@ export class RecoveryMaintenance {
       siblings.push(cycle); holds.set(hold, siblings);
       if (!Number.isSafeInteger(cycle.admittedAt + DAY) ||
         cycle.originalCycleExpiry !== cycle.admittedAt + DAY ||
-        cycle.lastObserved < cycle.admittedAt || cycle.lastObserved >= cycle.originalCycleExpiry ||
+        cycle.lastObserved < cycle.admittedAt ||
         cycle.reservedWork !== cycle.slots.length * SLOT ||
         canonical(cycle.reserved) !== canonical(multiply(quotas(cycle.config.decodedCap), cycle.slots.length)))
         refuse("maintenance_state_invalid");
@@ -325,10 +332,33 @@ export class RecoveryMaintenance {
   async admit(input: MaintenanceEligibility, options: { deadline?: number; signal?: AbortSignal } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
     return this.transaction(async (root, table) => {
       this.eligible(input);
+      const monotonicNow = this.options.monotonicNow ?? (() => performance.now());
+      const startedMonotonic = monotonicNow();
+      if (!Number.isFinite(startedMonotonic) || startedMonotonic < 0) return deny("maintenance_clock_invalid");
       const now = this.now(), id = hash(input.identity), key = cycleKey(input.identity, input.config);
+      const lineage = table.cycles.filter(c => hash(c.identity) === id);
+      if (lineage.some(c => now < c.lastObserved)) return deny("maintenance_clock_invalid");
+      // Preserve forward observations even on cap/expiry refusal; another configuration
+      // or later rollback must not forget them. This never rebases any expiry.
+      if (lineage.length) {
+        for (const c of lineage) c.lastObserved = now;
+        await this.save(root, table);
+      }
       let cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === key);
-      const existing = cycle !== undefined;
       if (!cycle) {
+        if (lineage.length) {
+          const version = Math.max(...lineage.map(c => c.config.verifierVersion));
+          const cap = Math.max(...lineage.filter(c => c.config.verifierVersion === version).map(c => c.config.decodedCap));
+          if (input.config.verifierVersion < version ||
+            (input.config.verifierVersion === version && input.config.decodedCap <= cap))
+            return deny("maintenance_config_changed");
+        }
+        if (table.cycles.some(c => c.identity.run === input.identity.run &&
+          c.identity.generation === input.identity.generation && c.identity.bareBasename === input.identity.bareBasename &&
+          c.identity.originalSource === input.identity.originalSource &&
+          (c.identity.hold !== input.identity.hold || c.identity.repo !== input.identity.repo ||
+           c.identity.custodian !== input.identity.custodian || c.identity.origin !== input.identity.origin)))
+          return deny("maintenance_identity_invalid");
         const hold = table.cycles.filter(c => c.identity.run === input.identity.run &&
           c.identity.generation === input.identity.generation && c.identity.hold === input.identity.hold);
         if (hold.some(c => c.identity.repo !== input.identity.repo || c.identity.custodian !== input.identity.custodian ||
@@ -350,7 +380,6 @@ export class RecoveryMaintenance {
       this.observe(cycle, now);
       // Check prospective history before any durable write.
       this.marker(table);
-      if (existing) await this.save(root, table);
       if (input.source !== cycle.identity.originalSource && !table.cycles.some(c => hash(c.identity) === id && c.outputs.includes(input.source)))
         return deny("maintenance_lineage_invalid");
       if (cycle.exhausted || cycle.slots.length >= 3) return deny("maintenance_cycle_exhausted");
@@ -378,11 +407,18 @@ export class RecoveryMaintenance {
       await this.options.prechargeHook?.("before");
       await this.save(root, table);
       await this.options.prechargeHook?.("after");
+      const observedAfter = this.now();
+      if (observedAfter < now) return deny("maintenance_clock_invalid");
+      const monotonicDeadline = startedMonotonic + deadline - now;
+      const finishedMonotonic = monotonicNow();
+      if (!Number.isFinite(finishedMonotonic) || finishedMonotonic < startedMonotonic) return deny("maintenance_clock_invalid");
+      if (observedAfter >= deadline || finishedMonotonic >= monotonicDeadline || options.signal?.aborted)
+        return deny("maintenance_token_invalid");
       const token = Object.freeze({ ordinal: slot.ordinal, admittedAt: cycle.admittedAt,
         originalCycleExpiry: cycle.originalCycleExpiry, start: now, deadline });
       const live: Live = { root, cycle: key, nonce: slot.nonce, deadline, now: () => this.now(),
-        monotonicDeadline: performance.now() + Math.max(0, deadline - this.now()),
-        revoked: false, finished: false, lastObserved: now, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal };
+        monotonicDeadline, monotonicNow,
+        revoked: false, finished: false, lastObserved: observedAfter, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal };
       tokens.set(token, live);
       const running = active.get(root) ?? new Map<string, Live>();
       running.set(id, live); active.set(root, running);
@@ -428,7 +464,7 @@ export class RecoveryMaintenance {
         return deny("maintenance_lineage_invalid");
       for (const sibling of siblings) {
         sibling.fenced = false;
-        if (now < sibling.originalCycleExpiry) sibling.lastObserved = now;
+        sibling.lastObserved = now;
       }
       await this.save(root, table);
       return { ok: true, value: undefined };
@@ -461,7 +497,7 @@ function checked(token: MaintenanceSlot): Live {
   const now = live.now();
   if (now < live.lastObserved) refuse("maintenance_clock_invalid");
   live.lastObserved = now;
-  if (now >= live.deadline || performance.now() >= live.monotonicDeadline || live.signal?.aborted) {
+  if (now >= live.deadline || live.monotonicNow() >= live.monotonicDeadline || live.signal?.aborted) {
     live.revoked = true;
     refuse("maintenance_token_invalid");
   }

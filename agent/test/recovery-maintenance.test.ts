@@ -123,7 +123,8 @@ test("canonical-root instances serialize precharge and deny concurrent live slot
 });
 
 test("late admission is bounded by the original expiry rather than receiving a new full slot", async t => {
-  const f = await fixture(t), ledger = f.make(), first = take(await ledger.admit(eligible()));
+  // Both clocks are virtual: real fsync latency must not consume the 10 ms remainder.
+  const f = await fixture(t), ledger = f.make({ monotonicNow: () => 0 }), first = take(await ledger.admit(eligible()));
   take(await ledger.finish(first, "nonmutating"));
   f.time(first.originalCycleExpiry - 10);
   const late = take(await ledger.admit(eligible()));
@@ -334,7 +335,7 @@ test("history capacity keeps exhausted cycles and outputs instead of evicting", 
   const next = take(await ledger.admit(eligible()));
   refused(await ledger.beforeMutation(next, [sha("one-too-many")]), "maintenance_table_capacity");
   await ledger.finish(next, "nonmutating");
-  const newInput = eligible(); newInput.identity.hold = "another";
+  const newInput = eligible(); newInput.identity.run = "another-run"; newInput.identity.hold = "another";
   const before = await Promise.all(["complete.json", "initialized.json"].map(n => fs.readFile(path.join(f.root, n), "utf8")));
   refused(await ledger.admit(newInput), "maintenance_table_capacity");
   assert.deepEqual(await Promise.all(["complete.json", "initialized.json"].map(n => fs.readFile(path.join(f.root, n), "utf8"))), before);
@@ -349,6 +350,19 @@ test("eligibility must be positive and missing current decoded cap is refused", 
   for (const cap of [0, NaN, 64 * 1024 ** 3 + 1]) {
     refused(await f.make().admit({ ...input, config: { ...input.config, decodedCap: cap } }), "maintenance_identity_invalid");
   }
+});
+
+test("changed hold binding cannot make the same canonical source an unseen lineage", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible();
+  const first = take(await ledger.admit(input));
+  take(await ledger.finish(first, "nonmutating"));
+  const before = await fs.readFile(path.join(f.root, "complete.json"), "utf8");
+  for (const field of ["hold", "repo", "custodian", "origin", "sourceConfig"] as const) {
+    const changed = structuredClone(input);
+    changed.identity[field] = field === "origin" || field === "sourceConfig" ? sha("changed") : "changed";
+    refused(await ledger.admit(changed), field === "sourceConfig" ? "maintenance_config_changed" : "maintenance_identity_invalid");
+  }
+  assert.equal(await fs.readFile(path.join(f.root, "complete.json"), "utf8"), before);
 });
 
 test("legacy unknown prior cap receives one current-config cycle without inferring old cap", async t => {
@@ -396,8 +410,7 @@ test("raised caps retain every configuration and restored exhausted caps cannot 
   take(await ledger.finish(larger, "nonmutating"));
   refused(await ledger.admit(small), "maintenance_cycle_exhausted");
   const lower = structuredClone(small); lower.config.decodedCap = 2048;
-  const lowerToken = take(await ledger.admit(lower));
-  take(await ledger.finish(lowerToken, "nonmutating"));
+  refused(await ledger.admit(lower), "maintenance_config_changed");
   refused(await ledger.admit(small), "maintenance_cycle_exhausted");
   f.time(f.now + 180_000);
   const resumed = take(await ledger.admit(raised));
@@ -405,14 +418,55 @@ test("raised caps retain every configuration and restored exhausted caps cannot 
   assert.equal(resumed.admittedAt, larger.admittedAt);
   take(await ledger.finish(resumed, "nonmutating"));
   const persisted = await table(f.root);
-  assert.equal(persisted.cycles.length, 3);
-  assert.deepEqual(persisted.cycles.map((c: any) => c.config.decodedCap), [4096, 1048576, 2048]);
+  assert.equal(persisted.cycles.length, 2);
+  assert.deepEqual(persisted.cycles.map((c: any) => c.config.decodedCap), [4096, 1048576]);
   const marker = JSON.parse(await fs.readFile(path.join(f.root, "initialized.json"), "utf8")).value;
-  assert.equal(marker.history.length, 5); // one lineage, three configurations, one output
+  assert.equal(marker.history.length, 4); // one lineage, two configurations, one output
   const minted = structuredClone(raised);
   minted.identity.hold = "other";
   minted.identity.originalSource = raised.source;
   refused(await ledger.admit(minted), "maintenance_lineage_invalid");
+});
+
+test("configuration changes cannot bypass the durable lineage clock watermark", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible();
+  input.config.decodedCap = 4096;
+  const slot = take(await ledger.admit(input));
+  take(await ledger.finish(slot, "nonmutating"));
+  f.time(slot.start - 1);
+  const raised = structuredClone(input); raised.config.decodedCap *= 2;
+  refused(await ledger.admit(raised), "maintenance_clock_invalid");
+  f.time(slot.start);
+  const next = take(await ledger.admit(raised));
+  assert.equal(next.ordinal, 1);
+  take(await ledger.finish(next, "nonmutating"));
+});
+
+test("expiry observation cannot be forgotten by a later clock rollback", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible();
+  const slot = take(await ledger.admit(input));
+  take(await ledger.finish(slot, "nonmutating"));
+  f.time(slot.originalCycleExpiry);
+  refused(await ledger.admit(input), "maintenance_cycle_expired");
+  f.time(slot.start + 900_000);
+  refused(await ledger.admit(input), "maintenance_clock_invalid");
+});
+
+test("precharge rollback and elapsed monotonic work never mint a live permit", async t => {
+  for (const cut of ["wall", "monotonic"] as const) {
+    const f = await fixture(t);
+    let monotonic = 100;
+    const ledger = f.make({ monotonicNow: () => monotonic, prechargeHook: (phase: string) => {
+      if (phase !== "after") return;
+      if (cut === "wall") f.time(0);
+      else monotonic += 120_000;
+    } });
+    refused(await ledger.admit(eligible()), cut === "wall" ? "maintenance_clock_invalid" : "maintenance_token_invalid");
+    const charged = (await table(f.root)).cycles[0];
+    assert.equal(charged.slots.length, 1);
+    assert.equal(charged.reservedWork, 120_000);
+    assert.equal(charged.fenced, true);
+  }
 });
 
 test("deterministic initialization cuts preserve evidence and never restart initialization", async t => {
