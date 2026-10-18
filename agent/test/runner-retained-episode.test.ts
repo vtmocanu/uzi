@@ -1,4 +1,5 @@
 import { it, afterEach, type TestContext } from "node:test";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { loadConfig } from "../src/config.js";
 import { GitCache } from "../src/git.js";
@@ -7,7 +8,7 @@ import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
 import { PendingRecoveryCaptureError } from "../src/git.js";
 import { quiesceRunAttempt } from "../src/run-quiescence.js";
@@ -1650,12 +1651,20 @@ it("late blocker finalization cannot change a replacement episode on the same so
 it("capture-closing executor is replaced before actual resumed model execution", async () => {
   const { claim, bare, clone } = await seed();
   let created = 0, models = 0, closed = false;
+  const rigs: ReturnType<typeof codexRig>[] = [];
   const { gitlab } = fakeGitlab();
   const make: ExecutorFactory = runId => {
     const ordinal = ++created;
+    const rig = codexRig();
+    rigs.push(rig);
     return { homeDir: path.join(homeDir, runId), executor: {
-      // A boundary-aware fake: retained capture closes admission permanently.
-      settleForCredentialFreeCapture: async () => { closed = true; return { kind: "observed_empty" }; },
+      safety: rig.safety,
+      settleForCredentialFreeCapture: rig.settle,
+      withCredentialFreeCapture: async (...args) => {
+        const result = await rig.capture(...args);
+        closed = result.kind === "observed_empty";
+        return result;
+      },
       sandboxesCommands: true,
       run: async ctx => {
         assert.equal(ordinal, 2);
@@ -1666,9 +1675,10 @@ it("capture-closing executor is replaced before actual resumed model execution",
       },
     } };
   };
-  // The factory recreation condition also covers capture-capable executors without a live safety epoch.
   await runnerWith(make, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
   assert.equal(created, 2);
+  assert.notEqual(rigs[0]!.registry, rigs[1]!.registry);
+  assert.ok(rigs[0]!.processSpawns() > 0, "capture children use the real registered spawner");
   assert.equal(models, 1);
   assert.equal(readJournal(bare, clone.branch).recovery.stage, "ready-for-model");
 });
@@ -1679,30 +1689,15 @@ for (const rejects of [false, true]) {
     let created = 0, models = 0, disposed = 0;
     const make: ExecutorFactory = runId => {
       created++;
+      const rig = codexRig();
       return { homeDir: path.join(homeDir, runId), executor: {
         sandboxesCommands: true,
-        settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+        settleForCredentialFreeCapture: rig.settle,
+        withCredentialFreeCapture: rig.capture,
         safety: {
-          kind: "codex",
-          withBoundary: async (request, action) => {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(new Error("fixture boundary expired")), request.deadlineMs);
-            try {
-              return await action({ epoch: 1, boundary: request.boundary, signal: controller.signal } as any);
-            } finally { clearTimeout(timer); }
-          },
-          spawnBoundaryProcess: async (_permit, request) => {
-            const [executable, ...args] = request.argv;
-            const child = spawn(executable!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
-            const completed = new Promise<{ code: number }>((resolve, reject) => {
-              child.once("error", reject);
-              child.once("exit", code => resolve({ code: code ?? 1 }));
-            });
-            return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
-              cancel: async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await completed; },
-              completed };
-          },
-          dispose: async () => {
+          ...rig.safety,
+          dispose: async request => {
+            await rig.safety.dispose(request);
             disposed++;
             if (rejects) throw new Error("disposal rejected");
             return { kind: "incomplete", errors: [{ category: "protocol", message: "fixture undrained" }] };
