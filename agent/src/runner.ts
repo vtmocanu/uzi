@@ -260,8 +260,8 @@ const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing
  *  cause (the recovery loop caps blocked proofs only for noncredential causes),
  *  because this runs synchronously inside the executor's completion loop, not the server-parked
  *  recovery loop.
- *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
- *  false, so the run's normal terminal cleanup runs (no park, no leak). */
+ *  Ordinary callers clear preserve flags and return false on capture exhaustion. Prepush refusals
+ *  instead request an empty-head hold while retaining the live clone and session. */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
@@ -840,9 +840,8 @@ class HistoryRewrittenError extends Error {
   }
 }
 
-/** A local publication refusal was already terminally reported; unwind without another push. The
- *  base of every refusal signal so the finalize unwind sites and the push retry classifier handle
- *  them alike (issue #2779). */
+/** A permanent publication refusal unwinds without another push. Workflow/CI refusals are
+ *  already reported; a closing-commit refusal carries evidence to the outer hold helper. */
 class PublicationRefusedSignal extends Error {
   constructor(message = "publication refused") {
     super(message);
@@ -867,10 +866,9 @@ class CIConfigGuardRefusedSignal extends PublicationRefusedSignal {
   }
 }
 
-/** Issue #2779: a declared non-closing run's commit messages close its issue (or could not be read);
- *  failClosingCommits already terminally reported, so unwind without pushing. */
+/** Carry exact candidate evidence out of the push retry before requesting a hold. */
 class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
-  constructor() {
+  constructor(readonly head: string, readonly shas: string[] | null) {
     super("closing commit message refused");
     this.name = "ClosingCommitRefusedSignal";
   }
@@ -2549,7 +2547,7 @@ export class RunRunner {
   /** issue #1783 M2: Docker wiring enables fresh `<key>.attempt-<attemptId>` paths by default,
    *  separating a successor's tree from late Docker binds to a predecessor's path. Recovery can
    *  enable attempt paths per flight even on unwired workers. Ordinary unwired keys use canonical
-   *  reseeding, including shared best-effort per-key residue retention. */
+   *  reseeding, including shared per-key retention diagnostics. */
   private readonly attemptPaths: boolean;
   /** PRD #1809 D6 (N3): aborted by `shutdown()` beside `shuttingDownGlobal`, so a pre-clone wait
    *  (the data-volume reclaim wait, before the flight joins `activeRuns`) can end on a shutdown. */
@@ -4463,8 +4461,7 @@ export class RunRunner {
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
       // issue #1783 M2: in attempt-path mode the next attempt runs at a NEW path with its own
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
-      // removed with it even on a park; a retained predecessor keeps its pair until the retention
-      // sweep deletes both.
+      // removed with it even on a park; automatic retention keeps a retained predecessor and its pair.
       const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (!this.cancellationExpired(flight) && flight.worktreePath && removeSkills) {
         await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps))
@@ -6292,9 +6289,11 @@ export class RunRunner {
     };
 
     let completionScope = claim.config?.completion_scope;
+    let publicationAck: StateAck | undefined;
+    let publicationProjection: StateAck["completionProjection"];
     // Both capped-empty and MR completion use the same bounded client retry and hold paths.
     const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
-      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
+      const contractRevision = publicationProjection?.revision ?? flight.latestContractRevision ?? claim.config?.contract_revision;
       if (!head || !branch || contractRevision === undefined) {
         runLog.warn("completion interlock: head, branch or contract revision is unresolvable", { run_id: runId });
         await holdOrFailInterlocked("completion identity unresolvable");
@@ -6339,13 +6338,24 @@ export class RunRunner {
       // A grant's scope belongs to its revision. An explicit empty object clears stale
       // claim decisions; older APIs may omit scope only while the claim remains current.
       const grantRevision = permit.permit?.contractRevision ?? contractRevision;
+      if (publicationProjection && grantRevision !== publicationProjection.revision) {
+        await holdOrFailInterlocked("completion permit revision differs from publication guard");
+        return false;
+      }
       if (permit.permit?.completionScope !== undefined) {
         completionScope = permit.permit.completionScope;
-      } else if (grantRevision > (claim.config?.contract_revision ?? 1)) {
+      } else if (grantRevision !== (claim.config?.contract_revision ?? 1)) {
         await holdOrFailInterlocked("completion permit scope missing for updated contract");
         return false;
       } else {
         completionScope = claim.config?.completion_scope;
+      }
+      if (publicationProjection) {
+        const resolvedIds = [...new Set((completionScope?.deferred ?? []).map(entry => entry.milestone_id))].sort();
+        if (JSON.stringify(resolvedIds) !== JSON.stringify(publicationProjection.deferredIds)) {
+          await holdOrFailInterlocked("completion permit scope differs from publication guard");
+          return false;
+        }
       }
       return true;
     };
@@ -6993,41 +7003,85 @@ export class RunRunner {
       );
     }
 
-    // Issue #2779: a declared non-closing issue run (result.nonClosing, the same declaration phasePublish
-    // later turns into effectiveNonClosing) must not publish a commit message that closes its issue:
-    // the commit messages reach the default branch in the squash commit and close the issue there.
-    // Scan the messages a push would publish with the SAME matcher the body uses and refuse BEFORE any
-    // push or PR call. No history rewrite is attempted (that is the owner's call); the committed work
-    // stays preserved by the recovery capture the failed terminal report triggers. Any failure to read,
-    // parse or resolve the commit range refuses (null), never passes.
-    const closingGateIid =
-      resolveRunKind(claim.kind) === "issue" && result.nonClosing && typeof claim.issue_iid === "number"
-        ? claim.issue_iid
-        : undefined;
+    const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
+    const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
+    let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
     const closingBarePath = barePath;
     const closingRepoPath = repoPathFromUrl(claim.repo.url);
-    /** The SHAs among the commits `tip` would publish whose message closes the issue, or null when
-     *  the range could not be read (tip absent or not a 40-hex OID, git or parse failure). */
+    // publishedCommitMessages scans default-branch..tip, including already-pushed history.
     const closingCommits = async (tip: string | null): Promise<string[] | null> => {
       if (!tip || closingGateIid === undefined || !closingBarePath) return null;
       const commits = await this.git.publishedCommitMessages(closingBarePath, tip);
       if (commits === null) return null;
-      return commits.filter(c => closingDirectiveFor(c.message, closingGateIid, closingRepoPath)).map(c => c.sha);
+      return commits.filter(c => closingDirectiveFor(c.message, closingGateIid!, closingRepoPath)).map(c => c.sha);
     };
-    let closingReported = false;
-    const failClosingCommits = async (shas: string[] | null) => {
-      if (closingReported) return;
-      closingReported = true;
+    let prepushReported = false;
+    const refusePrepush = async (kind: "closing" | "unknown", head: string | null, evidence: string[] | null = null): Promise<void> => {
+      if (prepushReported) return;
+      prepushReported = true;
+      // Never place unvalidated evidence or commit text in the feed or terminal journal.
+      const shas = evidence !== null && evidence.every(sha => /^[a-fA-F0-9]{40}$/.test(sha)) ? evidence : null;
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
-      const failureReason = shas === null
+      const failureReason = kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
         ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
         : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
+      const holdEligible = interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: shas === null
-          ? "non-closing delivery refused: the commit messages to publish could not be read; publication stopped"
-          : "non-closing delivery refused: a commit message closes the issue; publication stopped",
+        text: kind === "unknown"
+          ? holdEligible
+            ? "Completion state could not be confirmed before push; the run is held for the owner."
+            : "Completion state could not be confirmed before push; publication stopped."
+          : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`,
       } });
+      // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
+      if (!holdEligible) {
+        await closeBatcher();
+        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        return;
+      }
+      const holdReason = kind === "unknown" ? "completion identity unresolvable" : "closing commit message refused";
+      runLog.info(holdReason, { run_id: runId });
+      const signal = boundarySignal ? AbortSignal.any([flight.cancel.signal, boundarySignal]) : flight.cancel.signal;
+      // One logical empty attempt, at most three transient sends. Ambiguous sends can increment
+      // the server count more than once; an exhausted/unknown attempt still proceeds to the hold.
+      if (!(publicationAck?.completionAttempts !== undefined && publicationAck.completionAttempts > 0)) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          signal.throwIfAborted();
+          try {
+            await this.client.recordCompletionAttempt(runId, {
+              milestonesCompleted: [], head, worktreeFingerprint: null,
+              claimGeneration: flight.claimGeneration,
+              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: effectiveDeclared } : {}),
+            }, signal);
+            break;
+          } catch (error) {
+            signal.throwIfAborted();
+            if (error instanceof RequestError && (error.status === 409 || error.status === 404)) {
+              let refusal: { reason?: unknown; error?: unknown } | undefined;
+              try { refusal = JSON.parse(error.body); } catch { /* Unknown refusal still requests hold. */ }
+              if ((error.status === 409 && (refusal?.reason === "stale_claim" ||
+                    refusal?.error === "run is not in a live claimed state for this worker")) ||
+                  (error.status === 404 && refusal?.error === "run not found for this worker"))
+                throw new StaleClaimError();
+            }
+            if (!isTransient(error) || attempt === 2) {
+              runLog.warn("prepush completion attempt unresolved; requesting hold", { error: errMessage(error) });
+              break;
+            }
+            await sleep(250 * 2 ** attempt, signal);
+          }
+        }
+      }
+      signal.throwIfAborted();
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog, {
+        publishCheckpoint: false, allowDegradedCapture: true, signal,
+      });
+      if (held) {
+        if (flight.completionHoldOutcome === "confirmed") await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        await closeBatcher().catch(() => undefined);
+        return;
+      }
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
@@ -7188,12 +7242,31 @@ export class RunRunner {
       }
     }
 
+    // This fresh ACK supplies only the request-local publication guard projection. Completion
+    // permit and frozen contract authority remain unchanged; cached ACKs cannot supply this guard.
+    if (interlocked && issuePublication) {
+      publicationAck = await flight.reportState({ status: "running" }, boundarySignal);
+      // Reuse the stopped-claim path so the owner's local bytes survive this nonterminal exit.
+      if (publicationAck.status !== "running") throw new StaleClaimError();
+      const generation = publicationAck.sentClaimGeneration;
+      if (!publicationAck.applied || publicationAck.status !== "running" ||
+          publicationAck.runId !== runId || !publicationAck.workerIdentityMatches ||
+          !Number.isSafeInteger(generation) || (generation ?? 0) <= 0 || generation !== flight.claimGeneration ||
+          !publicationAck.completionProjection) {
+        await refusePrepush("unknown", publicationOriginalHead);
+        return;
+      }
+      publicationProjection = publicationAck.completionProjection;
+      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0)
+        closingGateIid = claim.issue_iid!;
+    }
+
     // Early closing-commit refusal, placed AFTER the GitHub workflow precheck so a workflow-scope
     // refusal keeps precedence when a run trips both.
     if (closingGateIid !== undefined) {
       const hits = await closingCommits(publicationOriginalHead);
       if (hits === null || hits.length > 0) {
-        await failClosingCommits(hits);
+        await refusePrepush("closing", publicationOriginalHead, hits);
         return;
       }
     }
@@ -7307,8 +7380,7 @@ export class RunRunner {
           if (closingGateIid !== undefined) {
             const closing = await closingCommits(sourceSha);
             if (closing === null || closing.length > 0) {
-              await failClosingCommits(closing);
-              throw new ClosingCommitRefusedSignal();
+              throw new ClosingCommitRefusedSignal(sourceSha, closing);
             }
           }
           // Default-branch CI repair lane: the authoritative CI-config check on the exact owned
@@ -7993,7 +8065,10 @@ export class RunRunner {
       }
     } catch (e) {
       rethrowWorkflowAbort(e);
-      if (e instanceof PublicationRefusedSignal) return;
+      if (e instanceof PublicationRefusedSignal) {
+        if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+        return;
+      }
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -8072,7 +8147,10 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         rethrowWorkflowAbort(e);
-        if (e instanceof PublicationRefusedSignal) return;
+        if (e instanceof PublicationRefusedSignal) {
+          if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+          return;
+        }
         if (e instanceof RunResidueBlockedError) throw e;
         if (await reportMovedBranchIfVerified(e)) return;
         if (e instanceof ScratchPublicationError) throw e;
@@ -8239,7 +8317,7 @@ export class RunRunner {
       }
     }
     const runKind = resolveRunKind(claim.kind);
-    const declaration = runKind === "issue" ? result.nonClosing : undefined;
+    const declaration = runKind === "issue" ? (result.nonClosing ?? claim.config?.non_closing) : undefined;
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
@@ -8252,7 +8330,15 @@ export class RunRunner {
         result.gatesDiscoveryTruncated,
         result.scopeCapped,
         withCloses,
-        completionScope,
+        completionScope ? {
+          ...completionScope,
+          // Redact raw frozen metadata before inline escaping can split a registered secret.
+          deferred: completionScope.deferred?.map(d => ({
+            milestone_id: redactText(d.milestone_id),
+            title: redactText(d.title),
+            reason: redactText(d.reason),
+          })),
+        } : undefined,
         bridged,
         opts,
         result.codeCrossCheckSummary,
@@ -8388,9 +8474,8 @@ export class RunRunner {
     // Issues #2779 and #2815: a non-closing issue delivery (declared, owner-partial or scope-capped)
     // opens its PR with a title that cannot close the issue on a squash merge (the issue title may
     // itself start with "Fixes #N"; mrTitle's "[partial] " prefix does not neutralise it). Full
-    // deliveries keep the plain title. The closing-commit refusal (closingGateIid) stays keyed on the
-    // explicit declaration only: owner-partial and scope-capped runs are not chosen by the agent, so
-    // they are not refused for a closing commit message (see #2815).
+    // deliveries keep the plain title. Interlocked owner-partial and scope-capped publication also
+    // refuses closing commit history using the publication-start projection and exact candidate.
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const titleFor = (): string => {
       const title = mrTitle(claim, result.scopeCapped, completionScope);
@@ -8679,6 +8764,15 @@ export class RunRunner {
     // the cap is redacted whole instead of cut and leaked as a prefix. It is never logged or
     // emitted: only byte counts.
     await this.saveDecisionsMemoBestEffort(flight, runKind, result.decisionsMemo);
+    if (runKind === "issue" && isOwnerPartial) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `Retained scope delivered; ${completionScope!.deferred!.length} deferred milestone(s) still not delivered or verified by this run. The owner must complete or verify them before closing the source issue.`,
+        },
+      });
+    }
     await finishCommittedPublish({
       status: "completed",
       branch: result.branch,
@@ -9330,7 +9424,7 @@ export class RunRunner {
         disposition = "retained-in-place";
       } else if ((flight.effectiveAttemptPaths ?? this.attemptPaths) && shape === "attempt") {
         // The foreign owner's work is retained IN PLACE (never moved) and was NOT captured, so it
-        // may be the only copy: the ledger says `reclaimed`, which the retention sweep never counts
+        // may be the only copy: the ledger says `reclaimed`, which automatic retention never counts
         // or deletes — the attempt-path twin of the foreign quarantine below (discard:false).
         await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
         disposition = "retained-in-place";
@@ -9350,9 +9444,6 @@ export class RunRunner {
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!(flight.effectiveAttemptPaths ?? this.attemptPaths) || attemptId === undefined) return undefined;
-    // Set when this seed's sweep could not attribute an unreadable process (below): every retention
-    // deletion of the same seed is then vetoed, whatever its own re-scan says.
-    let retentionVetoed = false;
     return {
       attemptId,
       isInterruption: canonicalRecoveryInterruption,
@@ -9379,10 +9470,9 @@ export class RunRunner {
         // exists. This honours the plan's "move nothing when unverified" rule rather than bending
         // it: seeding a FRESH attempt path moves, frees and deletes nothing (no predecessor path is
         // touched), so it is allowed; every step that WOULD move or free something still requires
-        // a quiescent proof, and the retention deletions of this same sweep are vetoed outright.
+        // a quiescent proof, and automatic retention only observes retained paths.
         // Only this seed mode relaxes it; capture and own proofs keep failing closed on unverified.
         if (unverifiedOnlyByUnattributedUnreadable(proof.outcome.process)) {
-          retentionVetoed = true;
           flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
             site: "attempt_seed",
             processes: describeProcesses(proof.outcome.process),
@@ -9392,8 +9482,8 @@ export class RunRunner {
         throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
       },
       onSeeded: (clonePath) => {
-        // Live from the seed on (inside the bare lock), so a concurrent same-key seed's sweep
-        // never treats this attempt's fresh path as residue.
+        // Live from the seed on (inside the bare lock), so a concurrent same-key seed's
+        // diagnostics never classify this attempt's fresh path as abandoned.
         const attempt = newRunAttempt(
           claim.run_id,
           claim.claim_generation,
@@ -9404,20 +9494,6 @@ export class RunRunner {
         );
         flight.attempt = attempt;
         this.liveAttempts.add(attempt);
-      },
-      // Retention keeps its process-only posture: fresh-path seed relaxation never authorizes
-      // deletion, and quarantine is checked both before and after the affirmative process proof.
-      quiescent: async (paths, canonical) => {
-        if (retentionVetoed || residueQuarantine() !== undefined) return false;
-        const proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "seed",
-          site: "attempt_retention",
-          propagateControl: true,
-          targetPaths: paths,
-          clonePath: canonical,
-          processOnly: true,
-        });
-        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
       },
     };
   }
@@ -9437,24 +9513,13 @@ export class RunRunner {
    * inside it (a dev server, a container's bind), and deleting or moving its tree under it is exactly
    * the residue hazard this issue closes. So unverified blocks.
    *
-   * After successful canonical free, the git layer uses these predicates for shared per-key
-   * residue retention before seeding. Unlike attempt retention, this callback forwards configured
-   * best-effort Docker handling; unwired workers acquire no daemon obligation. Deletion still
-   * requires an affirmative scoped seed-process verdict and no worker quarantine before/after proof;
-   * absent/off-Linux proof keeps excess, while classified control/recovery interruptions escape.
+   * After successful canonical free, shared diagnostics report retained excess without
+   * requesting a process or daemon proof or reclaiming any retained artifact.
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
       isInterruption: canonicalRecoveryInterruption,
       isLive: (p) => this.liveAttempts.isLivePath(p),
-      quiescent: async (paths, canonical) => {
-        if (residueQuarantine() !== undefined) return false;
-        const proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "seed", site: "canonical_retention", targetPaths: paths, clonePath: canonical,
-          propagateControl: true,
-        });
-        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
-      },
       beforeFree: async (canonical) => {
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
@@ -9919,7 +9984,7 @@ export class RunRunner {
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
-    // issue #1783 M2: the retention sweep relies on this ordering (see attemptCloneForBranch): no
+    // Retention diagnostics rely on this ordering (see attemptCloneForBranch): no
     // executor or agent starts in a seeded attempt path before this write, so a ledger `live`
     // entry that no journal names, is not live here and holds no custody is a seed interrupted
     // before this line, with no agent work in it.
@@ -12005,9 +12070,10 @@ export class RunRunner {
       // declaration + head + worktree fingerprint to the worker completion/attempt endpoint, which
       // union-merges the declaration into milestones_completed, recomputes unmet server-side, and
       // records a bounded attempt — returning the server-authoritative unmet set + attempt count.
-      recordCompletionAttempt: ({ declared, head, worktreeFingerprint }) =>
+      recordCompletionAttempt: ({ declared, head, worktreeFingerprint, nonClosing }) =>
         this.client.recordCompletionAttempt(runId, {
           milestonesCompleted: declared,
+          nonClosing,
           head,
           worktreeFingerprint,
           // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
@@ -12425,10 +12491,9 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
-      // Process-only checks include attempt retention and re-proofs after runner-clone git.
+      // Process-only re-proofs run after runner-clone git.
       // That git runs with the worker's HOME (git.ts gitEnv), so its children carry the run's HOME
-      // only if deliberately set; the sink's first proof already ran the attributed reap. Attempt
-      // retention keeps its existing process-only scan over candidate paths. A child deliberately
+      // only if deliberately set; the sink's first proof already ran the attributed reap. A child deliberately
       // escaping both clone and HOME escapes both reaps (the documented worker-level residual).
       if (
         !opts.processOnly &&
@@ -12472,8 +12537,8 @@ export class RunRunner {
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
           // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
           processes: (opts.forceProcessScan || !executor.safety || mode !== "own") && process.platform === "linux",
-          // Process-only re-proofs and attempt retention omit Docker teardown. Canonical
-          // retention forwards the configured host; Docker handling stays best effort.
+          // Process-only re-proofs omit Docker teardown; other proofs forward the configured
+          // host. Docker handling stays best effort.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
           otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
@@ -16793,7 +16858,7 @@ export class RunRunner {
     claim: ClaimResponse,
     reason: string,
     runLog: Logger,
-    options: { publishCheckpoint?: boolean } = {},
+    options: { publishCheckpoint?: boolean; allowDegradedCapture?: boolean; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
@@ -16804,8 +16869,8 @@ export class RunRunner {
     flight.preserveSession = true;
     // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
     //    and-retry, but bounded — this runs inside the executor's completion loop). DURING the retries
-    //    an unverified capture retains the live clone and does NOT request a hold; only on GIVING UP
-    //    does it clear the flags and return false so the subsequent terminal outcome cleans up.
+    //    an unverified capture retains the live clone and does NOT request a hold. Ordinary callers
+    //    clear the flags on exhaustion; prepush callers instead request the degraded empty-head hold.
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
@@ -16827,6 +16892,7 @@ export class RunRunner {
     };
     if (holdQuiescence.blocked) captured = residueHold(holdQuiescence.outcome.process?.state);
     for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+      options.signal?.throwIfAborted();
       if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog, options);
@@ -16845,6 +16911,10 @@ export class RunRunner {
       }
       if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
+    if ((!captured || captured.head === null) && options.allowDegradedCapture) {
+      runLog.warn("prepush completion hold: capture exhausted; retaining live clone and requesting an empty-head hold", { run_id: flight.runId });
+      captured = { verified: false, published: false, mode: "same_worker_only", head: "" };
+    }
     if (!captured || captured.head === null) {
       // Gave up: no verified restore point after the bounded retries. Clear the preserve flags so the
       // NOT-parked run follows normal terminal cleanup instead of leaking its clone + HOME.
@@ -16856,6 +16926,7 @@ export class RunRunner {
       );
       return false;
     }
+    options.signal?.throwIfAborted();
     const head = captured.head;
     flight.completionHoldOutcome = "unresolved";
     flight.parked = false;
@@ -16865,10 +16936,11 @@ export class RunRunner {
       const ack = await this.client.requestCompletionHold(flight.runId, {
         head,
         claimGeneration: flight.claimGeneration,
-      });
+      }, options.signal);
       status = ack?.status;
       if (status === "cancelled") this.observeCancellation(flight);
     } catch (holdError) {
+      options.signal?.throwIfAborted();
       runLog.warn("completion hold request ambiguous; retaining artifacts for ownership reconciliation", {
         run_id: flight.runId,
         error: errMessage(holdError),

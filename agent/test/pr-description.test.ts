@@ -619,6 +619,40 @@ describe("renderCompletionBlock (D10, D12, D14)", () => {
     assert.ok(quoted.startsWith(`${COMPLETION_START}\n> one\n> two\n\nRelated to #7.`), quoted);
   });
 
+  it("M4 owner-deferred implementation and live acceptance are unchecked pending work", () => {
+    const block = renderCompletionBlock({
+      issueIid: 7, branch: "b", closes: true,
+      completionScope: { deferred: [
+        { milestone_id: "m2", title: "Build export", reason: "follow-up coding" },
+        { milestone_id: "m3", title: "Live acceptance", reason: "owner verifies deployment" },
+      ] },
+    });
+    const explanation = "Not delivered or verified by this run; must be completed or verified before closing the source issue.";
+    for (const item of [
+      "> - [ ] `m2` — Build export: follow-up coding",
+      "> - [ ] `m3` — Live acceptance: owner verifies deployment",
+    ]) {
+      assert.ok(block.split("\n").includes(`${item}. ${explanation}`), `item carries its own explanation: ${item}`);
+    }
+    const codingOnly = renderCompletionBlock({
+      issueIid: 7, branch: "b", closes: true,
+      completionScope: { deferred: [{ milestone_id: "m2", title: "Build export", reason: "follow-up coding" }] },
+    });
+    assert.ok(codingOnly.split("\n").includes(`> - [ ] \`m2\` — Build export: follow-up coding. ${explanation}`));
+    assert.doesNotMatch(codingOnly, /acceptance.*pending|pending.*acceptance/i);
+    assert.match(block, /Checking a box grants no completion or closure authority/);
+    assert.match(block, /body refresh restores these boxes to unchecked/);
+    assert.doesNotMatch(block, /> - \[x\]|Steps:|Run .*command/);
+    assert.equal(closingDirectiveFor(block, 7), false);
+    for (const completionScope of [undefined, { deferred: [] }, {
+      accepted: [{ id: "c1", milestone_id: "m1", text: "Criterion", reason: "accepted" }],
+    }]) {
+      const full = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, completionScope });
+      assert.match(full, /Closes #7/);
+      assert.doesNotMatch(full, /\[ \]|Not delivered or verified by this run/);
+    }
+  });
+
   it("a partial (owner or operator) never renders Closes, whatever closes says", () => {
     const deferred: NonNullable<ClaimConfig["completion_scope"]>["deferred"] = [
       { milestone_id: "m3", title: "Third", reason: "later" },

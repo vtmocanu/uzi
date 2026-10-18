@@ -161,11 +161,9 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
               const siblingBranch = branch + "-retained";
               const sibling = await git.runnerCloneForBranch(bare, siblingBranch, "retained-source", {
                 isLive: () => false,
-                quiescent: async () => true,
                 beforeFree: async () => { throw new Error("retained source cannot free an incumbent"); },
               }, claim.run_id, false, undefined, {
                 attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),
-                quiescent: async () => true,
               });
               retainedClone = sibling.path;
               await git.markRecoveryCapture(bare, sibling.path, siblingBranch, claim.run_id, attemptId);

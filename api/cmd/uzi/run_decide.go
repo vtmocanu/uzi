@@ -41,9 +41,12 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 			"request):\n" +
 			"  --continue [--guidance <text>]  resume past the check; --guidance optionally steers the run.\n" +
 			"  --partial <ids> --reason <text> reduce scope to the kept milestone ids (comma-separated); the " +
-			"rest are deferred and the run's PR does NOT close the issue.\n" +
-			"  --accept <ids> --reason <text>  waive the named criterion ids (comma-separated) as met; a " +
-			"closing PR then names them in a warning block.\n\n" +
+			"rest are deferred in an unchecked pending checklist and the PR does NOT close the issue.\n" +
+			"  --accept <ids> --reason <text>  accept the named criterion ids (comma-separated) as-is; they " +
+			"remain unmet in the PR warning, not passed acceptance. Refused when all milestones are done.\n\n" +
+			"Partial and accept irreversibly change this frozen contract; neither fixes a commit-history hold. " +
+			"For unpublished history without Stop, continue with SHA-specific guidance for the lead to reword " +
+			"its own unpublished commits. For published history or Stop, cancel and manually deliver preserved work.\n\n" +
 			"--guidance is valid only with --continue; --reason is required with --partial/--accept. A " +
 			"partial/accept sends the run's CURRENT contract revision, which the server fences: a stale " +
 			"revision (someone else already decided) is a 409 (exit 5). A run that is NOT completion-blocked " +
@@ -190,7 +193,7 @@ func newRunDecideCmd(env Env, gf *globalFlags) *cobra.Command {
 	decide.Flags().Bool("continue", false, "record the CONTINUE decision — resume past the completion check")
 	decide.Flags().String("guidance", "", "optional guidance to steer the continued run (only with --continue)")
 	decide.Flags().String("partial", "", "record the PARTIAL decision: comma-separated milestone ids to KEEP in scope (requires --reason)")
-	decide.Flags().String("accept", "", "record the ACCEPT decision: comma-separated criterion ids to waive as met (requires --reason)")
+	decide.Flags().String("accept", "", "record ACCEPT-AS-IS: comma-separated criterion ids remaining unmet in the warning (requires --reason)")
 	decide.Flags().String("reason", "", "owner reason for the partial/accept decision (required for those)")
 	return decide
 }

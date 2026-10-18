@@ -880,6 +880,39 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 - An owner can start one MR rework cycle on demand from a completed run's page or with uzi run rework, with optional guidance, even after the automatic cap; on-demand cycles never count against the cap. [user, #1202]
 
+## Decision #3090 — Non-closing publication and pending acceptance
+
+Approved M5 prose. (AI-synced 2026-10-18). Mechanism and residual boundaries are recorded
+in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum--non-closing-publication-and-pending-acceptance-2026-10-18-3090).
+
+- Plans isolate external acceptance in a final milestone; implementation,
+  docs, tests, mandatory gates, security and review remain worker obligations.
+  Formal owner partial records exact kept/deferred IDs and reason, including
+  ordinary coding scope. Answers, non-closing intent and auto-approval waive
+  nothing. Pending entries remain unchecked with ID, frozen title, reason
+  and not-delivered/not-verified status before owner closure; checkbox edits
+  authorize nothing. Accept-as-is leaves unmet criteria in the warning.
+- Interlocked declared, owner-partial and Stop-capped issue delivery holds
+  before pushing closing commits, including earlier-flight history. One
+  generation-bound running ACK selects the guard; the later exact-head
+  permit retains scope authority. Unknown projections hold without commit
+  text. Empty-attempt retries preserve I6 admission and may count more than
+  once; degraded capture retains local work without a verified-copy claim.
+- The first non-closing reason persists through attempts and reclaim with
+  `completion_non_closing_v1`, including reconciliation. It restricts
+  publication without changing scope. Coordinate API/worker rollout;
+  old workers and APIs retain the documented legacy limits.
+- Unpublished history without Stop can return to the lead via owner continue
+  guidance. Published history or Stop requires cancel/manual delivery.
+  Partial/accept cannot fix history; a separately approved reconciliation
+  reset can replace the frozen contract but cannot clear stored intent.
+- Excluded MR-rework/branch-adopting CI-fix lanes and Forgejo/Gitea branch-push
+  closing are recorded together as finding
+  #3b56e6e5-4352-4694-ae1c-4999d5719e9c, not a forge issue. #1230 D4/#1231
+  remain open; #3068 provider-policy parking is planned. No semantic
+  activation, plan preauthorization or completed live deployment acceptance
+  is claimed.
+
 ## Feature #1226 — Structural completion interlock
 
 Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
@@ -1201,6 +1234,8 @@ Tracked as GitHub issue vtmocanu/uzi#1783; decision record `adr/1783-run-quiesce
 - On a Claude run on a Linux worker, that quiescence proof also requires a complete reap of every process carrying the run's HOME or working in its trees: a process left alive, or a reap that cannot finish, blocks the credentialed sink like any other unproven state. A re-claimed run reaps its HOME the same way before its clone fetch and fails `worker_residue_blocked` if it cannot. (AI-synced 2026-10-03, #1828)
 - On a single-uid Linux worker, a runner-uid process whose environment or working directory is unreadable and that nothing ties to another live attempt latches a process-wide quarantine, released only by a container restart. While latched the worker claims nothing, starts no forge-credentialed git child and no new Claude or Codex provider turn; a turn already in flight runs to its boundary and is not killed. Runs then fail `worker_residue_blocked` with the clone, generation hold and recovery pins kept; a run stopped by its own blocking quiescence check fails with a plain residue-blocked reason (usually naming the process) and gets no archive, while a run stopped because the latch refused its turn, credentialed git or claim fails with a "this worker is quarantined" reason and, when the capture succeeds, a verified credential-free local archive of the committed work already in the worker bare; nothing is uploaded or released except a completed run's custody release (including the exact guarded issue/mr_rework/self_improve completed-publication receipt path) and a pre-clone park's hold release. The latch is not set under the uid split, and no other unproven state latches it. (AI-synced 2026-10-09)
 - A recovery capture whose quiescence proof keeps blocking is retried only a bounded number of times, then the run fails `worker_residue_blocked` with the clone kept. The failure names the unreadable process's pid and program name so an operator can stop it. (AI-synced 2026-09-28)
+
+- Automatic retention sweep deletion is disabled on every worker for disposable-kind attempts (abandoned and crash-window live orphans), shared own-key residue from canonical and attempt entries, and orphaned skills; 3 attempts / 5 residue / any orphan are diagnostic thresholds only. Retained bytes, identity metadata and safety inventory are unbounded; per-seed process/teardown and compaction work grow without skipping safety checks. Normal cleanup, canonical free/quarantine and guarded operator discard remain unchanged: attributed attempts and paired skills may use existing discard checks, while shared residue and orphaned skills have no supported generic reclaim route. No safe automatic reclaim exists; process scans, daemon listings, age, count and disk pressure grant no retention deletion authority. The process-proof / daemon pending-create residual remains (#1860 separate daemon mediation); #2852 terminal/Docker writer exclusion is not fixed, and currently unwired is not proof of no prior exposure. Retention-only, non-closing Refs #1858. (AI-synced 2026-10-18)
 
 ## Feature #1795 — Plan-gate verdicts bound to the gate revision they were sent against
 

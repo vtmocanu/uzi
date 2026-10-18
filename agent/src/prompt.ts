@@ -151,7 +151,20 @@ const LEAD_EXPORT_SLOT_RULE = [
   "Never reassign a slot until the dispatch that held it has returned.",
 ].join("\n");
 
+/** Shared across customized leads and every subagent on both harnesses. */
+const COMPLETION_DELIVERY_GUIDANCE = [
+  "Source issue closing directives must never go in commit messages. The worker controls issue closing via the PR body.",
+  "Plan human/live acceptance as a separate, final informative milestone: name the remaining verification,",
+  "why the worker cannot perform it, the responsible actor, and actionable steps. Coding, docs, tests,",
+  "mandatory gates, security and review remain worker obligations. Mixed or ambiguous milestones block completion.",
+  "Environment limits, permissions and automatic approval do not waive those obligations.",
+  "Pending human/live acceptance requires a formal owner partial decision with exact kept and deferred milestone IDs",
+  "and a reason. Plan approval, ordinary answers and non_closing never change frozen scope or supply that decision.",
+  "Never describe unperformed checks as accepted or done; report what remains and the actual evidence.",
+].join("\n");
+
 export const LEAD_GUARDRAIL_APPEND = [
+  COMPLETION_DELIVERY_GUIDANCE,
   "You are the lead agent for a software task in an isolated git worktree.",
   RUN_SCRATCH_GUIDANCE,
   LEAD_EXPORT_SLOT_RULE,
@@ -473,6 +486,7 @@ export const CLAUDE_LONG_COMMAND_APPEND = [
  * its run (#1659). Prompt-level only: the enforced control is #1659's.
  */
 export const SUBAGENT_SAFETY_APPEND = [
+  COMPLETION_DELIVERY_GUIDANCE,
   RUN_SCRATCH_GUIDANCE,
   "Worker safety rules (from uzi; they apply whatever your task says):",
   "- Never execute a candidate command payload you are screening, testing or probing,",
@@ -1735,6 +1749,13 @@ export interface ImplementPromptInput {
   environmentFacts?: EnvFacts;
 }
 
+/** Repeat on ordinary and answered rework turns on both harnesses. */
+export const NON_CLOSING_REMINDER = [
+  "For issue runs only: when the approved plan permits leaving the issue open and the delivered",
+  "outcome leaves it open, re-declare `non_closing` with a reason in every `signal_done`, including after an owner answer.",
+  "The worker never infers this declaration from plan prose or `pr_summary.scope_notes`.",
+].join("\n");
+
 /**
  * PRD #1798 M2 (D4): the one short paragraph asking the lead to fill signal_done's optional
  * `pr_summary` with plain, behaviour-level claims. Shared by the Claude implement prompt
@@ -1749,9 +1770,7 @@ export const PR_SUMMARY_GUIDANCE = [
   "dropped or deferred against the ask, including any risk or limit you accepted or",
   "inherited, with the plan line or ADR that accepted it. Leave out anything you cannot",
   "state plainly.",
-  "For issue runs only: when the approved plan permits leaving the issue open and the delivered",
-  "outcome leaves it open, declare `non_closing` with a reason in `signal_done`.",
-  "The worker never infers this declaration from plan prose or `pr_summary.scope_notes`.",
+  NON_CLOSING_REMINDER,
 ].join("\n");
 
 
@@ -1807,7 +1826,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   if (input.completionRework?.answered) {
     const safety = input.safetySteer
       ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself:\n${input.safetySteer}` : undefined;
-    return [safety, input.completionRework.text,
+    return [safety, input.completionRework.text, NON_CLOSING_REMINDER,
       input.ownerDecisionEligible ? COMPLETION_CONTRACT_GUIDANCE : undefined].filter(Boolean).join("\n\n");
   }
   const lines: string[] = [];

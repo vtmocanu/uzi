@@ -6,7 +6,7 @@ import { execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import { StubExecutor } from "../src/executor.js";
-import { api, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, runnerWith, homeDir } from "./runner-harness.js";
+import { api, client, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, runnerWith, homeDir } from "./runner-harness.js";
 import type { PositiveOwedCandidateContext, PublicationCandidate } from "../src/git.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
@@ -76,6 +76,9 @@ for (const move of ["unchanged", "foreign", "same-generation"] as const) {
     const claim = gitlabClaim(2404, { kind: "issue", branch, claim_generation: 7,
       config: { completion_contract_version: 1, contract_revision: 1 },
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: remote } });
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("publication-retry");
+    api.setPublicationState(claim.run_id, [], 1);
     api.setCompletionPermitResponse(true);
     const forge = fakeGitlab();
     const { logger, lines } = recordingLogger();

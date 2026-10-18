@@ -3505,6 +3505,7 @@ export class SdkExecutor implements Executor {
             if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const { unmet } = await ctx.recordCompletionAttempt({
               declared: turn.milestonesCompleted ?? [],
+              ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
               head,
               worktreeFingerprint,
             });

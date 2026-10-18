@@ -828,6 +828,10 @@ describe("worker-owned subagent safety block (issue #1660)", () => {
     assert.deepStrictEqual(Object.keys(repo).sort(), ["coder", "lead", "validator"]);
     for (const [name, def] of Object.entries(repo)) {
       assert.ok(def.prompt.endsWith(SUBAGENT_SAFETY_APPEND), `${name}: safety block present`);
+      assert.match(def.prompt, /closing directives must never go in commit messages/);
+      assert.match(def.prompt, /separate, final informative milestone/);
+      assert.match(def.prompt, /formal owner partial decision/);
+      assert.match(def.prompt, /Mixed or ambiguous milestones block completion/);
     }
   });
 

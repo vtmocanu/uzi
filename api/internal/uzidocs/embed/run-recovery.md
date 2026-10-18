@@ -92,6 +92,34 @@ Source boundaries: [captured-context reconciliation](../agent/src/runner.ts),
 credential-driven promotion exclude this cause in the
 [runtime queries](../api/internal/store/queries/runtime.sql).
 
+## Completion publication holds
+
+An interlocked issue run can hold before push when a non-closing delivery
+contains a commit message that closes its source issue, or when its current
+completion projection cannot be confirmed. The feed names up to five
+offending SHAs and a remaining count, or reports unreadable messages without
+a SHA. Unknown projection uses fixed copy without commit content.
+
+1. For unpublished commits on a declared or owner-partial run without Stop,
+   use `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs
+   and ask the lead to reword its own unpublished commits. The worker does
+   not rewrite history or force-push.
+2. For published history or a Stop directive, cancel and manually deliver
+   the preserved work through the recovery paths on this page. Stop resumes
+   into finalization without another lead turn. Partial and accept decisions
+   cannot repair commit history.
+3. Check the available recovery evidence before replacing the worker.
+   Pre-push holds skip remote checkpoint publication. If bounded capture
+   exhausts, a degraded hold can record an empty head and retain the clone
+   and session without a verified recovery copy. Latest work may exist only
+   on that worker; an older archive does not prove it contains that work.
+
+An accepted or ambiguous hold does not produce a failed terminal report;
+a definitive hold refusal can fail. An uncertain completion-attempt report
+still proceeds to the hold; stale claim ownership stops the flight while
+retaining its source. See [Completion holds](run-completion-hold.md) for scope
+decisions, plain-resume refusal and version limits.
+
 ## When plan-revision retries expire
 
 After bounded inner retries exhaust a provider transient during a human plan
@@ -585,8 +613,21 @@ Keeping the old parked source costs storage, including after resume. On an
 unwired worker retained recovery also starts a fresh path and model session,
 instead of ordinary same-path continuity; Docker-wired resumes already start
 fresh sessions. Capacity pressure does not authorize deletion. This is a partial
-fix for #2852: real writer exclusion and safe reclaim in the Docker lane remain
-open, and no new rename, state, TTL or disposal mechanism is added.
+fix for #2852: terminal/Docker writer exclusion and safe reclaim remain open.
+After recapture, parked predecessors can become abandoned attempts; repeated
+disk parks can compound retained storage (#2013/#225). The retention-only,
+non-closing #1858 change disables unsafe automatic retention reclaim on every
+worker, including abandoned attempts and crash-window live orphans, shared
+own-key residue from canonical and attempt entries, and orphaned skills.
+There is no automatic reclaim escape from that accumulation.
+
+Retained bytes, identity metadata and the safety inventory have no retention
+bound. Existing per-seed process/teardown scope over non-live paths and ledger
+compaction work grow with inventory; no cap skips safety checks. Compaction keeps
+identities for present paths. The unchanged disk governor does not establish
+writer exclusion or guarantee protection against node eviction. Active-clone
+measurements are snapshots,
+not marginal retention cost, a growth bound or a complete historical deletion rate.
 
 To find these sources, run an aggregate inspect (see
 [Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)):
@@ -1128,8 +1169,10 @@ retirement, success describes retained quarantine or confirmed source absence
 established under that lock,
 not merely a retirement call returning. A completed quarantine stays retained
 if a later journal clear fails; reclaimed attempt bytes stay in place and are
-excluded from the later retention sweep. A refusal after a move or copy need
-not restore the original layout.
+excluded from the former retention sweep. Since #1858, automatic retention
+deletion is disabled for disposable-kind attempts, shared own-key residue and
+orphaned skills on every worker. A refusal after a move or copy need not restore
+the original layout.
 
 The new events carry `event`, `stage`, `reason`, `claimant_id`, `owner_id`,
 `repo_id`, `path_shape`, `path_fingerprint`, and `errno`. IDs are UUID strings
@@ -1155,6 +1198,35 @@ but a worker-local record (attempt ledger, recovery journal, marker) still names
 clone, so it keeps blocking reclaim or occupying disk. The server views above cannot
 show or discard it. The worker exposes a small operator channel for exactly this case:
 a read-only **inspect** and a guarded **discard**, run on the worker itself.
+
+Automatic retention reclaim is disabled on every worker (Refs #1858,
+retention-only and non-closing). Attributed attempts and their paired skills may
+use this existing retained-source discard route, subject to all its checks.
+Shared residue (`.uzi-residue-*`) and orphaned skills have **no supported generic
+reclaim route**. API custody discard alone is not local writer-exclusion proof.
+Do not fall back to deleting a source or volume without independent preservation
+of protected work and writer exclusion.
+
+The former 3-attempt / 5-residue caps and any-orphan trigger are diagnostic
+thresholds only. Known excess (>3 attempts, >5 residue, >0 orphaned skills) can
+log `runner clone retention: automatic reclaim disabled`, with a sanitized,
+truncated key and observed lower-bound counts/completeness. Observation validates
+the parent and is limited to 4096 direct siblings; it does no recursive byte walk.
+Overflow or read failure gives partial/unknown evidence. Protection predicates
+fail closed; protected-or-unreadable custody makes attempt classification partial
+without a second probe. Warning rate is one per hour per full canonical key in a
+128-key LRU; restart or eviction may warn again. These are diagnostic bounds,
+not storage, identity-metadata or safety-inventory bounds.
+
+No process scan, daemon listing (including repeated clean listings), time, age,
+count or disk pressure authorizes retention deletion. Existing canonical
+`beforeFree` / `freeCanonicalClonePath` and quarantine are unchanged and retain
+the **process-proof / daemon pending-create residual**: a create already accepted
+by the daemon can complete after process proof and clean listings. #1860 is the
+separate daemon-mediation follow-up; #2852's terminal/Docker writer-exclusion
+remainder is not fixed. Current unwired status is not durable proof that a path
+was never exposed to a daemon. No new proxy, marker, ledger, API, schema,
+configuration flag or infrastructure is added.
 
 - **Socket.** The worker listens on `<dataDir>/ops/retained-source.sock` (a
   worker-owned `0700` directory holding a `0600` socket). There is no TCP listener. If
@@ -1207,7 +1279,12 @@ reported as partial or unknown, never as `0`. Server hold state comes from the w
 API (this worker's open holds); an empty list means the hold is absent or released,
 never something inferred from local files. When a source is selected
 (`--run`/`--generation`/`--attempt`) it names one disposition; an aggregate inspect (no
-selector) only lists sources, without holds or a disposition:
+selector) only lists sources, without holds or a disposition. Aggregate output
+is capped at 64 descriptors (`RETAINED_MAX_DESCRIPTORS`); excess descriptors make
+it partial. Use selector-scoped inspection for a specific run even when aggregate
+output is partial; that inspection still has its existing time/read budgets.
+Aggregate output is not a complete inventory or disk-growth accounting, and
+unknown measurement does not mean zero.
 
 | Disposition | Meaning and next step |
 |---|---|
@@ -1247,7 +1324,7 @@ lifecycle read is unknown, and a cross-worker predecessor's hold can stay open; 
 record gives `resolve_local_record`. With neither, the lifecycle read decides. Its only
 automatic reclaim is a later run of that branch's terminal-orphan handling on this
 worker, which moves the clone to `<dataDir>/runner-quarantine/` (retained, never deleted
-automatically; the retention sweep never touches `runner-quarantine/`) and frees
+automatically; automatic retention deletion is disabled) and frees
 the canonical path; a protected source or an attempt clone is kept in place instead.
 Cross-worker reclaim needs a lifecycle read that is not worker-scoped (new API); it is
 an open follow-up and is not shipped.
@@ -1265,6 +1342,10 @@ investigation by the maintainer.
 episode or protected source. It closes new claims briefly, waits at most 5 s for
 in-flight claims, requires the worker to be idle, reserves the run, then deletes the
 exact source under one lock. It never cancels a run or stops the worker.
+Existing fresh server-hold reads, digest confirmation, journal, live-flight,
+quarantine, process, Docker and owned-path checks still apply. These checks
+do not guarantee that all writers are fenced; the Docker pending-create residual
+remains.
 
 - On a Docker-wired worker, discard itself runs the Docker teardown, which
   force-removes containers that bind-mount the clone (with their anonymous

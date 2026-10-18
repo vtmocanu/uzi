@@ -435,7 +435,7 @@ describe("issue #1828: the recovery capture", { skip: process.platform !== "linu
 // ─── predecessor capture ───────────────────────────────────────────────────────────────────
 
 function fixtureSeed(attemptId: string): AttemptSeedOptions {
-  return { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+  return { attemptId, isLive: () => false, beforeSeed: async () => {} };
 }
 
 /** A predecessor attempt as a worker that died mid-run leaves it: an attempt clone with

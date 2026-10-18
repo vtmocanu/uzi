@@ -63,7 +63,7 @@ describe("mrCompletionBlock — owner PARTIAL (PRD #1227 M2)", () => {
     assert.match(body, /Implements part of #1 \(partial delivery — owner scope decision/);
     assert.match(body, /Partial delivery — owner scope decision \(PRD #1227\)/);
     // Each deferred milestone is named as `milestone_id` — title: reason.
-    assert.match(body, /> - `m3` — Third milestone: deprioritized/);
+    assert.match(body, /> - \[ \] `m3` — Third milestone: deprioritized\. Not delivered or verified by this run; must be completed or verified before closing the source issue\./);
   });
 
   // MUTATION-MINDED (PRD M2): a partial NEVER closes, even when renderCloses would otherwise be true.
@@ -108,7 +108,7 @@ describe("mrCompletionBlock — owner ACCEPT (PRD #1227 M3)", () => {
     const body = render({ deferred: DEFERRED, accepted: ACCEPTED }, true);
     assert.doesNotMatch(body, /Closes #/, "a partial run never closes even with accepted criteria");
     assert.match(body, /owner scope decision/, "the partial body is rendered");
-    assert.match(body, /> - `m3` — Third milestone: deprioritized/, "the deferred milestone is listed");
+    assert.match(body, /> - \[ \] `m3` — Third milestone: deprioritized\. Not delivered or verified by this run; must be completed or verified before closing the source issue\./, "the deferred milestone is listed with its own explanation");
     assert.match(body, /Accepted unmet criteria — owner decision/, "the accept warning block is present");
     assert.match(body, /> - `m2\.c1` — Second milestone: acceptable as-is/);
   });

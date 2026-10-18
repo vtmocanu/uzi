@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { attemptGeneration, formatAttemptId } from "../src/attempt-path.js";
 import {
   GitCache,
@@ -71,7 +72,7 @@ function configBytes(): Buffer {
   return fs.readFileSync(path.join(bare, "config"));
 }
 function seedOpts(attemptId: string, over: Partial<AttemptSeedOptions> = {}): AttemptSeedOptions {
-  return { attemptId, isLive: notLive, beforeSeed: async () => {}, quiescent: quiet, ...over };
+  return { attemptId, isLive: notLive, beforeSeed: async () => {}, ...over };
 }
 
 interface Attempt {
@@ -197,17 +198,25 @@ describe("retainStoppedAttempt", () => {
     assert.equal(JSON.parse(journalRaw(next.branch)).clonePath, next.path, "the successor's own journal");
   });
 
-  it("a sweep, compactAttemptLedger and the abandoned cap keep a reclaimed stopped attempt", async () => {
+  it("disabled automatic sweep and compactAttemptLedger keep reclaimed and abandoned attempts past the diagnostic cap", async () => {
+    const rec = recordingLogger();
+    git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions());
     const a = await seedAttempt("run-a", 1);
     fs.writeFileSync(path.join(a.path, "dirty.txt"), "unpreserved\n");
     assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
-    // Five older abandoned attempts push the key past the cap of three; the oldest are swept.
-    const swept = [10, 11, 12, 13, 14].map((i) => plantAttempt(a.branch, a.key, attemptIdAt(i), `old-${i}`, "abandoned"));
+    // Five abandoned attempts exceed the diagnostic threshold of three without authorizing deletion.
+    const retained = [10, 11, 12, 13, 14].map((i) => plantAttempt(a.branch, a.key, attemptIdAt(i), `old-${i}`, "abandoned"));
     // Duplicate ledger values force a real compaction on the next seed.
     gitIn(bare, ["config", "--local", "--add", `uzi-attempts.${a.branch}.entry`,
       JSON.stringify({ attemptId: a.attemptId, runId: a.runId, clonePath: a.path, state: "reclaimed" })]);
     await seedAttempt("run-b", 20, { gen: 2 });
-    assert.equal(fs.existsSync(swept[0]!.dir), false, "the cap pass really ran and swept the oldest abandoned attempt");
+    for (const [i, artifact] of retained.entries()) {
+      assert.equal(fs.readFileSync(path.join(artifact.dir, "WORK.txt"), "utf8"), attemptIdAt(10 + i));
+      assert.equal(fs.readFileSync(path.join(artifact.skills, "plugin.json"), "utf8"), "{}");
+      assert.equal(ledgerState(a.branch, attemptIdAt(10 + i)), "abandoned");
+    }
+    assert.ok(rec.lines.some((line) => (line as { msg?: string }).msg === "runner clone retention: automatic reclaim disabled"),
+      "over-threshold inventory is diagnostic only");
     assert.equal(fs.readFileSync(path.join(a.path, "dirty.txt"), "utf8"), "unpreserved\n");
     assert.equal(ledgerState(a.branch, a.attemptId), "reclaimed");
     assert.equal(cfgAll(`uzi-attempts.${a.branch}.entry`).filter((v) => v.includes(a.attemptId)).length, 1, "compaction ran and kept it");
@@ -1186,6 +1195,180 @@ async function buildEpisode(opts: { descriptor?: boolean } = {}) {
   }
   return { branch, key, runId: EP_RUN, tip, sourcePath: source.path, successorPath: successor.path, successorAttempt: aid(2) };
 }
+
+// Drive the real runner delete timers; only the child and group kill are inert stand-ins.
+// The first child is held until the test emits close; each later child removes only its fixture.
+function controlledOperatorRm(killed: boolean) {
+  const rec = recordingLogger();
+  const events: string[] = [];
+  let onSpawn!: () => void;
+  const spawned = new Promise<void>(resolve => { onSpawn = resolve; });
+  let first: ChildProcess | undefined;
+  const children: ChildProcess[] = [];
+  git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+    retentionDelete: {
+      split: true, timeoutMs: 20, closeWaitMs: 50,
+      spawn: (_command, args) => {
+        const target = args.at(-1)!;
+        events.push(`spawn ${target}`);
+        const child = new EventEmitter() as unknown as ChildProcess;
+        Object.assign(child, { pid: 920001 + children.length, stderr: null });
+        children.push(child);
+        if (!first) {
+          first = child;
+          onSpawn();
+        } else {
+          queueMicrotask(() => {
+            fs.rmSync(target, { recursive: true, force: true });
+            child.emit("close", 0, null);
+          });
+        }
+        return child;
+      },
+      kill: (pid) => {
+        assert.equal(pid, first!.pid);
+        events.push("kill");
+        return killed;
+      },
+    },
+  }));
+  return {
+    ...rec, events, spawned,
+    close: () => {
+      events.push("close");
+      first!.emit("close", null, "SIGKILL");
+    },
+    // Also release held fake listeners on assertion failure; no real process was started.
+    cleanup: () => { for (const child of children) child.emit("close", null, "SIGKILL"); },
+  };
+}
+
+describe("operator discard runner delete timeout and unsettled coverage", () => {
+  for (const killed of [false, true]) {
+    for (const kind of ["attempt", "canonical"] as const) {
+      it(`${kind}: group kill ${killed ? "succeeds" : "fails"} without close; retries refuse overlap until close`, async (t) => {
+        const rm = controlledOperatorRm(killed);
+        t.after(rm.cleanup);
+        const c = kind === "canonical" ? await markedCanonical("run-timeout", 3090, 1) : undefined;
+        const a = kind === "attempt"
+          ? plantAttempt("agent/issue-3090", "issue-3090", attemptIdAt(9), "run-timeout", "abandoned")
+          : undefined;
+        const clone = c?.path ?? a!.dir;
+        const skills = a?.skills ?? path.join(path.dirname(clone), `.uzi-skills-${path.basename(clone)}`);
+        fs.mkdirSync(skills, { recursive: true });
+        fs.writeFileSync(path.join(skills, "plugin.json"), "{}");
+        const original = c ? path.join(clone, "dirty.txt") : path.join(clone, "WORK.txt");
+        const bytes = fs.readFileSync(original);
+        const sel: RetainedSourceSelector = { runId: "run-timeout", generation: 1, attempt: a ? attemptIdAt(9) : "canonical" };
+        const ev = await inspectOne(sel);
+        assert.equal(ev.disposition?.kind, "local_discard");
+        const metadata = configBytes();
+        t.mock.timers.enable({ apis: ["setTimeout"] });
+        const pending = git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+        await rm.spawned;
+        t.mock.timers.tick(20);
+        assert.deepEqual(rm.events, [`spawn ${skills}`, "kill"]);
+        t.mock.timers.tick(50);
+        const result = await pending;
+        assert.equal(result.kind, "incomplete");
+        assert.deepEqual(result.sources, [{ clonePath: clone, outcome: "unknown" }]);
+        assert.equal(result.metadata, "kept");
+        assert.deepEqual(configBytes(), metadata);
+        assert.deepEqual(fs.readFileSync(original), bytes);
+        assert.equal(fs.readFileSync(path.join(skills, "plugin.json"), "utf8"), "{}");
+        const warning = rm.lines.find(l => (l as { msg?: string }).msg === "retained source delete could not be settled; it and its records are kept") as { error?: string };
+        assert.match(warning.error!, killed ? /no exit within 50ms/ : /group kill of pid \d+ failed after 20ms; no close within 50ms/);
+        if (killed) assert.doesNotMatch(warning.error!, /group kill of pid .* failed/);
+        const fresh = await inspectOne(sel);
+        const retry = await git.discardStoppedSource(discardOpts(sel, fresh.descriptor));
+        assert.equal(retry.kind, "incomplete");
+        assert.deepEqual(rm.events, [`spawn ${skills}`, "kill"], "no overlapping rm");
+        assert.deepEqual(configBytes(), metadata);
+        assert.deepEqual(fs.readFileSync(original), bytes);
+        assert.ok(rm.lines.some(l => (l as { path?: string; reason?: string }).path === skills
+          && /may still be running/.test((l as { reason?: string }).reason ?? "")));
+        const entered = rm.lines.find(l => (l as { msg?: string }).msg?.includes("recorded as unsettled")) as { level: string; path: string; pending: number };
+        assert.deepEqual([entered.level, entered.path, entered.pending], ["warn", path.resolve(skills), 1]);
+        assert.equal(rm.lines.some(l => (l as { msg?: string }).msg?.includes("left the unsettled record")), false);
+        rm.close();
+        const left = rm.lines.find(l => (l as { msg?: string }).msg?.includes("left the unsettled record")) as { level: string; path: string; pending: number };
+        assert.deepEqual([left.level, left.path, left.pending], ["info", path.resolve(skills), 0]);
+        const afterClose = await inspectOne(sel);
+        const done = await git.discardStoppedSource(discardOpts(sel, afterClose.descriptor));
+        assert.equal(done.kind, "done");
+        assert.deepEqual(rm.events, [`spawn ${skills}`, "kill", "close", `spawn ${skills}`, `spawn ${clone}`]);
+        assert.equal(fs.existsSync(clone), false);
+        assert.equal(fs.existsSync(skills), false);
+        if (a) assert.equal(ledgerState("agent/issue-3090", attemptIdAt(9)), "retired");
+      });
+    }
+  }
+
+  for (const closeWithinWait of [false, true]) {
+    for (const killed of closeWithinWait ? [false, true] : [false]) {
+      it(`protected multipart: ${closeWithinWait ? "close after kill settles ordinary timeout" : "unsettled delete stops before other part"} (kill=${killed})`, async (t) => {
+        const rm = controlledOperatorRm(killed);
+        t.after(rm.cleanup);
+        const e = await buildEpisode();
+        const sel = { runId: EP_RUN, generation: 2, attempt: aid(2) } as const;
+        const ev = await inspectOne(sel);
+        assert.equal(ev.disposition?.kind, "local_protected_discard");
+        assert.equal(ev.sources.length, 2);
+        const clones = ev.sources.map(s => s.clonePath);
+        const skills = clones.map(p => path.join(path.dirname(p), `.uzi-skills-${path.basename(p)}`));
+        const files: string[] = [];
+        for (const p of [...clones, ...skills]) {
+          fs.mkdirSync(p, { recursive: true });
+          const file = path.join(p, "TIMEOUT-KEEP");
+          fs.writeFileSync(file, `original ${p}\n`);
+          files.push(file);
+        }
+        const original = files.map(p => fs.readFileSync(p));
+        const metadata = configBytes();
+        const journal = journalRaw(e.branch);
+        const ledger = ledgerState(e.branch, e.successorAttempt);
+        const pin = `refs/uzi-recovery-episode/${EP_RUN}/${e.tip}`;
+        t.mock.timers.enable({ apis: ["setTimeout"] });
+        let settled = false;
+        const pending = git.discardProtectedSource(discardOpts(sel, ev.descriptor)).then(result => { settled = true; return result; });
+        await rm.spawned;
+        t.mock.timers.tick(20);
+        await Promise.resolve();
+        assert.equal(settled, false, "timeout/kill alone cannot settle disposal");
+        assert.deepEqual(rm.events, [`spawn ${skills[0]}`, "kill"]);
+        for (const [i, file] of files.entries()) assert.deepEqual(fs.readFileSync(file), original[i]);
+        if (closeWithinWait) {
+          t.mock.timers.tick(49);
+          await Promise.resolve();
+          assert.equal(settled, false, "still waiting for close before the bounded deadline");
+          assert.deepEqual(rm.events, [`spawn ${skills[0]}`, "kill"]);
+          rm.close();
+        } else {
+          t.mock.timers.tick(50);
+        }
+        const result = await pending;
+        assert.equal(result.kind, "incomplete");
+        assert.equal(result.metadata, "kept");
+        assert.deepEqual(configBytes(), metadata);
+        assert.equal(journalRaw(e.branch), journal);
+        assert.equal(ledgerState(e.branch, e.successorAttempt), ledger);
+        assert.equal(gitIn(bare, ["rev-parse", pin]), e.tip);
+        assert.deepEqual(fs.readFileSync(files[0]!), original[0]);
+        assert.deepEqual(fs.readFileSync(files[2]!), original[2]);
+        if (closeWithinWait) {
+          assert.deepEqual(rm.events, [`spawn ${skills[0]}`, "kill", "close", `spawn ${skills[1]}`, `spawn ${clones[1]}`]);
+          assert.deepEqual(result.sources.map(s => s.outcome), ["retained", "removed"]);
+          assert.equal(rm.lines.some(l => (l as { msg?: string }).msg?.includes("recorded as unsettled")), false);
+          assert.equal(fs.existsSync(clones[1]!), false);
+        } else {
+          assert.deepEqual(rm.events, [`spawn ${skills[0]}`, "kill"]);
+          assert.deepEqual(result.sources.map(s => s.outcome), ["unknown", "retained"]);
+          for (const [i, file] of files.entries()) assert.deepEqual(fs.readFileSync(file), original[i]);
+        }
+      });
+    }
+  }
+});
 
 describe("protected-source disposition", () => {
   const epSel = (): RetainedSourceSelector => ({ runId: EP_RUN, generation: 2, attempt: aid(2) });

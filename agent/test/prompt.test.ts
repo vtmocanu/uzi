@@ -2611,3 +2611,19 @@ it("m2 non-closing guidance reaches the SDK implement builder", () => {
   assert.match(prompt, /non_closing/);
   assert.match(prompt, /never infers.*scope_notes/);
 });
+
+
+describe("M2 completion delivery guidance", () => {
+  for (const harness of ["claude", "codex"] as const) {
+    it(`${harness} customized lead retains completion obligations`, () => {
+      const prompt = buildLeadSystemPrompt("Custom lead body", { harness }).append;
+      for (const phrase of [
+        "closing directives must never go in commit messages", "worker controls issue closing via the PR body",
+        "separate, final informative milestone", "remaining verification", "responsible actor", "actionable steps",
+        "mandatory gates, security and review remain worker obligations", "Mixed or ambiguous milestones block completion",
+        "Environment limits, permissions and automatic approval do not waive", "formal owner partial decision",
+        "exact kept and deferred milestone IDs", "Never describe unperformed checks as accepted or done",
+      ]) assert.ok(prompt.includes(phrase), phrase);
+    });
+  }
+});

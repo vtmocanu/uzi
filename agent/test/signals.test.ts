@@ -1063,12 +1063,13 @@ describe("issue3089 owner request signal admission", () => {
 });
 
 describe("m1 non-closing validation", () => {
-  for (const reason of [" x ", " 😀 ", "  " + "😀".repeat(500) + "  "]) {
-    it("trims valid Unicode reason " + Array.from(reason.trim()).length, () => {
-      assert.deepEqual((scanSignals(toolUse("mcp__uzi__signal_done", { non_closing: { reason } })) as unknown as { nonClosing: unknown }).nonClosing, { reason: reason.trim() });
+  for (const [reason, expected] of [[" x ", "x"], [" 😀 ", "😀"], ["  " + "😀".repeat(500) + "  ", "😀".repeat(500)],
+    ["\u0000 \u0000😀\u0000 ", "😀"], ["\u0000" + "😀".repeat(500), "😀".repeat(500)]] as const) {
+    it("trims valid Unicode reason " + Array.from(reason).length, () => {
+      assert.deepEqual((scanSignals(toolUse("mcp__uzi__signal_done", { non_closing: { reason } })) as unknown as { nonClosing: unknown }).nonClosing, { reason: expected });
     });
   }
-  for (const value of [null, [], "bad", {}, { reason: 1 }, { reason: " " }, { reason: "😀".repeat(501) }]) {
+  for (const value of [null, [], "bad", {}, { reason: 1 }, { reason: " " }, { reason: "\u0000 \u0000" }, { reason: "😀".repeat(501) }]) {
     it("rejects malformed raw done " + JSON.stringify(value).slice(0, 40), () => {
       const scanned = scanSignals(toolUse("mcp__uzi__signal_done", {
         non_closing: value, summary: "LEAK", prd_done_path: "LEAK", milestones_completed: ["m1"],

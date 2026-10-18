@@ -19,7 +19,7 @@ import type { ClaimResponse, UserInput } from "../src/protocol.js";
  *  free. The git layer requires them on every entry point (there is no unproven plain-`fs.rm`
  *  fallback); this one answers the process proof "quiescent" without scanning, so the free still
  *  runs its validation, the delete and the quarantine. */
-export const noProofReseed: CanonicalReseedOptions = { beforeFree: async () => {}, isLive: () => false, quiescent: async () => true };
+export const noProofReseed: CanonicalReseedOptions = { beforeFree: async () => {}, isLive: () => false };
 
 /** GitCache options for suites that create runner clones. Off Linux the real scratch
  *  provisioner fails closed, so this adds a plain-fs stand-in for the dev loop; on Linux

@@ -980,6 +980,8 @@ export interface ClaimConfig {
    *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy,
    *  seeded or switch-off run) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
+  /** Persisted declaration only; never changes the frozen completion scope. */
+  non_closing?: { reason: string };
   /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
    *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so
    *  the server can reject a revision drift. WORKER-ONLY claim config (NOT the web RunDTO).
@@ -1952,6 +1954,7 @@ export interface CreateProposalRequest {
  *  records a bounded attempt — all in one call. Everything is SERVER-authoritative; the worker
  *  reworks against the returned unmet set, never its own belief. */
 export interface CompletionAttemptRequest {
+  non_closing?: { reason: string };
   milestones_completed: string[];
   head: string | null;
   worktree_fingerprint: string | null;
@@ -2835,6 +2838,14 @@ export interface StateAck {
     claim_generation: number;
     memory_episode: number;
   }>;
+  /** Request-local guard projection; completion permit and frozen contract authority remain unchanged. */
+  completionProjection?: { revision: number; deferredIds: string[] };
+  completionAttempts?: number;
+  runId?: unknown;
+  workerId?: unknown;
+  workerIdentityMatches?: boolean;
+  /** The actual request generation, after feature and strict-decode fallback selection. */
+  sentClaimGeneration?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

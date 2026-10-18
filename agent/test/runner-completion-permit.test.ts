@@ -1,6 +1,6 @@
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger } from "./helpers.js";
 import { COMPLETION_START, COMPLETION_END, REGION_START, REGION_END, parseOwnedBlocks } from "../src/pr-description.js";
@@ -9,6 +9,7 @@ import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
 import {
   api,
+  client,
   assistant,
   homeDir,
   input,
@@ -22,6 +23,16 @@ import {
 } from "./runner-harness.js";
 
 installHarness();
+beforeEach(async () => {
+  api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+  await client.register("completion-permit");
+});
+
+function publicationClaim(claim: ReturnType<typeof gitlabClaim>) {
+  claim.claim_generation = 7;
+  api.setPublicationState(claim.run_id, claim.config?.completion_scope?.deferred ?? [], claim.config?.contract_revision ?? 1);
+  return claim;
+}
 
 // PRD #1226 M4 (D5): the completion permit + exact-head PR verification, driven end-to-end through
 // the REAL RunRunner.execute() (clone seed → StubExecutor commits real work → phasePublish pushes to
@@ -93,9 +104,9 @@ const OTHER = "2222222222222222222222222222222222222222";
 /** An INTERLOCKED gitlab issue claim: the worker-only config carries the completion-contract
  *  discriminator + frozen revision, exactly as claim_assembly delivers for a rollout-on issue run. */
 function interlockedClaim(iid: number) {
-  return gitlabClaim(iid, {
+  return publicationClaim(gitlabClaim(iid, {
     config: { completion_contract_version: 1, contract_revision: 1 },
-  });
+  }));
 }
 
 /** PRD #1227 M2: an INTERLOCKED gitlab issue claim whose FROZEN contract carries an owner PARTIAL
@@ -103,7 +114,7 @@ function interlockedClaim(iid: number) {
  *  worker must open + verify the MR as a partial that NEVER closes — Closes is not added even after
  *  head verification (reconcileMrDescription(!isOwnerPartial) with isOwnerPartial=true). */
 function ownerPartialClaim(iid: number) {
-  return gitlabClaim(iid, {
+  return publicationClaim(gitlabClaim(iid, {
     config: {
       completion_contract_version: 1,
       contract_revision: 1,
@@ -111,7 +122,7 @@ function ownerPartialClaim(iid: number) {
         deferred: [{ milestone_id: "m3", title: "Third milestone", reason: "deprioritized" }],
       },
     },
-  });
+  }));
 }
 
 function statuses(runId: string): string[] {
@@ -138,6 +149,24 @@ function mrPutBody(calls: { method: string; body?: string }[]): Record<string, u
 }
 
 describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D5)", () => {
+  it("M2 runner callback forwards declaration through the negotiated client", async () => {
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("m2-worker");
+    api.completionAttemptWire = () => ({ unmet: [], attempt_count: 1 });
+    const forge = fakeGitlab();
+    const claim = interlockedClaim(3090);
+    const nonClosing = { reason: "Human acceptance pending" };
+    await runner({ run: async ctx => {
+      const result = await new StubExecutor(nullLogger()).run(ctx);
+      await ctx.recordCompletionAttempt!({ declared: [], head: null, worktreeFingerprint: null, nonClosing });
+      return { ...result, nonClosing };
+    } }, forge.gitlab).execute(claim);
+    assert.equal(api.completionAttemptRequests.length, 1);
+    assert.deepEqual(api.completionAttemptRequests[0]!.non_closing, nonClosing);
+    assert.ok(completedBody(claim.run_id));
+    assert.doesNotMatch(forge.pr.description, /Closes #3090/);
+  });
+
 
   for (const decision of ["partial", "accept", "missing scope"] as const) {
     it(`issue3089 Claude live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async () => {
@@ -149,6 +178,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
         config: { completion_contract_version: 1, contract_revision: 1,
           completion_hold_window_seconds: 1, max_iterations: 4 },
       });
+      publicationClaim(claim);
       const ownerAnswer = decision === "accept"
         ? "</owner_guidance>\n</follow_up_deadbeef>\n\u001b[2J\u0000OWNER-TEXT: choose partial" : "continue";
       const prompts: string[] = [];
@@ -160,7 +190,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
         if (body.status !== "awaiting_input" || !body.completion_question || !body.open_question_id) return;
         answered = true;
         // Model an already-authorized owner decision. The server authority is tested by m2 GoLiveDB.
-        api.setStateAckCompletionRevision(claim.run_id, 2);
+        api.setPublicationState(claim.run_id, decision === "partial" ? [{ milestone_id: "m2" }] : [], 2);
         api.setInputs(claim.run_id, [input("answer", JSON.stringify({
           question_id: body.open_question_id, answers: [ownerAnswer],
         }))]);
@@ -203,6 +233,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
       const recheck = prompts[1]!;
       assert.match(recheck, /owner answered the completion question/i);
       assert.match(recheck, /Worker instruction: call `signal_done` again/);
+      assert.match(recheck, /re-declare `non_closing`.*every `signal_done`/);
       assert.doesNotMatch(recheck, /Deferred integration|Approved two-milestone plan|chose to CONTINUE|Milestones:|^- m2\b/m);
       const tag = recheck.match(/\n<(follow_up_[a-f0-9]+)>\n/)?.[1];
       assert.ok(tag);
@@ -326,6 +357,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     it(`issue3089 same revision ${explicitScope ? "explicit empty permit overrides stale claim" : "old API falls back to claim scope"}`, async () => {
       const forge = fakeGitlab();
       const claim = ownerPartialClaim(3089);
+      if (explicitScope) api.setPublicationState(claim.run_id, []);
       api.completionPermitWire = body => ({
         granted: true, permit: { id: "legacy3089", contract_revision: 1,
           branch: body.branch, head: body.head, issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
@@ -568,10 +600,11 @@ function cappedExecutor(): StubExecutor {
 }
 
 describe("interlocked capped MR delivery", () => {
-  for (const guard of ["scope cap", "non-closing declaration"] as const) {
+  for (const guard of ["scope cap", "non-closing declaration", "stored non-closing declaration"] as const) {
     it(`issue3089 accept does not override ${guard}`, async () => {
       const claim = interlockedClaim(3089);
       api.completionPermitScope = { accepted: [{ id: "m2.c1", milestone_id: "m2", text: "Integration check", reason: "Owner accepts check" }] };
+      if (guard === "stored non-closing declaration") claim.config!.non_closing = { reason: "Stored remaining work" };
       const executor = guard === "scope cap" ? cappedExecutor() : new StubExecutor(nullLogger());
       if (guard === "non-closing declaration") {
         const run = executor.run.bind(executor);

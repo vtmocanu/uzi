@@ -1080,6 +1080,7 @@ type Run struct {
 	MemoryEpisode               int64              `json:"memory_episode"`
 	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
 	MemoryPolicy                []byte             `json:"memory_policy"`
+	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 }
 

@@ -538,6 +538,11 @@ describe("renderCodexRun — prompts", () => {
 
   it("renders a subagent prompt with shared appends, Codex guidance, then safety", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
+    const prompt = run.perRolePrompts.get("a")!;
+    assert.match(prompt, /closing directives must never go in commit messages/);
+    assert.match(prompt, /separate, final informative milestone/);
+    assert.match(prompt, /formal owner partial decision/);
+    assert.match(prompt, /Mixed or ambiguous milestones block completion/);
     assert.equal(
       run.perRolePrompts.get("a"),
       `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${CODEX_REPO_INSTRUCTIONS_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,

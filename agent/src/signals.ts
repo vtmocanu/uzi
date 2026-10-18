@@ -63,7 +63,7 @@ function validateNonClosing(input: unknown): {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { diagnostic };
   const reason = (value as Record<string, unknown>)["reason"];
   if (typeof reason !== "string") return { diagnostic };
-  const trimmed = reason.trim();
+  const trimmed = reason.replaceAll("\u0000", "").trim();
   // Stop at the first excess code point; never truncate an accepted declaration.
   let count = 0;
   for (const _point of trimmed) {
