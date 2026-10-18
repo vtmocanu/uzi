@@ -1350,7 +1350,7 @@ function recordLiveRequestIds(evidence: LiveLaunchEvidence, params: unknown, res
 }
 
 function recordLiveNoteIds(evidence: LiveLaunchEvidence, note: CodexNotification): void {
-  if (note.kind !== "activity") {
+  if (note.kind !== "activity" && note.kind !== "rate_limits_updated") {
     addLiveId(evidence.threadIds, note.threadId);
     if (note.kind !== "thread_started") addLiveId(evidence.turnIds, note.turnId);
   }
