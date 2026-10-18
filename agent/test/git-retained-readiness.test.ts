@@ -75,6 +75,7 @@ function fixture() {
     cleanup() { fs.rmSync(dir, { recursive: true, force: true }); } };
 }
 
+describe("retained readiness helper VM tests", { skip: process.platform !== "linux" }, () => {
 test("helper adds only group read/search, is idempotent, and preserves source and nonobjects", () => {
   const f = fixture();
   try {
@@ -319,6 +320,8 @@ test("entry/depth/path/deadline bounds reach their own guards", () => {
     assert.equal(f.run({ now: () => ++calls < 20 ? 0 : 30000 }), "refused deadline\n");
     assert.ok(calls >= 20, "deadline fault reached after root opens");
   } finally { f.cleanup(); }
+});
+
 });
 
 describe("runner retained readiness ordering and custody", async () => {
