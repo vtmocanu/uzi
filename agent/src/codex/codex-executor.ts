@@ -108,7 +108,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3247,7 +3247,7 @@ export class CodexExecutor implements Executor {
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
         let systemFollowUp = clarificationPrompt ?? completionFollowUp;
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
-          systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}`;
+          systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}\n\n${NON_CLOSING_REMINDER}`;
         }
         if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
@@ -3457,6 +3457,7 @@ export class CodexExecutor implements Executor {
           if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const { unmet } = await ctx.recordCompletionAttempt!({
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
+            ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
           });
           completionAttempted = true;
           if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);

@@ -3065,6 +3065,7 @@ export class WorkerClient {
     runId: string,
     args: {
       milestonesCompleted: string[];
+      nonClosing?: { reason: string };
       head: string | null;
       worktreeFingerprint: string | null;
       claimGeneration?: number;
@@ -3084,11 +3085,15 @@ export class WorkerClient {
     // non-capability worker clears them (sticky, as today). A genuine business 400 (e.g. "not
     // interlocked") is NOT a strict-decode 400 and propagates unchanged — no strip, no retry.
     const included = this.includeClaimGeneration(args.claimGeneration);
+    // Snapshot negotiation before the generation fallback can clear features. Both sends
+    // retain the intent; a server rejecting it must fail rather than silently close.
+    const nonClosing = this.serverFeatures.has("completion_non_closing_v1") ? args.nonClosing : undefined;
     const res = (await this.withGenerationFallback(included, (includeField) => {
       const body: CompletionAttemptRequest = {
         milestones_completed: args.milestonesCompleted,
         head: args.head,
         worktree_fingerprint: args.worktreeFingerprint,
+        ...(nonClosing !== undefined ? { non_closing: nonClosing } : {}),
       };
       if (includeField) body.claim_generation = args.claimGeneration;
       return this.postJSON(path, body);

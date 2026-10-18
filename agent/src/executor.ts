@@ -696,6 +696,7 @@ export interface RunContext {
    *  through to the legacy finalize). */
   recordCompletionAttempt?(args: {
     declared: string[];
+    nonClosing?: { reason: string };
     head: string | null;
     worktreeFingerprint: string | null;
   }): Promise<{ unmet: string[]; attemptCount: number }>;

@@ -6895,7 +6895,7 @@ export class RunRunner {
       );
     }
 
-    // Issue #2779: a declared non-closing issue run (result.nonClosing, the same declaration phasePublish
+    // Issue #2779: a declared non-closing issue run (current flight or stored claim, as phasePublish
     // later turns into effectiveNonClosing) must not publish a commit message that closes its issue:
     // the commit messages reach the default branch in the squash commit and close the issue there.
     // Scan the messages a push would publish with the SAME matcher the body uses and refuse BEFORE any
@@ -6903,7 +6903,7 @@ export class RunRunner {
     // stays preserved by the recovery capture the failed terminal report triggers. Any failure to read,
     // parse or resolve the commit range refuses (null), never passes.
     const closingGateIid =
-      resolveRunKind(claim.kind) === "issue" && result.nonClosing && typeof claim.issue_iid === "number"
+      resolveRunKind(claim.kind) === "issue" && (result.nonClosing ?? claim.config?.non_closing) && typeof claim.issue_iid === "number"
         ? claim.issue_iid
         : undefined;
     const closingBarePath = barePath;
@@ -8141,7 +8141,7 @@ export class RunRunner {
       }
     }
     const runKind = resolveRunKind(claim.kind);
-    const declaration = runKind === "issue" ? result.nonClosing : undefined;
+    const declaration = runKind === "issue" ? (result.nonClosing ?? claim.config?.non_closing) : undefined;
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
@@ -11829,9 +11829,10 @@ export class RunRunner {
       // declaration + head + worktree fingerprint to the worker completion/attempt endpoint, which
       // union-merges the declaration into milestones_completed, recomputes unmet server-side, and
       // records a bounded attempt — returning the server-authoritative unmet set + attempt count.
-      recordCompletionAttempt: ({ declared, head, worktreeFingerprint }) =>
+      recordCompletionAttempt: ({ declared, head, worktreeFingerprint, nonClosing }) =>
         this.client.recordCompletionAttempt(runId, {
           milestonesCompleted: declared,
+          nonClosing,
           head,
           worktreeFingerprint,
           // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure

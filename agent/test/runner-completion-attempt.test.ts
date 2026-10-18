@@ -406,11 +406,12 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
       assert.deepEqual(probe.askQuestionCalls, [], "rework before stall remains autonomous");
       const rpc = await connectSignalRpc(params.options.mcpServers!.uzi);
       try {
-        const admitted = await rpc.request("tools/call", { name: "signal_done", arguments: input });
+        const turnInput = prompts.length === 1 ? input : { milestones_completed: ["m1"] };
+        const admitted = await rpc.request("tools/call", { name: "signal_done", arguments: turnInput });
         assert.equal(admitted.error, undefined);
         assert.notEqual((admitted.result as { isError?: boolean }).isError, true,
           "non_closing is valid metadata, even though it cannot revise scope");
-        yield signalDone(input);
+        yield signalDone(turnInput);
         yield resultSuccess();
       } finally {
         await rpc.close();
@@ -423,7 +424,7 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
       assert.match(prompt, /Finish the remaining milestone/);
     }
     assert.deepEqual(probe.attemptCalls, Array.from({ length: 3 }, () => ({
-      declared: ["m1"], head: "TIP", worktreeFingerprint: "TIP\n M src/x.ts",
+      declared: ["m1"], head: "TIP", worktreeFingerprint: "TIP\n M src/x.ts", nonClosing: input.non_closing,
     })), "attempt payload contains only the declaration and real tree identity, never scope selection");
     assert.deepEqual(probe.order, [
       "checkpoint", "attempt", "checkpoint", "attempt", "checkpoint", "attempt", "askQuestion", "hold",

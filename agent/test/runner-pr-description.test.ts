@@ -668,6 +668,36 @@ describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD
 
 
 describe("m2 non-closing delivery", () => {
+  for (const current of [undefined, "Current flight reason"]) {
+    it(`M2 stored claim intent survives resume without redeclaration; current=${current}`, async () => {
+      const { gitlab, pr } = fakeGitlab({ existing: adoptedBody(2172, "Fixes #2172"), existingTitle: "Fixes #2172" });
+      const claim = interlockedClaim(2172);
+      const secret = "inert-stored-secret-2172";
+      claim.secrets.forge_pat = secret;
+      claim.issue_title = "Fixes #2172";
+      claim.config!.non_closing = { reason: `Remaining human acceptance ${secret}` };
+      api.setCompletionPermitResponse(true);
+      await runner(declaring(current), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("completed"));
+      assert.match(pr.description, current ? /Current flight reason/ : /Remaining human acceptance/);
+      assert.ok(!pr.description.includes(secret), "stored reason is redacted");
+      if (current) assert.doesNotMatch(pr.description, /Remaining human acceptance/);
+      assert.equal(closingDirectiveFor(pr.title + "\n" + pr.description, 2172, "org/repo"), false);
+      assert.equal(api.completionPermitRequests.length, 1, "stored metadata never skips the permit");
+    });
+  }
+
+  it("M2 stored intent never waives a mandatory completion gate", async () => {
+    const { gitlab, all } = fakeGitlab();
+    const claim = interlockedClaim(2172);
+    claim.config!.non_closing = { reason: "Human acceptance pending" };
+    api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
+    await runner(declaring(), gitlab).execute(claim);
+    assert.equal(all.length, 0, "denied permit blocks all publication");
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 1);
+  });
+
   function declaring(reason?: string, scopeCapped?: { completedCount: number; total?: number }) {
     return new class extends StubExecutor {
       override async run(ctx: RunContext): Promise<ExecutorResult> {
