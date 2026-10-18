@@ -129,6 +129,75 @@ func TestInterruptedCallsPairing(t *testing.T) {
 		}
 	})
 }
+func TestInterruptedCallsRoleAttribution(t *testing.T) {
+	use := interruptedRow(10, "call")
+	use.NullLane = false
+	use.AgentInstance = "dispatch"
+	use.Agent = "reviewer"
+	use.ExplicitLead = false
+	result := use
+	result.Kind.String = "tool_result"
+	result.Seq.Int32 = 11
+
+	t.Run("conflicting attribution is unavailable in either row order", func(t *testing.T) {
+		result.Agent = "lead"
+		result.ExplicitLead = true
+		for _, rows := range [][]store.InterruptedCallsWindowRow{{use, result}, {result, use}} {
+			out := interruptedRead(t, rows...)
+			if len(out.Entries) != 0 || !out.Unavailable {
+				t.Fatalf("%+v", out)
+			}
+		}
+	})
+	t.Run("role must not construct identity or hide duplicate uses", func(t *testing.T) {
+		other := use
+		other.Agent = "lead"
+		other.ExplicitLead = true
+		other.Command = ""
+		out := interruptedRead(t, use, other)
+		if len(out.Entries) != 0 || !out.Unavailable {
+			t.Fatalf("%+v", out)
+		}
+	})
+	t.Run("consistent nonnull lead is distinct from null lead", func(t *testing.T) {
+		lead := interruptedRow(12, "call")
+		nonnull := lead
+		nonnull.NullLane = false
+		nonnull.AgentInstance = "dispatch"
+		out := interruptedRead(t, lead, nonnull)
+		if len(out.Entries) != 2 || out.Unavailable {
+			t.Fatalf("%+v", out)
+		}
+		settled := nonnull
+		settled.Kind.String = "tool_result"
+		settled.Seq.Int32 = 13
+		out = interruptedRead(t, lead, nonnull, settled)
+		if len(out.Entries) != 1 || out.Entries[0].AgentInstance != nil || out.Unavailable {
+			t.Fatalf("%+v", out)
+		}
+	})
+	t.Run("role never repairs an empty nonnull lane", func(t *testing.T) {
+		lead := interruptedRow(12, "call")
+		malformed := lead
+		malformed.NullLane = false
+		malformed.Kind.String = "tool_result"
+		out := interruptedRead(t, lead, malformed)
+		if len(out.Entries) != 1 || out.Entries[0].AgentInstance != nil || !out.Unavailable {
+			t.Fatalf("%+v", out)
+		}
+	})
+}
+
+func TestInterruptedCallsProjectedLabelOmission(t *testing.T) {
+	r := interruptedRow(1, "call")
+	// SQL omits the complete oversized label and projects only this boolean.
+	r.AgentLabelOmitted = true
+	out := interruptedRead(t, r)
+	if len(out.Entries) != 1 || out.Entries[0].AgentLabel != nil || !out.Entries[0].DisplayOmitted || out.Entries[0].Command != "echo ok" || out.Unavailable {
+		t.Fatalf("%+v", out)
+	}
+}
+
 func TestInterruptedCallsPairsBeforeDisplayLimit(t *testing.T) {
 	var rows []store.InterruptedCallsWindowRow
 	for i := int32(1); i <= 4; i++ {

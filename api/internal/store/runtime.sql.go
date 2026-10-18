@@ -7957,6 +7957,7 @@ SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
                   AND octet_length(s.agent_instance) <= 1024
             THEN s.agent_instance END, '')::text AS agent_instance,
        COALESCE(CASE WHEN char_length(s.agent_label) <= 128 THEN s.agent_label END, '')::text AS agent_label,
+       COALESCE(char_length(s.agent_label) > 128, false)::boolean AS agent_label_omitted,
        COALESCE(CASE WHEN jsonb_typeof(s.payload->'name') = 'string'
                   AND char_length(s.payload->>'name') <= 128
             THEN s.payload->>'name' END, '')::text AS tool_name,
@@ -7981,19 +7982,20 @@ type InterruptedCallsWindowParams struct {
 }
 
 type InterruptedCallsWindowRow struct {
-	InspectedCount   int32       `json:"inspected_count"`
-	SourceGeneration int64       `json:"source_generation"`
-	Seq              pgtype.Int4 `json:"seq"`
-	Kind             pgtype.Text `json:"kind"`
-	Agent            string      `json:"agent"`
-	ExplicitLead     bool        `json:"explicit_lead"`
-	NullLane         bool        `json:"null_lane"`
-	AgentInstance    string      `json:"agent_instance"`
-	AgentLabel       string      `json:"agent_label"`
-	ToolName         string      `json:"tool_name"`
-	CallID           string      `json:"call_id"`
-	Command          string      `json:"command"`
-	CommandOmitted   bool        `json:"command_omitted"`
+	InspectedCount    int32       `json:"inspected_count"`
+	SourceGeneration  int64       `json:"source_generation"`
+	Seq               pgtype.Int4 `json:"seq"`
+	Kind              pgtype.Text `json:"kind"`
+	Agent             string      `json:"agent"`
+	ExplicitLead      bool        `json:"explicit_lead"`
+	NullLane          bool        `json:"null_lane"`
+	AgentInstance     string      `json:"agent_instance"`
+	AgentLabel        string      `json:"agent_label"`
+	AgentLabelOmitted bool        `json:"agent_label_omitted"`
+	ToolName          string      `json:"tool_name"`
+	CallID            string      `json:"call_id"`
+	Command           string      `json:"command"`
+	CommandOmitted    bool        `json:"command_omitted"`
 }
 
 // Identity and claim authorization share the history statement's MVCC snapshot.
@@ -8023,6 +8025,7 @@ func (q *Queries) InterruptedCallsWindow(ctx context.Context, arg InterruptedCal
 			&i.NullLane,
 			&i.AgentInstance,
 			&i.AgentLabel,
+			&i.AgentLabelOmitted,
 			&i.ToolName,
 			&i.CallID,
 			&i.Command,

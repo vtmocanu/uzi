@@ -79,6 +79,8 @@ func interruptedCallsJSON(run, worker uuid.UUID, nonce string, generation int64,
 	}
 	type group struct {
 		uses, results []store.InterruptedCallsWindowRow
+		agent         string
+		ambiguous     bool
 	}
 	groups := map[key]*group{}
 	// At most 256 independent rows; a malformed row does not block siblings.
@@ -93,9 +95,11 @@ func interruptedCallsJSON(run, worker uuid.UUID, nonce string, generation int64,
 		k := key{r.CallID, r.AgentInstance, r.NullLane}
 		g := groups[k]
 		if g == nil {
-			g = &group{}
+			g = &group{agent: r.Agent}
 			groups[k] = g
 		}
+		// Attribution may reject a persisted key, but never changes its identity.
+		g.ambiguous = g.ambiguous || g.agent != r.Agent
 		if r.Kind.String == "tool_use" {
 			g.uses = append(g.uses, r)
 		} else {
@@ -103,7 +107,7 @@ func interruptedCallsJSON(run, worker uuid.UUID, nonce string, generation int64,
 		}
 	}
 	for _, g := range groups {
-		if len(g.uses) != 1 || len(g.results) > 1 {
+		if g.ambiguous || len(g.uses) != 1 || len(g.results) > 1 {
 			out.Unavailable = true
 			continue
 		}
@@ -127,7 +131,7 @@ func interruptedCallsJSON(run, worker uuid.UUID, nonce string, generation int64,
 		}
 		agent, omitted := interruptedDisplay(r.Agent)
 		name, nameOmitted := interruptedDisplay(r.ToolName)
-		entry := apitypes.InterruptedCall{Seq: r.Seq.Int32, SourceGeneration: r.SourceGeneration, Agent: agent, ToolName: name, Command: command, DisplayOmitted: omitted || nameOmitted}
+		entry := apitypes.InterruptedCall{Seq: r.Seq.Int32, SourceGeneration: r.SourceGeneration, Agent: agent, ToolName: name, Command: command, DisplayOmitted: omitted || nameOmitted || r.AgentLabelOmitted}
 		if !r.NullLane {
 			// Pair on the full key above; sanitize a separate display value.
 			v, missing := interruptedDisplay(r.AgentInstance)

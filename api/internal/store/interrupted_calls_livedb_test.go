@@ -84,7 +84,9 @@ func TestInterruptedCallsPlanLiveDB(t *testing.T) {
 		exec("DELETE FROM run_messages WHERE run_id=$1", run)
 	}
 	exec(`INSERT INTO run_messages(run_id,seq,kind,agent,payload,claim_generation)
- SELECT $1,s,'text','lead','{}'::jsonb,2 FROM generate_series(1,4096) s`, run)
+ SELECT $1,s,'text','lead',jsonb_build_object('text', repeat(md5(s::text), 128)),2 FROM generate_series(1,32768) s`, run)
+	// Bulk-inserted fixtures need statistics before measuring default planner choices.
+	exec("ANALYZE run_messages")
 	rows, err = q.InterruptedCallsWindow(ctx, args)
 	if err != nil {
 		t.Fatal(err)
@@ -93,60 +95,77 @@ func TestInterruptedCallsPlanLiveDB(t *testing.T) {
 		t.Fatalf("window: %+v", rows)
 	}
 	exec("PREPARE interrupted_plan(uuid,uuid,uuid,text,bigint) AS " + interruptedCallsWindow)
-	for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
-		t.Run(mode, func(t *testing.T) {
-			exec("SET LOCAL plan_cache_mode = " + mode)
-			var raw []byte
-			sql := fmt.Sprintf("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE interrupted_plan('%s','%s','%s','nonce',2)", run, worker, user)
-			if err := tx.QueryRow(ctx, sql).Scan(&raw); err != nil {
-				t.Fatal(err)
+	for _, scenario := range []string{"displaced", "sparse"} {
+		if scenario == "sparse" {
+			exec(`UPDATE run_messages SET kind='tool_use', claim_generation=1,
+ payload='{"id":"sparse-call","name":"Bash","input":{"command":"echo sparse"}}'::jsonb
+ WHERE run_id=$1 AND seq=32760`, run)
+			exec("ANALYZE run_messages")
+			got, err := q.InterruptedCallsWindow(ctx, args)
+			if err != nil || len(got) != 1 || !got[0].Seq.Valid || got[0].Seq.Int32 != 32760 || got[0].SourceGeneration != 1 || got[0].InspectedCount != 256 {
+				t.Fatalf("sparse selection: %+v, %v", got, err)
 			}
-			var plans []struct{ Plan map[string]any }
-			if err := json.Unmarshal(raw, &plans); err != nil {
-				t.Fatal(err)
-			}
-			found := false
-			var walk func(map[string]any)
-			walk = func(node map[string]any) {
-				if node["Subplan Name"] == "CTE tail" {
-					found = true
-					if node["Node Type"] != "Limit" || node["Actual Rows"] != float64(256) {
-						t.Fatalf("tail is not bounded: %s", raw)
-					}
-					indexed := false
-					var inspect func(map[string]any)
-					inspect = func(n map[string]any) {
-						if n["Node Type"] == "Sort" {
-							t.Fatalf("tail sorts history: %s", raw)
+		}
+		for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+			t.Run(scenario+"/"+mode, func(t *testing.T) {
+				exec("SET LOCAL plan_cache_mode = " + mode)
+				var raw []byte
+				sql := fmt.Sprintf("EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE interrupted_plan('%s','%s','%s','nonce',2)", run, worker, user)
+				if err := tx.QueryRow(ctx, sql).Scan(&raw); err != nil {
+					t.Fatal(err)
+				}
+				var plans []struct {
+					Plan          map[string]any
+					ExecutionTime float64 `json:"Execution Time"`
+					PlanningTime  float64 `json:"Planning Time"`
+				}
+				if err := json.Unmarshal(raw, &plans); err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				var walk func(map[string]any)
+				walk = func(node map[string]any) {
+					if node["Subplan Name"] == "CTE tail" {
+						found = true
+						if node["Node Type"] != "Limit" || node["Actual Rows"] != float64(256) {
+							t.Fatalf("tail is not bounded: %s", raw)
 						}
-						if strings.Contains(fmt.Sprint(n["Node Type"]), "Index") && n["Scan Direction"] == "Backward" && strings.Contains(fmt.Sprint(n["Index Cond"]), "run_id") {
-							indexed = true
-						}
-						if filter, ok := n["Filter"].(string); ok && (strings.Contains(filter, "kind") || strings.Contains(filter, "claim_generation")) {
-							t.Fatalf("filtered before limit: %s", raw)
-						}
-						if children, ok := n["Plans"].([]any); ok {
-							for _, child := range children {
-								inspect(child.(map[string]any))
+						indexed := false
+						var inspect func(map[string]any)
+						inspect = func(n map[string]any) {
+							if n["Node Type"] == "Sort" {
+								t.Fatalf("tail sorts history: %s", raw)
+							}
+							if strings.Contains(fmt.Sprint(n["Node Type"]), "Index") && n["Scan Direction"] == "Backward" && strings.Contains(fmt.Sprint(n["Index Cond"]), "run_id") {
+								indexed = true
+							}
+							if filter, ok := n["Filter"].(string); ok && (strings.Contains(filter, "kind") || strings.Contains(filter, "claim_generation")) {
+								t.Fatalf("filtered before limit: %s", raw)
+							}
+							if children, ok := n["Plans"].([]any); ok {
+								for _, child := range children {
+									inspect(child.(map[string]any))
+								}
 							}
 						}
+						inspect(node)
+						if !indexed {
+							t.Fatalf("tail has no backwards run index scan: %s", raw)
+						}
 					}
-					inspect(node)
-					if !indexed {
-						t.Fatalf("tail has no backwards run index scan: %s", raw)
+					if children, ok := node["Plans"].([]any); ok {
+						for _, child := range children {
+							walk(child.(map[string]any))
+						}
 					}
 				}
-				if children, ok := node["Plans"].([]any); ok {
-					for _, child := range children {
-						walk(child.(map[string]any))
-					}
+				walk(plans[0].Plan)
+				if !found {
+					t.Fatalf("no materialized tail: %s", raw)
 				}
-			}
-			walk(plans[0].Plan)
-			if !found {
-				t.Fatalf("no materialized tail: %s", raw)
-			}
-		})
+				t.Logf("PostgreSQL prepared %s/%s: 32768 history rows, 4096-byte text sources, fresh ANALYZE, tail=256; planning=%.3fms execution=%.3fms; disposable local fixture, no concurrent load or production latency guarantee", scenario, mode, plans[0].PlanningTime, plans[0].ExecutionTime)
+			})
+		}
 	}
 	exec("DEALLOCATE interrupted_plan")
 }

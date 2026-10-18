@@ -6,11 +6,65 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// The query must cancel while waiting on an ordinary relation lock, not merely
+// carry a deadline that a fake reader observes.
+func TestInterruptedCallsLockDeadlineLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	wid := e.seedWorker(t, nil)
+	run := e.seedActiveRunOwnedBy(t, wid)
+	e.exec(t, "UPDATE workers SET snapshot_register_nonce='nonce' WHERE id=$1", wid)
+	e.exec(t, "UPDATE runs SET claim_generation=2 WHERE id=$1", run)
+	w, err := e.q.GetWorkerByID(e.ctx, wid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(e.q, nil, Params{})
+	lock, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback(e.ctx) }()
+	if _, err := lock.Exec(e.ctx, "LOCK TABLE run_messages IN ACCESS EXCLUSIVE MODE"); err != nil {
+		t.Fatal(err)
+	}
+	for _, parentBound := range []time.Duration{0, 80 * time.Millisecond} {
+		t.Run(parentBound.String(), func(t *testing.T) {
+			ctx := e.ctx
+			if parentBound > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, parentBound)
+				defer cancel()
+			}
+			started := time.Now()
+			raw, err := svc.InterruptedCalls(ctx, w, run, "nonce", 2)
+			elapsed := time.Since(started)
+			if !errors.Is(err, context.DeadlineExceeded) || len(raw) != 0 {
+				t.Fatalf("locked read returned %q, %v", raw, err)
+			}
+			bound := time.Second
+			if parentBound > 0 {
+				bound = parentBound
+			}
+			if elapsed > bound+time.Second {
+				t.Fatalf("deadline not enforced: %v, bound %v", elapsed, bound)
+			}
+			t.Logf("relation-lock wait cancelled after %v (context bound %v)", elapsed, bound)
+		})
+	}
+	if err := lock.Rollback(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.InterruptedCalls(e.ctx, w, run, "nonce", 2); err != nil {
+		t.Fatalf("read after lock release: %v", err)
+	}
+}
 
 func TestInterruptedCallsEligibilityLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
@@ -32,11 +86,11 @@ func TestInterruptedCallsEligibilityLiveDB(t *testing.T) {
 			case "issue", "self_improve":
 				issue = 700 + i
 			case "ci_fix":
-				pipeline, ref = 700+i, "candidate"
+				pipeline, ref = 700+i, "candidate/"+id.String()
 			case "task":
 				branch = "task/" + id.String()
 			case "mr_rework":
-				ref, mr, target = "candidate", 700+i, parent
+				ref, mr, target = "candidate/"+id.String(), 700+i, parent
 			case "chat":
 				repo = nil
 			case "judge":
@@ -173,6 +227,84 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		add(1, "tool_use", use("a", strings.Repeat("x", 2048)), "lead", nil, 3)
 		read(1, 3)
 	})
+	t.Run("oversized label omitted with metadata", func(t *testing.T) {
+		clear()
+		add(1, "tool_use", use("a", "echo accepted"), "lead", nil, 3)
+		e.exec(t, "UPDATE run_messages SET agent_label=$2 WHERE run_id=$1", run, strings.Repeat("界", 129))
+		out := read(1, 3)
+		entry := out.Entries[0]
+		if entry.AgentLabel != nil || !entry.DisplayOmitted || entry.Command != "echo accepted" || out.Unavailable {
+			t.Fatal(out)
+		}
+	})
+	t.Run("wire budget drops whole oldest entries", func(t *testing.T) {
+		clear()
+		command := strings.Repeat("<", 2048)
+		for seq := 1; seq <= 5; seq++ {
+			add(seq, "tool_use", use(string(rune('a'+seq)), command), "lead", nil, 3)
+		}
+		out := read(1, 3)
+		raw, err := json.Marshal(out)
+		if err != nil || len(raw)+1 > 16*1024 || !out.Truncated || out.Entries[0].Seq != 5 || out.Entries[0].Command != command {
+			t.Fatalf("wire budget: %s, %v", raw, err)
+		}
+	})
+	t.Run("pair entire window before top three", func(t *testing.T) {
+		clear()
+		for seq := 1; seq <= 5; seq++ {
+			add(seq, "tool_use", use(string(rune('a'+seq)), "echo candidate"), "lead", nil, 3)
+		}
+		add(6, "tool_result", result("e"), "lead", nil, 3)
+		add(7, "tool_result", result("f"), "lead", nil, 3)
+		out := read(3, 3)
+		if out.Entries[0].Seq != 3 || out.Entries[2].Seq != 1 {
+			t.Fatal(out)
+		}
+	})
+	t.Run("whole source secret omission and persisted markers", func(t *testing.T) {
+		clear()
+		// A source crossing the SQL boundary must disappear in full, not leak a token prefix.
+		secret := "glpat-" + "abcdefghijklmnopqrst"
+		add(1, "tool_use", use("oversized", strings.Repeat("x", 2040)+secret), "lead", nil, 3)
+		if out := read(0, 3); !out.Unavailable || !out.Truncated {
+			t.Fatal(out)
+		}
+		clear()
+		add(1, "tool_use", use("marker", "echo [REDACTED]"), "lead", nil, 3)
+		if out := read(1, 3); out.Entries[0].Command != "echo [REDACTED]" {
+			t.Fatal(out)
+		}
+		clear()
+		add(1, "tool_use", use("sanitized", "echo "+secret), "reviewer\u202e", "dispatch", 3)
+		e.exec(t, "UPDATE run_messages SET agent_label=$2 WHERE run_id=$1", run, "label\x1b[31m\u202e "+secret)
+		out := read(1, 3)
+		entry := out.Entries[0]
+		if strings.Contains(entry.Command, "abcdefghijklmnopqrst") || entry.Agent != "reviewer" || entry.AgentLabel == nil || strings.ContainsAny(*entry.AgentLabel, "\x1b\u202e") || strings.Contains(*entry.AgentLabel, "abcdefghijklmnopqrst") {
+			t.Fatal(out)
+		}
+	})
+	t.Run("multibyte and control identity boundaries", func(t *testing.T) {
+		for _, id := range []string{strings.Repeat("界", 341) + "x", strings.Repeat("界", 341) + "xx", "a\nb", "a\x1b[31mb", "a\u202eb", "a\u200bb"} {
+			clear()
+			add(1, "tool_use", use(id, "echo identity"), "reviewer", "dispatch", 3)
+			want := 0
+			if id == strings.Repeat("界", 341)+"x" {
+				want = 1
+			}
+			out := read(want, 3)
+			if want == 0 && !out.Unavailable {
+				t.Fatal(out)
+			}
+		}
+	})
+	t.Run("another run result cannot settle", func(t *testing.T) {
+		clear()
+		add(1, "tool_use", use("same", "echo candidate"), "lead", nil, 3)
+		other := e.seedActiveRunOwnedBy(t, wid)
+		raw, _ := json.Marshal(result("same"))
+		e.exec(t, "INSERT INTO run_messages(run_id,seq,kind,payload,agent,claim_generation) VALUES($1,1,'tool_result',$2,'lead',3)", other, raw)
+		read(1, 3)
+	})
 	t.Run("full key byte boundaries", func(t *testing.T) {
 		for _, n := range []int{129, 1024, 1025} {
 			clear()
@@ -202,8 +334,12 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		add(1, "tool_use", use("a", "echo"), "reviewer", "dispatch-a", 3)
 		add(2, "tool_result", result("a"), "reviewer", "dispatch-b", 3)
 		read(1, 3)
+		clear()
+		add(1, "tool_use", use("a", "echo"), "reviewer", "dispatch-a", 3)
 		add(3, "tool_result", result("a"), "lead", "dispatch-a", 3)
-		read(0, 3)
+		if out := read(0, 3); !out.Unavailable {
+			t.Fatal(out)
+		}
 		clear()
 		add(1, "tool_use", use("a", "echo"), "lead", nil, 3)
 		add(2, "tool_result", result("a"), "reviewer", nil, 3)
@@ -221,7 +357,11 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		generation := int64(3)
 		raw, _ := json.Marshal(use("a", "echo"))
 		svc.SetTxBeginner(e.pool)
-		if err := svc.AppendMessagesForClaim(e.ctx, w, run, []IncomingMessage{{Seq: 1, Kind: "tool_use", Agent: "reviewer", AgentInstance: strings.Repeat("x", 129), Payload: raw}}, &generation); err != nil {
+		settled, _ := json.Marshal(result("a"))
+		if err := svc.AppendMessagesForClaim(e.ctx, w, run, []IncomingMessage{
+			{Seq: 1, Kind: "tool_use", Agent: "reviewer", AgentInstance: strings.Repeat("x", 128) + "a", Payload: raw},
+			{Seq: 2, Kind: "tool_result", Agent: "reviewer", AgentInstance: strings.Repeat("x", 128) + "b", Payload: settled},
+		}, &generation); err != nil {
 			t.Fatal(err)
 		}
 		var instance string
@@ -232,7 +372,9 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			t.Fatalf("unexpected persisted instance %q", instance)
 		}
 		e.exec(t, "UPDATE runs SET claim_generation=4 WHERE id=$1", run)
-		read(0, 3)
+		if out := read(0, 3); !out.Unavailable {
+			t.Fatal(out)
+		}
 	})
 	t.Run("anykind newest256 displaces old tools", func(t *testing.T) {
 		for _, kind := range []string{"text", "thinking", "status"} {

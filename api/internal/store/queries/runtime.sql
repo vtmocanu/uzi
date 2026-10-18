@@ -7737,6 +7737,7 @@ SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
                   AND octet_length(s.agent_instance) <= 1024
             THEN s.agent_instance END, '')::text AS agent_instance,
        COALESCE(CASE WHEN char_length(s.agent_label) <= 128 THEN s.agent_label END, '')::text AS agent_label,
+       COALESCE(char_length(s.agent_label) > 128, false)::boolean AS agent_label_omitted,
        COALESCE(CASE WHEN jsonb_typeof(s.payload->'name') = 'string'
                   AND char_length(s.payload->>'name') <= 128
             THEN s.payload->>'name' END, '')::text AS tool_name,
