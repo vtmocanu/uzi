@@ -1,9 +1,7 @@
 package store_test
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,14 +11,11 @@ import (
 
 // Issue #1673: rolling 00254 back must hand an ACKed but unapplied input back to the legacy
 // consume-on-read drain, which selects consumed_at IS NULL. Keeping its consumed_at would make it
-// look delivered forever once applied_at is gone. Replays the migration's own Down/Up SQL.
+// look delivered forever once applied_at is gone. Uses an isolated database and Goose
+// version transitions 254 -> 253 -> 254.
 func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
-	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
-	}
-	ctx := context.Background()
-	if err := store.Migrate(ctx, dsn); err != nil {
+	ctx, dsn := standIsolatedDB(t, "receipt_down_")
+	if err := store.MigrateTo(ctx, dsn, 254); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -44,8 +39,8 @@ func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
 	}
 	pending, acked, applied := insert(false, false), insert(true, false), insert(true, true)
 
-	for _, stmt := range migrationDownStatements(t, "00254_input_receipts.sql") {
-		mustExec(ctx, t, pool, stmt)
+	if err := store.MigrateDownTo(ctx, dsn, 253); err != nil {
+		t.Fatal(err)
 	}
 	for id, wantConsumed := range map[int64]bool{pending: false, acked: false, applied: true} {
 		n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND consumed_at IS NOT NULL`, id)
@@ -53,20 +48,17 @@ func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
 			t.Errorf("after Down input %d consumed=%v, want %v", id, n == 1, wantConsumed)
 		}
 	}
-	for _, stmt := range migrationUpStatements(t, "00254_input_receipts.sql") {
-		mustExec(ctx, t, pool, stmt)
+	if err := store.MigrateTo(ctx, dsn, 254); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// Replays 00284's own Down/Up SQL over seeded rows: Down drops both inclusion columns and keeps
-// the rows, and Up re-adds them with no backfill (included_at NULL, inclusion_reported false).
+// Uses an isolated database and Goose version transitions 284 -> 283 -> 284 over seeded
+// rows: Down drops both inclusion columns and keeps the rows, and Up re-adds them with no
+// backfill (included_at NULL, inclusion_reported false).
 func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
-	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
-	}
-	ctx := context.Background()
-	if err := store.Migrate(ctx, dsn); err != nil {
+	ctx, dsn := standIsolatedDB(t, "included_replay_")
+	if err := store.MigrateTo(ctx, dsn, 284); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -82,8 +74,8 @@ func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
 		VALUES ($1,'follow_up','x',now(),now(),now(),true) RETURNING id`, run).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range migrationDownStatements(t, "00284_input_included_at.sql") {
-		mustExec(ctx, t, pool, stmt)
+	if err := store.MigrateDownTo(ctx, dsn, 283); err != nil {
+		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM information_schema.columns WHERE table_name='run_user_inputs' AND column_name IN ('included_at','inclusion_reported')`); n != 0 {
 		t.Fatalf("Down left %d inclusion columns", n)
@@ -91,8 +83,8 @@ func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1`, id); n != 1 {
 		t.Fatal("Down lost the seeded row")
 	}
-	for _, stmt := range migrationUpStatements(t, "00284_input_included_at.sql") {
-		mustExec(ctx, t, pool, stmt)
+	if err := store.MigrateTo(ctx, dsn, 284); err != nil {
+		t.Fatal(err)
 	}
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND included_at IS NULL AND inclusion_reported = false AND applied_at IS NOT NULL`, id); n != 1 {
 		t.Fatal("Up backfilled included_at or inclusion_reported, or lost applied_at")
