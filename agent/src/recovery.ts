@@ -3193,6 +3193,7 @@ export class RecoveryCoordinator {
   /** Volatile, deny-only accounting shared by discovery and every nested journal reopen.
    * It adds no deadline; existing discovery, caller and cancellation clocks still apply. */
   private checkSavedMetadata(resource?: "entries" | "bytes", amount = 0): void {
+    M1MaintenanceResources.checkIfActive();
     const pass = this.savedEvidenceOnly.getStore();
     if (!pass) return;
     MaintenanceBudget.current()?.check();
@@ -3222,13 +3223,15 @@ export class RecoveryCoordinator {
         // Reserve the read before dispatch, including an eventual EOF visit. A
         // completed listing cannot refund work to a later nested listing.
         this.checkSavedMetadata("entries", 1);
+        M1MaintenanceResources.consumeIfActive("adminEntries", 1);
         const entry = await directory.read();
+        this.checkSavedMetadata();
+        budget?.signal.throwIfAborted();
+        if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
         if (!entry) break;
+        M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
         this.checkSavedMetadata("bytes", Buffer.byteLength(entry.name));
-        if (completeOrigin) {
-          M1MaintenanceResources.consumeIfActive("adminEntries", 1);
-          M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
-        } else if (budget && ++entries > 256) throw new Error("report journal entry budget");
+        if (!completeOrigin && budget && ++entries > 256) throw new Error("report journal entry budget");
         yield entry.name;
       }
     } finally { await directory.close(); }
@@ -4159,9 +4162,11 @@ export class RecoveryCoordinator {
       let stat;
       try { stat = await fs.lstat(directory); }
       catch (err) { MaintenanceBudget.current()?.check();
+        this.checkSavedMetadata();
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw err;
       }
+      this.checkSavedMetadata();
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe recovery directory");
     }
     // The lstat checks above reject a symlinked recovery root or run directory. A symlinked
@@ -4171,6 +4176,7 @@ export class RecoveryCoordinator {
     if (await fs.realpath(dir) !== path.join(realRoot, path.basename(dir))) {
       throw new Error("symlink recovery directory");
     }
+    this.checkSavedMetadata();
     return dir;
   }
 
@@ -4183,7 +4189,7 @@ export class RecoveryCoordinator {
     let names: string[];
     // Disappearance after a positive directory check is unknown, not empty proof.
     const before = await fs.lstat(dir);
-    if (budget || this.savedEvidenceOnly.getStore()) {
+    if (budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) {
       names = [];
       for await (const name of this.journalNames(dir, budget, completeOrigin)) names.push(name);
     } else names = await fs.readdir(dir);
@@ -4213,7 +4219,8 @@ export class RecoveryCoordinator {
       budget.signal.throwIfAborted();
       if (Date.now() >= budget.deadline) throw new Error("origin journal deadline");
     }
-    if ((budget || this.savedEvidenceOnly.getStore()) && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
+    this.checkSavedMetadata();
+    if ((budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
         before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
   }
@@ -4289,10 +4296,10 @@ export class RecoveryCoordinator {
     if (!this.key) return { kind: "unreadable" };
     const savedPass = this.savedEvidenceOnly.getStore();
     this.checkSavedMetadata();
-    if (savedPass) {
+    if (savedPass || M1MaintenanceResources.active()) {
       // Every nested journal reopen uses the same byte cap and no-follow proofs.
       // Infinity selects the bounded reader without creating or renewing a deadline.
-      const signals = [savedPass.signal, budget?.signal, MaintenanceBudget.signal(),
+      const signals = [savedPass?.signal, budget?.signal, MaintenanceBudget.signal(),
         M1MaintenanceResources.signalIfActive()].filter((s): s is AbortSignal => s !== undefined);
       budget = { signal: AbortSignal.any(signals), deadline: budget?.deadline ?? Infinity };
       noFollow = true;
@@ -4300,7 +4307,9 @@ export class RecoveryCoordinator {
     }
     let raw: string;
     try {
-      if (savedPass) { MaintenanceBudget.current()?.check(); budget!.signal.throwIfAborted(); }
+      this.checkSavedMetadata();
+      budget?.signal.throwIfAborted();
+      if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
       if (noFollow) {
         const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {
@@ -4321,9 +4330,11 @@ export class RecoveryCoordinator {
               budget.signal.throwIfAborted();
               if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
               const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
-              if (!bytesRead) break;
+              M1MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
               this.checkSavedMetadata("bytes", bytesRead);
-              if (quiet) M1MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
+              budget.signal.throwIfAborted();
+              if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+              if (!bytesRead) break;
               length += bytesRead;
             }
             if (quiet) M1MaintenanceResources.checkIfActive();
@@ -4333,13 +4344,18 @@ export class RecoveryCoordinator {
             if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
                 before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
                 before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) return { kind: "unreadable" };
+            this.checkSavedMetadata();
+            budget.signal.throwIfAborted();
+            if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
             raw = bytes.subarray(0, length).toString("utf8");
           } else raw = await file.readFile("utf8");
         } finally { await file.close(); }
       } else {
         raw = await fs.readFile(filePath, "utf8");
       }
-      if (savedPass) { MaintenanceBudget.current()?.check(); budget!.signal.throwIfAborted(); }
+      this.checkSavedMetadata();
+      budget?.signal.throwIfAborted();
+      if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
     } catch (err) { MaintenanceBudget.current()?.check();
       this.checkSavedMetadata();
       return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
@@ -4374,6 +4390,7 @@ export class RecoveryCoordinator {
     // Identity consistency is checked only after the normal MAC authentication.
     if (path.basename(filePath) !== record.captureId + ".json" ||
         path.basename(path.dirname(filePath)) !== record.runId) return { kind: "unreadable" };
+    this.checkSavedMetadata();
     return { kind: "ok", record };
   }
 
@@ -4393,7 +4410,7 @@ export class RecoveryCoordinator {
 
   /** All authenticated records for a run (skips tampered/unreadable files). */
   private async listRecords(runId: string): Promise<RecoveryRecord[]> {
-    if (this.savedEvidenceOnly.getStore()) {
+    if (this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) {
       this.checkSavedMetadata();
       const dir = await this.checkedRecordDirectory(runId);
       if (!dir) return [];

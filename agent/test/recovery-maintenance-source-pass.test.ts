@@ -6,7 +6,8 @@ import path from "node:path";
 import { createHash, createHmac } from "node:crypto";
 import { RecoveryCoordinator, canonicalJson, type ClosedSourceObservation, type RecoveryRecord, type RecoveryArchiveClient } from "../src/recovery.js";
 import { setImmediate as turn } from "node:timers/promises";
-import { MaintenanceResources } from "../src/recovery-maintenance.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
 import type { PositiveOwedCandidateContext } from "../src/git.js";
 import type { RecoveryExactHold, RecoveryFinalDisposition } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -152,6 +153,126 @@ async function fixture(t: test.TestContext) {
     settle: (exact: RecoveryExactHold) => { settled = exact; } };
 }
 
+
+// Real admission exercises the production accounting context without enabling a producer.
+async function journalSlot(t: test.TestContext, f: Awaited<ReturnType<typeof fixture>>,
+  signal?: AbortSignal, now?: () => number) {
+  const ledger = new RecoveryMaintenance({ root: path.join(f.root, "recovery-maintenance"),
+    workerToken: token, now });
+  const admitted = await ledger.admit({
+    identity: { run: f.context.runId, generation: 7, hold: holdId, repo: repoId, custodian: "worker",
+      bareBasename: "repo.git", origin: digest, originalSource: digest, sourceConfig: digest },
+    config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: digest,
+  }, { signal });
+  assert.ok(admitted.ok);
+  t.after(() => ledger.finish(admitted.value, "nonmutating"));
+  return admitted.value;
+}
+
+test("active journal reader charges actual bytes on every nested inspect and keeps body quotas separate", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const slot = await journalSlot(t, f);
+  const size = (await fs.stat(f.file(ordinary))).size;
+  const nameBytes = Buffer.byteLength(ordinary + ".json");
+  await MaintenanceResources.run(slot, async () => {
+    MaintenanceResources.consume("metadataBytes", 256 * 1024 ** 2 - 2 * (size + nameBytes));
+    assert.equal((await f.coordinator.inspect(f.context.runId)).length, 1);
+    assert.equal((await f.coordinator.inspect(f.context.runId)).length, 1);
+    MaintenanceResources.consume("decoded", 8 * 1024 ** 3);
+    MaintenanceResources.consume("artifactBytes", 256 * 1024 ** 2);
+    await assert.rejects(f.coordinator.inspect(f.context.runId), /maintenance_resource_exhausted/);
+  });
+});
+
+test("active journal byte exhaustion refuses actual read bytes before decode and delivery", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const size = (await fs.stat(f.file(ordinary))).size;
+  const reads = await observeJournalReads(t, f.file(ordinary), async () => {});
+  const slot = await journalSlot(t, f);
+  await MaintenanceResources.run(slot, async () => {
+    MaintenanceResources.consume("metadataBytes",
+      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - size + 1);
+    await assert.rejects(f.coordinator.inspect(f.context.runId), /maintenance_resource_exhausted|maintenance_token_invalid/);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), size);
+    assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+  });
+});
+
+test("active journal growing after stat stays within the one-MiB read sentinel", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const reads = await observeJournalReads(t, f.file(ordinary), async () => {}, async () => {
+    await fs.appendFile(f.file(ordinary), " ".repeat(2 * 1024 ** 2));
+  });
+  const slot = await journalSlot(t, f);
+  await MaintenanceResources.run(slot, async () => {
+    assert.deepEqual(await f.coordinator.inspect(f.context.runId), []);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), 1024 * 1024 + 1);
+    MaintenanceResources.consume("metadataBytes",
+      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - (1024 * 1024 + 1));
+    assert.throws(() => MaintenanceResources.consume("metadataBytes", 1), /maintenance_resource_exhausted/);
+  });
+});
+
+for (const strict of [false, true]) {
+  test(`active ${strict ? "strict" : "advisory"} journal enumeration charges raw non-JSON visits cumulatively`, async t => {
+    const f = await fixture(t);
+    await f.seal(f.partial(ordinary));
+    seedRawNames(path.dirname(f.file(ordinary)), 4097);
+    const io = observeJournalDirectory(t, path.dirname(f.file(ordinary)));
+    const slot = await journalSlot(t, f);
+    await MaintenanceResources.run(slot, async () => {
+      const read = () => strict ? f.coordinator.inventoryCleanupState(f.context.runId, 7)
+        : f.coordinator.inspect(f.context.runId);
+      await assert.rejects(read(), /maintenance_resource_exhausted/);
+      assert.equal(io.wholeListings(), 0);
+      assert.equal(io.listings.reduce((sum, n) => sum + n, 0), 4096);
+      await assert.rejects(read(), /maintenance_token_invalid/);
+    });
+  });
+}
+
+test("active journal reader bounds oversized files and rejects symlinks while unscoped inspect stays advisory", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const huge = f.file("huge");
+  await fs.writeFile(huge, " ".repeat(1024 * 1024 + 1));
+  await fs.symlink(f.file(ordinary), f.file("alias"));
+  const reads = await observeJournalReads(t, huge, async () => {});
+  const slot = await journalSlot(t, f);
+  await MaintenanceResources.run(slot, async () => {
+    assert.deepEqual((await f.coordinator.inspect(f.context.runId)).map(r => r.captureId), [ordinary]);
+    assert.ok(reads.every(r => r.bytes === 0), "oversize is rejected before reading");
+    await assert.rejects(f.coordinator.inventoryCleanupState(f.context.runId, 7), /unverified recovery journal/);
+    const target = path.join(f.root, ordinary + ".json");
+    await fs.rename(f.file(ordinary), target);
+    await fs.symlink(target, f.file(ordinary));
+    assert.deepEqual(await f.coordinator.inspect(f.context.runId), [], "exact journal symlink cannot deliver valid target bytes");
+  });
+  assert.equal((await f.coordinator.inspect(f.context.runId)).length, 1);
+});
+
+for (const stop of ["signal", "clock", "parent"] as const) {
+  test(`active journal reader checks inherited ${stop} after actual read settlement`, async t => {
+    const f = await fixture(t);
+    await f.seal(f.partial(ordinary));
+    const controller = new AbortController();
+    let wall = 1_000_000, parentNow = 0;
+    const slot = await journalSlot(t, f, controller.signal, () => wall);
+    const parent = new MaintenanceBudget(1000, () => parentNow);
+    t.after(() => parent.dispose());
+    await observeJournalReads(t, f.file(ordinary), async () => {}, undefined, async () => {
+      if (stop === "signal") controller.abort();
+      if (stop === "clock") wall += 120_000;
+      if (stop === "parent") parentNow = 1000;
+    });
+    await assert.rejects(MaintenanceBudget.run(parent, () =>
+      MaintenanceResources.run(slot, () => f.coordinator.inspect(f.context.runId))),
+    /maintenance|abort/i);
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
