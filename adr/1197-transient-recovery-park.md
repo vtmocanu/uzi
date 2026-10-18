@@ -71,6 +71,30 @@ message cursor through every remaining page before starting its batcher.
 This prevents delayed park acknowledgments from causing overlapping clone
 cleanup or dropping late messages through stale sequence reuse.
 
+### Retained object access (issue #3059, 2026-10-18)
+
+After settlement and predecessor quiescence, before any retained-source Git
+read, a credential-free supervised helper runs as command UID 10003. It adds
+only runner-group read/traverse access inside the attributed clone's validated
+`.git/objects`: command-owned GID-10002 directories use `mode | 0050`
+(`2700 → 2750`); regular files use `mode | 0040` (`0400 → 0440`).
+Ownership, bytes, refs and the existing worker-side pack fetch stay unchanged.
+Pre-existing worker/runner objects and regular-file no-ops are never chmodded;
+multiply-linked command-owned regular mutation candidates are refused.
+
+Repair is nontransactional: refusal can leave a prefix group-readable.
+Unsuccessful recovery preserves the sources and custody. The helper does not
+follow alternate targets, and readiness does not replace closure integrity
+verification. The producer of the restrictive modes remains unknown.
+
+Every retained iteration failure is diagnosed before terminal retry branches.
+Git stderr stays private until whole-input redaction, followed by sanitization
+and bounded prefix/suffix selection. Oversized unsplit input is omitted at
+64 KiB; cause/context limits are 1024/256 characters, within 1536 total free-text
+characters including truncation markers and the constant warning. Helper
+failures use fixed codes; persisted blockers and failure reasons carry no raw
+transport text.
+
 ### Retained readiness cleanup (issue #3059, 2026-10-18)
 
 Unconfirmed cleanup of the supervised retained-source permission helper,

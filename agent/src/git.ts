@@ -294,6 +294,72 @@ export class ScratchPublicationError extends Error {
   }
 }
 
+// Transport text is private and ephemeral. Only the safe formatter below reads it;
+// the public Error message and abort/residue classifications remain unchanged.
+const retainedGitDiagnostics = new WeakMap<Error, { stderr: string; context: string }>();
+const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
+
+/** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
+ * a long source path cannot hide Git's trailing failure explanation. Bounds count
+ * UTF-16 units, including the marker; iteration keeps surrogate pairs together. */
+function retainedDiagnosticText(text: string, max: number, redactText: (text: string) => string): string {
+  const redacted = redactText(text.replace(/[\u2028\u2029]/g, "\n"));
+  const safe = sanitizeForLog(redacted.trim(), Number.POSITIVE_INFINITY);
+  if (safe.length <= max) return safe;
+  const half = Math.floor((max - 3) / 2);
+  const points = Array.from(safe);
+  let prefix = "", suffix = "";
+  for (const point of points) {
+    if (prefix.length + point.length > half) break;
+    prefix += point;
+  }
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (suffix.length + points[i]!.length > max - 3 - half) break;
+    suffix = points[i]! + suffix;
+  }
+  return prefix + "..." + suffix;
+}
+
+/** The only reader of runGit's private stderr. Fixed stage/code fields plus at
+ * most 1024 cause and 256 context units leave room for the constant warning text
+ * within 1536 units. Oversized raw inputs are omitted whole, never prefix-cut. */
+export function formatRetainedRecoveryDiagnostic(
+  error: unknown, redactText: (text: string) => string,
+): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
+  let stage = "recovery";
+  try {
+    const transport = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!transport && message.startsWith("retained_readiness_")) {
+      const reason = message.slice("retained_readiness_".length);
+      const known = RETAINED_READINESS_REASONS.has(reason) || [
+        "operation_required", "cancelled", "attribution", "cleanup", "missing_pipe",
+        "pipe", "output_limit", "nonzero", "child", "launch", "malformed",
+        "journal_changed", "validation", "profile",
+      ].includes(reason);
+      return { diagnostic_stage: "readiness", diagnostic_code: known
+        ? "retained_readiness_" + reason : "retained_readiness_validation", cause: "" };
+    }
+    stage = transport ? "git" : "recovery";
+    const cause = transport?.stderr || message;
+    const context = transport?.context;
+    // Check the original unsplit text, including leading whitespace, in bytes as
+    // well as units before normalization or redaction. No secret fragment is kept.
+    if (cause.length > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        (context?.length ?? 0) > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        Buffer.byteLength(cause, "utf8") + Buffer.byteLength(context ?? "", "utf8") > RETAINED_DIAGNOSTIC_INPUT_MAX) {
+      return { diagnostic_stage: stage, diagnostic_code: "input_oversized", cause: "[omitted: redaction input limit]" };
+    }
+    return {
+      diagnostic_stage: stage, diagnostic_code: transport ? "git_failed" : "recovery_failed",
+      cause: retainedDiagnosticText(cause, 1024, redactText),
+      ...(context ? { context: retainedDiagnosticText(context, 256, redactText) } : {}),
+    };
+  } catch {
+    return { diagnostic_stage: stage, diagnostic_code: "formatter_failed", cause: "" };
+  }
+}
+
 const DETAIL_MAX = 200;
 /** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
@@ -12532,7 +12598,13 @@ export class GitCache {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const stderr = (err as { stderr?: unknown })?.stderr;
+      retainedGitDiagnostics.set(failure, {
+        stderr: typeof stderr === "string" ? stderr : "",
+        context: `${cwd ?? ""}: git ${args.join(" ")}`,
+      });
+      throw failure;
     }
   }
 

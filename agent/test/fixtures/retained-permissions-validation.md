@@ -241,3 +241,52 @@ The original permission-specific same-image red evidence and all earlier
 failed gates remain recorded above. No production, quarantine-policy,
 workflow, assertion/deadline relaxation, or source cleanup was part of this
 test correction.
+
+## M3: bounded retained diagnostics
+
+The diagnostic writer is `runGit` and its only metadata reader is
+`formatRetainedRecoveryDiagnostic`. Metadata is held in a private WeakMap,
+without raw enumerable error fields or a durable record; the public thrown
+message remains compatible. The formatter bounds unsplit input to 64 KiB
+before redacting it whole, normalizes line separators for split-token
+redaction, sanitizes controls/bidi, and preserves bounded prefix/suffix cause
+text. Final cause/context limits are 1024/256 characters including markers;
+the warning and all free text fit 1536. Readiness failures produce fixed codes.
+
+The runner emits the structured warning after lifecycle/control checks and
+before deadline, third-attempt, cleanup or other terminal branches. Persisted
+blockers and terminal reasons contain no transport text. Reservation,
+renewal-ownership and blocker-persistence diagnostics use the same formatter.
+
+Focused new tests passed: `.uzi/scratch/gate-log.jsace8`, exit 0, 14 tests,
+zero skips/cancellations. They cover original-message compatibility, metadata
+privacy, long argv/stderr paths with visible Permission denied suffix, all
+field/aggregate bounds, UTF-8 byte overflow and whole-input omission, split
+tokens across newline/separators/controls, bidi/astral handling, and actual
+retained entry's final/third/deadline/cleanup reporting before terminal state.
+Dummy provider-shaped token values are assembled from source fragments.
+Selected existing readiness/control-precedence cases also passed:
+`.uzi/scratch/gate-log.YYBLTG`, exit 0, 20 tests, no skips/cancellations.
+
+Sensitivity: restoring the old warning position after terminal branches made
+all four runner regression cases fail in
+`.uzi/scratch/gate-log.b_60wrof`, exit 1. Third-attempt and generic cases
+logged two warnings instead of three; deadline and cleanup cases logged none
+instead of one. Correct placement was restored before subsequent checks.
+
+Lead integration checks passed: `.uzi/scratch/gate-log.eEL82f`, exit 0,
+226 focused diagnostic/readiness/retained-lifecycle tests, no skips or
+cancellations. Static agent/lane types, lint, dead code, docs and fragment
+validation passed in `.uzi/scratch/gate-log.ixEh5L`. The E2E library, forge
+fake and Docker-free worker-UID harness checks passed in
+`.uzi/scratch/gate-log.K2usyQ`, exit 0.
+
+The changed retained warning/blocker identifiers were swept across
+`e2e/phases/`, `e2e/lib.sh`, `e2e/lib.test.sh` and `e2e/forge-fake/`;
+no owned stale literal expectations were found. Existing same-claim capture,
+fresh-attempt and custody expectations remain applicable. Live compose phases
+were not run; the retained/custody paths include phases 45, 52 and 72.
+
+Focused evidence does not substitute for the final gates or same-image UID
+proof. Delivery reports those results, tested revisions, and local step
+timing separately; CI critical-path impact remains unmeasured until CI runs.
