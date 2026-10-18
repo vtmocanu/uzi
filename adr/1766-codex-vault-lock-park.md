@@ -27,7 +27,7 @@ open/seal calls or a same-operation retry's coherent durable recovery evidence. 
 checks still precede the vault outcome and are revalidated before the reply; the narrowly tolerated
 quarantine refusal grants evidence-check coordinates, not credential release authority (D1).
 
-**Slice A candidate contract, Refs #2852 (2026-10-18):** the held-capture and
+**Slice A contract, Refs #2852 (2026-10-18):** the held-capture and
 epoch-recreation amendments below define the candidate behavior. Earlier accepted
 protocol decisions retain their scope.
 
@@ -192,7 +192,12 @@ WIP commit, fetch-back, verification, authorized credential-free publication and
 supervised-child settlement. The intentionally poisoned, successfully settled registry
 admits this narrow capture lane, with no provider turn, normal callback, admission
 reopen, credential reconciliation, refresh or release, PAT, credential-bearing environment
-or overlay. An incomplete proof grants no capture authority. Then report `recovery_wait` with cause
+or overlay. Auth close joins raw refresh and direct-handler work, with synchronous
+epoch checks before token delivery and before/after release. Executor-owned summary
+and setup cleanup must join; an independent registry cleanup fault refuses capture,
+healthy credential reconciliation and recreation, separately from primary errors.
+The original absolute authority deadline expires without detaching owned cleanup or
+renewing authority. An incomplete proof grants no capture authority. Then report `recovery_wait` with cause
 `vault_locked` when the api advertises the `recovery_cause_vault_locked` protocol feature, else an
 untyped `recovery_wait`; keep the custody hold. The run does not open its merge request while parked this
 way — finalize, and the completion authority that would open the MR, run only after a successful

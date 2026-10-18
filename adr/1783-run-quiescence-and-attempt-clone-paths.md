@@ -220,7 +220,7 @@ removes the tree.
   survive its own reaper.
 - A Claude/stub pause that reaches its Linux proof boundary reaps attributed
   background processes. Codex owner-pause capture uses A's held supervisor capture
-  (candidate contract below). Clone-bound Docker teardown remains best-effort cleanup,
+  (contract below). Clone-bound Docker teardown remains best-effort cleanup,
   not writer-exclusion proof.
 - **M3 canonical-path quarantine (`freeCanonicalClonePath`/`quarantineCanonical`
   in `agent/src/git.ts`) runs on EVERY worker, wired or not**: `attemptSeedOptions`
@@ -268,7 +268,7 @@ removes the tree.
   park, actual graceful-shutdown durability, milestone checkpoint, pre-settle
   reap and finalize.
 
-  **Slice A candidate contract, Refs #2852 (2026-10-18):**
+  **Slice A contract, Refs #2852 (2026-10-18):**
   A separate credential-free GitCache capture callback covers owner pause and
   credential-free recovery, memory-pressure and retained-source captures. It
   holds safety serialization, the epoch fence and closed admission through source
@@ -282,10 +282,16 @@ removes the tree.
   capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate
   credential-presence check for the trusted worker identity `worker_pat`.
-  Codex dependency installation retains its runner identity and command/environment
-  contract while registering supervisor roots before launch. Its fulfilled result
-  grants no process proof without full clean root settlement; the setup binding
-  does not widen the Git-only capture lane or model/credential admission.
+  Codex JS dependency installation and Devbox install/shellenv retain their normal
+  identity and command/environment contract under registered setup supervisor roots.
+  Their fulfilled result grants no process proof without full clean root settlement;
+  the private setup binding does not widen the Git-only capture lane or model/credential
+  admission. The isolated fixed read-only PATH probe exception is recorded in ADR-1106.
+  Executor-owned intent/plan factory, auth, consume, root cleanup and POST remain
+  joined past delivery abandonment. Independent registry cleanup faults refuse capture,
+  healthy credentials and recreation while preserving primary errors separately;
+  other advice factories are unchanged. Authority expires at its original absolute
+  deadline, but owned cleanup stays joined under the fence without a new budget.
 
   Save credential-free session state before capture may drain the epoch. After
   failed or withdrawn pause, and before human or automatic changed-milestone gate
@@ -295,7 +301,9 @@ removes the tree.
   [ADR-1766's deferral](1766-codex-vault-lock-park.md#d3-settle-before-capture-and-no-completion-authority-while-locked).
   The approval path still skips persistence from the old drained HOME. This does
   not make an open approval gate parkable or change retained recovery's fresh
-  path/session policy.
+  path/session policy. Retained-source A coverage ends after `recordRecoveryCapture`;
+  fresh successor creation from the durable bare pin is outside capture. It reads
+  predecessor lstat metadata, not old clone bytes; ordinary seeding trust is unchanged.
 
   The healthy credentialed wall park, completion hold and recovery/credential-switch
   captures still have the pre-publish status/WIP/fetch-back gap; wrapping publish
@@ -350,7 +358,7 @@ removes the tree.
 
 Process proof remains limited to the boundary that actually runs: the Linux
 reaper where enabled, the existing credentialed Codex supervisor boundary, or
-A's callback-held credential-free GitCache capture (candidate contract above).
+A's callback-held credential-free GitCache capture (contract above).
 The held capture covers its action and supervised children; it does not close
 B's healthy credentialed pre-publish gaps or strengthen C's terminal release
 proof. Claude/stub process handling is unchanged. This says nothing about a Docker
@@ -626,7 +634,7 @@ The original follow-ups are recorded below with their later disposition where kn
   complete after the process proof and clean listings. #2852's terminal/Docker
   writer-exclusion remainder is not fixed. Currently unwired status is not durable
   proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial under the slice A candidate contract.** A holds owner
+- **Follow-up 4 — #2852 remains partial under the slice A contract.** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission
@@ -635,7 +643,10 @@ The original follow-ups are recorded below with their later disposition where kn
   continuing; vault lock on recreation takes credential deferral. Slice B's healthy
   wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
   proof remain unshipped. Existing credentialed permits remain required at their
-  sinks; A's capture context is separate. Existing terminal executor disposal does
+  sinks; A's capture context is separate and supplies no structural completion permit.
+  Owned summary/setup/auth cleanup remains joined after authority or delivery expiry,
+  with independent cleanup faults refusing capture and credential continuation.
+  Existing terminal executor disposal does
   not close the gap between snapshot coverage and writer-exclusion proof. A provides no daemon mediation,
   per-attempt cgroup proof or safe automatic retention reclaim. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process

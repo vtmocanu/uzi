@@ -472,7 +472,7 @@ for that frozen epoch. The
 holds the matching-epoch permit through the runner action and its owned work,
 preserving primary-error independence and the unchanged Claude branch.
 
-**Slice A candidate contract, Refs #2852 (2026-10-18):**
+**Slice A contract, Refs #2852 (2026-10-18):**
 A separate credential-free GitCache capture callback holds safety serialization,
 the epoch fence and closed admission through source reads, WIP commit, fetch-back,
 verification, authorized publication and full supervised-child settlement. An
@@ -486,23 +486,47 @@ mints neither a credentialed nor a completion permit. See the
 GitCache binds the restricted launch policy: the canonical environment includes
 exactly one empty `credential.helper` and one empty `core.askpass`, with no
 credential-bearing override. The strict GitCache builder policy matches the complete
-canonical environment, including indexed config order; it rejects extra helper or
-askpass entries, credential-bearing config and unapproved argv overrides.
+canonical environment, including exact indexed config order (reordering is refused).
+Only the builder supplies the empty helper/askpass pins; duplicate entries and caller
+helper/askpass argv overrides, even empty ones, are refused. The synchronous launch-request check
+scans credential/askpass, includes, config-env, `GIT_CONFIG_PARAMETERS`, Authorization
+and URL-userinfo channels. The fixed embedded cancellation-content helper is
+allowed only through its supervised binding, not as generic helper execution.
 Trusted-worker bare Git keeps its worker identity;
 `worker_pat` is the historical identity name, not evidence of credential presence.
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:
 it leaves uncaptured work in an ephemeral clone instead of moving capturable work
 into the persistent worker bare. Local capture alone proves neither origin
-publication nor permission to dispose of the source.
+publication nor permission to dispose of the source. Worker-provided global Git
+config may configure drivers; ordinary seeding trust is unchanged. These
+configuration pins alone prove neither driver inertness nor process exclusion.
 
-Codex background dependency installation also uses registered supervisor roots,
-with the existing runner identity, manager commands, replacement environment,
-HOME and caches. Its private setup binding grants no model or credential authority
+Codex background JS dependency installation and Devbox `install` / `shellenv`
+use registered supervisor roots for fixed normal setup, with the existing runner
+identity, manager commands, replacement environment, HOME and caches. The private
+setup binding grants no model or credential authority
 and is unavailable inside the Git capture lane. A primary child exit or fulfilled
 best-effort install result is insufficient: confirmed root cleanup is required
 before capture or boundary credential reconciliation. Unconfirmed cleanup remains
-separate from the dependency-install outcome. Claude's installer path is unchanged.
+separate from the dependency-install outcome. The PATH probe is a read-only
+exception: an isolated trusted fixed filesystem-access script checks path entries
+as data, without executing them. Claude's installer path is unchanged.
+
+Executor-owned intent/plan summaries use private factory/parameter/harness bindings
+in [summary-ownership.ts](../agent/src/codex/summary-ownership.ts), not labels or
+structural lookalikes. Their factory, launch, auth, consume, full root disposal and
+result POST stay joined after the delivery-abandonment bound. Registry cleanup
+failure independently refuses free capture, healthy credential reconciliation and
+epoch recreation; retain primary errors separately. Other judge, review, Now and
+delivery advice outside this factory keep their existing behavior.
+
+Auth close joins raw refresh and direct-handler work. Check the synchronous epoch
+fence before token delivery and before/after release; closing admission prevents a
+late reply from restoring authority. The original absolute authority deadline still
+expires: owned cleanup stays joined under the fence without a renewed budget or
+detached tail. These private bindings add no generic spawner, identities, privileges,
+protocol or infrastructure.
 
 The same supervisor mechanism has been measured with actual provider roots and
 separate process controls. M0 needs no different process primitive for command

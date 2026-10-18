@@ -78,10 +78,17 @@ otherwise `source_only`, before available unguarded archives or capture progress
 Other custody attention decisions retain their existing ordering.
 
 The worker attempts preservation using its existing recovery path. Under the
-**slice A candidate contract (Refs #2852)**, Codex credential-free capture keeps
+**slice A contract (Refs #2852)**, Codex credential-free capture keeps
 execution closed through capture and settlement of the supervised capture processes,
-including credential-free recovery and retained-source capture. This does not prove
-that latest work is archived or authorize source deletion.
+including credential-free recovery and retained-source capture. Setup, auth and
+executor-owned summary cleanup stay joined even after authority or summary delivery
+expires; unconfirmed cleanup blocks capture and credential continuation. Local
+capture moves capturable work from the ephemeral clone into the durable worker
+bare; it does not prove that latest work is archived or authorize source deletion.
+Retained-source capture ends at its durable capture record; creating a fresh
+successor from that bare pin follows outside the held capture, without reading
+old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened
+terminal proof (C) remain open; existing terminal executor disposal still applies.
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
 uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
@@ -625,7 +632,7 @@ worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
 
-**Slice A candidate contract (Refs #2852):** credential-free capture, including owner pause,
+**Slice A contract (Refs #2852):** credential-free capture, including owner pause,
 keeps execution closed without changing these retention rules. If a failed or withdrawn
 pause may have drained Codex execution, the saved session is loaded into a recreated
 provider epoch before work continues. Human or automatic gate revision after changed
