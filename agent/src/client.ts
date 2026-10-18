@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import type { ReadableStreamReadResult } from "node:stream/web";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
@@ -4334,21 +4335,46 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) signal = AbortSignal.any([resourceSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
+  const scoped = MaintenanceResources.active();
+  if (scoped) MaintenanceResources.checkIfActive();
   if (!res.body) return Buffer.alloc(0);
-  const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | ReadableStreamBYOBReader;
+  let read: () => Promise<ReadableStreamReadResult<Uint8Array>>;
+  if (scoped) {
+    let boundedReader: ReadableStreamBYOBReader;
+    try {
+      boundedReader = res.body.getReader({ mode: "byob" });
+    } catch (error) {
+      // Unsupported producers cannot bypass reservation with a default reader.
+      void res.body.cancel().catch(() => undefined);
+      throw error;
+    }
+    reader = boundedReader;
+    read = () => {
+      // Reserve the entire pull before allocation/read; EOF and short reads never refund.
+      // A fresh buffer is required even after EOF: BYOB transfers detach supplied buffers.
+      const size = Math.min(64 * 1024, Math.max(1, maxBytes - total));
+      MaintenanceResources.consumeIfActive("metadataBytes", size);
+      return boundedReader.read(new Uint8Array(size));
+    };
+  } else {
+    const defaultReader = res.body.getReader();
+    reader = defaultReader;
+    read = () => defaultReader.read();
+  }
   const abort = () => { void reader.cancel(signal?.reason).catch(() => undefined); };
   signal?.addEventListener("abort", abort, { once: true });
   try {
     signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
       signal?.throwIfAborted();
-      const { done, value } = await (budget ? budget.raceIO(() => reader.read(), undefined, signal) : reader.read());
+      const { done, value } = await (budget ? budget.raceIO(read, undefined, signal) : read());
       budget?.check();
       signal?.throwIfAborted();
+      if (scoped) MaintenanceResources.checkIfActive();
       if (done) break;
-      MaintenanceResources.consumeIfActive("metadataBytes", value.byteLength);
       if (rejectOverflow && value.byteLength > maxBytes - total) {
         throw new ResponseBodyOverflowError(maxBytes);
       }
@@ -4363,6 +4389,10 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     void reader.cancel().catch(() => undefined);
   }
   budget?.check();
+  if (scoped) {
+    MaintenanceResources.checkIfActive();
+    signal?.throwIfAborted();
+  }
   return Buffer.concat(parts);
 }
 
