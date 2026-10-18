@@ -5770,6 +5770,159 @@ export class GitCache {
     });
   }
 
+  /**
+   * Bounded metadata-only qualification. This never repairs attribution, reads Git
+   * objects, proves quiescence, or grants maintenance admission. Uncertainty in any
+   * administrative record protects the whole bare.
+   */
+  async matchMaintenanceSourceFamily(
+    barePath: string, branch: string, key: string, runId: string,
+    known: ReadonlyArray<{ runId: string; clonePath: string; attemptId: string; identity?: string }>,
+    options: { signal?: AbortSignal; maxSources?: number } = {},
+  ): Promise<{ sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }>;
+    metadata: string } | undefined> {
+    try {
+      return await MaintenanceResources.runDiscovery(() => this.withLock(barePath, async () => {
+        const maxSources = Math.min(128, options.maxSources ?? 128);
+        if (!Number.isSafeInteger(maxSources) || maxSources < 1 ||
+            !CODE_ID.test(key) || !CODE_ID.test(runId) || !Array.isArray(known) ||
+            !known.length || known.length > maxSources) throw new Error("invalid known family");
+        // Validate caller tuples before deriving paths or visiting source directories.
+        for (const source of known) {
+          if (!source || source.runId !== runId || !CODE_ID.test(source.runId) ||
+              typeof source.attemptId !== "string" || source.attemptId.length > 128 ||
+              !CODE_ID.test(source.attemptId) || !ATTEMPT_ID_RE.test(source.attemptId) ||
+              typeof source.clonePath !== "string" || source.clonePath.length > 4096 ||
+              (source.identity !== undefined && (typeof source.identity !== "string" ||
+                source.identity.length > 128 || !/^[0-9]+:[0-9]+(?![\s\S])/.test(source.identity))))
+            throw new Error("invalid known source");
+          recoverySource({ runId: source.runId, clonePath: source.clonePath, attemptId: source.attemptId });
+        }
+        await this.assertRecoveryBare(barePath);
+        const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+        // Charge every raw entry before filtering, parsing, or deduplicating.
+        MaintenanceResources.consumeMetadataEntriesIfActive(config, "\0");
+        const canonical = this.runnerClonePath(barePath, key);
+        for (const source of known) {
+          if (this.clonePathShape(source.clonePath, canonical)?.attemptId !== source.attemptId)
+            throw new Error("invalid known source path");
+        }
+        const ledgers = new Map<string, AttemptLedgerEntry & { branch: string }>();
+        const owners = new Map<string, string>();
+        const journals: Array<{ branch: string; journal: RecoveryJournalEntry }> = [];
+        const seen = new Set<string>();
+        let descriptors = 0;
+        const count = () => {
+          MaintenanceResources.checkIfActive();
+          if (++descriptors > maxSources) throw new Error("source descriptors exhausted");
+        };
+        const addJournal = (b: string, journal: RecoveryJournalEntry) => {
+          // Count raw descriptor occurrences, including repeated episode members.
+          const all = [journal, ...(journal.retainedSources ?? []),
+            ...(journal.recovery ? [journal.recovery.source,
+              ...(journal.recovery.successor ? [journal.recovery.successor] : [])] : [])];
+          for (const source of all) {
+            count();
+            const owner = owners.get(source.clonePath);
+            if (owner !== undefined && owner !== source.runId + ":" + b) throw new Error("conflicting source ownership");
+            owners.set(source.clonePath, source.runId + ":" + b);
+          }
+          journals.push({ branch: b, journal });
+        };
+        for (const item of config.split("\0")) {
+          if (!item) continue;
+          const nl = item.indexOf("\n"), name = nl < 0 ? item : item.slice(0, nl);
+          const raw = nl < 0 ? undefined : item.slice(nl + 1);
+          // Bound, detached, malformed and overflow markers all protect. Absence
+          // alone never establishes non-stopped provenance.
+          if (name.startsWith("uzi-stopped.")) throw new Error("stopped or ambiguous source");
+          if (name.startsWith("uzi-attempts.")) {
+            count();
+            const m = /^uzi-attempts\.(.+)\.entry$/.exec(name);
+            const entry = raw === undefined ? undefined : parseAttemptLedgerEntry(raw);
+            if (!m || !entry) throw new Error("malformed raw ledger");
+            const previous = ledgers.get(entry.attemptId);
+            if (previous && (previous.runId !== entry.runId || previous.clonePath !== entry.clonePath ||
+                previous.branch !== m[1])) throw new Error("conflicting attempt ownership");
+            // Reclaimed history cannot be laundered by a later live value.
+            if (entry.state === "reclaimed") throw new Error("stopped attempt history");
+            const owner = owners.get(entry.clonePath);
+            if (owner !== undefined && owner !== entry.runId + ":" + m[1]) throw new Error("conflicting path ownership");
+            owners.set(entry.clonePath, entry.runId + ":" + m[1]);
+            ledgers.set(entry.attemptId, { ...entry, branch: m[1]! });
+          } else if (name.startsWith("uzi-recovery.") || name.startsWith("uzi-retained.")) {
+            if (raw === undefined || seen.has(name)) throw new Error("ambiguous source descriptor");
+            seen.add(name);
+            if (name.startsWith("uzi-recovery.")) {
+              const m = /^uzi-recovery\.(.+)\.clone$/.exec(name);
+              if (!m) throw new Error("malformed journal key");
+              if (raw !== "") addJournal(m[1]!, parseRecoveryJournal(raw));
+            } else {
+              const m = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
+              const d = JSON.parse(raw);
+              if (!m || !d || typeof d !== "object" || Array.isArray(d) || d.version !== 1 ||
+                  Object.keys(d).sort().join(",") !== "branch,journal,key,version" ||
+                  typeof d.branch !== "string" || !d.branch || typeof d.key !== "string" ||
+                  !CODE_ID.test(d.key)) throw new Error("malformed protected descriptor");
+              const journal = parseRecoveryJournal(JSON.stringify(d.journal));
+              if (journal.runId !== m[1] || (!journal.recovery && !journal.retainedSources?.length) ||
+                  this.clonePathShape(journal.clonePath, this.runnerClonePath(barePath, d.key)) === undefined)
+                throw new Error("conflicting protected descriptor");
+              addJournal(d.branch, journal);
+            }
+          }
+        }
+        // Compare the complete parsed set so config order cannot hide conflicts.
+        const descriptorsByRun = new Map<string, string>();
+        for (const { branch: b, journal } of journals) {
+          const id = JSON.stringify([b, journal.runId]), value = JSON.stringify(journal);
+          const previous = descriptorsByRun.get(id);
+          if (previous !== undefined && previous !== value) throw new Error("conflicting descriptors");
+          descriptorsByRun.set(id, value);
+        }
+        // Validate ALL journal members, including foreign ones, before selection.
+        for (const { branch: b, journal } of journals) for (const source of this.recoverySources(journal)) {
+          const entry = source.attemptId === undefined ? undefined : ledgers.get(source.attemptId);
+          if (!entry || entry.runId !== source.runId || entry.clonePath !== source.clonePath ||
+              entry.branch !== b || entry.state === "retired") throw new Error("untracked source member");
+        }
+        const selected = [...ledgers.values()].filter(e => e.runId === runId);
+        if (!selected.length || selected.length !== known.length ||
+            new Set(known.map(s => s.clonePath)).size !== known.length) throw new Error("incomplete known family");
+        const sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }> = [];
+        // Stream actual siblings; unknown entries and unsafe artifacts protect.
+        const directory = await fs.opendir(path.dirname(canonical), { bufferSize: 1 });
+        try {
+          for (;;) {
+            const entry = await directory.read();
+            if (!entry) break;
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
+            MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
+            const artifact = parseRetainedArtifactName(entry.name);
+            const clonePath = path.join(path.dirname(canonical),
+              artifact?.kind === "skills" ? artifact.cloneBasename : entry.name);
+            if (artifact && artifact.kind !== "skills") throw new Error("unknown retained physical sibling");
+            const ledger = [...ledgers.values()].find(e => e.clonePath === clonePath);
+            if (!ledger || ledger.state === "retired" || !entry.isDirectory()) throw new Error("untracked physical sibling");
+          }
+        } finally { await directory.close(); }
+        for (const entry of selected) {
+          const original = known.find(s => s.runId === runId && s.clonePath === entry.clonePath && s.attemptId === entry.attemptId);
+          if (!original || entry.branch !== branch || entry.state === "retired" ||
+              this.clonePathShape(entry.clonePath, canonical)?.attemptId !== entry.attemptId)
+            throw new Error("unknown source family");
+          const stat = await fs.lstat(entry.clonePath);
+          if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe source path");
+          const identity = stat.dev + ":" + stat.ino;
+          if (original.identity !== undefined && original.identity !== identity) throw new Error("replaced source");
+          sources.push({ runId, clonePath: entry.clonePath, attemptId: entry.attemptId, identity });
+        }
+        if (!journals.some(j => j.branch === branch && j.journal.runId === runId)) throw new Error("missing source journal");
+        return { sources, metadata: config };
+      }), { signal: options.signal });
+    } catch { return undefined; }
+  }
+
   private recoverySources(journal: RecoveryJournalEntry): RecoverySource[] {
     const sources = [journal, ...(journal.retainedSources ?? []),
       ...(journal.recovery ? [journal.recovery.source, ...(journal.recovery.successor ? [journal.recovery.successor] : [])] : [])];
@@ -5865,6 +6018,7 @@ export class GitCache {
     if (await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) throw new Error("invalid recovery bare");
     await this.assertOwedBare(barePath);
     const entries = await this.runGit(barePath, ["config", "--local", "--no-includes", "--name-only", "--list"]);
+    MaintenanceResources.consumeMetadataEntriesIfActive(entries, "\n");
     if (entries.split("\n").some(k => /^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(k))) {
       throw new Error("unsafe recovery bare config");
     }

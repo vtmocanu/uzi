@@ -1818,9 +1818,19 @@ type SourceGenesis = Readonly<{
 
 type ClosedSourceObservation = Readonly<{
   genesis: SourceGenesis;
+  family?: Readonly<{
+    originals: ReadonlyArray<SourceGenesis & { identity: string }>;
+    observedExecution: Readonly<{ runId: string; generation: number }>;
+    metadata: string;
+  }>;
 }>;
 
 interface RunFlight {
+  sourceInherited?: ClosedSourceObservation;
+  sourceFamilyMatched?: boolean;
+  sourceBlockingNormal?: boolean;
+  sourceBlockedReport?: boolean;
+  sourceNormalBlocked?: boolean;
   sourceGenesis?: SourceGenesis;
   sourceJoinFailed?: boolean;
   sourceNormalPark?: boolean;
@@ -3064,6 +3074,7 @@ export class RunRunner {
     let release!: (observation: ClosedSourceObservation | void) => void;
     const tail = new Promise<ClosedSourceObservation | void>((resolve) => { release = resolve; });
     let observation: ClosedSourceObservation | void = undefined;
+    let inherited: ClosedSourceObservation | void = undefined;
     // Install synchronously before factory work. A third claim must queue behind
     // the second even while the second is waiting for the first's cleanup.
     this.executionTails.set(runId, tail);
@@ -3084,9 +3095,9 @@ export class RunRunner {
         this.cachesDropped?.forget(runId);
       }
       if (previous) {
-        // The queued caller receives the result, but retained-source adoption is
-        // deliberately deferred until it can identify the original exact tuple.
-        await previous;
+        // Only this exact pending tail conveys knowledge; nothing is retained for
+        // a caller arriving after release.
+        inherited = await previous;
         // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
         // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
         // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
@@ -3096,7 +3107,7 @@ export class RunRunner {
         if (!(await this.gateQueuedDuplicate(claim))) return;
         claim = await this.refreshQueuedClaimCursor(claim);
       }
-      observation = await this.executeClaim(claim);
+      observation = await this.executeClaim(claim, inherited || undefined);
     } finally {
       if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
       // Only callers that captured this pending tail can receive the observation.
@@ -3269,19 +3280,23 @@ export class RunRunner {
     }
   }
 
-  private async executeClaim(claim: ClaimResponse): Promise<ClosedSourceObservation | void> {
+  private async executeClaim(claim: ClaimResponse, inherited?: ClosedSourceObservation): Promise<ClosedSourceObservation | void> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
       return this.observeCancellation(observedFlight);
-    }, () => this.executeClaimInAttempt(claim, flight => { observedFlight = flight; }));
+    }, () => this.executeClaimInAttempt(claim, flight => {
+      observedFlight = flight;
+      flight.sourceInherited = inherited;
+    }));
     // executeClaimInAttempt has now returned through its entire finally, including
     // HOME/cache/lifecycle cleanup. Catch selection and steering.stop alone are too early.
     const flight = observedFlight;
-    if (!flight?.sourceGenesis || !flight.sourceNormalPark || !flight.sourceCleanupJoined ||
-        flight.sourceJoinFailed || flight.sourceExitDenied || !flight.parked || flight.terminalResolved ||
+    const blocked = flight?.sourceNormalBlocked === true && flight.sourceFamilyMatched === true;
+    if (!flight || (!blocked && (!flight.sourceGenesis || !flight.sourceNormalPark || !flight.parked || flight.terminalResolved ||
         flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
-        flight.completedRetainedSuccessor || flight.predecessorCapture || flight.workerMemory ||
+        flight.completedRetainedSuccessor || flight.predecessorCapture)) || !flight.sourceCleanupJoined ||
+        flight.sourceJoinFailed || flight.sourceExitDenied || flight.workerMemory ||
         flight.cancellationBudget || this.cancellationExpired(flight) ||
         flight.batcher.isTripped() || flight.batcher.isSpilled() || flight.batcher.bufferedCount() !== 0 ||
         flight.providerParkUnproven || flight.uncertainWallPark || flight.completionHoldOutcome !== "none" ||
@@ -3290,13 +3305,30 @@ export class RunRunner {
         (flight.steering.lifecycleSignal().aborted && !(flight.steering.lifecycleSignal().reason instanceof PauseNowSignal)) ||
         flight.steering.claimFence() !== undefined || flight.active?.shuttingDown || this.shuttingDownGlobal ||
         residueQuarantine() !== undefined) return;
-    const genesis = flight.sourceGenesis;
-    if (genesis.runId !== flight.runId || genesis.generation !== flight.claimGeneration ||
+    const genesis = blocked ? flight.sourceInherited?.genesis : flight.sourceGenesis;
+    if (!genesis || genesis.runId !== flight.runId) return;
+    if (!blocked && (genesis.generation !== flight.claimGeneration ||
         genesis.clonePath !== flight.worktreePath || genesis.attemptId !== flight.attemptId ||
-        genesis.attemptId !== flight.runnerClone?.attemptId) return;
-    // One known fresh source only. Unknown siblings always protect; a future
-    // producer must match the entire source family before deriving any authority.
-    return Object.freeze({ genesis });
+        genesis.attemptId !== flight.runnerClone?.attemptId)) return;
+    const originals = blocked ? flight.sourceInherited?.family?.originals : [genesis];
+    const family = originals && flight.barePath && flight.branch
+      ? await this.git.matchMaintenanceSourceFamily(flight.barePath, flight.branch, this.cloneCoordinates(claim).key,
+        flight.runId, originals, { signal: this.retainedLifecycleSignal(flight) }) : undefined;
+    // The metadata read awaited: repeat final lifecycle checks before delivery.
+    if (flight.sourceJoinFailed || flight.sourceExitDenied || flight.steering.isCancelled() ||
+        flight.steering.terminalLifecycleSignal().aborted || flight.steering.claimFence() !== undefined ||
+        (flight.cancel.signal.aborted && !(flight.cancel.signal.reason instanceof PauseNowSignal)) ||
+        (flight.steering.lifecycleSignal().aborted && !(flight.steering.lifecycleSignal().reason instanceof PauseNowSignal)) ||
+        flight.active?.shuttingDown || this.shuttingDownGlobal || residueQuarantine() !== undefined) return;
+    if (blocked && !family) return;
+    if (!family) return claim.inventory_guarded === true ? undefined : Object.freeze({ genesis });
+    return Object.freeze({ genesis, family: Object.freeze({
+      originals: Object.freeze(family.sources.map(source => Object.freeze({
+        ...originals!.find(original => original.clonePath === source.clonePath)!, identity: source.identity,
+      }))),
+      observedExecution: Object.freeze({ runId: flight.runId, generation: flight.claimGeneration }),
+      metadata: family.metadata,
+    }) });
   }
 
   private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void): Promise<void> {
@@ -3998,6 +4030,9 @@ export class RunRunner {
         });
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RetainedRecoveryStop) {
+        // Only the positively tracked normal recovery exit can undo this
+        // dispatcher's deny. Earlier stops and ambiguous custody remain denied.
+        if (flight.sourceNormalBlocked && !priorSourceExitDenied) flight.sourceExitDenied = false;
         // Discovery can stop before the source record reaches this flight. Preserve
         // its existing HOME and custody as well as any subsequently discovered clone.
         flight.preserveRecoveryClone = true;
@@ -4584,9 +4619,9 @@ export class RunRunner {
       // reclaim and its "fresh sample" wait start from the dropped HOME. A no-op when unwatched.
       this.diskGovernor?.unregister(runId);
       flight.cancellationBudget?.dispose();
-      // Only the legacy owner pause has observable joins here. Other sinks stay unknown.
-      flight.sourceCleanupJoined = !executor.safety && claim.inventory_guarded !== true &&
-        (!runHome || (preserveResumeArtifacts && flight.parked && !flight.providerParkUnproven)) &&
+      // Observable joins cover a fresh owner pause and an inherited family blocked before execution.
+      flight.sourceCleanupJoined = !executor.safety &&
+        (!runHome || (preserveResumeArtifacts && (flight.parked || flight.sourceNormalBlocked) && !flight.providerParkUnproven)) &&
         sourceOwedJoined &&
         !!flight.barePath && !!flight.branch && !retireBlocked &&
         (ownAttemptRetired || flight.preserveRecoveryClone);
@@ -5334,6 +5369,8 @@ export class RunRunner {
       },
       async (b, sig) => {
         const ack = await flight.reportState(b, sig);
+        if (flight.sourceBlockingNormal && ack.applied && ack.status === "failed" && !ack.staleClaim && !ack.staleRevisionSource)
+          flight.sourceBlockedReport = true;
         if (ack.staleRevisionSource) staleRevisionRejection = true;
         if (ack.applied && ack.status !== undefined && TERMINAL_RUN_STATUSES.has(ack.status) && !ack.staleRevisionSource && !ack.staleClaim)
           revisionRejectionConfirmed = true;
@@ -18174,6 +18211,12 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
+    const inherited = flight.sourceInherited?.family;
+    if (inherited?.observedExecution.runId === flight.runId) {
+      flight.sourceFamilyMatched = !!await this.git.matchMaintenanceSourceFamily(bare, branch, key, flight.runId,
+        inherited.originals, { signal: this.retainedLifecycleSignal(flight) });
+    }
+    let sourceQuiescenceJoined = false;
     let blocker: import("./recovery-progress.js").RecoveryBlocker = source.recovery?.blocker ?? "capture_failed";
     let expectedSource = source;
     let episode = source.recovery;
@@ -18209,9 +18252,15 @@ export class RunRunner {
         : blocker.replaceAll("_", " ");
       const reason = `Retained recovery blocked: ${detail}${persistence}; local work and custody retained`;
       flight.runLog.warn(reason, { blocker });
+      // Classification depends on the actual normal iteration, joined
+      // quiescence and persisted blocker, never the catch type or custody flags.
+      flight.sourceBlockingNormal = flight.sourceFamilyMatched === true && sourceQuiescenceJoined &&
+        blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied;
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
         { keepCustody: true });
+      this.retainedLifecycleGuard(flight);
+      flight.sourceNormalBlocked = flight.sourceBlockingNormal && flight.sourceBlockedReport === true;
       throw new RetainedRecoveryStop();
     };
     if (source.recovery?.stage === "blocked") await fail();
@@ -18266,6 +18315,7 @@ export class RunRunner {
           });
           await check();
           if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
+          sourceQuiescenceJoined = true;
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
