@@ -2,11 +2,14 @@ package workersvc
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -23,48 +26,119 @@ func (s policyOwnerStopReadRace) GetRunByIDForUser(ctx context.Context, p store.
 	return r, err
 }
 
-func TestPolicyOwnerStopLockedCountLiveDB(t *testing.T) {
+// This seeds complete canonical source context for component transaction tests.
+// It is not proof of a runtime source writer or of runtime approval authority.
+func newPolicyOwnerStopFixture(t *testing.T, completed string) usageTailEnv {
+	t.Helper()
 	e := setupPolicyHold(t)
-	held, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest())
+	e.svc.p.PolicyStopNegotiated = true
+	if _, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET kind='issue',issue_iid=101,
+ session_id='keep-stop-session',auto_approve=false,plan_source='agent',
+ plan_md='exact candidate',size_class='s',gate_revision=3,gate_presentation_id=$2,
+ milestones_candidate='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+ milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+ milestones_completed=$3 WHERE id=$1`, e.runID, uuid.New(), completed); err != nil {
+		t.Fatal(err)
+	}
+	seedPolicyOwnerStopSource(t, e.codexTestEnv, e.runID)
+	return e
+}
+
+// Use the production canonical gate encoding; never hash an ad hoc JSON rendering.
+func seedPolicyOwnerStopSource(t *testing.T, env codexTestEnv, id uuid.UUID) {
+	t.Helper()
+	r := mustRun(t, env, id)
+	payload, digest, err := gatePayloadFromRow(r).digest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET kind='issue',issue_iid=101,milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',milestones_completed='["m1"]' WHERE id=$1`, e.runID); err != nil {
+	source, err := json.Marshal(apitypes.PolicyRevisionSourceV1{
+		Version: 1,
+		Gate: &apitypes.PolicyStopGateContext{Revision: stopDecimal(r.GateRevision),
+			PresentationID: uuid.UUID(r.GatePresentationID.Bytes).String(), PayloadDigest: hex.EncodeToString(digest)},
+		AssociatedCrossChecks: []apitypes.PolicyRevisionRef{},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	e.svc.q = policyOwnerStopReadRace{Store: e.svc.q, afterRead: func() {
+	if _, err := env.pool.Exec(env.ctx, "UPDATE runs SET gate_presented_payload=$2,gate_payload_digest=$3,policy_revision_source=$4 WHERE id=$1", id, payload, digest, source); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func policyOwnerStopSnapshot(t *testing.T, env codexTestEnv, id uuid.UUID) string {
+	t.Helper()
+	var snapshot string
+	if err := env.pool.QueryRow(env.ctx, `SELECT jsonb_build_object(
+ 'run',to_jsonb(r),
+ 'inputs',(SELECT coalesce(jsonb_agg(to_jsonb(i) ORDER BY i.id),'[]'::jsonb) FROM run_user_inputs i WHERE i.run_id=r.id),
+ 'checks',(SELECT coalesce(jsonb_agg(to_jsonb(c) ORDER BY c.id),'[]'::jsonb) FROM cross_checks c WHERE c.lead_run_id=r.id))::text
+ FROM runs r WHERE r.id=$1`, id).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func policyOwnerStopReview(t *testing.T, e usageTailEnv) apitypes.PolicyStopReview {
+	t.Helper()
+	before := policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID)
+	review, err := e.svc.PolicyStopReviewForOwner(e.ctx, e.userID, e.runID, PolicyHoldActionToken(mustRun(t, e.codexTestEnv, e.runID)))
+	if err != nil {
+		t.Fatalf("display review: %v", err)
+	}
+	if policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != before {
+		t.Fatal("read-only review mutated database")
+	}
+	return review
+}
+
+func requirePolicyOwnerStopConflict(t *testing.T, err error, reason string) {
+	t.Helper()
+	var conflict *PolicyStopReviewConflict
+	if !errors.As(err, &conflict) || conflict.Reason != reason {
+		t.Fatalf("Stop error=%v, want typed %s", err, reason)
+	}
+}
+
+func TestPolicyOwnerStopLockedCountLiveDB(t *testing.T) {
+	e := newPolicyOwnerStopFixture(t, `["m1"]`)
+	review := policyOwnerStopReview(t, e)
+	base := e.svc.q
+	var baseline string
+	e.svc.q = policyOwnerStopReadRace{Store: base, afterRead: func() {
 		if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET milestones_completed='["m1","m2"]' WHERE id=$1`, e.runID); err != nil {
 			t.Fatal(err)
 		}
+		baseline = policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID)
 	}}
-	res, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: PolicyHoldActionToken(held)})
+	_, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: review.StopIfMatch})
+	requirePolicyOwnerStopConflict(t, err, "policy_stop_token_stale")
+	if baseline == "" || policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != baseline {
+		t.Fatal("stale displayed completed count mutated database")
+	}
+	e.svc.q = base
+	oldToken := review.StopIfMatch
+	review = policyOwnerStopReview(t, e)
+	if review.StopIfMatch == oldToken {
+		t.Fatal("changed completed count reused the original Stop consent")
+	}
+	res, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: review.StopIfMatch})
 	if err != nil || res.ScopeCeiling == nil || *res.ScopeCeiling != 2 {
-		t.Fatalf("locked completed count=%+v err=%v", res, err)
+		t.Fatalf("explicit new consent count=%+v err=%v", res, err)
 	}
 }
 
 func TestPolicyOwnerStopLiveDB(t *testing.T) {
 	for _, completed := range []string{`["m1"]`, `["m1","m2"]`} {
 		t.Run(completed, func(t *testing.T) {
-			e := setupPolicyHold(t)
-			held, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET kind='issue',issue_iid=101,milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',milestones_completed=$2 WHERE id=$1`, e.runID, completed); err != nil {
-				t.Fatal(err)
-			}
-			for _, token := range []string{"", "stale"} {
-				if _, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish only", nil, SubmitInputOptions{ActionIfMatch: token}); !errors.Is(err, ErrStaleClaim) {
-					t.Fatalf("token=%q err=%v", token, err)
-				}
-				got := mustRun(t, e.codexTestEnv, e.runID)
-				if got.ScopeCeiling.Valid || got.Status != "paused" || got.StopKind.Valid {
-					t.Fatal("rejected stop wrote state")
-				}
-			}
-			res, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish only", nil, SubmitInputOptions{ActionIfMatch: PolicyHoldActionToken(held)})
-			if err != nil || !res.Resumed || res.ScopeCeiling == nil {
+			e := newPolicyOwnerStopFixture(t, completed)
+			review := policyOwnerStopReview(t, e)
+			before := mustRun(t, e.codexTestEnv, e.runID)
+			res, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish only", nil, SubmitInputOptions{ActionIfMatch: review.StopIfMatch})
+			if err != nil || !res.Resumed || res.ScopeCeiling == nil || res.PolicyStop == nil {
 				t.Fatalf("stop=%+v err=%v", res, err)
 			}
 			want := 1
@@ -72,18 +146,19 @@ func TestPolicyOwnerStopLiveDB(t *testing.T) {
 				want = 2
 			}
 			got := mustRun(t, e.codexTestEnv, e.runID)
-			if int(got.ScopeCeiling.Int32) != want || got.Status != "queued" || got.StopKind.Valid || got.PolicyFreshClaimGeneration.Valid {
-				t.Fatalf("scope=%v status=%s stop=%v", got.ScopeCeiling, got.Status, got.StopKind)
+			if !got.ScopeCeiling.Valid || int(got.ScopeCeiling.Int32) != want || *res.ScopeCeiling != want || got.Status != "queued" || got.StopKind.Valid || got.PolicyFreshClaimGeneration.Valid || got.SessionID != before.SessionID {
+				t.Fatalf("scope=%v status=%s stop=%v session=%v", got.ScopeCeiling, got.Status, got.StopKind, got.SessionID)
 			}
 			var audits int
 			if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('scope','resume')", e.runID).Scan(&audits); err != nil || audits != 2 {
 				t.Fatalf("audits=%d err=%v", audits, err)
 			}
+			// Keep the original resume-rejected -> explicit fresh retry ceiling oracle.
 			if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET status='claimed',claim_generation=2 WHERE id=$1", e.runID); err != nil {
 				t.Fatal(err)
 			}
 			req := PolicyHoldRequest{OutcomeID: uuid.NewString(), SourceGeneration: 2, ClaimGeneration: 2, Detail: "resume_rejected"}
-			held, _, err = e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
+			held, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -96,24 +171,29 @@ func TestPolicyOwnerStopLiveDB(t *testing.T) {
 }
 
 func TestPolicyOwnerStopTokenRefusedLiveDB(t *testing.T) {
-	e := setupPolicyHold(t)
-	if _, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest()); err != nil {
+	e := newPolicyOwnerStopFixture(t, `["m1"]`)
+	_ = policyOwnerStopReview(t, e)
+	if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET policy_fresh_claim_generation=1 WHERE id=$1", e.runID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET kind='issue',issue_iid=101,milestones_frozen='[{\"id\":\"m1\",\"title\":\"one\"}]',milestones_completed='[\"m1\"]',session_id='keep-stop-session',policy_fresh_claim_generation=1 WHERE id=$1", e.runID); err != nil {
-		t.Fatal(err)
-	}
-	for _, token := range []string{"", "\"stale\""} {
-		if _, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish", nil, SubmitInputOptions{ActionIfMatch: token}); !errors.Is(err, ErrStaleClaim) {
-			t.Fatalf("token=%q err=%v", token, err)
+	for _, token := range []string{"", "stale", PolicyHoldActionToken(mustRun(t, e.codexTestEnv, e.runID))} {
+		baseline := policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID)
+		_, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish", nil, SubmitInputOptions{ActionIfMatch: token})
+		reason := "policy_stop_token_stale"
+		if token == "" {
+			reason = "policy_stop_token_required"
 		}
-		got := mustRun(t, e.codexTestEnv, e.runID)
-		if got.Status != "paused" || got.ScopeCeiling.Valid || got.SessionID.String != "keep-stop-session" || !got.PolicyFreshClaimGeneration.Valid {
-			t.Fatal("rejected stop changed state")
+		requirePolicyOwnerStopConflict(t, err, reason)
+		if policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != baseline {
+			t.Fatal("invalid token mutated database")
 		}
-		var n int
-		if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('scope','resume')", e.runID).Scan(&n); err != nil || n != 0 {
-			t.Fatalf("inputs=%d err=%v", n, err)
+		// Ownership must be checked before revealing token validation.
+		_, err = e.svc.SubmitInputWithOptions(e.ctx, uuid.New(), e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: token})
+		if !errors.Is(err, ErrRunNotFound) {
+			t.Fatalf("wrong owner disclosed Stop token validation: %v", err)
+		}
+		if policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != baseline {
+			t.Fatal("wrong owner mutated database")
 		}
 	}
 }
@@ -125,28 +205,17 @@ func TestPolicyOwnerStopRefusalsLiveDB(t *testing.T) {
 		"hold_reason='completion_blocked'",
 	} {
 		t.Run(mutation, func(t *testing.T) {
-			e := setupPolicyHold(t)
-			held, _, err := e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, policyRequest())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET kind='issue',issue_iid=101,milestones_frozen='[{"id":"m1","title":"one"}]',milestones_completed='["m1"]' WHERE id=$1`, e.runID); err != nil {
-				t.Fatal(err)
-			}
-			// Each mutation is a literal test fixture, never an owner-provided command.
+			e := newPolicyOwnerStopFixture(t, `["m1"]`)
+			review := policyOwnerStopReview(t, e)
+			// Each mutation is a literal fixture, never an owner-provided command.
 			if _, err := e.pool.Exec(e.ctx, "UPDATE runs SET "+mutation+" WHERE id=$1", e.runID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: PolicyHoldActionToken(held)}); err == nil {
-				t.Fatal("invalid stop accepted")
-			}
-			got := mustRun(t, e.codexTestEnv, e.runID)
-			if got.Status != "paused" || got.ScopeCeiling.Valid || got.StopKind.Valid {
-				t.Fatal("refused stop wrote state")
-			}
-			var n int
-			if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('scope','resume')", e.runID).Scan(&n); err != nil || n != 0 {
-				t.Fatalf("inputs=%d err=%v", n, err)
+			baseline := policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID)
+			_, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "", nil, SubmitInputOptions{ActionIfMatch: review.StopIfMatch})
+			requirePolicyOwnerStopConflict(t, err, "policy_stop_review_unverifiable")
+			if policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != baseline {
+				t.Fatal("ineligible Stop mutated run, feedback or audits")
 			}
 		})
 	}

@@ -103,7 +103,8 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 	// A Stop token always identifies this transaction, including an accepted replay
 	// after the run moved. Never fall through to an ordinary scope write.
-	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || PolicyOwnerConstrained(run)) {
+	// A running constrained run without that token or resolution retains ordinary Stop.
+	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || (PolicyOwnerConstrained(run) && run.Status != "running")) {
 		if opts.ExpectedGateRevision != nil {
 			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
 		}
@@ -1174,9 +1175,9 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 		if terminalStatuses[current.Status] {
 			return SubmitInputResult{}, ErrRunTerminal
 		}
-		// A Stop presented before a policy hold cannot mutate its newly held scope.
-		// The dedicated paused-policy path authorizes its own token under this lock.
-		if len(stopping) > 0 && stopping[0] && current.Status == "paused" && PolicyOwnerConstrained(current) {
+		// An ordinary Stop cannot cross a refusal or its preserving resume to queued.
+		// Constrained runs must still be running when this lock is acquired.
+		if len(stopping) > 0 && stopping[0] && current.Status != "running" && PolicyOwnerConstrained(current) {
 			return SubmitInputResult{}, ErrStaleClaim
 		}
 		frozen, err := DecodeMilestones(current.MilestonesFrozen)
