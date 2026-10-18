@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { z } from "zod";
+import { MaintenanceBudget } from "./maintenance-budget.js";
 
 export const MAINTENANCE_VERIFIER_VERSION = 1;
 const DEFAULT_MAINTENANCE_DECODED_CAP = 8 * 1024 ** 3;
@@ -120,6 +121,7 @@ export interface MaintenanceSlot {
 interface Live {
   root: string; cycle: string; nonce: string; deadline: number; monotonicDeadline: number; now: () => number; monotonicNow: () => number;
   revoked: boolean; finished: boolean; lastObserved: number; used: Quotas; limits: Quotas; signal?: AbortSignal;
+  controller: AbortController; timer?: ReturnType<typeof setTimeout>;
 }
 const tokens = new WeakMap<MaintenanceSlot, Live>();
 const resources = new AsyncLocalStorage<MaintenanceSlot>();
@@ -176,6 +178,7 @@ export class RecoveryMaintenance {
       while (length < buffer.length) {
         const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
         if (!bytesRead) break;
+        MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
         length += bytesRead;
       }
       if (length > max) refuse("maintenance_state_invalid");
@@ -428,7 +431,10 @@ export class RecoveryMaintenance {
         originalCycleExpiry: cycle.originalCycleExpiry, start: now, deadline });
       const live: Live = { root, cycle: key, nonce: slot.nonce, deadline, now: () => this.now(),
         monotonicDeadline, monotonicNow,
-        revoked: false, finished: false, lastObserved: observedAfter, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal };
+        revoked: false, finished: false, lastObserved: observedAfter, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal, controller: new AbortController() };
+      live.signal = AbortSignal.any([live.controller.signal, ...(options.signal ? [options.signal] : [])]);
+      live.timer = setTimeout(() => live.controller.abort(new Error("maintenance deadline exhausted")), Math.max(0, live.monotonicDeadline - live.monotonicNow()));
+      live.timer.unref();
       tokens.set(token, live);
       const running = active.get(root) ?? new Map<string, Live>();
       running.set(id, live); active.set(root, running);
@@ -484,12 +490,16 @@ export class RecoveryMaintenance {
   async finish(token: MaintenanceSlot, outcome: "transient" | "complete" | "permanent" | "nonmutating" = "complete"): Promise<MaintenanceResult<void>> {
     const live = tokens.get(token);
     if (!live || live.finished) return deny("maintenance_token_invalid");
+    if (live.timer) clearTimeout(live.timer);
     live.finished = true;
     live.revoked = true;
+    live.controller.abort(new Error("maintenance_token_invalid"));
     const running = active.get(live.root);
     // At most CAPACITY reservations; release only this exact joined owner.
     for (const [id, reservation] of running ?? []) if (reservation === live) running!.delete(id);
-    return this.transaction(async (root, table) => {
+    // Joined bookkeeping is bounded by the authenticated table format; it grants
+    // no production and must still persist after the work scope has been revoked.
+    return resources.exit(() => discovery.exit(() => this.transaction(async (root, table) => {
       if (root !== live.root) return deny("maintenance_token_invalid");
       const cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === live.cycle);
       if (!cycle || !cycle.slots.some(s => s.nonce === live.nonce)) return deny("maintenance_token_invalid");
@@ -498,24 +508,44 @@ export class RecoveryMaintenance {
       if (outcome === "complete" || outcome === "permanent") cycle.exhausted = true;
       await this.save(root, table);
       return { ok: true, value: undefined };
-    });
+    })));
   }
 }
 function checked(token: MaintenanceSlot): Live {
   const live = tokens.get(token);
   if (!live || live.revoked) refuse("maintenance_token_invalid");
   const now = live.now();
-  if (now < live.lastObserved) refuse("maintenance_clock_invalid");
+  if (now < live.lastObserved) {
+    live.revoked = true;
+    live.controller.abort(new Error("maintenance_clock_invalid"));
+    refuse("maintenance_clock_invalid");
+  }
   live.lastObserved = now;
   if (now >= live.deadline || live.monotonicNow() >= live.monotonicDeadline || live.signal?.aborted) {
     live.revoked = true;
+    live.controller.abort(new Error("maintenance_token_invalid"));
     refuse("maintenance_token_invalid");
   }
   return live;
 }
+interface Discovery {
+  deadline: number; monotonicDeadline: number; signal: AbortSignal; controller: AbortController;
+  used: Partial<Record<MaintenanceResource | "candidates", number>>;
+}
+const discovery = new AsyncLocalStorage<Discovery>();
+const discoveryLimits: Partial<Record<MaintenanceResource | "candidates", number>> = {
+  metadataBytes: 32 * 1024 ** 2, adminEntries: 4096, rpcAttempts: 16, candidates: 4, launches: 512,
+};
+function checkDiscovery(scope: Discovery): void {
+  if (scope.signal.aborted || Date.now() >= scope.deadline || performance.now() >= scope.monotonicDeadline) {
+    scope.controller.abort(new Error("maintenance_resource_exhausted"));
+    refuse("maintenance_resource_exhausted");
+  }
+}
 /** Separate producer resource scope. Nested fallback retains the original token and counters. */
 export class MaintenanceResources {
   static run<T>(token: MaintenanceSlot, action: () => T): T {
+    if (discovery.getStore()) refuse("maintenance_token_invalid");
     const current = resources.getStore() ?? token;
     checked(current);
     return resources.run(current, action);
@@ -525,9 +555,60 @@ export class MaintenanceResources {
     if (!token) refuse("maintenance_token_invalid");
     checked(token);
   }
-  static checkIfActive(): void { if (resources.getStore()) this.check(); }
-  static consumeIfActive(resource: MaintenanceResource, amount: number): void {
-    if (resources.getStore()) this.consume(resource, amount);
+  /** Metadata discovery never mints or accepts a producer token. Nested calls share all counters. */
+  static async runDiscovery<T>(action: () => Promise<T>, options: { signal?: AbortSignal; deadline?: number } = {}): Promise<T> {
+    if (resources.getStore()) refuse("maintenance_token_invalid");
+    const parent = discovery.getStore();
+    if (parent) checkDiscovery(parent);
+    const duration = Math.max(0, Math.min(10_000, (options.deadline ?? Infinity) - Date.now(),
+      parent ? parent.deadline - Date.now() : Infinity));
+    return MaintenanceBudget.runProducer(async budget => {
+      const scope: Discovery = { deadline: Math.min(Date.now() + duration, parent?.deadline ?? Infinity),
+        monotonicDeadline: Math.min(performance.now() + duration, parent?.monotonicDeadline ?? Infinity),
+        signal: budget.signal, controller: parent?.controller ?? new AbortController(), used: parent?.used ?? {} };
+      scope.signal = AbortSignal.any([budget.signal, scope.controller.signal, ...(parent ? [parent.signal] : [])]);
+      return discovery.run(scope, async () => {
+        checkDiscovery(scope);
+        const value = await action();
+        checkDiscovery(scope);
+        return value;
+      });
+    }, { durationMs: duration, signal: options.signal });
+  }
+  static active(): boolean { return !!resources.getStore() || !!discovery.getStore(); }
+  static remainingMsIfActive(): number {
+    const token = resources.getStore();
+    if (token) {
+      const live = checked(token);
+      return Math.max(0, Math.min(live.deadline - live.now(), live.monotonicDeadline - live.monotonicNow()));
+    }
+    const scope = discovery.getStore();
+    return scope ? Math.max(0, Math.min(scope.deadline - Date.now(), scope.monotonicDeadline - performance.now())) : Infinity;
+  }
+  static signalIfActive(): AbortSignal | undefined {
+    const token = resources.getStore();
+    return token ? tokens.get(token)?.signal : discovery.getStore()?.signal;
+  }
+  static checkIfActive(): void {
+    if (resources.getStore()) this.check();
+    const scope = discovery.getStore();
+    if (scope) checkDiscovery(scope);
+  }
+  static consumeIfActive(resource: MaintenanceResource | "candidates", amount: number): void {
+    if (resources.getStore()) {
+      if (resource === "candidates") return;
+      this.consume(resource, amount);
+    }
+    const scope = discovery.getStore();
+    if (!scope) return;
+    checkDiscovery(scope);
+    const limit = discoveryLimits[resource];
+    const used = scope.used[resource] ?? 0;
+    if (limit === undefined || !Number.isSafeInteger(amount) || amount < 0 || amount > limit - used) {
+      scope.controller.abort(new Error("maintenance_resource_exhausted"));
+      refuse("maintenance_resource_exhausted");
+    }
+    scope.used[resource] = used + amount;
   }
   /** Charge before delivery/launch/RPC. A failed charge never delivers partial allowance. */
   static consume(resource: MaintenanceResource, amount: number): void {
@@ -537,6 +618,7 @@ export class MaintenanceResources {
     if (!Object.hasOwn(live.limits, resource) || !Number.isSafeInteger(amount) || amount < 0 ||
       amount > live.limits[resource] - live.used[resource]) {
       live.revoked = true;
+      live.controller.abort(new Error("maintenance_resource_exhausted"));
       refuse("maintenance_resource_exhausted");
     }
     live.used[resource] += amount;

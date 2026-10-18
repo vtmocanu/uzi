@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { MaintenanceResources } from "./recovery-maintenance.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
@@ -2382,7 +2383,7 @@ export class WorkerClient {
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     };
     const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
-    const text = await readResponseText(res).catch(() => "");
+    const text = await readResponseText(res).catch(() => { MaintenanceResources.checkIfActive(); return ""; });
     MaintenanceBudget.current()?.check();
     if (res.status < 200 || res.status >= 300) {
       let reason = `http_${res.status}`;
@@ -4092,8 +4093,16 @@ function maintenanceSignal(timeoutMs: number): AbortSignal {
 }
 
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+  MaintenanceResources.consumeIfActive("rpcAttempts", 1);
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget) return transport(url, init);
+  if (!budget && !resourceSignal) return transport(url, init);
+  if (!budget) {
+    const res = await transport(url, init);
+    if (init.signal) responseSignals.set(res, init.signal);
+    return res;
+  }
   budget.check();
   const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
   const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
@@ -4111,10 +4120,10 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
 
 async function readResponseText(res: Response): Promise<string> {
   const budget = MaintenanceBudget.current();
-  if (!budget) return res.text();
-  budget.check();
+  if (!budget && !MaintenanceResources.active()) return res.text();
+  budget?.check();
   const text = await readBoundedText(res, MAINTENANCE_RESPONSE_MAX_BYTES, true);
-  budget.check();
+  budget?.check();
   responseSignals.get(res)?.throwIfAborted();
   return text;
 }
@@ -4189,6 +4198,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
   const budget = MaintenanceBudget.current();
   budget?.check();
   const responseSignal = responseSignals.get(res);
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  if (resourceSignal) signal = AbortSignal.any([resourceSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   if (!res.body) return Buffer.alloc(0);
   const reader = res.body.getReader();
@@ -4204,6 +4215,7 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
       budget?.check();
       signal?.throwIfAborted();
       if (done) break;
+      MaintenanceResources.consumeIfActive("metadataBytes", value.byteLength);
       if (rejectOverflow && value.byteLength > maxBytes - total) {
         throw new ResponseBodyOverflowError(maxBytes);
       }
