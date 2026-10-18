@@ -191,12 +191,33 @@ test("active journal byte exhaustion refuses actual read bytes before decode and
   const size = (await fs.stat(f.file(ordinary))).size;
   const reads = await observeJournalReads(t, f.file(ordinary), async () => {});
   const slot = await journalSlot(t, f);
+  const raw = await fs.readFile(f.file(ordinary), "utf8");
+  let utf8Decodes = 0, jsonDecodes = 0;
+  const toString = Buffer.prototype.toString, parse = JSON.parse;
+  t.mock.method(Buffer.prototype, "toString", function (this: Buffer, ...args: Parameters<Buffer["toString"]>) {
+    if (this.equals(Buffer.from(raw)) && args[0] === "utf8") utf8Decodes++;
+    return Reflect.apply(toString, this, args);
+  });
+  t.mock.method(JSON, "parse", (...args: Parameters<typeof JSON.parse>) => {
+    if (args[0] === raw) jsonDecodes++;
+    return parse(...args);
+  });
+  // Observe the exact journal payload only; ledger and setup decoding remain allowed.
+  await MaintenanceResources.run(slot, async () => {
+    assert.equal((await f.coordinator.inspect(f.context.runId)).length, 1);
+  });
+  assert.ok(utf8Decodes > 0);
+  assert.ok(jsonDecodes > 0);
+  utf8Decodes = 0; jsonDecodes = 0;
+  reads.length = 0;
   await MaintenanceResources.run(slot, async () => {
     MaintenanceResources.consume("metadataBytes",
-      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - size + 1);
+      256 * 1024 ** 2 - 2 * (Buffer.byteLength(ordinary + ".json") + size) + 1);
     await assert.rejects(f.coordinator.inspect(f.context.runId), /maintenance_resource_exhausted|maintenance_token_invalid/);
     assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), size);
     assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+    assert.equal(utf8Decodes, 0);
+    assert.equal(jsonDecodes, 0);
   });
 });
 
@@ -271,6 +292,62 @@ for (const stop of ["signal", "clock", "parent"] as const) {
     await assert.rejects(MaintenanceBudget.run(parent, () =>
       MaintenanceResources.run(slot, () => f.coordinator.inspect(f.context.runId))),
     /maintenance|abort/i);
+  });
+}
+
+for (const boundary of ["open", "final stat", "root realpath", "listing lstat", "opendir"] as const) {
+  test(`active journal expiry after ${boundary} prevents the next filesystem dispatch and joins close`, async t => {
+    const f = await fixture(t);
+    await f.seal(f.partial(ordinary));
+    let wall = 1_000_000, expired = false, forbidden = 0, closed = 0;
+    const slot = await journalSlot(t, f, undefined, () => wall);
+    const expire = () => { wall += 120_000; expired = true; };
+    const filename = f.file(ordinary), dir = path.dirname(filename);
+    const open = fs.open.bind(fs), lstat = fs.lstat.bind(fs);
+    const realpath = fs.realpath.bind(fs), opendir = fs.opendir.bind(fs);
+    t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+      const file = await open(...args);
+      if (args[0] !== filename) return file;
+      const stat = file.stat.bind(file), close = file.close.bind(file);
+      let stats = 0;
+      t.mock.method(file, "stat", async (...args: Parameters<typeof file.stat>) => {
+        if (expired) forbidden++;
+        const result = await stat(...args);
+        if (++stats === 2 && boundary === "final stat") expire();
+        return result;
+      });
+      t.mock.method(file, "close", async () => { await turn(); await close(); closed++; });
+      if (boundary === "open") expire();
+      return file;
+    });
+    let dirStats = 0;
+    t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+      if (expired && args[0] === filename) forbidden++;
+      const result = await lstat(...args);
+      if (args[0] === dir && ++dirStats === 2 && boundary === "listing lstat") expire();
+      return result;
+    });
+    t.mock.method(fs, "realpath", async (...args: Parameters<typeof fs.realpath>) => {
+      if (expired && args[0] === dir) forbidden++;
+      const result = await realpath(...args);
+      if (args[0] === f.recoveryRoot && boundary === "root realpath") expire();
+      return result;
+    });
+    t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+      if (expired && args[0] === dir) forbidden++;
+      const directory = await opendir(...args);
+      if (args[0] !== dir) return directory;
+      const read = directory.read.bind(directory), close = directory.close.bind(directory);
+      t.mock.method(directory, "read", async () => { if (expired) forbidden++; return read(); });
+      t.mock.method(directory, "close", async () => { await turn(); await close(); closed++; });
+      if (boundary === "opendir") expire();
+      return directory;
+    });
+    await assert.rejects(MaintenanceResources.run(slot, () => f.coordinator.inspect(f.context.runId)), /maintenance/i);
+    assert.equal(expired, true, "expiry seam must be reached");
+    assert.equal(forbidden, 0, "no new filesystem dispatch after expiry");
+    assert.equal(closed, boundary === "root realpath" || boundary === "listing lstat" ? 0 :
+      boundary === "final stat" || boundary === "open" ? 2 : 1, "all opened resources close before return");
   });
 }
 

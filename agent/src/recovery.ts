@@ -3206,28 +3206,34 @@ export class RecoveryCoordinator {
     if (pass.exhausted) throw new Error("terminal journal metadata exhausted");
   }
 
+  /** Check existing journal scopes only; no new clock or authority is introduced. */
+  private checkJournalMetadata(budget?: { signal: AbortSignal; deadline: number }): void {
+    this.checkSavedMetadata();
+    if (budget) {
+      MaintenanceBudget.current()?.check();
+      budget.signal.throwIfAborted();
+      if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+    }
+  }
+
   /** Stream raw names before any filtering. Each listing shares the saved pass counters;
    * the existing explicit proof budget and discovery limits may only tighten them.
    * One failed read stops this listing; the caller cannot use a partial lock/proof view. */
   private async *journalNames(dir: string, budget?: { signal: AbortSignal; deadline: number },
     completeOrigin = false): AsyncGenerator<string> {
-    this.checkSavedMetadata();
+    this.checkJournalMetadata(budget);
     const directory = await fs.opendir(dir);
     let entries = 0;
     try {
       for (;;) {
-        this.checkSavedMetadata();
-        budget?.signal.throwIfAborted();
-        if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
+        this.checkJournalMetadata(budget);
         if (completeOrigin) M1MaintenanceResources.checkIfActive();
         // Reserve the read before dispatch, including an eventual EOF visit. A
         // completed listing cannot refund work to a later nested listing.
         this.checkSavedMetadata("entries", 1);
         M1MaintenanceResources.consumeIfActive("adminEntries", 1);
         const entry = await directory.read();
-        this.checkSavedMetadata();
-        budget?.signal.throwIfAborted();
-        if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
+        this.checkJournalMetadata(budget);
         if (!entry) break;
         M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
         this.checkSavedMetadata("bytes", Buffer.byteLength(entry.name));
@@ -3235,6 +3241,7 @@ export class RecoveryCoordinator {
         yield entry.name;
       }
     } finally { await directory.close(); }
+    this.checkJournalMetadata(budget);
   }
 
   private savedSourceCandidate(record: RecoveryRecord): boolean {
@@ -4154,49 +4161,60 @@ export class RecoveryCoordinator {
   }
 
   /** Shared directory containment checks; no filename or record grants authority. */
-  private async checkedRecordDirectory(runId: string): Promise<string | undefined> {
+  private async checkedRecordDirectory(runId: string, budget?: { signal: AbortSignal; deadline: number }): Promise<string | undefined> {
+    this.checkJournalMetadata(budget);
     if (!/^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(runId)) throw new Error("unsafe recovery run id");
     const root = path.resolve(this.recoveryRoot);
     const dir = this.runDir(runId);
     for (const directory of [root, dir]) {
       let stat;
+      this.checkJournalMetadata(budget);
       try { stat = await fs.lstat(directory); }
       catch (err) { MaintenanceBudget.current()?.check();
-        this.checkSavedMetadata();
+        this.checkJournalMetadata(budget);
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw err;
       }
-      this.checkSavedMetadata();
+      this.checkJournalMetadata(budget);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe recovery directory");
     }
     // The lstat checks above reject a symlinked recovery root or run directory. A symlinked
     // ANCESTOR of the root (a symlinked data dir) is a legitimate layout every other journal
     // read already tolerates, so containment compares against the canonical root, not the lexical one.
+    this.checkJournalMetadata(budget);
     const realRoot = await fs.realpath(root);
-    if (await fs.realpath(dir) !== path.join(realRoot, path.basename(dir))) {
+    this.checkJournalMetadata(budget);
+    const realDir = await fs.realpath(dir);
+    this.checkJournalMetadata(budget);
+    if (realDir !== path.join(realRoot, path.basename(dir))) {
       throw new Error("symlink recovery directory");
     }
-    this.checkSavedMetadata();
+    this.checkJournalMetadata(budget);
     return dir;
   }
 
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
   private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false): Promise<RecoveryRecord[]> {
-    this.checkSavedMetadata();
-    const dir = await this.checkedRecordDirectory(runId);
+    this.checkJournalMetadata(budget);
+    const dir = await this.checkedRecordDirectory(runId, budget);
+    this.checkJournalMetadata(budget);
     if (!dir) return [];
     let names: string[];
     // Disappearance after a positive directory check is unknown, not empty proof.
     const before = await fs.lstat(dir);
+    this.checkJournalMetadata(budget);
     if (budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) {
       names = [];
       for await (const name of this.journalNames(dir, budget, completeOrigin)) names.push(name);
     } else names = await fs.readdir(dir);
+    this.checkJournalMetadata(budget);
     const records: RecoveryRecord[] = [];
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
+      this.checkJournalMetadata(budget);
       const result = await this.readRecordResult(path.join(dir, name), true, budget, completeOrigin);
+      this.checkJournalMetadata(budget);
       if (result.kind !== "ok" || result.record.runId !== runId ||
           name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
       records.push(result.record);
@@ -4209,17 +4227,23 @@ export class RecoveryCoordinator {
         if (name.endsWith(".json")) continue;
         // Unknown entries, including truncated namespace filenames and incomplete writes,
         // cannot prove an empty or ordinary-only inventory. Names grant no origin authority.
-        if (!bundles.has(name) || !(await fs.lstat(path.join(dir, name))).isFile()) {
+        this.checkJournalMetadata(budget);
+        if (!bundles.has(name)) throw new Error("unknown recovery journal entry");
+        const stat = await fs.lstat(path.join(dir, name));
+        this.checkJournalMetadata(budget);
+        if (!stat.isFile()) {
           throw new Error("unknown recovery journal entry");
         }
       }
     }
+    this.checkJournalMetadata(budget);
     const after = await fs.lstat(dir);
+    this.checkJournalMetadata(budget);
     if (completeOrigin && budget) {
       budget.signal.throwIfAborted();
       if (Date.now() >= budget.deadline) throw new Error("origin journal deadline");
     }
-    this.checkSavedMetadata();
+    this.checkJournalMetadata(budget);
     if ((budget || this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
         before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
@@ -4307,13 +4331,13 @@ export class RecoveryCoordinator {
     }
     let raw: string;
     try {
-      this.checkSavedMetadata();
-      budget?.signal.throwIfAborted();
-      if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
+      this.checkJournalMetadata(budget);
       if (noFollow) {
         const file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         try {
+          this.checkJournalMetadata(budget);
           const before = await file.stat({ bigint: true });
+          this.checkJournalMetadata(budget);
           if (!before.isFile()) return { kind: "unreadable" };
           if (budget) {
             if (before.size > BigInt(1024 * 1024)) return { kind: "unreadable" };
@@ -4326,36 +4350,32 @@ export class RecoveryCoordinator {
               savedPass ? 32 * 1024 ** 2 - savedPass.bytes + 1 : Infinity));
             let length = 0;
             while (length < bytes.length) {
-              this.checkSavedMetadata();
-              budget.signal.throwIfAborted();
-              if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+              this.checkJournalMetadata(budget);
               const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
               M1MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
               this.checkSavedMetadata("bytes", bytesRead);
-              budget.signal.throwIfAborted();
-              if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+              this.checkJournalMetadata(budget);
               if (!bytesRead) break;
               length += bytesRead;
             }
             if (quiet) M1MaintenanceResources.checkIfActive();
             if (length > 1024 * 1024) return { kind: "unreadable" };
+            this.checkJournalMetadata(budget);
             const after = await file.stat({ bigint: true });
+            this.checkJournalMetadata(budget);
             const named = await fs.lstat(filePath, { bigint: true });
+            this.checkJournalMetadata(budget);
             if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
                 before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
                 before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) return { kind: "unreadable" };
-            this.checkSavedMetadata();
-            budget.signal.throwIfAborted();
-            if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
+            this.checkJournalMetadata(budget);
             raw = bytes.subarray(0, length).toString("utf8");
           } else raw = await file.readFile("utf8");
         } finally { await file.close(); }
       } else {
         raw = await fs.readFile(filePath, "utf8");
       }
-      this.checkSavedMetadata();
-      budget?.signal.throwIfAborted();
-      if (budget && Date.now() >= budget.deadline) throw new Error("report journal deadline");
+      this.checkJournalMetadata(budget);
     } catch (err) { MaintenanceBudget.current()?.check();
       this.checkSavedMetadata();
       return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
@@ -4413,15 +4433,19 @@ export class RecoveryCoordinator {
     if (this.savedEvidenceOnly.getStore() || M1MaintenanceResources.active()) {
       this.checkSavedMetadata();
       const dir = await this.checkedRecordDirectory(runId);
+      this.checkSavedMetadata();
       if (!dir) return [];
       const before = await fs.lstat(dir);
+      this.checkSavedMetadata();
       const out: RecoveryRecord[] = [];
       for await (const name of this.journalNames(dir)) {
         if (!name.endsWith(".json")) continue;
         const record = await this.readRecord(path.join(dir, name));
         if (record) out.push(record);
       }
+      this.checkSavedMetadata();
       const after = await fs.lstat(dir);
+      this.checkSavedMetadata();
       if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
           before.ctimeMs !== after.ctimeMs) throw new Error("terminal journal directory changed");
       this.checkSavedMetadata();
