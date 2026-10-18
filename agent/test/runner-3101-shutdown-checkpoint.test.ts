@@ -1,5 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import type { Executor, RunContext } from "../src/executor.js";
 import type { GracefulShutdownCheckpoint } from "../src/harness.js";
 import { RunDiskLocks } from "../src/run-disk-locks.js";
@@ -7,10 +9,54 @@ import type { SteeringChannel } from "../src/steering.js";
 import {
   client, deferred, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith,
 } from "./runner-harness.js";
-import { codexRig, type CodexRig } from "./runner-codex-sinks-fixture.js";
+import { codexRig, commitInTree, type CodexRig } from "./runner-codex-sinks-fixture.js";
 import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 
 installHarness();
+
+for (const refusal of ["timeout", "boundary_blocked"] as const) {
+  it(`#3101 shutdown preflight ${refusal} retains unpublished clone bytes`, async t => {
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const started = deferred();
+    let context: RunContext | undefined;
+    const executor: Executor = {
+      run: async ctx => {
+        context = ctx;
+        executor.safety = codexRig({
+          lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
+        }).safety;
+        commitInTree(ctx.worktreePath, "retained.txt", "committed before shutdown\n");
+        fs.writeFileSync(path.join(ctx.worktreePath, "retained.txt"), "dirty retained bytes\n");
+        fs.writeFileSync(path.join(ctx.worktreePath, "untracked.txt"), "untracked retained bytes\n");
+        started.resolve();
+        await new Promise<void>(resolve => ctx.signal!.addEventListener("abort", () => resolve(), { once: true }));
+        throw new Error("worker shutdown");
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      checkpointTickIntervalMs: 0, codexBoundaryDeadlineMs: 1_000, shutdownPublishTimeoutMs: 1_000,
+    });
+    const claim = gitlabClaim(refusal === "timeout" ? 310107 : 310108);
+    const execution = runner.execute(claim);
+    try {
+      await Promise.race([started.promise, execution.then(() => { throw new Error("run ended before readiness"); })]);
+      const active = (runner as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> })
+        .activeRuns.get(claim.run_id)!;
+      runner.shutdown();
+      if (refusal === "timeout") now += 1_000;
+      else active.steering.markCancelled();
+      await execution;
+      assert.equal(fs.existsSync(context!.worktreePath), true, "preflight refusal must retain the only unpublished source");
+      assert.equal(fs.readFileSync(path.join(context!.worktreePath, "retained.txt"), "utf8"), "dirty retained bytes\n");
+      assert.equal(fs.readFileSync(path.join(context!.worktreePath, "untracked.txt"), "utf8"), "untracked retained bytes\n");
+    } finally {
+      runner.shutdown();
+      await execution;
+    }
+  });
+}
 
 it("#3101 actual Runner late admission inherits the original deadline across repeated shutdown", async t => {
   const start = Date.now();

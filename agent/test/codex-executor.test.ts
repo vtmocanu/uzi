@@ -18965,6 +18965,12 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
   const diagnostics = recordingLog();
   const client = new WorkerClient(url, "3101-worker", "test", diagnostics.log,
     { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+  const getInputs = client.getInputs.bind(client);
+  let inputGetsStarted = 0;
+  client.getInputs = (...args) => {
+    inputGetsStarted++;
+    return getInputs(...args);
+  };
   client.protocolFeatures = ["run_checkpoint_durability"];
   const iid = 310101;
   const claim = makeClaim({
@@ -19004,7 +19010,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
       if (context?.signal?.aborted && !remoteCancelled) {
         assert.equal(api.codexRequests.filter(r => r.operation === "refresh").length, 1,
           "remote cancel lands after shutdown reconcile and before its first Git child");
-        getsAtCancel = api.inputGets.get(claim.run_id) ?? 0;
+        getsAtCancel = inputGetsStarted;
         receiptsAtCancel = api.inputReceiptCalls.length;
         // Remote-only owner cancel under the SAME still-bound claim. The stopped
         // steering loop consumes no GET/ACK/APPLIED and delivers no local stop.
@@ -19082,7 +19088,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     assert.equal(remoteCancelled, true, "broker receipt remains eligible after remote-only cancel");
     assert.equal(api.parkRunOwnership!.status, "cancelled");
     assert.equal(api.parkRunOwnership!.claim_generation, claim.claim_generation);
-    assert.equal(api.inputGets.get(claim.run_id) ?? 0, getsAtCancel);
+    assert.equal(inputGetsStarted, getsAtCancel, "no input GET starts after remote cancellation during the sink");
     assert.equal(api.inputReceiptCalls.length, receiptsAtCancel);
   });
   const execution = runner.execute(claim);
@@ -19098,7 +19104,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     await withTimeout(execution, 60_000, "actual executor shutdown");
     await proof.verify(git);
     assert.equal(remoteCancelled, true, diagnostics.lines.join("\n"));
-    assert.equal(api.inputGets.get(claim.run_id) ?? 0, getsAtCancel);
+    assert.equal(inputGetsStarted, getsAtCancel, "no input GET starts after remote cancellation during the sink");
     assert.equal(api.inputReceiptCalls.length, receiptsAtCancel);
     assert.equal(api.inputReceiptCalls.some(r => r.ids.includes(3101)), false);
     assert.equal(api.parkRunOwnership!.claim_generation, claim.claim_generation);

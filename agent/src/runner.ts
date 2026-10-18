@@ -3616,8 +3616,14 @@ export class RunRunner {
             let permitSignal: AbortSignal | undefined;
             if (executor.safety) {
               const cause = flight.active!.gracefulShutdownCheckpoint!;
-              if (cause.stopSignal.aborted) return "boundary_blocked";
-              if (Date.now() >= cause.deadlineAt) return "timeout";
+              if (cause.stopSignal.aborted) {
+                flight.preserveRecoveryClone = true;
+                return "boundary_blocked";
+              }
+              if (Date.now() >= cause.deadlineAt) {
+                flight.preserveRecoveryClone = true;
+                return "timeout";
+              }
             }
             // issue #1597 M2: a surviving tick process group gets its bounded chance to go first.
             await this.awaitTickSurvivorsGone(flight);
