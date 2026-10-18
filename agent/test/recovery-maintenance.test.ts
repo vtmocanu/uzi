@@ -428,6 +428,17 @@ test("raised caps retain every configuration and restored exhausted caps cannot 
   refused(await ledger.admit(minted), "maintenance_lineage_invalid");
 });
 
+test("uncertain producer mutation cannot become an unseen source in the same custody", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible();
+  const token = take(await ledger.admit(input));
+  take(await ledger.finish(token, "transient"));
+  const rewritten = structuredClone(input);
+  rewritten.identity.originalSource = sha("unindexed-postmutation-tip");
+  rewritten.source = rewritten.identity.originalSource;
+  refused(await ledger.admit(rewritten), "maintenance_mutation_fenced");
+  assert.equal((await table(f.root)).cycles.length, 1);
+});
+
 test("configuration changes cannot bypass the durable lineage clock watermark", async t => {
   const f = await fixture(t), ledger = f.make(), input = eligible();
   input.config.decodedCap = 4096;
@@ -449,6 +460,22 @@ test("expiry observation cannot be forgotten by a later clock rollback", async t
   f.time(slot.originalCycleExpiry);
   refused(await ledger.admit(input), "maintenance_cycle_expired");
   f.time(slot.start + 900_000);
+  refused(await ledger.admit(input), "maintenance_clock_invalid");
+});
+
+test("postcharge expiry observation stays durable across rollback and revalidation", async t => {
+  const f = await fixture(t), input = eligible();
+  let jump = true;
+  const ledger = f.make({ prechargeHook: (phase: string) => {
+    if (phase === "after" && jump) f.time(1_000_000 + 86_400_000);
+  } });
+  refused(await ledger.admit(input), "maintenance_token_invalid");
+  const value = (await table(f.root)).cycles[0];
+  assert.equal(value.lastObserved, value.originalCycleExpiry);
+  assert.equal(value.slots.length, 1);
+  jump = false;
+  f.time(1_900_000);
+  refused(await ledger.revalidate(input), "maintenance_clock_invalid");
   refused(await ledger.admit(input), "maintenance_clock_invalid");
 });
 

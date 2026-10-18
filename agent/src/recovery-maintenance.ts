@@ -368,6 +368,10 @@ export class RecoveryMaintenance {
           return deny("maintenance_config_changed");
         if (table.cycles.some(c => c.outputs.includes(input.identity.originalSource)))
           return deny("maintenance_lineage_invalid");
+        // A changed tip cannot erase unresolved mutation provenance in this custody.
+        // Positive revalidation of the retained lineage must resolve it first.
+        if (hold.some(c => c.fenced && hash(c.identity) !== id))
+          return deny("maintenance_mutation_fenced");
         if (input.source !== input.identity.originalSource && !table.cycles.some(c => hash(c.identity) === id && c.outputs.includes(input.source)))
           return deny("maintenance_lineage_invalid");
         if (!Number.isSafeInteger(now + DAY)) return deny("maintenance_clock_invalid");
@@ -409,6 +413,12 @@ export class RecoveryMaintenance {
       await this.options.prechargeHook?.("after");
       const observedAfter = this.now();
       if (observedAfter < now) return deny("maintenance_clock_invalid");
+      // This observation is part of admission even when it refuses the charged slot.
+      // Persist it before returning, so rollback cannot reopen an observed expiry.
+      if (observedAfter > now) {
+        for (const sibling of table.cycles) if (hash(sibling.identity) === id) sibling.lastObserved = observedAfter;
+        await this.save(root, table);
+      }
       const monotonicDeadline = startedMonotonic + deadline - now;
       const finishedMonotonic = monotonicNow();
       if (!Number.isFinite(finishedMonotonic) || finishedMonotonic < startedMonotonic) return deny("maintenance_clock_invalid");
