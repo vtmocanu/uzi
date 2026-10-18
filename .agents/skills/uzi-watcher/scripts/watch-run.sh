@@ -3,10 +3,10 @@
 # transition with a timestamp. Launch with a verified native completion callback
 # or an explicitly delegated observer; background execution alone is not coverage.
 #
-# WHY a script and not `uzi run wait`: this harness reaps long-lived background
-# processes, so a backgrounded `uzi run wait` gets killed mid-run and you never
-# learn the outcome. A short poll loop that exits on the stop set survives,
-# but restarting a killed or expired poll is the owner's responsibility. This
+# Foreground tool calls have finite limits, not multi-hour coverage. This bounded
+# poller emits stop/expiry evidence for an explicitly owned completion route;
+# no process-lifetime guarantee follows from running in the background.
+# Restarting a killed or expired poll is the owner's responsibility. This
 # script neither notifies a session nor re-arms itself.
 #
 # uzi's benign "CLI is behind server" line goes to stderr and is discarded here.

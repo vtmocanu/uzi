@@ -147,6 +147,8 @@ session-peers completion guidance: bounded consented owner notification or an
 explicit native-capable peer observer, otherwise honest manual-only coverage.
 Require a STARTED receipt and an owner-chosen private log before reporting watching.
 Native callbacks do not guarantee process/session survival across interruption.
+A foreground tool call cannot hold a multi-hour wait: Claude Code's Bash foreground
+timeout is at most 10 minutes; other hosts have their own limits.
 
 ```
 <this skill's directory>/scripts/watch-run.sh RUN               # stops at gate/park/terminal
@@ -560,7 +562,7 @@ and falling back to the durable bare tracking ref when no clone survives:
   Pruning is path/name constrained, never follows symlinks, and preserves both latest targets.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
-  on Linux, a launchd LaunchAgent on macOS; this harness reaps `nohup` children).
+  on Linux, a launchd LaunchAgent on macOS; the Claude Code harness reaps `nohup` children).
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
   launchd refused a log path in Downloads before starting the job. Set the plist's
   `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
