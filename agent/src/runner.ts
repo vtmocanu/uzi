@@ -16005,6 +16005,7 @@ export class RunRunner {
           continue;
         }
         if (!capture) {
+          let settleIncomplete = false;
           let blockedDetail: string | undefined;
           let quarantinedCapture: ResidueQuarantinedError | undefined;
           try {
@@ -16013,9 +16014,13 @@ export class RunRunner {
                 this.shutdownSignal.signal, held => this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                   credentialFree: true, heldCapture: held, signal: held.signal,
                   terminalDisk: opts.terminalDisk,
-                })).then(result => result.kind === "observed_empty" ? result.value : {
-                  verified: false, published: false, residueBlocked: true,
-                  residueDetail: "credential-free capture unverified",
+                })).then(result => {
+                  if (result.kind === "observed_empty") return result.value;
+                  settleIncomplete = true;
+                  return {
+                    verified: false, published: false, residueBlocked: true,
+                    residueDetail: "credential-free capture unverified",
+                  };
                 })
               : await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
                 terminalDisk: opts.terminalDisk,
@@ -16112,7 +16117,7 @@ export class RunRunner {
           }
           if (!capture) {
             if (credentialDeferred) {
-              await note(feed.unverified);
+              await note(settleIncomplete ? feed.settleIncomplete : feed.unverified);
             } else if (!notified) {
               batcher.emit({
                 kind: "status",

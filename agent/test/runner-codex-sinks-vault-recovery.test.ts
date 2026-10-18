@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -356,6 +356,19 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     const rig = codexRig({ vaultLocked: () => true });
     let allow = false;
     let incomplete = 0;
+    let observeSource = false;
+    let sourceReads = 0;
+    let publications = 0;
+    const status = git.worktreeStatus.bind(git);
+    mock.method(git, "worktreeStatus", async (...args: Parameters<typeof status>) => {
+      if (observeSource && !allow) sourceReads += 1;
+      return status(...args);
+    });
+    const publish = client.publishCheckpoint.bind(client);
+    mock.method(client, "publishCheckpoint", async (...args: Parameters<typeof publish>) => {
+      if (observeSource && !allow) publications += 1;
+      return publish(...args);
+    });
     let reachedTwice!: () => void;
     const twice = new Promise<void>((r) => (reachedTwice = r));
     const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
@@ -368,6 +381,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     };
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       fs.writeFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "only copy\n");
+      observeSource = true;
       return { branch: ctx.branch };
     }, undefined, capture);
     const claim = gitlabClaim(1775);
@@ -384,10 +398,13 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
         "only copy\n",
         "the local work is retained",
       );
+      assert.equal(sourceReads, 0, "no capture source reads before process proof");
+      assert.equal(publications, 0, "no publication before process proof");
       assert.ok(feedTexts(claim.run_id).includes(VAULT_SETTLE_INCOMPLETE), "the wait is visible on the feed");
       allow = true;
       await execution;
       assert.equal(parkReports(claim.run_id).length, 1, "parked once the settle completed");
+      assert.equal(trackedFile(1775, "UNCOMMITTED.txt"), "only copy\n", "accepted capture preserves the actual bytes");
       assert.ok(!statuses(claim.run_id).includes("failed"));
     } finally {
       allow = true;

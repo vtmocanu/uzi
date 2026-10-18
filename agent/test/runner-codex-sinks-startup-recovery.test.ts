@@ -12,6 +12,7 @@ import {
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { carriesForgeCredential } from "../src/residue-quarantine.js";
 import { COMMAND_UID, WORKER_UID } from "../src/runner-uid.js";
 import { RejectedStartupTransport } from "./codex-rejected-startup-fixture.js";
 import type { Logger } from "../src/log.js";
@@ -83,7 +84,11 @@ describe("RunRunner M2 — lost refresh replies reconcile before credential reco
         try {
           client.protocolFeatures = [VAULT_FEATURE];
           const { gitlab, calls: mrCalls } = fakeGitlab();
-          const rig = codexRig({ credentialClient });
+          const processCredentials: boolean[] = [];
+          const rig = codexRig({ credentialClient, boundaryProcess: (request) => {
+            processCredentials.push(carriesForgeCredential(request.env));
+            return undefined;
+          } });
           const { logger, lines } = recordingLogger();
           const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
             commitInTree(ctx.worktreePath, "COMMITTED.txt", "committed, not yet fetched back\n");
@@ -103,7 +108,9 @@ describe("RunRunner M2 — lost refresh replies reconcile before credential reco
           assert.equal(parks[0]!.recovery_cause, reply === "vault_locked" || reply === "legacy_typed_first" ? "vault_locked" : undefined);
           assertCaptured(iid);
           assert.deepEqual(rig.boundaries, [sink], "no new boundary after reconciliation deferred");
-          assert.equal(rig.processSpawns(), 0, "no permit-held process action");
+          assert.ok(processCredentials.length > 0, "supervised credential-free Git captures the actual work");
+          assert.equal(processCredentials.length, rig.processSpawns(), "every actual process seam is observed");
+          assert.ok(processCredentials.every((credentialed) => !credentialed), "no spawned process carries forge credentials");
           assert.equal(api.completionPermitRequests.length, 0, "no completion authority requested");
           assert.equal(mrCalls.length, 0);
           assert.equal(custody(), 0);
