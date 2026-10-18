@@ -304,7 +304,8 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
 
   it("provider-hold continuation at the owner's scope ceiling still requests a permit and publishes a non-closing partial", async () => {
     await withHome(async homeRoot => {
-      client.protocolFeatures = FEATURES;
+      api.setRegisterProtocolFeatures([...FEATURES, "completion_non_closing_v1"]);
+      await client.register("provider-scope-continuation");
       const claim = gitlabClaim(3310, {
         claim_generation: 3,
         plan_source: "seeded",
@@ -313,6 +314,7 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
         milestones: [{ id: "m1", title: "Delivered" }, { id: "m2", title: "Deferred" }],
         config: { completion_contract_version: 1, contract_revision: 1 },
       });
+      api.setPublicationState(claim.run_id, [], 1);
       const parked = rigFor("claude", { turns: 1 }, homeRoot);
       api.ackTypedParkAs(claim.run_id, "paused", HOLD);
       await parked.runner.execute(claim);

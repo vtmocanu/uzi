@@ -2726,6 +2726,14 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Request-local guard projection; completion permit and frozen contract authority remain unchanged. */
+  completionProjection?: { revision: number; deferredIds: string[] };
+  completionAttempts?: number;
+  runId?: unknown;
+  workerId?: unknown;
+  workerIdentityMatches?: boolean;
+  /** The actual request generation, after feature and strict-decode fallback selection. */
+  sentClaimGeneration?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

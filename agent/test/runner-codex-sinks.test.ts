@@ -226,6 +226,7 @@ describe("M2 serial post-permit completion custody", () => {
       });
       api.setRegisterProtocolFeatures(["claim_generation_fence"]);
       await client.register("m2-codex");
+      api.setPublicationState(claim.run_id, [], 1);
       api.setCompletionPermitResponse(false, { denyReason: "incomplete" });
       api.completionHoldWire.set(claim.run_id, (res) => {
         ownershipReadsAfterHold = api.ownershipRequests.length;
@@ -335,6 +336,10 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     const claim = gitlabClaim(1916, {
       config: { completion_contract_version: 1, contract_revision: 1 },
     });
+    claim.claim_generation = 7;
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("permit-deadline");
+    api.setPublicationState(claim.run_id, [], 1);
     api.setCompletionPermitResponse(true, { httpStatus: 503 });
 
     let retryStarted!: () => void;

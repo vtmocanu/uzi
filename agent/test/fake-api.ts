@@ -187,6 +187,25 @@ export class FakeApi {
   // approval / the autopilot plan report); the worker reads it off the same body (readRunAck) and
   // binds its completion permit to it when the claim carried no contract_revision.
   private readonly stateAckCompletionRevision = new Map<string, unknown>();
+  private registeredWorkerId?: string;
+  private readonly publicationState = new Map<string, { deferred: unknown; attempts: number }>();
+  private readonly admittedAttempts = new Map<string, number>();
+  /** Opt in to the real hold admission rule; only successful attempts increment it. */
+  requireCompletionAttempt(runId: string, prior = 0): void {
+    this.admittedAttempts.set(runId, prior);
+    const state = this.publicationState.get(runId);
+    if (state) state.attempts = prior;
+  }
+  setPublicationState(runId: string, deferred: unknown = [], revision: unknown = 1, attempts?: number): void {
+    this.setStateAckCompletionRevision(runId, revision);
+    const count = attempts ?? this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0;
+    if (this.admittedAttempts.has(runId)) this.admittedAttempts.set(runId, count);
+    this.publicationState.set(runId, { deferred, attempts: count });
+  }
+  stateAckWire?: (body: StateRequest, run: Record<string, unknown>) => { status: number; body: unknown } | undefined;
+  completionAttemptHttpStatus = 200;
+  completionAttemptDropReplies = 0;
+  completionAttemptFailTimes = Infinity;
   // Issue #1514: the operator scope ceiling + completed ids the /state ACK's RunDTO carries.
   private readonly stateAckScope = new Map<string, { scope_ceiling: number; milestones_completed: string[] }>();
   private readonly stateRawOverride = new Map<
@@ -1038,7 +1057,8 @@ export class FakeApi {
       this.registers.push(rec);
       // PRD #1392 M2 (D7): the api advertises its protocol features here. Omit the field unless a
       // test configured one, so an unconfigured register wire stays byte-identical to an older api.
-      const registerBody: Record<string, unknown> = { worker_id: randomUUID() };
+      this.registeredWorkerId = randomUUID();
+      const registerBody: Record<string, unknown> = { worker_id: this.registeredWorkerId };
       if (this.registerProtocolFeatures !== undefined)
         registerBody.protocol_features = this.registerProtocolFeatures;
       if (this.registerNonce !== undefined) registerBody.register_nonce = this.registerNonce;
@@ -1477,9 +1497,22 @@ export class FakeApi {
     // configured decision. A non-200 httpStatus models a transport/HTTP error (the client throws);
     // otherwise {granted} rides a 200, with deny_reason on a denial.
     const attemptMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/attempt$/.exec(p);
-    if (req.method === "POST" && attemptMatch && this.completionAttemptWire) {
+    if (req.method === "POST" && attemptMatch) {
+      const runId = attemptMatch[1]!;
       this.completionAttemptRequests.push(json);
-      return send(res, 200, this.completionAttemptWire(json));
+      if (this.completionAttemptRequests.length <= this.completionAttemptFailTimes && this.completionAttemptHttpStatus !== 200)
+        return send(res, this.completionAttemptHttpStatus, { error: this.completionAttemptHttpStatus === 409 ? "run is not in a live claimed state for this worker" : "injected attempt failure" });
+      const count = (this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0) + 1;
+      const reply = this.completionAttemptWire?.(json) ?? { unmet: [], attempt_count: count };
+      this.admittedAttempts.set(runId, count);
+      const state = this.publicationState.get(runId);
+      if (state) state.attempts = count;
+      if (this.completionAttemptDropReplies > 0) {
+        this.completionAttemptDropReplies--;
+        res.destroy();
+        return;
+      }
+      return send(res, 200, reply);
     }
 
     const permitMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/permit$/.exec(p);
@@ -1511,6 +1544,8 @@ export class FakeApi {
     if (req.method === "POST" && holdMatch) {
       const runId = holdMatch[1] as string;
       this.completionHoldRequests.push({ runId, body: json });
+      if (this.admittedAttempts.has(runId) && this.admittedAttempts.get(runId)! < 1)
+        return send(res, 409, { run: { id: runId, status: "running" } });
       const wire = this.completionHoldWire.get(runId);
       if (wire) return wire(res);
       return send(res, this.completionHoldHttpStatus, {
@@ -1815,6 +1850,14 @@ export class FakeApi {
       }
       await after.action;
     }
+    if (this.stateAckWire) {
+      const state = this.publicationState.get(runId);
+      const answer = this.stateAckWire(body, {
+        id: runId, worker_id: this.registeredWorkerId, status: body.status,
+        ...(state ? { completion_revision: this.stateAckCompletionRevision.get(runId), completion_deferred: state.deferred, completion_attempts: state.attempts } : {}),
+      });
+      if (answer) return send(res, answer.status, answer.body);
+    }
     send(res, 200, {
       ...(this.checkedTransport && body.status === "awaiting_approval" ? {
         claim_generation: body.claim_generation, plan_cross_check_settled: true,
@@ -1831,6 +1874,11 @@ export class FakeApi {
       } : {}),
       run: {
         id: runId,
+        worker_id: this.registeredWorkerId,
+        ...(this.publicationState.has(runId) ? {
+          completion_deferred: this.publicationState.get(runId)!.deferred,
+          completion_attempts: this.publicationState.get(runId)!.attempts,
+        } : {}),
         // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves
         // StateAck.status undefined — the client cannot branch on it and falls through to ownership.
         ...(this.omitStateAckStatusRuns.has(runId)

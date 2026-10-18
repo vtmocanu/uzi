@@ -1866,9 +1866,9 @@ export class WorkerClient {
         path,
         includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined, expected_gate_revision: undefined, revision_input_id: undefined, superseded_revision_input_ids: undefined },
         signal,
-        // Terminal ACKs carry the full RunDTO, as strict gate ACKs do, not a small
-        // maintenance envelope. Keep their shared operational response cap.
-        b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
+        // Running and terminal ACKs carry the full RunDTO, as strict gate ACKs do.
+        // Enforce the shared response cap on actual streamed bytes.
+        b.status === "running" || b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
         evidence,
       );
     try {
@@ -1990,6 +1990,12 @@ export class WorkerClient {
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
+            runId: fields.runId,
+            workerId: fields.workerId,
+            workerIdentityMatches: !!this.registeredWorkerId && fields.workerId === this.registeredWorkerId,
+            sentClaimGeneration: body.claim_generation,
+            completionProjection: fields.completionProjection,
+            completionAttempts: fields.completionAttempts,
           };
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
@@ -3070,6 +3076,7 @@ export class WorkerClient {
       worktreeFingerprint: string | null;
       claimGeneration?: number;
     },
+    signal?: AbortSignal,
   ): Promise<{ unmet: string[]; attemptCount: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`;
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
@@ -3096,7 +3103,7 @@ export class WorkerClient {
         ...(nonClosing !== undefined ? { non_closing: nonClosing } : {}),
       };
       if (includeField) body.claim_generation = args.claimGeneration;
-      return this.postJSON(path, body);
+      return this.postJSON(path, body, this.httpTimeoutMs, signal);
     })) as CompletionAttemptResponse;
     return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
   }
@@ -3211,6 +3218,7 @@ export class WorkerClient {
   async requestCompletionHold(
     runId: string,
     args: { head: string; claimGeneration?: number },
+    signal?: AbortSignal,
   ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
@@ -3231,7 +3239,7 @@ export class WorkerClient {
     return this.withGenerationFallback(included, async (includeField) => {
       const body: { head: string; claim_generation?: number } = { head: args.head };
       if (includeField) body.claim_generation = args.claimGeneration;
-      const res = await this.fetchRaw("POST", path, body);
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
         return { status: fields.status ?? "" };
@@ -4088,6 +4096,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
+  completionProjection?: StateAck["completionProjection"];
+  completionAttempts?: number;
   budgetTotalSeconds?: number;
   budgetUsedSeconds?: number;
   scopeCeiling?: number;
@@ -4128,6 +4138,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
         completion_revision?: unknown;
+        completion_deferred?: unknown;
+        completion_attempts?: unknown;
         budget_total_seconds?: unknown;
         budget_used_seconds?: unknown;
         scope_ceiling?: unknown;
@@ -4158,6 +4170,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
+      completionProjection?: StateAck["completionProjection"];
+      completionAttempts?: number;
       budgetTotalSeconds?: number;
       budgetUsedSeconds?: number;
       scopeCeiling?: number;
@@ -4197,8 +4211,18 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // server) or any other shape leaves it undefined, which the finalize reads as "fall back to
     // the claim's contract_revision" (and holds fail-closed when that is absent too).
     const rev = run?.completion_revision;
-    if (typeof rev === "number" && Number.isInteger(rev) && rev >= 1)
+    if (typeof rev === "number" && Number.isSafeInteger(rev) && rev >= 1)
       out.contractRevision = rev;
+    const deferred = run?.completion_deferred;
+    if (out.contractRevision !== undefined && Array.isArray(deferred) && deferred.every(entry =>
+      isRecord(entry) && typeof entry.milestone_id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(entry.milestone_id))) {
+      out.completionProjection = {
+        revision: out.contractRevision,
+        deferredIds: [...new Set(deferred.map(entry => (entry as { milestone_id: string }).milestone_id))].sort(),
+      };
+    }
+    if (typeof run?.completion_attempts === "number" && Number.isSafeInteger(run.completion_attempts) && run.completion_attempts >= 0)
+      out.completionAttempts = run.completion_attempts;
     // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no
     // wall deadline) or absent (older server) leaves it undefined, and the sdk-executor falls
     // back to budgetWallSeconds.

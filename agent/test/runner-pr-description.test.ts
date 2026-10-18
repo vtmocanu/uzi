@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { assistant, resultOk, homeDir, input } from "./runner-harness.js";
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -23,6 +23,10 @@ import { FakePrDescApi } from "./fake-pr-desc-api.js";
 import { api, client, fakeGitlab as rawFakeGitlab, fx, git, gitlabClaim, installHarness, runner, runnerWith, type FakeForgeOpts } from "./runner-harness.js";
 
 installHarness();
+beforeEach(async () => {
+  api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+  await client.register("pr-description");
+});
 
 // PRD #1798 M6 (M6b): the description publisher and the completion interlock, end to end through the
 // REAL RunRunner.execute() (StubExecutor commits real work, phasePublish pushes it), against a fake
@@ -91,9 +95,12 @@ const OTHER = "2222222222222222222222222222222222222222";
 
 function interlockedClaim(iid: number, scope?: { deferred: { milestone_id: string; title: string; reason: string }[] }) {
   api.completionPermitScope = scope ?? {};
-  return gitlabClaim(iid, {
+  const claim = gitlabClaim(iid, {
+    claim_generation: 7,
     config: { completion_contract_version: 1, contract_revision: 1, ...(scope ? { completion_scope: scope } : {}) },
   });
+  api.setPublicationState(claim.run_id, scope?.deferred ?? [], 1);
+  return claim;
 }
 
 function statuses(runId: string): string[] {

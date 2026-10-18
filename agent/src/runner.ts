@@ -256,8 +256,8 @@ const QUEUED_DUPLICATE_END_LOG = "queued duplicate claim ended without executing
  *  cause (the recovery loop caps blocked proofs only for noncredential causes),
  *  because this runs synchronously inside the executor's completion loop, not the server-parked
  *  recovery loop.
- *  A never-verified capture DOES NOT park: enterCompletionHold clears its preserve flags and returns
- *  false, so the run's normal terminal cleanup runs (no park, no leak). */
+ *  Ordinary callers clear preserve flags and return false on capture exhaustion. Prepush refusals
+ *  instead request an empty-head hold while retaining the live clone and session. */
 const COMPLETION_HOLD_CAPTURE_ATTEMPTS = 3;
 
 /** PRD #1247 M5b (D3): bounded in-call attempts to capture a VERIFIED restore point before a
@@ -836,9 +836,8 @@ class HistoryRewrittenError extends Error {
   }
 }
 
-/** A local publication refusal was already terminally reported; unwind without another push. The
- *  base of every refusal signal so the finalize unwind sites and the push retry classifier handle
- *  them alike (issue #2779). */
+/** A permanent publication refusal unwinds without another push. Workflow/CI refusals are
+ *  already reported; a closing-commit refusal carries evidence to the outer hold helper. */
 class PublicationRefusedSignal extends Error {
   constructor(message = "publication refused") {
     super(message);
@@ -863,10 +862,9 @@ class CIConfigGuardRefusedSignal extends PublicationRefusedSignal {
   }
 }
 
-/** Issue #2779: a declared non-closing run's commit messages close its issue (or could not be read);
- *  failClosingCommits already terminally reported, so unwind without pushing. */
+/** Carry exact candidate evidence out of the push retry before requesting a hold. */
 class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
-  constructor() {
+  constructor(readonly head: string, readonly shas: string[] | null) {
     super("closing commit message refused");
     this.name = "ClosingCommitRefusedSignal";
   }
@@ -6194,9 +6192,11 @@ export class RunRunner {
     };
 
     let completionScope = claim.config?.completion_scope;
+    let publicationAck: StateAck | undefined;
+    let publicationProjection: StateAck["completionProjection"];
     // Both capped-empty and MR completion use the same bounded client retry and hold paths.
     const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
-      const contractRevision = flight.latestContractRevision ?? claim.config?.contract_revision;
+      const contractRevision = publicationProjection?.revision ?? flight.latestContractRevision ?? claim.config?.contract_revision;
       if (!head || !branch || contractRevision === undefined) {
         runLog.warn("completion interlock: head, branch or contract revision is unresolvable", { run_id: runId });
         await holdOrFailInterlocked("completion identity unresolvable");
@@ -6241,6 +6241,10 @@ export class RunRunner {
       // A grant's scope belongs to its revision. An explicit empty object clears stale
       // claim decisions; older APIs may omit scope only while the claim remains current.
       const grantRevision = permit.permit?.contractRevision ?? contractRevision;
+      if (publicationProjection && grantRevision !== publicationProjection.revision) {
+        await holdOrFailInterlocked("completion permit revision differs from publication guard");
+        return false;
+      }
       if (permit.permit?.completionScope !== undefined) {
         completionScope = permit.permit.completionScope;
       } else if (grantRevision > (claim.config?.contract_revision ?? 1)) {
@@ -6248,6 +6252,13 @@ export class RunRunner {
         return false;
       } else {
         completionScope = claim.config?.completion_scope;
+      }
+      if (publicationProjection) {
+        const resolvedIds = [...new Set((completionScope?.deferred ?? []).map(entry => entry.milestone_id))].sort();
+        if (JSON.stringify(resolvedIds) !== JSON.stringify(publicationProjection.deferredIds)) {
+          await holdOrFailInterlocked("completion permit scope differs from publication guard");
+          return false;
+        }
       }
       return true;
     };
@@ -6895,41 +6906,85 @@ export class RunRunner {
       );
     }
 
-    // Issue #2779: a declared non-closing issue run (current flight or stored claim, as phasePublish
-    // later turns into effectiveNonClosing) must not publish a commit message that closes its issue:
-    // the commit messages reach the default branch in the squash commit and close the issue there.
-    // Scan the messages a push would publish with the SAME matcher the body uses and refuse BEFORE any
-    // push or PR call. No history rewrite is attempted (that is the owner's call); the committed work
-    // stays preserved by the recovery capture the failed terminal report triggers. Any failure to read,
-    // parse or resolve the commit range refuses (null), never passes.
-    const closingGateIid =
-      resolveRunKind(claim.kind) === "issue" && (result.nonClosing ?? claim.config?.non_closing) && typeof claim.issue_iid === "number"
-        ? claim.issue_iid
-        : undefined;
+    const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
+    const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
+    let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
     const closingBarePath = barePath;
     const closingRepoPath = repoPathFromUrl(claim.repo.url);
-    /** The SHAs among the commits `tip` would publish whose message closes the issue, or null when
-     *  the range could not be read (tip absent or not a 40-hex OID, git or parse failure). */
+    // publishedCommitMessages scans default-branch..tip, including already-pushed history.
     const closingCommits = async (tip: string | null): Promise<string[] | null> => {
       if (!tip || closingGateIid === undefined || !closingBarePath) return null;
       const commits = await this.git.publishedCommitMessages(closingBarePath, tip);
       if (commits === null) return null;
-      return commits.filter(c => closingDirectiveFor(c.message, closingGateIid, closingRepoPath)).map(c => c.sha);
+      return commits.filter(c => closingDirectiveFor(c.message, closingGateIid!, closingRepoPath)).map(c => c.sha);
     };
-    let closingReported = false;
-    const failClosingCommits = async (shas: string[] | null) => {
-      if (closingReported) return;
-      closingReported = true;
+    let prepushReported = false;
+    const refusePrepush = async (kind: "closing" | "unknown", head: string | null, evidence: string[] | null = null): Promise<void> => {
+      if (prepushReported) return;
+      prepushReported = true;
+      // Never place unvalidated evidence or commit text in the feed or terminal journal.
+      const shas = evidence !== null && evidence.every(sha => /^[a-fA-F0-9]{40}$/.test(sha)) ? evidence : null;
       const shown = (shas ?? []).slice(0, 5).join(", ");
       const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
-      const failureReason = shas === null
+      const failureReason = kind === "unknown" ? COMPLETION_INTERLOCK_UNHELD_REASON : shas === null
         ? "non-closing delivery refused: could not read the commit messages to publish; publication stopped"
         : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); publication stopped; correcting them needs a history rewrite, left to the owner`;
+      const holdEligible = interlocked && !(effectiveDeclared && !this.client.hasFeature("completion_non_closing_v1"));
       batcher.emit({ kind: "status", agent: "worker", payload: {
-        text: shas === null
-          ? "non-closing delivery refused: the commit messages to publish could not be read; publication stopped"
-          : "non-closing delivery refused: a commit message closes the issue; publication stopped",
+        text: kind === "unknown"
+          ? holdEligible
+            ? "Completion state could not be confirmed before push; the run is held for the owner."
+            : "Completion state could not be confirmed before push; publication stopped."
+          : `${failureReason}; work is preserved for owner history correction; partial or accept decisions cannot fix commit history.${holdEligible ? " For unpublished history on a run without a Stop, choose continue with guidance for the lead to reword its own commits; for published history or a Stop, cancel and deliver the preserved work with corrected messages." : ""}`,
       } });
+      // An old API cannot retain declared intent on a new hold. Preserve the existing terminal path.
+      if (!holdEligible) {
+        await closeBatcher();
+        await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+        return;
+      }
+      const holdReason = kind === "unknown" ? "completion identity unresolvable" : "closing commit message refused";
+      runLog.info(holdReason, { run_id: runId });
+      const signal = boundarySignal ? AbortSignal.any([flight.cancel.signal, boundarySignal]) : flight.cancel.signal;
+      // One logical empty attempt, at most three transient sends. Ambiguous sends can increment
+      // the server count more than once; an exhausted/unknown attempt still proceeds to the hold.
+      if (!(publicationAck?.completionAttempts !== undefined && publicationAck.completionAttempts > 0)) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          signal.throwIfAborted();
+          try {
+            await this.client.recordCompletionAttempt(runId, {
+              milestonesCompleted: [], head, worktreeFingerprint: null,
+              claimGeneration: flight.claimGeneration,
+              ...(effectiveDeclared && this.client.hasFeature("completion_non_closing_v1") ? { nonClosing: effectiveDeclared } : {}),
+            }, signal);
+            break;
+          } catch (error) {
+            signal.throwIfAborted();
+            if (error instanceof RequestError && (error.status === 409 || error.status === 404)) {
+              let refusal: { reason?: unknown; error?: unknown } | undefined;
+              try { refusal = JSON.parse(error.body); } catch { /* Unknown refusal still requests hold. */ }
+              if ((error.status === 409 && (refusal?.reason === "stale_claim" ||
+                    refusal?.error === "run is not in a live claimed state for this worker")) ||
+                  (error.status === 404 && refusal?.error === "run not found for this worker"))
+                throw new StaleClaimError();
+            }
+            if (!isTransient(error) || attempt === 2) {
+              runLog.warn("prepush completion attempt unresolved; requesting hold", { error: errMessage(error) });
+              break;
+            }
+            await sleep(250 * 2 ** attempt, signal);
+          }
+        }
+      }
+      signal.throwIfAborted();
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog, {
+        publishCheckpoint: false, allowDegradedCapture: true, signal,
+      });
+      if (held) {
+        if (flight.completionHoldOutcome === "confirmed") await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        await closeBatcher().catch(() => undefined);
+        return;
+      }
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
@@ -7090,12 +7145,31 @@ export class RunRunner {
       }
     }
 
+    // This fresh ACK supplies only the request-local publication guard projection. Completion
+    // permit and frozen contract authority remain unchanged; cached ACKs cannot supply this guard.
+    if (interlocked && issuePublication) {
+      publicationAck = await flight.reportState({ status: "running" }, boundarySignal);
+      // Reuse the stopped-claim path so the owner's local bytes survive this nonterminal exit.
+      if (publicationAck.status !== "running") throw new StaleClaimError();
+      const generation = publicationAck.sentClaimGeneration;
+      if (!publicationAck.applied || publicationAck.status !== "running" ||
+          publicationAck.runId !== runId || !publicationAck.workerIdentityMatches ||
+          !Number.isSafeInteger(generation) || (generation ?? 0) <= 0 || generation !== flight.claimGeneration ||
+          !publicationAck.completionProjection) {
+        await refusePrepush("unknown", publicationOriginalHead);
+        return;
+      }
+      publicationProjection = publicationAck.completionProjection;
+      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0)
+        closingGateIid = claim.issue_iid!;
+    }
+
     // Early closing-commit refusal, placed AFTER the GitHub workflow precheck so a workflow-scope
     // refusal keeps precedence when a run trips both.
     if (closingGateIid !== undefined) {
       const hits = await closingCommits(publicationOriginalHead);
       if (hits === null || hits.length > 0) {
-        await failClosingCommits(hits);
+        await refusePrepush("closing", publicationOriginalHead, hits);
         return;
       }
     }
@@ -7209,8 +7283,7 @@ export class RunRunner {
           if (closingGateIid !== undefined) {
             const closing = await closingCommits(sourceSha);
             if (closing === null || closing.length > 0) {
-              await failClosingCommits(closing);
-              throw new ClosingCommitRefusedSignal();
+              throw new ClosingCommitRefusedSignal(sourceSha, closing);
             }
           }
           // Default-branch CI repair lane: the authoritative CI-config check on the exact owned
@@ -7895,7 +7968,10 @@ export class RunRunner {
       }
     } catch (e) {
       rethrowWorkflowAbort(e);
-      if (e instanceof PublicationRefusedSignal) return;
+      if (e instanceof PublicationRefusedSignal) {
+        if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+        return;
+      }
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -7974,7 +8050,10 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         rethrowWorkflowAbort(e);
-        if (e instanceof PublicationRefusedSignal) return;
+        if (e instanceof PublicationRefusedSignal) {
+          if (e instanceof ClosingCommitRefusedSignal) await refusePrepush("closing", e.head, e.shas);
+          return;
+        }
         if (e instanceof RunResidueBlockedError) throw e;
         if (await reportMovedBranchIfVerified(e)) return;
         if (e instanceof ScratchPublicationError) throw e;
@@ -8290,9 +8369,8 @@ export class RunRunner {
     // Issues #2779 and #2815: a non-closing issue delivery (declared, owner-partial or scope-capped)
     // opens its PR with a title that cannot close the issue on a squash merge (the issue title may
     // itself start with "Fixes #N"; mrTitle's "[partial] " prefix does not neutralise it). Full
-    // deliveries keep the plain title. The closing-commit refusal (closingGateIid) stays keyed on the
-    // explicit declaration only: owner-partial and scope-capped runs are not chosen by the agent, so
-    // they are not refused for a closing commit message (see #2815).
+    // deliveries keep the plain title. Interlocked owner-partial and scope-capped publication also
+    // refuses closing commit history using the publication-start projection and exact candidate.
     const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const titleFor = (): string => {
       const title = mrTitle(claim, result.scopeCapped, completionScope);
@@ -16611,7 +16689,7 @@ export class RunRunner {
     claim: ClaimResponse,
     reason: string,
     runLog: Logger,
-    options: { publishCheckpoint?: boolean } = {},
+    options: { publishCheckpoint?: boolean; allowDegradedCapture?: boolean; signal?: AbortSignal } = {},
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
@@ -16622,8 +16700,8 @@ export class RunRunner {
     flight.preserveSession = true;
     // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
     //    and-retry, but bounded — this runs inside the executor's completion loop). DURING the retries
-    //    an unverified capture retains the live clone and does NOT request a hold; only on GIVING UP
-    //    does it clear the flags and return false so the subsequent terminal outcome cleans up.
+    //    an unverified capture retains the live clone and does NOT request a hold. Ordinary callers
+    //    clear the flags on exhaustion; prepush callers instead request the degraded empty-head hold.
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
@@ -16645,6 +16723,7 @@ export class RunRunner {
     };
     if (holdQuiescence.blocked) captured = residueHold(holdQuiescence.outcome.process?.state);
     for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
+      options.signal?.throwIfAborted();
       if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog, options);
@@ -16663,6 +16742,10 @@ export class RunRunner {
       }
       if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
+    if ((!captured || captured.head === null) && options.allowDegradedCapture) {
+      runLog.warn("prepush completion hold: capture exhausted; retaining live clone and requesting an empty-head hold", { run_id: flight.runId });
+      captured = { verified: false, published: false, mode: "same_worker_only", head: "" };
+    }
     if (!captured || captured.head === null) {
       // Gave up: no verified restore point after the bounded retries. Clear the preserve flags so the
       // NOT-parked run follows normal terminal cleanup instead of leaking its clone + HOME.
@@ -16674,6 +16757,7 @@ export class RunRunner {
       );
       return false;
     }
+    options.signal?.throwIfAborted();
     const head = captured.head;
     flight.completionHoldOutcome = "unresolved";
     flight.parked = false;
@@ -16683,10 +16767,11 @@ export class RunRunner {
       const ack = await this.client.requestCompletionHold(flight.runId, {
         head,
         claimGeneration: flight.claimGeneration,
-      });
+      }, options.signal);
       status = ack?.status;
       if (status === "cancelled") this.observeCancellation(flight);
     } catch (holdError) {
+      options.signal?.throwIfAborted();
       runLog.warn("completion hold request ambiguous; retaining artifacts for ownership reconciliation", {
         run_id: flight.runId,
         error: errMessage(holdError),
