@@ -1376,7 +1376,8 @@ function issueArm(input: CompletionBlockInput): string[] {
         "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
         "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
         "> this merge request, so it does not close the issue:",
-        ...deferred.map((d) => `> - ${codeSpan(d.milestone_id)} — ${escapeInline(d.title)}: ${escapeInline(d.reason)}`),
+        "> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked.",
+        ...deferred.map((d) => `> - [ ] ${codeSpan(d.milestone_id)} — ${escapeInline(d.title)}: ${escapeInline(d.reason)}. Not delivered or verified by this run; must be completed or verified before closing the source issue.`),
       ]
     : input.scopeCapped
       ? [

@@ -8233,7 +8233,15 @@ export class RunRunner {
         result.gatesDiscoveryTruncated,
         result.scopeCapped,
         withCloses,
-        completionScope,
+        completionScope ? {
+          ...completionScope,
+          // Redact raw frozen metadata before inline escaping can split a registered secret.
+          deferred: completionScope.deferred?.map(d => ({
+            milestone_id: redactText(d.milestone_id),
+            title: redactText(d.title),
+            reason: redactText(d.reason),
+          })),
+        } : undefined,
         bridged,
         opts,
         result.codeCrossCheckSummary,
@@ -8659,6 +8667,15 @@ export class RunRunner {
     // the cap is redacted whole instead of cut and leaked as a prefix. It is never logged or
     // emitted: only byte counts.
     await this.saveDecisionsMemoBestEffort(flight, runKind, result.decisionsMemo);
+    if (runKind === "issue" && isOwnerPartial) {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `Retained scope delivered; ${completionScope!.deferred!.length} deferred milestone(s) still not delivered or verified by this run. The owner must complete or verify them before closing the source issue.`,
+        },
+      });
+    }
     await finishCommittedPublish({
       status: "completed",
       branch: result.branch,
