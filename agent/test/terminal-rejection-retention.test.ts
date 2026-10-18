@@ -58,7 +58,7 @@ test("bad MAC retains attempts above the limit, every ledger state, and terminal
       cmd(bare, "config", "--add", ledgerKey, JSON.stringify({ attemptId: id, runId: run, clonePath: `${canonical}.attempt-${id}`, state }));
     }
     const seeded = await git.runnerCloneForBranch(bare, branch, "issue-7", noProofReseed, "new-run", false, undefined, {
-      attemptId: mintAttemptId(9), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
+      attemptId: mintAttemptId(9), isLive: () => false, beforeSeed: async () => {},
     });
     for (const p of retained) assert.ok(fs.existsSync(p), p);
     const entries = cmd(bare, "config", "--get-all", ledgerKey).trim().split("\n").map((v) => JSON.parse(v));

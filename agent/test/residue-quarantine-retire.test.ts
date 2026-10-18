@@ -160,7 +160,7 @@ describe("worker residue quarantine latching inside the git release methods (#22
     const bare = await git.ensureClone(fx.originPath);
     const branch = `agent/issue-${iid}`;
     const attemptId = mintAttemptId(1);
-    const seedOpts: AttemptSeedOptions = { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+    const seedOpts: AttemptSeedOptions = { attemptId, isLive: () => false, beforeSeed: async () => {} };
     const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, owner, false, undefined, seedOpts);
     fs.writeFileSync(path.join(clone.path, "OWNER.txt"), "owner bytes\n");
     await git.markRecoveryCapture(bare, clone.path, branch, owner, clone.attemptId);

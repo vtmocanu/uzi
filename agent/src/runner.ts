@@ -2547,7 +2547,7 @@ export class RunRunner {
   /** issue #1783 M2: Docker wiring enables fresh `<key>.attempt-<attemptId>` paths by default,
    *  separating a successor's tree from late Docker binds to a predecessor's path. Recovery can
    *  enable attempt paths per flight even on unwired workers. Ordinary unwired keys use canonical
-   *  reseeding, including shared best-effort per-key residue retention. */
+   *  reseeding, including shared per-key retention diagnostics. */
   private readonly attemptPaths: boolean;
   /** PRD #1809 D6 (N3): aborted by `shutdown()` beside `shuttingDownGlobal`, so a pre-clone wait
    *  (the data-volume reclaim wait, before the flight joins `activeRuns`) can end on a shutdown. */
@@ -4458,8 +4458,7 @@ export class RunRunner {
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
       // issue #1783 M2: in attempt-path mode the next attempt runs at a NEW path with its own
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
-      // removed with it even on a park; a retained predecessor keeps its pair until the retention
-      // sweep deletes both.
+      // removed with it even on a park; automatic retention keeps a retained predecessor and its pair.
       const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (!this.cancellationExpired(flight) && flight.worktreePath && removeSkills) {
         await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps))
@@ -9325,7 +9324,7 @@ export class RunRunner {
         disposition = "retained-in-place";
       } else if ((flight.effectiveAttemptPaths ?? this.attemptPaths) && shape === "attempt") {
         // The foreign owner's work is retained IN PLACE (never moved) and was NOT captured, so it
-        // may be the only copy: the ledger says `reclaimed`, which the retention sweep never counts
+        // may be the only copy: the ledger says `reclaimed`, which automatic retention never counts
         // or deletes — the attempt-path twin of the foreign quarantine below (discard:false).
         await this.git.releaseAttemptInPlace(barePath, journaledPath, branch, ownerRunId, "reclaimed");
         disposition = "retained-in-place";
@@ -9345,9 +9344,6 @@ export class RunRunner {
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!(flight.effectiveAttemptPaths ?? this.attemptPaths) || attemptId === undefined) return undefined;
-    // Set when this seed's sweep could not attribute an unreadable process (below): every retention
-    // deletion of the same seed is then vetoed, whatever its own re-scan says.
-    let retentionVetoed = false;
     return {
       attemptId,
       isInterruption: canonicalRecoveryInterruption,
@@ -9374,10 +9370,9 @@ export class RunRunner {
         // exists. This honours the plan's "move nothing when unverified" rule rather than bending
         // it: seeding a FRESH attempt path moves, frees and deletes nothing (no predecessor path is
         // touched), so it is allowed; every step that WOULD move or free something still requires
-        // a quiescent proof, and the retention deletions of this same sweep are vetoed outright.
+        // a quiescent proof, and automatic retention only observes retained paths.
         // Only this seed mode relaxes it; capture and own proofs keep failing closed on unverified.
         if (unverifiedOnlyByUnattributedUnreadable(proof.outcome.process)) {
-          retentionVetoed = true;
           flight.runLog.warn("attempt seed: unattributable unreadable runner-uid process(es); seeding the fresh path, no retention deletion this seed", {
             site: "attempt_seed",
             processes: describeProcesses(proof.outcome.process),
@@ -9387,8 +9382,8 @@ export class RunRunner {
         throw new RunResidueBlockedError(proof.outcome.process?.detail ?? "not quiescent");
       },
       onSeeded: (clonePath) => {
-        // Live from the seed on (inside the bare lock), so a concurrent same-key seed's sweep
-        // never treats this attempt's fresh path as residue.
+        // Live from the seed on (inside the bare lock), so a concurrent same-key seed's
+        // diagnostics never classify this attempt's fresh path as abandoned.
         const attempt = newRunAttempt(
           claim.run_id,
           claim.claim_generation,
@@ -9399,20 +9394,6 @@ export class RunRunner {
         );
         flight.attempt = attempt;
         this.liveAttempts.add(attempt);
-      },
-      // Retention keeps its process-only posture: fresh-path seed relaxation never authorizes
-      // deletion, and quarantine is checked both before and after the affirmative process proof.
-      quiescent: async (paths, canonical) => {
-        if (retentionVetoed || residueQuarantine() !== undefined) return false;
-        const proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "seed",
-          site: "attempt_retention",
-          propagateControl: true,
-          targetPaths: paths,
-          clonePath: canonical,
-          processOnly: true,
-        });
-        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
       },
     };
   }
@@ -9432,24 +9413,13 @@ export class RunRunner {
    * inside it (a dev server, a container's bind), and deleting or moving its tree under it is exactly
    * the residue hazard this issue closes. So unverified blocks.
    *
-   * After successful canonical free, the git layer uses these predicates for shared per-key
-   * residue retention before seeding. Unlike attempt retention, this callback forwards configured
-   * best-effort Docker handling; unwired workers acquire no daemon obligation. Deletion still
-   * requires an affirmative scoped seed-process verdict and no worker quarantine before/after proof;
-   * absent/off-Linux proof keeps excess, while classified control/recovery interruptions escape.
+   * After successful canonical free, shared diagnostics report retained excess without
+   * requesting a process or daemon proof or reclaiming any retained artifact.
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
       isInterruption: canonicalRecoveryInterruption,
       isLive: (p) => this.liveAttempts.isLivePath(p),
-      quiescent: async (paths, canonical) => {
-        if (residueQuarantine() !== undefined) return false;
-        const proof = await this.quiesceRun(flight, flight.executor, {
-          mode: "seed", site: "canonical_retention", targetPaths: paths, clonePath: canonical,
-          propagateControl: true,
-        });
-        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
-      },
       beforeFree: async (canonical) => {
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
@@ -9914,7 +9884,7 @@ export class RunRunner {
 
     // Journal ownership before any model can write. The worker-owned bare config
     // survives failed captures, process restarts, and runner-owned clone tampering.
-    // issue #1783 M2: the retention sweep relies on this ordering (see attemptCloneForBranch): no
+    // Retention diagnostics rely on this ordering (see attemptCloneForBranch): no
     // executor or agent starts in a seeded attempt path before this write, so a ledger `live`
     // entry that no journal names, is not live here and holds no custody is a seed interrupted
     // before this line, with no agent work in it.
@@ -12402,10 +12372,9 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
-      // Process-only checks include attempt retention and re-proofs after runner-clone git.
+      // Process-only re-proofs run after runner-clone git.
       // That git runs with the worker's HOME (git.ts gitEnv), so its children carry the run's HOME
-      // only if deliberately set; the sink's first proof already ran the attributed reap. Attempt
-      // retention keeps its existing process-only scan over candidate paths. A child deliberately
+      // only if deliberately set; the sink's first proof already ran the attributed reap. A child deliberately
       // escaping both clone and HOME escapes both reaps (the documented worker-level residual).
       if (
         !opts.processOnly &&
@@ -12449,8 +12418,8 @@ export class RunRunner {
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
           // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
           processes: (opts.forceProcessScan || !executor.safety || mode !== "own") && process.platform === "linux",
-          // Process-only re-proofs and attempt retention omit Docker teardown. Canonical
-          // retention forwards the configured host; Docker handling stays best effort.
+          // Process-only re-proofs omit Docker teardown; other proofs forward the configured
+          // host. Docker handling stays best effort.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
           otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),

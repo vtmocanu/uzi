@@ -50,7 +50,7 @@ async function fixture(shared = false, attempted = false, receipted = true, fore
   const runId = literal.run_id, generation = literal.generation, branch = literal.branch;
   const attemptId = attempted ? `20261009T000000Z-g${generation}-1234567890abcdef` : undefined;
   const clone = (await git.runnerCloneForBranch(bare, branch, "issue-7", noProofReseed, runId, false, undefined,
-    attemptId ? { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true } : undefined)).path;
+    attemptId ? { attemptId, isLive: () => false, beforeSeed: async () => {} } : undefined)).path;
   cmd(clone, ["config", "user.name", "fixture"]);
   cmd(clone, ["config", "user.email", "fixture@example.com"]);
   cmd(clone, ["config", "commit.gpgsign", "false"]);

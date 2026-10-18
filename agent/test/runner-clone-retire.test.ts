@@ -682,7 +682,7 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
   }
 
   function attemptOptions(attemptId: string): AttemptSeedOptions {
-    return { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+    return { attemptId, isLive: () => false, beforeSeed: async () => {} };
   }
 
   function ledger(bare: string): { attemptId: string; clonePath: string; runId: string; state: string }[] {

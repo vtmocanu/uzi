@@ -276,21 +276,10 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     assert.equal(git.runnerClonePath(bare, `issue-${RESIDUE_IID}`), RESIDUE_CANON, "plant-residue.sh planted at GitCache's canonical path");
 
     const proofs: string[] = [];
-    const retentionProofs: string[][] = [];
     const reseed: import("../../agent/src/git.js").CanonicalReseedOptions = {
       // The runner's canonical-reseed proof: a seed-mode scan scoped to the canonical path,
       // through the real runner-uid helper. Anything but quiescent blocks with nothing moved.
       isLive: () => false,
-      quiescent: async (paths, canonical) => {
-        retentionProofs.push(paths);
-        const out = await q.quiesceRunAttempt({
-          mode: "seed", attempt: undefined,
-          cloneKey: attemptPath.cloneKeyOf(canonical).cloneKey,
-          targetPaths: paths, processes: true, dockerHost: undefined,
-          registry: new q.LiveAttemptRegistry(), site: "canonical_retention",
-        });
-        return out.process?.state === "quiescent";
-      },
       beforeFree: async (p) => {
         proofs.push(p);
         const out = await q.quiesceRunAttempt({
@@ -329,8 +318,8 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     // The delete ran as the runner uid (the setpriv-wrapped /bin/rm), never an in-process worker rm.
     assert.match(String(warn?.detail), /^runner-uid delete exited /, `the delete's failure: ${String(warn?.detail)}`);
 
-    // Exercise the real canonical retention path: one removable oldest residue, the retained
-    // root-owned residue, and five newer runner-owned entries. Only the original excess is tried.
+    // Canonical retention observes excess while keeping every residue and its bytes.
+    const originalBytes = fs.readFileSync(path.join(residue, "gate-log.loop"));
     const planted: string[] = [];
     for (let i = 0; i < 6; i++) {
       const p = path.join(parent, attemptPath.formatResidueName(`issue-${RESIDUE_IID}`,
@@ -340,13 +329,14 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
       const stamp = i === 0 ? "1000" : String(Math.floor(Date.now() / 1000) + 3600 + i);
       const touch = runnerUid.runnerCommand("/bin/touch", ["-m", "-d", `@${stamp}`, "--", p]);
       execFileSync(touch.command, touch.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" });
+      const write = runnerUid.runnerCommand("/bin/sh", ["-c", 'printf "%s" "$1" > "$2"', "sh", `retained-${i}`, path.join(p, "sentinel")]);
+      execFileSync(write.command, write.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" });
       planted.push(p);
     }
     await git.createOrAttachRunnerClone(bare, RESIDUE_IID, reseed, "run-cq-residue-next");
-    assert.deepEqual(retentionProofs, [[planted[0]], [residue]], "real seed-mode retention proofs cover only the original excess");
-    assert.equal(fs.existsSync(planted[0]!), false, "runner-owned residue deleted through the runner uid");
-    assert.ok(planted.slice(1).every(p => fs.existsSync(p)), "newer entries survive the failed root-owned delete");
-    assert.equal(fs.existsSync(path.join(residue, "gate-log.loop")), true, "root-owned residue kept");
-    assert.ok(lines.some(l => String(l.msg).includes("could not delete; keeping it") && l.path === residue));
+    assert.deepEqual(proofs, [RESIDUE_CANON, RESIDUE_CANON], "only canonical free requests proof");
+    for (const [i, p] of planted.entries()) assert.equal(fs.readFileSync(path.join(p, "sentinel"), "utf8"), `retained-${i}`);
+    assert.deepEqual(fs.readFileSync(path.join(residue, "gate-log.loop")), originalBytes, "root-owned residue bytes kept");
+    assert.ok(lines.some(l => l.msg === "runner clone retention: automatic reclaim disabled"));
   });
 });

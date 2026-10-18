@@ -149,7 +149,7 @@ function protectedValue(value = journal()): string {
 }
 
 function attemptSeed(n: number) {
-  return { attemptId: aid(n), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+  return { attemptId: aid(n), isLive: () => false, beforeSeed: async () => {} };
 }
 
 for (const overlap of [false, true]) {
@@ -395,7 +395,7 @@ test("discard exact detached run preserves newer active ownership and fresh atte
   await cache.detachTerminalRetained(bare, branch, key, before);
   const nextRun = "run-next";
   const next = await recreate().createOrAttachRunnerClone(bare, 2512, noProofReseed, nextRun, false, undefined, {
-    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
+    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {},
   });
   await cache.markRecoveryCapture(bare, next.path, branch, nextRun, next.attemptId);
   const active = journal();
@@ -581,12 +581,10 @@ test("missing-source identity mismatches and missing known own source never over
   for (const attempt of [false, true]) {
     await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, {
       isLive: () => false,
-      quiescent: async () => true,
       beforeFree: async () => { calls.push("free"); },
     }, runId, false, undefined, attempt ? {
       attemptId: aid(3), isLive: () => { calls.push("live"); return false; },
       beforeSeed: async () => { calls.push("seed"); },
-      quiescent: async () => { calls.push("sweep"); return true; },
     } : undefined), { message: "known recovery source is missing; nothing seeded" });
     assert.deepEqual(calls, []);
     assert.deepEqual(snapshot(), ownEvidence);
@@ -1287,7 +1285,7 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   assert.throws(() => git(bare, ["rev-parse", "--verify", `refs/uzi-recovery-episode/${runId}/${tip}`]));
   await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId), /fresh attempt/);
   const clone = await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId, true, undefined, {
-    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => false,
+    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {},
   });
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });

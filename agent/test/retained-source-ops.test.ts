@@ -71,7 +71,7 @@ function configBytes(): Buffer {
   return fs.readFileSync(path.join(bare, "config"));
 }
 function seedOpts(attemptId: string, over: Partial<AttemptSeedOptions> = {}): AttemptSeedOptions {
-  return { attemptId, isLive: notLive, beforeSeed: async () => {}, quiescent: quiet, ...over };
+  return { attemptId, isLive: notLive, beforeSeed: async () => {}, ...over };
 }
 
 interface Attempt {
