@@ -203,6 +203,15 @@ untyped `recovery_wait`; keep the custody hold. The run does not open its merge 
 way — finalize, and the completion authority that would open the MR, run only after a successful
 resume past the lock.
 
+Retiring an intentionally capture-drained epoch preserves the public Codex safety
+marker, so a normal runner boundary cannot fall into the legacy branch. A poisoned
+or disposed normal facade refuses before credential reconciliation. A later owned
+free capture may select the existing internal capture-only machinery after the exact
+completed scope/epoch/registry proof revalidates clean teardown and an unchanged
+poison revision; removal evidence itself grants neither ordinary nor capture authority.
+That acquisition still needs its own settlement and deadline. New poison or unknown
+cleanup retains the outstanding registry and refuses capture.
+
 This mirrors the credential-free discipline the reconcile closure already keeps (D2): once the
 vault is known to be locked, nothing on the park path may assume it can still reach the credential,
 even to clean up. The #3101 actual graceful-shutdown exception below applies to a separate
