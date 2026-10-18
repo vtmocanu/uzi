@@ -132,3 +132,19 @@ The delivery metadata adds a UUID-v4 changelog fragment describing only the demo
 CI is required after worker publication and is not a locally observed result. The maintainer still owns focused/full compose verification. Unrun compose coverage includes phases 05/06 in both forge lanes, 52, 60, 70 handoff and 72, plus the #3054 phase-boundary check when present. No API file, workflow, migration, discovery producer, scheduler, tail-lifetime rule or deletion authority was changed. The issue remains open because the historical outage and heartbeat causes are unproved; M2's conditional incident repairs are not claimed. #3105 retains ownership of binding-less closed-custody suppression.
 
 Deferred review notes: tester at `373bd30d`, one optional coverage-instrumentation gap; tester at `db96740d`, one optional inline execution-metadata improvement; auditor at `db96740d`, one pre-existing off-task directory-enumeration finding recorded separately for triage. None is presented as executed validation or silently folded into this repair.
+
+### First full gate and narrowed triage
+
+The first `task gate:agent` at `ba946116` failed: task exit 201 (wrapper exit 1), 4,435 seconds elapsed, log `gate-log.z09lOf`. Dependency validation, lint, dead-code and typecheck completed. Unit results were 15,750 tests: 15,698 pass, 37 fail, 15 skipped, zero cancelled; unit duration was 4,414.370 seconds. The Codex M4 stage did not run after the unit failure. This is a recorded failed check, not an unrelated-failure claim based on inspection alone.
+
+The four-case narrowed selection reproduced one pin-cleanup failure and three Runner cleanup failures on the candidate (`gate-log.7qNVz1`); the same selection on an isolated dispatch-base export reproduced the pin failure but passed all three Runner controls (`gate-log.nFR3Po`). The Runner tests expected an immediate replay after ACK loss and feature restoration. They now use the harness's existing injected `now` seam: the immediate attempt must retain one request with no ACK; after advancing 60 seconds, the exact saved request must receive its real ACK. The existing unreadable/uncovered sibling and terminal/source retirement assertions remain intact. The selected three pass (`gate-log.EV68LK`, 4.027s), as does the entire 23-case Runner cleanup file (`gate-log.UM4i8e`, 8.803s). Scoped lint, typecheck and diff checks exited zero (`MEI5Na`, `OluTG0`, `XyeHDT`). No production code or retry timing was changed by this test correction.
+
+The inherited worker umask was `0002`. The legacy pin fixtures create directories with default modes; the existing physical-source boundary refuses metadata writable by the shared runner group. A controlled serial comparison ran the entire unchanged pin-cleanup file with only the creation mask changed:
+
+| Revision and mask | Result | Log |
+| --- | --- | --- |
+| Dispatch base, `0002` | EXIT=1, 13 pass / 34 fail | gate-log.b6YbZW |
+| Dispatch base, `0022` | EXIT=0, 47 pass | gate-log.XF2EKM |
+| Candidate product, `0022` | EXIT=0, 47 pass | gate-log.BOIBvX |
+
+All 34 base failure names match the full gate's pin failures. This establishes an environment-sensitive baseline fixture problem, not a new cleanup-authority defect. It is recorded separately for triage; this issue does not edit those fixtures or weaken the production `unsafe_metadata` refusal. The next serial gate run uses `umask 0022` so test-created private metadata is not shared-runner writable. The failed gate remains part of the evidence. A rerun is justified by the three corrected controls and the demonstrated creation-mask change, after their scoped review is clean. Repo gate and final agent-gate results remain delivery-record results, not assumed passes here.
