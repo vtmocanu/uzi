@@ -10531,7 +10531,8 @@ export class GitCache {
   private async maintenanceWipInput(
     cwd: string,
     limits: { sourceBytes?: number; sourceEntries?: number; metadataBytes?: number } = {},
-  ): Promise<{ digest: string; entries: number; bytes: number }> {
+    expectedIndex = "",
+  ): Promise<{ digest: string; entries: number; bytes: number; agrees: boolean }> {
     const sourceBytes = limits.sourceBytes ?? 64 * 1024 ** 2;
     const sourceEntries = limits.sourceEntries ?? 16384;
     const metadataBytes = limits.metadataBytes ?? 32 * 1024 ** 2;
@@ -10540,6 +10541,8 @@ export class GitCache {
         !Number.isSafeInteger(metadataBytes) || metadataBytes <= 0 || metadataBytes > 32 * 1024 ** 2)
       throw new Error("maintenance_wip_input_refused");
     MaintenanceResources.check();
+    // Bound the already-metered Git output before handing it to the raw reader.
+    if (Buffer.byteLength(expectedIndex) > metadataBytes / 16) throw new Error("maintenance_wip_input_refused");
     const boundary = this.boundaryProcesses.getStore();
     if (!boundary || MaintenanceResources.discoveryActive()) throw new Error("maintenance_wip_input_refused");
     boundary.signal.throwIfAborted();
@@ -10550,20 +10553,20 @@ export class GitCache {
     MaintenanceResources.consume("adminEntries", 256);
     try {
       const result = await this.execScoped(process.execPath,
-        ["-e", MAINTENANCE_WIP_INPUT_HELPER, cwd, String(sourceBytes), String(sourceEntries), String(metadataBytes)], {
+        ["-e", MAINTENANCE_WIP_INPUT_HELPER, cwd, String(sourceBytes), String(sourceEntries), String(metadataBytes), expectedIndex ? "manifest" : "none"], {
           cwd: "/", env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
-          timeout: 30000, maxBuffer: 256,
+          timeout: 30000, maxBuffer: 256, input: expectedIndex,
         }, "command");
       MaintenanceResources.check();
       boundary.signal.throwIfAborted();
-      if (!/^[a-f0-9]{64} [0-9]+ [0-9]+\n$/.test(result.stdout) || result.stderr)
+      if (!/^[a-f0-9]{64} [0-9]+ [0-9]+ [01]\n$/.test(result.stdout) || result.stderr)
         throw new Error("maintenance_wip_input_refused");
-      const [digest, entriesText, bytesText] = result.stdout.trim().split(" ");
+      const [digest, entriesText, bytesText, agrees] = result.stdout.trim().split(" ");
       const entries = Number(entriesText), bytes = Number(bytesText);
       if (!Number.isSafeInteger(entries) || entries < 1 || entries > sourceEntries ||
           !Number.isSafeInteger(bytes) || bytes < 0 || bytes > sourceBytes)
         throw new Error("maintenance_wip_input_refused");
-      return { digest: digest!, entries, bytes };
+      return { digest: digest!, entries, bytes, agrees: agrees === "1" };
     } catch {
       throw new Error("maintenance_wip_input_refused");
     }
@@ -10703,6 +10706,7 @@ try {
       return staged;
     };
     let sourceDigest: string | undefined;
+    let headIndex = "";
     let commitIndex = "";
     // Three attempts maximum, sharing the original scope/counters/deadline.
     // Any refusal stops the sequence; no reset, fence clearing or retry.
@@ -10710,7 +10714,18 @@ try {
       await callbacks.beforeStep(step);
       check();
       const index = await safety();
-      const input = await this.maintenanceWipInput(clonePath);
+      if (step === "status") {
+        headIndex = rows(await read(["ls-tree", "-r", "-z", oldHead]), "sourceEntries").map(row => {
+          const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t([^\0]+)$/.exec(row);
+          if (!match) throw refused();
+          MaintenanceResources.consume("metadataBytes", 4 * row.length + 32);
+          return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
+        }).join("");
+      }
+      // Compare on the same raw byte pass: HEAD for clean, staged blobs before commit.
+      // No fourth enumeration, smaller blob limit, or additional source reservation.
+      const input = await this.maintenanceWipInput(clonePath, {}, step === "status" ? headIndex : step === "commit" ? index : "");
+      if (step === "commit" && !input.agrees) throw refused();
       if (sourceDigest !== undefined && sourceDigest !== input.digest) throw refused();
       sourceDigest = input.digest;
       await callbacks.beforeStep(step);
@@ -10726,6 +10741,7 @@ try {
       check();
       if (step === "status") {
         if (output === "") {
+          if (!input.agrees || index !== headIndex) throw refused();
           if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
           return { kind: "clean", head: oldHead, parent: null };
         }
@@ -14719,11 +14735,11 @@ const fs = require("node:fs");
 const { createHash } = require("node:crypto");
 const { isUtf8 } = require("node:buffer");
 const C = fs.constants, O_PATH = 0x200000;
-const [root, byteText, entryText, metadataText] = process.argv.slice(1);
+const [root, byteText, entryText, metadataText, inputKind] = process.argv.slice(1);
 const byteLimit = Number(byteText), entryLimit = Number(entryText), metadataLimit = Number(metadataText);
 const deadline = Date.now() + 28000, fds = new Set(), ancestors = [], records = [];
 let bytes = 0, entries = 0, metadata = 0, admin = 0, administrative = true;
-const frames = [];
+const frames = [], expected = new Map();
 function refuse() { throw Error("refused"); }
 function check() { if (Date.now() >= deadline) refuse(); }
 function debit(n) { check(); if (n > byteLimit - bytes) refuse(); bytes += n; }
@@ -14772,6 +14788,10 @@ function directory(parent, leaf, lookupOnly = false) {
   (lookupOnly ? sameIdentity : same)(before, opened);
   return fd;
 }
+function agree(rel, mode, oid) {
+  const entry = expected.get(rel);
+  if (entry && entry[0] === mode && entry[1] === oid) expected.delete(rel);
+}
 function walk(fd, relative, depth) {
   check(); if (depth > 64) refuse();
   const before = fstat(fd);
@@ -14810,6 +14830,7 @@ function walk(fd, relative, depth) {
         if (target.length > 4096 || BigInt(target.length) !== beforeLeaf.size) refuse();
         same(beforeLeaf, stat(p));
         meta(16384); // Hex conversion capacity before allocation.
+        agree(rel, "120000", createHash("sha1").update("blob " + target.length + "\0").update(target).digest("hex"));
         frame(rel, "symlink", target.toString("hex"));
       } else if (beforeLeaf.isFile()) {
         const file = open(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
@@ -14820,6 +14841,7 @@ function walk(fd, relative, depth) {
           const content = createHash("sha256");
           let n = 0;
           const size = Number(opened.size);
+          const blob = createHash("sha1").update("blob " + size + "\0");
           while (true) {
             const request = Math.min(65536, size + 1 - n);
             debit(request); // Includes short reads and the EOF/growth sentinel.
@@ -14829,10 +14851,12 @@ function walk(fd, relative, depth) {
             if (n > size) refuse();
             if (!got) break;
             content.update(buf.subarray(0, got));
+            blob.update(buf.subarray(0, got));
           }
           if (n !== size) refuse();
           same(opened, fstat(file));
           same(opened, stat(p));
+          agree(rel, opened.mode & 64n ? "100755" : "100644", blob.digest("hex"));
           frame(rel, "file", String(opened.mode), size, content.digest("hex"));
         } finally { close(file); }
       } else refuse();
@@ -14847,6 +14871,38 @@ try {
       !Number.isSafeInteger(byteLimit) || byteLimit <= 0 || byteLimit > 67108864 ||
       !Number.isSafeInteger(entryLimit) || entryLimit <= 0 || entryLimit > 16384 ||
       !Number.isSafeInteger(metadataLimit) || metadataLimit <= 0 || metadataLimit > 33554432) refuse();
+  // Optional stage-format manifest from bounded, metered Git output. Reserve
+  // buffers, decoding, row arrays and map storage before allocation/read.
+  // This metadata cap does not lower the existing source/blob byte envelope.
+  if (inputKind !== "manifest" && inputKind !== "none") refuse();
+  if (inputKind === "manifest") {
+  const chunks = [];
+  let inputBytes = 0;
+  while (true) {
+    const request = Math.min(65536, Math.floor(metadataLimit / 16) + 1 - inputBytes);
+    meta(request * 4 + 256);
+    const chunk = Buffer.alloc(request), got = fs.readSync(0, chunk, 0, request, null);
+    if (!got) break;
+    inputBytes += got;
+    if (inputBytes > metadataLimit / 16) refuse();
+    chunks.push(chunk.subarray(0, got));
+  }
+  meta(inputBytes * 8 + 1024);
+  const raw = Buffer.concat(chunks);
+  if (!isUtf8(raw)) refuse();
+  const manifest = raw.toString("utf8");
+  if (manifest && !manifest.endsWith("\0")) refuse();
+  for (let start = 0; start < manifest.length;) {
+    row(); meta(512); // Count manifest visits before slicing/parsing the row.
+    const end = manifest.indexOf("\0", start);
+    if (end < 0 || end === start) refuse();
+    const entry = manifest.slice(start, end);
+    start = end + 1;
+    const match = /^(100644|100755|120000) ([0-9a-f]{40}) 0\t([^\0]+)$/.exec(entry);
+    if (!match || expected.has(match[3]) || expected.size >= entryLimit) refuse();
+    expected.set(match[3], [match[1], match[2]]);
+  }
+  }
   meta(32768); // Root split, component buffers and ancestor storage capacity.
   const components = root.slice(1).split("/");
   if (components.length > 64) refuse();
@@ -14882,7 +14938,7 @@ try {
   check();
   const hash = createHash("sha256");
   for (const frame of frames.sort()) { check(); hash.update(frame); }
-  process.stdout.write(hash.digest("hex") + " " + entries + " " + bytes + "\n");
+  process.stdout.write(hash.digest("hex") + " " + entries + " " + bytes + " " + (expected.size === 0 ? "1" : "0") + "\n");
 } catch {
   process.exitCode = 1; // Fixed diagnostic only; never echo an OS error or path.
 } finally {

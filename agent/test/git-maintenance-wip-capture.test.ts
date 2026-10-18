@@ -2,6 +2,7 @@ import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
@@ -160,6 +161,56 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     } }), /refused/);
     assert.notEqual(f.head(), f.old);
     assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "changed");
+  });
+
+  for (const visible of [false, true]) test("cached index stat cannot hide changed tracked bytes" + (visible ? " with visible WIP" : ""), async t => {
+    const f = await fixture(t);
+    await fs.writeFile(path.join(f.root, "tracked"), "modified");
+    if (visible) await fs.writeFile(path.join(f.root, "visible"), "new");
+    const indexPath = path.join(f.root, ".git/index");
+    const index = await f.index();
+    assert.equal(index.readUInt32BE(4), 2);
+    const st = await fs.stat(path.join(f.root, "tracked"), { bigint: true });
+    let offset = 12;
+    let found = false;
+    for (let i = 0; i < index.readUInt32BE(8); i++) {
+      const end = index.indexOf(0, offset + 62);
+      assert.ok(end >= offset + 62);
+      if (index.toString("utf8", offset + 62, end) === "tracked") {
+        const fields = [st.ctimeNs / 1000000000n, st.ctimeNs % 1000000000n,
+          st.mtimeNs / 1000000000n, st.mtimeNs % 1000000000n,
+          st.dev, st.ino, st.mode, st.uid, st.gid, st.size];
+        fields.forEach((value, field) => index.writeUInt32BE(Number(BigInt.asUintN(32, value)), offset + field * 4));
+        assert.equal(index.readUInt16BE(offset + 60), 7); // Ordinary path flags, no hiding bits.
+        found = true;
+      }
+      offset += Math.ceil((end + 1 - offset) / 8) * 8;
+    }
+    assert.ok(found);
+    createHash("sha1").update(index.subarray(0, -20)).digest().copy(index, index.length - 20);
+    await fs.writeFile(indexPath, index);
+    // Newer than the file's mtime, without a real-time wait or racy-cache fallback.
+    const newer = Number(st.mtimeNs / 1000000000n) + 10;
+    await fs.utimes(indexPath, newer, newer);
+    assert.equal(f.gitIn("--no-optional-locks", "status", "--porcelain=v1"), visible ? "?? visible\n" : "");
+    assert.equal(f.gitIn("show", ":tracked"), "original");
+    const before = await f.index();
+    let result: Awaited<ReturnType<typeof f.capture>> | undefined;
+    try { result = await f.capture(); }
+    catch (error) { assert.match(String(error), /refused/); }
+    assert.notEqual(result?.kind, "clean", "forged index stat cache must not hide changed tracked bytes");
+    if (result?.kind === "committed") {
+      assert.equal(f.gitIn("show", "HEAD:tracked"), "modified", "successful tree must include masked tracked bytes");
+      assert.equal(f.gitIn("show", "HEAD:visible"), "new");
+    } else {
+      assert.equal(f.head(), f.old);
+      if (visible) {
+        assert.equal(f.gitIn("show", ":tracked"), "original");
+        assert.equal(f.gitIn("show", ":visible"), "new");
+      } else assert.deepEqual(await f.index(), before);
+      assert.ok(!f.events.includes("launch:commit"));
+    }
+    assert.equal(await fs.readFile(path.join(f.root, "tracked"), "utf8"), "modified");
   });
 
   test("clean is explicit, HEAD/index unchanged and only status attempted", async t => {
@@ -388,6 +439,20 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     f.signal.abort(Error("deadline"));
     await assert.rejects(f.capture(), /deadline/);
     assert.equal(f.launches(), 0);
+  });
+
+  test("manifest visits share the raw reader source-entry reservation", async t => {
+    const f = await fixture(t);
+    const reader = f.git as unknown as {
+      maintenanceWipInput(root: string, limits: object, expected?: string): Promise<{ digest: string; entries: number; agrees: boolean }>;
+    };
+    const baseline = await f.run(() => f.owned(() => reader.maintenanceWipInput(f.root, {})));
+    const manifest = f.gitIn("ls-files", "--stage", "-z");
+    const rows = manifest.split("\0").filter(Boolean).length;
+    const checked = await f.run(() => f.owned(() => reader.maintenanceWipInput(f.root, {}, manifest)));
+    assert.equal(checked.agrees, true);
+    assert.equal(checked.digest, baseline.digest);
+    assert.equal(checked.entries, baseline.entries + rows);
   });
 
   test("ordinary WIP remains best effort; active unguarded WIP throws before launching", async t => {
