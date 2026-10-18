@@ -391,6 +391,257 @@ test("scoped discovery charges raw root entries before name validation or filter
   });
 });
 
+// Build the worker-owned on-disk public discovery input, including several logical
+// generations sharing one physical pin. Expected page sizes are independent constants.
+async function producerBare(f: Awaited<ReturnType<typeof fixture>>, name: string, generations: number, pinned = true) {
+  const bare = path.join(f.root, "repos", name);
+  await fs.mkdir(path.dirname(bare), { recursive: true });
+  await fs.cp(f.bare, bare, { recursive: true });
+  await fs.chmod(path.dirname(bare), 0o700);
+  await fs.chmod(bare, 0o700);
+  await fs.chmod(path.join(bare, "config"), 0o600);
+  const owed = path.join(bare, "uzi-owed");
+  await fs.mkdir(owed, { mode: 0o700 });
+  for (let generation = 1; generation <= generations; generation++) {
+    const context = { runId: "run", branch: "agent/test", barePath: bare, generation,
+      kind: "issue", defaultIdentity: { ref: "refs/heads/main", sha: f.tip } };
+    const key = sha(JSON.stringify(["run", "agent/test", bare, generation, "issue", "refs/heads/main", f.tip, "claim"]));
+    const contextName = `context-${key}.json`;
+    await fs.writeFile(path.join(owed, contextName), JSON.stringify({ version: 1, ...context }), { mode: 0o600 });
+    if (pinned) await fs.writeFile(path.join(owed, `candidate-run-${f.tip}-${key}.json`),
+      JSON.stringify({ version: 1, runId: "run", sha: f.tip, context: contextName }), { mode: 0o600 });
+  }
+  if (pinned) execFileSync("git", ["--git-dir", bare, "update-ref", `refs/uzi-owed/run/${f.tip}`, f.tip]);
+  return bare;
+}
+
+test("producer cursor counts logical fanout, continues pages, and preserves ordinary discovery", async t => {
+  const f = await fixture(t);
+  await producerBare(f, "fanout.git", 7);
+  await producerBare(f, "sibling.git", 2);
+  const ordinary = await f.cache.discoverOwedCandidates();
+  assert.equal(ordinary.length, 9);
+  const cursor = f.cache.openProducerOwedDiscovery();
+  t.after(() => cursor.close());
+  const pages = [];
+  for (let pass = 0; pass < 4; pass++) {
+    const page = await cursor.next();
+    pages.push(page);
+    assert.equal(page.coverage, "incomplete");
+    assert.equal(page.protectedInventory, false, JSON.stringify(page.protectedBares));
+    if (page.scanComplete) break;
+  }
+  assert.deepEqual(pages.map(page => page.selected.length), [4, 4, 1]);
+  const observed = pages.flatMap(page => page.selected)
+    .map(item => `${item.context.barePath}:${item.context.generation}`).sort();
+  assert.deepEqual(observed, ordinary.map(item => `${item.context.barePath}:${item.context.generation}`).sort());
+  assert.equal(new Set(observed).size, 9);
+  assert.deepEqual(await f.cache.discoverOwedCandidates(), ordinary);
+});
+
+test("producer cursor bounds pinless context fanout and matches ordinary discovery", async t => {
+  const f = await fixture(t);
+  await producerBare(f, "pinless.git", 9, false);
+  const ordinary = await f.cache.discoverOwedCandidates();
+  assert.equal(ordinary.length, 9);
+  assert.ok(ordinary.every(item => item.candidates.length === 0));
+  const cursor = f.cache.openProducerOwedDiscovery();
+  t.after(() => cursor.close());
+  const pages = [];
+  for (let pass = 0; pass < 4; pass++) {
+    const page = await cursor.next();
+    pages.push(page);
+    assert.equal(page.coverage, "incomplete");
+    assert.equal(page.protectedInventory, false);
+    if (page.scanComplete) break;
+  }
+  assert.deepEqual(pages.map(page => page.selected.length), [4, 4, 1]);
+  assert.equal(pages.at(-1)!.scanComplete, true);
+  const observed = pages.flatMap(page => page.selected).sort((a, b) => a.context.generation! - b.context.generation!);
+  assert.deepEqual(observed, ordinary);
+  assert.deepEqual(await f.cache.discoverOwedCandidates(), ordinary);
+});
+
+test("producer close joins an active directory read and handle cleanup", async t => {
+  const f = await fixture(t);
+  await producerBare(f, "closing.git", 6);
+  const deferred = () => {
+    let resolve!: () => void;
+    const promise = new Promise<void>(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  const readStarted = deferred();
+  const releaseRead = deferred();
+  const closeStarted = deferred();
+  const releaseClose = deferred();
+  t.after(() => { releaseRead.resolve(); releaseClose.resolve(); });
+  const opendir = fs.opendir.bind(fs);
+  let opened = 0, closed = 0;
+  t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+    const directory = await opendir(...args);
+    if (args[0] !== path.join(f.root, "repos")) return directory;
+    opened++;
+    const read = directory.read.bind(directory);
+    const close = directory.close.bind(directory);
+    t.mock.method(directory, "read", async () => {
+      readStarted.resolve();
+      await releaseRead.promise;
+      return read();
+    });
+    t.mock.method(directory, "close", async () => {
+      closeStarted.resolve();
+      await releaseClose.promise;
+      await close();
+      closed++;
+    });
+    return directory;
+  });
+  const cursor = f.cache.openProducerOwedDiscovery();
+  t.after(() => cursor.close());
+  const next = cursor.next();
+  await readStarted.promise;
+  let closeSettled = false;
+  const closing = cursor.close().then(() => { closeSettled = true; });
+  await Promise.resolve();
+  assert.equal(closeSettled, false);
+  assert.equal(closed, 0);
+  releaseRead.resolve();
+  await closeStarted.promise;
+  assert.equal(closeSettled, false);
+  assert.equal(closed, 0);
+  releaseClose.resolve();
+  await Promise.all([next, closing]);
+  assert.equal(closeSettled, true);
+  assert.equal(opened, 1);
+  assert.equal(closed, 1);
+  await assert.rejects(cursor.next(), /cursor closed/);
+  await cursor.close();
+  assert.equal(closed, 1);
+});
+
+test("producer cursor refuses an already aborted signal without opening a handle", async t => {
+  const f = await fixture(t);
+  const controller = new AbortController();
+  controller.abort();
+  let opened = 0;
+  t.mock.method(fs, "opendir", async () => { opened++; throw new Error("unexpected open"); });
+  const cursor = f.cache.openProducerOwedDiscovery({ signal: controller.signal });
+  await assert.rejects(cursor.next(), /cursor closed/);
+  await cursor.close();
+  assert.equal(opened, 0);
+});
+
+test("producer cursor passes a root prefix larger than the per-pass entry budget without rescanning", async t => {
+  const f = await fixture(t);
+  const repos = path.join(f.root, "repos");
+  await fs.mkdir(repos);
+  for (let first = 0; first < 4100; first += 50) {
+    await Promise.all(Array.from({ length: Math.min(50, 4100 - first) },
+      (_, i) => fs.writeFile(path.join(repos, `unreadable-${first + i}`), "")));
+  }
+  await producerBare(f, "valid.git", 1);
+  const cursor = f.cache.openProducerOwedDiscovery();
+  t.after(() => cursor.close());
+  const protectedPaths = new Set<string>();
+  let selected = 0, complete = false, passes = 0;
+  for (; passes < 140; passes++) {
+    const page = await cursor.next();
+    assert.ok(page.protectedBares.length <= 32);
+    for (const item of page.protectedBares) {
+      assert.equal(item.reason, "metadata_incomplete");
+      assert.equal(protectedPaths.has(item.barePath), false);
+      protectedPaths.add(item.barePath);
+    }
+    selected += page.selected.length;
+    if (page.scanComplete) { complete = true; assert.equal(page.protectedInventory, true); break; }
+  }
+  assert.ok(complete);
+  assert.ok(passes > 1);
+  assert.equal(protectedPaths.size, 4100);
+  assert.equal(selected, 1);
+});
+
+for (const corruption of ["malformed", "missing-context"] as const) {
+  test(`producer refuses the entire selected bare with ${corruption} metadata`, async t => {
+    const f = await fixture(t);
+    const bare = await producerBare(f, "broken.git", 6);
+    const owed = path.join(bare, "uzi-owed");
+    const contexts = (await fs.readdir(owed)).filter(name => name.startsWith("context-")).sort();
+    if (corruption === "malformed") await fs.writeFile(path.join(owed, contexts.at(-1)!), "{");
+    else await fs.unlink(path.join(owed, contexts.at(-1)!));
+    const cursor = f.cache.openProducerOwedDiscovery();
+    t.after(() => cursor.close());
+    const page = await cursor.next();
+    assert.equal(page.selected.length, 0);
+    assert.equal(page.protectedInventory, true);
+    assert.deepEqual(page.protectedBares, [{ barePath: bare, reason: "metadata_incomplete" }]);
+    assert.equal(page.coverage, "incomplete");
+    await assert.rejects(f.cache.discoverOwedCandidates());
+  });
+}
+
+test("producer resource refusal retains protection and cancellation closes the cursor", async t => {
+  const f = await fixture(t);
+  await producerBare(f, "budget.git", 1);
+  const controller = new AbortController();
+  const cursor = f.cache.openProducerOwedDiscovery({ signal: controller.signal });
+  t.after(() => cursor.close());
+  const page = await MaintenanceResources.runDiscovery(async () => {
+    MaintenanceResources.consumeIfActive("adminEntries", 4096);
+    return cursor.next();
+  }).catch(error => {
+    assert.match(String(error), /maintenance_resource_exhausted/);
+    return undefined;
+  });
+  // An outer exhausted discovery scope also refuses its final check; the cursor's
+  // sticky protection must survive into the next independent page.
+  assert.equal(page, undefined);
+  const final = await cursor.next();
+  assert.equal(final.protectedInventory, true);
+  assert.equal(final.selected.length, 0);
+  assert.equal(final.scanComplete, true);
+  assert.equal(final.coverage, "incomplete");
+  await producerBare(f, "cancelled.git", 6);
+  const cancelled = f.cache.openProducerOwedDiscovery({ signal: controller.signal });
+  assert.equal((await cancelled.next()).scanComplete, false);
+  controller.abort();
+  await assert.rejects(cancelled.next(), /cursor closed/);
+  await cancelled.close();
+});
+
+test("ACK config charges raw comments before invoking its parser", async t => {
+  const f = await fixture(t);
+  const bare = await producerBare(f, "ack.git", 1);
+  const padding = "# " + "x".repeat(8192) + "\n";
+  await fs.appendFile(path.join(bare, "config"), padding);
+  let parserCalls = 0;
+  const exec = f.cache["execScoped"].bind(f.cache);
+  t.mock.method(f.cache as unknown as { execScoped: typeof exec }, "execScoped", async (...args: Parameters<typeof exec>) => {
+    if (args[1].includes("--no-includes")) parserCalls++;
+    return exec(...args);
+  });
+  await MaintenanceResources.run(f.token, async () => {
+    MaintenanceResources.consume("metadataBytes", metadataCap - 4096);
+    const result = await f.cache.withReportProofBudget({ signal: new AbortController().signal, deadline: Date.now() + 10000 },
+      () => f.cache.readAcknowledgedReportSourcesUnderLock(bare, "run"));
+    assert.equal(result.kind, "unknown");
+    assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+  });
+  assert.equal(parserCalls, 0);
+});
+
+test("ACK config entries are charged before interpreting a parsed snapshot", async t => {
+  const f = await fixture(t);
+  const bare = await producerBare(f, "ack-entries.git", 1);
+  await MaintenanceResources.run(f.token, async () => {
+    MaintenanceResources.consume("adminEntries", 4096);
+    const result = await f.cache.withReportProofBudget({ signal: new AbortController().signal, deadline: Date.now() + 10000 },
+      () => f.cache.readAcknowledgedReportSourcesUnderLock(bare, "run"));
+    assert.equal(result.kind, "unknown");
+    assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+  });
+});
+
 test("discovery shares nested counters, grants no token, and refuses decode/source/artifact production", async t => {
   const f = await fixture(t);
   await MaintenanceResources.runDiscovery(async () => {

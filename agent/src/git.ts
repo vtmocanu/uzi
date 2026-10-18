@@ -8005,6 +8005,7 @@ export class GitCache {
           this.checkReportProof();
           const read = await file.read(bytes, length, bytes.length - length, null);
           if (!read.bytesRead) break;
+          MaintenanceResources.consumeIfActive("metadataBytes", read.bytesRead);
           length += read.bytesRead;
         }
         if (length > 1048576) throw new Error("oversized ACK config");
@@ -8021,6 +8022,7 @@ export class GitCache {
         { env: gitEnv(), input: raw, maxBuffer: 1048576, timeout: GIT_TIMEOUT_MS });
       if ((budget.configBytes += raw.length + Buffer.byteLength(parsed.stdout) + Buffer.byteLength(parsed.stderr)) > 4194304)
         throw new Error("ACK config cumulative bound");
+      MaintenanceResources.consumeMetadataEntriesIfActive(parsed.stdout, "\0");
       const entries = parsed.stdout.split("\0").filter(Boolean);
       if (entries.length > 1024) throw new Error("ACK config value count");
       const journals = new Map<string, RecoveryJournalEntry>();
@@ -8148,6 +8150,8 @@ export class GitCache {
         if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
         const bytes = Buffer.alloc(1024 * 1024 + 1);
         const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+        MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
+        MaintenanceResources.consumeIfActive("adminEntries", 1);
         if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
         return bytes.subarray(0, bytesRead).toString("utf8").trim();
       } finally { await file.close(); }
@@ -8161,7 +8165,9 @@ export class GitCache {
       catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         const packed = await readRef("packed-refs");
-        head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+        MaintenanceResources.consumeMetadataEntriesIfActive(packed, "\n");
+        const entries = packed.split("\n").filter(Boolean);
+        head = entries.find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
       }
     }
     if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
@@ -12451,6 +12457,12 @@ export class GitCache {
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
       });
+      // Charge the complete config snapshot before any caller filters keys or parses
+      // journals, ledgers, origins or stopped markers. Raw output bytes are metered
+      // by execScoped; unscoped boot/live calls retain their existing behavior.
+      if (MaintenanceResources.active() && args[0] === "config" && args.includes("--null") && args.includes("--list")) {
+        MaintenanceResources.consumeMetadataEntriesIfActive(stdout, "\0");
+      }
       return stdout;
     } catch (err) {
       // issue #2213: the quarantine refusal reaches the runner unwrapped (a typed worker fault).
@@ -13543,6 +13555,7 @@ export class GitCache {
     const records = loaded.records.filter((r) => r.runId === runId);
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
     const result: OwedCandidate[] = [];
+    MaintenanceResources.consumeMetadataEntriesIfActive(out, "\n");
     for (const line of out.trim().split("\n").filter(Boolean)) {
       const m = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
       if (!m || m[1] !== runId || m[2] !== m[3]) throw new Error("malformed owed pin");
@@ -13556,6 +13569,128 @@ export class GitCache {
       result.push({ sha, pinRef: `refs/uzi-owed/${runId}/${sha}`, contexts: producing });
     }
     return result.sort((a, b) => a.sha.localeCompare(b.sha));
+  }
+
+  /**
+   * Producer-only, caller-owned scan; close when abandoning it. One directory handle and
+   * one context key survive pages, never an inventory or custody authority. Directory
+   * mutation can omit entries, so even EOF is explicitly NOT source/hold coverage.
+   */
+  openProducerOwedDiscovery(options: { signal?: AbortSignal } = {}) {
+    let directory: import("node:fs").Dir | undefined;
+    let pending: { barePath: string; after?: string } | undefined;
+    let ended = false, closed = false, busy = false, protectedInventory = false;
+    let closing: Promise<void> | undefined;
+    let pageJoined: Promise<void> | undefined;
+    let joinPage: (() => void) | undefined;
+    const closeHandle = async () => {
+      if (directory) {
+        const owned = directory;
+        directory = undefined;
+        closing = owned.close();
+      }
+      await closing;
+    };
+    const close = async () => {
+      closed = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      // Join the active page before closing its directory reader.
+      if (busy) await pageJoined;
+      await closeHandle();
+    };
+    const onAbort = () => { void close().catch(() => undefined); };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
+    const next = async () => {
+      if (busy) throw new Error("producer discovery page already active");
+      if (closed) throw new Error("producer discovery cursor closed");
+      busy = true;
+      pageJoined = new Promise<void>(resolve => { joinPage = resolve; });
+      const selected: Array<{ context: StoredOwedContext; candidates: OwedCandidate[] }> = [];
+      const protectedBares: Array<{ barePath: string; reason: "metadata_incomplete" | "resource_exhausted" }> = [];
+      const protect = (reason: "metadata_incomplete" | "resource_exhausted") => {
+        protectedInventory = true;
+        protectedBares.push({ barePath: pending?.barePath ?? path.resolve(this.reposRoot), reason });
+        pending = undefined;
+      };
+      try {
+        await MaintenanceResources.runDiscovery(async () => {
+          if (!MaintenanceResources.discoveryActive()) throw new Error("producer discovery scope required");
+          if (!directory && !ended) {
+            try { directory = await fs.opendir(this.reposRoot, { bufferSize: 1 }); }
+            catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              ended = true;
+            }
+          }
+          // Bound empty/bad-root work as well as logical selections. Independent bad
+          // bares protect inventory and do not block later roots on the next page.
+          for (let roots = 0; roots < 32 && selected.length < 4 && !ended; roots++) {
+            MaintenanceResources.checkIfActive();
+            if (!pending) {
+              const entry = await directory!.read();
+              if (!entry) { ended = true; break; }
+              pending = { barePath: path.join(path.resolve(this.reposRoot), entry.name) };
+              MaintenanceResources.consumeIfActive("adminEntries", 1);
+              MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
+            }
+            const current = pending;
+            try {
+              const logical = await this.withLock(current.barePath, async () => {
+                await this.assertOwedBare(current.barePath);
+                const metadata = await this.readOwedMetadataUnderLock(current.barePath);
+                const out = await this.runGit(current.barePath,
+                  ["for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-owed/"]);
+                const pins = new Map<string, OwedCandidate[]>();
+                MaintenanceResources.consumeMetadataEntriesIfActive(out, "\n");
+                for (const line of out.split("\n").filter(Boolean)) {
+                  const match = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40}) ([0-9a-f]{40})$/.exec(line);
+                  if (!match || match[2] !== match[3]) throw new Error("malformed owed pin");
+                  const records = metadata.records.filter(r => r.runId === match[1] && r.sha === match[2]);
+                  if (!records.length) throw new Error("owed pin has no discovery metadata");
+                  // cat-file -t only reads object type; no decoded closure verification.
+                  await this.requireOwedCommit(current.barePath, match[2]!);
+                  for (const record of records) {
+                    const list = pins.get(record.contextName) ?? [];
+                    list.push({ sha: record.sha, pinRef: `refs/uzi-owed/${record.runId}/${record.sha}`,
+                      contexts: [record.c] });
+                    pins.set(record.contextName, list);
+                  }
+                }
+                return [...metadata.contexts].sort(([a], [b]) => a.localeCompare(b)).map(([key, context]) =>
+                  ({ key, context, candidates: pins.get(key) ?? [] }));
+              });
+              const remaining = logical.filter(item => !current.after || item.key > current.after);
+              const page = remaining.slice(0, 4 - selected.length);
+              for (const item of page) {
+                MaintenanceResources.consumeIfActive("candidates", 1);
+                selected.push({ context: item.context, candidates: item.candidates });
+                current.after = item.key;
+              }
+              if (page.length === remaining.length) pending = undefined;
+            } catch (error) {
+              // Budget failures are handled outside runDiscovery: its final check also
+              // refuses an exhausted scope. Never skip unreadable evidence as complete.
+              if (MaintenanceResources.signalIfActive()?.aborted) throw error;
+              protect("metadata_incomplete");
+            }
+          }
+        }, { signal: options.signal });
+      } catch {
+        protect("resource_exhausted");
+      } finally {
+        try {
+          if (ended || closed || options.signal?.aborted) {
+            closed = true;
+            options.signal?.removeEventListener("abort", onAbort);
+            await closeHandle();
+          }
+        } finally { busy = false; joinPage!(); }
+      }
+      return { selected, protectedBares, protectedInventory, scanComplete: ended,
+        coverage: "incomplete" as const };
+    };
+    return { next, close };
   }
 
   /** Boot discovery walks only this worker's known bare store, independent of HOME/journals. */

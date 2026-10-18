@@ -588,6 +588,8 @@ export class MaintenanceResources {
     }, { durationMs: duration, signal: options.signal });
   }
   static active(): boolean { return !!resources.getStore() || !!discovery.getStore(); }
+  /** Producer pagination must not borrow a charged production slot. */
+  static discoveryActive(): boolean { return !!discovery.getStore() && !resources.getStore(); }
   static remainingMsIfActive(): number {
     const token = resources.getStore();
     if (token) {
@@ -621,6 +623,18 @@ export class MaintenanceResources {
       refuse("maintenance_resource_exhausted");
     }
     scope.used[resource] = used + amount;
+  }
+  /** Count raw nonempty rows before callers allocate arrays or interpret metadata. */
+  static consumeMetadataEntriesIfActive(value: string, separator: "\0" | "\n"): void {
+    if (!this.active()) return;
+    this.checkIfActive();
+    for (let start = 0; start < value.length;) {
+      const end = value.indexOf(separator, start);
+      if (end !== start) this.consumeIfActive("adminEntries", 1);
+      if (end < 0) break;
+      start = end + 1;
+    }
+    this.checkIfActive();
   }
   /** Charge before delivery/launch/RPC. A failed charge never delivers partial allowance. */
   static consume(resource: MaintenanceResource, amount: number): void {
