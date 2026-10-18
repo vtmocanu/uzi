@@ -2904,6 +2904,13 @@ export interface Run {
       recorded_at: string;
     } | null;
   };
+  /** Persisted memory intervention allowance for an owner-only memory hold; distinct from requeues. */
+  memory_hold?: {
+    episode: number;
+    used: number;
+    max: number | null;
+    remaining: number | null;
+  };
   requeue_count: number;
   iteration_count: number;
   /** issue #321: server-computed planning-phase display flag — true only while a run is

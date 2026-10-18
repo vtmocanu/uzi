@@ -123,7 +123,13 @@ The pending drain refuses new run and chat claims but lets the worker's own
 parked runs resume and finish. Any run status other than `completed`,
 `failed`, or `cancelled` blocks cleanup: parked, paused, approval, input,
 and follow-up waits all count. DinD cleanup has no user nudge, timer, forced
-park, drain deadline, or force-roll override.
+park, drain deadline, or ForceRoll bypass: independent readiness, identity and
+pod-absence guards remain authoritative. Global ForceRoll can bypass busy deferral
+for image/template drift and independent legacy maintenance, but cannot bypass
+this DinD gate. Busy spec-hash/generation drift and associated legacy recycle now
+wait indefinitely for idle; the compatible 24h drain deadline applies only to
+independent nondrifted pressure/nix-size maintenance. See
+[Draining and cordoned](./hosted-workers.md#draining-and-cordoned).
 
 Once the server atomically proves no nonterminal claims and fences all
 claims, the worker must also prove zero local activity and fresh

@@ -80,11 +80,15 @@ It clears when the pod recovers, not on a timer.
 
 Persistent hosted workers use one canary per owner, placement lane and effective
 registered capability pool before admitting more replacements. The default is
-one concurrent replacement per pool after promotion. Workers waiting behind a
-canary keep claiming on the old image; a healthy busy worker can still be useful
-capacity. A stuck participant holds the rest of its pool even after a drain
-deadline. A single-worker pool can lose service while its worker is replaced.
-Ephemeral workers are outside this pacing policy.
+one concurrent replacement per pool after promotion. Healthy peers waiting for
+admission keep claiming on the old image. For routine upgrades, an admitted busy
+worker with image, template or generation drift waits indefinitely until genuinely
+idle. It occupies a concurrency slot and supplies no replacement coverage, canary
+proof or post-promotion proof, and can hold its pool indefinitely. The drain deadline
+(default `24h`) applies only to independent nondrifted pressure/nix-size
+maintenance. Run-bound workers are outside pacing but follow the same busy-drift
+policy; see [Draining and cordoned](hosted-workers.md#draining-and-cordoned).
+A single-worker pool can lose service while its worker is replaced.
 
 A Ready pod alone does not promote a canary. The controller must connect the
 current Deployment, ReplicaSet and running pod UID to the target image, exact

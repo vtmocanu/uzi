@@ -1,7 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
-import { CodexExecutor } from "../src/codex/codex-executor.js";
+import { CodexExecutor, createRunLaneInstallerReconcile } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 
@@ -37,8 +38,17 @@ for (const jump of [-1_000_000, 1_000_000]) it(`cumulative summary/drain/install
     return { kind: "observed_empty" };
   };
   const install = deferred();
-  Object.assign(exec, { depsInstall: { abort: new AbortController(), cancellation: new AbortController().signal,
-    promise: install.promise.then(() => { now += 20; }), reported: false, noted: false } });
+  const selected = selectCodexBinding({ codex: {
+    auth_mode: "api_key", access_token: "fixture-access", capability: "fixture-capability",
+  } });
+  assert.equal(selected.kind, "codex");
+  if (selected.kind !== "codex") throw new Error("missing fixture binding");
+  const installer = createRunLaneInstallerReconcile(new AbortController().signal, {
+    runId: "budget-run", binding: selected.binding, client: {} as never,
+    registerToken: () => assert.fail("credential reconciliation forbidden"),
+  });
+  installer.promise = install.promise.then(() => { now += 20; return { results: [], truncated: false }; });
+  Object.assign(exec, { depsInstall: installer });
   const original = Date.now;
   try {
     await MaintenanceBudget.run(budget, async () => {

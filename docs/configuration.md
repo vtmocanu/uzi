@@ -426,6 +426,10 @@ Only **committed** work is captured either way — a checkpoint fetches back com
 
 **Mid-turn tick (issue #1597).** Both tiers above fire only at a turn boundary, so a single very long turn — the case this closes — could previously commit real work and reach no checkpoint at all until the turn ended. A repeating mid-turn tick, `CHECKPOINT_TICK_INTERVAL` (default `5m`; `0` disables it), fetches the runner clone's committed work back into the worker's bare repository at most once per tick, when the branch tip has moved and the clone is not busy, and publishes it to origin through the same credential-free broker once the branch tip differs from the last confirmed published tip and `CHECKPOINT_INTERVAL` has elapsed since the last publish attempt, not the last success — the same publish cadence as the iteration-boundary tier, just triggered without waiting for the turn to end. Worst-case loss is therefore roughly `CHECKPOINT_INTERVAL` plus one tick interval, as a best-effort bound rather than a guarantee: it holds only while the tick actually runs (the clone is not git-busy and no retained bare lock remains), the scan is trusted and finding-free, and the broker accepts the publish, so sink reachability alone does not provide it — a lingering git-busy marker defers the tick indefinitely, a finding or untrusted scan keeps that tick's work on worker-local storage (#1964 also holds remembered findings at the upload seam within the current flight; its memory does not survive reclaim), and the tick starts a failed publish's next logical operation at most once per `CHECKPOINT_INTERVAL` (each operation may make up to three HTTP requests); there is no durability claim while every sink is down, and a fetch-back with no successful remote publish is never reported as durable. A per-flight sink gate serializes the tick against every other path that moves the run's durable state (checkpoint closure, pause/wall/completion-hold parks, credential switch). A metadata-only git-busy probe (one non-blocking open of `.git`, then `lstat` of each marker; no git child) skips the tick whenever one of a fixed set of git lock files or merge/rebase/cherry-pick/revert markers is present in the runner clone, or its gitdir is unreadable, regardless of age. Scanning covers every checkpoint publish that goes through the checkpoint body without an overlay context — the mid-turn tick, the time-gated iteration-boundary tier, and milestone publishes on non-GitHub forges — over the pinned commit range being packed, minus content already public, before that range ever reaches origin; a finding or an untrusted scan skips the remote publish and keeps only the local fetch-back. On a Codex run such an overlay-less (non-GitHub) milestone publish is instead deferred (`scan_deferred`) rather than scanned inside the boundary permit. The park/shutdown/pause/capture checkpoint publishes and every GitHub milestone (`reap:true`) publish remain unscanned, unchanged from before this issue — a GitHub milestone, Codex or otherwise, always carries an overlay context and, when the #1964 hold permits publication, publishes unscanned, whether or not an overlay commit is actually built.
 
+**Actual graceful-shutdown capture (issue #3101).** The actual `execute()` graceful-shutdown durability sink has a typed exception to the Codex execution lifecycle's shutdown abort: execution stays aborted while one logical bounded credential release/refresh, proof, WIP capture, publication and unwind share the original absolute grace's remaining time. This is a credentialed path, with no credential-free fallback or poisoned-registry revival; other shutdown-labelled reconciliation sinks keep their lifecycle checks and disposal is unchanged. Already-delivered terminal stops, claim fencing and credential switches block admission. An owner `stop` that requests normal finish leaves shutdown preservation eligible. Effective revocation, claim/credential authorization and deadlines still apply, with no control-observation loop or polling during grace. Only a late remote owner cancellation after successful reconciliation may still permit bounded broker publication for the still-bound same claim generation through [PRD #1810's terminal route](../prds/1810-retain-failed-run-checkpoint-ref.md), consistent with #3030. Terminal cancellation still refuses credential release/refresh on the server; a pending queued cancellation is not itself that terminal refusal.
+
+Shutdown WIP capture makes a bounded best-effort attempt to include dirty and untracked work before fetch-back. This does not extend the ordinary tiers' committed-only coverage or guarantee ignored files, bytes written after proof/capture or work from late writers. Quiescence/completion proofs, missing-source refusal, the [#1036 post-reap workflow overlay](../adr/1036-checkpoint-workflow-overlay.md) and existing secret/remediation and workflow guards still apply. D3's credential-free settle after a typed deferral is unchanged; see [ADR-1766](../adr/1766-codex-vault-lock-park.md#amendment-3101-actual-graceful-shutdown-durability). The separate episode failure remains unsolved; this exception changes no retention, deletion, drain, recovery framework or episode journal.
+
 **Remembered-finding upload hold (issue #1964).** Every checkpoint upload — usage-limit park, shutdown, pause, credentialed or credential-free recovery, credential switch, completion-hold/wall park, and checkpoint-body publishes with overlays or pinned ranges — is held while the current flight has nonempty known or blocked findings, overflow, or a retained flagged SHA in the actual candidate's ancestry. Unknown ancestry or a git error holds the upload too. After a finding has ever been known, boundary (`reap:true`) publishes additionally require the source tip to match the last trusted clean tip; `reap:false` retains its exemption from that equality check. The guard checks the actual overlay candidate before `pack-objects`, so a held upload starts neither a pack producer nor a remote attempt. Local captures still run and are verified, but provide no origin durability on a hold. A fresh pause whose upload is held fails and the run continues; the already-durable pause shortcut is unchanged.
 
 **Explicit residual boundaries.** The sinks described above as unscanned remain **UNSCANNED**; #1964 adds no scan. Unknown, never-flagged content and workflow tree content copied from non-parent commits are outside remembered-SHA ancestry containment. Remediation memory is process-local `RunFlight` state and is lost on reclaim or a new flight, including same-worker reclaim. Local commits can survive on the same worker; a later unscanned publish before another finding is recorded may ship the previously flagged content. Persisting that memory and mandatory resume scanning remain separate work under the approved plan.
@@ -467,6 +471,95 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
+
+### Worker memory guard
+
+The proactive worker memory guard is **off by default** (issue #2396).
+Enabling it requires six explicit numeric settings; there are no calibrated
+production thresholds; fixture values are unmeasured inputs, not production
+recommendations. Configure the worker container, not the API:
+
+| Worker environment variable | Helm `workers.memoryGuard` key | Default | Meaning / ceiling |
+|---|---|---|---|
+| `WORKER_MEMORY_GUARD_ENABLED` | `enabled` | `false` | Opt in to the guard. |
+| `WORKER_MEMORY_GUARD_RESERVE_BYTES` | `reserveBytes` | empty | Headroom below the cgroup limit; bytes, maximum `9007199254740991`. |
+| `WORKER_MEMORY_GUARD_SAMPLE_MS` | `sampleMs` | empty | Sampling interval; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_HYSTERESIS_BYTES` | `hysteresisBytes` | empty | Gap between high and quiet thresholds; bytes, maximum `9007199254740991`. |
+| `WORKER_MEMORY_GUARD_REARM_MS` | `rearmMs` | empty | Fresh low-usage dwell required before rearming; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS` | `responseBudgetMs` | empty | Bounded intervention response budget; milliseconds, maximum `2147483647`. |
+| `WORKER_MEMORY_GUARD_MAX_INTERVENTIONS` | `maxInterventions` | empty | Persisted maximum per run memory episode; maximum `9999`. |
+
+Compose relays these seven `WORKER_MEMORY_GUARD_*` variables from `.env`.
+Hosted workers use the chart keys above; the controller receives the same
+suffixes with a `UZI_` prefix (for example,
+`UZI_WORKER_MEMORY_GUARD_RESERVE_BYTES`) and relays them into worker pods.
+Standalone workers need the variables explicitly injected into their container.
+Restart to change worker settings; hosted configuration changes roll workers.
+
+The enabled flag is trimmed and case-insensitive: empty, `0`, `false`,
+`no` and `off` disable it; `1`, `true`, `yes` and `on` enable it.
+Other flag values reject startup/rendering. Disabled configuration ignores
+the numeric fields. When enabled, each numeric field must be a trimmed,
+positive decimal integer within its ceiling. Leading zeroes are accepted;
+missing/blank values, signs, fractions, exponent notation, zero and values
+above the ceiling reject worker/controller startup or chart rendering.
+These `_MS` settings take decimal milliseconds, not Go-style durations.
+
+For a finite cgroup limit `L = memory.max`, the guard computes
+`H = L - reserveBytes` and `Q = H - hysteresisBytes`, requiring
+`0 < Q < H < L`. Unavailable, stale or incompatible cgroup evidence inhibits
+intervention; an unlimited cgroup does not supply a usable limit. Total
+`memory.current` is authoritative, with no file-memory subtraction.
+Approximate command-tree RSS ranks eligible targets; it does not measure
+cgroup usage or prove that memory was freed.
+
+**Sizing input:** use `max(1Gi, 10-15% of memory.max)` as a reserve sizing
+input, subject to workload measurements. This is neither a shipped default
+nor a production recommendation. Measure allocation bursts, sampling delays,
+cleanup/capture costs and the shared run/chat/cross-check workload before
+choosing the six values. The guard does not force concurrency to one.
+Node memory pressure and separately accounted Docker-in-Docker sidecar
+memory remain outside the worker cgroup budget.
+
+Enabled workers require API feature `worker_memory_pressure_v1` and a valid
+registration incarnation. Roll out the API advertising that feature first,
+then enable workers. An enabled worker against an older API, or a registration
+without a valid incarnation, refuses startup with `UnsupportedMemoryAPI`.
+For a worker-first rollout, keep the guard disabled until the API is ready,
+then enable it with a fresh registration/restart. Heartbeat feature growth
+does not create memory authority; feature shrink revokes it before further
+reservation or signalling. Original settlement, feedback and source-custody
+obligations remain with the captured flight after revocation; an unconfirmed
+ACK does not establish release. Intervention uses the captured worker
+incarnation, claim generation and memory episode.
+The delivered adapter enrolls trusted Codex model shell commands through
+their exact registered supervisor handle and process start ticks.
+Claude enrollment (#2471), internal probes, provider/credential processes,
+boundary/checkpoint/capture operations and cross-checker authority are outside
+this adapter's scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+After an intervention, another intervention/retry requires confirmed drain,
+a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
+alone does not clear uncertainty. The API persists the episode's maximum
+and spent allowance across ordinary redispatch. Exhaustion, uncertain drainage
+or unconfirmed outcome reporting invokes capture and an owner-held `worker_memory_pressure` recovery
+park attempt. Unconfirmed capture or park retains local custody. Owner Resume
+starts a fresh memory episode subject to existing budget, custody and lifecycle
+fences; Cancel is terminal. See
+[Memory-pressure holds](./run-recovery.md#memory-pressure-holds) and
+[Worker setup](./worker-setup.md#proactive-memory-guard) for scope and
+recovery limitations.
+
+To disable operationally, turn off the worker flag and restart/roll workers;
+preserve existing holds, episode accounting and retained source. Migration
+00342 Down is destructive schema rollback: it fails memory-held runs as
+`worker_lost` and drops intervention history and episode columns. It is not
+an operational disable procedure.
+
+Implementation: [worker parsing](../agent/src/config.ts),
+[controller parsing](../controller/internal/config/memory_guard.go),
+[cgroup policy](../agent/src/worker-memory-guard.ts) and
+[episode persistence](../api/internal/store/queries/memory.sql).
 
 ### Recovery decoded-history limit
 

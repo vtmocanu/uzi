@@ -414,6 +414,11 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 }
 
 func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health healthDetectorState, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
+	workers, err := s.cfg.Store.ListAllWorkers(ctx)
+	return s.checkFleetCapacityWithWorkers(ctx, now, health, workers, err, shared...)
+}
+
+func (s *Service) checkFleetCapacityWithWorkers(ctx context.Context, now time.Time, health healthDetectorState, workers []store.ListAllWorkersRow, workersErr error, shared ...*waitConfirmations) apitypes.HealthCheckDTO {
 	c := s.base("fleet.capacity")
 	switch health {
 	case healthDetectorDisabled:
@@ -445,6 +450,11 @@ func (s *Service) checkFleetCapacity(ctx context.Context, now time.Time, health 
 	evidence := waitEvidence{rows: c.Evidence}
 	for _, r := range rows {
 		evidence.append(r.RunID, r.UserID, r.HealthReason, r.HealthSince, now)
+	}
+	// Read display-only blocker facts before the first confirmation starts its
+	// shared capacity/queue deadline. Diagnostic latency must not spend that budget.
+	s.enrichCapacityBlockers(ctx, &evidence, workers, workersErr)
+	for _, r := range rows {
 		confirmed, overlap := confirm.confirm(s, ctx, now, r.RunID, r.HealthReason, r.HealthSince)
 		if confirmed {
 			rolling[r.UserID] = true

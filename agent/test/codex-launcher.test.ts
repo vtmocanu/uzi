@@ -66,6 +66,8 @@ function baseSpec(overrides: Partial<CodexLaunchSpec> = {}): CodexLaunchSpec {
 }
 
 interface FakeOpts {
+  disposeReply?: (id: number) => unknown;
+  observeReply?: (id: number) => unknown;
   uid?: number;
   nondumpable?: boolean;
   capBoundingSet?: "0x0" | "0xc0" | "0xff";
@@ -100,11 +102,16 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitBeforeEvidence: boolean;
   private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
+  readonly observeRequests: number[] = [];
+  private readonly disposeReply: ((id: number) => unknown) | undefined;
+  private readonly observeReply: ((id: number) => unknown) | undefined;
   autoSnapshots = true;
   readonly snapshotIds: number[] = [];
 
   constructor(opts: FakeOpts = {}) {
     super();
+    this.disposeReply = opts.disposeReply;
+    this.observeReply = opts.observeReply;
     this.stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
     this.disposeState = opts.disposeState ?? "drained";
     this.singleDisposeResponse = opts.singleDisposeResponse ?? false;
@@ -138,13 +145,22 @@ class FakeSupervisor extends EventEmitter {
 
   private onControl(line: string): void {
     const cmd = JSON.parse(line) as { op: string; id: number; timeoutMs?: number };
-    if (cmd.op === "snapshot") {
+    if (cmd.op === "observe") {
+      this.observeRequests.push(cmd.id);
+      const result = this.observeReply?.(cmd.id);
+      if (result !== undefined) this.writeEvidence(result);
+    } else if (cmd.op === "snapshot") {
       this.snapshotIds.push(cmd.id);
       if (!this.autoSnapshots) return;
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
       if (this.singleDisposeResponse && this.disposeTimeouts.length > 1) return;
+      if (this.disposeReply) {
+        const response = this.disposeReply(cmd.id);
+        if (response !== undefined) this.writeEvidence(response);
+        return;
+      }
       if (this.disposeState === "drained") {
         const emit = (): void => {
           this.writeEvidence({
@@ -162,7 +178,7 @@ class FakeSupervisor extends EventEmitter {
           setImmediate(emit);
         } else emit();
       } else {
-        this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
+        this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [{ pid: this.pid + 1, startTime: "18446744073709551615" }] });
       }
     }
   }
@@ -741,6 +757,21 @@ describe("launchCodexRoot: trusted construction contract", () => {
 });
 
 describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () => {
+  it("preserves sorted snapshot rows and an empty comm from best-effort reporting", async () => {
+    const fake = newFake();
+    fake.autoSnapshots = false;
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const pending = handle.snapshot();
+    const processes = [
+      { pid: fake.pid + 1, ppid: fake.pid, pgid: fake.pid, comm: "" },
+      { pid: fake.pid + 2, ppid: fake.pid, pgid: fake.pid, comm: "fixture" },
+    ];
+    fake.writeEvidence({ event: "snapshot", id: fake.snapshotIds[0], processes });
+    assert.deepEqual((await pending).processes, processes);
+    assert.equal(handle.failed, undefined, "best-effort rows do not poison the root");
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
   it("(e) surfaces started, snapshot, and a drained dispose", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -1221,6 +1252,49 @@ describe("createHandle: tmpCleanup must carry meaning, not just shape", () => {
 });
 
 describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
+  it("keeps genuine provider exit during requested disposal separate from clean-drain authority", async () => {
+    let fake: FakeSupervisor;
+    fake = newFake({ disposeReply: (id) => {
+      fake.emitChildExit(137);
+      setImmediate(() => fake.exitWith(0));
+      return { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [4243], reaped: [4243] };
+    } });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, true, "genuine primary status must not invalidate separately confirmed requested disposal");
+    assert.deepEqual(await handle.waitChild(), { event: "child_exit", code: 137 });
+    assert.equal(handle.failed, undefined);
+  });
+
+  for (const scenario of ["unconfirmed", "duplicate", "malformed", "unmatched", "nonzero", "after-response", "timeout"] as const) {
+    it(`provider exit during disposal stays failed and retains data after ${scenario}`, async () => {
+      let fake: FakeSupervisor;
+      fake = newFake({ disposeReply: (id) => {
+        const drained = { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [4243], reaped: [4243] };
+        if (scenario === "after-response") {
+          fake.writeEvidence(drained);
+          fake.emitChildExit(137);
+          setImmediate(() => fake.exitWith(0));
+          return undefined;
+        }
+        fake.emitChildExit(137);
+        if (scenario === "duplicate") fake.emitChildExit(137);
+        if (scenario === "malformed") fake.writeEvidence({ event: "child_exit", code: "137" });
+        if (scenario === "timeout") return undefined;
+        if (scenario === "unconfirmed") {
+          return { event: "dispose", id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [] };
+        }
+        setImmediate(() => fake.exitWith(scenario === "nonzero" ? 2 : 0));
+        return scenario === "unmatched" ? { ...drained, id: id + 1 } : drained;
+      } });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(100);
+      assert.equal(outcome.clean, false);
+      assert.ok(handle.failed, "a dead provider after unsuccessful disposal must never appear healthy");
+      assert.equal(treeRemoveCalls.length, 0, "unconfirmed or invalid evidence never authorizes tree removal");
+    });
+  }
+
   it("treats a provider primary-child exit as a root failure", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -1247,6 +1321,108 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     await handle.whenFailed;
     const outcome = await handle.dispose();
     assert.equal(outcome.clean, false);
+  });
+
+  it("memory drain evidence preserves process identities and reports enumeration failure without claiming clean disposal", async () => {
+    const children = [{ pid: 4243, startTime: "18446744073709551615" }];
+    for (const [reason, remaining] of [
+      ["deadline", children],
+      ["echild-contradicted", children],
+      ["enumeration", []],
+    ] as const) {
+      const fake = newFake({
+        disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason,
+          killed: [4243], reaped: [], children: remaining, evidenceTruncated: true }),
+      });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(200);
+      assert.equal(outcome.clean, false);
+      assert.ok(!outcome.clean);
+      assert.equal(outcome.event?.state, "unconfirmed", "valid negative evidence reaches the caller");
+      assert.equal(outcome.event?.reason, reason);
+      assert.deepEqual(outcome.event?.children, remaining, "kernel tick identity is preserved exactly");
+      assert.equal(handle.failed, undefined, "unconfirmed evidence is not a parser failure");
+      assert.equal(treeRemoveCalls.length, 0, "negative drain evidence cannot authorize tree removal");
+    }
+  });
+
+  it("bounded drain evidence remains unconfirmed without disabling disposal retries", async () => {
+    let requests = 0;
+    const fake = newFake({
+      disposeReply: (id) => { requests += 1; return { event: "dispose", id, state: "unconfirmed", reason: "oversize",
+        killed: [], reaped: [], children: [] }; },
+    });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(200);
+    assert.equal(outcome.clean, false);
+    assert.ok(!outcome.clean);
+    assert.equal(outcome.event?.reason, "oversize", "bounded negative evidence reaches the caller");
+    const retry = await handle.dispose(200);
+    assert.equal(retry.clean, false);
+    assert.ok(!retry.clean);
+    assert.equal(retry.event?.reason, "oversize");
+    assert.equal(requests, 2, "retry sends another supervisor request");
+    assert.equal(handle.failed, undefined);
+    assert.equal(treeRemoveCalls.length, 0);
+  });
+
+  it("rejects malformed memory drain identities and reasons without claiming clean disposal", async () => {
+    const identity = { pid: 4243, startTime: "123" };
+    const cases = [
+      { children: [4243] },
+      { children: [{ pid: 0, startTime: "123" }] },
+      { children: [{ pid: 4243, startTime: 123 }] },
+      { children: [{ pid: 4243, startTime: "0" }] },
+      { children: [{ pid: 4243, startTime: "01" }] },
+      { children: [{ pid: 4243, startTime: "18446744073709551616" }] },
+      { children: [{ ...identity, extra: true }] },
+      { children: [identity, identity] },
+      { children: null },
+      { reason: "unknown", children: [] },
+      { reason: "enumeration", children: [identity] },
+      { authority: "ECHILD+__WALL", children: [] },
+      { evidenceTruncated: "true", children: [] },
+      { evidenceTruncated: 1, children: [] },
+      { evidenceTruncated: null, children: [] },
+    ];
+    for (const fields of cases) {
+      const fake = newFake({
+        disposeReply: (id) => ({ event: "dispose", id, state: "unconfirmed", reason: "deadline",
+          killed: [], reaped: [], ...fields }),
+      });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(200);
+      assert.equal(outcome.clean, false);
+      assert.ok(!outcome.clean);
+      assert.equal(outcome.event, undefined);
+      assert.match(outcome.reason, /malformed dispose evidence/);
+      assert.ok(handle.failed instanceof TrustedExecutionRefusal);
+      assert.equal(treeRemoveCalls.length, 0);
+    }
+  });
+
+  it("truncated diagnostic IDs preserve exact ECHILD disposal authority", async () => {
+    for (const evidenceTruncated of [undefined, false, true]) {
+      const fake = newFake({ disposeReply: (id) => {
+        setImmediate(() => fake.exitWith(0));
+        return { event: "dispose", id, state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [],
+          ...(evidenceTruncated === undefined ? {} : { evidenceTruncated }) };
+      } });
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      const outcome = await handle.dispose(200);
+      assert.equal(outcome.clean, true);
+      assert.equal(outcome.event?.evidenceTruncated, evidenceTruncated);
+    }
+  });
+
+  it("abnormal cleanup refuses a malformed diagnostic truncation flag", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.writeEvidence({ event: "abnormal", reason: "fixture", cleanup: {
+      state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [], evidenceTruncated: "true",
+    } });
+    const error = await handle.whenFailed;
+    assert.match(error.message, /malformed cleanup evidence/);
   });
 
   it("(f3) a dispose `unconfirmed` is NOT clean", async () => {
@@ -1534,6 +1710,7 @@ describe("runLaunchCli: packaged entrypoint (knip-visible import)", () => {
       supervisorPid: 1,
       transport: { stdin: null, stdout: null, stderr: null },
       snapshot: () => Promise.reject(new Error("unused")),
+      observe: () => Promise.resolve({ event: "observe" as const, id: 1, state: "unavailable" as const, reason: "unreadable" as const }),
       waitChild: () => Promise.resolve({ event: "child_exit" as const, code: 0 }),
       dispose: () => { disposed.push(1); return Promise.resolve({ clean: true as const, event: { event: "dispose" as const, id: 1, state: "drained" as const } }); },
       failed: undefined,
@@ -1738,5 +1915,201 @@ describe("launchCodexRoot: provisioning failure diagnostics", () => {
     assert.match(tree, /^runner-owned tree creation failed \(exit 1\): mkdir: \*\*\*REDACTED\*\*\* exists$/);
     const write = await failure({ write: { status: 1, stderr: "cat: denied" } }, { redactDiagnostic });
     assert.match(write, /^runner-owned file write failed for \S+ \(exit 1\): cat: denied$/);
+  });
+});
+
+
+describe("launcher observation contract", () => {
+  const complete = (id: number) => ({
+    event: "observe", id, state: "complete",
+    supervisor: { pid: 4242, startTime: "9007199254740993" },
+    root: { pid: 4243, startTime: "9007199254740994" },
+    processes: [{ pid: 4243, startTime: "9007199254740994", ppid: 4242, rss: 8192 }],
+  });
+  it("serves more than 256 observations without spending the lifecycle budget", async () => {
+    const fake = newFake({ observeReply: complete });
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    for (let i = 0; i < 300; i++) {
+      const outcome = await handle.observe();
+      assert.equal(outcome.state, "complete");
+      if (outcome.state === "complete") assert.equal(outcome.root.startTime, "9007199254740994");
+    }
+    assert.equal(fake.observeRequests.length, 300);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("keeps unavailable responses and timed-out late replies nondestructive and single-flight", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const first = handle.observe(10);
+    const busy = await handle.observe(10);
+    assert.equal(busy.state, "unavailable");
+    if (busy.state === "unavailable") assert.equal(busy.reason, "busy");
+    assert.equal(fake.observeRequests.length, 1);
+    const timeout = await first;
+    assert.equal(timeout.state, "unavailable");
+    if (timeout.state === "unavailable") assert.equal(timeout.reason, "timeout");
+    assert.equal((await handle.observe(10)).state, "unavailable");
+    fake.writeEvidence({ ...complete(fake.observeRequests[0]!), root: { pid: 4243, startTime: "7" } });
+    const second = handle.observe(1000);
+    // A late oversized reply is discarded too; it cannot settle the new request.
+    fake.evidence.write(`{"event":"observe","id":${fake.observeRequests[0]!},"payload":"${"x".repeat(100000)}"}\n`);
+    const id = fake.observeRequests[1]!;
+    fake.writeEvidence({ event: "observe", id, state: "unavailable", reason: "unreadable" });
+    const unavailable = await second;
+    assert.equal(unavailable.state, "unavailable");
+    if (unavailable.state === "unavailable") assert.equal(unavailable.reason, "unreadable");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("rejects missing ancestry, identity drift, duplicates and malformed observations without poisoning control", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const request = async (mutate: (value: ReturnType<typeof complete>) => unknown) => {
+      const promise = handle.observe();
+      fake.writeEvidence(mutate(complete(fake.observeRequests.at(-1)!)));
+      return promise;
+    };
+    assert.equal((await request((v) => v)).state, "complete");
+    for (const mutate of [
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "7" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, pid: 4244 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, supervisor: { ...v.supervisor, pid: 4244 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "020" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: "18446744073709551616" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, root: { ...v.root, startTime: 9007199254740994 } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [{ ...v.processes[0]!, ppid: 4243 }] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [{ ...v.processes[0]!, ppid: 8888 }] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, processes: [...v.processes, ...v.processes] }),
+      (v: ReturnType<typeof complete>) => ({ ...v, supervisor: { ...v.supervisor, startTime: "5" } }),
+      (v: ReturnType<typeof complete>) => ({ ...v, tmpCleanup: { state: "removed", reason: "" } }),
+    ]) {
+      const outcome = await request(mutate);
+      assert.equal(outcome.state, "unavailable");
+      if (outcome.state === "unavailable") assert.equal(outcome.reason, "stale");
+    }
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("bounds chunked and single-chunk oversized observation records before materialization", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    for (const chunked of [false, true]) {
+      const promise = handle.observe();
+      const prefix = `{"event":"observe","id":${fake.observeRequests.at(-1)!},"payload":"`;
+      if (chunked) {
+        fake.evidence.write(prefix);
+        for (let i = 0; i < 80; i++) fake.evidence.write("x".repeat(1024));
+        fake.evidence.write('"}\n');
+      } else fake.evidence.write(prefix + "x".repeat(100000) + '"}\n');
+      const outcome = await promise;
+      assert.equal(outcome.state, "unavailable");
+      if (outcome.state === "unavailable") assert.equal(outcome.reason, "oversize");
+    }
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+  it("preflights 16000 rows, escaped keys, nesting and malformed structure before parsing rows", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const parse = JSON.parse;
+    let materialized = 0;
+    JSON.parse = ((text: string, ...args: unknown[]) => {
+      if (text.startsWith("{") && text.includes("process")) materialized++;
+      return Reflect.apply(parse, JSON, [text, ...args]);
+    }) as typeof JSON.parse;
+    try {
+      for (const rows of [
+        Array(16000).fill("{}").join(","),
+        Array(257).fill('"braces [ ] and \\"quotes\\""').join(","),
+        "[".repeat(40) + "0" + "]".repeat(40),
+        Array(129).fill("[0]").join(","),
+      ]) {
+        const promise = handle.observe();
+        const id = fake.observeRequests.at(-1)!;
+        const text = '{"proce\\u0073ses":[' + rows + '],"id":' + id + ',"ev\\u0065nt":"observe"}';
+        assert.ok(Buffer.byteLength(text) < 65536);
+        fake.writeRawEvidence(text);
+        const outcome = await promise;
+        assert.equal(outcome.state, "unavailable");
+        if (outcome.state === "unavailable") assert.equal(outcome.reason, "oversize");
+      }
+      assert.equal(materialized, 0);
+      const malformed = handle.observe();
+      fake.writeRawEvidence('{"event":"observe","id":' + fake.observeRequests.at(-1)! + ',"processes":[{},]}');
+      assert.equal((await malformed).state, "unavailable");
+      assert.equal(materialized, 0);
+    } finally { JSON.parse = parse; }
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
+  it("fences 300 timed-out attempts and ignores invalid and oversized late IDs", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const first = await handle.observe(0);
+    assert.equal(first.state, "unavailable");
+    const old = fake.observeRequests[0]!;
+    for (let i = 0; i < 300; i++) {
+      const result = await handle.observe(0);
+      if (result.state === "unavailable") assert.equal(result.reason, "busy");
+    }
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeRawEvidence('{"id":-1,"event":"observe","payload":"' + "x".repeat(100000) + '"}');
+    assert.equal((await handle.observe(0)).state, "unavailable");
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeRawEvidence('{"id":' + old + ',"event":"observe","payload":"' + "x".repeat(100000) + '"}');
+    const next = handle.observe(1000);
+    let settled = false;
+    void next.then(() => { settled = true; });
+    fake.writeEvidence(complete(old));
+    fake.writeRawEvidence('{"event":"observe","id":' + old + ',"payload":"' + "x".repeat(100000) + '"}');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(fake.observeRequests.length, 2);
+    fake.writeEvidence(complete(fake.observeRequests[1]!));
+    assert.equal((await next).state, "complete");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
+  it("respects real writable backpressure without queueing further observations", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.control.cork();
+    // Force the next tiny control frame to hit the actual Writable high-water mark.
+    const state = fake.control as unknown as { _writableState: { highWaterMark: number } };
+    state._writableState.highWaterMark = 1;
+    const first = await handle.observe(0);
+    assert.equal(first.state, "unavailable");
+    assert.equal(fake.control.writableNeedDrain, true);
+    const queued = fake.control.writableLength;
+    for (let i = 0; i < 300; i++) await handle.observe(0);
+    assert.equal(fake.control.writableLength, queued);
+    assert.equal(fake.observeRequests.length, 0);
+    fake.control.uncork();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(fake.observeRequests.length, 1);
+    fake.writeEvidence(complete(fake.observeRequests[0]!));
+    const next = handle.observe(1000);
+    fake.writeEvidence(complete(fake.observeRequests[1]!));
+    assert.equal((await next).state, "complete");
+    assert.equal(handle.failed, undefined);
+    assert.equal(fake.control.writableEnded, false);
+    assert.equal((await handle.dispose()).clean, true);
+  });
+
+  it("retains transport death as unavailable observation and unconfirmed disposal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const promise = handle.observe();
+    fake.exitWith(1);
+    const outcome = await promise;
+    assert.equal(outcome.state, "unavailable");
+    if (outcome.state === "unavailable") assert.equal(outcome.reason, "transport");
+    assert.equal((await handle.dispose()).clean, false);
   });
 });

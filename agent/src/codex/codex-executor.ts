@@ -62,6 +62,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
 import { constants as FS } from "node:fs";
@@ -148,6 +149,8 @@ import {
   CommandDeadlineError,
   type FileopClient,
   type ScreenPolicy,
+  type CapturedMemoryContext,
+  isBrokerModelCommand,
   type SpawnCommandResult,
   type SpawnCommandSeam,
   type ToolHandler,
@@ -866,6 +869,79 @@ class CodexInitialCredentialUnavailableError extends Error {
 }
 
 /**
+ * Per-run installer ownership and the installer-before-credential boundary reconcile.
+ * Terminal joins have no deadline; bounded joins retain the handle on expiry/cancellation.
+ * The mutable promise/result cells are populated by startDepsInstall in CodexExecutor.run.
+ */
+export function createRunLaneInstallerReconcile(
+  lifecycleSignal: AbortSignal,
+  credentials: {
+    runId: string;
+    client: Pick<WorkerClient, "releaseCodex" | "refreshCodex">;
+    binding: CodexBinding;
+    registerToken: (token: string) => void;
+    committed?: CodexCommittedGenerationCell;
+    isVaultLocked?: () => boolean;
+  },
+  timeoutNow?: () => number,
+  abort = new AbortController(),
+) {
+  const credentialReconcile = buildRunLaneReconcile(
+    credentials.runId, credentials.client, credentials.binding, credentials.registerToken,
+    credentials.committed, credentials.isVaultLocked, lifecycleSignal,
+  );
+  const state: {
+    abort: AbortController;
+    cancellation: AbortSignal;
+    promise?: Promise<JsDepsInstall>;
+    result?: JsDepsInstall;
+    reported: boolean;
+    noted: boolean;
+  } = { abort, cancellation: lifecycleSignal, reported: false, noted: false };
+  const settle = async (deadlineAt?: number, signal?: AbortSignal, remaining?: () => number): Promise<boolean> => {
+    state.abort.abort();
+    if (!state.promise) return true;
+    if (deadlineAt === undefined) {
+      await state.promise;
+      return true;
+    }
+    const left = remaining ?? (() => Math.max(0, deadlineAt - Date.now()));
+    if (signal?.aborted || left() <= 0) return false;
+    let timer: ReturnType<typeof chunkedTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    try {
+      return await new Promise<boolean>((resolve) => {
+        onAbort = () => resolve(false);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer = chunkedTimeout(() => resolve(false), left(), { now: timeoutNow });
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
+      });
+    } finally {
+      timer?.cancel();
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+    }
+  };
+  const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+    const cause = request.gracefulShutdownCheckpoint;
+    const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
+    const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+    const cancellation = AbortSignal.any([signal, authoritySignal,
+      ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+    const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
+      category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
+      message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
+        : "codex dependency install did not settle before reconcile",
+    }] });
+    const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
+      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
+    if (cause && cancellation.aborted) return refused();
+    if (!await settle(deadlineAt, cancellation, remaining)) return refused();
+    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+  };
+  return Object.assign(state, { settle, reconcile });
+}
+
+/**
  * PRD #1171 m4 (part 4): the RUN-LANE per-sink auth-mode reconcile closure — the safety facade
  * runs it BEFORE every durability boundary. Mirrors {@link CodexAdviceCredentialBridge}: it
  * captures the runId, the client (release/refresh) and the immutable binding (authMode +
@@ -904,8 +980,13 @@ export function buildRunLaneReconcile(
   let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
   let operationUncertain = false;
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
-    const deadlineAt = Date.now() + request.deadlineMs;
-    const signal = lifecycleSignal ? AbortSignal.any([boundarySignal, lifecycleSignal]) : boundarySignal;
+    const cause = request.gracefulShutdownCheckpoint;
+    const deadlineAt = Math.min(Date.now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
+    const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+    const signal = AbortSignal.any([boundarySignal,
+      ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+    const expired = () => signal.aborted || Date.now() >= deadlineAt ||
+      (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
       errors: [{ category: "authorization", message: deferral === "refresh_unknown"
@@ -914,7 +995,7 @@ export function buildRunLaneReconcile(
       ...(deferral ? { deferral } : {}),
     });
     // Lifecycle cancellation wins even after an ambiguous send; the runner routes steering.
-    if (lifecycleSignal?.aborted) return blocked();
+    if (authoritySignal?.aborted) return blocked();
     // Issue #1789: the run already learned (mid-turn) that the owner vault is locked: defer at once
     // with NO credential call, instead of re-asking the api for a refresh/release it will refuse.
     if (isVaultLocked?.()) {
@@ -923,7 +1004,7 @@ export function buildRunLaneReconcile(
       ];
       return { kind: "blocked", errors, deferral: "vault_locked" };
     }
-    if (signal.aborted || Date.now() >= deadlineAt) return blocked(operationUncertain ? "refresh_unknown" : undefined);
+    if (expired()) return blocked(operationUncertain ? "refresh_unknown" : undefined);
     try {
       if (binding.authMode === "subscription") {
         if (committed.value === undefined) {
@@ -941,15 +1022,19 @@ export function buildRunLaneReconcile(
         // At most two HTTP attempts, immediate reconciliation in this same flight. A refusal
         // ends the loop; ambiguity/contended alone admits the second attempt.
         for (let attempt = 0; attempt < 2; attempt++) {
-          if (lifecycleSignal?.aborted) return blocked();
-          if (signal.aborted || Date.now() >= deadlineAt) return blocked(uncertain ? "refresh_unknown" : undefined);
+          if (authoritySignal?.aborted) return blocked();
+          if (expired()) return blocked(uncertain ? "refresh_unknown" : undefined);
           try {
             const res = await client.refreshCodex(
               runId, { ...frozenOperation },
               { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId }, signal,
             );
             // Cancellation can arrive with the response; it still precedes any new authority.
-            if (lifecycleSignal?.aborted) return blocked();
+            if (authoritySignal?.aborted) return blocked();
+            if (expired()) {
+              operationUncertain = true;
+              return blocked("refresh_unknown");
+            }
             // WorkerClient validates identity, shape and generation before returning a token.
             registerToken(res.access_token);
             committed.value = Math.max(committed.value ?? frozenOperation.observed_generation, res.generation);
@@ -957,7 +1042,7 @@ export function buildRunLaneReconcile(
             operationUncertain = false;
             return { kind: "ready" };
           } catch (err) {
-            if (lifecycleSignal?.aborted) return blocked();
+            if (authoritySignal?.aborted) return blocked();
             if (codexDeferralReason(err) === "vault_locked") {
               return { kind: "blocked", errors: [{ category: "authorization",
                 message: "codex subscription boundary reconcile deferred: vault locked" }], deferral: "vault_locked" };
@@ -990,11 +1075,12 @@ export function buildRunLaneReconcile(
         { authMode: "api_key" },
         signal,
       );
-      if (lifecycleSignal?.aborted) return blocked();
+      if (authoritySignal?.aborted) return blocked();
+      if (expired()) return blocked();
       registerToken(res.access_token);
       return { kind: "ready" };
     } catch (err) {
-      if (lifecycleSignal?.aborted) return blocked();
+      if (authoritySignal?.aborted) return blocked();
       // Fail CLOSED with a bounded, secret-free reason (authMode is safe to name). The op id and
       // observed generation are DELIBERATELY left intact so a retried boundary reuses them.
       // Issue #1766: a typed 409 vault_locked reply is still a block (the boundary poisons and
@@ -1768,6 +1854,7 @@ export interface CodexExecutorDeps {
 }
 
 export interface CodexExecutorOptions {
+  readonly capturedMemory?: CapturedMemoryContext;
   /** Advisory seams; the default runner uses the shared provisioning HOME and advice factory. */
   readonly summaryRunner?: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
   /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
@@ -2078,41 +2165,14 @@ export class CodexExecutor implements Executor {
   private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
 
   /** Owned across epochs, replaced on sequential reuse; expiry never drops the handle. */
-  private depsInstall?: {
-    abort: AbortController;
-    cancellation: AbortSignal;
-    promise?: Promise<JsDepsInstall>;
-    result?: JsDepsInstall;
-    reported: boolean;
-    noted: boolean;
-  };
+  private depsInstall?: ReturnType<typeof createRunLaneInstallerReconcile>;
 
   /** Abort before a durability boundary. Terminal callers await without a deadline.
    * Each bounded wait has one deadline and removes its own timer/listener on every exit.
    * Expiry/cancellation blocks this boundary, leaving the run to actually join at terminal.
    */
   private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall, remaining?: () => number): Promise<boolean> {
-    state?.abort.abort();
-    if (!state?.promise) return true;
-    if (deadlineAt === undefined) {
-      await state.promise;
-      return true;
-    }
-    const left = remaining ?? (() => Math.max(0, deadlineAt - Date.now()));
-    if (signal?.aborted || left() <= 0) return false;
-    let timer: ReturnType<typeof chunkedTimeout> | undefined;
-    let onAbort: (() => void) | undefined;
-    try {
-      return await new Promise<boolean>((resolve) => {
-        onAbort = () => resolve(false);
-        signal?.addEventListener("abort", onAbort, { once: true });
-        timer = chunkedTimeout(() => resolve(false), left(), { now: this.deps.timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
-      });
-    } finally {
-      timer?.cancel();
-      if (onAbort) signal?.removeEventListener("abort", onAbort);
-    }
+    return state ? state.settle(deadlineAt, signal, remaining) : true;
   }
 
   /**
@@ -2508,10 +2568,15 @@ export class CodexExecutor implements Executor {
       };
     };
     const installAbort = new AbortController();
-    const installState: NonNullable<CodexExecutor["depsInstall"]> = {
-      abort: installAbort, cancellation: lifecycleSignal,
-      reported: false, noted: false,
-    };
+    const installState = createRunLaneInstallerReconcile(
+      lifecycleSignal,
+      {
+        runId: ctx.runId, client: this.opts.client, binding: this.opts.binding, registerToken,
+        committed: committedGeneration, isVaultLocked: () => pauseNow.vaultLock.latched,
+      },
+      this.deps.timeoutNow,
+      installAbort,
+    );
     this.depsInstall = installState;
     const settleInstall = async (): Promise<void> => { await this.settleDepsInstall(undefined, undefined, installState); };
     const forwardInstallAbort = (): void => {
@@ -2645,15 +2710,7 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const credentialReconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched, lifecycleSignal);
-      const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
-        const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
-        const cancellation = AbortSignal.any([signal, lifecycleSignal]);
-        if (!await this.settleDepsInstall(deadlineAt, cancellation, installState)) {
-          return { kind: "blocked", errors: [{ category: "protocol", message: "codex dependency install did not settle before reconcile" }] };
-        }
-        return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
-      };
+      const reconcile = installState.reconcile;
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
       // already evicted+cleared the DURING-run tokens — so the FINAL epoch's onDispose evicts only
@@ -3682,6 +3739,18 @@ export class CodexExecutor implements Executor {
     epochIndex: number,
     opts: { persistAfterLaunchOnly?: boolean } = {},
   ): Promise<ProviderEpoch> {
+    // Snapshot the runner contract once for all effect surfaces in this epoch.
+    // Legacy direct callers may still bind through the static executor option.
+    const captureMemory = ctx.capturedMemory;
+    const capturedMemory = captureMemory !== undefined
+      ? captureMemory.call(ctx)
+      : this.opts.capturedMemory;
+    if (captureMemory !== undefined && capturedMemory === undefined) {
+      throw new TrustedExecutionRefusal("captured memory capability unavailable");
+    }
+    if (capturedMemory !== undefined && capturedMemory.context.run_id !== ctx.runId) {
+      throw new TrustedExecutionRefusal("captured memory run identity mismatch");
+    }
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
@@ -3757,6 +3826,9 @@ export class CodexExecutor implements Executor {
         commandSandbox,
         this.log,
         commandCache,
+        DEFAULT_COMMAND_WALL_MS,
+        LONG_COMMAND_WALL_MS,
+        capturedMemory,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -3772,6 +3844,7 @@ export class CodexExecutor implements Executor {
             get failed() { return handle.failed; },
             get whenFailed() { return handle.whenFailed; },
             snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+            observe: (timeoutMs) => handle.observe(timeoutMs),
             waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
             dispose: async (timeoutMs) => {
               await settleDepsInstall();
@@ -3821,7 +3894,13 @@ export class CodexExecutor implements Executor {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
         );
+        const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
+          ...result, command: scrubProjected(result.command),
+          tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),
+        });
         const delegationRunner = new CodexDelegationRunner({
+          capturedMemory,
+          scrubToolResult,
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
@@ -3838,6 +3917,8 @@ export class CodexExecutor implements Executor {
           scrubPolicyRole: scrubProjected,
         });
         return new CodexCallbackBroker({
+          capturedMemory,
+          scrubToolResult,
           registry,
           spawnCommand,
           fileop,
@@ -4632,23 +4713,6 @@ export class CodexExecutor implements Executor {
     throw new CodexInitialCredentialUnavailableError();
   }
 
-  /**
-   * The executor-owned auth-mode reconcile closure the safety facade runs BEFORE every boundary
-   * quiesce/reap/mint. Delegates to the standalone {@link buildRunLaneReconcile} (pinned by the
-   * differential test against the advice bridge), sharing the run's ONE committed-generation cell
-   * and `registerToken` closure so the boundary reconcile and the app-server refresh bridge never
-   * keep private state (part C / m1).
-   */
-  private makeBoundaryReconcile(
-    runId: string,
-    registerToken: (token: string) => void,
-    committed: CodexCommittedGenerationCell,
-    isVaultLocked: () => boolean,
-    lifecycleSignal: AbortSignal,
-  ): ReconcileBeforeBoundary {
-    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed, isVaultLocked, lifecycleSignal);
-  }
-
   // ─── the child-turn demux seam (part C) ───────────────────────────────────────
   private startChildTurn(
     harness: CodexHarness,
@@ -5095,6 +5159,7 @@ export class HeldRunCommandCache implements RunCommandCache {
         supervisorPid: handle.supervisorPid,
         transport: handle.transport,
         snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+        observe: (timeoutMs) => handle.observe(timeoutMs),
         waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
         dispose: async (timeoutMs) => {
           let outcome: DisposeOutcome;
@@ -5192,7 +5257,7 @@ async function launchRegisteredEffectRoot(
   const root = registeredRoot(handle, kind, log);
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
-    await root.dispose(deadlineMs).catch(() => undefined);
+    await boundedCommandWait(root.dispose(deadlineMs), deadlineMs).catch(() => undefined);
     throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
@@ -5413,8 +5478,14 @@ export function makeDefaultSpawnCommand(
   cache?: RunCommandCache,
   wallMs: number = DEFAULT_COMMAND_WALL_MS,
   longWallMs: number = LONG_COMMAND_WALL_MS,
+  capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand)
+        && !isBrokerModelCommand(opts.modelCommand, capturedMemory)) throw new Error("memory command context binding mismatch");
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand, capturedMemory)
+        && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
+          || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
       const withCache = cacheForLaunch(cache, launch);
       const launched = await launchRegisteredEffectRoot(
@@ -5425,6 +5496,13 @@ export function makeDefaultSpawnCommand(
         "command",
         log,
       );
+      let memory: Awaited<ReturnType<typeof enrollMemoryCommand>>;
+      try {
+        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, opts.signal);
+      } catch (error) {
+        await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        throw error;
+      }
       let stdout = "";
       let stderr = "";
       let capturedBytes = 0;
@@ -5482,20 +5560,45 @@ export function makeDefaultSpawnCommand(
       const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
       const terminal = launched.handle.waitChild(effectiveWallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
-      const first = await Promise.race([
+      const ordinary = Promise.race([
         terminal,
         aborted.then(() => ({ kind: "aborted" as const })),
         capTrip.then(() => ({ kind: "cap" as const })),
       ]);
+      const first = await Promise.race([
+        ordinary,
+        ...(memory ? [memory.outcome.then((result) => ({ kind: "memory" as const, result }))] : []),
+      ]);
+      // A pressure outcome conveys tool feedback, never ordinary disposal authority.
+      // Keep this root owned in the foreground until exit, abort, cap or wall deadline.
+      const cleanupReason = first.kind === "memory" ? await ordinary : first;
       if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
-      const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
-      if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
-      await outputEnded;
-      if (first.kind === "aborted" || (first.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
-      if (first.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
-      if (first.kind === "failed") throw first.error;
+      let cleanupError: unknown;
+      let reaped = false;
+      try {
+        const result = await (memory?.reap() ?? boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs));
+        reaped = result.ok;
+        if (!result.ok) cleanupError = new Error(COMMAND_ROOT_UNREAPED);
+      } catch (error) {
+        registry.poison({ category: "protocol", message: "command cleanup completion unconfirmed" });
+        cleanupError = error;
+      }
+      memory?.recordDisposal(reaped);
+      try { await boundedCommandWait(outputEnded, reapDeadlineMs); } catch (error) { cleanupError ??= error; }
+      const prepared = memory?.preparedOutcome();
+      let memoryPressure = first.kind === "memory" ? first.result : undefined;
+      try {
+        if (!memoryPressure && prepared) memoryPressure = await boundedCommandWait(prepared, reapDeadlineMs);
+      } finally {
+        if (reaped) memory?.unregister();
+      }
+      if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
+      if (cleanupError) throw cleanupError;
+      if (cleanupReason.kind === "aborted" || (cleanupReason.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
+      if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
+      if (cleanupReason.kind === "failed") throw cleanupReason.error;
       return {
-        code: first.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
+        code: cleanupReason.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : cleanupReason.code,
         stdout,
         stderr,
       };

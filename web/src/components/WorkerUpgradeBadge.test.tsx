@@ -348,6 +348,38 @@ describe("fleetSummary", () => {
 });
 
 describe("the detail strip", () => {
+  it("sanitizes ordinary draining detail without adding attention or failure actions", () => {
+    const worker = aWorker({
+      kind: "hosted", upgrade_status: "up_to_date", draining_since: "2026-10-17T12:00:00Z",
+      upgrade_detail: "paused: submit input; queued: wait; pool_wait: fund token; +2 omitted\u202e\u0007",
+    });
+    const { container } = render(<WorkerUpgradeDetail worker={worker} />);
+    expect(screen.getByText("paused: submit input; queued: wait; pool_wait: fund token; +2 omitted")).toBeTruthy();
+    expect(container.textContent).not.toContain("\u202e");
+    expect(container.textContent).not.toContain("\u0007");
+    expect(container.querySelector(".text-danger")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(needsAttention(worker)).toBe(false);
+  });
+
+  it.each([
+    { kind: "hosted", draining_since: null },
+    { kind: "external", draining_since: "2026-10-17T12:00:00Z" },
+  ] as const)("keeps ordinary non-draining and external detail hidden: %s", (control) => {
+    const { container } = render(<WorkerUpgradeDetail worker={aWorker({
+      ...control, upgrade_status: "up_to_date", upgrade_detail: "hidden detail",
+    })} />);
+    expect(container.textContent).toBe("");
+  });
+
+  it.each(["up_to_date", "upgrading", "unknown"] as const)("shows ordinary draining blockers for %s", (status) => {
+    const detail = "run 11111111-1111-4111-8111-111111111111 (chat, pool_wait): a pooled token becomes spendable";
+    render(<WorkerUpgradeDetail worker={aWorker({
+      kind: "hosted", upgrade_status: status, draining_since: "2026-10-17T12:00:00Z", upgrade_detail: detail,
+    })} />);
+    expect(screen.getByText(detail)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /copy kubectl/i })).toBeNull();
+  });
   it("renders for the WHOLE attention set, not just failures", () => {
     // `outdated` is an alert state that `needsAttention` counts and the nav badge will
     // count. Gating this strip on upgrade_failed left its entire explanation in a hover

@@ -332,7 +332,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
   ): Promise<T> {
-    const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
+    const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs),
+      request.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
     // (1) Serialize overlapping acquisitions. Each call parks on the prior tail and
     // installs a fresh release the next caller will await.
     const prior = this.queueTail;
@@ -408,6 +409,17 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     deadlineAt: number,
   ): Promise<T> {
     const boundaryAbort = new AbortController();
+    const cause = request.gracefulShutdownCheckpoint;
+    const stopSignal = cause?.stopSignal;
+    const maintenanceSignal = cause ? MaintenanceBudget.signal() : undefined;
+    const boundarySignal = AbortSignal.any([boundaryAbort.signal,
+      ...[stopSignal, maintenanceSignal].filter((s): s is AbortSignal => s !== undefined)]);
+    const requireAuthority = (stage: "reconcile" | "quiesce" | "reap" | "action"): void => {
+      if (!stopSignal?.aborted) return;
+      const errors: readonly HarnessError[] = [{ category: "authorization", message: "codex shutdown checkpoint authority revoked" }];
+      this.registry.poison(errors);
+      throw new CodexBoundaryError(stage, errors, undefined, undefined, { boundary: request.boundary });
+    };
     // Issue #1864: every boundary failure names the boundary and sink it happened at.
     const where = { boundary: request.boundary, ...(request.sink !== undefined ? { sink: request.sink } : {}) };
     // Convert the public duration to one absolute deadline. Each acquisition stage
@@ -416,7 +428,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // not Promise.race and abandon an uncooperative action. The production runner
     // propagates it through finalize/recovery forge + worker HTTP, retry backoff and
     // message drain, while permit-owned processes consume the shrinking budget.
-    const atEntry = remainingMs(deadlineAt);
+    requireAuthority("reconcile");
+    const atEntry = Math.min(remainingMs(deadlineAt),
+      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity);
     if (atEntry <= 0) {
       const errors: readonly HarnessError[] = [{ category: "timeout", message: "codex boundary expired in the acquisition queue" }];
       this.registry.poison(errors);
@@ -430,7 +444,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       boundaryAbort.abort();
     });
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
-      if (!boundaryAbort.signal.aborted && remainingMs(deadlineAt) > 0) return;
+      requireAuthority(stage);
+      if (!boundarySignal.aborted && remainingMs(deadlineAt) > 0 &&
+          (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) > 0) return;
       const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
       this.registry.poison(errors);
       throw new CodexBoundaryError(stage, errors, undefined, undefined, where);
@@ -447,7 +463,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     if (this.reconcileBeforeBoundary) {
       const reconciled = await this.reconcileBeforeBoundary(
         { ...request, deadlineMs: remainingMs(deadlineAt) },
-        boundaryAbort.signal,
+        boundarySignal,
       );
       if (reconciled.kind === "blocked") {
         this.registry.poison(reconciled.errors);
@@ -492,7 +508,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // holding it. The permit/closed epoch is held through the full async action and
     // every boundary-action child; release only after actual settlement. The action
     // consumes permit.signal rather than being raced and abandoned at the deadline.
-    const permit = mintPermit(epoch, request.boundary, boundaryAbort.signal);
+    const permit = mintPermit(epoch, request.boundary, boundarySignal);
     this.heldPermit = permit;
     this.currentDeadlineAt = deadlineAt;
     this.pendingActions = [];
@@ -523,7 +539,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 
     this.heldPermit = undefined;
 
-    if (boundaryAbort.signal.aborted) {
+    if (stopSignal?.aborted) {
+      this.registry.poison({ category: "authorization", message: "codex shutdown checkpoint authority revoked" });
+    } else if (boundarySignal.aborted) {
       this.registry.poison({
         category: "timeout",
         message:

@@ -76,6 +76,7 @@ type Store interface {
 	ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error)
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
+	ListWorkerUpgradeBlockers(context.Context, []uuid.UUID) ([]store.ListWorkerUpgradeBlockersRow, error)
 	// fleet.rundisk (PRD #1809 M6): each listed worker's largest fresh run HOME size (per_worker 1).
 	ListLargestRunDiskForWorkers(ctx context.Context, arg store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error)
 	// fleet.capacity: owners waiting with zero usable (online, non-draining, fresh) workers.
@@ -283,7 +284,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 	controllerReportOK := controllerReport.Severity == sevOK
 
 	confirm := &waitConfirmations{}
-	capacity := s.checkFleetCapacity(ctx, now, healthState, confirm)
+	capacity := s.checkFleetCapacityWithWorkers(ctx, now, healthState, workers, nil, confirm)
 	waiting := s.checkQueueWaiting(ctx, now, healthState, confirm)
 	confirm.close()
 

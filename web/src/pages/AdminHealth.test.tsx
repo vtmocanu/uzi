@@ -600,6 +600,42 @@ async function fleetRow(name: string): Promise<HTMLElement> {
 }
 
 describe("AdminHealth — Fleet card (M5)", () => {
+  it.each(["up_to_date", "upgrading", "unknown", "upgrade_failed"] as const)(
+    "shows sanitized draining detail as text alongside failures for %s", async (status) => {
+      const detail = "run 11111111-1111-4111-8111-111111111111 paused: submit input; queued: wait; pool_wait: fund token; +2 omitted";
+      await renderHealth(healthySilentDoc(), [fleetWorker({
+        name: "draining-worker", kind: "hosted", draining_since: "2026-10-17T12:00:00Z",
+        upgrade_status: status, upgrade_detail: detail + "\u202e\u0007",
+        upgrade_blocking_container: "worker\u202e",
+        upgrade_blocking_reason: "ImagePullBackOff\u0007",
+      })]);
+      const row = await fleetRow("draining-worker");
+      expect(within(row).getByText(detail)).toBeTruthy();
+      expect(row.textContent).not.toContain("\u202e");
+      expect(row.textContent).not.toContain("\u0007");
+      if (status === "upgrade_failed") {
+        const failure = within(row).getByText("worker: ImagePullBackOff");
+        expect(failure.getAttribute("title")).toBeTruthy();
+        expect(failure.getAttribute("title")).not.toContain("\u202e");
+        expect(failure.getAttribute("title")).not.toContain("\u0007");
+      } else {
+        expect(within(row).queryByText("worker: ImagePullBackOff")).toBeNull();
+      }
+    },
+  );
+
+  it.each([
+    { kind: "hosted", draining_since: null },
+    { kind: "external", draining_since: "2026-10-17T12:00:00Z" },
+  ] as const)("keeps non-draining and external blocking cells unchanged: %s", async (control) => {
+    await renderHealth(healthySilentDoc(), [fleetWorker({
+      name: "control-worker", ...control, upgrade_detail: "tooltip only",
+    })]);
+    const row = await fleetRow("control-worker");
+    expect(within(row).getByText("none")).toBeTruthy();
+    expect(within(row).queryByText("tooltip only")).toBeNull();
+  });
+
   it.each([
     ["capacity_blocked", "waiting for capacity"],
     ["provisioning_failed", "provisioning failed"],

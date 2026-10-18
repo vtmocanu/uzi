@@ -558,6 +558,22 @@ type JobResult struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type MemoryIntervention struct {
+	InterventionID  uuid.UUID          `json:"intervention_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RegisterNonce   string             `json:"register_nonce"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	MemoryEpisode   int64              `json:"memory_episode"`
+	Admitted        bool               `json:"admitted"`
+	AllowanceUsed   int32              `json:"allowance_used"`
+	Policy          []byte             `json:"policy"`
+	Outcome         pgtype.Text        `json:"outcome"`
+	ReservedAt      pgtype.Timestamptz `json:"reserved_at"`
+	OutcomeAt       pgtype.Timestamptz `json:"outcome_at"`
+}
+
 type MrReviewAuthorQueue struct {
 	RepoID        uuid.UUID          `json:"repo_id"`
 	Ref           string             `json:"ref"`
@@ -1062,6 +1078,9 @@ type Run struct {
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 	CiConfigGuard               bool               `json:"ci_config_guard"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
+	MemoryEpisode               int64              `json:"memory_episode"`
+	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
+	MemoryPolicy                []byte             `json:"memory_policy"`
 }
 
 type RunCompletionAttempt struct {

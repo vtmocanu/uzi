@@ -156,7 +156,13 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			// WorkerDTO. LARGEST RUN (PRD #1809 M6, D8) is the HOME size of each worker's largest
 			// run, the same largestRunCell `uzi worker list` uses; it is the fleet-wide view the
 			// fleet.rundisk health check's action points at.
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "ROLL", "BLOCKING", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows)
+			if err := p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "ROLL", "BLOCKING", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows); err != nil {
+				return err
+			}
+			for _, w := range ws {
+				printWorkerDrainDetail(p, w.WorkerDTO)
+			}
+			return nil
 		},
 	}
 
@@ -463,7 +469,9 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 // cellText, never the unbounded uzicli.CellText: the document is server-authored from fixed
 // templates, but it interpolates already-sanitized identifiers an owner controls (worker
 // names, repo paths), and this is an ADMIN's terminal. cellText's 200-rune cap is what bounds
-// a hostile megabyte-long summary that CellText alone would print in full.
+// a hostile megabyte-long summary that CellText alone would print in full. fleet.capacity
+// evidence is sanitized and wrapped into bounded continuation cells before cellText, so
+// run UUIDs, actions and omissions survive without changing other checks' output.
 func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, all, strict bool) error {
 	doc, err := c.AdminHealth(cmd.Context())
 	if err != nil {
@@ -496,7 +504,19 @@ func runAdminHealth(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comman
 				rows = append(rows, row)
 				row = []string{"", "", "", "", ""}
 			}
-			row[4] = cellText(evidence.Label + ": " + evidence.Value)
+			text := evidence.Label + ": " + evidence.Value
+			if ck.ID == "fleet.capacity" {
+				pieces := safeDetailLines(text)
+				for j, piece := range pieces {
+					if j > 0 {
+						rows = append(rows, row)
+						row = []string{"", "", "", "", ""}
+					}
+					row[4] = cellText(piece)
+				}
+			} else {
+				row[4] = cellText(text)
+			}
 		}
 		rows = append(rows, row)
 	}

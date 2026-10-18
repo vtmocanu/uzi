@@ -569,6 +569,49 @@ paired with an older api may show an MR cancellation reason implying the
 candidate was not applied; that older wording does not establish whether an
 earlier push applied.
 
+## Proactive memory guard
+
+Operators can opt into a worker-wide memory guard with
+`WORKER_MEMORY_GUARD_ENABLED`; it is **off by default** and needs six explicit
+numeric settings. See [configuration](./configuration.md#worker-memory-guard)
+for Compose, standalone and hosted wiring, validation and sizing inputs.
+There are no calibrated production thresholds; fixture values are unmeasured
+and are not production recommendations. Roll out the API advertising
+`worker_memory_pressure_v1` before enabling workers. For a worker-first rollout,
+keep the guard disabled until the API is ready, then enable with a fresh
+registration/restart. Enabled workers refuse startup against an unsupported
+API or invalid registration incarnation (`UnsupportedMemoryAPI`). Heartbeat
+feature growth creates no authority; shrink revokes reservation/signal authority
+while the original flight still owns settlement, feedback and source custody.
+
+One monitor shares the worker's cgroup budget across its configured
+concurrency. It can intervene in enrolled **Codex model shell commands**,
+using the exact registered supervisor and process start ticks; approximate
+tree RSS ranks candidates while total cgroup usage determines pressure.
+It does not subtract file memory. Claude commands (#2471), internal probes,
+provider/credential processes, boundary/checkpoint/capture operations and
+cross-checker authority are outside the delivered adapter's scope. Enrollment
+adds no process authority and changes no concurrency setting; see
+[ADR-2396](../adr/2396-worker-memory-guard.md).
+
+A confirmed command drain, resolved outcome and fresh low-usage dwell are
+required before another intervention/retry. The per-run memory-episode
+allowance survives ordinary redispatch. Exhaustion, uncertain drainage or
+unconfirmed outcome reporting takes the capture/owner-hold path; see
+[Memory-pressure holds](./run-recovery.md#memory-pressure-holds).
+Capture can fail, leaving local custody retained without a downloadable
+archive or a latest-work guarantee. An unconfirmed park ACK does not release
+custody. Codex command bounds stay 60 minutes, or 120 minutes with root-lead
+`long_running: true`; memory feedback does not extend those deadlines or
+supersede abort, output-cap or ordinary command cleanup ownership.
+
+This is proactive mitigation, not OOM prevention: allocation bursts,
+stalled sampling and node pressure can still kill the worker. A separate
+Docker-in-Docker cgroup needs its own sizing. Keep concurrency configured
+for the shared run, chat and checker workload; enabling the guard does not
+force it to one. An actual worker OOM still follows the worker-death requeue
+path described below.
+
 ## Plan-revision retry rollout
 
 Upgrade the API before workers. The API advertises `plan_revision_retry_v1`;
@@ -620,7 +663,7 @@ Raising the cap is an informed trade-off, not a free speedup:
   credential-reading commands but not writes outside a run's own worktree, so a
   prompt-injected run could shell-write into a sibling's worktree or the shared
   bare-repo cache.
-- **One container, one memory budget.** A runaway run can OOM the whole container,
+- **One container, one memory budget.** An actual OOM can kill the whole container,
   requeuing eligible in-flight runs together; raise the API's `RUN_MAX_REQUEUES`
   alongside `workers.maxConcurrentRuns > 1` to give affected runs more automatic
   worker-death retries per episode. Registration cannot attribute the memory consumer, so
@@ -664,8 +707,14 @@ it is an operator action: apply updated chart values with the new cap. The
 controller Deployment gets the updated `UZI_WORKER_MAX_CONCURRENT_RUNS` env and
 restarts; the restarted controller renders a changed worker pod-template hash.
 Reconciliation then rolls each worker under the existing drain rules: busy workers
-are cordoned and allowed to finish, bounded by the drain deadline and the operator
-force-roll override (see [ADR-422](../adr/0422-decouple-worker-version.md)). No new
+are cordoned when admitted and wait indefinitely for genuine idle, including
+assigned queued, paused and waiting/gated runs. Run-bound workers remain outside
+pacing but follow the same busy-drift policy. The unchanged 24h drain deadline now
+bounds only independent nondrifted pressure/nix-size maintenance; shortening it
+cannot force this template upgrade. Global emergency ForceRoll may interrupt runs
+and lose all capacity, while custody-held data and independent DinD guards remain
+authoritative (see [ADR-422](../adr/0422-decouple-worker-version.md) and
+[Draining and cordoned](./hosted-workers.md#draining-and-cordoned)). No new
 published controller or chart release is required. Size the preset to hold that
 many concurrent runs. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)

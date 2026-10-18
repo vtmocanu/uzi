@@ -46,6 +46,7 @@ REAL_PYTHON3=$(command -v python3)
 cat > "$WORK/bin/python3" <<'STUB'
 #!/usr/bin/env bash
 if [ "$*" != "$SESSION_PEERS_PY list --json" ]; then exec "$REAL_PYTHON3" "$@"; fi
+if [ -n "${PEERS_FIXTURE:-}" ]; then cat "$PEERS_FIXTURE"; exit 0; fi
 echo '{"claude":[{"sessionId":"uuid-me","name":"me","socket":"/x"},{"sessionId":"uuid-other","name":"other","socket":"/y"}],"codex":[],"codex_schema_recognised":true}'
 STUB
 : > "$WORK/peers.py"
@@ -123,4 +124,41 @@ has strand 'NEXT=claimed_by_other'; rc_is strand 4
 [ ! -f "$CL/run-run-1.json" ] || fail "strand: run key left behind: $(cat "$CL/run-run-1.json")"
 rm -f "$CL"/*.json
 
-echo "PASS takeover-run-claim: a live dispatcher's run-<RUN_ID> claim stops other landers; an own or dead one converts to the PR claim; acquisition and conversion are serialised"
+# OpenCode identity persists across subprocesses and the run-to-PR handoff.
+unset SESSION_PEERS_NAME SESSION_PEERS_UUID SESSION_PEERS_KIND
+unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID CODEX_SESSION_ID
+export OPENCODE_SESSION_ID=ses_aaaaaaaaaaaaAAAAAAAAAAAAAA
+export PEERS_FIXTURE="$WORK/opencode-registry.json"
+printf '%s\n' '{"claude":[],"codex":[],"opencode":[{"id":"ses_aaaaaaaaaaaaAAAAAAAAAAAAAA","title":"oc-owner","state":"idle"}],"opencode_error":null}' > "$PEERS_FIXTURE"
+bash "$HERE/claims.sh" whoami > "$WORK/who1"
+bash "$HERE/claims.sh" whoami > "$WORK/who2"
+cmp "$WORK/who1" "$WORK/who2" || fail "OpenCode identity changed between subprocesses"
+grep -qF "SESSION_UUID=$OPENCODE_SESSION_ID" "$WORK/who1" || fail "native OpenCode id not used"
+grep -qF 'SESSION_KIND=opencode' "$WORK/who1" || fail "OpenCode runtime not used"
+rm -f "$CL"/*.json
+export RUN_STATUS=running RUN_PR=null
+snap ocactive run-1
+[ "$(jq -r .owner_uuid "$CL/run-run-1.json")" = "$OPENCODE_SESSION_ID" ] || fail "run claim lost OC identity"
+export RUN_STATUS=completed RUN_PR=42
+snap ocpr run-1
+[ "$(jq -r .owner_uuid "$CL/#42.json")" = "$OPENCODE_SESSION_ID" ] || fail "PR claim lost OC identity"
+[ ! -f "$CL/run-run-1.json" ] || fail "OC run key not converted"
+
+# A different OpenCode session cannot steal an idle but extant owner's claim.
+export OPENCODE_SESSION_ID=ses_bbbbbbbbbbbbBBBBBBBBBBBBBB
+printf '%s\n' '{"claude":[],"codex":[],"opencode":[{"id":"ses_aaaaaaaaaaaaAAAAAAAAAAAAAA","title":"oc-owner","state":"idle"},{"id":"ses_bbbbbbbbbbbbBBBBBBBBBBBBBB","title":"oc-other","state":"running"}]}' > "$PEERS_FIXTURE"
+snap ocother 42
+has ocother 'NEXT=claimed_by_other'; rc_is ocother 4
+
+# Recent-session discovery cannot prove an absent OpenCode session dead.
+rc=0; bash -c '. "$1/lib/state.sh"; is_live ses_ccccccccccccCCCCCCCCCCCCCC' test "$HERE" || rc=$?
+[ "$rc" -eq 2 ] || fail "absent OpenCode owner must be unknown, got $rc"
+printf '%s\n' '{"claude":[],"codex":[],"opencode":[],"opencode_error":"service stopped"}' > "$PEERS_FIXTURE"
+rc=0; bash "$HERE/claims.sh" whoami > "$WORK/unknown.out" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] || fail "unverified native OC identity silently fell back"
+export CODEX_THREAD_ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+rc=0; bash "$HERE/claims.sh" claim ambiguous --repo test/repo > "$WORK/ambiguous.out" 2>&1 || rc=$?
+[ "$rc" -ne 0 ] || fail "ambiguous runtime environment claimed ownership"
+[ ! -f "$CL/ambiguous.json" ] || fail "ambiguous runtime wrote a claim"
+
+echo "PASS takeover-run-claim: serialized run/PR claims preserve native owners, including OpenCode; unknown and ambiguous identity fail closed"

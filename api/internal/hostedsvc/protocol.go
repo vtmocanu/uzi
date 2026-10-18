@@ -81,17 +81,18 @@ type DesiredWorker struct {
 	Isolated bool `json:"isolated"`
 	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3,
 	// Decision 5): it reuses the same active-run predicate the DeleteWorker guard uses
-	// (awaiting_approval included). The controller reads it to defer a deliberate roll of
-	// a busy worker (cordon-then-roll-when-idle, M4). Always present on the wire (no
+	// (queued, paused and all waits/gates included). API assignments, not worker
+	// reported_runs, are authoritative. Busy drift waits indefinitely for idle unless
+	// global ForceRoll (#3103). Always present on the wire (no
 	// omitempty) so a drop is a visible contract change, not a silent false.
 	Busy bool `json:"busy"`
 	// DrainingSince is WHEN the worker was cordoned (draining_since set, PRD #422
 	// Decision 7), or nil when it is not draining (nil == not draining). A cordoned
-	// worker keeps heartbeating and finishing its in-flight runs but claims nothing
-	// new. The controller reads this to enforce the drain deadline — it is stateless,
-	// so `now - draining_since` is the only way it can tell how long a worker has been
-	// draining (M5) — and to avoid re-cordoning one already draining (M4). It replaces
-	// M3's `draining` bool, which could say only y/n and not for-how-long.
+	// worker keeps heartbeating and finishing own pinned continuations/checkers, but
+	// refuses unrelated new roots, unassigned children and judge intake. This timestamp
+	// supports independent NONDRIFTED maintenance timing and avoids repeat cordons;
+	// it cannot authorize busy drift replacement or timer-based release (#3103).
+	// It replaces M3's bool, which could say only y/n and not for-how-long.
 	DrainingSince *time.Time `json:"draining_since"`
 	// DiskPressure is true when the worker has self-reported a volume at/above the
 	// disk-pressure threshold on at least the last two consecutive fresh heartbeats
@@ -117,9 +118,8 @@ type DesiredWorker struct {
 	// recovery custody hold (PRD #1296 M1, D3/D9): a distinct desired-worker signal,
 	// INDEPENDENT of Busy and DrainingSince, that the controller must honor on every
 	// teardown/data-PVC-recycle path (ordinary roll, drain deadline, ForceRoll, disk
-	// pressure) so a held PVC is never discarded. The wire field is frozen here; M1's api
-	// Poll mapping sets it false (M4 wires the real value from the custody store), so the
-	// contract round-trips now without changing behavior. Always present (no omitempty) so
+	// pressure) so a held PVC is never discarded, even with zero assigned blockers.
+	// Poll maps the custody store's value. Always present (no omitempty) so
 	// a drop is a visible contract change, not a silent false, exactly like Busy/Ephemeral.
 	CustodyHeld bool `json:"custody_held"`
 	// Generation is bumped whenever the desired spec changes; the controller

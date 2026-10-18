@@ -15,7 +15,8 @@
 #   --interval    seconds between polls (default 60; publish jobs are 2-3 min).
 #   --max-ticks   give up after N polls (default 60 -> ~60 min at 60s).
 #
-# Run it in the BACKGROUND (the harness re-invokes you when it exits).
+# Use a verified native callback or consented completion adapter; background
+# execution alone does not establish owner re-entry.
 #
 # TRANSIENT vs REAL, signature-independent by design. A failed job is auto-rerun
 # ONLY if it is not a publication GATE — the gates are `assert-version`,

@@ -13,10 +13,36 @@ const rawDocs = import.meta.glob("../../../docs/*.md", {
   eager: true,
 }) as Record<string, string>;
 
+// Local structural HAST view, matching the production heading plugin's approach.
+type HastNode = {
+  type?: string;
+  tagName?: string;
+  children?: HastNode[];
+};
+
+function rehypeFragmentTargets() {
+  return (tree: HastNode) => {
+    const targets: HastNode[] = [];
+    // Bounded by the document tree. Keep entire target subtrees and stop there:
+    // links inside headings must render once, with their inline formatting intact.
+    function walk(node: HastNode) {
+      if (node.type === "element" && /^(?:h[1-6]|a)$/.test(node.tagName ?? "")) {
+        targets.push(node);
+      } else {
+        for (const child of node.children ?? []) walk(child);
+      }
+    }
+    walk(tree);
+    // With no custom components or raw-HTML plugin, other elements cannot render
+    // headings or anchors. Production IDs have already been assigned before pruning.
+    tree.children = targets;
+  };
+}
+
 function collect(raw: string) {
   const template = document.createElement("template");
   template.innerHTML = renderToStaticMarkup(
-    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHeadingIds]} urlTransform={(url) => url}>
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHeadingIds, rehypeFragmentTargets]} urlTransform={(url) => url}>
       {parseFrontmatter(raw).body}
     </ReactMarkdown>,
   );
@@ -30,6 +56,42 @@ it("collects parsed links and headings while ignoring fenced examples", () => {
   const parsed = collect("## A *heading*\n\n[real](#a-heading)\n\n\x60\x60\x60md\n[example](#broken)\n## fake\n\x60\x60\x60");
   expect([...parsed.ids]).toEqual(["a-heading"]);
   expect(parsed.hrefs).toEqual(["#a-heading"]);
+});
+
+it("collects nested targets in order with GFM and encoded hashes", () => {
+  const parsed = collect([
+    "> ## A *formatted* [link](#a-formatted-link)",
+    ">",
+    "> - [nested](guide.md#caf%C3%A9)",
+    "",
+    "## A *formatted* [link](#a-formatted-link-1)",
+    "",
+    "| Target |",
+    "| --- |",
+    "| [table](#table) |",
+    "",
+    "![image](image.png#ignored)",
+    "",
+    "<https://example.com/#auto> and https://example.com/#bare",
+    "",
+    '<h2 id="raw">Raw</h2><a href="#raw">raw</a>',
+    "",
+    "`inline [example](#ignored)`",
+    "",
+    "```md",
+    "## Fake",
+    "[example](#ignored)",
+    "```",
+  ].join("\n"));
+  expect([...parsed.ids]).toEqual(["a-formatted-link", "a-formatted-link-1"]);
+  expect(parsed.hrefs).toEqual([
+    "#a-formatted-link",
+    "guide.md#caf%C3%A9",
+    "#a-formatted-link-1",
+    "#table",
+    "https://example.com/#auto",
+    "https://example.com/#bare",
+  ]);
 });
 
 it("resolves all parsed fragments targeting the docs corpus", () => {

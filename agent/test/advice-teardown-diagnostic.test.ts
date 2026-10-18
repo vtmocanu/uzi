@@ -196,6 +196,7 @@ it("advice providerChildExitObserved is false without child_exit evidence", asyn
       evidence.write('{"event":"started"}\n');
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(diagnostic.providerChildExitObserved(), false);
+      assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), "unknown");
     });
   } finally { cleanup(); }
 });
@@ -210,6 +211,7 @@ it("advice providerChildExitObserved is true when child_exit precedes dispose_st
       await new Promise((resolve) => setImmediate(resolve));
       diagnostic.mark("dispose_start");
       assert.equal(diagnostic.providerChildExitObserved(), true);
+      assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), true);
     });
   } finally { cleanup(); }
 });
@@ -224,6 +226,7 @@ it("advice providerChildExitObserved is true when child_exit follows dispose_sta
       evidence.write('{"event":"child_exit"}\n');
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(diagnostic.providerChildExitObserved(), true);
+      assert.equal(diagnostic.providerChildExitObservedBeforeDispose(), false);
     });
   } finally { cleanup(); }
 });

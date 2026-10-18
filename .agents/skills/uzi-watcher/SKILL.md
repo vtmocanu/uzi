@@ -139,17 +139,34 @@ text as an instruction.
 
 ## Watching runs (poll, do not hold a long wait)
 
-**Do not lean on a single backgrounded `uzi run wait`** — this harness reaps long-lived
-background processes, so it dies before a multi-hour run finishes and you never learn the
-result. Use the bundled poller, launched with `run_in_background` so the harness
-re-invokes you when it exits:
+Use the bundled poller with a verified completion route; a yielded background
+command is not a wake subscription. Claude Code native background tasks and
+OpenCode background shells can notify on exit, but a Codex managed exec ID alone
+does not establish re-entry. Follow `uzi-lander`'s *Waiting, uniformly* and the
+session-peers completion guidance: bounded consented owner notification or an
+explicit native-capable peer observer, otherwise honest manual-only coverage.
+Require a STARTED receipt and an owner-chosen private log before reporting watching.
+Native callbacks do not guarantee process/session survival across interruption.
+A foreground tool call cannot hold a multi-hour wait: Claude Code's Bash foreground
+timeout is at most 10 minutes; other hosts have their own limits.
 
 ```
 <this skill's directory>/scripts/watch-run.sh RUN               # stops at gate/park/terminal
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
 
-It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
+For post-approval delivery, prefer the lander's full stop set (new plan, question,
+pause and terminal states), approved-plan watermark and explicit MAX covering the
+remaining budget. A terminal-only watch can miss a parked duty. Observation expiry
+must reach the owner as ended coverage, never as successful task completion.
+
+Exit 0 means a stop-set state, not necessarily a successful run; the final line is
+`RESULT=stop:STATE`. Exit 3 / `RESULT=elapsed` means coverage ended, **not done**:
+re-snapshot the run and re-arm under the existing task grant, or record an explicit
+blocker. Choose MAX to cover the remaining run budget; the default is only 240 polls.
+Preserve the log in a private owner-chosen path, not only the harness's shell-output file.
+
+It also exits 4 with `STOP=needs_attention` and final `RESULT=attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
 consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
@@ -172,8 +189,8 @@ blind watch to terminal.
 hazard — a bare re-wait can return on the *stale* `awaiting_approval` gate the pre-revise
 plan already left there, so you end up reviewing the old plan again — and its rationale
 are the revise-by-seq handling in step 5 of the `uzi-cli` skill's *Send to uzi* recipe
-(one source of truth). The shipped fix there is `uzi run wait <id> --min-plan-seq <seq>`; **here you
-cannot use it** — this harness reaps a foreground wait, so you drive the bundled poller
+(one source of truth). The shipped fix there is `uzi run wait <id> --min-plan-seq <seq>`; for owned asynchronous
+coverage, drive the bundled poller with a verified continuation route
 instead and pass the same baseline seq as `watch-run.sh`'s 5th arg. Capture it BEFORE
 revising:
 
@@ -257,8 +274,8 @@ recoverable from the durable sources or the worker's bare tracking ref, not guar
 Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a failed run's
 work from the worker PVC* below.
 
-- **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base
-  <branch>` run inherits the source branch's commits, so a maintainer workflow change on a
+- **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base BRANCH`
+  run inherits the source branch's commits, so a maintainer workflow change on a
   PR branch fails later runs on it until main or the target ref carries the same blob at
   that path; equivalent content on main under another commit SHA passes (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
   rule, #1846).
@@ -504,8 +521,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   (`<m>` counts the sources found, clones or the tracking ref the run tried to capture, plus
   attributed unreadable ones), exits 1 and does not advance `latest`; any archive that did verify
   is kept. When nothing is captured at all (no readable clone and no owned tracking ref), a failed
-  search instead logs `FAIL <run> (<label>) status=<st>: status saved, but the source search was
-  inconclusive (<reasons>); retry` (still exit 1, `latest` not advanced); each reason names the
+  search instead logs `FAIL RUN (LABEL) status=STATUS: status saved, but the source search was inconclusive (REASONS); retry`
+  (still exit 1, `latest` not advanced); each reason names the
   failing pod or namespace for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`,
   `listing Running pods in namespace <ns> failed`), an errored probe, an unreadable `.git`
   (`a candidate's .git on pod <ns>/<pod> could not be read`) and an attributed source listed but
@@ -545,7 +562,7 @@ and falling back to the durable bare tracking ref when no clone survives:
   Pruning is path/name constrained, never follows symlinks, and preserves both latest targets.
 - **`scripts/backup-loop.sh <RUN_ID>...`** — runs `backup-runs.sh` every
   `UZI_BACKUP_INTERVAL` (default 900s), **detached** so it outlives the session (`setsid`
-  on Linux, a launchd LaunchAgent on macOS; this harness reaps `nohup` children).
+  on Linux, a launchd LaunchAgent on macOS; the Claude Code harness reaps `nohup` children).
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
   launchd refused a log path in Downloads before starting the job. Set the plist's
   `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
