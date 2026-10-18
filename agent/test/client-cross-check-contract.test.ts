@@ -229,7 +229,7 @@ it("strict checked state accepts large ACKs through EOF at and below the byte ca
   }
 });
 
-it("strict checked state propagates ACK stream failures while ordinary state retains compatibility", async (t) => {
+it("checked and ordinary running state propagate ACK stream failures while nonrunning state retains compatibility", async (t) => {
   const response = () => new Response(new ReadableStream<Uint8Array>({
     pull() { throw new Error("fixture ACK stream failure"); },
   }));
@@ -237,7 +237,8 @@ it("strict checked state propagates ACK stream failures while ordinary state ret
   const c = client();
   c.protocolFeatures = ["gate_revision_v1"];
   await assert.rejects(c.reportPlanCrossCheckGateState("run", checkedState), /fixture ACK stream failure/);
-  assert.deepEqual(await c.reportState("run", { status: "running" }), { applied: true, status: undefined });
+  await assert.rejects(c.reportState("run", { status: "running" }), /fixture ACK stream failure/);
+  assert.deepEqual(await c.reportState("run", { status: "awaiting_approval" }), { applied: true, status: undefined });
 });
 
 it("strict checked state retries identical requests after transient transport or ACK stream failures", async (t) => {
@@ -265,13 +266,17 @@ it("strict checked state retries identical requests after transient transport or
   }
 });
 
-it("ordinary state still accepts an ACK larger than the strict byte cap", async (t) => {
+it("ordinary running state rejects ACK overflow while nonrunning state retains compatibility", async (t) => {
   const streamed = streamedAck(ackMaxBytes + 1);
   t.mock.method(globalThis, "fetch", async () => streamed.response);
-  const ack = await client().reportState("run", { status: "running" });
+  await assert.rejects(client().reportState("run", { status: "running" }), /response body exceeds 6291456 bytes/);
+  assert.equal(streamed.cancellations(), 1);
+  const compatible = streamedAck(ackMaxBytes + 1);
+  t.mock.method(globalThis, "fetch", async () => compatible.response);
+  const ack = await client().reportState("run", { status: "awaiting_approval" });
   assert.equal(ack.applied, true);
   assert.equal(ack.status, "awaiting_approval");
-  assert.equal(streamed.emitted(), ackMaxBytes + 1);
+  assert.equal(compatible.emitted(), ackMaxBytes + 1);
 });
 
 it("strict checked state rejects missing negotiation or generation without sending", async (t) => {

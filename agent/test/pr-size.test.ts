@@ -27,7 +27,7 @@ import { StubExecutor } from "../src/executor.js";
 import { mrCompletionBlock } from "../src/runner.js";
 import { renderBody, renderRegion } from "../src/pr-description.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
-import { api, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, client, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
 
 // PRD #1798 M1 (D3) — the deterministic size line. The classifier is table-tested per ecosystem path
@@ -826,7 +826,10 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     ].join("\n");
     const { gitlab, calls, all, pr } = fakeGitlab();
     const pushedHead = followSuccessfulPush(harnessGit, pr);
-    const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
+    const claim = gitlabClaim(1798, { claim_generation: 7, config: { completion_contract_version: 1, contract_revision: 1 } });
+    api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+    await client.register("pr-size");
+    api.setPublicationState(claim.run_id, [], 1);
     api.setCompletionPermitResponse(true);
     // Keep size reads deterministic while the forge follows the successful real push.
     harnessGit.sizeMergeBase = async () => "d".repeat(40);

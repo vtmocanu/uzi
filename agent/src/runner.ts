@@ -6247,7 +6247,7 @@ export class RunRunner {
       }
       if (permit.permit?.completionScope !== undefined) {
         completionScope = permit.permit.completionScope;
-      } else if (grantRevision > (claim.config?.contract_revision ?? 1)) {
+      } else if (grantRevision !== (claim.config?.contract_revision ?? 1)) {
         await holdOrFailInterlocked("completion permit scope missing for updated contract");
         return false;
       } else {

@@ -1990,13 +1990,20 @@ export class WorkerClient {
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
-            runId: fields.runId,
-            workerId: fields.workerId,
-            workerIdentityMatches: !!this.registeredWorkerId && fields.workerId === this.registeredWorkerId,
-            sentClaimGeneration: body.claim_generation,
-            completionProjection: fields.completionProjection,
-            completionAttempts: fields.completionAttempts,
           };
+          if (typeof fields.runId === "string" && fields.runId.trim().length > 0)
+            ack.runId = fields.runId;
+          if (typeof fields.workerId === "string" && fields.workerId.trim().length > 0) {
+            ack.workerId = fields.workerId;
+            if (this.registeredWorkerId)
+              ack.workerIdentityMatches = fields.workerId === this.registeredWorkerId;
+          }
+          if (body.claim_generation !== undefined)
+            ack.sentClaimGeneration = body.claim_generation;
+          if (fields.completionProjection !== undefined)
+            ack.completionProjection = fields.completionProjection;
+          if (fields.completionAttempts !== undefined)
+            ack.completionAttempts = fields.completionAttempts;
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
               ack.completedPublicationReason = "unsupported_feature";

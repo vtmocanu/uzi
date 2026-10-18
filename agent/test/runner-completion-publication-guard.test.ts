@@ -650,6 +650,38 @@ describe("M3 publication-start completion guard", () => {
     });
   }
 
+  for (const explicitScope of [false, true]) {
+    it(`claim revision 3 with guard/grant revision 2 ${explicitScope ? "uses explicit permit scope" : "holds when permit scope is omitted"}`, async () => {
+      const claim = claimFor("gitlab", [{ milestone_id: "m2", title: "Claim title must not render", reason: "Claim reason must not render" }]);
+      claim.config!.contract_revision = 3;
+      api.setPublicationState(claim.run_id, [{ milestone_id: "m2", title: "ACK title must not render", reason: "ACK reason must not render" }], 2, 1);
+      api.requireCompletionAttempt(claim.run_id, 1);
+      api.completionPermitWire = body => ({
+        granted: true,
+        permit: {
+          id: "m3-permit", contract_revision: 2, branch: body.branch, head: body.head,
+          issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
+          ...(explicitScope ? { completion_scope: { deferred: DEFERRED } } : {}),
+        },
+      });
+      const forge = fakeGitlab();
+      followSuccessfulPush(git, forge.pr, true);
+      await runner(committing("Refs #3090").executor, forge.gitlab).execute(claim);
+      assert.equal(api.completionPermitRequests[0]!.body.contract_revision, 2);
+      assert.equal(api.completionAttemptRequests.length, 0);
+      if (explicitScope) {
+        assert.ok(statuses(claim.run_id).includes("completed"));
+        assert.equal(api.completionHoldRequests.length, 0);
+        assert.match(forge.pr.description, /Follow up.*Owner deferred/);
+        assert.doesNotMatch(forge.pr.description, /Claim title|Claim reason|ACK title|ACK reason|Closes #3090/);
+      } else {
+        assert.equal(api.completionHoldRequests.length, 1);
+        assert.equal(forge.calls.length, 0);
+        assert.equal(terminal(claim.run_id).length, 0);
+      }
+    });
+  }
+
   it("live pre-freeze clean publication resolves deferred titles/reasons from the permit only", async () => {
     const claim = claimFor("gitlab", []);
     delete claim.config!.contract_revision;
