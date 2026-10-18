@@ -33,7 +33,7 @@ The final product rejects an incomplete completion attempt without failing the r
 
 Queue policy: remove `uzi` from the current child after its PR merges and main CI is green, then add `uzi` to the next child. The scheduled sweep's `max_issues=3` is not a serialization guarantee; the single eligibility label is.
 
-Refresh (2026-10-17): table order is not a technical dependency on #1228 for semantic work. Provider-context storage remains separate; #1229 is not planned. #1230's foundation can be designed now, but the complete child cannot dispatch with unmerged #3089/#3090 integration. No issue is made eligible by this document edit.
+Refresh (AI-synced 2026-10-18): table order is not a technical dependency on #1228 for semantic work. Provider-context storage remains separate; #1229 is not planned. #3089 (PR #3098) and #3090 (PR #3117) are merged; #1230 may dispatch only under its own Execution conditions. No issue is made eligible by this document edit.
 
 ## Binding cross-child contracts
 

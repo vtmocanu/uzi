@@ -65,7 +65,7 @@ Five sequential milestones; all implementation-run milestones are worker-runnabl
 
 | Phase | Milestone | Dependencies | Primary areas | Outcome |
 |---|---|---|---|---|
-| 1 | M1: integrated #1220 lifecycle fixture | #1226-#1231 + #1233 | e2e/API/agent harness | Missing and partial work reworks before any closing PR. |
+| 1 | M1: integrated #1220 lifecycle fixture | #1226, #1227, #1228, #1230, #1231, #1233 | e2e/API/agent harness | Missing and partial work reworks before any closing PR. |
 | 2 | M2: failure, race and recovery matrix | M1 | integration/LiveDB/real Git tests | Every cross-service crash/race preserves state and resumes correctly. |
 | 3 | M3: compatibility and rollout rehearsal | M1-M2 | claim/DTO/config tests, isolated compose | Old/new version skew is safe and visible. |
 | 4 | M4: full gates and adversarial mutations | M1-M3 | Task gates and mutation harness | Regression channels prove the load-bearing guards. |
