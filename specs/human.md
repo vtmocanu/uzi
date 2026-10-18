@@ -716,6 +716,26 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
   as durable. [user, #1597] (AI-synced 2026-09-24)
 - When the checkpoint is not published, the shutdown feed must name a bounded
   reason class. [user, #1597] (AI-synced 2026-09-24)
+- The actual typed graceful-shutdown durability sink may perform one logical bounded
+  credential release/refresh while execution remains aborted; reconciliation, proof,
+  capture, publication and unwind share the original absolute grace's remaining time,
+  without a control-observation loop or polling. Already-delivered stops, claim fences
+  and credential switches block admission; effective revocation, claim/credential
+  authorization and deadlines remain enforced. Only a late remote owner cancellation
+  after successful reconciliation may still permit bounded broker publication for the
+  still-bound same claim generation through PRD #1810's terminal route, consistent with
+  #3030. Terminal cancellation still refuses server credential release/refresh; a pending
+  queued cancellation is not itself that terminal refusal. Other shutdown-labelled reconciliation sinks
+  keep their lifecycle checks and disposal is unchanged, with no credential-free fallback or poisoned-registry revival;
+  ADR-1766 D3's credential-free settle is unchanged. [approved #3101]
+  (AI-synced 2026-10-18)
+- Graceful shutdown makes a bounded best-effort WIP capture of dirty and untracked work,
+  preserving quiescence/completion proofs, missing-source refusal, #1036's post-reap overlay
+  and secret/remediation and workflow guards. Ordinary checkpoints remain committed-only;
+  ignored files, bytes written after proof/capture and work from late writers are not
+  guaranteed. The separate episode failure remains unsolved; this decision changes no
+  retention, deletion, drain, recovery framework or episode journal. [approved #3101]
+  (AI-synced 2026-10-18)
 
 ## Feature #1392 — Park a run on a transient forge failure at clone or fetch
 
