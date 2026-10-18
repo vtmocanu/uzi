@@ -113,6 +113,17 @@ const RUN_SCRATCH_GUIDANCE = [
   "export can find the parent checkout; never run Git there. Run Git-dependent gates",
   "in the real checkout under the frozen gate discipline, and report any check that",
   "cannot run in the export rather than claiming it ran.",
+  "Run deliberate mutation checks only in a disposable scratch export of the exact",
+  "candidate, including intended uncommitted edits, not a stale committed version.",
+  "Never mutate the primary or shared candidate: a later restore command, trap or finally",
+  "cannot protect it from worker death. Never copy a mutant back or commit it.",
+  "If a mutation check cannot run in isolation, report it as blocked; the real-checkout",
+  "gate rule above is not permission to mutate that checkout. Remove only your own export",
+  "after the check and confirm the mutation stayed out of the candidate.",
+  "For large comparisons, keep complete equality and ordering checks, but report only a",
+  "bounded first mismatch instead of constructing a huge aggregate assertion diff.",
+  "A custom assertion message or truncated output may still allocate the full diff before",
+  "printing. These are authoring rules, not an enforced memory limit.",
 ].join("\n");
 
 /**
