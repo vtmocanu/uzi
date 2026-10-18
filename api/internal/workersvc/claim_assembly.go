@@ -664,6 +664,10 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	frozenMemoryPolicy, err := optionalMemoryPolicy(run.MemoryPolicy)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
 		InventoryGuarded: inventoryGuarded,
 		RunID:            run.ID.String(),
@@ -692,6 +696,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
 		ClaimGeneration:          run.ClaimGeneration,
+		MemoryEpisode:            run.MemoryEpisode,
+		MemoryInterventionCount:  run.MemoryInterventionCount,
+		MemoryPolicy:             frozenMemoryPolicy,
 		PlanMd:                   textPtr(run.PlanMd),
 		AutoApprove:              run.AutoApprove,
 		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,

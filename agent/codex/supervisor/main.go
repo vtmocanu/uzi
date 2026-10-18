@@ -40,6 +40,8 @@ func realMain(args []string) int {
 	if !ok {
 		return 2
 	}
+	supervisorIdentity, _ := readIdentity(os.Getpid())
+	primaryIdentity, _ := readIdentity(childPid)
 	sup := &supervisor{
 		ev:      ev,
 		control: &controlReader{r: os.NewFile(3, "control")},
@@ -54,10 +56,13 @@ func realMain(args []string) int {
 				return ticker.C, ticker.Stop
 			},
 			reapAdopted: realReapAdopted,
-			snapshot:    func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
-			now:         time.Now,
-			sleep:       func() { time.Sleep(2 * time.Millisecond) },
-			tmpCleanup:  tmpCleanupFor(tmp),
+			observe: func(deadline time.Time) observationEvidence {
+				return observe("/proc", supervisorIdentity, primaryIdentity, deadline)
+			},
+			snapshot:   func() ([]procRow, error) { return walkDescendants(os.Getpid()) },
+			now:        time.Now,
+			sleep:      func() { time.Sleep(2 * time.Millisecond) },
+			tmpCleanup: tmpCleanupFor(tmp),
 		},
 	}
 	// The supervised child inherited stdio 0/1/2. Drop the supervisor's copies so
@@ -190,13 +195,17 @@ func realReapChild(pid int) (int, error) {
 	if got != pid {
 		return 0, errors.New("child was not waitable after pidfd readiness")
 	}
+	return terminalWaitCode(ws)
+}
+
+func terminalWaitCode(ws unix.WaitStatus) (int, error) {
 	if ws.Exited() {
 		return ws.ExitStatus(), nil
 	}
 	if ws.Signaled() {
 		return 128 + int(ws.Signal()), nil
 	}
-	return 1, nil
+	return 0, errors.New("child wait did not report terminal status")
 }
 
 // realReapAdopted checks one current direct child without blocking the control loop.
@@ -439,27 +448,41 @@ func launchChild(childArgv []string) (int, error) {
 	return syscall.ForkExec(childArgv[0], childArgv, attr)
 }
 
-// selfDirectChildren lists the supervisor's current direct children.
-func selfDirectChildren() []int {
-	return childrenOf(os.Getpid())
+// selfDirectChildren visits the supervisor's current direct children.
+func selfDirectChildren(deadline time.Time, visit func(observationRow) error) error {
+	return visitCleanupChildren("/proc", os.Getpid(), deadline, visit)
 }
 
 // realKill pidfd-opens the pid and delivers SIGKILL. A vanished process (ESRCH)
 // is returned as an error so the drain does not record it as killed.
-func realKill(pid int) error {
-	fd, err := unix.PidfdOpen(pid, 0)
+func realKill(child processIdentity) error {
+	fd, err := unix.PidfdOpen(child.Pid, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
+	live, err := readIdentity(child.Pid)
+	if err != nil {
+		return err
+	}
+	if live != child {
+		return errObservationStale
+	}
 	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 }
 
 // realReap is one non-blocking Wait4 over ALL children including differently-
 // grouped/threaded descendants (__WALL). ECHILD (no children remain) is the
 // drain authority.
-func realReap() (int, error) {
+func realReap() (childWaitResult, error) {
 	var ws unix.WaitStatus
 	pid, err := unix.Wait4(-1, &ws, unix.WNOHANG|unix.WALL, nil)
-	return pid, err
+	if err != nil || pid == 0 {
+		return childWaitResult{}, err
+	}
+	code, err := terminalWaitCode(ws)
+	if err != nil {
+		return childWaitResult{}, err
+	}
+	return childWaitResult{pid: pid, code: code}, nil
 }

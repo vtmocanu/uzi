@@ -227,6 +227,9 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   /** Opt-in M2 fixtures; legacy tests retain their original wire shape. */
   parkRunGeneration: number | undefined;
+  /** Opt-in memory contract fixture; other registrations keep their legacy shape. */
+  memoryRegisterNonce: string | undefined;
+  private memoryWorkerId: string | undefined;
   readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
   parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
   /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
@@ -1039,6 +1042,10 @@ export class FakeApi {
       // PRD #1392 M2 (D7): the api advertises its protocol features here. Omit the field unless a
       // test configured one, so an unconfigured register wire stays byte-identical to an older api.
       const registerBody: Record<string, unknown> = { worker_id: randomUUID() };
+      if (this.memoryRegisterNonce) {
+        this.memoryWorkerId = registerBody.worker_id as string;
+        registerBody.register_nonce = this.memoryRegisterNonce;
+      }
       if (this.registerProtocolFeatures !== undefined)
         registerBody.protocol_features = this.registerProtocolFeatures;
       if (this.registerNonce !== undefined) registerBody.register_nonce = this.registerNonce;
@@ -1831,6 +1838,11 @@ export class FakeApi {
       } : {}),
       run: {
         id: runId,
+        ...(body.recovery_cause === "worker_memory_pressure" && this.memoryWorkerId &&
+            body.register_nonce === this.memoryRegisterNonce ? {
+          worker_id: this.memoryWorkerId, recovery_wait_cause: body.recovery_cause,
+          memory_hold: { episode: body.memory_episode },
+        } : {}),
         // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves
         // StateAck.status undefined — the client cannot branch on it and falls through to ownership.
         ...(this.omitStateAckStatusRuns.has(runId)

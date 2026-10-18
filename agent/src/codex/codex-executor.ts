@@ -61,6 +61,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
 import { constants as FS } from "node:fs";
@@ -147,6 +148,8 @@ import {
   CommandDeadlineError,
   type FileopClient,
   type ScreenPolicy,
+  type CapturedMemoryContext,
+  isBrokerModelCommand,
   type SpawnCommandResult,
   type SpawnCommandSeam,
   type ToolHandler,
@@ -1843,6 +1846,7 @@ export interface CodexExecutorDeps {
 }
 
 export interface CodexExecutorOptions {
+  readonly capturedMemory?: CapturedMemoryContext;
   /** Advisory seams; the default runner uses the shared provisioning HOME and advice factory. */
   readonly summaryRunner?: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
   /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
@@ -3725,6 +3729,18 @@ export class CodexExecutor implements Executor {
     epochIndex: number,
     opts: { persistAfterLaunchOnly?: boolean } = {},
   ): Promise<ProviderEpoch> {
+    // Snapshot the runner contract once for all effect surfaces in this epoch.
+    // Legacy direct callers may still bind through the static executor option.
+    const captureMemory = ctx.capturedMemory;
+    const capturedMemory = captureMemory !== undefined
+      ? captureMemory.call(ctx)
+      : this.opts.capturedMemory;
+    if (captureMemory !== undefined && capturedMemory === undefined) {
+      throw new TrustedExecutionRefusal("captured memory capability unavailable");
+    }
+    if (capturedMemory !== undefined && capturedMemory.context.run_id !== ctx.runId) {
+      throw new TrustedExecutionRefusal("captured memory run identity mismatch");
+    }
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
@@ -3800,6 +3816,9 @@ export class CodexExecutor implements Executor {
         commandSandbox,
         this.log,
         commandCache,
+        DEFAULT_COMMAND_WALL_MS,
+        LONG_COMMAND_WALL_MS,
+        capturedMemory,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -3815,6 +3834,7 @@ export class CodexExecutor implements Executor {
             get failed() { return handle.failed; },
             get whenFailed() { return handle.whenFailed; },
             snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+            observe: (timeoutMs) => handle.observe(timeoutMs),
             waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
             dispose: async (timeoutMs) => {
               await settleDepsInstall();
@@ -3864,7 +3884,13 @@ export class CodexExecutor implements Executor {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
         );
+        const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
+          ...result, command: scrubProjected(result.command),
+          tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),
+        });
         const delegationRunner = new CodexDelegationRunner({
+          capturedMemory,
+          scrubToolResult,
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
@@ -3881,6 +3907,8 @@ export class CodexExecutor implements Executor {
           scrubPolicyRole: scrubProjected,
         });
         return new CodexCallbackBroker({
+          capturedMemory,
+          scrubToolResult,
           registry,
           spawnCommand,
           fileop,
@@ -5120,6 +5148,7 @@ export class HeldRunCommandCache implements RunCommandCache {
         supervisorPid: handle.supervisorPid,
         transport: handle.transport,
         snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+        observe: (timeoutMs) => handle.observe(timeoutMs),
         waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
         dispose: async (timeoutMs) => {
           let outcome: DisposeOutcome;
@@ -5217,7 +5246,7 @@ async function launchRegisteredEffectRoot(
   const root = registeredRoot(handle, kind, log);
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
-    await root.dispose(deadlineMs).catch(() => undefined);
+    await boundedCommandWait(root.dispose(deadlineMs), deadlineMs).catch(() => undefined);
     throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
@@ -5438,8 +5467,14 @@ export function makeDefaultSpawnCommand(
   cache?: RunCommandCache,
   wallMs: number = DEFAULT_COMMAND_WALL_MS,
   longWallMs: number = LONG_COMMAND_WALL_MS,
+  capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand)
+        && !isBrokerModelCommand(opts.modelCommand, capturedMemory)) throw new Error("memory command context binding mismatch");
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand, capturedMemory)
+        && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
+          || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
       const withCache = cacheForLaunch(cache, launch);
       const launched = await launchRegisteredEffectRoot(
@@ -5450,6 +5485,13 @@ export function makeDefaultSpawnCommand(
         "command",
         log,
       );
+      let memory: Awaited<ReturnType<typeof enrollMemoryCommand>>;
+      try {
+        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, opts.signal);
+      } catch (error) {
+        await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        throw error;
+      }
       let stdout = "";
       let stderr = "";
       let capturedBytes = 0;
@@ -5507,20 +5549,45 @@ export function makeDefaultSpawnCommand(
       const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
       const terminal = launched.handle.waitChild(effectiveWallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
-      const first = await Promise.race([
+      const ordinary = Promise.race([
         terminal,
         aborted.then(() => ({ kind: "aborted" as const })),
         capTrip.then(() => ({ kind: "cap" as const })),
       ]);
+      const first = await Promise.race([
+        ordinary,
+        ...(memory ? [memory.outcome.then((result) => ({ kind: "memory" as const, result }))] : []),
+      ]);
+      // A pressure outcome conveys tool feedback, never ordinary disposal authority.
+      // Keep this root owned in the foreground until exit, abort, cap or wall deadline.
+      const cleanupReason = first.kind === "memory" ? await ordinary : first;
       if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
-      const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
-      if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
-      await outputEnded;
-      if (first.kind === "aborted" || (first.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
-      if (first.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
-      if (first.kind === "failed") throw first.error;
+      let cleanupError: unknown;
+      let reaped = false;
+      try {
+        const result = await (memory?.reap() ?? boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs));
+        reaped = result.ok;
+        if (!result.ok) cleanupError = new Error(COMMAND_ROOT_UNREAPED);
+      } catch (error) {
+        registry.poison({ category: "protocol", message: "command cleanup completion unconfirmed" });
+        cleanupError = error;
+      }
+      memory?.recordDisposal(reaped);
+      try { await boundedCommandWait(outputEnded, reapDeadlineMs); } catch (error) { cleanupError ??= error; }
+      const prepared = memory?.preparedOutcome();
+      let memoryPressure = first.kind === "memory" ? first.result : undefined;
+      try {
+        if (!memoryPressure && prepared) memoryPressure = await boundedCommandWait(prepared, reapDeadlineMs);
+      } finally {
+        if (reaped) memory?.unregister();
+      }
+      if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
+      if (cleanupError) throw cleanupError;
+      if (cleanupReason.kind === "aborted" || (cleanupReason.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
+      if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
+      if (cleanupReason.kind === "failed") throw cleanupReason.error;
       return {
-        code: first.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
+        code: cleanupReason.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : cleanupReason.code,
         stdout,
         stderr,
       };

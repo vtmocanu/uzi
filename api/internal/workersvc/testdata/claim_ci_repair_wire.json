@@ -1,4 +1,7 @@
 {
+  "memory_episode": 0,
+  "memory_intervention_count": 0,
+  "memory_policy": null,
   "run_id": "44444444-4444-4444-4444-444444444444",
   "kind": "prompt",
   "issue_iid": null,

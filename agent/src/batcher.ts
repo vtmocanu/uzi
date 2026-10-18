@@ -871,6 +871,32 @@ export class MessageBatcher {
     await this.flushMessages(signal);
   }
 
+  /** ACK-only memory boundary: join the owned send before deciding whether the tail landed.
+   * Cancellation reaches the original request; its real settlement remains owned by this call.
+   * One explicit flush attempt follows the join; failure leaves replay for the existing scheduler.
+   */
+  async flushOwned(signal: AbortSignal): Promise<boolean> {
+    const abortOwned = (): void => this.inFlightAbort?.abort(signal.reason);
+    signal.addEventListener("abort", abortOwned, { once: true });
+    try {
+      if (signal.aborted) abortOwned();
+      await this.inFlight;
+      if (signal.aborted || this.reservation || this.closed || this.tripped || this.spilled ||
+          this.outbox?.hasUndrainedMessages(this.runId)) return false;
+      const usageConfirmed = await this.usage.drainConfirmed(undefined, signal);
+      if (!usageConfirmed || signal.aborted || this.reservation || this.closed ||
+          this.tripped || this.spilled) return false;
+      await this.flushMessages(signal);
+      // A periodic send may have acquired ownership during the usage drain.
+      await this.inFlight;
+      return !signal.aborted && !this.inFlight && !this.reservation && !this.tripped &&
+        !this.spilled && this.buffer.length === 0 && this.pendingRangeFirst === undefined &&
+        !this.outbox?.hasUndrainedMessages(this.runId);
+    } finally {
+      signal.removeEventListener("abort", abortOwned);
+    }
+  }
+
   private async flushMessages(signal?: AbortSignal): Promise<void> {
     // A pending dropped-range is work in BOTH modes even with an empty buffer (PRD #1391
     // M2): SPILLED → doSpillFlush writes it durably; network → doFlush drains it as
@@ -1391,9 +1417,9 @@ export class MessageBatcher {
    *  to the outbox (durable, replayed later by the drainer) and clear the unclean flag
    *  once the tail is on disk. A write failure leaves the flag set so restart admits
    *  the possible loss. */
-  private async finalSpillOnClose(signal?: AbortSignal): Promise<void> {
+  private async finalSpillOnClose(signal?: AbortSignal): Promise<boolean> {
     const outbox = this.outbox;
-    if (!outbox) return;
+    if (!outbox || outbox.isDisabled()) return false;
     try {
       // Re-mark unclean BEFORE any close-time write, mirroring doSpillFlush's own
       // defensive re-mark at its top. A prior clean periodic doSpillFlush may have
@@ -1413,8 +1439,10 @@ export class MessageBatcher {
         await outbox.markSpillUnclean(this.runId, signal);
       }
       if (this.pendingRangeFirst !== undefined && this.pendingRangeLast !== undefined) {
+        let committed = false;
         await outbox.appendRangeRecord(this.runId, this.generation, this.pendingRangeFirst, this.pendingRangeLast,
-          (identity) => { this.reservation?.outboxPending.add(identity); }, signal);
+          (identity) => { committed = true; this.reservation?.outboxPending.add(identity); }, signal);
+        if (!committed) throw new Error("outbox refused tail range");
         this.pendingRangeFirst = undefined;
         this.pendingRangeLast = undefined;
       }
@@ -1422,26 +1450,47 @@ export class MessageBatcher {
         const batch = this.takePrefix();
         if (batch.length === 0) break;
         try {
+          let committed = false;
           await outbox.appendSegment(
             this.runId,
             this.generation,
             batch.map((b) => b.msg),
-            (identity) => { this.reservation?.outboxPending.add(identity); },
+            (identity) => { committed = true; this.reservation?.outboxPending.add(identity); },
             signal,
           );
+          if (!committed) throw new Error("outbox refused tail segment");
         } catch (err) {
           this.buffer = batch.concat(this.buffer);
           throw err;
         }
       }
       await outbox.clearSpillUnclean(this.runId, signal);
+      return !outbox.isDisabled();
     } catch (err) {
       this.log.warn("message batcher: spilling the tail to the outbox on close failed; it may be lost", {
         run_id: this.runId,
         dropped: this.buffer.length + this.pendingRangeWidth(),
         error: errMessage(err),
       });
+      return false;
     }
+  }
+
+  /** Memory retention only: freeze admission and preserve the assigned tail regardless
+   * of the network spill threshold. One attempt shares the caller's cleanup budget.
+   * Abort and join the original send before examining the buffer; an uncooperative
+   * send keeps this operation pending, even after expiry. No ACK is fabricated.
+   */
+  async preserveOwnedTail(signal: AbortSignal): Promise<boolean> {
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    this.inFlightAbort?.abort();
+    await this.inFlight;
+    if (signal.aborted || this.reservation) return false;
+    return this.finalSpillOnClose(signal);
   }
 
   /** Stop accepting messages and drain the buffer with a few bounded retries.

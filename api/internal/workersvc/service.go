@@ -3822,6 +3822,8 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	RegisterNonce              string                          `json:"register_nonce,omitempty"`
+	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
 	GateCheckpointWitness      *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
 	ExpectedGateRevision       *int64                          `json:"expected_gate_revision,omitempty"`
 	RevisionInputID            *int64                          `json:"revision_input_id,omitempty"`
@@ -4249,6 +4251,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if err := validateCompletedPublicationReport(wkr, req); err != nil {
 		return store.Run{}, false, err
+	}
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseWorkerMemoryPressure {
+		return s.parkWorkerMemoryPressure(ctx, wkr, runID, req)
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
 		return store.Run{}, false, err

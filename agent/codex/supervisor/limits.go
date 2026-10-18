@@ -2,7 +2,8 @@ package main
 
 // Bounds on every untrusted-input and evidence-output surface. Each is a hard
 // cap the control loop enforces: an oversized control line is abnormal, evidence
-// is both length- and count-bounded, and the /proc walk is depth/breadth bounded
+// is both length- and count-bounded. Snapshot and observation walks are capped;
+// ordinary cleanup streams under its deadline with bounded diagnostic storage,
 // so a hostile descendant tree cannot make the supervisor allocate without limit.
 const (
 	// maxControlLine is the largest accepted control frame (fd 3). A longer
@@ -19,6 +20,10 @@ const (
 	// snapshot cannot be turned into an unbounded traversal.
 	maxSnapshotDescendants = 200
 
+	// Diagnostic storage is bounded separately from traversal and disposal.
+	// Exhausting it marks evidenceTruncated but never stops ordinary cleanup.
+	maxCleanupDiagnosticItems = 256
+
 	// defaultDisposeTimeoutMs is used when a dispose omits timeoutMs and for the
 	// best-effort drain that accompanies an abnormal outcome.
 	defaultDisposeTimeoutMs = 2000
@@ -30,6 +35,7 @@ const (
 
 // Control op names carried on fd 3.
 const (
+	opObserve  = "observe"
 	opSnapshot = "snapshot"
 	opDispose  = "dispose"
 )

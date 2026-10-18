@@ -166,6 +166,16 @@ type Config struct {
 	// UZI_WORKER_CROSS_CHECK_SLOTS is relayed as WORKER_CROSS_CHECK_SLOTS.
 	WorkerCrossCheckSlots int
 
+	// WorkerMemoryGuard settings have no numeric defaults. The worker validates
+	// limit-relative thresholds against its live finite cgroup memory limit.
+	WorkerMemoryGuardEnabled          bool
+	WorkerMemoryGuardReserveBytes     int64
+	WorkerMemoryGuardSampleMs         int64
+	WorkerMemoryGuardHysteresisBytes  int64
+	WorkerMemoryGuardRearmMs          int64
+	WorkerMemoryGuardResponseBudgetMs int64
+	WorkerMemoryGuardMaxInterventions int64
+
 	// --- Codex uid-split profile (PRD #1493 M1) -------------------------------
 	// WorkerUIDSplit opts the fleet into the Codex uid-split worker profile
 	// (UZI_WORKER_UID_SPLIT, default false). When on, the controller renders the
@@ -187,16 +197,17 @@ type Config struct {
 	WorkerCommandSandbox string
 
 	// --- drain policy (PRD #422 M5) -------------------------------------------
-	// DrainDeadline bounds how long a cordoned BUSY hosted worker delays a deliberate
-	// image roll before the controller rolls it anyway and its in-flight run requeues
-	// (UZI_WORKER_DRAIN_DEADLINE). Default 24h. The reconcile loop is stateless, so the
-	// elapsed time is computed from the api-supplied draining_since; without this bound a
-	// worker parked at an approval gate would hold the old image forever.
+	// DrainDeadline bounds busy deferral for independent NONDRIFTED pressure/nix-size
+	// maintenance (UZI_WORKER_DRAIN_DEADLINE). Default 24h; positive-only parsing is
+	// unchanged. Age comes from API draining_since. No elapsed time authorizes busy
+	// spec-hash/generation replacement or drift-associated recycle (#3103), including
+	// run-bound workers, plain drains and calls without a pacing entry.
 	DrainDeadline time.Duration
-	// ForceRoll, when true, rolls EVERY drifted worker immediately regardless of busy —
-	// the emergency override (UZI_WORKER_FORCE_ROLL, e.g. a CVE that must not wait on a
-	// drain). It only accelerates a PENDING roll (a drifted worker); it never invents one.
-	// Default false.
+	// ForceRoll is the GLOBAL emergency override (UZI_WORKER_FORCE_ROLL). It bypasses
+	// pacing, hold, incarnation proof and busy deferral for drifted workers, plus busy
+	// deferral for independent maintenance. It may interrupt runs and lose all capacity;
+	// it is neither targeted nor a recovery guarantee. Custody-held data and independent
+	// DinD readiness/identity/pod-absence guards remain authoritative. Default false.
 	ForceRoll bool
 
 	// --- disk-pressure self-heal (PRD #837 M4) --------------------------------
@@ -316,7 +327,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		PollInterval: parseDuration("CONTROLLER_POLL_INTERVAL", 10*time.Second),
 		HTTPTimeout:  parseDuration("CONTROLLER_HTTP_TIMEOUT", 15*time.Second),
-		// The bounded drain deadline (PRD #422 M5). Default 24h; parseDuration falls back
+		// The independent nondrifted maintenance deadline (#3103). Default 24h; parseDuration falls back
 		// on empty or a non-positive value, the same tuning-not-security split as the
 		// interval knobs above.
 		DrainDeadline: parseDuration("UZI_WORKER_DRAIN_DEADLINE", 24*time.Hour),
@@ -449,6 +460,10 @@ func loadWorkerSettings(cfg *Config) error {
 	// does not reject), so a typo like 100000 would otherwise boot and render into the
 	// pod. Raising it opts into the intra-user concurrency residuals documented in
 	// docs/worker-setup.md (PRD #58 Decision 7).
+	if err := loadWorkerMemoryGuard(cfg); err != nil {
+		return err
+	}
+
 	cfg.WorkerMaxConcurrentRuns = 1
 	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_MAX_CONCURRENT_RUNS")); raw != "" {
 		n, err := strconv.Atoi(raw)

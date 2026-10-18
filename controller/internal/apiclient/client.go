@@ -200,32 +200,6 @@ func (c *Client) RequestDrainWithReason(ctx context.Context, workerID string, re
 	return nil
 }
 
-// ConfirmImageRollDrain reasserts the image hold, then reads authoritative desired
-// state through Poll's bounded decoder. Missing or duplicate identity is uncertain.
-func (c *Client) ConfirmImageRollDrain(ctx context.Context, workerID string) (protocol.DesiredWorker, error) {
-	if err := c.RequestDrainWithReason(ctx, workerID, "image_roll"); err != nil {
-		return protocol.DesiredWorker{}, err
-	}
-	poll, err := c.Poll(ctx)
-	if err != nil {
-		return protocol.DesiredWorker{}, err
-	}
-	var found *protocol.DesiredWorker
-	for i := range poll.Workers {
-		if poll.Workers[i].ID != workerID {
-			continue
-		}
-		if found != nil {
-			return protocol.DesiredWorker{}, fmt.Errorf("apiclient: duplicate drain confirmation identity")
-		}
-		found = &poll.Workers[i]
-	}
-	if found == nil {
-		return protocol.DesiredWorker{}, fmt.Errorf("apiclient: drain confirmation worker absent")
-	}
-	return *found, nil
-}
-
 // ClearDrain asks the api to UNCORDON a hosted worker — clear draining_since so the
 // claim gate stops idling it (issue #458). It is the exact mirror endpoint of
 // RequestDrain: DELETE where cordon POSTs, on the same worker path.

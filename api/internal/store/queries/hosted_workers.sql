@@ -36,18 +36,18 @@ SELECT w.id,
        w.docker_enabled,
        -- busy (PRD #422 M3, Decision 5): does this worker hold any non-terminal run? This
        -- reuses the EXACT active-run predicate the DeleteWorker guard uses
-       -- (CountWorkerNonTerminalRuns), awaiting_approval included, because rolling a worker
-       -- that holds such a run would requeue it. Feeds the controller's cordon/defer-roll
-       -- decision (M4).
+       -- (CountWorkerNonTerminalRuns), queued, paused and all waits/gates included. API
+       -- assignments, not worker reported_runs, feed indefinite busy drift deferral and cordon
+       -- decisions (#3103); custody is an independent fence even with zero blockers.
        (SELECT count(*) FROM runs r
           WHERE r.worker_id = w.id
             AND r.status NOT IN ('completed', 'failed', 'cancelled')) > 0 AS busy,
        -- draining_since (PRD #422 M3/M5): the raw nullable cordon timestamp — WHEN this
        -- worker was cordoned, or NULL if it is not draining (draining == draining_since != nil).
        -- M5 selects the timestamp itself rather than an `IS NOT NULL` boolean because the
-       -- controller's reconcile loop is stateless (it remembers nothing across ticks) and must
-       -- compute `now - draining_since >= deadline` to enforce the bounded drain deadline; the
-       -- bool it replaces could only answer "draining y/n", not "for how long".
+       -- controller uses elapsed time only for independent NONDRIFTED maintenance (#3103);
+       -- the timestamp also supports drain diagnostics and idempotent cordons.
+       -- Busy drift and associated recycle wait indefinitely for idle, even on a plain drain.
        w.draining_since,
        -- disk_pressure (PRD #837 M4): the ONE lifecycle reader of the display-only disk
        -- telemetry, allow-listed exactly like ReapEphemeralWorkers is for the uptime anchor. It
@@ -607,12 +607,13 @@ WHERE token_ciphertext IS NOT NULL
 
 -- name: CordonHostedWorker :execrows
 -- Controller cordon-write (PRD #422 M4): mark a hosted worker draining so the claim
--- gate (workersvc.Claim) idles it — it finishes its in-flight runs, then the controller
--- rolls it. COALESCE preserves the ORIGINAL cordon time so a repeat cordon is idempotent
--- and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
+-- gate (workersvc.Claim) restricts intake to own assigned continuations; pinned checkers
+-- may finish, while unrelated new roots, unassigned children and judge intake are refused.
+-- COALESCE preserves the ORIGINAL cordon time for independent maintenance timing;
+-- busy drift has no deadline (#3103). Scoped to kind='hosted': the controller
 -- manages only hosted workers and must never cordon an external one. Rows affected = 0
 -- means no such hosted worker exists (the handler answers 404).
--- PRD #2006: a cordon also ENDS any ephemeral lease (a draining worker claims nothing new, and a
+-- PRD #2006: a cordon also ENDS any ephemeral lease (unrelated intake is closed, and a
 -- leased-idle worker is idle, so it rolls or is released at once, never held for its lease). The
 -- UPDATE takes the row lock, so it serializes against a claim that is rebinding the same worker.
 UPDATE workers

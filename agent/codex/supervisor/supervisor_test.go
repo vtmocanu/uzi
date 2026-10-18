@@ -17,13 +17,13 @@ import (
 // scriptedReaper yields the scripted results in order, then fallback forever.
 func scriptedReaper(fallback reapStep, steps ...reapStep) childReaper {
 	i := 0
-	return func() (int, error) {
+	return func() (childWaitResult, error) {
 		if i < len(steps) {
 			s := steps[i]
 			i++
-			return s.pid, s.err
+			return childWaitResult{pid: s.pid}, s.err
 		}
-		return fallback.pid, fallback.err
+		return childWaitResult{pid: fallback.pid}, fallback.err
 	}
 }
 
@@ -62,8 +62,8 @@ func newTestSupervisor(frames string, reap childReaper) (*supervisor, *bytes.Buf
 		control: &controlReader{r: strings.NewReader(frames)},
 		seams: seams{
 			supervisorPid:  1,
-			directChildren: func() []int { return nil },
-			kill:           func(int) error { return nil },
+			directChildren: listedChildren(func() ([]observationRow, error) { return nil, nil }),
+			kill:           func(processIdentity) error { return nil },
 			reap:           reap,
 			reapChild:      func(int) (int, error) { return 0, nil },
 			snapshot:       func() ([]procRow, error) { return nil, nil },
@@ -366,9 +366,14 @@ func TestDisposeCleanupPastDeadlineIsRetainedDeadline(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(full, "f"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// timeoutMs 0: the drain deadline is its start, so the cleanup deadline has
-	// passed (on the real clock the safetree walk reads) before it begins.
-	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":0}`+"\n", scriptedReaper(reapEmpty))
+	// Drain completes at 950ms: before its 1000ms deadline but after the
+	// 900ms cleanup deadline. The real safetree clock also sees it as expired.
+	now := time.Unix(0, 0)
+	sup, buf := newTestSupervisor(`{"op":"dispose","id":1,"timeoutMs":1000}`+"\n", func() (childWaitResult, error) {
+		now = now.Add(950 * time.Millisecond)
+		return childWaitResult{}, syscall.ECHILD
+	})
+	sup.seams.now = func() time.Time { return now }
 	sup.seams.tmpCleanup = tmpCleanupFor(ct)
 	if code := sup.run(9, procStatus{}); code != 0 {
 		t.Fatalf("code = %d, want 0", code)

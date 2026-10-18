@@ -142,7 +142,7 @@ versions withhold incarnation binding: different builds sharing a truncated
 prefix cannot promote each other. Explicit force-roll is the escape hatch for
 unsupported proof, not an automatic relaxation of exact matching.
 
-### D6 — Holds and deadlines preserve independent fences
+### D6 — Indefinite busy-drift waits preserve independent fences
 
 Any unresolved stuck participant halts further admissions in its pool, including
 a failure after canary promotion. Release clears only an `image_roll`-owned drain
@@ -150,15 +150,35 @@ on a healthy retained old worker or a proven healthy current replacement.
 Independent maintenance, pressure and custody fences remain authoritative.
 There is no automatic revert, timeout override of a hold, or rollback.
 
-ADR-422's `workers.drainDeadline` (default `24h`) applies to an **admitted busy
-image turn**. Before mutation, a bounded fresh re-cordon/poll confirms desired
-state, independent fences, ordinary API liveness and the **current** expired
-drain timestamp at API evaluation. A stale expired timestamp cannot authorize a
-clear/re-cordon that reset the clock. Independent maintenance deadlines retain
-their meaning. `workers.forceRoll: true` explicitly bypasses pacing, holds,
-evidence and busy waits for drifted workers; it can remove remaining capacity.
-Custody and independent maintenance protections still apply. Restore `false`
-after the emergency; no automatic rollback follows it.
+**#3103 supersedes the original admitted-image deadline policy (2026-10-18).**
+Actual spec-hash/generation drift (image pin, template or size) and associated
+recycle wait indefinitely for genuine idle, including run-bound workers outside
+pacing and calls with no pacing entry or a plain drain reason. An admitted busy
+drainer occupies concurrency (default one), supplies no replacement coverage,
+canary proof or post-promotion proof, and can hold its pool indefinitely. It may retain the canary
+reservation while busy, without supplying promotion proof. Unadmitted peers
+stay uncordoned and claimable; legacy recycle cannot evade admission or the busy
+guard. Separately fenced DinD maintenance remains independent.
+
+Every assigned nonterminal run blocks, including queued, paused and all waits/gates.
+Own pinned continuations/checkers may finish; unrelated new roots, unassigned
+children and judge intake are refused. Idle guards and custody remain separate,
+even with zero assigned blockers. No elapsed timer releases a drain or authorizes
+busy drift replacement. Restoring an unchanged retained zero-replica Deployment
+while busy retains its existing guard.
+
+`workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains default `24h` and
+positive-only parsing, now only for independent **nondrifted** pressure/nix-size
+maintenance. That maintenance can interrupt busy runs and delete /data unless
+custody-held. A shorter deadline no longer forces image upgrades; no knob is added.
+Indefinite waits can delay capacity turnover and security fixes indefinitely.
+
+`workers.forceRoll: true` is **global**, bypassing pacing, holds, incarnation
+proof and busy deferral for drift, plus busy deferral for independent maintenance.
+It may interrupt runs and lose all capacity; it is neither targeted nor a recovery
+guarantee. Custody-held data and independent DinD readiness/identity/pod-absence
+guards remain authoritative; DinD has no deadline or ForceRoll bypass. Restore
+`false` after the emergency; no automatic rollback follows it.
 
 ### D7 — Deploy API first; diagnostics do not control admission
 
