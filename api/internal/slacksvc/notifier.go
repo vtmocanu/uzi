@@ -19,6 +19,7 @@ import (
 // NotifierStore is the slice of generated queries the notifier reads/writes.
 // *store.Queries satisfies it.
 type NotifierStore interface {
+	IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)
@@ -224,9 +225,11 @@ type notifyEvent struct {
 	body   string
 	link   string
 	// linkLabel is the caller-set fixed label for link; empty ⇒ "Open in uzi".
-	linkLabel string
-	emoji     string
-	facts     []string
+	linkLabel    string
+	emoji        string
+	facts        []string
+	deliveryTag  string
+	codexAccount *notifysvc.CodexAccountFence
 	// credential is the PRD #1732 D13 fence of a credential-specific alert; nil for
 	// every other notification. handleNotify re-checks it just before posting.
 	credential *notifysvc.CredentialFence
@@ -277,8 +280,15 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 // r.DeliveryID, issue #1675): its row stays undelivered and the notifysvc Redeliverer
 // re-enqueues it later; handleNotify marks it delivered once the DM is posted.
 func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
+	if r.CodexAccount != nil {
+		fence := *r.CodexAccount
+		r.CodexAccount = &fence
+	}
+	if r.DeliveryTag != "" || r.CodexAccount != nil {
+		r.DeliveryID = uuid.Nil
+	}
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts, credential: r.Credential, deliveryID: r.DeliveryID}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts, deliveryTag: r.DeliveryTag, codexAccount: r.CodexAccount, credential: r.Credential, deliveryID: r.DeliveryID}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}
