@@ -271,11 +271,12 @@ export class RecoveryMaintenance {
     for (const cycle of table.cycles)
       if (outputs.has(cycle.identity.originalSource)) refuse("maintenance_state_invalid");
   }
-  private async load(root: string): Promise<Table> {
+  private async load(root: string, initialize = true): Promise<Table> {
     let stat;
     try { stat = await fs.lstat(root); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (!initialize) refuse("maintenance_state_invalid");
       const stage = root + ".initializing";
       // Exclusive deterministic mkdir preserves any interrupted initialization evidence.
       await fs.mkdir(stage, { mode: 0o700 });
@@ -312,14 +313,40 @@ export class RecoveryMaintenance {
     this.validate(table, marker);
     return table;
   }
-  private async transaction<T>(action: (root: string, table: Table) => Promise<MaintenanceResult<T>>): Promise<MaintenanceResult<T>> {
+  private async transaction<T>(action: (root: string, table: Table) => Promise<MaintenanceResult<T>>, initialize = true): Promise<MaintenanceResult<T>> {
     try {
       const root = await this.root();
       return await locked(root, async () => {
-        try { return await action(root, await this.load(root)); }
+        try { return await action(root, await this.load(root, initialize)); }
         catch (error) { return deny(error instanceof MaintenanceRefusal ? error.reason : "maintenance_state_invalid"); }
       });
     } catch (error) { return deny(error instanceof MaintenanceRefusal ? error.reason : "maintenance_state_invalid"); }
+  }
+  /**
+   * Read-only evidence routing from an authenticated output index to its original
+   * identity. No content/eligibility proof, clock observation, allowance or token:
+   * callers must freshly prove source/config/output continuity and admit separately.
+   * Exhausted/expired history remains inspectable; absent/partial history is denied.
+   */
+  async resolveOutput(
+    outputDigest: string,
+    expected: Omit<MaintenanceIdentity, "originalSource" | "sourceConfig">,
+  ): Promise<MaintenanceResult<MaintenanceIdentity>> {
+    return this.transaction(async (_root, table) => {
+      const binding = identitySchema.omit({ originalSource: true, sourceConfig: true });
+      if (!digest.safeParse(outputDigest).success || !binding.safeParse(expected).success)
+        return deny("maintenance_identity_invalid");
+      // The authenticated table bounds this scan to CAPACITY cycles/outputs and
+      // validate rejects conflicting producers before any matching entry is used.
+      const matches = table.cycles.filter(cycle => cycle.outputs.includes(outputDigest));
+      if (!matches.length) return deny("maintenance_lineage_invalid");
+      const identity = matches[0]!.identity;
+      if (matches.some(cycle => canonical(cycle.identity) !== canonical(identity)))
+        return deny("maintenance_lineage_invalid");
+      const { originalSource: _source, sourceConfig: _config, ...actual } = identity;
+      if (canonical(actual) !== canonical(expected)) return deny("maintenance_identity_invalid");
+      return { ok: true, value: structuredClone(identity) };
+    }, false);
   }
   private eligible(input: MaintenanceEligibility): void {
     if (!identitySchema.safeParse(input.identity).success || !configSchema.safeParse(input.config).success ||

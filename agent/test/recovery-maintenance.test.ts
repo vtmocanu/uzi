@@ -6,7 +6,7 @@ import { createHmac, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { RecoveryMaintenance, MaintenanceResources, MAINTENANCE_VERIFIER_VERSION } from "../src/recovery-maintenance.js";
-import type { MaintenanceEligibility, MaintenanceResult, MaintenanceSlot } from "../src/recovery-maintenance.js";
+import type { MaintenanceEligibility, MaintenanceIdentity, MaintenanceResult, MaintenanceSlot } from "../src/recovery-maintenance.js";
 
 const workerToken = "test-worker-key";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -50,6 +50,167 @@ async function reseal(root: string, value: any): Promise<void> {
 async function table(root: string): Promise<any> {
   return JSON.parse(await fs.readFile(path.join(root, "complete.json"), "utf8")).value;
 }
+
+function expectedBinding(identity: MaintenanceIdentity) {
+  const { originalSource: _source, sourceConfig: _config, ...binding } = identity;
+  return binding;
+}
+async function storageSnapshot(dir: string): Promise<unknown> {
+  // Bounded test fixture tree: capture names, bytes and write metadata, not atime.
+  const names = (await fs.readdir(dir)).sort();
+  return Promise.all(names.map(async name => {
+    const file = path.join(dir, name), stat = await fs.lstat(file);
+    return [name, stat.ino, stat.mtimeMs, stat.ctimeMs, stat.isDirectory()
+      ? await storageSnapshot(file) : await fs.readFile(file, "utf8")];
+  }));
+}
+
+test("output lookup routes immutable capture digests to original identity without new slots or writes", async t => {
+  const f = await fixture(t), input = eligible(), ledger = f.make();
+  const output = sha("maintenance-v1-12345678-1234-4abc-8abc-123456789abc");
+  const token = take(await ledger.admit(input));
+  take(await ledger.beforeMutation(token, [output]));
+  take(await ledger.finish(token, "transient"));
+  const before = await storageSnapshot(path.dirname(f.root));
+  // Evidence routing must not consult or advance either admission clock.
+  const reader = f.make({ now: () => { throw new Error("lookup read the clock"); },
+    monotonicNow: () => { throw new Error("lookup read the monotonic clock"); } });
+  const binding = expectedBinding(input.identity);
+  const resolved = take(await reader.resolveOutput(output, binding));
+  assert.deepEqual(resolved, input.identity);
+  resolved.originalSource = sha("caller mutation");
+  assert.deepEqual(take(await reader.resolveOutput(output, binding)), input.identity);
+  for (const [key, value] of Object.entries(binding)) {
+    const wrong = { ...binding, [key]: typeof value === "number" ? 2 : key === "origin" ? sha("wrong") : "wrong" };
+    refused(await reader.resolveOutput(output, wrong), "maintenance_identity_invalid");
+  }
+  refused(await reader.resolveOutput(output, { ...binding, generation: 0 }), "maintenance_identity_invalid");
+  refused(await reader.resolveOutput(output + "\n", binding), "maintenance_identity_invalid");
+  for (const unknown of [sha("new capture id"), sha("updated tip"), input.identity.originalSource])
+    refused(await reader.resolveOutput(unknown, binding), "maintenance_lineage_invalid");
+  assert.deepEqual(await storageSnapshot(path.dirname(f.root)), before);
+  f.time(f.now + 180_000);
+  // The record's output cannot become a fresh input with a fresh config identity.
+  const replacement = structuredClone(input);
+  replacement.identity.originalSource = output; replacement.source = output;
+  replacement.identity.sourceConfig = sha("record updated config");
+  refused(await ledger.admit(replacement), "maintenance_lineage_invalid");
+  const continuation = { ...input, identity: take(await reader.resolveOutput(output, binding)), source: output };
+  take(await ledger.revalidate(continuation));
+  const second = take(await ledger.admit(continuation));
+  assert.equal(second.ordinal, 2);
+  assert.equal(second.admittedAt, token.admittedAt);
+  assert.equal(second.originalCycleExpiry, token.originalCycleExpiry);
+  take(await ledger.finish(second, "nonmutating"));
+  const fresh = eligible();
+  fresh.identity.originalSource = sha("positively unseen source");
+  fresh.source = fresh.identity.originalSource;
+  const newSlot = take(await ledger.admit(fresh));
+  assert.equal(newSlot.ordinal, 1);
+  take(await ledger.finish(newSlot, "nonmutating"));
+});
+
+test("output lookup retains one original identity across configuration siblings and completed cycles", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible(), output = sha("shared-config-output");
+  input.config.decodedCap = 4096;
+  const first = take(await ledger.admit(input));
+  take(await ledger.beforeMutation(first, [output]));
+  take(await ledger.finish(first, "complete"));
+  const before = await storageSnapshot(path.dirname(f.root));
+  assert.deepEqual(take(await f.make().resolveOutput(output, expectedBinding(input.identity))), input.identity);
+  assert.deepEqual(await storageSnapshot(path.dirname(f.root)), before);
+  refused(await ledger.admit(input), "maintenance_cycle_exhausted");
+  f.time(f.now + 180_000);
+  take(await ledger.revalidate({ ...input, source: output }));
+  const raised = { ...input, config: { ...input.config, decodedCap: 8192 }, source: output };
+  const next = take(await ledger.admit(raised));
+  take(await ledger.beforeMutation(next, [output]));
+  take(await ledger.finish(next, "complete"));
+  const siblings = await storageSnapshot(path.dirname(f.root));
+  assert.deepEqual(take(await f.make().resolveOutput(output, expectedBinding(input.identity))), input.identity);
+  assert.deepEqual(await storageSnapshot(path.dirname(f.root)), siblings);
+  refused(await ledger.admit(raised), "maintenance_cycle_exhausted");
+});
+
+test("output lookup never initializes absent or interrupted storage; ordinary first admission still initializes", async t => {
+  for (const staged of [false, true]) {
+    const f = await fixture(t);
+    if (staged) {
+      await fs.mkdir(f.root + ".initializing");
+      await fs.writeFile(path.join(f.root + ".initializing", "evidence"), "interrupted");
+    }
+    const before = await storageSnapshot(path.dirname(f.root));
+    refused(await f.make().resolveOutput(sha("output"), expectedBinding(eligible().identity)), "maintenance_state_invalid");
+    assert.deepEqual(await storageSnapshot(path.dirname(f.root)), before);
+    await assert.rejects(fs.lstat(f.root), { code: "ENOENT" });
+    if (!staged) {
+      const slot = take(await f.make().admit(eligible()));
+      take(await f.make().finish(slot, "nonmutating"));
+    }
+  }
+});
+
+test("output lookup preserves missing, corrupt, tampered, index-lost and rotated-key evidence", async t => {
+  for (const mode of ["missing-table", "missing-marker", "corrupt", "tampered", "index-lost",
+    "output-index-lost", "invalid-identity", "incomplete", "conflict", "rotated", "stage"] as const) {
+    const f = await fixture(t), ledger = f.make(), input = eligible(), output = sha("indexed output");
+    const slot = take(await ledger.admit(input));
+    take(await ledger.beforeMutation(slot, [output]));
+    take(await ledger.finish(slot, "nonmutating"));
+    const tableFile = path.join(f.root, "complete.json"), markerFile = path.join(f.root, "initialized.json");
+    if (mode === "missing-table") await fs.unlink(tableFile);
+    else if (mode === "missing-marker") await fs.unlink(markerFile);
+    else if (mode === "corrupt") await fs.writeFile(tableFile, "{");
+    else if (mode === "tampered") {
+      const raw = await fs.readFile(tableFile, "utf8");
+      await fs.writeFile(tableFile, raw.replace('"run":"run"', '"run":"other"'));
+    } else if (mode === "stage") await fs.mkdir(f.root + ".initializing");
+    else if (mode === "index-lost") {
+      const marker = JSON.parse(await fs.readFile(markerFile, "utf8")).value;
+      marker.history.pop();
+      await signed(markerFile, marker);
+    } else if (mode !== "rotated") {
+      const stored = await table(f.root);
+      if (mode === "output-index-lost") stored.cycles[0].outputs = [];
+      if (mode === "invalid-identity") stored.cycles[0].identity.generation = 0;
+      if (mode === "incomplete") stored.complete = false;
+      if (mode === "conflict") {
+        const conflict = structuredClone(stored.cycles[0]);
+        conflict.identity.run = "other-run";
+        conflict.identity.originalSource = sha("other-source");
+        conflict.slots[0].nonce = "other-nonce";
+        stored.cycles.push(conflict);
+      }
+      await reseal(f.root, stored);
+    }
+    const before = await storageSnapshot(path.dirname(f.root));
+    refused(await f.make(mode === "rotated" ? { workerToken: "rotated-worker" } : {})
+      .resolveOutput(output, expectedBinding(input.identity)), "maintenance_state_invalid");
+    assert.deepEqual(await storageSnapshot(path.dirname(f.root)), before, mode);
+  }
+});
+
+test("output lookup works at full capacity and exhausted/expired cycles without rebasing history", async t => {
+  const f = await fixture(t), ledger = f.make(), input = eligible();
+  const outputs = Array.from({ length: 4094 }, (_, i) => sha("lookup-output-" + i));
+  for (let ordinal = 1; ordinal <= 3; ordinal++) {
+    const slot = take(await ledger.admit(input));
+    if (ordinal === 1) take(await ledger.beforeMutation(slot, outputs));
+    take(await ledger.finish(slot, "nonmutating"));
+    f.time(f.now + 180_000);
+  }
+  for (const expired of [false, true]) {
+    if (expired) f.time(1_000_000 + 86_400_000);
+    const before = await storageSnapshot(path.dirname(f.root));
+    for (const output of [outputs[0]!, outputs[4093]!])
+      assert.deepEqual(take(await f.make().resolveOutput(output, expectedBinding(input.identity))), input.identity);
+    refused(await ledger.resolveOutput(sha("unknown"), expectedBinding(input.identity)), "maintenance_lineage_invalid");
+    assert.deepEqual(await storageSnapshot(path.dirname(f.root)), before);
+    refused(await ledger.admit(input), expired ? "maintenance_cycle_expired" : "maintenance_cycle_exhausted");
+  }
+  const fresh = eligible(); fresh.identity.run = "new-run";
+  refused(await ledger.admit(fresh), "maintenance_table_capacity");
+});
 
 test("durable slots survive interruption, reserve full totals, retain expiry and stop after three", async t => {
   const f = await fixture(t), input = eligible(), ledger = f.make();
