@@ -25,6 +25,7 @@ type policyStopApprovalBeginner struct {
 	lockAttempt    chan struct{}
 	locked         chan struct{}
 	releaseLock    <-chan struct{}
+	verdictAttempt chan struct{}
 	verdictScanned chan struct{}
 	commitAttempt  chan struct{}
 	releaseCommit  <-chan struct{}
@@ -60,6 +61,9 @@ func (tx *policyStopApprovalTx) QueryRow(ctx context.Context, sql string, args .
 		}
 		scanned, release = tx.observer.locked, tx.observer.releaseLock
 	case strings.HasPrefix(sql, "-- name: CreateGateVerdictInput :one"):
+		if tx.observer.verdictAttempt != nil {
+			close(tx.observer.verdictAttempt)
+		}
 		scanned = tx.observer.verdictScanned
 	}
 	return policyStopApprovalRow{Row: tx.Tx.QueryRow(ctx, sql, args...), ctx: ctx, scanned: scanned, release: release}
@@ -242,10 +246,10 @@ func TestPolicyStopApprovalOrdersLiveDB(t *testing.T) {
 			stopResult := policyStopRacePOST(t, stopActor, `{"kind":"stop","body":"keep completed work"}`, token)
 			policyStopRaceWait(t, ctx, stopLocked, "Stop owns run lock")
 			approveAttempt, approveLocked, releaseApproval := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			approvePID, sqlDone := make(chan uint32, 1), make(chan struct{})
+			approvePID, verdictAttempt := make(chan uint32, 1), make(chan struct{})
 			approveActor := policyStopApprovalActor(f, policyStopApprovalBeginner{
 				pool: pool, pid: approvePID, lockAttempt: approveAttempt, locked: approveLocked,
-				releaseLock: releaseApproval, verdictScanned: sqlDone,
+				releaseLock: releaseApproval, verdictAttempt: verdictAttempt,
 			})
 			approvalResult := policyStopRacePOST(t, approveActor, `{"kind":"approve_plan","body":"delayed owner verdict"}`, "")
 			// Reaching this generated lock statement follows the initial read and
@@ -267,8 +271,8 @@ func TestPolicyStopApprovalOrdersLiveDB(t *testing.T) {
 				t.Fatal("delayed approval changed accepted Stop full snapshot")
 			}
 			select {
-			case <-sqlDone:
-				t.Fatal("resolved gate reached verdict SQL")
+			case <-verdictAttempt:
+				t.Fatal("resolved gate attempted verdict SQL")
 			default:
 			}
 		})
@@ -297,11 +301,10 @@ func TestPolicyStopApprovalOrdersLiveDB(t *testing.T) {
 		close(releaseApproval)
 		policyStopRaceResponse(t, ctx, approvalResult, http.StatusAccepted, "")
 		policyStopApprovalReceipt(t, policyStopRaceResponse(t, ctx, stopResult, http.StatusAccepted, ""))
-		acceptedSnapshot := f.snapshot()
+		// The PostgreSQL wait establishes the commit order. Verify that the
+		// earlier verdict remains pending after Stop rather than claiming a
+		// second snapshot observes an outstanding production action.
 		policyStopApprovalPending(t, ctx, pool, f, "approval first")
-		if f.snapshot() != acceptedSnapshot {
-			t.Fatal("approval changed full snapshot after Stop ACK")
-		}
 	})
 }
 
