@@ -2783,6 +2783,14 @@ export interface StateAck {
     claim_generation: number;
     memory_episode: number;
   }>;
+  /** Request-local guard projection; completion permit and frozen contract authority remain unchanged. */
+  completionProjection?: { revision: number; deferredIds: string[] };
+  completionAttempts?: number;
+  runId?: unknown;
+  workerId?: unknown;
+  workerIdentityMatches?: boolean;
+  /** The actual request generation, after feature and strict-decode fallback selection. */
+  sentClaimGeneration?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
