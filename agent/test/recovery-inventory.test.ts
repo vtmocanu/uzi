@@ -21,6 +21,43 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+it("retained owner attention paces FINAL retries without repeated reason writes", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    const coordinator = f.make();
+    const warnings: string[] = [];
+    f.log.warn = message => { warnings.push(message); };
+    f.state.finalError = new RequestError("POST", "/release", 403, JSON.stringify({ reason: "not_authorized" }));
+    f.client.reconcileRecoveryCapture = async (run, id, request) => ({
+      run_id: run, capture_id: id, generation: request.generation,
+      outcome: "retained", reason: "capture_failure_requires_attention",
+    });
+    let writes = 0;
+    const write = coordinator["writeRecordUnlocked"].bind(coordinator);
+    Object.assign(coordinator, { writeRecordUnlocked: async (...args: Parameters<typeof write>) => {
+      writes++; return write(...args);
+    } });
+    const initialFinals = f.finals.length;
+    await coordinator.resumePending(undefined, [before]);
+    const first = (await coordinator.inspect(before.runId))[0]!;
+    assert.equal(first.reason, "capture_failure_requires_attention");
+    const firstWrites = writes;
+    await coordinator.resumePending(undefined, [first]);
+    assert.equal(f.finals.length, initialFinals + 1, "same-clock pass must respect per-record backoff");
+    assert.equal(writes, firstWrites);
+    f.state.now += 60_000;
+    await coordinator.resumePending(undefined, [first]);
+    assert.equal(f.finals.length, initialFinals + 2, "due retry stays eligible");
+    assert.equal(writes, firstWrites, "stable owner reason must not flip to refusal and back");
+    assert.equal(warnings.filter(message => message === "recovery: inventory requires owner attention").length, 1);
+    const after = (await coordinator.inspect(before.runId))[0]!;
+    assert.equal(after.reason, first.reason);
+    assert.deepEqual(after.finalRequest, before.finalRequest);
+    assert.equal(after.finalAcknowledged, undefined);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
+
 for (const [status, reason] of [[401, "hold_not_original_worker"],
   [403, "capture_failure_requires_attention"], [409, "capture_manifest_integrity_mismatch"]] as const) {
   it(`FINAL refusal ${status} preserves the reconciliation owner-attention reason`, async () => {
@@ -3207,7 +3244,11 @@ for (const variant of ["network", "5xx", "timeout", "generation_not_ended", "att
       if (variant === "attention") {
         f.state.now += 30_000;
         await live();
-        assert.equal(f.finals.length, 3, "attention reasons retain the ordinary live interval");
+        assert.equal(f.finals.length, 2, "owner-attention retry respects its per-record delay");
+        await assertPending();
+        f.state.now += 30_000;
+        await live();
+        assert.equal(f.finals.length, 3, "owner-attention retry remains eligible when due");
         await assertPending();
       } else {
         f.state.now += 60_000 - 1;

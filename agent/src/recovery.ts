@@ -519,6 +519,14 @@ export const PERMANENT_UPLOAD_REASONS: ReadonlySet<string> = new Set([
   "local_bundle_mismatch",
 ]);
 
+/** Bounded server reconciliation reasons that retain custody for owner attention. */
+const INVENTORY_RECONCILE_ATTENTION_REASONS: ReadonlySet<string> = new Set([
+  "hold_released_without_final_receipt", "hold_not_open", "hold_not_original_worker",
+  "capture_not_replaceable", "capture_manifest_integrity_mismatch", "available_capture_manifest_unbound",
+  "capture_manifest_invalid", "capture_failure_requires_attention", "available_capture_expiry_invalid",
+  "capture_state_unknown",
+]);
+
 /** The `needs_action` reasons a live pass may retry (all need a journaled bundle). */
 const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
@@ -905,6 +913,7 @@ export class RecoveryCoordinator {
     if (!identity || residueQuarantine() !== undefined) return;
     const current = persist ? await this.writeExistingRecord(record, cur =>
       this.finalRetryIdentity(cur) === identity && cur.reason !== reason && !["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(cur.reason ?? "")
+        && !INVENTORY_RECONCILE_ATTENTION_REASONS.has(cur.reason ?? "")
         ? { ...cur, reason } : undefined) : await this.requireRecord(record);
     if (this.finalRetryIdentity(current) !== identity) return;
     // Only known protocol reasons can enter diagnostics; RequestError text/body is untrusted.
@@ -931,8 +940,9 @@ export class RecoveryCoordinator {
 
   private async paceFinalRetry(record: RecoveryRecord, outcome: RecoveryOutcome | void): Promise<void> {
     if (residueQuarantine() !== undefined || !outcome?.reason ||
-        !["upload_transient", "storage_quota_exceeded", "final_retry_refused", "final_retry_unknown",
-          "stale_ownership", "upload_rejected"].includes(outcome.reason)) return;
+        (!["upload_transient", "storage_quota_exceeded", "final_retry_refused", "final_retry_unknown",
+          "stale_ownership", "upload_rejected"].includes(outcome.reason) &&
+          !INVENTORY_RECONCILE_ATTENTION_REASONS.has(outcome.reason))) return;
     const latest = await this.readLatest(record);
     if (latest.kind !== "ok" || this.finalRetryIdentity(latest.record) !== this.finalRetryIdentity(record) ||
         !this.finalRetryIdentity(latest.record)) {
@@ -2017,20 +2027,16 @@ export class RecoveryCoordinator {
       }
       if (response.outcome === "retained") {
         // api/internal/recovery/reconcile.go emits only these bounded protocol reasons.
-        const reasons = new Set(["hold_released_without_final_receipt", "hold_not_open",
-          "hold_not_original_worker", "generation_not_ended", "capture_not_replaceable",
-          "capture_manifest_integrity_mismatch", "available_capture_manifest_unbound",
-          "capture_manifest_invalid", "capture_failure_requires_attention",
-          "available_capture_expiry_invalid", "capture_available", "capture_state_unknown"]);
         if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
-            typeof response.reason !== "string" || !reasons.has(response.reason)) return unknown();
+            typeof response.reason !== "string" || (!INVENTORY_RECONCILE_ATTENTION_REASONS.has(response.reason) &&
+              response.reason !== "capture_available" && response.reason !== "generation_not_ended")) return unknown();
         const reason = response.reason;
         if (reason === "capture_available" || reason === "generation_not_ended") return unknown();
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && !cur.finalAcknowledged &&
-          canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
+          cur.reason !== reason && canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
         if (current.reason !== reason) return;
-        this.log.warn("recovery: inventory requires owner attention", {
+        if (record.reason !== reason) this.log.warn("recovery: inventory requires owner attention", {
           run_id: current.runId, generation: current.generation, reason,
         });
         return { state: current.state, captureId: current.captureId, reason };
