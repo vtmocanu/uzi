@@ -5521,14 +5521,32 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     });
   });
 
-  it("a launch failure cancels the reservation (no poison) and re-throws the setup error", async () => {
+  it("unknown failed startup retains uncertainty after reservation cancellation and terminal disposal", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let reject!: (error: Error) => void;
+    const pending = new Promise<never>((_, fail) => { reject = fail; });
+    const boom = new Error("unknown native startup");
+    const { harness } = makeHarness({ registry, launchRoot: () => pending });
+    const turn = collect(harness.startTurn(makeRequest()).events);
+    await tick();
+    assert.equal(registry.pendingLaunchCount(), 1);
+    reject(boom);
+    await assert.rejects(turn, error => error === boom);
+    assert.equal(registry.pendingLaunchCount(), 0);
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
+    assert.equal((await registry.disposeTools(1000)).kind, "incomplete");
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
+  });
+
+  it("an unknown launch failure settles its reservation but retains uncertainty and the setup error", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const boom = new Error("launch failed");
     const { harness } = makeHarness({ registry, launchRoot: async () => { throw boom; } });
 
     await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => err === boom);
     assert.equal(registry.pendingLaunchCount(), 0, "the reservation was settled (cancelled)");
-    assert.equal(registry.isPoisoned(), false, "a launch abort cancels, it does not poison");
+    assert.equal(registry.isPoisoned(), true, "canceling a reservation cannot prove failed-start cleanup");
+    assert.equal((await registry.settleForCapture(1_000)).kind, "incomplete");
   });
 
   it("aborts the launch and tears the root down when registry admission fails (finding 6)", async () => {

@@ -169,6 +169,8 @@ export function assertSupervisedProvisionRequest(request: SupervisedProvisionReq
 }
 
 export interface ProvisionDeps {
+  /** Codex setup cancellation; other executors retain their existing retry behavior. */
+  signal?: AbortSignal;
   log: Logger;
   /** Runs a provisioning command. Injected so unit tests never touch real
    *  devbox/nix (no substituter egress). Default shells out to devbox. */
@@ -278,6 +280,8 @@ export function filterShellenv(output: string, basePath: string): Record<string,
 
 // One child checks the whole PATH under one consuming identity. JSON on both sides
 // avoids shell parsing of entries containing spaces, quotes, or newlines.
+// Read-only exception: absolute process.execPath runs this fixed node:fs helper;
+// JSON argv is data and buildProvisionEnv excludes Node startup injection variables.
 const PATH_PROBE_SCRIPT = `const fs = require("node:fs");
 const entries = JSON.parse(process.argv[1]);
 const statuses = entries.map((entry) => {
@@ -353,6 +357,7 @@ export async function provisionTools(input: ProvisionInput, deps: ProvisionDeps)
       classify: classifyDevboxError,
       schedule: DEVBOX_RETRY_SCHEDULE,
       sleep: deps.sleep,
+      signal: deps.signal,
       log: deps.log,
       logMessage: "transient devbox install error; retrying",
     });

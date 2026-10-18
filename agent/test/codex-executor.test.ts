@@ -1,3 +1,4 @@
+import { provisionNative } from "./codex-provision-fixture.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
@@ -20214,4 +20215,167 @@ describe("#2852 default installer binding", () => {
       }
     }
   });
+});
+
+describe("#2852 default provision binding", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  async function fixture(options: Parameters<typeof provisionNative>[0] = {}, packages = ["hello"], tier2 = false) {
+    const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/provision-binding-"));
+    const repo = path.join(dir, "repo");
+    await fs.mkdir(repo);
+    if (tier2) await fs.writeFile(path.join(repo, "devbox.json"), JSON.stringify({ packages: ["hello"] }));
+    const native = provisionNative(options);
+    const rig = makeRig({ responder: done });
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true, provisionRunTools: undefined, launchCodexProvisionRootForTest: native.launcher };
+    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, path.join(dir, "home"));
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ runId: "28520000-0000-4000-8000-000000000001", worktreePath: repo,
+      signal: controller.signal, config: { tool_packages: packages, repo_devbox_opt_in: tier2 } as RunContext["config"] });
+    const run = exec.run(ctx).then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+    return { native, rig, exec, controller, run, cleanup: async () => {
+      controller.abort(); native.release();
+      await withTimeout(run, 5000, "provision cleanup");
+      native.destroy(); await fs.rm(dir, { recursive: true, force: true });
+    } };
+  }
+
+  it("primary zero and held full root block capture, credentials and model startup", async () => {
+    const fx = await fixture({ hold: true });
+    try {
+      await withTimeout(fx.native.disposing, 2000, "provision root disposal");
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      let body = 0, settled = false;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; }).finally(() => { settled = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(body, 0); assert.equal(settled, false);
+      fx.native.release();
+      assert.equal((await withTimeout(capture, 3000, "provision capture")).kind, "observed_empty");
+      assert.equal(body, 1);
+      await withTimeout(fx.run, 3000, "captured provision");
+      assert.equal(fx.native.calls.length, 1, "no shellenv after capture");
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const unknown of [false, true]) it(`tier2-only degradation requires clean whole provisioning finisher unknown=${unknown}`, async () => {
+    const fx = await fixture({ unknown, code: 1, stderr: unknown ? "connection reset by peer" : undefined }, [], true);
+    try {
+      const result = await withTimeout(fx.run, 4000, "tier2 fallback");
+      assert.equal(!!result.value, !unknown);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.providerLaunches(), unknown ? 0 : 1);
+      if (unknown) assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  it("clean nonzero network stderr retries through the unchanged devbox policy", async () => {
+    const fx = await fixture({ transientOnce: true });
+    try {
+      const result = await withTimeout(fx.run, 4000, "transient provision retry");
+      assert.ok(result.value);
+      assert.equal(fx.native.calls.length, 3, "install retry then shellenv");
+      assert.equal(fx.rig.probeCalls[0]?.opts.env?.NIX_SSL_CERT_FILE, "/fixture/cert", "output arriving before startup survives full settlement");
+      assert.equal(fx.rig.providerLaunches(), 1);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const phase of ["startup", "backoff"] as const) it(`capture cancels provisioning during ${phase}`, async () => {
+    const fx = await fixture({ hold: true, pendingStartup: phase === "startup", transientOnce: phase === "backoff" });
+    try {
+      await withTimeout(fx.native.spawned, 2000, "provision spawn");
+      if (phase === "backoff") {
+        await withTimeout(fx.native.disposing, 2000, "failed primary cleanup");
+        fx.native.release();
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      let body = 0;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+      fx.native.release();
+      assert.equal((await withTimeout(capture, 3000, "cancel setup")).kind, "observed_empty");
+      await withTimeout(fx.run, 3000, "cancelled provisioning");
+      assert.equal(body, 1);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const phase of ["startup", "backoff"] as const) it(`lifecycle cancellation joins provisioning during ${phase}`, async () => {
+    const fx = await fixture({ hold: true, pendingStartup: phase === "startup", transientOnce: phase === "backoff" });
+    try {
+      await withTimeout(fx.native.spawned, 2000, "lifecycle provision spawn");
+      if (phase === "backoff") {
+        await withTimeout(fx.native.disposing, 2000, "lifecycle primary cleanup");
+        fx.native.release();
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      fx.controller.abort(new Error("owner cancellation"));
+      fx.native.release();
+      const result = await withTimeout(fx.run, 3000, "lifecycle cancelled provision");
+      assert.ok(result.error);
+      assert.equal(fx.native.calls.length, 1);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+      assert.equal(fx.rig.providerLaunches(), 0);
+      assert.equal((await fx.exec.withCredentialFreeCapture(1000, async () => undefined, "cancel")).kind, "observed_empty");
+    } finally { await fx.cleanup(); }
+  });
+
+  it("rejected returned provision root stays owned until full cleanup", async t => {
+    const register = ExecutionRegistry.prototype.registerRoot;
+    const registries = new Set<ExecutionRegistry>();
+    t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+    ) {
+      if (!registries.size && args[1].kind === "command") {
+        registries.add(this);
+        this.cancelReservation(args[0]);
+      }
+      return register.apply(this, args);
+    });
+    const fx = await fixture({ hold: true });
+    try {
+      await withTimeout(fx.native.disposing, 2000, "rejected root cleanup");
+      assert.equal(Array.from(registries)[0]?.rootCount(), 1);
+      let body = 0;
+      const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+      fx.native.release();
+      assert.equal((await withTimeout(capture, 3000, "rejected capture")).kind, "incomplete");
+      await withTimeout(fx.run, 3000, "rejected setup");
+      assert.equal(body, 0);
+      assert.equal(fx.rig.client.releaseCalls.length, 0);
+    } finally { await fx.cleanup(); }
+  });
+
+  for (const mode of ["clean", "zero", "failure", "unknown", "startup", "overflow"] as const) {
+    it(`production provisioning ${mode} preserves admission and cleanup`, async () => {
+      const fx = await fixture({ unknown: mode === "unknown", startup: mode === "startup",
+        overflow: mode === "overflow", code: mode === "failure" ? 1 : 0 }, mode === "zero" ? [] : ["hello"]);
+      try {
+        const result = await withTimeout(fx.run, 4000, "provision outcome");
+        const success = mode === "clean" || mode === "zero";
+        assert.equal(!!result.value, success);
+        assert.equal(fx.rig.providerLaunches(), success ? 1 : 0);
+        assert.equal(fx.native.calls.length, mode === "zero" ? 0 : mode === "clean" ? 2 : 1);
+        let body = 0;
+        const capture = await fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
+        assert.equal(capture.kind, mode === "unknown" || mode === "startup" ? "incomplete" : "observed_empty");
+        assert.equal(body, mode === "unknown" || mode === "startup" ? 0 : 1);
+      } finally { await fx.cleanup(); }
+    });
+  }
+});
+
+it("#2852 fileop unknown failed start retains registry proof through terminal teardown", async () => {
+  const rig = makeRig();
+  const original = new Error("unknown fileop native start");
+  rig.deps = { ...rig.deps, launchEffectRoot: async () => { throw original; } };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+  const { ctx } = makeCtx();
+  await assert.rejects(withTimeout(exec.run(ctx), 3000, "failed fileop setup"));
+  let body = 0;
+  assert.equal((await exec.withCredentialFreeCapture(1000, async () => { body++; })).kind, "incomplete");
+  assert.equal(body, 0);
+  assert.equal(rig.providerLaunches(), 0);
 });

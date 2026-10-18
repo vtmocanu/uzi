@@ -1485,20 +1485,30 @@ export class CodexHarness implements RunHarness {
         credentialValue: this.appServerAuth === undefined ? this.credentialValue : undefined,
       });
     } catch (error) {
-      // The launch aborted before producing a root: settle the reservation so it does
-      // not poison the epoch at quiesce, then re-throw the setup failure.
+      // This seam has no exact-attempt cleanup certificate. Constructor fields
+      // cannot prove that a failed native startup left no descendants.
+      this.registry.markLaunchCleanupUnconfirmed();
       this.registry.cancelReservation(reservation.reservation);
       throw error;
     }
     const admission = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!admission.ok) {
-      // The registry POISONED on a kind / unknown-reservation mismatch: this root was
-      // never admitted, so model work must NOT proceed on it. Do NOT assign transport/
-      // notes; best-effort tear the just-launched root down (a poisoned epoch will not
-      // reap it), then fail closed. A close/dispose throw is swallowed — we are already
-      // failing the launch and only bound the cleanup.
-      await launched.transport.close().catch(() => {});
-      await launched.root.dispose(REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS).catch(() => {});
+      this.registry.retainRejectedRoot(reservation.reservation, launched.root);
+      const deadlineAt = Date.now() + REGISTRY_ADMISSION_TEARDOWN_DEADLINE_MS;
+      const remaining = () => Math.max(0, deadlineAt - Date.now());
+      const bounded = async (work: Promise<unknown>): Promise<void> => {
+        // Expiry revokes authority, never ownership of a started close/disposal.
+        try { await work; }
+        catch { this.registry.markLaunchCleanupUnconfirmed(); }
+        if (remaining() <= 0) this.registry.markLaunchCleanupUnconfirmed();
+      };
+      // Three attempts share one deadline; a failed channel does not skip root settlement.
+      await bounded(launched.transport.close());
+      const reaped = await this.registry.reapRoot(launched.root, remaining()).catch(() => undefined);
+      if (!reaped?.ok) this.registry.markLaunchCleanupUnconfirmed();
+      await bounded(this.registry.disposeTools(remaining()).then(outcome => {
+        if (outcome.kind !== "disposed") this.registry.markLaunchCleanupUnconfirmed();
+      }));
       throw new CodexHarnessError({ category: "protocol", message: "codex provider root failed registry admission" });
     }
     this.transport = launched.transport;

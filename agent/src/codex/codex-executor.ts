@@ -90,6 +90,7 @@ import {
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
+import { provisionTools, prepareSupervisedProvision } from "../provision.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
@@ -175,6 +176,8 @@ import {
   SUPERVISOR_BIN,
   launchCodexEffectRoot,
   launchCodexInstallerRoot,
+  launchCodexProvisionRoot,
+  type CodexProvisionRootHandle,
   classifyCodexLaunchFailure,
   launchCodexRoot,
   watchStartupCleanup,
@@ -1773,6 +1776,7 @@ export interface CodexExecutorDeps {
   readonly installDeps?: typeof installJsDeps;
   /** Fixed canonical installer request and native lifecycle; no generic spawn authority. */
   readonly launchCodexInstallerRootForTest?: typeof launchCodexInstallerRoot;
+  readonly launchCodexProvisionRootForTest?: typeof launchCodexProvisionRoot;
   /** Adapts the real M3a launcher for a PROVIDER root; a test injects a fake returning a
    *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND the
    *  immutable app-server auth mode; the credential NO LONGER rides into the launcher env — it
@@ -2076,6 +2080,8 @@ export class CodexExecutor implements Executor {
     const timeout = (): CredentialFreeCaptureSettlement => ({ kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] });
     this.summaryLifecycleClosed = true;
     if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
+    this.provisionDeadline?.(Date.now() + remaining());
+    this.provisionAbort?.abort();
     await this.closeAndSettlePlanSummary(remaining());
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
@@ -2169,6 +2175,8 @@ export class CodexExecutor implements Executor {
   private captureRevision = 0;
   private captureCleanupRemaining?: () => number;
   private captureTail: Promise<void> = Promise.resolve();
+  private provisionAbort?: AbortController;
+  private provisionDeadline?: (deadlineAt: number) => void;
   private readonly epochSetups = new Map<Promise<unknown>, Set<ExecutionRegistry> | undefined>();
   private runActive = false;
 
@@ -2236,6 +2244,8 @@ export class CodexExecutor implements Executor {
     const remaining = () => signal?.aborted ? 0 : Math.min(
       Math.max(0, deadlineAt - Date.now()), cap?.() ?? Infinity);
     if (this.captureOwners === 1) this.captureCleanupRemaining = remaining;
+    this.provisionDeadline?.(Date.now() + remaining());
+    this.provisionAbort?.abort();
     const incomplete = (message: string) => ({
       kind: "incomplete" as const, errors: [{ category: "protocol" as const, message }],
     });
@@ -2883,11 +2893,141 @@ export class CodexExecutor implements Executor {
       // materializing the per-run HOME with the wrong gid (matching sdk-executor).
       const provisionRunToolsFn = this.deps.provisionRunTools ?? provisionRunTools;
       this.assertCaptureAdmission(setupRevision);
-      const provisioned = await this.trackEpochSetup(() => provisionRunToolsFn(ctx, {
-        provisionRoot: this.provisionRoot,
-        homeDir: this.provisionHomeDir,
-        log: this.log,
-      }));
+      const provisionAbort = new AbortController();
+      this.provisionAbort = provisionAbort;
+      const provisionSignal = AbortSignal.any([provisionAbort.signal, lifecycleSignal]);
+      const provisionRegistry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+      const provisionRegistries = new Set([provisionRegistry]);
+      let provisionClean = false;
+      let provisionDeadlineAt = Date.now() + 10 * 60_000;
+      this.provisionDeadline = deadlineAt => { provisionDeadlineAt = Math.min(provisionDeadlineAt, deadlineAt); };
+      const provisionRemaining = () => Math.max(0, Math.min(provisionDeadlineAt - Date.now(),
+        this.captureCleanupRemaining?.() ?? Infinity));
+      const provisionGuard = () => {
+        this.assertCaptureAdmission(setupRevision);
+        provisionSignal.throwIfAborted();
+        if (provisionRegistry.isPoisoned()) throw new Error("provision cleanup unconfirmed");
+      };
+      const refuseProvision = async (): Promise<never> => {
+        throw new TrustedExecutionRefusal("provision has no boundary authority");
+      };
+      let provisionDone: Promise<Awaited<ReturnType<typeof provisionRunTools>>> | undefined;
+      const provisionFacade = createCodexExecutionSafety(provisionRegistry, refuseProvision, refuseProvision, async (deadlineAt) => {
+        provisionDeadlineAt = Math.min(provisionDeadlineAt, deadlineAt);
+        provisionAbort.abort();
+        await provisionDone?.catch(() => undefined);
+        if (!provisionClean) throw new TrustedExecutionRefusal("provision cleanup unconfirmed");
+      });
+      const disposeProvision = provisionFacade.dispose.bind(provisionFacade);
+      provisionFacade.dispose = async (request) => {
+        provisionDeadlineAt = Math.min(provisionDeadlineAt, Date.now() + Math.max(0, request.deadlineMs));
+        provisionAbort.abort();
+        await provisionDone?.catch(() => undefined);
+        return disposeProvision({ ...request, deadlineMs: provisionRemaining() });
+      };
+      provisionDone = this.trackEpochSetup(async () => {
+        this.unverifiedEpochRegistries.add(provisionRegistry);
+        this.epochSafeties.set(provisionRegistry, provisionFacade);
+        this.safety = provisionFacade;
+        try {
+          return await provisionRunToolsFn(ctx, {
+            provisionRoot: this.provisionRoot, homeDir: this.provisionHomeDir, log: this.log,
+            provision: (input, deps) => {
+              provisionGuard();
+              const source = { ...process.env };
+              return provisionTools(input, { ...deps, processEnv: source, signal: provisionSignal,
+                run: async (command, args, opts) => {
+                  provisionGuard();
+                  const request = prepareSupervisedProvision(command, args, opts, input, source, provisionSignal, provisionGuard);
+                  provisionDeadlineAt = Date.now() + request.timeoutMs;
+                  const startupCleanup = Object.freeze({ attempt: Object.freeze({}), hardDeadlineAt: provisionDeadlineAt });
+                  const verified = watchStartupCleanup(startupCleanup);
+                  const reservation = provisionRegistry.reserveLaunch("command");
+                  if (reservation.kind !== "reserved") throw new Error("provision admission closed");
+                  let handle: CodexProvisionRootHandle;
+                  try {
+                    handle = await (this.deps.launchCodexProvisionRootForTest ?? launchCodexProvisionRoot)(request, { startupCleanup });
+                  } catch (error) {
+                    const classification = classifyCodexLaunchFailure(error);
+                    if (!verified(error) && classification !== "profile_quarantine" && !classification.startsWith("spawn_")) {
+                      provisionRegistry.markLaunchCleanupUnconfirmed();
+                    }
+                    provisionRegistry.cancelReservation(reservation.reservation);
+                    // Static diagnostics prevent network-looking startup errors from authorizing retries.
+                    throw new Error("provision startup failed");
+                  }
+                  const root = registeredRoot({ ...handle, dispose: (budget) =>
+                    handle.dispose(Math.min(budget ?? Infinity, provisionRemaining())) }, "command", this.log);
+                  const admitted = provisionRegistry.registerRoot(reservation.reservation, root);
+                  if (!admitted.ok) provisionRegistry.retainRejectedRoot(reservation.reservation, root);
+                  let cleanup: Promise<boolean> | undefined;
+                  const stop = () => cleanup ??= provisionRegistry.reapRoot(root, provisionRemaining())
+                    .then(outcome => outcome.ok, () => false);
+                  let workerStopped = false;
+                  let stopped!: () => void;
+                  const stoppedPromise = new Promise<void>(resolve => { stopped = resolve; });
+                  const abort = () => { workerStopped = true; stopped(); void stop(); };
+                  provisionSignal.addEventListener("abort", abort, { once: true });
+                  try {
+                    if (!admitted.ok) throw new Error("provision root admission failed");
+                    if (provisionSignal.aborted) abort();
+                    if (handle.outputFailure) { abort(); throw handle.outputFailure; }
+                    const exit = await Promise.race([
+                      handle.waitChild(provisionRemaining()),
+                      stoppedPromise.then(() => { throw new Error("provision stopped"); }),
+                      handle.whenOutputFailed.then(error => { abort(); throw error; }),
+                    ]);
+                    if (!await stop() || provisionRegistry.isPoisoned()) throw new Error("provision cleanup unconfirmed");
+                    const output = handle.output();
+                    if (workerStopped) throw Object.assign(new Error("provision stopped"), { killed: true, signal: "SIGKILL" });
+                    if (exit.code !== 0) throw Object.assign(new Error("devbox command failed"), output, { code: exit.code });
+                    return output;
+                  } catch (error) {
+                    if (error instanceof SupervisedChildExitTimeoutError) workerStopped = true;
+                    const clean = await stop();
+                    if (!clean || provisionRegistry.isPoisoned()) {
+                      provisionRegistry.markLaunchCleanupUnconfirmed();
+                      throw new Error("provision cleanup unconfirmed");
+                    }
+                    if (workerStopped) throw Object.assign(new Error("provision stopped"), { killed: true, signal: "SIGKILL" });
+                    throw error;
+                  } finally {
+                    await stop();
+                    provisionSignal.removeEventListener("abort", abort);
+                  }
+                },
+              });
+            },
+          });
+        } finally {
+          // Direct registry finisher: capture joins this promise before taking any safety queue.
+          // One registry pass attempts all siblings even if an earlier root failed.
+          let drained = false;
+          try {
+            const closed = await provisionRegistry.quiesceChildren(provisionRemaining());
+            if (closed.kind === "quiescent") drained =
+              (await provisionRegistry.reapProcesses(provisionRemaining(), closed.epoch)).kind === "observed_empty";
+          } catch { /* Disposal still owns every returned root. */ }
+          try {
+            const disposed = await provisionRegistry.disposeTools(provisionRemaining());
+            provisionClean = drained && disposed.kind === "disposed" && !provisionRegistry.isPoisoned();
+          } catch { provisionClean = false; }
+          if (provisionClean) {
+            this.unverifiedEpochRegistries.delete(provisionRegistry);
+            this.epochSafeties.delete(provisionRegistry);
+            if (this.safety === provisionFacade) this.safety = undefined;
+          }
+        }
+      }, provisionRegistries);
+      const provisioned = await provisionDone.finally(() => {
+        // Also clear a setup rejected by trackEpochSetup before its action entered.
+        if (this.provisionAbort === provisionAbort) {
+          this.provisionAbort = undefined;
+          this.provisionDeadline = undefined;
+        }
+      });
+      // Tier degradation may return an empty env even after unknown native startup.
+      if (!provisionClean) throw new TrustedExecutionRefusal("provision cleanup unconfirmed");
       provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
       this.assertCaptureAdmission(setupRevision);
       let installDeps = this.deps.installDeps;
@@ -4056,6 +4196,7 @@ export class CodexExecutor implements Executor {
       // added. Joining and epoch mutation still wait for exclusive ownership.
       summaryState.closed = true;
       this.summaryLifecycleClosed = true;
+      this.provisionAbort?.abort();
       this.intentFlight?.ctrl.abort();
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
       await this.withCaptureOwnership(async () => {
@@ -5745,17 +5886,29 @@ async function launchRegisteredEffectRoot(
 ): Promise<RegisteredEffectRoot> {
   const reservation = registry.reserveLaunch(kind);
   if (reservation.kind !== "reserved") throw new TrustedExecutionRefusal(`${kind} launch admission is closed`);
+  const deadlineAt = Date.now() + deadlineMs;
+  const remaining = () => Math.max(0, deadlineAt - Date.now());
   let handle: CodexRootHandle;
   try {
-    handle = await launch(spec, deadlineMs);
+    handle = await launch(spec, remaining());
   } catch (error) {
+    const classification = classifyCodexLaunchFailure(error);
+    // Only production launch classifications prove no spawn; injected error fields do not.
+    if (classification !== "profile_quarantine" && !classification.startsWith("spawn_")) {
+      registry.markLaunchCleanupUnconfirmed();
+    }
     registry.cancelReservation(reservation.reservation);
     throw error;
   }
   const root = registeredRoot(handle, kind, log);
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
-    await boundedCommandWait(root.dispose(deadlineMs), deadlineMs).catch(() => undefined);
+    registry.retainRejectedRoot(reservation.reservation, root);
+    const reaped = await registry.reapRoot(root, remaining()).catch(() => undefined);
+    if (!reaped?.ok) registry.markLaunchCleanupUnconfirmed();
+    await registry.disposeTools(remaining()).then(outcome => {
+      if (outcome.kind !== "disposed") registry.markLaunchCleanupUnconfirmed();
+    }, () => { registry.markLaunchCleanupUnconfirmed(); });
     throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
