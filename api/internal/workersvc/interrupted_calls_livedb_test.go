@@ -158,7 +158,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 	result := func(id any) any {
 		return map[string]any{"tool_use_id": id, "content": "synthetic interruption", "is_error": true}
 	}
-	read := func(n int, p int64) apitypes.InterruptedCallsResponse {
+	read := func(t *testing.T, n int, p int64) apitypes.InterruptedCallsResponse {
 		t.Helper()
 		raw, err := svc.InterruptedCalls(e.ctx, w, run, "nonce", 4)
 		if err != nil {
@@ -176,14 +176,14 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		}
 		return out
 	}
-	t.Run("empty authorized", func(t *testing.T) { clear(); read(0, 0) })
+	t.Run("empty authorized", func(t *testing.T) { clear(); read(t, 0, 0) })
 	t.Run("selected unmatched completed late synthetic", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo a"), "lead", nil, 1)
 		add(2, "tool_use", use("b", "echo b"), "lead", nil, 2)
-		read(1, 2)
+		read(t, 1, 2)
 		add(3, "tool_result", result("b"), "lead", nil, 2)
-		read(0, 2)
+		read(t, 0, 2)
 	})
 	t.Run("tool-less skip NULL current future excluded", func(t *testing.T) {
 		clear()
@@ -192,28 +192,28 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		add(3, "tool_use", use("b", "echo b"), "lead", nil, nil)
 		add(4, "tool_use", use("c", "echo c"), "lead", nil, 4)
 		add(5, "tool_use", use("d", "echo d"), "lead", nil, 5)
-		read(1, 1)
+		read(t, 1, 1)
 	})
 	t.Run("other-generation results do not settle", func(t *testing.T) {
 		clear()
 		add(1, "tool_result", result("same"), "lead", nil, 2)
 		add(2, "tool_use", use("same", "echo candidate"), "lead", nil, 3)
 		add(3, "tool_result", result("same"), "lead", nil, 4)
-		read(1, 3)
+		read(t, 1, 3)
 		add(4, "tool_result", result("same"), "lead", nil, 3)
-		read(0, 3)
+		read(t, 0, 3)
 	})
 	t.Run("newer results-only generation does not fall back", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("old", "echo old"), "lead", nil, 1)
 		add(2, "tool_result", result("unrelated"), "lead", nil, 3)
-		read(0, 3)
+		read(t, 0, 3)
 	})
 	t.Run("newer tool bearing malformed no fallback", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo a"), "lead", nil, 1)
 		add(2, "tool_use", use(123, "echo b"), "lead", nil, 3)
-		if out := read(0, 3); !out.Unavailable {
+		if out := read(t, 0, 3); !out.Unavailable {
 			t.Fatal(out)
 		}
 	})
@@ -221,17 +221,17 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		for _, cmd := range []any{123, map[string]any{"command": "echo"}, strings.Repeat("x", 2049), strings.Repeat("界", 2048)} {
 			clear()
 			add(1, "tool_use", use("a", cmd), "lead", nil, 3)
-			read(0, 3)
+			read(t, 0, 3)
 		}
 		clear()
 		add(1, "tool_use", use("a", strings.Repeat("x", 2048)), "lead", nil, 3)
-		read(1, 3)
+		read(t, 1, 3)
 	})
 	t.Run("oversized distinct attribution never settles through projection", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("same", "echo candidate"), strings.Repeat("a", 129), "dispatch", 3)
 		add(2, "tool_result", result("same"), strings.Repeat("b", 129), "dispatch", 3)
-		if out := read(0, 3); !out.Unavailable {
+		if out := read(t, 0, 3); !out.Unavailable {
 			t.Fatal(out)
 		}
 	})
@@ -239,7 +239,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo accepted"), "lead", nil, 3)
 		e.exec(t, "UPDATE run_messages SET agent_label=$2 WHERE run_id=$1", run, strings.Repeat("界", 129))
-		out := read(1, 3)
+		out := read(t, 1, 3)
 		entry := out.Entries[0]
 		if entry.AgentLabel != nil || !entry.DisplayOmitted || entry.Command != "echo accepted" || out.Unavailable {
 			t.Fatal(out)
@@ -251,7 +251,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		for seq := 1; seq <= 5; seq++ {
 			add(seq, "tool_use", use(string(rune('a'+seq)), command), "lead", nil, 3)
 		}
-		out := read(1, 3)
+		out := read(t, 1, 3)
 		raw, err := json.Marshal(out)
 		if err != nil || len(raw)+1 > 16*1024 || !out.Truncated || out.Entries[0].Seq != 5 || out.Entries[0].Command != command {
 			t.Fatalf("wire budget: %s, %v", raw, err)
@@ -264,7 +264,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		}
 		add(6, "tool_result", result("e"), "lead", nil, 3)
 		add(7, "tool_result", result("f"), "lead", nil, 3)
-		out := read(3, 3)
+		out := read(t, 3, 3)
 		if out.Entries[0].Seq != 3 || out.Entries[2].Seq != 1 {
 			t.Fatal(out)
 		}
@@ -274,18 +274,18 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		// A source crossing the SQL boundary must disappear in full, not leak a token prefix.
 		secret := "glpat-" + "abcdefghijklmnopqrst"
 		add(1, "tool_use", use("oversized", strings.Repeat("x", 2040)+secret), "lead", nil, 3)
-		if out := read(0, 3); !out.Unavailable || !out.Truncated {
+		if out := read(t, 0, 3); !out.Unavailable || !out.Truncated {
 			t.Fatal(out)
 		}
 		clear()
 		add(1, "tool_use", use("marker", "echo [REDACTED]"), "lead", nil, 3)
-		if out := read(1, 3); out.Entries[0].Command != "echo [REDACTED]" {
+		if out := read(t, 1, 3); out.Entries[0].Command != "echo [REDACTED]" {
 			t.Fatal(out)
 		}
 		clear()
 		add(1, "tool_use", use("sanitized", "echo "+secret), "reviewer\u202e", "dispatch", 3)
 		e.exec(t, "UPDATE run_messages SET agent_label=$2 WHERE run_id=$1", run, "label\x1b[31m\u202e "+secret)
-		out := read(1, 3)
+		out := read(t, 1, 3)
 		entry := out.Entries[0]
 		if strings.Contains(entry.Command, "abcdefghijklmnopqrst") || entry.Agent != "reviewer" || entry.AgentLabel == nil || strings.ContainsAny(*entry.AgentLabel, "\x1b\u202e") || strings.Contains(*entry.AgentLabel, "abcdefghijklmnopqrst") {
 			t.Fatal(out)
@@ -299,7 +299,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			if id == strings.Repeat("界", 341)+"x" {
 				want = 1
 			}
-			out := read(want, 3)
+			out := read(t, want, 3)
 			if want == 0 && !out.Unavailable {
 				t.Fatal(out)
 			}
@@ -311,7 +311,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		other := e.seedActiveRunOwnedBy(t, wid)
 		raw, _ := json.Marshal(result("same"))
 		e.exec(t, "INSERT INTO run_messages(run_id,seq,kind,payload,agent,claim_generation) VALUES($1,1,'tool_result',$2,'lead',3)", other, raw)
-		read(1, 3)
+		read(t, 1, 3)
 	})
 	t.Run("full key byte boundaries", func(t *testing.T) {
 		for _, n := range []int{129, 1024, 1025} {
@@ -322,42 +322,42 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			if n > 1024 {
 				want = 0
 			}
-			read(want, 3)
+			read(t, want, 3)
 			add(2, "tool_result", result(id), "lead", nil, 3)
-			read(0, 3)
+			read(t, 0, 3)
 		}
 	})
 	t.Run("duplicates and result before use", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo"), "lead", nil, 3)
 		add(2, "tool_use", use("a", 12), "lead", nil, 3)
-		read(0, 3)
+		read(t, 0, 3)
 		clear()
 		add(1, "tool_result", result("a"), "lead", nil, 3)
 		add(2, "tool_use", use("a", "echo"), "lead", nil, 3)
-		read(0, 3)
+		read(t, 0, 3)
 	})
 	t.Run("persisted instances and malformed null lanes", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo"), "reviewer", "dispatch-a", 3)
 		add(2, "tool_result", result("a"), "reviewer", "dispatch-b", 3)
-		read(1, 3)
+		read(t, 1, 3)
 		clear()
 		add(1, "tool_use", use("a", "echo"), "reviewer", "dispatch-a", 3)
 		add(3, "tool_result", result("a"), "lead", "dispatch-a", 3)
-		if out := read(0, 3); !out.Unavailable {
+		if out := read(t, 0, 3); !out.Unavailable {
 			t.Fatal(out)
 		}
 		clear()
 		add(1, "tool_use", use("a", "echo"), "lead", nil, 3)
 		add(2, "tool_result", result("a"), "reviewer", nil, 3)
-		read(1, 3)
+		read(t, 1, 3)
 		clear()
 		add(1, "tool_use", use("a", "echo"), "lead", "", 3)
-		read(0, 3)
+		read(t, 0, 3)
 		clear()
 		add(1, "tool_use", use("a", "echo"), "lead", strings.Repeat("x", 128), 3)
-		read(0, 3)
+		read(t, 0, 3)
 	})
 	t.Run("ingestion ceiling loses pairing authority", func(t *testing.T) {
 		clear()
@@ -380,7 +380,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			t.Fatalf("unexpected persisted instance %q", instance)
 		}
 		e.exec(t, "UPDATE runs SET claim_generation=4 WHERE id=$1", run)
-		if out := read(0, 3); !out.Unavailable {
+		if out := read(t, 0, 3); !out.Unavailable {
 			t.Fatal(out)
 		}
 	})
@@ -389,7 +389,7 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 			clear()
 			add(1, "tool_use", use("old", "echo"), "lead", nil, 1)
 			e.exec(t, "INSERT INTO run_messages(run_id,seq,kind,payload,agent,claim_generation) SELECT $1,s,$2,'{}'::jsonb,'reviewer',4 FROM generate_series(2,257) s", run, kind)
-			if out := read(0, 0); out.InspectedCount != 256 {
+			if out := read(t, 0, 0); out.InspectedCount != 256 {
 				t.Fatal(out)
 			}
 		}
