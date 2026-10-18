@@ -18,9 +18,11 @@ import {
   CodexUnsupportedProfileError,
   CodexLaunchError,
   classifyCodexLaunchFailure,
+  hasVerifiedStartupCleanup,
   TMP_RETAINED_REASONS,
   launchCodexRoot,
   launchCodexEffectRoot,
+  launchCodexProvisionRoot,
   type CodexLaunchSpec,
   type CodexEffectLaunchSpec,
   type LauncherDeps,
@@ -44,6 +46,8 @@ import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
 import { createCaptureContext, captureGitSpawner, validateCaptureGitRequest, assertCaptureRequest } from "../src/credential-free-capture.js";
 import { gitEnv } from "../src/git.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
+
+import { prepareSupervisedProvision, buildProvisionEnv, type SupervisedProvisionRequest } from "../src/provision.js";
 
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 
@@ -2337,4 +2341,113 @@ describe("C2 real effect launcher capture policy", () => {
       });
     }
   }
+});
+
+describe("fixed supervised devbox provisioning seam", () => {
+  const input = { runDir: "/data/provision/run", homeDir: "/data/provision/home" };
+  const source = { UZI_UID_SPLIT: "1", UZI_RUNNER_PATH: "/nix/bin:/usr/bin:/bin", UZI_RUNNER_TMPDIR: "/tmp/runner", SSL_CERT_FILE: "/cert.pem" };
+  function request(args: string[], guard: () => void = () => {}, controller = new AbortController()) {
+    return prepareSupervisedProvision("devbox", args, { cwd: input.runDir, env: buildProvisionEnv(source, input.homeDir) }, input, source, controller.signal, guard);
+  }
+
+  for (const args of [["install"], ["shellenv", "--no-refresh-alias"]]) {
+    it(`executes canonical ${args.join(" ")} with early output and full disposal`, async () => {
+      const fake = newFake({ autoStarted: false });
+      const req = request(args);
+      const launching = launchCodexProvisionRoot(req, baseDeps(fake));
+      fake.stdout.write('export PATH="/nix/tools:$PATH";\n');
+      fake.stderr.write("diagnostic before started");
+      fake.writeEvidence({ event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1,
+        subreaper: true, nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true });
+      const root = await launching;
+      assert.equal(spawnCalls.length, 1);
+      const call = spawnCalls[0]!;
+      assert.deepEqual(call, {
+        command: "/bin/setpriv",
+        args: [...setprivRunnerArgs(), SUPERVISOR_BIN, "--expect-uid", "10002", "--", "/usr/bin/env", "devbox", ...args],
+        options: { cwd: input.runDir, env: buildProvisionEnv(source, input.homeDir), stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] },
+      });
+      assert.equal(req.timeoutMs, 600000);
+      assert.deepEqual(root.transport, { stdin: null, stdout: null, stderr: null });
+      assert.throws(() => root.output(), /full disposal/);
+      fake.emitChildExit(0);
+      assert.equal((await root.waitChild(100)).code, 0);
+      assert.throws(() => root.output(), /full disposal/);
+      assert.equal((await root.dispose(1000)).clean, true);
+      assert.deepEqual(root.output(), { stdout: 'export PATH="/nix/tools:$PATH";\n', stderr: "diagnostic before started" });
+    });
+  }
+
+  for (const channel of ["stdout", "stderr"] as const) {
+    it(`bounds ${channel} before started and continues draining through disposal`, async () => {
+      const fake = newFake({ autoStarted: false });
+      const launching = launchCodexProvisionRoot(request(["install"]), baseDeps(fake));
+      fake[channel].write(Buffer.alloc(8 * 1024 * 1024 + 1, 120));
+      fake[channel].write("further bytes are drained without retention");
+      fake.writeEvidence({ event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1,
+        subreaper: true, nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true });
+      const root = await launching;
+      assert.match((await root.whenOutputFailed).message, /output limit/);
+      assert.equal(root.outputFailure?.message, "devbox output limit exceeded");
+      assert.throws(() => root.output(), /full disposal/);
+      assert.equal((await root.dispose(1000)).clean, true);
+      assert.throws(() => root.output(), /output limit/);
+    });
+  }
+
+  it("keeps text inaccessible after unconfirmed disposal", async () => {
+    const fake = newFake({ disposeState: "unconfirmed" });
+    const root = await launchCodexProvisionRoot(request(["install"]), baseDeps(fake));
+    fake.stdout.write("private output");
+    fake.emitChildExit(0);
+    await root.waitChild(100);
+    assert.equal((await root.dispose(50)).clean, false);
+    assert.throws(() => root.output(), /full disposal/);
+  });
+
+  it("refuses forged requests, cancellation, and a guard closing immediately before spawn", async () => {
+    const fake = newFake();
+    const req = request(["install"]);
+    await assert.rejects(launchCodexProvisionRoot({ ...req } as SupervisedProvisionRequest, baseDeps(fake)));
+    const controller = new AbortController();
+    const cancelled = request(["install"], () => {}, controller);
+    controller.abort();
+    await assert.rejects(launchCodexProvisionRoot(cancelled, baseDeps(fake)));
+    let checks = 0;
+    const closing = request(["install"], () => { if (++checks === 3) throw new Error("admission closed"); });
+    await assert.rejects(launchCodexProvisionRoot(closing, baseDeps(fake)));
+    assert.equal(checks, 3);
+    assert.equal(spawnCalls.length, 0);
+  });
+});
+
+it("devbox startup failure retains native authorization proof and refuses replay", async () => {
+  const input = { runDir: "/data/provision/run", homeDir: "/data/provision/home" };
+  const source = { PATH: "/usr/bin:/bin" };
+  const request = prepareSupervisedProvision("devbox", ["install"], {
+    cwd: input.runDir, env: buildProvisionEnv(source, input.homeDir),
+  }, input, source, new AbortController().signal, () => {});
+  const fake = newFake({ autoStarted: false });
+  const authorization = { attempt: {}, hardDeadlineAt: Date.now() + 2000 };
+  let fire!: () => void;
+  const launching = launchCodexProvisionRoot(request, baseDeps(fake, {
+    startupCleanup: authorization,
+    armStartedDeadlineForTest: (callback) => { fire = callback; return () => {}; },
+  }));
+  fake.stdout.write("private startup text");
+  fire();
+  // The existing startup cleanup owner can accept delayed started evidence and drain.
+  fake.writeEvidence({ event: "started", supervisorPid: fake.pid, childPid: fake.pid + 1,
+    subreaper: true, nondumpable: true, uid: RUNNER_UID, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true });
+  await assert.rejects(launching, (error: unknown) => {
+    assert.ok(error instanceof CodexLaunchError);
+    assert.equal(error.cleanupStatus, "verified");
+    assert.equal(hasVerifiedStartupCleanup(error, authorization), true);
+    assert.equal(hasVerifiedStartupCleanup({ ...error }, authorization), false);
+    assert.doesNotMatch(error.message, /private startup text/);
+    return true;
+  });
+  const count = spawnCalls.length;
+  await assert.rejects(launchCodexProvisionRoot(request, baseDeps(newFake(), { startupCleanup: authorization })));
+  assert.equal(spawnCalls.length, count);
 });

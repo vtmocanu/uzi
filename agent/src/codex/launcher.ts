@@ -63,6 +63,7 @@ import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli
 import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { assertCaptureLaunch } from "../credential-free-capture.js";
 import { assertSupervisedInstallRequest, type SupervisedInstallRequest } from "../js-deps.js";
+import { assertSupervisedProvisionRequest, type SupervisedProvisionRequest, type RunResult } from "../provision.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -1046,8 +1047,17 @@ export async function launchCodexInstallerRoot(
   request: SupervisedInstallRequest,
   deps: LauncherDeps = {},
 ): Promise<CodexRootHandle> {
+  return launchSetupRoot(request, deps, () => assertSupervisedInstallRequest(request));
+}
+
+async function launchSetupRoot(
+  request: SupervisedInstallRequest | SupervisedProvisionRequest,
+  deps: LauncherDeps,
+  validate: () => void,
+  collect?: (child: SupervisorProcess) => void,
+): Promise<CodexRootHandle> {
   try {
-    assertSupervisedInstallRequest(request);
+    validate();
     if (!uidSplitActive(deps.env ?? process.env)) {
       throw new CodexUnsupportedProfileError("Codex installer roots require the A1 uid split; refusing to launch");
     }
@@ -1069,7 +1079,7 @@ export async function launchCodexInstallerRoot(
     }
     // Ordinary trusted worker setup, not the credential-free Git capture exception.
     // Repeat the actual request and current-epoch guard immediately at the spawn seam.
-    assertSupervisedInstallRequest(request);
+    validate();
     let child: SupervisorProcess;
     try {
       child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
@@ -1082,12 +1092,15 @@ export async function launchCodexInstallerRoot(
       launchClassifications.set(error, error.classification);
       throw error;
     }
-    // Installer output has never been a logging surface. Drain without decoding or
-    // collecting bytes, including failed startup; stdin stays EOF as with stdio:ignore.
+    // Attach devbox collectors before startup evidence can flow. JS installers
+    // retain discard mode, including failed startup; stdin stays EOF.
+    if (collect) collect(child);
+    else {
+      child.stdout?.resume();
+      child.stderr?.resume();
+    }
     child.stdin?.on("error", () => undefined);
     child.stdin?.end();
-    child.stdout?.resume();
-    child.stderr?.resume();
     const unregister = registerWorkerRunnerRoot(child.pid, deps.rootStartTime);
     child.once("exit", () => unregister());
     child.once("error", () => unregister());
@@ -1099,6 +1112,68 @@ export async function launchCodexInstallerRoot(
     launchClassifications.set(error, error.classification);
     throw error;
   }
+}
+
+/** Devbox output is available only after this owner confirms whole-root disposal.
+ * The future executor adapter owns cancellation, the canonical request deadline,
+ * and registration; primary exit alone never opens the output boundary.
+ */
+export interface CodexProvisionRootHandle extends CodexRootHandle {
+  output(): RunResult;
+  readonly outputFailure: Error | undefined;
+  readonly whenOutputFailed: Promise<Error>;
+}
+
+export async function launchCodexProvisionRoot(
+  request: SupervisedProvisionRequest,
+  deps: LauncherDeps = {},
+): Promise<CodexProvisionRootHandle> {
+  const buffers = [Buffer.alloc(8 * 1024 * 1024), Buffer.alloc(8 * 1024 * 1024)];
+  const sizes = [0, 0];
+  let outputFailure: Error | undefined;
+  let reportFailure!: (error: Error) => void;
+  const whenOutputFailed = new Promise<Error>((resolve) => { reportFailure = resolve; });
+  const failOutput = (message: string) => {
+    if (outputFailure) return;
+    outputFailure = new Error(message);
+    reportFailure(outputFailure);
+  };
+  const root = await launchSetupRoot(request, deps, () => assertSupervisedProvisionRequest(request), (child) => {
+    for (const [index, stream] of [child.stdout, child.stderr].entries()) {
+      if (!stream) { failOutput("devbox output channel unavailable"); continue; }
+      stream.on("data", (chunk: Buffer | string) => {
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        const available = 8 * 1024 * 1024 - sizes[index]!;
+        if (available > 0) {
+          const length = Math.min(bytes.length, available);
+          bytes.copy(buffers[index]!, sizes[index]!, 0, length);
+          sizes[index]! += length;
+        }
+        if (bytes.length > available) failOutput("devbox output limit exceeded");
+      });
+      stream.on("error", () => failOutput("devbox output channel failed"));
+    }
+  });
+  let clean = false;
+  return {
+    ...root,
+    get failed() { return root.failed; },
+    get outputFailure() { return outputFailure; },
+    // The native owner keeps the actual channels for disposal; callers receive text
+    // through output only, so attaching a second raw reader cannot bypass the bound.
+    transport: { stdin: null, stdout: null, stderr: null },
+    whenOutputFailed,
+    dispose: async (timeoutMs) => {
+      const outcome = await root.dispose(timeoutMs);
+      clean ||= outcome.clean;
+      return outcome;
+    },
+    output: () => {
+      if (!clean) throw new Error("devbox output requires confirmed full disposal");
+      if (outputFailure) throw outputFailure;
+      return { stdout: buffers[0]!.toString("utf8", 0, sizes[0]), stderr: buffers[1]!.toString("utf8", 0, sizes[1]) };
+    },
+  };
 }
 
 /** A generic supervised effect launch. Unlike {@link launchCodexRoot}, it creates

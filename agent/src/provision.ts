@@ -79,6 +79,95 @@ export interface RunResult {
   stderr: string;
 }
 
+declare const supervisedProvisionBrand: unique symbol;
+
+/** Fixed devbox setup input; preparation provenance is checked again at native spawn. */
+export interface SupervisedProvisionRequest {
+  readonly [supervisedProvisionBrand]: true;
+  readonly command: "/usr/bin/env";
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<NodeJS.ProcessEnv>;
+  readonly timeoutMs: number;
+  readonly signal: AbortSignal;
+}
+
+const supervisedProvisions = new WeakMap<SupervisedProvisionRequest, {
+  readonly cwd: string;
+  readonly homeDir: string;
+  readonly source: Readonly<NodeJS.ProcessEnv>;
+  readonly env: Readonly<NodeJS.ProcessEnv>;
+  readonly args: readonly string[];
+  readonly signal: AbortSignal;
+  readonly beforeSpawn: () => void;
+}>();
+
+/** Worker-selected directory and environment are captured before asynchronous setup. */
+export function prepareSupervisedProvision(
+  command: string,
+  args: readonly string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv },
+  input: Pick<ProvisionInput, "runDir" | "homeDir">,
+  source: NodeJS.ProcessEnv,
+  signal: AbortSignal,
+  beforeSpawn: () => void,
+): SupervisedProvisionRequest {
+  const capturedSource = Object.freeze(buildProvisionEnv(source, input.homeDir));
+  const env = capturedSource;
+  const keys = Object.keys(opts.env);
+  if (command !== "devbox" ||
+    !(args.length === 1 && args[0] === "install" ||
+      args.length === 2 && args[0] === "shellenv" && args[1] === "--no-refresh-alias") ||
+    !path.isAbsolute(input.runDir) || path.resolve(input.runDir) !== input.runDir ||
+    input.runDir.includes("\0") || opts.cwd !== input.runDir ||
+    !path.isAbsolute(input.homeDir) || path.resolve(input.homeDir) !== input.homeDir ||
+    keys.length !== Object.keys(env).length ||
+    !keys.every((key) => Object.hasOwn(env, key) && opts.env[key] === env[key]) ||
+    Object.values(env).some((value) => typeof value !== "string" || value.includes("\0")) ||
+    !(signal instanceof AbortSignal) || typeof beforeSpawn !== "function") {
+    throw new Error("provision command, directory or environment is not canonical");
+  }
+  const capturedArgs = Object.freeze(["devbox", ...args]);
+  const request = Object.freeze({
+    command: "/usr/bin/env" as const, args: capturedArgs, cwd: input.runDir,
+    env, timeoutMs: 10 * 60_000, signal,
+  }) as SupervisedProvisionRequest;
+  supervisedProvisions.set(request, {
+    cwd: input.runDir, homeDir: input.homeDir, source: capturedSource,
+    env, args: capturedArgs, signal, beforeSpawn,
+  });
+  assertSupervisedProvisionRequest(request);
+  return request;
+}
+
+/** No structural lookalike grants authority; repeat the complete check at spawn. */
+export function assertSupervisedProvisionRequest(request: SupervisedProvisionRequest): void {
+  const binding = supervisedProvisions.get(request);
+  if (!binding || !Object.isFrozen(request) || !Object.isFrozen(request.args) ||
+    !Object.isFrozen(request.env) || request.command !== "/usr/bin/env" ||
+    request.cwd !== binding.cwd || request.env !== binding.env ||
+    request.args !== binding.args || request.timeoutMs !== 10 * 60_000 ||
+    request.signal !== binding.signal ||
+    !(request.args.length === 2 && request.args[0] === "devbox" && request.args[1] === "install" ||
+      request.args.length === 3 && request.args[0] === "devbox" &&
+      request.args[1] === "shellenv" && request.args[2] === "--no-refresh-alias")) {
+    throw new Error("provision request has no canonical preparation provenance");
+  }
+  const canonicalEnv = buildProvisionEnv(binding.source, binding.homeDir);
+  if (!path.isAbsolute(request.cwd) || path.resolve(request.cwd) !== request.cwd ||
+    request.cwd.includes("\0") || !path.isAbsolute(binding.homeDir) ||
+    path.resolve(binding.homeDir) !== binding.homeDir ||
+    Object.keys(request.env).length !== Object.keys(canonicalEnv).length ||
+    !Object.keys(request.env).every((key) => Object.hasOwn(canonicalEnv, key) &&
+      typeof request.env[key] === "string" && !request.env[key]!.includes("\0") &&
+      request.env[key] === canonicalEnv[key])) {
+    throw new Error("provision request is not canonical");
+  }
+  binding.signal.throwIfAborted();
+  if (binding.beforeSpawn() !== undefined) throw new Error("provision launch guard must be synchronous");
+  binding.signal.throwIfAborted();
+}
+
 export interface ProvisionDeps {
   log: Logger;
   /** Runs a provisioning command. Injected so unit tests never touch real
