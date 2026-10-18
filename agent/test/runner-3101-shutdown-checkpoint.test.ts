@@ -83,69 +83,93 @@ it("#3101 actual Runner late admission inherits the original deadline across rep
   }
 });
 
-it("#3101 shutdown checkpoint preserves newer C and dirty work with a genuinely absent installer promise", async () => {
-  client.protocolFeatures = ["run_checkpoint_durability"];
-  const iid = 310102;
-  const proof = shutdownContentProof(fx, client, iid);
-  const started = deferred();
-  let rig: CodexRig | undefined;
-  let context: RunContext | undefined;
-  const executor: Executor = {
-    run: async (ctx) => {
-      context = ctx;
-      assert.ok(ctx.signal, "Runner supplies its genuine run signal");
-      assert.ok(ctx.terminalLifecycleSignal, "Runner supplies its terminal lifecycle signal");
-      // The provider alone is fake; registry, lifecycle, safety and installer reconcile
-      // are real. No promise/result is populated on this shared production factory.
-      rig = codexRig({
-        lifecycleSignal: AbortSignal.any([ctx.signal, ctx.terminalLifecycleSignal]),
-      });
-      executor.safety = rig.safety;
-      assert.equal(rig.installer.promise, undefined);
-      await proof.prepare(ctx);
-      started.resolve();
-      try {
-        await new Promise<void>((resolve) => {
-          if (ctx.signal!.aborted) resolve();
-          else ctx.signal!.addEventListener("abort", () => resolve(), { once: true });
+for (const finish of ["none", "seeded", "live"] as const) {
+  it(finish === "none"
+    ? "#3101 shutdown checkpoint preserves newer C and dirty work with a genuinely absent installer promise"
+    : `#3101 ${finish} finish before shutdown preserves newer C and dirty work with a genuinely absent installer promise`, async () => {
+    client.protocolFeatures = ["run_checkpoint_durability"];
+    const iid = finish === "none" ? 310102 : finish === "seeded" ? 310105 : 310106;
+    const proof = shutdownContentProof(fx, client, iid);
+    const started = deferred();
+    let rig: CodexRig | undefined;
+    let context: RunContext | undefined;
+    const executor: Executor = {
+      run: async (ctx) => {
+        context = ctx;
+        assert.ok(ctx.signal, "Runner supplies its genuine run signal");
+        assert.ok(ctx.terminalLifecycleSignal, "Runner supplies its terminal lifecycle signal");
+        // The provider alone is fake; registry, lifecycle, safety and installer reconcile
+        // are real. No promise/result is populated on this shared production factory.
+        rig = codexRig({
+          lifecycleSignal: AbortSignal.any([ctx.signal, ctx.terminalLifecycleSignal]),
         });
-        throw new Error("runner shutdown interrupted provider");
-      } finally {
-        await rig.installer.settle();
+        executor.safety = rig.safety;
         assert.equal(rig.installer.promise, undefined);
+        await proof.prepare(ctx);
+        started.resolve();
+        try {
+          await new Promise<void>((resolve) => {
+            if (ctx.signal!.aborted) resolve();
+            else ctx.signal!.addEventListener("abort", () => resolve(), { once: true });
+          });
+          throw new Error("runner shutdown interrupted provider");
+        } finally {
+          await rig.installer.settle();
+          assert.equal(rig.installer.promise, undefined);
+        }
+      },
+    };
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      github,
+      checkpointIntervalMs: 1,
+      checkpointTickIntervalMs: 0,
+      codexBoundaryDeadlineMs: 60_000,
+      shutdownPublishTimeoutMs: 60_000,
+    });
+    const execution = runner.execute(gitlabClaim(iid, {
+      stop_pending: finish === "seeded",
+      repo: {
+        id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
+        forge_type: "github", default_branch: "main",
+      },
+    }));
+    try {
+      await Promise.race([
+        started.promise,
+        execution.then(() => { throw new Error("run ended before shutdown readiness"); }),
+      ]);
+      const active = (runner as unknown as { activeRuns: Map<string, {
+        steering: SteeringChannel;
+        gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint;
+      }> }).activeRuns.get(context!.runId);
+      assert.ok(active);
+      if (finish === "live") {
+        // Deliver through SteeringChannel's existing input routing seam. The runner's
+        // original poller remains the only poller; no sticky field is manufactured.
+        (active.steering as unknown as {
+          route(kind: string, body: undefined, id: number): void;
+        }).route("stop", undefined, 310106);
       }
-    },
-  };
-  const { gitlab } = fakeGitlab();
-  const { github } = fakeGitHub();
-  const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
-    github,
-    checkpointIntervalMs: 1,
-    checkpointTickIntervalMs: 0,
-    codexBoundaryDeadlineMs: 60_000,
-    shutdownPublishTimeoutMs: 60_000,
+      if (finish !== "none") {
+        assert.deepEqual(await active.steering.awaitFollowUp(10_000),
+          { kind: "ended", reason: "stopped" });
+        assert.equal(context!.signal!.aborted, false, "finish leaves the current provider turn alive");
+        assert.equal(context!.terminalLifecycleSignal!.aborted, false);
+      }
+      runner.shutdown();
+      await execution;
+      assert.equal(context!.signal!.aborted, true);
+      assert.equal(context!.terminalLifecycleSignal!.aborted, true);
+      assert.ok(rig!.boundaries.includes("shutdown"));
+      await proof.verify(git);
+      assert.equal(active.gracefulShutdownCheckpoint!.stopSignal.aborted, false);
+      assert.deepEqual(rig!.disposeBoundaries, ["terminal"]);
+    } finally {
+      runner.shutdown();
+      await execution;
+      proof.cleanup();
+    }
   });
-  const execution = runner.execute(gitlabClaim(iid, {
-    repo: {
-      id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
-      forge_type: "github", default_branch: "main",
-    },
-  }));
-  try {
-    await Promise.race([
-      started.promise,
-      execution.then(() => { throw new Error("run ended before shutdown readiness"); }),
-    ]);
-    runner.shutdown();
-    await execution;
-    assert.equal(context!.signal!.aborted, true);
-    assert.equal(context!.terminalLifecycleSignal!.aborted, true);
-    assert.ok(rig!.boundaries.includes("shutdown"));
-    await proof.verify(git);
-    assert.deepEqual(rig!.disposeBoundaries, ["terminal"]);
-  } finally {
-    runner.shutdown();
-    await execution;
-    proof.cleanup();
-  }
-});
+}

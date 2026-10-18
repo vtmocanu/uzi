@@ -409,8 +409,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     deadlineAt: number,
   ): Promise<T> {
     const boundaryAbort = new AbortController();
-    const stopSignal = request.gracefulShutdownCheckpoint?.stopSignal;
-    const maintenanceSignal = MaintenanceBudget.signal();
+    const cause = request.gracefulShutdownCheckpoint;
+    const stopSignal = cause?.stopSignal;
+    const maintenanceSignal = cause ? MaintenanceBudget.signal() : undefined;
     const boundarySignal = AbortSignal.any([boundaryAbort.signal,
       ...[stopSignal, maintenanceSignal].filter((s): s is AbortSignal => s !== undefined)]);
     const requireAuthority = (stage: "reconcile" | "quiesce" | "reap" | "action"): void => {
@@ -428,7 +429,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // propagates it through finalize/recovery forge + worker HTTP, retry backoff and
     // message drain, while permit-owned processes consume the shrinking budget.
     requireAuthority("reconcile");
-    const atEntry = Math.min(remainingMs(deadlineAt), MaintenanceBudget.current()?.remainingMs() ?? Infinity);
+    const atEntry = Math.min(remainingMs(deadlineAt),
+      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity);
     if (atEntry <= 0) {
       const errors: readonly HarnessError[] = [{ category: "timeout", message: "codex boundary expired in the acquisition queue" }];
       this.registry.poison(errors);
@@ -444,7 +446,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
       requireAuthority(stage);
       if (!boundarySignal.aborted && remainingMs(deadlineAt) > 0 &&
-          (MaintenanceBudget.current()?.remainingMs() ?? Infinity) > 0) return;
+          (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) > 0) return;
       const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
       this.registry.poison(errors);
       throw new CodexBoundaryError(stage, errors, undefined, undefined, where);

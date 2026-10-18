@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { WorkerClient } from "../src/client.js";
-import { createRunLaneInstallerReconcile } from "../src/codex/codex-executor.js";
+import { buildRunLaneReconcile, createRunLaneInstallerReconcile } from "../src/codex/codex-executor.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import { createCodexExecutionSafety, CodexBoundaryError } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
@@ -220,6 +220,26 @@ describe("M1 shutdown checkpoint authority", () => {
     }
   });
 
+  for (const delivery of ["seeded", "live"] as const) {
+    it(`${delivery} graceful finish before shutdown preserves checkpoint authority`, async () => {
+      const { ch, cancel } = channel();
+      if (delivery === "seeded") ch.seedStopRequested();
+      else {
+        // Use the existing input routing seam without starting another poller.
+        (ch as unknown as { route(kind: string, body: undefined, id: number): void })
+          .route("stop", undefined, 3101);
+      }
+      assert.deepEqual(await ch.awaitFollowUp(10_000), { kind: "ended", reason: "stopped" });
+      assert.equal(cancel.signal.aborted, false, "finish lets the current turn complete");
+      assert.equal(ch.lifecycleSignal().aborted, false);
+      const cause = ch.workerShutdown(Date.now() + 10_000);
+      assert.equal(cancel.signal.aborted, true);
+      assert.equal(ch.lifecycleSignal().aborted, true);
+      assert.equal(ch.terminalLifecycleSignal().aborted, true);
+      assert.equal(cause.stopSignal.aborted, false);
+    });
+  }
+
   it("spends execution signals once and retains the first immutable deadline", () => {
     const { ch, cancel } = channel();
     const cause = ch.workerShutdown(100);
@@ -356,6 +376,32 @@ describe("M1 shutdown checkpoint authority", () => {
     await installer.settle();
   });
 
+  for (const obstacle of ["aborted lifecycle", "installer timeout"] as const) {
+    it(`unmarked ${obstacle} retains the original installer protocol refusal`, async () => {
+      const lifecycle = new AbortController();
+      const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+        runId: "run-shutdown", binding: binding("api_key"),
+        registerToken: () => assert.fail("no registration"),
+        client: { releaseCodex: async () => assert.fail("no release") } as never,
+      });
+      let finish!: () => void;
+      installer.promise = new Promise(resolve => {
+        finish = () => resolve({ results: [], truncated: false });
+      });
+      if (obstacle === "aborted lifecycle") lifecycle.abort();
+      // A real outstanding installer at a spent operation deadline, not a spent lifecycle.
+      try {
+        assert.deepEqual(await installer.reconcile({
+          boundary: "shutdown", deadlineMs: obstacle === "installer timeout" ? 0 : 10_000,
+        }, new AbortController().signal), {
+          kind: "blocked", errors: [{
+            category: "protocol", message: "codex dependency install did not settle before reconcile",
+          }],
+        });
+      } finally { finish(); await installer.settle(); }
+    });
+  }
+
   it("safety consumes the cause deadline before credential acquisition", async () => {
     const { ch } = channel();
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -374,6 +420,155 @@ describe("M1 shutdown checkpoint authority", () => {
     await assert.rejects(safety.withBoundary(marked, async () => assert.fail("no sink")),
       (error: unknown) => error instanceof CodexBoundaryError && error.errors[0]?.category === "authorization");
   });
+
+  it("unmarked safety ignores new budget entry gating after the existing queue guard passed", async t => {
+    let now = 100;
+    const budget = new MaintenanceBudget(10_000, () => now);
+    const waitFor = MaintenanceBudget.waitFor.bind(MaintenanceBudget);
+    let queuePassed = false;
+    t.mock.method(MaintenanceBudget, "waitFor", async <T>(pending: Promise<T>): Promise<T> => {
+      const value = await waitFor(pending);
+      queuePassed = true;
+      now = 10_101;
+      assert.throws(() => budget.check(), /maintenance deadline exhausted/);
+      return value;
+    });
+    let reconciles = 0;
+    const safety = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(1)),
+      async () => assert.fail("no spawn"), async (_request, signal) => {
+        assert.equal(queuePassed, true);
+        assert.equal(signal.aborted, false);
+        reconciles++;
+        return { kind: "ready" };
+      });
+    try {
+      await MaintenanceBudget.run(budget, async () => {
+        assert.equal(await safety.withBoundary({ boundary: "shutdown", deadlineMs: 10_000 },
+          async permit => {
+            assert.equal(permit.signal.aborted, false);
+            return "published";
+          }), "published");
+      });
+      assert.equal(reconciles, 1);
+    } finally {
+      budget.dispose();
+      await safety.dispose({ boundary: "terminal", deadlineMs: 100 });
+    }
+  });
+
+  for (const marked of [false, true]) {
+    for (const phase of ["reconcile", "permit action"] as const) {
+      it(`${marked ? "marked" : "unmarked"} safety budget exhaustion during ${phase} scopes the new cancellation gates`, async () => {
+        let now = 100;
+        const budget = new MaintenanceBudget(10_000, () => now);
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+        const expire = () => {
+          now = 10_101;
+          assert.throws(() => budget.check(), /maintenance deadline exhausted/);
+        };
+        let reconciles = 0;
+        let sinks = 0;
+        const safety = createCodexExecutionSafety(registry, async () => assert.fail("no spawn"),
+          async (_request, signal) => {
+            reconciles++;
+            assert.equal(signal.aborted, false, "existing queue wait passed with live budget");
+            if (phase === "reconcile") {
+              expire();
+              assert.equal(signal.aborted, marked);
+            }
+            return { kind: "ready" };
+          });
+        const boundary: BoundaryRequest = marked ? request(channel().ch) :
+          { boundary: "shutdown", deadlineMs: 10_000 };
+        try {
+          await MaintenanceBudget.run(budget, async () => {
+            const pending = safety.withBoundary(boundary, async permit => {
+              sinks++;
+              if (phase === "permit action") expire();
+              assert.equal(permit.signal.aborted, marked);
+              return "published";
+            });
+            if (marked) {
+              await assert.rejects(pending, (error: unknown) =>
+                error instanceof CodexBoundaryError && error.errors.some(e => e.category === "timeout"));
+            } else assert.equal(await pending, "published");
+          });
+          assert.equal(reconciles, 1);
+          assert.equal(sinks, marked && phase === "reconcile" ? 0 : 1);
+          assert.equal(registry.isPoisoned(), marked);
+        } finally {
+          budget.dispose();
+          await safety.dispose({ boundary: "terminal", deadlineMs: 100 });
+        }
+      });
+    }
+  }
+
+  for (const factory of ["installer", "direct"] as const) {
+    for (const authMode of ["api_key", "subscription"] as const) {
+      for (const phase of (factory === "installer"
+        ? ["before acquisition", "installer join", "credential response"] as const
+        : ["before acquisition", "credential response"] as const)) {
+        it(`unmarked ${factory} ${authMode} ignores new ambient budget gates at ${phase}`, async () => {
+          let now = 100;
+          const budget = new MaintenanceBudget(10_000, () => now);
+          const lifecycle = new AbortController();
+          const boundarySignal = new AbortController().signal;
+          const committed = { value: 3 };
+          const tokens: string[] = [];
+          let calls = 0;
+          const expire = () => {
+            now = 10_101;
+            assert.throws(() => budget.check(), /maintenance deadline exhausted/);
+          };
+          const response = (signal: AbortSignal) => {
+            calls++;
+            assert.equal(signal.aborted, false);
+            if (phase === "credential response") expire();
+            assert.equal(signal.aborted, false, "unmarked credential I/O retains its operation signal");
+            return { access_token: "fixture-next", generation: 4 };
+          };
+          const client = {
+            releaseCodex: async (_run: string, _body: unknown, _expected: unknown, signal: AbortSignal) => response(signal),
+            refreshCodex: async (_run: string, _body: unknown, _expected: unknown, signal: AbortSignal) => response(signal),
+          } as never;
+          const registerToken = (token: string) => tokens.push(token);
+          const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+            runId: "run-shutdown", binding: binding(authMode), client, committed, registerToken,
+          });
+          let finish: (() => void) | undefined;
+          if (phase === "installer join") {
+            installer.promise = new Promise(resolve => {
+              finish = () => resolve({ results: [], truncated: false });
+            });
+            // settle has been entered with live authority. Expire at its actual
+            // installer-abort event and settle the owned writer without a real wait.
+            installer.abort.signal.addEventListener("abort", () => {
+              expire();
+              finish!();
+            }, { once: true });
+          }
+          const reconcile = factory === "installer" ? installer.reconcile :
+            buildRunLaneReconcile("run-shutdown", client, binding(authMode), registerToken,
+              committed, undefined, lifecycle.signal);
+          try {
+            await MaintenanceBudget.run(budget, async () => {
+              // Direct API callers have no queue. Exhaust only after entering the live
+              // budget scope; these calls never ask an already-expired queue guard to pass.
+              if (phase === "before acquisition") expire();
+              assert.deepEqual(await reconcile({ boundary: "shutdown", deadlineMs: 10_000 },
+                boundarySignal), { kind: "ready" });
+            });
+            assert.equal(calls, 1);
+            assert.deepEqual(tokens, ["fixture-next"]);
+            assert.equal(committed.value, authMode === "subscription" ? 4 : 3);
+            assert.equal(lifecycle.signal.aborted, false);
+            assert.equal(boundarySignal.aborted, false);
+          } finally { budget.dispose(); finish?.(); await installer.settle(); }
+        });
+      }
+    }
+  }
 
   it("maintenance cancellation reaches reconcile without restoring execution authority", async () => {
     const { ch, cancel } = channel();

@@ -719,8 +719,9 @@ Tracked as GitLab issue vtmocanu/uzi#218; PRD at `prds/done/218-park-resume-work
 - The actual typed graceful-shutdown durability sink may perform one logical bounded
   credential release/refresh while execution remains aborted; reconciliation, proof,
   capture, publication and unwind share the original absolute grace's remaining time,
-  without a control-observation loop or polling. Already-delivered stops, claim fences
-  and credential switches block admission; effective revocation, claim/credential
+  without a control-observation loop or polling. A graceful owner `stop` requests normal
+  finish and leaves shutdown preservation eligible. Already-delivered terminal stops, claim
+  fences and credential switches block admission; effective revocation, claim/credential
   authorization and deadlines remain enforced. Only a late remote owner cancellation
   after successful reconciliation may still permit bounded broker publication for the
   still-bound same claim generation through PRD #1810's terminal route, consistent with

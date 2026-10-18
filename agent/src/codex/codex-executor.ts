@@ -922,15 +922,15 @@ export function createRunLaneInstallerReconcile(
     const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const cancellation = AbortSignal.any([signal, authoritySignal,
-      ...[MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined)]);
+      ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
-      category: authoritySignal.aborted ? "authorization" : "timeout",
-      message: authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
+      category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
+      message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
         : "codex dependency install did not settle before reconcile",
     }] });
     const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
-      MaintenanceBudget.current()?.remainingMs() ?? Infinity));
-    if (cancellation.aborted) return refused();
+      cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
+    if (cause && cancellation.aborted) return refused();
     if (!await settle(deadlineAt, cancellation, remaining)) return refused();
     return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
   };
@@ -980,9 +980,9 @@ export function buildRunLaneReconcile(
     const deadlineAt = Math.min(Date.now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const signal = AbortSignal.any([boundarySignal,
-      ...[authoritySignal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined)]);
+      ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const expired = () => signal.aborted || Date.now() >= deadlineAt ||
-      (MaintenanceBudget.current()?.remainingMs() ?? Infinity) <= 0;
+      (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
       errors: [{ category: "authorization", message: deferral === "refresh_unknown"

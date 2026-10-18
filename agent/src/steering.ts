@@ -1411,7 +1411,7 @@ export class SteeringChannel {
     if (this.shutdownCheckpoint) return this.shutdownCheckpoint;
     if (this.lifecycleEnded || this.terminalLifecycle.signal.aborted || this.cancelled ||
         this.flightEnded || this.pendingSwitchGeneration !== undefined || this.pauseMode === "disk" ||
-        this.stopRequested || (this.cancel.signal.aborted &&
+        (this.cancel.signal.aborted &&
           !(this.cancel.signal.reason instanceof PauseNowSignal))) this.shutdownStop.abort();
     this.shutdownCheckpoint = Object.freeze({ stopSignal: this.shutdownStop.signal, deadlineAt });
     this.cancel.abort();
@@ -1534,7 +1534,6 @@ export class SteeringChannel {
    *  waiting out the idle timeout. Idempotent with a later live `stop` input. */
   seedStopRequested(): void {
     this.stopRequested = true;
-    this.shutdownStop.abort();
   }
 
   /** Seed the sticky pause state at construction time (PRD #1190 M2), before the poll loop
@@ -2389,7 +2388,6 @@ export class SteeringChannel {
         // MR iff open_mr → completed). serviceFollowUp/awaitFollowUp check this AHEAD of the
         // follow-up drain so an explicit stop beats a queued follow-up (Decision 5).
         this.stopRequested = true;
-        this.shutdownStop.abort();
         break;
       case "pause": {
         // PRD #1190 M2: an owner-requested pause. The body is the mode; default to "milestone"

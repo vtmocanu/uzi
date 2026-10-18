@@ -222,7 +222,8 @@ proof, capture, publication and unwind. It starts no control-observation loop or
 grace. Other reconciliation sinks labelled `shutdown` keep their lifecycle checks; the label alone
 grants no exception. Disposal semantics are unchanged.
 
-Already-delivered stops, a claim fence or a credential switch block admission. Effective
+Already-delivered terminal stops, a claim fence or a credential switch block admission. An
+owner `stop` that requests normal finish does not abort execution or revoke shutdown capture. Effective
 revocation, ownership, unreleased claim, generation, credential authorization and deadlines
 remain enforced. Only a late **remote** owner cancellation after successful reconciliation may
 still allow bounded broker publication for the still-bound same claim generation through
