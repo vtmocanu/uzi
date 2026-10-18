@@ -2035,6 +2035,28 @@ for (const stage of ["reconcile", "quiesce", "reap", "action"] as const) {
   }
 }
 
+it("m1 recovered startup timeout cannot hide lifecycle refusal before the soft signal fires", async () => {
+  const reg = new ExecutionRegistry(newLocalExecutionEpoch(3141));
+  const lifecycle = new AbortController(), stop = new AbortController();
+  const primary = new CheckpointSoftDeadlineError();
+  const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+  await assert.rejects(safety.withBoundary({
+    boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 1000,
+    activeStep: () => "checkpoint_lock_wait",
+    checkpointStop: { signal: stop.signal, lifecycleSignal: lifecycle.signal },
+  }, async () => { lifecycle.abort(); throw primary; }), (error: unknown) => {
+    assert.ok(error instanceof CodexBoundaryError);
+    assert.equal(error.actionError, primary);
+    assert.equal(error.stage, "action");
+    assert.equal(error.errors[0]?.category, "authorization");
+    assert.equal(error.sink, "done_checkpoint");
+    assert.equal(error.step, "checkpoint_lock_wait");
+    assert.equal(reg.isPoisoned(), true);
+    assert.equal(stop.signal.aborted, false);
+    return true;
+  });
+});
+
 it("m1 reconcile soft escape preserves poison evidence and primary error", async () => {
   const reg = new ExecutionRegistry(newLocalExecutionEpoch(3128));
   const stop = new AbortController();

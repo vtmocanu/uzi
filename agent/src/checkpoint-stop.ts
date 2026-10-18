@@ -40,13 +40,13 @@ export class CheckpointUnsafeCleanupError extends TrustedExecutionRefusal {
 }
 
 export function checkCheckpointStop(stop?: CheckpointStop): void {
-  if (!stop?.signal.aborted) return;
+  if (!stop) return;
   const shutdown = stop.workerShutdown?.();
   if (shutdown?.stopSignal.aborted || (shutdown && Date.now() >= shutdown.deadlineAt) ||
       (stop.lifecycleSignal?.aborted && !shutdown)) {
     throw new GitBoundaryAbortError("checkpoint authority revoked");
   }
-  throw new CheckpointSoftDeadlineError();
+  if (stop.signal.aborted) throw new CheckpointSoftDeadlineError();
 }
 
 /** Forfeit admission only. The caller must retain its predecessor in its queue tail. */
