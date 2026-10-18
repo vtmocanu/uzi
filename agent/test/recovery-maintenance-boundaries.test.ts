@@ -148,8 +148,8 @@ for (const operation of ["admit", "revalidate"] as const) {
     let cancelled = 0;
     signal.addEventListener("abort", () => cancelled++, { once: true });
     wall = f.token.deadline;
-    const result = await f.ledger[operation](f.input);
-    assert.deepEqual(result, { ok: false, reason: "maintenance_slot_active" });
+    const result = operation === "admit" ? await f.ledger.admit(f.input) : await f.ledger.revalidate(f.token, f.input);
+    assert.deepEqual(result, { ok: false, reason: operation === "admit" ? "maintenance_slot_active" : "maintenance_token_invalid" });
     assert.equal(signal.aborted, true);
     assert.equal(cancelled, 1);
     assert.throws(() => MaintenanceResources.run(f.token, () => {}), /maintenance_token_invalid/);

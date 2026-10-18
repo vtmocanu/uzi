@@ -26,15 +26,18 @@ const configSchema = z.object({
 export type MaintenanceConfig = z.infer<typeof configSchema>;
 
 /** Digests are caller-validated stable identities, never raw URLs, configs or credentials. */
-export interface MaintenanceEligibility {
+export interface MaintenanceAdmission {
   identity: MaintenanceIdentity;
   config: MaintenanceConfig;
   exactCustody: true;
   terminalNonStopped: true;
-  quiescent: true;
-  sourceOutputContinuity: true;
   /** Current source: original input or a previously indexed output of this input. */
   source: string;
+}
+/** Fresh physical/content proof, established independently under the charged slot. */
+export interface MaintenanceEligibility extends MaintenanceAdmission {
+  quiescent: true;
+  sourceOutputContinuity: true;
 }
 export type MaintenanceDenial =
   | "maintenance_state_invalid" | "maintenance_identity_invalid" | "maintenance_ineligible"
@@ -120,6 +123,7 @@ export interface MaintenanceSlot {
 }
 interface Live {
   root: string; cycle: string; nonce: string; deadline: number; monotonicDeadline: number; now: () => number; monotonicNow: () => number;
+  verified: boolean; verification: object; source: string;
   revoked: boolean; finished: boolean; lastObserved: number; used: Quotas; limits: Quotas; signal?: AbortSignal;
   controller: AbortController; timer?: ReturnType<typeof setTimeout>;
 }
@@ -348,18 +352,17 @@ export class RecoveryMaintenance {
       return { ok: true, value: structuredClone(identity) };
     }, false);
   }
-  private eligible(input: MaintenanceEligibility): void {
+  private eligible(input: MaintenanceAdmission): void {
     if (!identitySchema.safeParse(input.identity).success || !configSchema.safeParse(input.config).success ||
       !digest.safeParse(input.source).success) refuse("maintenance_identity_invalid");
-    if (input.config.verifierVersion !== MAINTENANCE_VERIFIER_VERSION || input.exactCustody !== true || input.terminalNonStopped !== true ||
-      input.quiescent !== true || input.sourceOutputContinuity !== true) refuse("maintenance_ineligible");
+    if (input.config.verifierVersion !== MAINTENANCE_VERIFIER_VERSION || input.exactCustody !== true || input.terminalNonStopped !== true) refuse("maintenance_ineligible");
   }
   private observe(cycle: Cycle, now: number): void {
     if (now < cycle.lastObserved) refuse("maintenance_clock_invalid");
     if (now >= cycle.originalCycleExpiry) refuse("maintenance_cycle_expired");
     cycle.lastObserved = now;
   }
-  async admit(input: MaintenanceEligibility, options: { deadline?: number; signal?: AbortSignal } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
+  async admit(input: MaintenanceAdmission, options: { deadline?: number; signal?: AbortSignal } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
     // Metadata discovery cannot initialize storage, precharge work or mint a permit.
     if (discovery.getStore()) return deny("maintenance_discovery_only");
     return this.transaction(async (root, table) => {
@@ -401,8 +404,8 @@ export class RecoveryMaintenance {
         if (table.cycles.some(c => c.outputs.includes(input.identity.originalSource)))
           return deny("maintenance_lineage_invalid");
         // A changed tip cannot erase unresolved mutation provenance in this custody.
-        // Positive revalidation of the retained lineage must resolve it first.
-        if (hold.some(c => c.fenced && hash(c.identity) !== id))
+        // Only an explicit positively verified nonmutating outcome resolves it.
+        if (hold.some(c => c.fenced))
           return deny("maintenance_mutation_fenced");
         if (input.source !== input.identity.originalSource && !table.cycles.some(c => hash(c.identity) === id && c.outputs.includes(input.source)))
           return deny("maintenance_lineage_invalid");
@@ -426,7 +429,8 @@ export class RecoveryMaintenance {
         priorLive.controller.abort(new Error("maintenance_token_invalid"));
       }
       if (active.get(root)?.has(id)) return deny("maintenance_slot_active");
-      if (table.cycles.some(c => hash(c.identity) === id && c.fenced)) return deny("maintenance_mutation_fenced");
+      if (lineage.some(c => cycleKey(c.identity, c.config) !== key && c.fenced))
+        return deny("maintenance_mutation_fenced");
       if (cycle.slots.length && now < cycle.slots[cycle.slots.length - 1]!.nextStart)
         return deny("maintenance_slot_spacing");
       if (options.signal?.aborted) return deny("maintenance_ineligible");
@@ -461,7 +465,7 @@ export class RecoveryMaintenance {
         originalCycleExpiry: cycle.originalCycleExpiry, start: now, deadline });
       const live: Live = { root, cycle: key, nonce: slot.nonce, deadline, now: () => this.now(),
         monotonicDeadline, monotonicNow,
-        revoked: false, finished: false, lastObserved: observedAfter, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal, controller: new AbortController() };
+        verified: false, verification: {}, source: input.source, revoked: false, finished: false, lastObserved: observedAfter, used: multiply(slot.reserved, 0), limits: slot.reserved, signal: options.signal, controller: new AbortController() };
       live.signal = AbortSignal.any([live.controller.signal, ...(options.signal ? [options.signal] : [])]);
       live.timer = setTimeout(() => live.controller.abort(new Error("maintenance deadline exhausted")), Math.max(0, live.monotonicDeadline - live.monotonicNow()));
       live.timer.unref();
@@ -475,10 +479,12 @@ export class RecoveryMaintenance {
   async beforeMutation(token: MaintenanceSlot, outputs: readonly string[]): Promise<MaintenanceResult<void>> {
     return this.transaction(async (root, table) => {
       const live = checked(token);
+      if (!live.verified) return deny("maintenance_ineligible");
+      const verification = live.verification;
       if (outputs.length > CAPACITY) return deny("maintenance_table_capacity");
       if (live.root !== root) return deny("maintenance_token_invalid");
       const cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === live.cycle);
-      if (!cycle || !cycle.slots.some(s => s.nonce === live.nonce)) return deny("maintenance_token_invalid");
+      if (!cycle || cycle.slots.at(-1)?.nonce !== live.nonce) return deny("maintenance_token_invalid");
       this.observe(cycle, this.now());
       if (active.get(root)?.get(hash(cycle.identity)) !== live) return deny("maintenance_token_invalid");
       for (const output of outputs) {
@@ -489,57 +495,80 @@ export class RecoveryMaintenance {
       }
       cycle.fenced = true;
       await this.save(root, table);
+      checked(token);
+      // A refresh can invalidate proof while output persistence is in flight.
+      if (!live.verified || live.verification !== verification) return deny("maintenance_ineligible");
       return { ok: true, value: undefined };
-    });
+    }, false);
   }
-  /** Only a NEW explicit positive continuity proof clears an ambiguous mutation fence. */
-  async revalidate(input: MaintenanceEligibility): Promise<MaintenanceResult<void>> {
+  /** Bind fresh positive proof to this exact live reservation; never clear durable uncertainty. */
+  async revalidate(token: MaintenanceSlot, input: MaintenanceEligibility): Promise<MaintenanceResult<void>> {
+    // Invalidate synchronously, including failures before the transaction callback.
+    // One live ticket bounds state; older completions cannot publish or erase later proof.
+    const reservation = tokens.get(token), verification = {};
+    if (reservation) { reservation.verified = false; reservation.verification = verification; }
     return this.transaction(async (root, table) => {
+      const live = checked(token);
       this.eligible(input);
-      const id = hash(input.identity), siblings = table.cycles.filter(c => hash(c.identity) === id);
-      if (!siblings.length) return deny("maintenance_lineage_invalid");
-      const now = this.now(), priorLive = active.get(root)?.get(id);
-      // A positive continuity observation can resolve old uncertainty for a genuinely
-      // new configuration. It never renews any expired cycle or rewrites its clock.
-      if (siblings.some(c => now < c.lastObserved)) return deny("maintenance_clock_invalid");
-      if (priorLive && (now >= priorLive.deadline || priorLive.signal?.aborted)) {
-        priorLive.revoked = true;
-        priorLive.controller.abort(new Error("maintenance_token_invalid"));
-      }
-      if (active.get(root)?.has(id)) return deny("maintenance_slot_active");
-      if (input.source !== input.identity.originalSource && !siblings.some(c => c.outputs.includes(input.source)))
+      if (input.quiescent !== true || input.sourceOutputContinuity !== true)
+        return deny("maintenance_ineligible");
+      if (live.root !== root) return deny("maintenance_token_invalid");
+      const cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === live.cycle);
+      if (!cycle || cycle.slots.at(-1)?.nonce !== live.nonce ||
+        active.get(root)?.get(hash(cycle.identity)) !== live) return deny("maintenance_token_invalid");
+      if (canonical(input.identity) !== canonical(cycle.identity)) return deny("maintenance_identity_invalid");
+      if (canonical(input.config) !== canonical(cycle.config)) return deny("maintenance_config_changed");
+      if (input.source !== live.source || (input.source !== cycle.identity.originalSource &&
+        !table.cycles.some(c => hash(c.identity) === hash(cycle.identity) && c.outputs.includes(input.source))))
         return deny("maintenance_lineage_invalid");
-      for (const sibling of siblings) {
-        sibling.fenced = false;
-        sibling.lastObserved = now;
-      }
+      const now = this.now();
+      const siblings = table.cycles.filter(c => hash(c.identity) === hash(cycle.identity));
+      if (siblings.some(c => now < c.lastObserved)) return deny("maintenance_clock_invalid");
+      this.observe(cycle, now);
       await this.save(root, table);
+      checked(token); // Persistence time is charged; it cannot revive a timed out proof.
+      if (live.verification !== verification) return deny("maintenance_ineligible");
+      live.verified = true;
       return { ok: true, value: undefined };
-    });
+    }, false);
   }
-  /** Call only after all owned work has joined. Revoked tokens may finish exactly once. */
-  async finish(token: MaintenanceSlot, outcome: "transient" | "complete" | "permanent" | "nonmutating" = "complete"): Promise<MaintenanceResult<void>> {
+  /**
+   * Call only after all owned work has joined. Revoked tokens may finish exactly once.
+   * Both nonmutating outcomes assert positive actual no-source-effect knowledge;
+   * permanent_nonmutating also ends this configuration cycle after a known refusal.
+   * They require the positive proof already bound by revalidate, even after revocation.
+   */
+  async finish(token: MaintenanceSlot, outcome: "transient" | "complete" | "permanent" | "nonmutating" | "permanent_nonmutating" = "complete"): Promise<MaintenanceResult<void>> {
     const live = tokens.get(token);
     if (!live || live.finished) return deny("maintenance_token_invalid");
     if (live.timer) clearTimeout(live.timer);
+    const verified = live.verified;
+    live.verified = false;
     live.finished = true;
     live.revoked = true;
     live.controller.abort(new Error("maintenance_token_invalid"));
-    const running = active.get(live.root);
-    // At most CAPACITY reservations; release only this exact joined owner.
-    for (const [id, reservation] of running ?? []) if (reservation === live) running!.delete(id);
     // Joined bookkeeping is bounded by the authenticated table format; it grants
     // no production and must still persist after the work scope has been revoked.
-    return resources.exit(() => discovery.exit(() => this.transaction(async (root, table) => {
-      if (root !== live.root) return deny("maintenance_token_invalid");
-      const cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === live.cycle);
-      if (!cycle || !cycle.slots.some(s => s.nonce === live.nonce)) return deny("maintenance_token_invalid");
-      // Caller joins all owned work before finish; nonmutating requires positive proof.
-      if (outcome === "nonmutating") cycle.fenced = false;
-      if (outcome === "complete" || outcome === "permanent") cycle.exhausted = true;
-      await this.save(root, table);
-      return { ok: true, value: undefined };
-    })));
+    try {
+      return await resources.exit(() => discovery.exit(() => this.transaction(async (root, table) => {
+        if (root !== live.root) return deny("maintenance_token_invalid");
+        const cycle = table.cycles.find(c => cycleKey(c.identity, c.config) === live.cycle);
+        if (!cycle || !cycle.slots.some(s => s.nonce === live.nonce)) return deny("maintenance_token_invalid");
+        // Caller joins all owned work before finish; nonmutating requires positive proof.
+        if (outcome === "nonmutating" || outcome === "permanent_nonmutating") {
+          if (!verified) return deny("maintenance_ineligible");
+          cycle.fenced = false;
+        }
+        if (outcome === "complete" || outcome === "permanent" || outcome === "permanent_nonmutating") cycle.exhausted = true;
+        await this.save(root, table);
+        return { ok: true, value: undefined };
+      }, false)));
+    } finally {
+      const running = active.get(live.root);
+      // Retain the reservation through settlement, then release only this joined owner.
+      // At most CAPACITY entries; a failed write still releases the owner without refund.
+      for (const [id, reservation] of running ?? []) if (reservation === live) running!.delete(id);
+    }
   }
 }
 function checked(token: MaintenanceSlot): Live {
@@ -551,7 +580,13 @@ function checked(token: MaintenanceSlot): Live {
     live.controller.abort(error);
     throw error;
   }
-  const now = live.now();
+  let now: number;
+  try { now = live.now(); }
+  catch (error) {
+    live.revoked = true;
+    live.controller.abort(error);
+    throw error;
+  }
   if (now < live.lastObserved) {
     live.revoked = true;
     live.controller.abort(new Error("maintenance_clock_invalid"));
