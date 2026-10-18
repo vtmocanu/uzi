@@ -87,7 +87,7 @@ type Store interface {
 }
 
 // EarlyResetNotifier is the account-fenced Codex early-reset notification seam.
-// *notifysvc.Service satisfies it; the engine does not invoke it yet.
+// *notifysvc.Service satisfies it; accepted qualifying readings invoke it best effort.
 type EarlyResetNotifier interface {
 	NotifyCodexEarlyReset(ctx context.Context, fence notifysvc.CodexAccountFence, expected, observed time.Time) (store.Notification, error)
 }
@@ -140,7 +140,6 @@ type Engine struct {
 }
 
 // SetNotifier sets the optional early-reset collaborator before the engine runs.
-// The collaborator is reserved for future detection and is currently unused.
 func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
 
 // New builds an Engine. interval is the poll cadence; the caller starts the engine only when
@@ -407,6 +406,15 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		e.logger.Error("codex usage poller: marshal buckets", "account", t.accountID.String(), "error", err)
 		return
 	}
+	prior, readErr := e.store.GetCodexEarlyResetBaseline(ctx, store.GetCodexEarlyResetBaselineParams{
+		UserID: t.userID, ProviderAccountID: t.accountID, EnablementSig: t.enablementSig,
+	})
+	observed := e.now()
+	var expected time.Time
+	detected := false
+	if readErr == nil && baselineMatches(prior, t) {
+		expected, detected = codexEarlyReset(prior, reading.Buckets, observed)
+	}
 	n, err := e.store.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
 		UserID:                     t.userID,
 		ProviderAccountID:          t.accountID,
@@ -425,6 +433,17 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		// alias vanished, no linked alias is enabled any more, or an alias's enablement moved
 		// since the listing) — the reading is discarded, the prior good row untouched.
 		e.logger.Info("codex usage poller: reading discarded (authority moved)", "account", t.accountID.String())
+	}
+	if n > 0 && detected && e.notifier != nil {
+		fence := notifysvc.CodexAccountFence{
+			OwnerID: t.userID, AccountID: t.accountID,
+			Generation: reading.ObservedGeneration, CredentialRevision: reading.ObservedCredentialRevision,
+			EnablementSig: t.enablementSig,
+		}
+		// Delivery is best effort: the accepted reading remains the next comparison basis.
+		if _, notifyErr := e.notifier.NotifyCodexEarlyReset(ctx, fence, expected, observed); notifyErr != nil {
+			e.logger.Info("codex usage poller: early-reset notification declined", "account", t.accountID.String(), "error", notifyErr)
+		}
 	}
 }
 

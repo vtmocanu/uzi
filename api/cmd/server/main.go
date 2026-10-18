@@ -1335,6 +1335,7 @@ func run() error {
 		codexReconciler := workersvc.NewCodexReconciler(q, vlt, box,
 			codexauth.NewClient(codexauth.WithPerRequestTimeout(codexProviderRequestTimeout)), pool)
 		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
+		codexUsageEngine.SetNotifier(notifier)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()
