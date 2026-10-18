@@ -48,9 +48,19 @@ func policyOwnerRunningContinuation(t *testing.T) usageTailEnv {
 	if receipt, err := fx.svc.ApplyInputs(env.ctx, w, fx.runID, gen, []int64{approval}); err != nil || !receipt.Active {
 		t.Fatalf("approval APPLIED=%+v err=%v", receipt, err)
 	}
+	if _, applied, err := fx.svc.SetState(env.ctx, w, fx.runID, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+		t.Fatalf("approved running: applied=%v err=%v", applied, err)
+	}
+	// Progress is membership-checked against the already frozen list. Report it
+	// after the initial running transition freezes that list, as a real worker does.
 	completed := []string{"m1"}
 	if _, applied, err := fx.svc.SetState(env.ctx, w, fx.runID, StateRequest{State: "running", ClaimGeneration: &gen, MilestonesCompleted: &completed}); err != nil || !applied {
-		t.Fatalf("approved running: applied=%v err=%v", applied, err)
+		t.Fatalf("completed progress: applied=%v err=%v", applied, err)
+	}
+	beforeHold := mustRun(t, env, fx.runID)
+	completedIDs, err := DecodeMilestoneIDs(beforeHold.MilestonesCompleted)
+	if err != nil || len(completedIDs) != 1 || completedIDs[0] != "m1" {
+		t.Fatalf("completed progress was not persisted: ids=%v err=%v", completedIDs, err)
 	}
 	req := policyRequest()
 	phase := "implementation"
@@ -79,6 +89,9 @@ func policyOwnerRunningContinuation(t *testing.T) usageTailEnv {
 	r := mustRun(t, env, fx.runID)
 	if r.Status != "running" || r.SessionID.String != session || r.HoldReason.Valid || r.PolicyRefusalCount <= 0 || r.ClaimGeneration != gen || !r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != w.ID || r.PolicyFreshClaimGeneration.Valid || r.AutoApprove || r.PlanSource != "agent" || len(r.PolicyStopResolution) != 0 {
 		t.Fatal("invalid ordinary constrained continuation")
+	}
+	if string(r.MilestonesFrozen) != string(beforeHold.MilestonesFrozen) || string(r.MilestonesCompleted) != string(beforeHold.MilestonesCompleted) || string(r.CompletionContract) != string(beforeHold.CompletionContract) || r.CompletionContractVersion != beforeHold.CompletionContractVersion || r.ContractRevision != beforeHold.ContractRevision {
+		t.Fatal("continuation changed frozen completed execution contract")
 	}
 	return usageTailEnv{codexTestEnv: env, svc: fx.svc, wkr: w, runID: fx.runID, userID: fx.userID, repoID: fx.repoID}
 }
