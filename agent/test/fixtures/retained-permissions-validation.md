@@ -31,11 +31,15 @@ blob were absent from worker storage before recovery. Sources were self-containe
 there was no alternate through which a captured tip could mask unreadable source
 objects. Resumed capture instead began with an already-valid bare tip and pin.
 
-The seven positive leaves (loose, packed, captured-tip ordering, and all four
-mixed worker/runner hardlink variants) failed at source-read recovery:
+The six fresh-source positive leaves (loose, packed, and all four mixed
+worker/runner hardlink variants) failed at source-read recovery:
 `recovery capture: worktree status unreadable (cannot assert clean)`, then bounded
-exhaustion without successor adoption. The command-owned hardlink mutation case
-also failed because the new `hardlinked_mutation` refusal did not yet exist.
+exhaustion without successor adoption. The captured-tip ordering leaf reached
+successor adoption using the valid pre-existing bare restore tip, then failed its
+`source normalized BEFORE resumed-tip verification` assertion (`false !== true`):
+the source was still unreadable at the resumed verification seam. The
+command-owned hardlink mutation case also failed because the new
+`hardlinked_mutation` refusal did not yet exist.
 The corrupted-source preservation case passed. None of the nine leaves skipped,
 errored during startup, or timed out. All 38 existing worker leaves and both
 existing command leaves passed.
@@ -75,3 +79,28 @@ inject a test stop before provider/model admission. Assertions require the
 ready-for-model journal, retained predecessor, exact tip/tree/blob, closure and
 hardlink preservation. Those post-repair assertions remain unproven at M1.
 Negative mutation refusal and final non-skipped green are also M2/M3 work.
+
+## M1 review and full-gate triage
+
+Review of `1edf88d3..8b199f4a` identified missing positive assertions for retained
+predecessor object bytes/identities, source refs and recovery pins. The following
+repair records the original command-owned file snapshots and checks them after
+adoption, allowing only group-read mode additions; it also checks source refs,
+worktree bytes, directory modes and the exact retained episode pin. The same
+repair corrects the resumed-tip baseline evidence above. These additional
+post-adoption assertions require the M3 green proof; they are not claimed green
+on the baseline.
+
+`task gate:agent` on `8b199f4a` failed: recorded task exit 201, log
+`.uzi/scratch/gate-log.kkWiVY`. Static stages passed; unit results were 16,086
+passed, one failed, 15 skipped, zero cancelled, in 3,744 seconds. The sole failure
+was the existing `wall-during-dispose settles eligible Bash and retires roots
+before park/report` case in `codex-executor.test.ts`, reporting unconfirmed
+command cleanup. M4 did not run after this unit failure.
+
+The smallest selected test passed on both candidate `8b199f4a` (log
+`.uzi/scratch/gate-log.0IuWHw`) and an isolated base `1edf88d3` export using the
+same provisioned dependencies and hermetic preload (log
+`.uzi/scratch/gate-log.tqvBba`), exit 0 and one test each, no skips. This comparison
+is inconclusive: it does not establish that the full-gate failure is unrelated.
+Final delivery still requires a successful full agent gate.

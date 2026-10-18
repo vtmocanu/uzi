@@ -294,7 +294,9 @@ catch(e) { if(e.code!=="EACCES") throw e; }
   }
   // Command still reads its own restricted source (including corrupted bytes in the failure case).
   const privateFiles = privateEntries.filter(e => !e.dir).map(e => e.path);
-  assert.equal(JSON.parse(await commandNode(clone.path, SNAPSHOT, ...privateFiles)).length, privateFiles.length);
+  const privateBefore: Identity[] = JSON.parse(await commandNode(clone.path, SNAPSHOT, ...privateFiles));
+  assert.equal(privateBefore.length, privateFiles.length);
+  const sourceRefsBefore = await commandGit(clone.path, "for-each-ref", "--format=%(refname) %(objectname)");
   if (!options.corrupt) assert.equal(await commandGit(clone.path, "cat-file", "blob", blob), CONTENT.trim());
   else assert.notEqual((await commandExec(clone.path, "/usr/bin/git", gitArgs(clone.path, ["cat-file", "blob", blob]))).code, 0);
   const candidateBefore: Identity[] = candidateNames.length
@@ -390,4 +392,21 @@ catch(e) { if(e.code!=="EACCES") throw e; }
     assert.ok(resumedReads.length > 0, "captured restore tip was actually verified");
     assert.equal(resumedReads.every(Boolean), true, "source normalized BEFORE resumed-tip verification");
   }
+  assert.deepEqual(JSON.parse(await commandNode(clone.path, SNAPSHOT, ...privateFiles)),
+    privateBefore.map(entry => ({ ...entry, mode: entry.mode | 0o040 })),
+    "predecessor objects retain bytes and identity with only group-read added");
+  for (const entry of privateEntries.filter(entry => entry.dir)) {
+    assert.equal(fs.lstatSync(entry.path).mode & 0o7777, entry.mode | 0o050,
+      "predecessor directories gain only group read/traverse");
+  }
+  assert.equal(await commandGit(clone.path, "for-each-ref", "--format=%(refname) %(objectname)"), sourceRefsBefore,
+    "predecessor refs remain unchanged after successor adoption");
+  assert.equal(await commandGit(clone.path, "rev-parse", "HEAD"), tip);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), CONTENT);
+  const refsAfter = workerGit(bare, "for-each-ref", "--format=%(refname) %(objectname)").split("\n");
+  for (const ref of refsBefore.filter(ref => ref.startsWith("refs/uzi-recovery-episode/"))) {
+    assert.ok(refsAfter.includes(ref), "pre-existing recovery pins remain unchanged after adoption");
+  }
+  assert.equal(workerGit(bare, "rev-parse", "refs/uzi-recovery-episode/" + claim.run_id + "/" + tip), tip,
+    "the exact captured recovery pin survives successor adoption");
 }
