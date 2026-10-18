@@ -18202,6 +18202,18 @@ export class RunRunner {
           });
           await check();
           if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
+          this.retainedLifecycleGuard(flight);
+          // Command sandbox attribution precedes executor.run() and its safety facade.
+          // An absent permit is never evidence of a legacy single-UID profile.
+          if (flight.executor.sandboxesCommands === true) {
+            await check();
+            await this.git.normalizeRetainedSourceObjects(bare, branch, key, source);
+            this.retainedLifecycleGuard(flight);
+            await check();
+          } else if (claim.secrets.codex || (flight.executor.sandboxesCommands !== undefined &&
+              flight.executor.sandboxesCommands !== false)) {
+            throw new Error("retained_readiness_profile");
+          }
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
