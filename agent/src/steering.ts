@@ -2541,6 +2541,9 @@ export class SteeringChannel {
       }
       try {
         if (!this.held && !this.stopped) {
+          // Shutdown must not restart observation when an already-running sleep ends.
+          // Leave pending receipt settlement on its existing path above.
+          if (this.shutdownCheckpoint) break;
           this.requestStage = "get";
           const { inputs: read, staleObservation, terminalCancelled, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
           if (this.fence !== undefined || this.terminalLifecycle.signal.aborted) break;

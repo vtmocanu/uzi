@@ -19514,13 +19514,13 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
   try {
     await withTimeout(Promise.race([ready, execution.then(() => {
       throw new Error("actual executor ended before readiness: " + diagnostics.lines.join("\n"));
-    })]), 30_000, "actual executor turn admission");
+    })]), 15_000, "actual executor turn admission");
     await withTimeout(summaryReady, 5_000, "live summary admission");
     assert.deepEqual(summaryCalls, ["intent"], "a live summary was admitted before shutdown");
     const closesBeforeShutdown = summaryCloses;
     runner.shutdown();
     runner.shutdown();
-    await withTimeout(execution, 60_000, "actual executor shutdown");
+    await withTimeout(execution, 40_000, "actual executor shutdown");
     await proof.verify(git);
     assert.equal(remoteCancelled, true, diagnostics.lines.join("\n"));
     assert.equal(inputGetsStarted, getsAtCancel, "no input GET starts after remote cancellation during the sink");
@@ -19537,7 +19537,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     assert.ok(rig.disposed() > 0);
   } finally {
     runner.shutdown();
-    try { await withTimeout(execution, 60_000, "actual executor cleanup"); }
+    try { await withTimeout(execution, 20_000, "actual executor cleanup"); }
     finally { proof.cleanup(); await api.close(); fx.cleanup(); }
   }
 });

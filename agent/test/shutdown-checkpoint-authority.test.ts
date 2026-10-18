@@ -35,6 +35,30 @@ function request(ch: SteeringChannel, deadlineAt = Date.now() + 10_000): Boundar
 }
 
 describe("M1 shutdown checkpoint authority", () => {
+  it("worker shutdown prevents a sleeping poll loop from starting another input GET", async () => {
+    let reads = 0;
+    let sleeping!: () => void;
+    const asleep = new Promise<void>(resolve => { sleeping = resolve; });
+    let wake!: () => void;
+    const wakeup = new Promise<void>(resolve => { wake = resolve; });
+    const client = withReceipts({ getInputs: async () => { reads++; return { inputs: [] }; } } as unknown as WorkerClient);
+    const ch = new SteeringChannel(client, "run-shutdown", 1, nullLogger(), new AbortController(), {
+      sleep: async () => { sleeping(); await wakeup; },
+    });
+    ch.start();
+    try {
+      await asleep;
+      assert.equal(reads, 1);
+      ch.workerShutdown(Date.now() + 10_000);
+      wake();
+      await (ch as unknown as { loop: Promise<void> }).loop;
+      assert.equal(reads, 1, "shutdown must not start another GET when an existing sleep completes");
+    } finally {
+      wake();
+      await ch.stop();
+    }
+  });
+
   for (const conflict of ["claim fence", "credential switch"] as const) {
     for (const phase of ["before reconcile", "installer wait", "HTTP acquisition"] as const) {
       it(`delivered ${conflict} during ${phase} denies marked shutdown publication`, async () => {

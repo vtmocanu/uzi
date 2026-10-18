@@ -78,25 +78,31 @@ it("#3101 actual Runner late admission inherits the original deadline across rep
     diskLocks: locks, codexBoundaryDeadlineMs: 1_000, shutdownPublishTimeoutMs: 2_000,
   });
   const deadlines: number[] = [];
+  const reportErrors: unknown[] = [];
   const report = client.reportState.bind(client);
   client.reportState = async (runId, body, signal) => {
     if (body.status === "running") {
-      // Observe phaseClone's actual registration at the existing first-running ACK seam.
-      const active = (runner as unknown as { activeRuns: Map<string, {
-        gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint;
-        steering: SteeringChannel;
-        cancel: AbortController;
-      }> }).activeRuns.get(runId);
-      assert.ok(active);
-      const cause = active.gracefulShutdownCheckpoint;
-      assert.ok(cause, "late registration receives shutdown checkpoint authority");
-      deadlines.push(cause.deadlineAt);
-      assert.equal(cause.deadlineAt, start + 1_000, "elapsed admission time never renews the original grace");
-      assert.equal(active.cancel.signal.aborted, true);
-      assert.equal(active.steering.lifecycleSignal().aborted, true);
-      assert.equal(active.steering.terminalLifecycleSignal().aborted, true);
-      assert.equal(cause.stopSignal.aborted, false, "shutdown retains only bounded checkpoint authority");
-      assert.equal(Object.isFrozen(cause), true);
+      try {
+        // Observe phaseClone's actual registration at the existing first-running ACK seam.
+        const active = (runner as unknown as { activeRuns: Map<string, {
+          gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint;
+          steering: SteeringChannel;
+          cancel: AbortController;
+        }> }).activeRuns.get(runId);
+        assert.ok(active);
+        const cause = active.gracefulShutdownCheckpoint;
+        assert.ok(cause, "late registration receives shutdown checkpoint authority");
+        deadlines.push(cause.deadlineAt);
+        assert.equal(cause.deadlineAt, start + 1_000, "elapsed admission time never renews the original grace");
+        assert.equal(active.cancel.signal.aborted, true);
+        assert.equal(active.steering.lifecycleSignal().aborted, true);
+        assert.equal(active.steering.terminalLifecycleSignal().aborted, true);
+        assert.equal(cause.stopSignal.aborted, false, "shutdown retains only bounded checkpoint authority");
+        assert.equal(Object.isFrozen(cause), true);
+      } catch (error) {
+        reportErrors.push(error);
+        throw error;
+      }
     }
     return report(runId, body, signal);
   };
@@ -117,6 +123,7 @@ it("#3101 actual Runner late admission inherits the original deadline across rep
     runner.shutdown();
     releaseSecond();
     await secondExecution;
+    if (reportErrors.length > 0) throw reportErrors[0];
     assert.deepEqual(deadlines, [start + 1_000, start + 1_000]);
     assert.equal(factories, 2);
     assert.equal(models, 0);
