@@ -4,6 +4,15 @@ import { constants } from "node:os";
 import { fileURLToPath } from "node:url";
 import { selectAgentTests } from "./agent-test-shards.js";
 
+function reportError(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  // JSON escaping handles C0/ANSI bytes; also escape C1, line and bidi controls.
+  const diagnostic = JSON.stringify(message).slice(1, -1)
+    .replace(/[\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g,
+      (character) => "\\u" + character.charCodeAt(0).toString(16).padStart(4, "0"));
+  console.error(diagnostic);
+}
+
 function filters(args: string[]): string[] {
   const result: string[] = [];
   for (let index = 0; index < args.length; index++) {
@@ -64,7 +73,7 @@ function main(): void {
   process.on("SIGINT", onInt);
   process.on("SIGTERM", onTerm);
   child.on("error", (error) => {
-    console.error(error);
+    reportError(error);
     process.exitCode = 1;
   });
   child.on("close", (code, signal) => {
@@ -81,6 +90,6 @@ function main(): void {
 try {
   main();
 } catch (error) {
-  console.error(error instanceof Error ? error.message : error);
+  reportError(error);
   process.exitCode = 1;
 }

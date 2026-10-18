@@ -285,10 +285,12 @@ cp.spawn = function(command, args, options) {
 };
 syncBuiltinESMExports();
 EOF
+  # A file URL preserves spaces/quotes in TMPDIR through Node's option parser.
+  PRELOAD_URL="$(node -e 'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' -- "$PRELOAD")"
   ARGV="$TMP/node-argv"
   : > "$ARGV"
   if (cd "$ROOT/agent" && env UZI_PACKAGE_CHILD_ARGV="$ARGV" \
-    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require=$PRELOAD" \
+    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
     UZI_AGENT_TEST_CONCURRENCY=1 sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test-concurrency=1' "$ARGV"; then
     echo "PASS: package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 passes --test-concurrency=1"
@@ -300,7 +302,7 @@ EOF
   # --test proves the actual test-child boundary was reached.
   : > "$ARGV"
   if (cd "$ROOT/agent" && env -u UZI_AGENT_TEST_CONCURRENCY UZI_PACKAGE_CHILD_ARGV="$ARGV" \
-    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require=$PRELOAD" \
+    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
     sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test' "$ARGV" && ! grep -q -- '^--test-concurrency' "$ARGV"; then
     echo "PASS: package.json test script: unset UZI_AGENT_TEST_CONCURRENCY passes no --test-concurrency"

@@ -5,7 +5,7 @@ const shards = ["1/2", "2/2"] as const;
 function canonicalPath(value: unknown): value is string {
   return typeof value === "string"
     // eslint-disable-next-line no-control-regex -- Reject control bytes in canonical filenames.
-    && /^test\/[^/\\\x00-\x1f\x7f]+\.test\.ts$/.test(value);
+    && /^test\/[^/\\\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]+\.test\.ts$/.test(value);
 }
 
 /** Pin validation also runs for an unsharded invocation; additions need no pins. */

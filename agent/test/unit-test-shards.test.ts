@@ -145,7 +145,9 @@ test("pin structures, canonical names, sortedness, duplicates and stale entries 
   for (const invalid of ["1/3", "0/2", "3/2", "1", ""]) {
     assert.throws(() => selectAgentTests(inventory, emptyPins, invalid), /Shard/);
   }
-  for (const invalid of ["../test/a.test.ts", "/test/a.test.ts", "test/sub/a.test.ts", "test/a.test.ts.mjs"]) {
+  for (const invalid of ["../test/a.test.ts", "/test/a.test.ts", "test/sub/a.test.ts", "test/a.test.ts.mjs",
+    "test/\u009bhidden.test.ts", "test/\u061chidden.test.ts", "test/\u200ehidden.test.ts",
+    "test/\u2028hidden.test.ts", "test/\u202eforged.test.ts", "test/\u2066hidden.test.ts"]) {
     assert.throws(() => selectAgentTests([invalid], emptyPins), /Inventory/);
   }
   assert.throws(() => selectAgentTests([], emptyPins), /Inventory/);
@@ -181,7 +183,8 @@ function launcherFixture(): string {
     writeFileSync(path.join(root, "test", name + ".test.ts"), [
       'import assert from "node:assert/strict";',
       'import test from "node:test";',
-      'test("fixture:' + name + '", () => {',
+      'import { appendFileSync } from "node:fs";',
+      'test("fixture:' + name + '", { only: ' + String(name === "a") + ' }, () => {',
       '  assert.equal(process.env.FIXTURE_PRELOADED, "yes");',
       '  assert.ok(process.execArgv.includes("--test-timeout=120000"));',
       '  if (process.env.UZI_AGENT_TEST_CONCURRENCY) assert.ok(process.execArgv.includes("--test-concurrency=" + process.env.UZI_AGENT_TEST_CONCURRENCY));',
@@ -189,6 +192,7 @@ function launcherFixture(): string {
       '  assert.ok(process.execArgv.includes("./test/setup/hermetic-proc.ts"));',
       '  assert.ok(!process.execArgv.some(arg => arg.startsWith("--test-shard")));',
       '  assert.equal(process.env.FIXTURE_INHERITED, "preserved");',
+      '  if (process.env.FIXTURE_EXECUTED) appendFileSync(process.env.FIXTURE_EXECUTED, ' + JSON.stringify(name + "\n") + ');',
       '  if (process.env.FIXTURE_FAIL) assert.fail("intentional fixture failure");',
       '});',
     ].join("\n"));
@@ -236,13 +240,18 @@ test("actual launcher runs the full inventory, each shard, filters, reporters an
       }
     }
     assert.deepEqual([...union].sort(), fixtureNames.toSorted());
-    const filtered = runLauncher(root, {}, ["--test-name-pattern", "fixture:a", "--test-skip-pattern=fixture:b"]);
-    assert.equal(filtered.status, 0, filtered.stdout + filtered.stderr);
-    assert.match(filtered.stdout, /fixture:a/);
-    const dashPattern = runLauncher(root, {}, ["--test-name-pattern=--unmatched"]);
-    assert.equal(dashPattern.status, 0, dashPattern.stdout + dashPattern.stderr);
-    const only = runLauncher(root, {}, ["--test-only"]);
-    assert.equal(only.status, 0, only.stdout + only.stderr);
+    const executed = path.join(root, "executed");
+    const assertFiltered = (args: string[], expected: string[]): void => {
+      writeFileSync(executed, "");
+      const result = runLauncher(root, { FIXTURE_EXECUTED: executed }, args);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      const observed = readFileSync(executed, "utf8").split("\n").filter(Boolean).sort();
+      assert.deepEqual(observed, expected.toSorted(), "filters must control the exact executed fixture set");
+    };
+    assertFiltered(["--test-name-pattern", "fixture:a"], ["a"]);
+    assertFiltered(["--test-skip-pattern=fixture:b"], ["a", "config", "worker"]);
+    assertFiltered(["--test-name-pattern=--unmatched"], []);
+    assertFiltered(["--test-only"], ["a"]);
     const exactExit = path.join(root, "exit.cjs");
     writeFileSync(exactExit, 'if (process.execArgv.includes("--test")) process.exit(7);\n');
     const exited = runLauncher(root, { NODE_OPTIONS: `--require=${JSON.stringify(exactExit)}` });
@@ -280,6 +289,57 @@ test("actual launcher rejects widening/override arguments, bad settings and malf
     const empty = runLauncher(root);
     assert.equal(empty.status, 1, empty.stdout + empty.stderr);
     assert.match(empty.stderr, /Inventory/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const route of ["argument", "pin"] as const) {
+  test("actual launcher escapes rejected " + route + " diagnostics onto one safe line", () => {
+    const root = launcherFixture();
+    const payload = "forged\nPASS: forged audit row\u001b[2K\u009b2K\u202e";
+    try {
+      if (route === "pin") {
+        writeFileSync(path.join(root, "test-shards.json"), JSON.stringify({
+          "1/2": ["test/" + payload + ".test.ts"], "2/2": [],
+        }));
+      }
+      const result = runLauncher(root, {}, route === "argument" ? ["--unknown-" + payload] : []);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.equal(result.stderr.includes("\nPASS:"), false, "no forged diagnostic row");
+      for (const control of ["\u001b", "\u009b", "\u202e"]) {
+        assert.equal(result.stderr.includes(control), false, "no raw terminal or bidi controls");
+      }
+      assert.match(result.stderr, /\\nPASS: forged audit row/);
+      assert.match(result.stderr, /\\u001b/);
+      assert.match(result.stderr, /\\u009b/);
+      assert.match(result.stderr, /\\u202e/);
+      assert.equal(result.stderr.trimEnd().split("\n").length, 1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("package child-argv guard supports spaces and quotes in TMPDIR", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "uzi-shard-argv-"));
+  const spaced = path.join(root, 'space "quoted" tmp');
+  mkdirSync(spaced);
+  try {
+    const script = fileURLToPath(new URL("../../scripts/real-procfs-skip-check.test.sh", import.meta.url));
+    const source = readFileSync(script, "utf8");
+    const start = source.indexOf("# (k) the other half of the cap");
+    const end = source.indexOf("# (h) end to end through the real TypeScript recorder", start);
+    assert.ok(start >= 0 && end > start, "use the actual package-child guard case");
+    const body = 'set -eu\nROOT="$1"\nTMP="$2"\nfailures=0\n'
+      + source.slice(start, end) + '\ntest "$failures" -eq 0\n';
+    const result = spawnSync("sh", ["-c", body, "package-child-guard", path.resolve(agentRoot, ".."), spaced], {
+      cwd: agentRoot, env: launcherEnv({ TMPDIR: spaced }), encoding: "utf8", timeout: 30_000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 passes/);
+    assert.match(result.stdout, /unset UZI_AGENT_TEST_CONCURRENCY passes no/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
