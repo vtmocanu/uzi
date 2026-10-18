@@ -1,6 +1,12 @@
 {
   "cases": [
     {
+      "name": "null evidence path",
+      "from": "\"path\":\"agent/test/semantic-plan.test.ts\"",
+      "to": "\"path\":null",
+      "valid": false
+    },
+    {
       "name": "null start",
       "from": "\"start\":0",
       "to": "\"start\":null",

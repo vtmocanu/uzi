@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
 
@@ -29,6 +30,67 @@ func semanticJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestSemanticUnknownSourceStorageInput(t *testing.T) {
+	c, p, captures := semanticFixture()
+	captures = append(captures, apitypes.SemanticSourceCapture{ID: "uncited", Kind: "prd", Provenance: "repo:missing-prd", Completeness: "unknown"})
+	candidate, _, err := compileSemanticProposal(c, semanticJSON(t, p), captures)
+	if err != nil || candidate.SourceOutcome != "unknown" {
+		t.Fatalf("unknown source: outcome=%s err=%v", candidate.SourceOutcome, err)
+	}
+	blobs := semanticSnapshotBlobs(c.PlanMd, captures)
+	raw, found := blobs[semanticHash(nil)]
+	if !found || len(raw) != 0 {
+		t.Fatal("missing empty source blob at original hash")
+	}
+	for _, format := range []int16{pgtype.BinaryFormatCode, pgtype.TextFormatCode} {
+		encoded, err := pgtype.NewMap().Encode(pgtype.ByteaOID, format, raw, make([]byte, 0, 16))
+		if err != nil || encoded == nil {
+			t.Errorf("empty source must encode non-NULL bytea: format=%d encoded=%v err=%v", format, encoded, err)
+		}
+	}
+}
+
+func TestSemanticProposalRawByteLimit(t *testing.T) {
+	c, p, captures := semanticFixture()
+	raw := semanticJSON(t, p)
+	const limit = 16 * 1024 * 1024
+	atLimit := append(raw, bytes.Repeat([]byte(" "), limit-len(raw))...)
+	if _, _, err := compileSemanticProposal(c, atLimit, captures); err != nil {
+		t.Fatalf("exactly 16 MiB rejected: %v", err)
+	}
+	if _, _, err := compileSemanticProposal(c, append(atLimit, ' '), captures); err == nil {
+		t.Fatal("proposal above 16 MiB accepted")
+	}
+}
+
+func TestSemanticEvidencePathWire(t *testing.T) {
+	c, p, captures := semanticFixture()
+	raw := semanticJSON(t, p)
+	for _, tc := range []struct {
+		name, replacement string
+		valid             bool
+	}{
+		{"absent", "", true},
+		{"empty", `,"path":""`, true},
+		{"present", `,"path":"api/test.go"`, true},
+		{"null", `,"path":null`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := bytes.Replace(raw, []byte(`,"path":"api/test.go"`), []byte(tc.replacement), 1)
+			candidate, _, err := compileSemanticProposal(c, wire, captures)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v error=%v", tc.valid, err)
+			}
+			if tc.valid && tc.name != "present" {
+				evidence := candidate.Criteria[0].EvidenceRequirements[0]
+				if evidence.Path != "" || string(semanticJSON(t, evidence)) != `{"description":"test output"}` {
+					t.Fatal("empty path wire shape changed")
+				}
+			}
+		})
+	}
 }
 
 func TestSemanticCompilerValidation(t *testing.T) {
@@ -124,7 +186,8 @@ func TestSemanticCanonicalContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate.Criteria[0].ID = uuid.NewString()
-	raw, err := buildSemanticCompletionContract(candidate, 1)
+	candidate.Revision = 7
+	raw, err := buildSemanticCompletionContract(candidate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,16 +202,16 @@ func TestSemanticCanonicalContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Profile != "semantic" || decoded.Criteria[0].DoneWhen != p.Criteria[0].DoneWhen || decoded.Criteria[0].ID != candidate.Criteria[0].ID {
+	if decoded.Revision != contractRevisionInitial || decoded.Profile != "semantic" || decoded.Criteria[0].DoneWhen != p.Criteria[0].DoneWhen || decoded.Criteria[0].ID != candidate.Criteria[0].ID {
 		t.Fatal("compiler dropped semantic fields")
 	}
 	candidate.Criteria = append(candidate.Criteria, candidate.Criteria[0])
-	if _, err = buildSemanticCompletionContract(candidate, 1); err == nil {
+	if _, err = buildSemanticCompletionContract(candidate); err == nil {
 		t.Fatal("duplicate canonical ID accepted")
 	}
 	candidate.Criteria = candidate.Criteria[:1]
 	candidate.Criteria[0].ID = "foreign"
-	if _, err = buildSemanticCompletionContract(candidate, 1); err == nil {
+	if _, err = buildSemanticCompletionContract(candidate); err == nil {
 		t.Fatal("invalid canonical ID accepted")
 	}
 }
@@ -165,7 +228,7 @@ func TestSemanticByteBounds(t *testing.T) {
 			limit = 256 * 1024
 		}
 		for _, delta := range []int{-1, 0, 1} {
-			t.Run(field+"/"+string(rune('1'+delta)), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/%d", field, delta), func(t *testing.T) {
 				c, p, s := semanticFixture()
 				v := strings.Repeat("x", limit+delta)
 				switch field {

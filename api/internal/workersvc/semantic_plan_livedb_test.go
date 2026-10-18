@@ -31,7 +31,7 @@ func TestSemanticCandidateLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	contractRaw, contractErr := buildSemanticCompletionContract(first, 1)
+	contractRaw, contractErr := buildSemanticCompletionContract(first)
 	if contractErr != nil {
 		t.Fatal(contractErr)
 	}
@@ -173,6 +173,37 @@ func TestSemanticCandidateLiveDB(t *testing.T) {
 	}
 	if historyCount != 128 {
 		t.Fatal("candidate refusal changed history")
+	}
+}
+
+func TestSemanticUnknownSourceLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	worker := e.seedWorker(t, nil)
+	run := e.seedActiveRunOwnedBy(t, worker)
+	e.exec(t, `UPDATE runs SET claim_generation=7, completion_contract_version=1 WHERE id=$1`, run)
+	e.exec(t, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"reserved","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, run)
+	c, p, captures := semanticFixture()
+	captures = append(captures, apitypes.SemanticSourceCapture{ID: "uncited", Kind: "prd", Provenance: "repo:missing-prd", Completeness: "unknown"})
+	candidate, err := (&Service{txBeginner: e.pool}).submitSemanticCandidate(e.ctx, worker, run, 7, c, semanticJSON(t, p), captures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.SourceOutcome != "unknown" {
+		t.Fatalf("source_outcome=%s", candidate.SourceOutcome)
+	}
+	var outcome string
+	var nonnull bool
+	var size int
+	err = e.pool.QueryRow(e.ctx, `SELECT p.candidate->>'source_outcome', b.raw IS NOT NULL, octet_length(b.raw)
+		FROM semantic_planning p
+		JOIN semantic_source_snapshots s ON s.run_id=p.run_id
+		JOIN semantic_snapshots b ON b.run_id=s.run_id AND b.hash=s.hash
+		WHERE p.run_id=$1 AND s.source_id='uncited' AND s.hash=$2`, run, semanticHash(nil)).Scan(&outcome, &nonnull, &size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome != "unknown" || !nonnull || size != 0 {
+		t.Fatalf("stored outcome=%s nonnull=%v bytes=%d", outcome, nonnull, size)
 	}
 }
 

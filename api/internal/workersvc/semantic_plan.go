@@ -22,11 +22,11 @@ const semanticIdentityVersion = "semantic_v1"
 // buildSemanticCompletionContract constructs the same completion contract that
 // structural runs use. M3 owns freezing it in the existing approval transaction;
 // this helper performs no write and authorizes no maintainer exception.
-func buildSemanticCompletionContract(candidate apitypes.SemanticCandidate, revision int) ([]byte, error) {
-	if candidate.CandidateIdentityVersion != semanticIdentityVersion || revision < 1 || len(candidate.Criteria) == 0 || len(candidate.Criteria) > 256 {
+func buildSemanticCompletionContract(candidate apitypes.SemanticCandidate) ([]byte, error) {
+	if candidate.CandidateIdentityVersion != semanticIdentityVersion || len(candidate.Criteria) == 0 || len(candidate.Criteria) > 256 {
 		return nil, fmt.Errorf("invalid canonical semantic candidate")
 	}
-	contract := completionContract{Profile: "semantic", Revision: revision, Criteria: make([]completionCriterion, len(candidate.Criteria)), Sources: candidate.Sources, PlanHash: candidate.PlanHash, CandidateIdentityVersion: candidate.CandidateIdentityVersion, SourceOutcome: candidate.SourceOutcome, Coverage: candidate.Coverage}
+	contract := completionContract{Profile: "semantic", Revision: contractRevisionInitial, Criteria: make([]completionCriterion, len(candidate.Criteria)), Sources: candidate.Sources, PlanHash: candidate.PlanHash, CandidateIdentityVersion: candidate.CandidateIdentityVersion, SourceOutcome: candidate.SourceOutcome, Coverage: candidate.Coverage}
 	seen := map[string]bool{}
 	for i, c := range candidate.Criteria {
 		if uuid.Validate(c.ID) != nil || seen[c.ID] {
@@ -156,6 +156,9 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 	var out apitypes.SemanticCandidate
 	fail := func() (apitypes.SemanticCandidate, string, error) {
 		return out, "", fmt.Errorf("invalid semantic proposal or capture")
+	}
+	if len(raw) > 16*1024*1024 {
+		return fail()
 	}
 	var proposal apitypes.SemanticProposal
 	if err := strictSemanticJSON(raw, &proposal); err != nil {

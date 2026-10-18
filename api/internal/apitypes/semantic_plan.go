@@ -56,6 +56,30 @@ type SemanticEvidence struct {
 	Path        string `json:"path,omitempty"`
 }
 
+// UnmarshalJSON preserves optional paths while rejecting an explicit JSON null.
+func (e *SemanticEvidence) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		Description string          `json:"description"`
+		Path        json.RawMessage `json:"path"`
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&wire); err != nil {
+		return err
+	}
+	var path string
+	if len(wire.Path) != 0 {
+		if bytes.Equal(bytes.TrimSpace(wire.Path), []byte("null")) {
+			return fmt.Errorf("evidence path must be a string")
+		}
+		if err := json.Unmarshal(wire.Path, &path); err != nil {
+			return err
+		}
+	}
+	*e = SemanticEvidence{Description: wire.Description, Path: path}
+	return nil
+}
+
 type SemanticMaintainer struct {
 	Reason            string   `json:"reason"`
 	Conditions        []string `json:"conditions"`

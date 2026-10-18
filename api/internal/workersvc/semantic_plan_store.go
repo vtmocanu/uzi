@@ -12,6 +12,21 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// semanticSnapshotBlobs assembles the exact bytea inputs persisted by submitSemanticCandidate.
+func semanticSnapshotBlobs(planMd string, captures []apitypes.SemanticSourceCapture) map[string][]byte {
+	blobs := map[string][]byte{}
+	for _, capture := range captures {
+		raw := capture.Bytes
+		if raw == nil {
+			raw = []byte{}
+		}
+		blobs[semanticHash(raw)] = raw
+	}
+	plan := []byte(planMd)
+	blobs[semanticHash(plan)] = plan
+	return blobs
+}
+
 // submitSemanticCandidate has no production caller or route. The source capture
 // argument is worker-owned, distinct from the strictly decoded lead proposal.
 // Every mutation requires a transaction and the run lock serializes all capacity,
@@ -70,7 +85,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 		if candidate.Revision != revision || candidate.Digest == "" {
 			return empty, fmt.Errorf("invalid persisted semantic candidate")
 		}
-		if _, err = buildSemanticCompletionContract(candidate, 1); err != nil {
+		if _, err = buildSemanticCompletionContract(candidate); err != nil {
 			return empty, err
 		}
 		// A lost response is a read of the current persisted candidate; no UUIDs or
@@ -83,12 +98,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	if revision >= 128 {
 		return empty, fmt.Errorf("semantic candidate capacity exceeded")
 	}
-	blobs := map[string][]byte{}
-	for _, capture := range captures {
-		blobs[semanticHash(capture.Bytes)] = capture.Bytes
-	}
-	plan := []byte(structural.PlanMd)
-	blobs[semanticHash(plan)] = plan
+	blobs := semanticSnapshotBlobs(structural.PlanMd, captures)
 	used, err := q.GetSemanticSnapshotBytes(ctx, runID)
 	if err != nil {
 		return empty, err
