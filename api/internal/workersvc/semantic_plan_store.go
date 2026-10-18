@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -25,26 +26,32 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 		return empty, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	run, err := store.New(tx).GetRunByIDForUpdate(ctx, runID)
+	q := store.New(tx)
+	run, err := q.GetRunByIDForUpdate(ctx, runID)
 	if err != nil {
 		return empty, err
 	}
-	if !run.WorkerID.Valid || run.WorkerID.Bytes != workerID || run.ClaimGeneration != generation {
+	if !run.WorkerID.Valid || run.WorkerID.Bytes != workerID {
 		return empty, ErrRunNotOwned
 	}
-	if !run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 {
-		return empty, fmt.Errorf("semantic enrollment requires contract schema version 1")
+	if run.ClaimGeneration != generation || run.ClaimReleasedAt.Valid {
+		return empty, ErrStaleClaim
 	}
 	if terminalStatuses[run.Status] {
 		return empty, ErrRunTerminal
 	}
-	var enrollmentRaw, priorRaw []byte
-	var revision int64
-	var fingerprint *string
-	err = tx.QueryRow(ctx, `SELECT enrollment, revision, fingerprint, candidate FROM semantic_planning WHERE run_id=$1`, runID).Scan(&enrollmentRaw, &revision, &fingerprint, &priorRaw)
+	if run.Status != "running" {
+		return empty, ErrInvalidState
+	}
+	if !run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 {
+		return empty, fmt.Errorf("semantic enrollment requires contract schema version 1")
+	}
+	planning, err := q.GetSemanticPlanning(ctx, runID)
 	if err != nil {
 		return empty, err
 	}
+	enrollmentRaw, priorRaw := planning.Enrollment, planning.Candidate
+	revision, fingerprint := planning.Revision, planning.Fingerprint
 	var enrollment apitypes.SemanticEnrollment
 	if err = strictSemanticJSON(enrollmentRaw, &enrollment); err != nil {
 		return empty, err
@@ -56,7 +63,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	if err != nil {
 		return empty, err
 	}
-	if fingerprint != nil && *fingerprint == fp {
+	if fingerprint.Valid && fingerprint.String == fp {
 		if err = strictSemanticJSON(priorRaw, &candidate); err != nil {
 			return empty, err
 		}
@@ -82,15 +89,15 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	}
 	plan := []byte(structural.PlanMd)
 	blobs[semanticHash(plan)] = plan
-	var used int64
-	if err = tx.QueryRow(ctx, `SELECT COALESCE(sum(octet_length(raw)),0)::bigint FROM semantic_snapshots WHERE run_id=$1`, runID).Scan(&used); err != nil {
+	used, err := q.GetSemanticSnapshotBytes(ctx, runID)
+	if err != nil {
 		return empty, err
 	}
 	// At most ten distinct blobs per submission. A failure aborts the entire
 	// transaction; there is no partial admission or best-effort eviction.
 	for hash, raw := range blobs {
-		var exists bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM semantic_snapshots WHERE run_id=$1 AND hash=$2)`, runID, hash).Scan(&exists); err != nil {
+		exists, err := q.HasSemanticSnapshot(ctx, store.HasSemanticSnapshotParams{RunID: runID, Hash: hash})
+		if err != nil {
 			return empty, err
 		}
 		if !exists {
@@ -101,7 +108,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 		return empty, fmt.Errorf("semantic snapshot capacity exceeded")
 	}
 	for hash, raw := range blobs {
-		if _, err = tx.Exec(ctx, `INSERT INTO semantic_snapshots(run_id,hash,raw) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, runID, hash, raw); err != nil {
+		if err = q.InsertSemanticSnapshot(ctx, store.InsertSemanticSnapshotParams{RunID: runID, Hash: hash, Raw: raw}); err != nil {
 			return empty, err
 		}
 	}
@@ -114,7 +121,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 		if marshalErr != nil {
 			return empty, marshalErr
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO semantic_source_snapshots(run_id,identity_hash,source_id,kind,hash,provenance,completeness) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, runID, semanticHash(metadata), ref.ID, ref.Kind, ref.Hash, ref.Provenance, ref.Completeness); err != nil {
+		if err = q.InsertSemanticSourceSnapshot(ctx, store.InsertSemanticSourceSnapshotParams{RunID: runID, IdentityHash: semanticHash(metadata), SourceID: ref.ID, Kind: ref.Kind, Hash: ref.Hash, Provenance: ref.Provenance, Completeness: ref.Completeness}); err != nil {
 			return empty, err
 		}
 	}
@@ -136,14 +143,14 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	if err != nil {
 		return empty, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO semantic_candidate_history(run_id,revision,candidate) VALUES($1,$2,$3)`, runID, candidate.Revision, raw); err != nil {
+	if err = q.InsertSemanticCandidateHistory(ctx, store.InsertSemanticCandidateHistoryParams{RunID: runID, Revision: candidate.Revision, Candidate: raw}); err != nil {
 		return empty, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE semantic_planning SET revision=$2,fingerprint=$3,candidate=$4,review_state=NULL WHERE run_id=$1`, runID, candidate.Revision, fp, raw)
+	affected, err := q.UpdateSemanticPlanning(ctx, store.UpdateSemanticPlanningParams{RunID: runID, Revision: candidate.Revision, Fingerprint: pgtype.Text{String: fp, Valid: true}, Candidate: raw})
 	if err != nil {
 		return empty, err
 	}
-	if tag.RowsAffected() != 1 {
+	if affected != 1 {
 		return empty, errors.New("semantic planning state disappeared")
 	}
 	if err = tx.Commit(ctx); err != nil {

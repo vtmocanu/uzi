@@ -102,7 +102,7 @@ const semanticCandidateSchema = z.strictObject({
   for (const c of candidate.criteria) {
     for (const cite of c.citations) {
       const source = sources.get(cite.source_id);
-      if (!source || source.hash !== cite.hash) {
+      if (!source || source.completeness !== "complete" || source.hash !== cite.hash) {
         ctx.addIssue({ code: "custom", message: "Foreign citation" });
       }
     }

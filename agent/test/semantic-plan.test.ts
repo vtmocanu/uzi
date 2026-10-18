@@ -292,3 +292,23 @@ test("snapshot size limits are inclusive and overflow never captures a passing p
   const planOverflow = await captureSemanticSources(git, { ...input(), planBytes: Buffer.alloc(256 * 1024 + 1) });
   assert.ok(planOverflow.sources.every(s => s.bytes === "" && s.completeness === "unknown"));
 });
+
+test("shared server wire rejects missing offsets and unpaired escapes, retaining valid Unicode", () => {
+  const raw = readFileSync(new URL("../../fixtures/semantic-plan/candidate.json", import.meta.url), "utf8");
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/semantic-plan/invalid-proposals.json", import.meta.url), "utf8")) as {
+    cases: { name: string; from: string; to: string; valid: boolean }[];
+  };
+  for (const c of fixture.cases) {
+    assert.equal(raw.split(c.from).length, 2, c.name);
+    const wire = raw.replace(c.from, c.to);
+    if (c.valid) assert.deepEqual(parseSemanticCandidate(wire), JSON.parse(wire), c.name);
+    else assert.throws(() => parseSemanticCandidate(wire), c.name);
+  }
+});
+test("canonical candidates reject incomplete cited sources without trusted context", () => {
+  const wire = candidate();
+  assert.throws(() => parseSemanticCandidate({
+    ...wire, source_outcome: "unknown",
+    sources: wire.sources.map(s => ({ ...s, completeness: "unknown" })),
+  }));
+});

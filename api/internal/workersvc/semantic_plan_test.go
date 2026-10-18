@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -64,6 +65,9 @@ func TestSemanticCompilerValidation(t *testing.T) {
 		}},
 		{"duplicate source", func(_ *PlanCrossCheckCandidate, _ *apitypes.SemanticProposal, s *[]apitypes.SemanticSourceCapture) {
 			*s = append(*s, (*s)[0])
+		}},
+		{"incomplete cited source", func(_ *PlanCrossCheckCandidate, _ *apitypes.SemanticProposal, s *[]apitypes.SemanticSourceCapture) {
+			(*s)[0].Completeness = "unknown"
 		}},
 		{"unknown completeness", func(_ *PlanCrossCheckCandidate, _ *apitypes.SemanticProposal, s *[]apitypes.SemanticSourceCapture) {
 			(*s)[0].Completeness = "complete-prefix"
@@ -209,6 +213,7 @@ func TestSemanticByteBounds(t *testing.T) {
 }
 func TestSemanticCanonicalIdentity(t *testing.T) {
 	c, p, s := semanticFixture()
+	s = append(s, apitypes.SemanticSourceCapture{ID: "uncited", Kind: "prd", Provenance: "repo:prd", Completeness: "complete", Bytes: []byte("uncited")})
 	first, fp, err := compileSemanticProposal(c, semanticJSON(t, p), s)
 	if err != nil {
 		t.Fatal(err)
@@ -242,7 +247,7 @@ func TestSemanticCanonicalIdentity(t *testing.T) {
 	if !bytes.Equal(old, again) {
 		t.Fatal("structural identity changed")
 	}
-	s[0].Completeness = "unknown"
+	s[1].Completeness = "unknown"
 	unknownCandidate, unknown, err := compileSemanticProposal(c, semanticJSON(t, p), s)
 	if err != nil {
 		t.Fatal(err)
@@ -355,5 +360,47 @@ func TestSemanticRequiresTransaction(t *testing.T) {
 	c, p, s := semanticFixture()
 	if _, err := (&Service{}).submitSemanticCandidate(context.Background(), uuid.New(), uuid.New(), 0, c, semanticJSON(t, p), s); err == nil {
 		t.Fatal("nil beginner accepted")
+	}
+}
+
+func TestSemanticSharedWire(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/semantic-plan/candidate.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	casesRaw, err := os.ReadFile("../../../fixtures/semantic-plan/invalid-proposals.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Cases []struct {
+			Name, From, To string
+			Valid          bool
+		}
+	}
+	if err := json.Unmarshal(casesRaw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range fixture.Cases {
+		t.Run(tc.Name, func(t *testing.T) {
+			if bytes.Count(raw, []byte(tc.From)) != 1 {
+				t.Fatal("replacement must match exactly once")
+			}
+			wire := bytes.Replace(raw, []byte(tc.From), []byte(tc.To), 1)
+			var candidate apitypes.SemanticCandidate
+			err := strictSemanticJSON(wire, &candidate)
+			if (err == nil) != tc.Valid {
+				t.Fatalf("valid=%v error=%v", tc.Valid, err)
+			}
+			if tc.Valid {
+				var expected apitypes.SemanticCandidate
+				if err := json.Unmarshal(wire, &expected); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(semanticJSON(t, candidate), semanticJSON(t, expected)) {
+					t.Fatal("valid input was normalized")
+				}
+			}
+		})
 	}
 }

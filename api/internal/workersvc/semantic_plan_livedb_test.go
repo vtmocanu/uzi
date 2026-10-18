@@ -3,12 +3,16 @@ package workersvc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestSemanticCandidateLiveDB(t *testing.T) {
@@ -38,8 +42,8 @@ func TestSemanticCandidateLiveDB(t *testing.T) {
 	if first.Revision != 1 || uuid.Validate(first.Criteria[0].ID) != nil || first.Digest == "" {
 		t.Fatalf("candidate: %+v", first)
 	}
-	var stored []byte
-	if err = e.pool.QueryRow(e.ctx, `SELECT raw FROM semantic_snapshots WHERE run_id=$1 AND hash=$2`, run, first.Sources[0].Hash).Scan(&stored); err != nil {
+	stored, err := store.New(e.pool).GetSemanticSnapshot(e.ctx, store.GetSemanticSnapshotParams{RunID: run, Hash: first.Sources[0].Hash})
+	if err != nil {
 		t.Fatal(err)
 	}
 	var provenance, completeness string
@@ -180,5 +184,101 @@ func TestSemanticEnrollmentDormantLiveDB(t *testing.T) {
 	c, p, s := semanticFixture()
 	if _, err := (&Service{txBeginner: e.pool}).submitSemanticCandidate(e.ctx, worker, run, 0, c, semanticJSON(t, p), s); err == nil {
 		t.Fatal("real unenrolled run admitted")
+	}
+}
+
+func semanticPersistedState(t *testing.T, e interlockLiveDB, run uuid.UUID) []byte {
+	t.Helper()
+	var raw []byte
+	err := e.pool.QueryRow(e.ctx, `SELECT jsonb_build_object(
+ 'planning', (SELECT to_jsonb(p) FROM semantic_planning p WHERE run_id=$1),
+ 'blobs', (SELECT jsonb_agg(to_jsonb(b) ORDER BY hash) FROM semantic_snapshots b WHERE run_id=$1),
+ 'sources', (SELECT jsonb_agg(to_jsonb(s) ORDER BY identity_hash) FROM semantic_source_snapshots s WHERE run_id=$1),
+ 'history', (SELECT jsonb_agg(to_jsonb(h) ORDER BY revision) FROM semantic_candidate_history h WHERE run_id=$1))`, run).Scan(&raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestSemanticClaimFenceLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	worker := e.seedWorker(t, nil)
+	run := e.seedActiveRunOwnedBy(t, worker)
+	e.exec(t, `UPDATE runs SET claim_generation=7, completion_contract_version=1 WHERE id=$1`, run)
+	e.exec(t, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"reserved","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, run)
+	svc := &Service{txBeginner: e.pool}
+	c, p, captures := semanticFixture()
+	raw := semanticJSON(t, p)
+	if _, err := svc.submitSemanticCandidate(e.ctx, worker, run, 7, c, raw, captures); err != nil {
+		t.Fatal(err)
+	}
+	e.exec(t, `UPDATE semantic_planning SET review_state='{"outcome":"pending"}' WHERE run_id=$1`, run)
+	before := semanticPersistedState(t, e, run)
+	assertUnchanged := func(t *testing.T) {
+		t.Helper()
+		if !bytes.Equal(before, semanticPersistedState(t, e, run)) {
+			t.Fatal("refusal mutated semantic state")
+		}
+	}
+	// Force a metadata failure after the new plan blob has been inserted.
+	t.Run("metadata rollback", func(t *testing.T) {
+		e.exec(t, `ALTER TABLE semantic_source_snapshots ADD CONSTRAINT semantic_m1_metadata_failure CHECK (run_id <> '`+run.String()+`'::uuid OR kind <> 'plan' OR hash = '`+semanticHash([]byte(c.PlanMd))+`')`)
+		t.Cleanup(func() {
+			e.exec(t, `ALTER TABLE semantic_source_snapshots DROP CONSTRAINT semantic_m1_metadata_failure`)
+		})
+		changed := c
+		changed.PlanMd = "new snapshot before metadata failure"
+		_, err := svc.submitSemanticCandidate(e.ctx, worker, run, 7, changed, raw, captures)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "semantic_m1_metadata_failure" {
+			t.Fatalf("expected metadata constraint failure: %v", err)
+		}
+		assertUnchanged(t)
+	})
+	// Exercise the actual release transition, which keeps worker/generation.
+	affected, err := store.New(e.pool).ReleaseCredentialSwitch(e.ctx, store.ReleaseCredentialSwitchParams{
+		ID: run, WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, Generation: 7,
+	})
+	if err != nil || affected != 1 {
+		t.Fatalf("release: rows=%d err=%v", affected, err)
+	}
+	released, err := store.New(e.pool).GetRunByID(e.ctx, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released.Status != "queued" || !released.ClaimReleasedAt.Valid || !released.WorkerID.Valid || released.WorkerID.Bytes != worker || released.ClaimGeneration != 7 {
+		t.Fatal("release fixture did not retain the old claim pair")
+	}
+	assertUnchanged(t)
+	for _, tc := range []struct {
+		name, status string
+		released     bool
+		generation   int64
+		want         error
+	}{
+		{"actual release", "", true, 7, ErrStaleClaim},
+		{"released running", "running", true, 7, ErrStaleClaim},
+		{"generation mismatch", "running", false, 8, ErrStaleClaim},
+		{"queued", "queued", false, 7, ErrInvalidState},
+		{"claimed", "claimed", false, 7, ErrInvalidState},
+		{"awaiting approval", "awaiting_approval", false, 7, ErrInvalidState},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.status != "" {
+				e.exec(t, `UPDATE runs SET status=$2, claim_released_at=CASE WHEN $3::boolean THEN now() ELSE NULL END WHERE id=$1`, run, tc.status, tc.released)
+			}
+			for _, newPlan := range []bool{false, true} {
+				attempt := c
+				if newPlan {
+					attempt.PlanMd = "new plan from invalid claim"
+				}
+				_, err := svc.submitSemanticCandidate(e.ctx, worker, run, tc.generation, attempt, raw, captures)
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("new plan=%v: got %v want %v", newPlan, err, tc.want)
+				}
+				assertUnchanged(t)
+			}
+		})
 	}
 }

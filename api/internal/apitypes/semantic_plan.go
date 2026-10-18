@@ -1,5 +1,11 @@
 package apitypes
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+)
+
 // SemanticSourceCapture is trusted worker capture input, never lead authority.
 // Bytes are UTF-8 bytes (including NUL); JSON encodes them as base64.
 type SemanticSourceCapture struct {
@@ -23,6 +29,26 @@ type SemanticCitation struct {
 	Hash     string `json:"hash"`
 	Start    int    `json:"start"`
 	End      int    `json:"end"`
+}
+
+// UnmarshalJSON requires both offsets without changing their public wire shape.
+func (c *SemanticCitation) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		SourceID string `json:"source_id"`
+		Hash     string `json:"hash"`
+		Start    *int   `json:"start"`
+		End      *int   `json:"end"`
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&wire); err != nil {
+		return err
+	}
+	if wire.Start == nil || wire.End == nil {
+		return fmt.Errorf("citation start and end are required")
+	}
+	*c = SemanticCitation{SourceID: wire.SourceID, Hash: wire.Hash, Start: *wire.Start, End: *wire.End}
+	return nil
 }
 
 type SemanticEvidence struct {

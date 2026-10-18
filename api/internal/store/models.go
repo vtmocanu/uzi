@@ -1392,6 +1392,37 @@ type RunUserInput struct {
 	InclusionReported       bool               `json:"inclusion_reported"`
 }
 
+type SemanticCandidateHistory struct {
+	RunID     uuid.UUID `json:"run_id"`
+	Revision  int64     `json:"revision"`
+	Candidate []byte    `json:"candidate"`
+}
+
+type SemanticPlanning struct {
+	RunID       uuid.UUID   `json:"run_id"`
+	Enrollment  []byte      `json:"enrollment"`
+	Revision    int64       `json:"revision"`
+	Fingerprint pgtype.Text `json:"fingerprint"`
+	Candidate   []byte      `json:"candidate"`
+	ReviewState []byte      `json:"review_state"`
+}
+
+type SemanticSnapshot struct {
+	RunID uuid.UUID `json:"run_id"`
+	Hash  string    `json:"hash"`
+	Raw   []byte    `json:"raw"`
+}
+
+type SemanticSourceSnapshot struct {
+	RunID        uuid.UUID `json:"run_id"`
+	IdentityHash string    `json:"identity_hash"`
+	SourceID     string    `json:"source_id"`
+	Kind         string    `json:"kind"`
+	Hash         string    `json:"hash"`
+	Provenance   string    `json:"provenance"`
+	Completeness string    `json:"completeness"`
+}
+
 type Skill struct {
 	ID          uuid.UUID          `json:"id"`
 	Name        string             `json:"name"`

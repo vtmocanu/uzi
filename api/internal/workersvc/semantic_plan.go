@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -42,6 +43,40 @@ func buildSemanticCompletionContract(candidate apitypes.SemanticCandidate, revis
 func strictSemanticJSON(raw []byte, dst any) error {
 	if !utf8.Valid(raw) {
 		return fmt.Errorf("invalid UTF-8 JSON")
+	}
+
+	// Scan escape spellings before encoding/json can replace lone surrogates.
+	// Each byte is visited at most once; syntax validation remains with the decoder.
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) || raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return fmt.Errorf("short Unicode escape")
+		}
+		unit, err := strconv.ParseUint(string(raw[i+1:i+5]), 16, 16)
+		if err != nil {
+			return err
+		}
+		i += 4
+		if unit >= 0xdc00 && unit <= 0xdfff {
+			return fmt.Errorf("unpaired low surrogate")
+		}
+		if unit < 0xd800 || unit > 0xdbff {
+			continue
+		}
+		if i+6 >= len(raw) || raw[i+1] != '\\' || raw[i+2] != 'u' {
+			return fmt.Errorf("unpaired high surrogate")
+		}
+		low, err := strconv.ParseUint(string(raw[i+3:i+7]), 16, 16)
+		if err != nil || low < 0xdc00 || low > 0xdfff {
+			return fmt.Errorf("unpaired high surrogate")
+		}
+		i += 6
 	}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	var value func() error
@@ -222,7 +257,7 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 		}
 		for _, cite := range c.Citations {
 			s, exists := sources[cite.SourceID]
-			if !exists || cite.Hash != semanticHash(s.Bytes) || cite.Start < 0 || cite.End <= cite.Start || cite.End > len(s.Bytes) {
+			if !exists || s.Completeness != "complete" || cite.Hash != semanticHash(s.Bytes) || cite.Start < 0 || cite.End <= cite.Start || cite.End > len(s.Bytes) {
 				return fail()
 			}
 			if !utf8.Valid(s.Bytes[:cite.Start]) || !utf8.Valid(s.Bytes[:cite.End]) {
