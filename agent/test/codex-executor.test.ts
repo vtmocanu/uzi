@@ -3293,11 +3293,35 @@ describe("M1 composed policy guidance delivery", () => {
           }
           return report(...args);
         });
+        const reportHold = f.client.reportPolicyHold.bind(f.client);
+        type Witness = { kind: "hold ACK"; ack: Awaited<ReturnType<typeof reportHold>> } |
+          { kind: "forbidden root turn" };
+        let observe!: (event: Witness) => void;
+        const witnessed = new Promise<Witness>(resolve => { observe = resolve; });
+        t.mock.method(f.client, "reportPolicyHold", async (...args: Parameters<typeof reportHold>) => {
+          // WorkerClient.reportPolicyHold resolves only after the real HTTP reply is decoded.
+          const ack = await reportHold(...args);
+          observe({ kind: "hold ACK", ack });
+          return ack;
+        });
         const { rig, running } = f.start();
-        await waitFor(() => f.api.policyHoldRequests.length > 0 || rig.transport.turnStartCount > 0,
-          "required ACK rejection or forbidden turn");
-        if (rig.transport.turnStartCount > 0) await f.cancel(running);
-        else await withTimeout(running, 5000, "required Stop ACK hold");
+        const removeTurnListener = rig.transport.onFirstTurnStart(() => observe({ kind: "forbidden root turn" }));
+        try {
+          const outcome = await Promise.race([
+            witnessed,
+            running.then(() => ({ kind: "premature execution end" } as const),
+              error => ({ kind: "premature execution rejection", error: String(error) } as const)),
+          ]);
+          if (outcome.kind !== "hold ACK") {
+            t.diagnostic(JSON.stringify({ outcome, boundaries, lines: f.diagnostics.lines, states: f.api.states }));
+          }
+          if (outcome.kind === "forbidden root turn") await f.cancel(running);
+          assert.equal(outcome.kind, "hold ACK", "required ACK rejection must receive a decoded policy hold ACK before execution ends");
+          if (outcome.kind === "hold ACK") assert.equal(outcome.ack.disposition, "applied");
+          await withTimeout(running, 5000, "required Stop ACK hold");
+        } finally {
+          removeTurnListener();
+        }
         assert.equal(boundaries, 1);
         assert.equal(rig.providerLaunches(), 0, "no lead root may start without the required ACK");
         assert.equal(rig.transport.turnStartCount, 0);
