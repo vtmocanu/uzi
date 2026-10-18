@@ -418,7 +418,8 @@ export interface RecoveryCoordinatorOptions {
   withTerminalSourceBoundary?: <T>(runId: string, paths: readonly string[], action: (ctx: {
     open: () => boolean; quiesce: (paths: string[]) => Promise<boolean>;
     isLivePath: (clonePath: string) => boolean;
-  }) => Promise<T>) => Promise<{ entered: false } | { entered: true; value: T }>;
+    captureWip?: GitCache["captureMaintenanceWip"];
+  }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
     action: (canDelete: () => boolean) => Promise<void>,

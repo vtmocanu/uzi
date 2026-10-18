@@ -16,6 +16,7 @@ import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.j
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceResources } from "./recovery-maintenance.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -2627,12 +2628,18 @@ export class RunRunner {
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
-        withTerminalSourceBoundary: (runId, paths, action) => {
+        withTerminalSourceBoundary: (runId, paths, action, signal) => {
           const pressureOpen = () => this.dataVolume?.preflight() !== "data_volume_full";
           if (!pressureOpen()) return Promise.resolve({ entered: false as const });
           return this.withRetainedSourceBoundary(runId, paths, async ctx => action({
             ...ctx,
             open: () => pressureOpen() && ctx.open(),
+            captureWip: async (...args) => {
+              if (!pressureOpen() || !ctx.open()) throw new Error("maintenance_wip_boundary_refused");
+              const result = await ctx.captureWip(...args);
+              if (!pressureOpen() || !ctx.open()) throw new Error("maintenance_wip_boundary_refused");
+              return result;
+            },
             quiesce: async targets => {
               for (const target of targets) {
                 if (!pressureOpen() || !ctx.open()) return false;
@@ -2641,7 +2648,7 @@ export class RunRunner {
               }
               return true;
             },
-          }));
+          }), signal);
         },
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
@@ -3020,14 +3027,20 @@ export class RunRunner {
       open: () => boolean;
       quiesce: (paths: string[]) => Promise<boolean>;
       isLivePath: (clonePath: string) => boolean;
+      captureWip: GitCache["captureMaintenanceWip"];
     }) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<{ entered: false } | { entered: true; value: T }> {
-    if (this.shutdownSignal.signal.aborted || this.executionTails.has(runId)) return { entered: false };
+    // Snapshot the reserved family; a caller cannot extend authority by mutating its array.
+    clonePaths = [...clonePaths];
+    if (this.shutdownSignal.signal.aborted || signal?.aborted || this.executionTails.has(runId)) return { entered: false };
     let release!: () => void;
     const tail = new Promise<void>(resolve => { release = resolve; });
     this.executionTails.set(runId, tail);
     this.inventoryReservations.add(runId);
-    const open = (): boolean => !this.shutdownSignal.signal.aborted &&
+    let boundaryActive = true;
+    let settlementUncertain = false;
+    const open = (): boolean => boundaryActive && !settlementUncertain && !this.shutdownSignal.signal.aborted && !signal?.aborted &&
       this.executionTails.get(runId) === tail && residueQuarantine() === undefined &&
       !clonePaths.some(p => this.liveAttempts.isLivePath(p));
     const quiesce = async (paths: string[]): Promise<boolean> => {
@@ -3048,13 +3061,123 @@ export class RunRunner {
       }
       return true;
     };
+    let captureClaimed = false;
+    let captureTask: ReturnType<GitCache["captureMaintenanceWip"]> | undefined;
+    const scope = new AbortController();
+    let spawner: TickSpawner | undefined;
+    const refused = () => new Error("maintenance_wip_boundary_refused");
+    const settleOwned = async () => {
+      if (!spawner) return;
+      try {
+        await spawner.settled();
+        if (spawner.survivors().length) throw refused();
+      } catch {
+        settlementUncertain = true;
+        // The unresolved execution tail denies ordinary cleanup/recovery too.
+        this.inventoryReservations.delete(runId);
+        this.log.warn("maintenance WIP source retained", { diagnostic: "maintenance_wip_settlement_unconfirmed" });
+        throw new Error("maintenance_wip_settlement_unconfirmed");
+      }
+    };
+    const captureWip: GitCache["captureMaintenanceWip"] = (clonePath, oldHead, callbacks) => {
+      // One capture per reservation bounds the extra family scans to initial + three Git steps.
+      if (captureClaimed) return Promise.reject(refused());
+      captureClaimed = true; // Claim before any synchronous callback can reenter.
+      captureTask = (async () => {
+        const check = () => {
+          if (!boundaryActive || !open() || !clonePaths.includes(clonePath) || signal?.aborted ||
+              this.dataVolume?.preflight() === "data_volume_full") throw refused();
+          MaintenanceBudget.current()?.check();
+          MaintenanceResources.check(); // Requires the current charged token, never discovery.
+        };
+        try {
+          check();
+          if (typeof callbacks?.beforeStep !== "function" || typeof callbacks?.afterRunnerGit !== "function" ||
+              typeof clonePath !== "string" || !clonePath.startsWith("/") || resolvePath(clonePath) !== clonePath ||
+              clonePaths.some(p => typeof p !== "string" || !p.startsWith("/") || resolvePath(p) !== p) ||
+              typeof oldHead !== "string" || oldHead.length !== 40 || !/^[a-f0-9]{40}$/.test(oldHead)) throw refused();
+          const chargedSignal = MaintenanceResources.signalIfActive();
+          if (!chargedSignal) throw refused();
+          const ambientSignal = MaintenanceBudget.current()?.signal;
+          const ownerSignal = AbortSignal.any([scope.signal, chargedSignal, this.shutdownSignal.signal,
+            ...(ambientSignal ? [ambientSignal] : []), ...(signal ? [signal] : [])]);
+          ownerSignal.throwIfAborted();
+          spawner = new TickSpawner({ signal: ownerSignal, log: this.log,
+            ...(this.checkpointTestHooks?.tickSpawn ? { hooks: this.checkpointTestHooks.tickSpawn } : {}),
+            ...(this.checkpointTestHooks?.tickKillGraceMs !== undefined
+              ? { killGraceMs: this.checkpointTestHooks.tickKillGraceMs } : {}),
+          });
+          const owner = spawner;
+          const familyKey = cloneKeyOf(clonePath).cloneKey;
+          const familyQuiet = async () => {
+            check();
+            ownerSignal.throwIfAborted();
+            if (process.platform !== "linux" || !open()) return false;
+            // A retained family has one stable clone key across attempts and skills roots.
+            // Scan all paths together: one helper envelope per pass, never one per member.
+            for (const p of clonePaths) {
+              const base = pathBasename(p);
+              const source = base.startsWith(".uzi-skills-") ? join(pathDirname(p), base.slice(".uzi-skills-".length)) : p;
+              if (cloneKeyOf(source).cloneKey !== familyKey) return false;
+            }
+            const outcome = await this.quiesceImpl({
+              mode: "capture", attempt: undefined, cloneKey: familyKey, targetPaths: [...clonePaths],
+              processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
+              otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+              site: "retained_ops",
+            });
+            return outcome.process?.state === "quiescent" && open() &&
+              (!this.dockerHost || outcome.docker.state === "docker_unconfirmed");
+          };
+          return await this.git.withBoundaryProcessSpawner(request => {
+            check();
+            ownerSignal.throwIfAborted();
+            return owner.spawn(request);
+          }, ownerSignal, async () => {
+            // Initial proof is explicit and positive, before the primitive's first preparation.
+            if (!await familyQuiet()) throw refused();
+            check();
+            return this.git.captureMaintenanceWip(clonePath, oldHead, {
+              beforeStep: async step => {
+                check();
+                await callbacks.beforeStep(step);
+                check();
+              },
+              afterRunnerGit: async step => {
+                // Even command failure joins the family before the caller's durable revalidation.
+                if (!await familyQuiet()) throw refused();
+                check();
+                await callbacks.afterRunnerGit(step);
+                check();
+              },
+            });
+          });
+        } catch {
+          throw refused();
+        } finally {
+          scope.abort();
+          await settleOwned();
+        }
+      })();
+      // A caller may neglect to await; the reservation's finally still joins and refuses.
+      void captureTask.catch(() => {});
+      return captureTask;
+    };
     try {
       if (!open()) return { entered: false };
-      return { entered: true, value: await action({ open, quiesce, isLivePath: (p) => this.liveAttempts.isLivePath(p) }) };
+      return { entered: true, value: await action({ open, quiesce, captureWip, isLivePath: (p) => this.liveAttempts.isLivePath(p) }) };
     } finally {
-      this.inventoryReservations.delete(runId);
-      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
-      release();
+      boundaryActive = false;
+      scope.abort();
+      try {
+        if (captureTask) await captureTask;
+      } finally {
+        this.inventoryReservations.delete(runId);
+        if (!settlementUncertain) {
+          if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+          release();
+        }
+      }
     }
   }
 
