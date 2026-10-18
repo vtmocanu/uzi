@@ -10373,8 +10373,13 @@ export class RunRunner {
       check: () => {
         // Lifecycle failures propagate even when the optional read failed.
         MaintenanceBudget.current()?.check();
+        const currentLifecycle = flight.steering.lifecycleSignal();
+        currentLifecycle.throwIfAborted();
+        flight.steering.terminalLifecycleSignal().throwIfAborted();
+        this.shutdownSignal.signal.throwIfAborted();
+        // rearmLifecycle retires handled pause/switch stops, including the shared cancel.
+        if (currentLifecycle !== interruptedLifecycle) return false;
         interruptedCancel.throwIfAborted();
-        flight.steering.lifecycleSignal().throwIfAborted();
         return interruptedIdentity !== undefined &&
           this.client.interruptedCallsRegistration === interruptedIdentity &&
           flight.active !== undefined && this.activeRuns.get(runId) === flight.active &&
