@@ -88,7 +88,7 @@ establish hosted acceptance or CI validation. The receipt baseline is clean HEAD
 | `task gate:web` | Receipt baseline | Exit 0; browser suite passed 8 files / 28 tests. |
 | `task gate:repo` | Receipt baseline | Exit 0; tracked-secret scan and canaries passed; SAST clean. |
 | `task render:drain-knobs-check` | Receipt baseline | Exit 0; confirmed 24h default, 1h override, and ForceRoll false/true. |
-| Disposable full store integration harness (`./e2e/run-store-it.sh`, scratch-backed TMPDIR) | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; 2,984 PASS results including subtests, 0 skips across 7 packages. |
+| Disposable full store integration harness (`./e2e/run-store-it.sh`, scratch-backed TMPDIR) | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; 2,984 top-level tests passed, plus 5,121 subtest passes; 0 skips across 7 packages. |
 | `task test:e2e-lib && task test:forge-fake` | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; forge fake reported 10 passed, 0 skipped. |
 
 The gates ran serially, with no source changes during them. The implementation
