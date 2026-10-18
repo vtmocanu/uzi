@@ -7,6 +7,8 @@ interface AttemptContext {
   factory?: () => MaintenanceBudget;
   activating?: boolean;
   pendingAbort?: AbortController;
+  /** Producer clamps retain the original observation context for late cancellation. */
+  producerParent?: AttemptContext;
 }
 
 const scope = new AsyncLocalStorage<AttemptContext>();
@@ -17,6 +19,8 @@ export class MaintenanceBudget {
   readonly signal: AbortSignal;
   private readonly controller = new AbortController();
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private readonly inherited: Array<{ signal: AbortSignal; abort: () => void }> = [];
+  private inheritedBudget?: () => MaintenanceBudget | undefined;
 
   constructor(
     durationMs = 600_000,
@@ -29,7 +33,9 @@ export class MaintenanceBudget {
     this.timer.unref();
   }
 
-  remainingMs(): number { return Math.max(0, this.deadline - this.now()); }
+  remainingMs(): number {
+    return Math.max(0, Math.min(this.deadline - this.now(), this.inheritedBudget?.()?.remainingMs() ?? Infinity));
+  }
 
   /** A shorter operation consumes this attempt's clock without renewing either bound. */
   cap(maxMs: number): () => number {
@@ -40,6 +46,7 @@ export class MaintenanceBudget {
   }
 
   check(): void {
+    this.inheritedBudget?.()?.check();
     if (this.remainingMs() <= 0 && !this.signal.aborted) {
       this.controller.abort(new Error("maintenance deadline exhausted"));
     }
@@ -58,9 +65,39 @@ export class MaintenanceBudget {
     return scope.run({ budget: current }, action);
   }
 
+  /**
+   * Producer-only scope: owns its timer/listeners until the action settles, including
+   * owned cleanup. No timeout race detaches the action. Ordinary run keeps its semantics.
+   */
+  static async runProducer<T>(
+    action: (budget: MaintenanceBudget) => Promise<T>,
+    options: { durationMs?: number; signal?: AbortSignal; now?: () => number } = {},
+  ): Promise<T> {
+    const parent = scope.getStore();
+    const duration = Math.min(120_000, options.durationMs ?? 120_000, parent?.budget?.remainingMs() ?? Infinity);
+    const child = new MaintenanceBudget(duration, options.now);
+    child.inheritedBudget = () => parent?.budget;
+    const signals = [parent?.pendingAbort?.signal, parent?.budget?.signal, options.signal];
+    for (const signal of signals) {
+      if (!signal) continue;
+      const abort = () => child.controller.abort(signal.reason);
+      if (signal.aborted) abort();
+      else { signal.addEventListener("abort", abort, { once: true }); child.inherited.push({ signal, abort }); }
+    }
+    try {
+      child.check();
+      return await scope.run({ budget: child, identity: parent?.identity, producerParent: parent }, async () => {
+        const result = await action(child);
+        child.check();
+        return result;
+      });
+    } finally { child.dispose(); }
+  }
+
   /** Attach the flight's observation before synchronous abort listeners continue. */
   static attachObserved(identity: string, budget: MaintenanceBudget): void {
-    const context = scope.getStore();
+    let context = scope.getStore();
+    while (context?.producerParent) context = context.producerParent;
     if (context?.identity === identity && !context.budget) this.attachBudget(context, budget);
   }
 
@@ -86,6 +123,7 @@ export class MaintenanceBudget {
   static observeCancellation(): MaintenanceBudget | undefined {
     const context = scope.getStore();
     if (!context) return undefined;
+    if (context.producerParent) scope.run(context.producerParent, () => this.observeCancellation());
     if (!context.budget && context.factory && !context.activating) {
       context.activating = true;
       try { this.attachBudget(context, context.factory()); }
@@ -136,6 +174,8 @@ export class MaintenanceBudget {
   dispose(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    for (const { signal, abort } of this.inherited) signal.removeEventListener("abort", abort);
+    this.inherited.length = 0;
   }
 
   /**

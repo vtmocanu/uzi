@@ -2,6 +2,82 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 
+test("producer clamp caps a long parent and keeps nested ordinary scopes", async t => {
+  let now = 0;
+  const parent = new MaintenanceBudget(600_000, () => now);
+  t.after(() => parent.dispose());
+  await assert.rejects(MaintenanceBudget.run(parent, () => MaintenanceBudget.runProducer(async child => {
+    assert.equal(child.remainingMs(), 120_000);
+    assert.equal(MaintenanceBudget.current(), child);
+    MaintenanceBudget.run(parent, () => assert.equal(MaintenanceBudget.current(), child));
+    now = 120_000;
+    assert.throws(() => child.check(), /maintenance deadline/);
+    assert.equal(parent.signal.aborted, false);
+  }, { now: () => now })), /maintenance deadline/);
+});
+
+test("producer clamp inherits short parent and later pending attempt cancellation", async t => {
+  let now = 0;
+  const short = new MaintenanceBudget(20, () => now);
+  const late = new MaintenanceBudget(30, () => now);
+  t.after(() => { short.dispose(); late.dispose(); });
+  await MaintenanceBudget.run(short, () => MaintenanceBudget.runProducer(async child => {
+    assert.equal(child.remainingMs(), 20);
+  }, { now: () => now }));
+  let observe!: () => void;
+  await MaintenanceBudget.runAttempt("pending", () => late, async () => {
+    // Capture the parent continuation before entering the producer scope.
+    const trigger = new Promise<void>(resolve => { observe = resolve; });
+    const observer = trigger.then(() => { MaintenanceBudget.observeCancellation(); now = 30; assert.throws(() => late.check()); });
+    const producer = MaintenanceBudget.runProducer(async child => {
+      assert.equal(child.remainingMs(), 120_000);
+      observe();
+      await observer;
+      assert.equal(child.signal.aborted, true);
+    }, { now: () => now });
+    await assert.rejects(producer, /maintenance deadline/);
+  });
+});
+
+test("producer waits for owned action cleanup on cancellation and removes listeners", async () => {
+  const controller = new AbortController();
+  let cleaned = false;
+  await assert.rejects(MaintenanceBudget.runProducer(async child => {
+    controller.abort(new Error("cancelled"));
+    assert.equal(child.signal.aborted, true);
+    await Promise.resolve();
+    cleaned = true;
+  }, { signal: controller.signal }), /cancelled/);
+  assert.equal(cleaned, true);
+});
+
+test("producer observes late cancellation in its own continuation without replacing the clamp", async t => {
+  let now = 0, factories = 0;
+  const parent = new MaintenanceBudget(20, () => now);
+  t.after(() => parent.dispose());
+  await assert.rejects(MaintenanceBudget.runAttempt("late-producer", () => {
+    factories++;
+    return parent;
+  }, () => MaintenanceBudget.runProducer(async child => {
+    assert.equal(MaintenanceBudget.observeCancellation(), child);
+    assert.equal(factories, 1);
+    assert.equal(child.remainingMs(), 20);
+    now = 20;
+    child.check();
+  }, { now: () => now })), /maintenance deadline/);
+  assert.equal(factories, 1);
+});
+
+test("producer checks tighter parent clock before its abort timer runs", async t => {
+  let parentNow = 0;
+  const parent = new MaintenanceBudget(50, () => parentNow);
+  t.after(() => parent.dispose());
+  await assert.rejects(MaintenanceBudget.run(parent, () => MaintenanceBudget.runProducer(async child => {
+    parentNow = 50;
+    child.check();
+  }, { now: () => 0 })), /maintenance deadline/);
+});
+
 test("monotonic cumulative budget survives wall jumps, repeats and disposal", async t => {
   let now = 10;
   const budget = new MaintenanceBudget(undefined, () => now);
