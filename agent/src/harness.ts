@@ -409,6 +409,8 @@ export interface GracefulShutdownCheckpoint {
 }
 
 type BoundaryRequestBase = {
+  /** Internal done-only cooperative cancellation; never grants credential authority. */
+  checkpointStop?: import("./checkpoint-stop.js").CheckpointStop;
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
   /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
   sink?: BoundarySink;

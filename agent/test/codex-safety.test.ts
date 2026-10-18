@@ -2,8 +2,9 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import * as codexLauncher from "../src/codex/launcher.js";
-import { WorkerClient } from "../src/client.js";
-import { buildRunLaneReconcile } from "../src/codex/codex-executor.js";
+import { WorkerClient, CodexRequestFailure } from "../src/client.js";
+import { GitCache, CheckpointSoftDeadlineError } from "../src/git.js";
+import { createRunLaneInstallerReconcile, buildRunLaneReconcile } from "../src/codex/codex-executor.js";
 import { nullLogger } from "./helpers.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 
@@ -1680,3 +1681,211 @@ describe("M2 first-send deadline safety propagation", () => {
     assert.equal(reg.state(), "poisoned");
   });
 });
+
+
+describe("m1 cooperative safety admission", () => {
+  it("attributes an already hard-expired admission instead of reporting a soft stop", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3122));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const stop = new AbortController();
+    stop.abort();
+    await assert.rejects(safety.withBoundary({
+      boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 0,
+      activeStep: () => "checkpoint_lock_wait", checkpointStop: { signal: stop.signal },
+    }, async () => assert.fail("expired action ran")), (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.equal(error.errors[0]?.category, "timeout");
+      assert.equal(error.boundary, "checkpoint");
+      assert.equal(error.sink, "done_checkpoint");
+      assert.equal(error.step, "checkpoint_lock_wait");
+      assert.equal(reg.isPoisoned(), true);
+      return true;
+    });
+  });
+  it("forfeits a queued boundary while retaining the active predecessor in the tail", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3123));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const entered = defer<void>(), release = defer<void>();
+    const events: string[] = [];
+    const active = safety.withBoundary(req("checkpoint"), async () => { entered.resolve(); await release.promise; events.push("active"); });
+    await entered.promise;
+    const stop = new AbortController();
+    const request = { ...req("checkpoint"), checkpointStop: { signal: stop.signal } };
+    const cancelled = safety.withBoundary(request, async () => assert.fail("cancelled action ran"));
+    const rejected = assert.rejects(cancelled, CheckpointSoftDeadlineError);
+    const later = safety.withBoundary(req("checkpoint"), async () => { events.push("later"); });
+    stop.abort(); await rejected;
+    assert.deepEqual(events, []);
+    release.resolve(); await Promise.all([active, later]);
+    assert.deepEqual(events, ["active", "later"]);
+    assert.equal(reg.isPoisoned(), false);
+  });
+
+  for (const path of ["buffered", "streaming"] as const) {
+    for (const failure of ["clean", "dispose", "reap"] as const) {
+      it("m1 " + path + " cancellation awaits " + failure + " cleanup and closes owned collectors", async () => {
+        const reg = new ExecutionRegistry(newLocalExecutionEpoch(3124));
+        const launched = defer<void>(), launch = defer<void>(), disposed = defer<void>(), reap = defer<void>();
+        const stdout = new PassThrough(), stderr = new PassThrough();
+        let reaps = 0, disposals = 0;
+        const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+          launched.resolve(); await launch.promise;
+          return { stdin: null, stdout, stderr, waitChild: async () => new Promise(() => {}), root: {
+            kind: "boundary_action",
+            dispose: async () => { disposals++; disposed.resolve(); if (failure === "dispose") throw new Error("unsafe dispose"); },
+            reap: async () => { reaps++; await reap.promise; return failure === "reap" ? failReap(1000) : { ok: true }; },
+          } };
+        });
+        const cache = new GitCache("/unused-m1", nullLogger());
+        const stop = new AbortController();
+        const boundary = safety.withBoundary(req("checkpoint"), async permit => {
+          const operation = cache.withBoundaryProcessSpawner(request => safety.spawnBoundaryProcess(permit, request), permit.signal,
+            async () => path === "buffered" ? cache.branchTip("/unused", "agent/issue-3123")
+              : cache.readBare("/unused", ["show", "HEAD"], { maxBytes: 1024 }), { softSignal: stop.signal });
+          const rejection = assert.rejects(operation, error => {
+            if (failure === "clean") assert.ok(error instanceof CheckpointSoftDeadlineError);
+            else assert.ok(!(error instanceof CheckpointSoftDeadlineError));
+            return true;
+          });
+          await launched.promise;
+          stop.abort(); // deliberately during async launch
+          launch.resolve();
+          await disposed.promise;
+          assert.equal(stdout.destroyed, false, "no stream closure before verified reap");
+          reap.resolve();
+          await rejection;
+          if (failure === "clean") {
+            assert.equal(stdout.destroyed, true);
+            assert.equal(stderr.destroyed, true);
+          }
+        });
+        if (failure === "clean") await boundary;
+        else await assert.rejects(boundary, CodexBoundaryError);
+        assert.equal(reaps, 1); assert.equal(disposals, 1);
+        assert.equal(reg.isPoisoned(), failure !== "clean");
+        stdout.destroy(); stderr.destroy();
+      });
+    }
+  }
+
+  for (const outcome of ["settled", "unsafe", "hard"] as const) {
+    it("m1 done stop joins the real installer before classification: " + outcome, async () => {
+      const lifecycle = new AbortController(), stop = new AbortController(), hard = new AbortController();
+      const selected = selectCodexBinding({ codex: { auth_mode: "api_key", access_token: "fixture-token", capability: "fixture-cap" } });
+      if (selected.kind !== "codex") assert.fail("binding");
+      let calls = 0;
+      const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+        runId: "run-1", binding: selected.binding,
+        client: { releaseCodex: async () => { calls++; assert.fail("no credential work"); },
+          refreshCodex: async () => { calls++; assert.fail("no refresh"); } },
+        registerToken: () => assert.fail("no token"),
+      });
+      const settlement = defer<{ results: []; truncated: boolean }>();
+      let rejectInstall!: (error: Error) => void;
+      installer.promise = Promise.race([settlement.promise, new Promise<never>((_resolve, reject) => { rejectInstall = reject; })]);
+      lifecycle.abort(); stop.abort();
+      const authority = new AbortController();
+      const request = { ...req("checkpoint"), checkpointStop: {
+        signal: stop.signal, workerShutdown: () => ({ stopSignal: authority.signal, deadlineAt: Date.now() + 1000 }),
+      } };
+      let returned = false;
+      const result = installer.reconcile(request, hard.signal).finally(() => { returned = true; });
+      // Attach immediately: unsafe cleanup must become blocked, not an unhandled rejection.
+      const checked = outcome === "settled" ? assert.rejects(result, CheckpointSoftDeadlineError)
+        : result.then(value => assert.equal(value.kind, "blocked"));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(installer.abort.signal.aborted, true);
+      assert.equal(returned, false, "no clean stop while installer bookkeeping is live");
+      assert.equal(calls, 0);
+      if (outcome === "unsafe") rejectInstall(new Error("unverified installer cleanup"));
+      else if (outcome === "hard") hard.abort();
+      else settlement.resolve({ results: [], truncated: false });
+      await checked;
+      assert.equal(calls, 0);
+      // The real owner retains and eventually joins the promise after hard expiry.
+      if (outcome === "hard") {
+        settlement.resolve({ results: [], truncated: false });
+        await installer.promise;
+      }
+    });
+  }
+
+  for (const fenced of [false, true]) {
+    it("m1 installer source distinguishes worker shutdown from real lifecycle fence: " + fenced, async () => {
+      const lifecycle = new AbortController(), stop = new AbortController(), authority = new AbortController();
+      const selected = selectCodexBinding({ codex: { auth_mode: "api_key", access_token: "fixture-token", capability: "fixture-cap" } });
+      if (selected.kind !== "codex") assert.fail("binding");
+      const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+        runId: "run-1", binding: selected.binding,
+        client: { releaseCodex: async () => assert.fail("no release after lifecycle abort"),
+          refreshCodex: async () => assert.fail("no refresh") }, registerToken: () => assert.fail("no token"),
+      });
+      lifecycle.abort(); stop.abort(); if (fenced) authority.abort();
+      const proof = { stopSignal: authority.signal, deadlineAt: Date.now() + 1000 };
+      const request = { ...req("checkpoint"), checkpointStop: { signal: stop.signal, workerShutdown: () => proof } };
+      if (fenced) assert.equal((await installer.reconcile(request, new AbortController().signal)).kind, "blocked");
+      else await assert.rejects(installer.reconcile(request, new AbortController().signal), CheckpointSoftDeadlineError);
+    });
+  }
+
+  it("m1 a soft stop never downgrades an ambiguous subscription refresh", async () => {
+    const selected = selectCodexBinding({ codex: { auth_mode: "subscription", access_token: "fixture-token", capability: "fixture-cap", generation: 3,
+      chatgpt_account_id: "fixture-account", chatgpt_plan_type: null } });
+    if (selected.kind !== "codex") assert.fail("binding");
+    const stop = new AbortController();
+    const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", nullLogger());
+    const reconcile = buildRunLaneReconcile("run-1", client, selected.binding, () => assert.fail("no token"));
+    const original = client.refreshCodex.bind(client);
+    client.refreshCodex = async () => { stop.abort(); throw new CodexRequestFailure("parent_abort"); };
+    const request = { ...req("checkpoint"), checkpointStop: { signal: stop.signal } };
+    const first = await reconcile(request, new AbortController().signal);
+    assert.equal(first.kind, "blocked");
+    const again = await reconcile(request, new AbortController().signal);
+    assert.equal(again.kind, "blocked");
+    client.refreshCodex = original;
+  });
+});
+
+
+it("m1 cancellation during natural-exit reap closes streams only after the single reap settles", async () => {
+  const reg = new ExecutionRegistry(newLocalExecutionEpoch(3126));
+  const inReap = defer<void>(), reaped = defer<ReapOutcome>(), disposed = defer<void>();
+  const stdout = new PassThrough(), stderr = new PassThrough();
+  let reaps = 0, disposals = 0;
+  const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+    stdin: null, stdout, stderr, waitChild: async () => ({ code: 0 }),
+    root: { kind: "boundary_action", reap: async () => { reaps++; inReap.resolve(); return reaped.promise; },
+      dispose: async () => { disposals++; disposed.resolve(); } },
+  }));
+  await safety.withBoundary(req("checkpoint"), async permit => {
+    const process = await safety.spawnBoundaryProcess(permit, { argv: ["/bin/true"], cwd: "/unused", env: {}, identity: "worker_pat" });
+    await inReap.promise;
+    const cancelled = process.cancel();
+    await disposed.promise;
+    assert.equal(stdout.destroyed, false); assert.equal(stderr.destroyed, false);
+    reaped.resolve({ ok: true }); await cancelled;
+    assert.equal(stdout.destroyed, true); assert.equal(stderr.destroyed, true);
+  });
+  assert.equal(reaps, 1); assert.equal(disposals, 1); assert.equal(reg.isPoisoned(), false);
+});
+
+for (const refusal of ["vault", "account", "response", "lifecycle", "stale"] as const) {
+  it("m1 soft admission preserves " + refusal + " refusal", async () => {
+    const subscription = refusal === "stale";
+    const selected = selectCodexBinding({ codex: subscription
+      ? { auth_mode: "subscription", access_token: "fixture-token", capability: "fixture-cap", generation: 3,
+        chatgpt_account_id: "fixture-account", chatgpt_plan_type: null }
+      : { auth_mode: "api_key", access_token: "fixture-token", capability: "fixture-cap" } });
+    if (selected.kind !== "codex") assert.fail("binding");
+    const stop = new AbortController(), lifecycle = new AbortController();
+    if (["vault", "lifecycle", "stale"].includes(refusal)) stop.abort();
+    if (refusal === "lifecycle") lifecycle.abort();
+    const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", nullLogger());
+    client.releaseCodex = async () => { stop.abort(); throw new CodexRequestFailure("response"); };
+    const reconcile = buildRunLaneReconcile("run-1", client, selected.binding, () => assert.fail("no token"),
+      { value: subscription ? 2 : undefined }, () => refusal === "vault", lifecycle.signal);
+    // A shutdown label alone never exempts the ordinary lifecycle fence.
+    const request = { ...req(refusal === "lifecycle" ? "shutdown" : "checkpoint"), checkpointStop: { signal: stop.signal } };
+    assert.equal((await reconcile(request, new AbortController().signal)).kind, "blocked");
+  });
+}

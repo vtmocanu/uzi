@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { GitCache, CheckpointSoftDeadlineError, type BoundaryProcessSpawner } from "../src/git.js";
 import { CheckpointChildStartupTimeoutError } from "../src/harness.js";
+import { CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 import { CodexLaunchError } from "../src/codex/launcher.js";
 import { nullLogger } from "./helpers.js";
 
@@ -102,15 +103,18 @@ for (const route of routes) {
       (error: unknown) => { assert.equal(error, original); return true; });
     });
 
-    it("retains unrelated error behavior when the soft signal fires", async () => {
+    it("refuses unverified startup cleanup when the soft signal fires", async () => {
       const soft = new AbortController();
       await assert.rejects(invoke(async () => {
         soft.abort();
         throw new Error("private-input");
       }, new AbortController().signal, { softSignal: soft.signal, softDeadlineAt: Date.now() + 10_000 }),
       (error: unknown) => {
-        assert.ok(error instanceof CheckpointSoftDeadlineError);
-        assert.equal(error.message, "checkpoint publication soft deadline exceeded");
+        assert.ok(error instanceof CheckpointUnsafeCleanupError);
+        assert.ok(!(error instanceof CheckpointSoftDeadlineError));
+        assert.equal(error.message, "checkpoint child startup cleanup unverified");
+        assert.equal((error.cause as Error).message, "private-input");
+        assert.equal(error.message.includes("private-input"), false);
         return true;
       });
     });

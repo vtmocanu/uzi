@@ -1,3 +1,4 @@
+import { checkCheckpointStop, CheckpointUnsafeCleanupError, waitCheckpointAdmission } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 1, first unit): the `CodexExecutionSafety` facade and
 // the trusted boundary-action lane.
 //
@@ -341,7 +342,21 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const held = new Promise<void>((res) => { release = res; });
     this.queueTail = prior.then(() => held);
     try {
-      await MaintenanceBudget.waitFor(prior);
+      try {
+        await MaintenanceBudget.waitFor(waitCheckpointAdmission(prior, request.checkpointStop));
+      } catch (error) {
+        if (this.registry.isPoisoned() || Date.now() >= deadlineAt || request.gracefulShutdownCheckpoint?.stopSignal.aborted) {
+          const errors: readonly HarnessError[] = this.registry.isPoisoned() ? this.registry.poisonErrors()
+            : request.gracefulShutdownCheckpoint?.stopSignal.aborted
+              ? [{ category: "authorization", message: "codex shutdown checkpoint authority revoked" }]
+              : [{ category: "timeout", message: "codex boundary expired in the acquisition queue" }];
+          this.registry.poison(errors);
+          throw new CodexBoundaryError("reconcile", errors, error, undefined, {
+            boundary: request.boundary, sink: request.sink, step: readStep(request),
+          });
+        }
+        throw error;
+      }
       return await this.runBoundary(request, action, deadlineAt);
     } finally {
       release();
@@ -470,10 +485,12 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         throw new CodexBoundaryError("reconcile", reconciled.errors, undefined, reconciled.deferral, where);
       }
       requireRemaining("reconcile");
+      checkCheckpointStop(request.checkpointStop);
     }
 
     // (2) Quiesce child admission. Must be fully quiescent or the sink is uncalled.
     requireRemaining("quiesce");
+    checkCheckpointStop(request.checkpointStop);
     const q = await this.seams.quiesce({ ...request, deadlineMs: remainingMs(deadlineAt) });
     if (q.kind !== "quiescent") {
       const errors: readonly HarnessError[] =
@@ -503,6 +520,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       throw new CodexBoundaryError("reap", errors, undefined, undefined, where);
     }
     requireRemaining("reap");
+    checkCheckpointStop(request.checkpointStop);
 
     // (4) Mint the unforgeable matching-epoch permit and (5) run the action while
     // holding it. The permit/closed epoch is held through the full async action and
@@ -566,6 +584,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       );
     }
     if (!outcome.ok) throw outcome.error;
+    checkCheckpointStop(request.checkpointStop);
     return outcome.value;
     } finally {
       cancelDeadline();
@@ -678,8 +697,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       if (cancellation.signal.aborted || permit.signal.aborted) await dispose();
       const reaped = await reap;
       if (cancellation.signal.aborted || permit.signal.aborted) await dispose();
-      if (disposalFailed) throw new TrustedExecutionRefusal("boundary process disposal failed");
-      if (!reaped.ok) throw new TrustedExecutionRefusal("boundary process root did not reap cleanly");
+      if (disposalFailed) throw new CheckpointUnsafeCleanupError("boundary process disposal failed");
+      if (!reaped.ok) throw new CheckpointUnsafeCleanupError("boundary process root did not reap cleanly");
       if (softTimeout && !cancellation.signal.aborted) {
         // The timeout only authorizes a skip after the supervisor has stopped its
         // owned process group and the registry has verified a full-root reap.
@@ -692,7 +711,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         return { code: -1, softTimedOut: true };
       }
       if (permit.signal.aborted) throw new TrustedExecutionRefusal("boundary process deadline exceeded");
-      if (cancellation.signal.aborted) return { code: -1 };
+      if (cancellation.signal.aborted) {
+        launched.stdout?.destroy();
+        launched.stderr?.destroy();
+        return { code: -1 };
+      }
       if (terminalError !== undefined) throw terminalError;
       if (!terminal) throw new TrustedExecutionRefusal("boundary process produced no terminal result");
       return terminal;

@@ -1,3 +1,4 @@
+import { cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
 //
@@ -913,7 +914,7 @@ export function createRunLaneInstallerReconcile(
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
         timer = chunkedTimeout(() => resolve(false), left(), { now: timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0), () => resolve(false));
       });
     } finally {
       timer?.cancel();
@@ -925,6 +926,7 @@ export function createRunLaneInstallerReconcile(
     const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const cancellation = AbortSignal.any([signal, authoritySignal,
+      ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
       ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
       category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
@@ -934,7 +936,18 @@ export function createRunLaneInstallerReconcile(
     const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
       cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
     if (cause && cancellation.aborted) return refused();
-    if (!await settle(deadlineAt, cancellation, remaining)) return refused();
+    if (!await settle(deadlineAt, cancellation, remaining)) {
+      if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
+        // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
+        // credential authority. The original hard deadline still bounds the join.
+        const cleanupSignal = AbortSignal.any([signal,
+          ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
+            .filter((s): s is AbortSignal => s !== undefined)]);
+        if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
+        return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+      }
+      return refused();
+    }
     return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
   };
   return Object.assign(state, { settle, reconcile });
@@ -983,7 +996,7 @@ export function buildRunLaneReconcile(
     const deadlineAt = Math.min(Date.now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const signal = AbortSignal.any([boundarySignal,
-      ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+      ...[authoritySignal, request.checkpointStop?.signal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const expired = () => signal.aborted || Date.now() >= deadlineAt ||
       (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
@@ -993,8 +1006,16 @@ export function buildRunLaneReconcile(
         : `codex ${binding.authMode} boundary reconcile failed` }],
       ...(deferral ? { deferral } : {}),
     });
+    // Only a pre-exchange stop can be clean. A shutdown proof explains lifecycle
+    // cancellation for admission, never authorizes ordinary credential work.
+    const cleanStop = () => !cause && !operationUncertain && !boundarySignal.aborted &&
+      Date.now() < deadlineAt && !isVaultLocked?.() &&
+      (binding.authMode !== "subscription" || (committed.value !== undefined &&
+        Number.isSafeInteger(committed.value) && committed.value >= binding.generation)) &&
+      cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal);
+    if (cleanStop()) throw new CheckpointSoftDeadlineError();
     // Lifecycle cancellation wins even after an ambiguous send; the runner routes steering.
-    if (authoritySignal?.aborted) return blocked();
+    if (authoritySignal?.aborted) return blocked(operationUncertain ? "refresh_unknown" : undefined);
     // Issue #1789: the run already learned (mid-turn) that the owner vault is locked: defer at once
     // with NO credential call, instead of re-asking the api for a refresh/release it will refuse.
     if (isVaultLocked?.()) {
@@ -1052,7 +1073,7 @@ export function buildRunLaneReconcile(
             }
             const failure = codexRefreshFailure(err);
             // The boundary deadline after a send cannot prove whether the provider spent the token.
-            if (failure === "cancelled" && boundarySignal.aborted) {
+            if (failure === "cancelled" && signal.aborted) {
               operationUncertain = true;
               return blocked("refresh_unknown");
             }
