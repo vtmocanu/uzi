@@ -826,7 +826,7 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
       approvedPlan: undefined,
       gatePlan: async () => {
         gated = true;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
       },
     });
     const log = recordingLog();
@@ -2319,7 +2319,7 @@ async function runLiveSubscription(): Promise<void> {
         worktreePath: worktree,
         planApproved: false,
         approvedPlan: undefined,
-        gatePlan: async () => ({ kind: "approve", selection: { source: "own", agents: [] } }) as never,
+        gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }),
         agents,
         checkpoint: async () => {},
       });
@@ -2562,7 +2562,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       approvedPlan: undefined,
       gatePlan: async () => {
         planGates += 1;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
       },
       agents,
       checkpoint: async () => {
