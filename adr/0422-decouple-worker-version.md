@@ -74,3 +74,53 @@ All actual spec-hash/generation drift — image pin, template or size — and dr
   3. The CLI is deliberately read-mostly for workers (`docs/cli.md`: "No `worker create` and no `admin` writes"; minting a join token is web-only). A worker-write verb would be the first and cuts against that convention.
   Building a CLI verb would therefore require **new** product surface — an admin-scoped, operator-initiated manual-drain endpoint distinct from the controller's cordon — which this PRD's controller-driven model does not need. If operator-initiated manual drain is wanted later, it is a clean follow-up (new admin endpoint + CLI verb + tests). Recorded here as an explicit deferral per the PRD's "add it OR defer it in the ADR with a reason."
 - **(f) Reverted-drift cordon recovery (issue #458 — landed, not deferred; historical mechanism).** The following records #458's original single-writer model, not the current release predicate: #1470 added reason-owned drain release and independent maintenance fences; #3103 removed elapsed-time busy-drift replacement. No timer now authorizes uncordon. A worker cordoned on drift (D4/D8) whose drift was then REVERTED before it rolled — an operator resets `workers.image.tag` mid-rollout — used to stay cordoned forever: both the drain-deadline check and the force-roll override live INSIDE `reconcileWorker`'s drift branch, *after* the no-drift early return, and `draining_since` is cleared only by `RegisterWorker` on an actual roll (a reverted drift has nothing to roll). Fixed by clearing `draining_since` on the no-drift reconcile path via a new symmetric uncordon control-write — `DELETE /api/controller/workers/{id}/drain` (`ControllerUncordonWorker` → `hostedsvc.Uncordon` → `UncordonHostedWorker`) and `apiclient.ClearDrain` — the exact mirror of D8's cordon `POST`. **Invariant this relies on:** `draining_since` has a single writer and a single meaning — the controller's own drift-cordon (there is no user/admin/node-maintenance drain) — so "no drift + still draining" can only be a reverted drift or a just-committed roll, both correct to clear; if a second `draining_since` writer is ever added, the unconditional no-drift uncordon must be revisited. The clear is fail-safe (on error, log and retry next tick — a failed uncordon self-heals) and idempotent (converges to NULL alongside `RegisterWorker`; `ClearDrain` treats a 404 as success, the opposite of the cordon `RequestDrain`'s fail-closed 404-is-error). This is the recovery corner flagged under (d)'s still-open live-cluster validation, so validating it on-cluster belongs with M9.
+
+## #3103 local verification 2026-10-18
+
+The local results below were inspected by the implementation lead. They do not
+establish hosted acceptance or CI validation. The receipt baseline is clean HEAD
+`0250a7c7f529dd8269804f925bde03a9696ff9ce`.
+
+| Local check | Tested revision | Recorded result |
+|---|---|---|
+| `task gate:controller` | `77c0229d0a7a2afbf4201484287c28e08d8bbb8c` | Exit 0; controller tree unchanged at the receipt baseline. |
+| `env -u UZI_TEST_DATABASE_URL task gate:api` | Receipt baseline | Exit 0; race enabled, sqlc drift clean, API deadcode 0 findings against a 0 baseline. |
+| `task gate:web` | Receipt baseline | Exit 0; browser suite passed 8 files / 28 tests. |
+| `task gate:repo` | Receipt baseline | Exit 0; tracked-secret scan and canaries passed; SAST clean. |
+| `task render:drain-knobs-check` | Receipt baseline | Exit 0; confirmed 24h default, 1h override, and ForceRoll false/true. |
+| Disposable full store integration harness (`./e2e/run-store-it.sh`, scratch-backed TMPDIR) | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; 2,984 PASS results including subtests, 0 skips across 7 packages. |
+| `task test:e2e-lib && task test:forge-fake` | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; forge fake reported 10 passed, 0 skipped. |
+
+The gates ran serially, with no source changes during them. The implementation
+lead verified that the new blocker query and its generated code were unchanged
+since the store-harness revision. E2E sources
+were likewise unchanged. The repeated M4 string sweep of E2E phases, library,
+library tests and forge fake found unchanged credential-pool cases; no assertions
+or fakes needed edits.
+
+Executed live-DB PASS evidence includes `TestWorkerUpgradeBlockersProjectionLiveDB`,
+`TestWorkerUpgradeBlockersOwnerAdminLiveDB`, and
+`TestHostedRollRetainedClaimsLiveDB` (the API parent injects the controller bridge
+and proves its child did not skip), plus `TestCrossCheckLaneEligibilityLiveDB`
+for own-draining and foreign-draining cases.
+
+M1 red/green evidence records `TestBusyDriftNeverExpires` failing before the
+policy fix (exit 1) and passing afterward (exit 0), using a fake clock for
+1h, 24h, equality and exceeded boundaries; no real 24-hour wait was performed.
+Those initial logs do not establish an embedded source SHA; the root lead
+observed the tested source. The first full-DB query test failed on fixture
+active-branch-ref uniqueness; unique UUID refs fixed it in the store-harness
+revision, followed by three narrowed tests with 0 skips and the green full harness.
+
+A disposable-DB EXPLAIN measurement used 78 fixture workers, 8,000 terminal-history
+rows (90% assigned to one worker), an authorized batch of 4, fresh ANALYZE and
+`idx_runs_worker`: execution was 2.505 ms. This is a measurement, not a production
+performance guarantee; no index or migration was added.
+
+**Unrun:** isolated hosted drain, new-root refusal, existing-work completion and
+idle-upgrade acceptance. No expressly isolated disposable hosted worker was
+supplied; shared workers, runs and volumes were not mutated. PRD #1470 hosted
+acceptance remains unchecked; #3103 is delivered without closure pending that
+acceptance. This evidence gives no
+lost-source or shutdown-preservation guarantee. Subsequent receipt-only
+documentation does not alter tested product trees; no API embedded docs changed.
