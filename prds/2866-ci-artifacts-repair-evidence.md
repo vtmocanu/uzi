@@ -82,12 +82,19 @@ none establishes live-provider acceptance.
   to the dependency provisioning failure below.
 - [x] Owner selection and GitHub-only documentation written and mirrored;
   documentation checks are recorded separately below.
-- [ ] Required final component gates on the final integrated head. The current
+- [ ] Required final component gates on the final integrated head. The earlier
   web gate **FAILED** at dependency check (`log7NvY8U`, `EXIT=201`):
   installed Playwright and playwright-core 1.63 versus locked 1.64,
   KaTeX 0.18.2 versus 0.18.10, and Commander 8.3 versus 15.
   The same four mismatches were confirmed on the base `34a6f8b5` export
-  (`logKa6z8f`). No manual install is permitted; this is not a passing gate.
+  (`logKa6z8f`); this was a provisioning failure, not a product regression
+  or a passing gate. On 2026-10-18 the owner authorized the narrow
+  project-dependency exception: `npm ci --ignore-scripts` in `web/` at
+  committed `266d4ef3f8f475098c842d327a21ed52ff09e70f` completed with
+  `EXIT=0` (`gate-log.AJCXVQ`). Tracked manifests and lockfiles remained
+  byte-identical. The merge did not change the agent lockfile, so `agent/`
+  was not refreshed. Every web check must rerun in the refreshed environment;
+  no earlier mismatched-environment result discharges acceptance.
 - [ ] Four real-database composition cases: **NOT RUN**:
   `TestCIArtifactsRepairE2E/claude/fresh`,
   `TestCIArtifactsRepairE2E/claude/resume`,
