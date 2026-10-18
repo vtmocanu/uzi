@@ -1961,6 +1961,9 @@ describe("#2493 initial credential release", () => {
       JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
     await CodexSessionStore.persist(priorHome, path.join(homeDir, "codex-session-store"));
     const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    // Synthetic roots use host-owned files; UID readiness is an explicit fixture precondition.
+    let readiness = 0;
+    git.normalizeRetainedSourceObjects = async () => { readiness++; };
     const quiesceRun = async () => ({
       process: { state: "quiescent" as const, processes: [], killed: [], detail: "fixture roots reaped" },
       docker: { state: "not_wired" as const, removed: [], detail: "not wired" },
@@ -1993,6 +1996,7 @@ describe("#2493 initial credential release", () => {
       assert.equal(api.states.at(-1)?.body.status, "recovery_wait", diagnostics.lines.join("\n"));
       assert.equal(api.states.at(-1)?.body.session_id, thread);
       assert.equal(await CodexSessionStore.inspectSession(path.join(homeDir, "codex-session-store"), thread), "present");
+      assert.equal(readiness, 0, "initial execution does not normalize a retained source");
       const releasesBefore = api.codexRequests.filter(r => r.operation === "release").length;
       const secondFactory = () => {
         const second = configureRig(makeMultiEpochRig([epochResponder(freshThread, "tn-fresh", (t, th, tn) => {
@@ -2003,6 +2007,7 @@ describe("#2493 initial credential release", () => {
         const resumeRun = resumedExecutor.run.bind(resumedExecutor);
         resumedExecutor.run = async ctx => {
           successorPath = ctx.worktreePath;
+          assert.equal(readiness, 1, "retained readiness completed before successor execution");
           assert.equal(ctx.sessionId, undefined, "the retained-source successor starts a fresh session");
           assert.notEqual(successorPath, predecessorPath);
           assert.match(successorPath, /\.attempt-.*-g2-/);
@@ -2021,6 +2026,7 @@ describe("#2493 initial credential release", () => {
         .execute({ ...claim, claim_generation: claim.claim_generation! + 1, session_id: thread, last_seq: 1000 });
       assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
       assert.ok(api.codexRequests.filter(r => r.operation === "release").length > releasesBefore, "reclaim freshly authorizes");
+      assert.equal(readiness, 1, "reclaim normalized the retained source once");
       const second = secondRigs.at(-1)!;
       const requests = second.epochs[0]!.transport.requests;
       assert.equal(requests.some(r => r.method === "thread/resume"), false);

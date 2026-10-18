@@ -145,3 +145,42 @@ These are host runner/fake-supervisor fault tests, not replacements for the
 separate real distinct-UID permission and credential proofs. No surviving
 process was manufactured or claimed. Final M3 delivery still requires its
 complete integration gates and real-UID proof.
+
+### M2 integration-gate fixture repair
+
+`UZI_AGENT_TEST_CONCURRENCY=2 task gate:agent` on `01980dc7` failed,
+exit 201, log `.uzi/scratch/gate-log.OLVErZ`: 16,154 passed,
+three failed, 15 skipped and zero cancelled; unit duration 4,862 seconds.
+M4 did not run. The failures were the retained release-unavailable reclaim
+in `codex-executor.test.ts`, retained session-artifact adoption in
+`runner-resume-preflight.test.ts`, and late native park ACK fencing in
+`runner-worker-memory.test.ts`.
+
+All three failed again in a narrow selection on `01980dc7` (log
+`.uzi/scratch/gate-log.dflgqN`, exit 1). The equivalent selected command on
+an isolated original-base `1edf88d3` export passed all three without skips
+(log `.uzi/scratch/gate-log.3sbrub`, exit 0). Both used the hermetic preload,
+skip/leak wrappers and an explicit Node concurrency-two flag. The wrapper's
+diagnostic printed its default concurrency estimate because the environment
+override was unset; the explicit Node flag was identical in both commands.
+
+These were new readiness-dependency integration regressions, not classified
+as unrelated gate failures. Their host-only synthetic-root fixtures now
+explicitly satisfy readiness and assert its single call before successor
+execution. The resume wrapper forwards the real executor's sandbox profile;
+the memory successor fake declares the profile it models. Production guards,
+timeouts and existing adoption/session/custody/fencing assertions are unchanged.
+The separate real-UID proof has no injected launcher or readiness stub.
+
+The repaired narrow selection passed all three, no skips, in 19 seconds
+(log `.uzi/scratch/gate-log.mJDdXy`, exit 0). This run also sets the environment
+concurrency override to two, so its wrapper diagnostic agrees with the Node flag.
+A full gate repeat is still required after the scoped repair review.
+
+The real-UID lane on `01980dc7` separately passed: log
+`.uzi/scratch/gate-log.NV9cSL`, exit 0, report
+`.uzi/scratch/worker-uid.88EBP0/results.xml`. All nine retained-permission
+leaves passed without skips, failures or errors, plus all existing required
+worker/command leaves. Image identity matched the original ID above.
+Worker proof: 172 seconds; command proof: 19 seconds. These are local source-tree
+timings, not measured CI critical-path results.
