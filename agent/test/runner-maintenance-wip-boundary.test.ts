@@ -103,8 +103,9 @@ for (const dirty of [false, true]) test("real owned boundary captures " + (dirty
     await fs.writeFile(path.join(f.root, "untracked"), "new");
     await fs.writeFile(path.join(f.root, "binary"), Buffer.from([0, 255, 1]));
   }
+  const phases: string[] = [];
   const after: string[] = [];
-  const result = await f.capture({ beforeStep: callbacks.beforeStep, afterRunnerGit: async step => {
+  const result = await f.capture({ beforeStep: async (step, phase) => { phases.push(step + ":" + phase); }, afterRunnerGit: async step => {
     after.push(step);
     for (const pid of f.pids) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   } });
@@ -113,6 +114,7 @@ for (const dirty of [false, true]) test("real owned boundary captures " + (dirty
   assert.equal(value.kind, dirty ? "committed" : "clean");
   assert.equal(value.parent, dirty ? f.old : null);
   assert.deepEqual(after, dirty ? ["status", "add", "commit"] : ["status"]);
+  assert.deepEqual(phases, after.flatMap(step => [step + ":prepare", step + ":dispatch"]));
   assert.equal(f.families.length, dirty ? 4 : 2, "one family pass initially and after each attempted Git");
   assert.ok(f.families.every(paths => paths.length === 1 && paths[0] === f.root));
   assert.equal(f.runner.isExecuting("run"), false);
@@ -270,7 +272,7 @@ test("refuses before child: " + mode, async t => {
 test("slot abort after Git prevents a new quiescence dispatch", async t => {
   const f = await fixture(t);
   t.mock.method(git, "captureMaintenanceWip", async (...[_path, _head, cb]: Parameters<Capture>) => {
-    await cb.beforeStep("status");
+    await cb.beforeStep("status", "prepare");
     f.slotAbort.abort();
     await cb.afterRunnerGit("status");
     return { kind: "clean" as const, head: f.old, parent: null };

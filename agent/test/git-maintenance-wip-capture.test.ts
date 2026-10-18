@@ -60,7 +60,7 @@ async function fixture(t: test.TestContext, monotonicNow?: () => number) {
     return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
       cancel: async () => { child.kill("SIGTERM"); await completed; } };
   };
-  const before = async (step: Step) => { events.push("before:" + step); };
+  const before = async (step: Step, phase: "prepare" | "dispatch") => { events.push("before:" + step + ":" + phase); };
   const after = async (step: Step) => { events.push("after:" + step); assert.equal(launches, joins); };
   const run = <T>(action: () => T) => MaintenanceResources.run(admitted.value, action);
   const owned = <T>(action: () => Promise<T>) => git.withBoundaryProcessSpawner(owner, signal.signal, action);
@@ -101,11 +101,11 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     assert.ok(f.gitIn("show", "-s", "--format=%s").startsWith(WIP_PARK_COMMIT_PREFIX));
     const effects = f.events.filter(event => /^(before|after):|^(launch|join):(status|add|commit)$/.test(event));
     assert.deepEqual(effects, ["status", "add", "commit"].flatMap(step =>
-      ["before:" + step, "before:" + step, "launch:" + step, "join:" + step, "after:" + step]));
+      ["before:" + step + ":prepare", "before:" + step + ":dispatch", "launch:" + step, "join:" + step, "after:" + step]));
     assert.equal(f.events.filter(e => e === "launch:proof").length, 3);
     for (const step of ["status", "add", "commit"]) {
-      const start = f.events.indexOf("before:" + step);
-      const end = f.events.indexOf("before:" + step, start + 1);
+      const start = f.events.indexOf("before:" + step + ":prepare");
+      const end = f.events.indexOf("before:" + step + ":dispatch", start + 1);
       const preparation = f.events.slice(start + 1, end);
       assert.ok(preparation.includes("join:metadata"));
       assert.ok(preparation.includes("join:config"));
@@ -226,7 +226,7 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
       const f = await fixture(t); await f.dirty();
       let visits = 0;
       await assert.rejects(f.capture({
-        beforeStep: async step => { await f.before(step); if (step === stop && ++visits === (fresh ? 2 : 1)) throw Error("stopped"); },
+        beforeStep: async (step, phase) => { await f.before(step, phase); if (step === stop && ++visits === (fresh ? 2 : 1)) throw Error("stopped"); },
         afterRunnerGit: f.after,
       }), /stopped/);
       assert.equal(f.head(), f.old);
@@ -314,8 +314,8 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
         (request.argv.includes("--stage") ? '"100644 " + "a".repeat(40) + " 0\\tf"' : '"H f"') +
         ' + i + "\\0").join(""))' : undefined);
     let visits = 0;
-    await assert.rejects(f.capture({ beforeStep: async step => {
-      await f.before(step); if (++visits === 2) throw Error("prepared");
+    await assert.rejects(f.capture({ beforeStep: async (step, phase) => {
+      await f.before(step, phase); if (++visits === 2) throw Error("prepared");
     }, afterRunnerGit: f.after }), /prepared/);
     assert.equal(visits, 2);
     assert.ok(!f.events.includes("launch:status"));
@@ -325,8 +325,8 @@ describe("guarded maintenance WIP capture", { skip: process.platform !== "linux"
     let clock = 0;
     const f = await fixture(t, () => clock);
     let visits = 0;
-    await assert.rejects(f.capture({ beforeStep: async step => {
-      await f.before(step); if (++visits === 2) clock = 121000;
+    await assert.rejects(f.capture({ beforeStep: async (step, phase) => {
+      await f.before(step, phase); if (++visits === 2) clock = 121000;
     }, afterRunnerGit: f.after }), /maintenance_/);
     assert.ok(f.events.includes("join:proof"));
     assert.ok(!f.events.includes("launch:status"));

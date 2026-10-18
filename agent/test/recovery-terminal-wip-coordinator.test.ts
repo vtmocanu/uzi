@@ -39,6 +39,7 @@ async function fixture(t: test.TestContext, mode: string) {
   let originChanged = false;
   let metadata = observation.family!.metadata;
   let repo = repoId, quiescent = true, quiesceCalls = 0, holdCalls = 0, headCalls = 0, sourceHead = sha;
+  let chargedRpc = 0, discoveryRpc = 0;
   let afterCharge: (() => Promise<void> | void) | undefined;
   const signal = new AbortController();
   const token = Object.freeze({});
@@ -46,7 +47,12 @@ async function fixture(t: test.TestContext, mode: string) {
   const client: RecoveryArchiveClient = {
     observeTerminalMaintenanceHold: async () => {
       holdCalls++;
-      MaintenanceResources.consumeIfActive("rpcAttempts", 2);
+      // Model the strict client's two actual transports, each charged once.
+      for (const attempt of [1, 1]) {
+        MaintenanceResources.consumeIfActive("rpcAttempts", attempt);
+        if (MaintenanceResources.discoveryActive()) discoveryRpc += attempt;
+        else chargedRpc += attempt;
+      }
       if (closed || repo !== repoId) return { ok: false, reason: "invalid_exact_hold" };
       return { ok: true, token, hold: { run_id: runId, generation: 1, hold_id: holdId, repo_id: repo,
         original_worker_id: workerId, original_worker_identity: "human-label",
@@ -88,20 +94,36 @@ async function fixture(t: test.TestContext, mode: string) {
           if (!quiescent) throw new Error("not quiescent");
           events.push("initial-quiescence");
           if (mode === "initial-stop") stopped = true;
-          await callbacks.beforeStep("status");
+          await callbacks.beforeStep("status", (mode === "missing-phase" ? undefined :
+            mode === "wrong-phase" ? "unknown" : mode === "dispatch-first" ? "dispatch" : "prepare") as "prepare");
           const pinned = await coordinator.inspect(runId);
           assert.equal(pinned.length, 1);
           assert.equal(pinned[0]!.sourceSha, sha);
           assert.equal(pinned[0]!.state, "pinned");
           events.push("authenticated-before-raw");
           for (const step of ["status", "add", "commit"] as const) {
-            if (step !== "status") await callbacks.beforeStep(step);
-            if (step === "add" && mode === "before-add-stop") closed = true;
-            await callbacks.beforeStep(step);
+            if (step !== "status") await callbacks.beforeStep(step, "prepare");
+            if ((step === "add" && mode === "before-add-stop") ||
+                (step === "commit" && mode === "before-commit-stop")) closed = true;
+            if (mode === "local-" + step + "-prepare-stop") stopped = true;
+            if (mode === "local-" + step + "-prepare-origin") originChanged = true;
+            if (mode === "local-" + step + "-prepare-head") sourceHead = "f".repeat(40);
+            if (mode === "local-" + step + "-prepare-token") registration = false;
+            if (mode.startsWith("local-" + step + "-prepare-")) await callbacks.beforeStep(step, "prepare");
+            if (mode === "local-status-dispatch-stop") stopped = true;
+            if (mode === "local-status-dispatch-origin") originChanged = true;
+            if (mode === "local-status-dispatch-head") sourceHead = "f".repeat(40);
+            if (mode === "local-status-dispatch-token") registration = false;
+            await callbacks.beforeStep(step, (step === "add" && mode === "late-missing-phase" ? undefined :
+              step === "add" && mode === "late-wrong-phase" ? "unknown" : "dispatch") as "dispatch");
             events.push("git-" + step);
             if (step === "commit") sourceHead = "e".repeat(40);
             if (step === "commit" && mode === "post-commit-stop") closed = true;
             if (step === "commit" && mode === "post-commit-custody") registration = false;
+            if (mode === "local-after-" + step + "-stop") stopped = true;
+            if (mode === "local-after-" + step + "-origin") originChanged = true;
+            if (mode === "local-after-" + step + "-head") sourceHead = "f".repeat(40);
+            if (mode === "local-after-" + step + "-token") registration = false;
             await callbacks.afterRunnerGit(step);
           }
           if (mode === "return-stop") closed = true;
@@ -142,10 +164,10 @@ async function fixture(t: test.TestContext, mode: string) {
     unquiescent: () => { quiescent = false; }, headChanged: () => { sourceHead = "e".repeat(40); },
     afterCharge: (action: () => Promise<void> | void) => { afterCharge = action; },
     metadata: (value: string) => { metadata = value; },
-    counts: () => ({ quiesceCalls, holdCalls, headCalls }) };
+    counts: () => ({ quiesceCalls, holdCalls, headCalls, chargedRpc, discoveryRpc }) };
 }
 
-for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-stop", "post-commit-stop",
+for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-stop", "before-commit-stop", "post-commit-stop",
   "post-commit-custody", "return-stop", "return-family", "return-origin", "return-custody", "wrong-head",
   "invalid-kind", "invalid-parent", "invalid-clean", "invalid-sha"]) {
   test("terminal WIP coordinator: " + mode, async t => {
@@ -173,8 +195,50 @@ for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-s
     if (mode === "committed") expected.push(digest(["maintenance-wip-v1", cycle.identity, "e".repeat(40)]));
     assert.deepEqual(cycle.outputs, expected);
     if (mode === "before-add-stop") assert.ok(!f.events.includes("git-add"));
+    if (mode === "before-commit-stop") assert.ok(!f.events.includes("git-commit"));
     await f.run(f.make());
     assert.equal(await f.chargeCount(), 1);
     assert.deepEqual((await f.table()).cycles[0].outputs, expected);
+  });
+}
+
+for (const directories of [0, 1, 2]) test("terminal WIP charged transports with " + directories + " cold directories", async t => {
+  const f = await fixture(t, "committed");
+  if (directories < 2) await fs.mkdir(f.recoveryRoot);
+  if (directories === 0) await fs.mkdir(f.dir);
+  await f.run();
+  assert.equal((await f.table()).cycles[0].outputs.length, 2);
+  assert.equal(f.counts().chargedRpc, 12 + 2 * directories);
+  assert.equal(f.counts().discoveryRpc, 4);
+  t.diagnostic(JSON.stringify(f.counts()));
+});
+
+for (const mode of ["missing-phase", "wrong-phase", "dispatch-first", "late-missing-phase", "late-wrong-phase"])
+test("terminal WIP refuses unspecified callback authority: " + mode, async t => {
+  const f = await fixture(t, mode);
+  await f.run();
+  const cycle = (await f.table()).cycles[0];
+  assert.equal(cycle.fenced, true);
+  assert.equal(cycle.slots.length, 1);
+  assert.equal(cycle.outputs.length, mode.startsWith("late-") ? 1 : 0);
+  assert.ok(!f.events.includes(mode.startsWith("late-") ? "git-add" : "git-status"));
+  assert.equal(f.counts().discoveryRpc, 4);
+});
+
+for (const point of ["status-dispatch", "add-prepare", "commit-prepare", "after-status", "after-add", "after-commit"])
+for (const change of ["stop", "origin", "head", "token"]) {
+  // Commit's post-proof intentionally omits old HEAD until the verified result.
+  if (point === "after-commit" && change === "head") continue;
+  test("terminal WIP local read-only refusal: " + point + " " + change, async t => {
+    const f = await fixture(t, "local-" + point + "-" + change);
+    await f.run();
+    const cycle = (await f.table()).cycles[0];
+    assert.equal(cycle.fenced, true);
+    assert.equal(cycle.slots.length, 1);
+    assert.equal(cycle.outputs.length, 1, "only immutable original prefix is indexed");
+    const next = point === "after-commit" ? undefined :
+      point === "commit-prepare" || point === "after-add" ? "commit" :
+      point === "status-dispatch" ? "status" : "add";
+    if (next) assert.ok(!f.events.includes("git-" + next));
   });
 }

@@ -10583,7 +10583,7 @@ export class GitCache {
     clonePath: string,
     oldHead: string,
     callbacks: {
-      beforeStep: (step: "status" | "add" | "commit") => Promise<void>;
+      beforeStep: (step: "status" | "add" | "commit", phase: "prepare" | "dispatch") => Promise<void>;
       afterRunnerGit: (step: "status" | "add" | "commit") => Promise<void>;
     },
   ): Promise<{ kind: "clean"; head: string; parent: null } | { kind: "committed"; head: string; parent: string }> {
@@ -10711,7 +10711,7 @@ try {
     // Three attempts maximum, sharing the original scope/counters/deadline.
     // Any refusal stops the sequence; no reset, fence clearing or retry.
     for (const step of ["status", "add", "commit"] as const) {
-      await callbacks.beforeStep(step);
+      await callbacks.beforeStep(step, "prepare");
       check();
       const index = await safety();
       if (step === "status") {
@@ -10728,7 +10728,7 @@ try {
       if (step === "commit" && !input.agrees) throw refused();
       if (sourceDigest !== undefined && sourceDigest !== input.digest) throw refused();
       sourceDigest = input.digest;
-      await callbacks.beforeStep(step);
+      await callbacks.beforeStep(step, "dispatch");
       check(); // Fresh eligibility/slot/signal check immediately before dispatch.
       let output: string;
       try {

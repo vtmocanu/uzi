@@ -3138,9 +3138,9 @@ export class RunRunner {
             if (!await familyQuiet()) throw refused();
             check();
             return this.git.captureMaintenanceWip(clonePath, oldHead, {
-              beforeStep: async step => {
+              beforeStep: async (step, phase) => {
                 check();
-                await callbacks.beforeStep(step);
+                await callbacks.beforeStep(step, phase);
                 check();
               },
               afterRunnerGit: async step => {

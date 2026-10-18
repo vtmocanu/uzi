@@ -3339,10 +3339,16 @@ export class RecoveryCoordinator {
             const sourceSha = await head(genesis.clonePath);
             if (!sourceSha || !/^[a-f0-9]{40}$/.test(sourceSha)) return refused(stage);
             check();
-            const fresh = async (expectedHead?: string) => {
+            const localFresh = async (expectedHead?: string) => {
               check();
+              if (!current(chargedHold.token)) refused("exact_hold_refused");
               if (!await freshFamily() || await originDigest(original.barePath, original.cloneUrl) !== origin ||
                   (expectedHead !== undefined && await head(genesis.clonePath) !== expectedHead)) refused("source_unverified");
+              check();
+              if (!current(chargedHold.token)) refused("exact_hold_refused");
+            };
+            const fresh = async (expectedHead?: string) => {
+              await localFresh(expectedHead);
               const exact = await observe(genesis.runId, genesis.generation, binding, signal);
               check();
               if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token) ||
@@ -3354,13 +3360,25 @@ export class RecoveryCoordinator {
               stage = "history_refused";
               const validation = await ledger.revalidate(slot, { ...admission, quiescent: true, sourceOutputContinuity: true });
               if (!validation.ok) return refused(validation.reason);
+              check();
+              if (!current(chargedHold.token)) refused("exact_hold_refused");
             };
             const result = await captureWip(genesis.clonePath, sourceSha, {
-              beforeStep: async step => {
+              beforeStep: async (step, phase) => {
+                // Unknown or omitted phases cannot select the read-only observation path.
+                if ((phase !== "prepare" && phase !== "dispatch") ||
+                    (step !== "status" && step !== "add" && step !== "commit")) return refused("source_unverified");
+                if (published) {
+                  // Only add/commit dispatch mutates the source. Each gets a new
+                  // strict list/exact observation after its bounded preparation.
+                  if (phase === "dispatch" && step !== "status") await fresh(sourceSha);
+                  else await localFresh(sourceSha);
+                  await revalidate();
+                  return;
+                }
                 // The bridge has positively joined the family before this first callback.
                 // Publish once, before the primitive enumerates or hashes any raw source.
-                if (published) { await fresh(sourceSha); await revalidate(); return; }
-                if (step !== "status") return refused("source_unverified");
+                if (step !== "status" || phase !== "prepare") return refused("source_unverified");
                 await this.withJournalLock(genesis.runId, async () => {
                   // A single bounded second view closes replay/publication races.
                   stage = "metadata_incomplete";
@@ -3390,7 +3408,7 @@ export class RecoveryCoordinator {
               },
               afterRunnerGit: async step => {
                 // Commit has changed HEAD; the primitive verifies its exact parent/result.
-                await fresh(step === "commit" ? undefined : sourceSha);
+                await localFresh(step === "commit" ? undefined : sourceSha);
                 await revalidate();
               },
             });

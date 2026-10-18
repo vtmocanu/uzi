@@ -35,6 +35,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
   t.mock.method(client, "hasFeature", (name: Parameters<typeof client.hasFeature>[0]) =>
     name === "recovery_inventory_v1" || name === "claim_generation_fence" || feature(name));
   t.mock.method(client, "listRecoveryHolds", async () => ({ run_id: claim.run_id, holds: [{ hold_id: "fixture-hold", generation: 1, inventory_guarded: true, has_available_capture: false }] }));
+  let chargedTransports = 0, discoveryTransports = 0;
   if (originMode) {
     claim.repo.id = "00000000-0000-4000-8000-000000000033";
     const workerId = "00000000-0000-4000-8000-000000000034";
@@ -45,6 +46,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       fetch: async input => {
         const url = new URL(String(input));
         if (url.pathname.endsWith("/register")) return Response.json({ worker_id: workerId, protocol_features: [] });
+        if (MaintenanceResources.discoveryActive()) discoveryTransports++;
+        else if (MaintenanceResources.active()) chargedTransports++;
         return Response.json(url.search ? { run_id: claim.run_id, exact_hold: {
           run_id: claim.run_id, hold_id: holdId, generation: 1, repo_id: claim.repo.id,
           original_worker_id: workerId, original_worker_identity: "human-label", live_worker_id: workerId,
@@ -191,6 +194,9 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
         upload.mock.restore(); reserve.mock.restore(); held.mock.restore();
         const after = await snapshot();
         if (mode === "origin-admission") {
+          assert.equal(chargedTransports, 12, "warm real WorkerClient list/exact transports");
+          assert.equal(discoveryTransports, 4, "discovery has separate counters");
+          t.diagnostic(JSON.stringify({ chargedTransports, discoveryTransports }));
           assert.notEqual(after.head, before.head);
           assert.notDeepEqual(after.index, before.index);
           assert.deepEqual({ ...after, head: before.head, index: before.index }, before);

@@ -83,8 +83,8 @@ async function fixture(t: test.TestContext) {
         captureWip: async (_path, oldHead, callbacks) => {
           quiesceCalls++; events.push("quiesce");
           if (!quiescent) throw new Error("not quiescent");
-          await callbacks.beforeStep("status");
-          await callbacks.beforeStep("status");
+          await callbacks.beforeStep("status", "prepare");
+          await callbacks.beforeStep("status", "dispatch");
           await callbacks.afterRunnerGit("status");
           return { kind: "clean", head: oldHead, parent: null };
         },
