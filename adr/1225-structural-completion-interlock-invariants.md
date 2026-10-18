@@ -51,15 +51,15 @@ None of those three can authorize a worker that does not implement the completio
 
 **The worker must learn `contract_revision` from more than the claim response, or a first-claimed-before-approval run can never resolve its own identity (#1626 fix).** The contract freezes at plan approval (I1), which can happen strictly after a run's first claim — a lead that claims once during planning and only later gets its plan approved saw no further claim response to learn the frozen `contract_revision` from, and held at finalize with "completion identity unresolvable" even though the contract had since frozen cleanly. The worker now also reads `completion_revision` off the `RunDTO` returned by the ordinary `/state` acknowledgement (the same channel that already carries `pause_requested` and the budget-exhausted steer, I7), so a run that freezes its contract after its one and only claim still has a live channel to learn the revision it needs to request a permit against.
 
-**Additive permit-scope authority (#3089).** A granted worker permit carries `completion_scope` from the same locked run revision that authorized it, including `{}` when there is no decision. The worker uses that scope for partial/accept rendering, title, body, `Closes` and finalization guards, rather than a stale claim snapshot. With a new worker and old API, omission at the same claim revision retains the claim-scope fallback; omission at a revision newer than the claim fails closed into the existing hold without opening a PR. A new API with an old worker retains the old worker's behavior: it ignores the additive field, so live-window decisions can still render claim-time scope. Both API and worker upgrades are required for the permit-scope guarantee. This adds no capability, state, endpoint, migration or claim field and does not expand decision admission; the claim fence, exact-head identity and consume-and-complete transaction above remain intact.
+**Additive permit-scope authority (#3089).** A granted worker permit carries `completion_scope` from the same locked run revision that authorized it, including `{}` when there is no decision. The worker uses that scope for partial/accept rendering, title, body, `Closes` and finalization guards, rather than a stale claim snapshot. With a new worker and old API, omission at exactly the claim revision (default 1 when absent) retains the claim-scope fallback; omission at any different revision fails closed into the existing hold without opening a PR. A new API with an old worker retains the old worker's behavior: it ignores the additive field, so live-window decisions can still render claim-time scope. Both API and worker upgrades are required for the permit-scope guarantee. This adds no capability, state, endpoint, migration or claim field and does not expand decision admission; the claim fence, exact-head identity and consume-and-complete transaction above remain intact.
 
 ### I4 — the permit binds the exact final head, verified against the real PR head, across all three forges (D5)
 
-`phasePublish`'s existing scan/alignment/push path is unchanged in this child — D5 deliberately does not move the large ADR-456 alignment finalizer. What changes is what happens **after** that path lands: the permit is requested (or reissued, if alignment rewrote the candidate) for `H`, the exact source-branch tip that path successfully produced, because structural milestone membership is head-independent. After the PR is created/adopted, the worker reads the PR's actual head SHA through a forge-neutral method implemented by all three drivers (`agent/src/forge.ts`, GitHub/GitLab/Forgejo). **A head mismatch invalidates the permit and the run cannot report completed; no `Closes #N` body is ever rendered without a currently-valid permit.** The interlocked MR/PR body is created **without** `Closes #N`, so a held, unverified-head MR can never carry a closing line — the create-then-verify hole (a human merge closing the issue on an unverified head) is structurally impossible, not merely repaired. The canonical `Closes #N` body is **added** — via the drivers' `updateMergeRequestDescription` — **only after** the PR head is verified to equal `H`, and the head is then **re-read once more** to bind that add to the verified head: a change in the read→add window (or an unreadable re-read) strips `Closes` back off and holds, so `Closes` is never left on a head the interlock did not confirm both before and after the write. If the add itself fails the run **holds** rather than reporting completion (the completion contract requires the merged MR to carry the closing line, except for an explicit issue-only `non_closing` declaration: that delivery still requires the permit, both exact-head checks, and a confirmed non-closing body). **Amendment (2026-09-28, PRD #1798, see [ADR-1798](1798-pr-description-owned-blocks.md)):** "fails" here is narrower than any add attempt going wrong. Specifically, if the add cannot be *confirmed* — the write itself fails, the confirming re-read fails, or the PR's head moves between the write and the re-read — uzi strips `Closes` back out. The run **holds** once that strip is *confirmed*, and also holds when the strip could not be confirmed only because the MR itself was unreadable (the strip then falls back to a *blind* whole-body non-closing rewrite, which carries no closing directive by construction even though nothing confirmed it landed). The run fails closed (`failInterlockedClosed`) only when the strip write is refused outright, or is written but a confirming re-read shows it did not land — a hold is a nominally non-closing parked state uzi cannot vouch for in either of those two cases. **The adopted-MR contract (CodeRabbit !1254):** `createMergeRequest` can *adopt* a pre-existing MR/PR that already carries `Closes #N`, so a hold is only safe once the body has been positively rewritten to a non-closing variant. Every hold path therefore strips `Closes` (adding an unverified banner) and **requires that write to succeed**; if the strip fails, the run **fails closed** rather than parking a possibly-closing MR on an unverified head. A future forge driver that omits `updateMergeRequestDescription`, a finalize path that renders `Closes` before the head is verified, or a hold path that strips `Closes` best-effort, reopens exactly the class of hole #1220 was.
+Historically, #1226 left `phasePublish`'s scan/alignment/push path unchanged; #3090 adds the pre-push guard described in the dated addendum below — D5 deliberately does not move the large ADR-456 alignment finalizer. What changes is what happens **after** that path lands: the permit is requested (or reissued, if alignment rewrote the candidate) for `H`, the exact source-branch tip that path successfully produced, because structural milestone membership is head-independent. After the PR is created/adopted, the worker reads the PR's actual head SHA through a forge-neutral method implemented by all three drivers (`agent/src/forge.ts`, GitHub/GitLab/Forgejo). **A head mismatch invalidates the permit and the run cannot report completed; no `Closes #N` body is ever rendered without a currently-valid permit.** The interlocked MR/PR body is created **without** `Closes #N`, so a newly created, unverified-head MR carries no worker-authored closing line. This prevents the worker's create-then-verify hole; an already-open adopted MR can still be merged before a resumed guard runs (see the #3090 residuals below). The canonical `Closes #N` body is **added** — via the drivers' `updateMergeRequestDescription` — **only after** the PR head is verified to equal `H`, and the head is then **re-read once more** to bind that add to the verified head: a change in the read→add window (or an unreadable re-read) strips `Closes` back off and holds, so `Closes` is never left on a head the interlock did not confirm both before and after the write. If the add itself fails the run **holds** rather than reporting completion (the completion contract requires the merged MR to carry the closing line, except for an explicit issue-only `non_closing` declaration: that delivery still requires the permit, both exact-head checks, and a confirmed non-closing body). **Amendment (2026-09-28, PRD #1798, see [ADR-1798](1798-pr-description-owned-blocks.md)):** "fails" here is narrower than any add attempt going wrong. Specifically, if the add cannot be *confirmed* — the write itself fails, the confirming re-read fails, or the PR's head moves between the write and the re-read — uzi strips `Closes` back out. The run **holds** once that strip is *confirmed*, and also holds when the strip could not be confirmed only because the MR itself was unreadable (the strip then falls back to a *blind* whole-body non-closing rewrite, which carries no closing directive by construction even though nothing confirmed it landed). The run fails closed (`failInterlockedClosed`) only when the strip write is refused outright, or is written but a confirming re-read shows it did not land — a hold is a nominally non-closing parked state uzi cannot vouch for in either of those two cases. **The adopted-MR contract (CodeRabbit !1254):** `createMergeRequest` can *adopt* a pre-existing MR/PR that already carries `Closes #N`, so a hold is only safe once the body has been positively rewritten to a non-closing variant. Every hold path therefore strips `Closes` (adding an unverified banner) and **requires that write to succeed**; if the strip fails, the run **fails closed** rather than parking a possibly-closing MR on an unverified head. A future forge driver that omits `updateMergeRequestDescription`, a finalize path that renders `Closes` before the head is verified, or a hold path that strips `Closes` best-effort, reopens exactly the class of hole #1220 was.
 
 ### I5 — a missing milestone returns to the SAME lead session, checkpoint-first, and calls the forge zero times (D3)
 
-On a gated `signal_done`, the executor checkpoints the current work **before** any denial is emitted (`sdk-executor.ts`'s `turn.done` attempt loop). It compares the server-recomputed unmet set against the declaration; a non-empty unmet set re-prompts the **same** SDK session via the existing mid-loop follow-up injection — no session reset, and critically, **no forge call of any kind** while milestones remain unmet. The completion-attempt fingerprint is `(sorted unmet IDs, head, worktree fingerprint)`, distinct from the #281 prose-response fingerprint but sharing the same `STALL_LIMIT = 3`: without an explicit owner request, three identical attempts (unchanged fingerprint) route to the completion question and, on expiry, the hold (I6), not an arbitrary iteration count. This is the exact mechanism the M6 regression (`agent/test/runner-completion-1220-regression.test.ts`) pins against run `b0ffd0ea`'s shape: frozen five, declared four, and the fixed path both names `m5` back to the same lead and asserts `calls.length === 0` on the forge's create-MR spy. The bundled mutation control (neutering the missing-milestone gate) demonstrates the regression barrier is real, not decorative — deleting the denial makes the create call fire with `Closes` again.
+On a gated `signal_done`, the executor checkpoints the current work **before** any denial is emitted (`sdk-executor.ts`'s `turn.done` attempt loop). It compares the server-recomputed unmet set against the declaration; a non-empty unmet set re-prompts the **same** SDK session via the existing mid-loop follow-up injection — no session reset, and critically, **no create-MR call** on that denied completion-attempt path while milestones remain unmet. This does not promise that earlier checkpoint publication or an already-open MR cannot affect the forge. The completion-attempt fingerprint is `(sorted unmet IDs, head, worktree fingerprint)`, distinct from the #281 prose-response fingerprint but sharing the same `STALL_LIMIT = 3`: without an explicit owner request, three identical attempts (unchanged fingerprint) route to the completion question and, on expiry, the hold (I6), not an arbitrary iteration count. This is the exact mechanism the M6 regression (`agent/test/runner-completion-1220-regression.test.ts`) pins against run `b0ffd0ea`'s shape: frozen five, declared four, and the fixed path both names `m5` back to the same lead and asserts `calls.length === 0` on the forge's create-MR spy. The bundled mutation control (neutering the missing-milestone gate) demonstrates the regression barrier is real, not decorative — deleting the denial makes the create call fire with `Closes` again.
 
 Additive routing (#3089): on an interlocked, noninteractive issue run on either harness, `signal_done({owner_decision_requested:{reason:string}})` can open that same question at the first authoritative unmet result without waiting for the stall threshold. The request object admits only `reason`, trimmed to 1–500 Unicode code points by validation (invalid or extra keys are refused, never truncated). It supplies no scope authority and does not block finalization when the authoritative unmet set is empty. The fingerprint, iteration/wall budgets, deadline, cancellation/pause/completion-budget bounds and I6 capture-before-park ordering remain unchanged; requesting the window resets none of them. The durable question labels and escapes the lead reason as untrusted display text and uses server-provided unmet IDs. Only the existing decision endpoints apply continue/partial/accept, within their existing live completion-question or paused completion-blocked windows; ordinary clarification and plain pause remain ineligible. Ordinary answers, repository docs and `non_closing` carry no scope authority. After any answer the worker asks for a fresh authoritative `signal_done` recheck, without enforcing the old unmet list or inferring a formal decision from prose.
 
@@ -69,7 +69,10 @@ Before any completion attempt exists on a run, legacy stall/wall/budget outcomes
 
 Exactly like [ADR-1190](1190-run-pause-invariants.md) rejected widening `SetRunPaused` to admit new source statuses, D6 rejected widening it to admit `awaiting_input`. `SetRunCompletionHold` is its own transition: it admits only an **owned, interlocked** run in `running` or `awaiting_input`, requires at least one recorded completion attempt, stamps `hold_reason='completion_blocked'` and `hold_captured_head`, clears the completion-question marker, and transitions to `paused` — reusing the `paused` **status** (so it inherits every one of ADR-1190's six status-list exclusions and three negative-guard protections for free) while remaining a **distinct write path** with its own admission guard.
 
-The park order is fixed and must not be reordered by a later child:
+The normal park order is fixed and must not be reordered by a later child.
+The #3090 pre-push exception skips remote checkpoint publication and permits
+bounded degraded capture with local retention, as recorded in the dated
+addendum below; it does not relax the prior-attempt guard above:
 
 1. reap the agent tree (before any credentialed capture git — REAP-BEFORE-GIT);
 2. WIP-commit dirty work;
@@ -79,7 +82,7 @@ The park order is fixed and must not be reordered by a later child:
 6. call `SetRunCompletionHold` and require the **returned status literally `paused`** — the same positive-ACK contract the pause park uses, never `applied` alone;
 7. only then mark the flight parked so normal cleanup runs.
 
-**The preserve flags (`preserveRecoveryClone`, `preserveSession`) are set BEFORE any of this is attempted, and cleared on every non-parked exit path** — a failed WIP commit, a failed fetch-back, an unverifiable tracking ref, a hold request that errors, or a hold ACK that is not `paused`. This is the single mechanism behind the acceptance criterion "no hold releases/cleans the only Git work copy when capture or acknowledgement is uncertain": retain-by-default until a **positive** double proof (verified local capture AND a `paused` ACK), never retain-until-something-fails. `captureHoldContext` mirrors [ADR-1197](1197-transient-recovery-park.md)'s verified-capture template exactly (dirty check → WIP commit required → fetch → positive tracking-ref verification → best-effort remote publish) and the same correction that ADR records — a prior checkpoint is not sufficient; only a positively verified capture licenses a park — applies here unchanged.
+**The preserve flags (`preserveRecoveryClone`, `preserveSession`) are set before capture.** Ordinary capture exhaustion clears them; a definitive hold refusal permits terminal cleanup. An ambiguous hold delivery retains the clone and session and ends non-terminal, without claiming a confirmed park. A literal `paused` ACK or the existing fenced ownership probe confirms the hold. `captureHoldContext` retains [ADR-1197](1197-transient-recovery-park.md)'s verified-capture sequence (dirty check → WIP commit → fetch → positive tracking-ref verification → best-effort remote publish); a prior checkpoint is not proof of the latest capture. The #3090 addendum qualifies that template only for new pre-push holds: exhausted capture can request the existing empty-head degraded hold, preserving live work without claiming a verified recovery copy.
 
 ### I7 — the served `budget_exhausted` steer is one-shot and survives an ordinary running report (D3)
 
@@ -111,6 +114,154 @@ The live window itself is time-boxed by `completion_hold_window_seconds` (claim-
 A new, unseeded Codex issue run is stamped before its first claim under the same rollout switch and freezes the same structural contract as a Claude run. The Codex executor records a completion attempt, checkpoints work, and returns unmet milestones to the **same Codex thread** for another attempt. Repeated attempts without progress enter the same owner question and recoverable completion hold; a closing PR still requires the exact-head permit. The cold settings-read fallback and the seeded-plan exclusion above remain in force.
 
 For an interlocked Codex run, `ClaimRun` requires both the shared `completion_interlock_v1` protocol and `codex_completion_interlock_v1`, in addition to the separate Codex harness capability. The Codex completion predicate is a dedicated clause outside `required_capabilities`, `ClearRunRequiredCapabilities`, and `capability_aware`; those paths cannot bypass it. Fleet-spread peer eligibility mirrors the clause so a run is not deferred to a peer that cannot claim it. This guards the Codex completion loop even when an older worker advertises the shared completion protocol.
+
+## Addendum — non-closing publication and pending acceptance (2026-10-18, #3090)
+
+This amendment qualifies the original #1226 guarantees without changing I6's
+prior-attempt admission requirement. User recovery steps live in
+[Completion holds](../docs/run-completion-hold.md) and
+[Recovering unpublished work](../docs/run-recovery.md#completion-publication-holds).
+
+### Scope authority and honest delivery
+
+Plans should isolate owner/deployment acceptance in a final acceptance-only
+milestone. Implementation, docs, tests, mandatory gates, security and review
+remain worker obligations. Plan approval and auto-approval do not waive them.
+An ordinary answer and a `non_closing` declaration supply no scope authority.
+Formal owner partial records the exact kept/deferred milestone IDs and reason;
+it is equally applicable to ordinary coding work.
+
+The worker-owned partial block renders each deferred entry unchecked, with
+its ID, frozen title and reason and an explicit not-delivered/not-verified
+boundary before owner closure. Checkbox edits authorize nothing; refresh
+restores unchecked entries. Actionable next steps belong in the ordinary
+summary outside that block. Accept is accept-as-is: the publication warning
+continues to name the unmet criteria and reason; unperformed acceptance is
+not rendered as passed. Accept is refused when all milestones are done.
+
+Partial/accept irreversibly alter THIS frozen contract. A separately
+authorized, explicit approved milestone reconciliation reset can replace it,
+clearing scope ceilings and completion decisions. Stored non-closing intent
+survives that reset. No ordinary answer, plan approval or stored publication
+intent substitutes for that authority.
+
+### Pre-push selection and post-push authority
+
+The source-issue closing-commit guard applies to declared non-closing delivery
+on any issue run. On an interlocked issue it additionally applies to owner
+partial and Stop-capped delivery. Both scans walk outgoing default-branch..tip,
+including merge commits, earlier-flight history, alignment bridge commits and
+an adopted own branch: once before alignment/push and again on the exact
+candidate immediately before push. Full and accept-closing delivery use the
+normal closing path. This **reverses #2815's declared-only exception**:
+interlocked partial/Stop with earlier closing commits now holds before push.
+
+Both harnesses' agents are instructed to avoid source-issue closing commit
+messages; the worker owns PR-body publication. The enforcement boundary is
+the issue-publication path in `agent/src/runner.ts` (`closingCommits`,
+`refusePrepush`, and the exact-candidate callback), not arbitrary agent text
+or every forge sink.
+
+After existing prechecks, the worker makes one owned publication-start
+`running` report. The client strictly decodes a positive safe revision and a
+validated, deduplicated, sorted deferred-ID projection. The ACK must be
+applied, identify this run and registered worker, and bind the positive
+sent claim generation to the current flight. This projection selects the
+guard; it is not completion authority. An unknown running projection holds
+using fixed diagnostic copy without commit content. A non-running ACK takes
+the quiet stale-claim stop; transport errors retain existing finalize-failure
+handling.
+
+The normal permit is still requested **after push**, not earlier, and adds no
+new ledger. Its revision must equal the publication-start ACK revision and
+its resolved deferred IDs must be set-equal to that projection. The granted
+full `completion_scope`, from the same locked run revision, remains authority
+for rendering and finalization. I3's old-API omission fallback is restricted
+to EXACT claim revision (default 1), not merely a revision that is not newer.
+Scope corruption outside supported writers is not detected by this pre-push
+projection; the later permit comparison fails closed.
+
+### Hold, attempts and capture
+
+An interlocked pre-push refusal holds rather than fails unless hold refusal
+is definitive. Accepted and ambiguous hold outcomes emit no failed terminal
+report. Work is preserved; closing-message diagnostics show at most five
+validated offending SHAs plus a remaining count, or an unreadable result
+without SHA. Raw commit text is not diagnostic output.
+
+If the publication-start ACK reports zero attempts or an unknown count,
+the worker sends one logical empty completion attempt with bounded transient
+retries (at most three sends). Each accepted send can increase the real count
+and replace latest-attempt metadata, so ambiguous retries can increment more
+than once. The empty declaration changes no completed progress, scope,
+stall fingerprint or budget. An exhausted or uncertain attempt still
+requests the hold; a stale claim stops the flight. **I6 still requires a
+previously recorded attempt**; there is no zero-attempt hold exception.
+
+This pre-push path skips remote checkpoint publication during finalize
+capture. After bounded capture exhaustion it may enter a degraded hold
+with empty captured head, retaining clone/session rather than claiming a
+verified copy. Latest work may exist only on the worker. This qualifies I6's
+normal verified-capture sequence; it grants no custody release or deletion
+authority and does not claim remote durability.
+
+### Stored intent and mixed versions
+
+Migration `00342_completion_non_closing.sql` adds one nullable
+`runs.completion_non_closing_reason`. A completion attempt accepts
+`non_closing: {reason}`; the server strips NUL, trims, and validates 1–500
+Unicode code points, refusing invalid input rather than truncating it.
+The existing owned, interlocked claim and issue-kind fences apply. The
+attempt write in `api/internal/store/queries/runtime.sql` uses COALESCE to
+retain the first stored value. Claim configuration returns `non_closing`;
+the feature is `completion_non_closing_v1`.
+
+The first reason persists across resume, reclaim, hold, owner decision and
+reconciliation. It is conservative publication intent, never a scope change,
+criterion satisfaction or waiver. Both harnesses carry this flight's latched
+declaration on every completion attempt, including unmet attempts. Publication
+uses the current flight's declaration, otherwise restored claim intent.
+The lead must redeclare on each `signal_done`. A declaring signal re-prompted
+before its attempt is not durable until the next recorded attempt; a park,
+reclaim or hold before that attempt can lose the in-memory declaration.
+
+Workers send the new attempt field only with feature support. Without it,
+a new declared pre-push refusal follows the legacy terminal path rather than
+holding with intent the API cannot retain. Existing executor/post-push holds
+are unchanged and can lose intent. Old workers ignore claim intent, so
+coordinated API/worker rollout is necessary. Retain the nullable column on
+application rollback. The additive ALTER TABLE takes a table lock but has
+no backfill, default or index.
+
+### Owner recovery and explicit residuals
+
+For an unpublished declared/owner-partial history refusal without Stop,
+owner continue guidance can name the SHAs and ask the lead to reword its own
+unpublished commits. The worker never rewrites history or force-pushes.
+For published history or Stop, cancel and manually deliver preserved work
+through existing recovery. Stop resumes directly into finalization with no
+lead turn; partial/accept cannot repair history. Plain resume is refused for
+`completion_blocked`; formal decide or an eligible set-token switch can
+resume. Stop is a running owner directive, wall parking follows #1497, and
+provider-policy parking under #3068 remains planned.
+
+Legacy declared refusal remains terminal. Legacy scope caps retain title/body
+protection but can still close through commit messages. `mr_rework` and
+branch-adopting `ci_fix` are excluded from this issue-publication guard.
+Forgejo/Gitea any-branch closing concerns branch pushes; checkpoint refs
+`refs/uzi-checkpoints` and held refs `refs/uzi-held` are not branches.
+The excluded lanes and this Forgejo/Gitea branch-push residual are recorded
+together via finding handoff #3b56e6e5-4352-4694-ae1c-4999d5719e9c.
+That identifier is a finding ID, not a forge issue number.
+
+Already-published history cannot be unpushed; an already-open PR may merge
+before a resumed guard runs. Claim loss accepted between ACK and push also
+remains: there is no API fence around the Git push itself.
+
+#1230 D4 and #1231 remain open. This change introduces no plan-time
+preauthorization or semantic activation. Live deployment acceptance has not
+been performed; mocked tests and PR existence establish neither that
+acceptance nor full end-to-end coverage.
 
 ## Linked from ARCHITECTURE.md
 

@@ -383,9 +383,11 @@ A few worth knowing:
   error unless you pass `--discard-pending-outcome`, which cancels the run and
   throws that finished result away. On a **milestone-structured issue run** (PRD #634), `stop` instead
   sets an operator scope ceiling at the already-completed milestone count:
-  the run finalizes the committed slice (pushes the branch, opens the MR
-  when requested) and starts no further milestone — the same graceful
-  finalize, just capped at what's already done. Use `run scope --through N`
+  the run attempts to finalize the committed slice and starts no further
+  milestone. On an interlocked issue run, closing commit messages hold
+  before push, including messages from earlier flights. Stop resumes into
+  finalization without another lead turn; cancel and manually deliver the
+  preserved work if its history needs correction. Stop does not waive gates. Use `run scope --through N`
   below instead to let the run complete through a later milestone before
   finalizing. An optional `-m`/`--message` (or piped stdin) rides along with
   the stop. A foreign or unknown run id is exit 4; a run that has already
@@ -447,7 +449,9 @@ A few worth knowing:
   is still alive, or recovers the branch from the checkpoint and re-plans
   the remaining milestones if it's gone. A run that isn't paused is a 409
   (exit 5). It posts to the same endpoint as `run resume-now` below, which
-  now also resumes a paused run in addition to a pool-held one.
+  also resumes an ordinary paused run in addition to a pool-held one.
+  A `completion_blocked` hold refuses plain resume; use `run decide` or an
+  eligible `run set-token` switch.
 - **`run decide <id>`** (PRD #1226/#1227) records the owner's decision on a
   run the [structural completion interlock](./run-completion-hold.md) has
   blocked — either a live completion question or a run already parked in the
@@ -459,18 +463,29 @@ A few worth knowing:
     place with no new claim; answered after it has parked, it resumes through
     `queued` like `run resume`.
   - `--partial <ids> --reason <text>` reduces scope to the comma-separated
-    milestone ids to **keep**; the rest are deferred, and the run's closing
-    pull/merge request does **not** close the issue (it lists the deferred
-    ids). `--reason` is required.
-  - `--accept <ids> --reason <text>` waives the comma-separated criterion ids
-    as met; a closing pull/merge request then names them in a warning block.
-    `--reason` is required.
+    milestone ids to **keep**; the rest are deferred with the required reason.
+    The non-closing request lists each deferred ID, frozen title and reason
+    unchecked, marked not delivered or not verified before owner closure.
+    Checking a box grants no authority; refresh restores it unchecked.
+  - `--accept <ids> --reason <text>` accepts the exact criterion ids as-is;
+    they remain unmet in the publication warning with your required reason.
+    It does not claim pending acceptance passed and is refused when all
+    milestones are already done.
 
   `--guidance` is valid only with `--continue`, and `--reason` only with
   `--partial`/`--accept`. A partial or accept first reads the run's **current**
   contract revision and sends it, which the server fences: a stale revision
   (someone has already decided) is a 409 (exit 5), as is a run that is not
-  completion-blocked. `--json` emits the resumed run object.
+  completion-blocked. Partial and accept irreversibly change this frozen
+  contract and cannot fix a commit-history publication hold. A separately
+  approved milestone reconciliation reset can replace the contract and
+  clear ceilings/decisions, but preserves stored non-closing intent.
+  For unpublished history without Stop, use continue with SHA-specific
+  guidance for the lead to reword its own unpublished commits. For published
+  history or Stop, cancel and manually deliver
+  [preserved work](run-recovery.md#completion-publication-holds).
+  Ordinary answers, non-closing declarations and auto-approval waive no work.
+  `--json` emits the resumed run object.
 - **`run answer <id>`** answers the clarifying question a run is parked on
   (`awaiting_input`) — see [Answering a
   question](./run-activity.md#answering-a-question). It reads the open

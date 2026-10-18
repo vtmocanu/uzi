@@ -43,9 +43,11 @@ it again.
 ## Why a run holds
 
 Before an interlocked run can finalize, the server checks that every required
-frozen milestone is declared complete or its criteria are formally accepted
-as met. A completion attempt with unmet milestones does not immediately fail
-or open a pull/merge request:
+frozen milestone is declared complete, formally deferred by the owner, or
+covered by an explicit owner accept-as-is decision. Accept-as-is leaves the
+criterion unmet and records a warning; it is not evidence that acceptance ran.
+A completion attempt with unmet milestones does not immediately fail or open
+a pull/merge request:
 
 1. The lead checkpoints its work and the server checks the frozen contract.
    If the lead requested an owner decision with `signal_done` (see below),
@@ -59,11 +61,12 @@ or open a pull/merge request:
    hold** — a `paused` run, but held for this structural reason rather than
    because you asked it to pause.
 
-A completion hold never opens a pull/merge request for an incomplete run. It
-also never discards a run's work to get there: the worker verifies its Git
-work is safely captured before it parks, and if that verification can't be
-confirmed, the run stays live and keeps trying rather than parking on
-uncertain ground.
+A completion hold does not authorize publication. It preserves work for a
+later decision. Normal capture verifies the Git work before parking. The
+pre-push guard also has a bounded degraded-capture path: after capture
+exhaustion it can hold with an empty captured head, retaining the clone and
+session without claiming a verified recovery copy. See
+[Recovering unpublished work](run-recovery.md#completion-publication-holds).
 
 ## Requesting an owner decision
 
@@ -86,6 +89,25 @@ not reset the iteration or wall budget, extend the deadline, or bypass
 cancellation, pause or completion-budget bounds. Leads needing an owner
 scope decision should use this request rather than `park_run`, retries
 without progress, or an announcement of publication.
+
+## Planning work and pending acceptance
+
+Put owner or deployment acceptance in a separate final milestone when it
+must happen outside the worker. Implementation, documentation, tests,
+mandatory gates, security checks and review remain worker work. Approval
+or auto-approval of that plan does not waive them.
+
+Formal owner partial is the scope-reduction authority: it records the exact
+kept and deferred milestone IDs and a reason. This applies to ordinary
+coding work too, not just acceptance milestones. An ordinary answer or a
+non-closing declaration grants no waiver.
+
+On a partial delivery, the pending checklist keeps each deferred entry
+unchecked and includes its ID, frozen title and reason, explicitly marked
+**not delivered** or **not verified** before owner closure. Checking a box
+grants no completion authority; a refresh restores it unchecked. Put
+actionable next steps in the ordinary summary outside the worker-owned
+completion block.
 
 ## What you'll see
 
@@ -158,15 +180,17 @@ reason. If publication succeeds, the `[partial]` pull/merge request is
 **non-closing** and lists the deferred milestone IDs and reason, so the
 remaining work stays visible for a later run.
 
-**Accept** — accept exact unmet criterion IDs as met, with a required reason:
+**Accept** — accept exact unmet criterion IDs as-is, with a required reason:
 
 ```
 uzi run decide <id> --accept m2.c1,m2.c3 --reason "<why>"
 ```
 
 Use the exact criterion IDs from the run view or `uzi run get`. The named
-criteria are accepted as met, not deferred. A published pull/merge request
-names them and your reason in a warning block. Closing remains possible
+criteria remain unmet in the publication warning, with your reason. This
+accept-as-is decision permits proceeding despite them; it does not turn
+unperformed acceptance into a passed check. It is refused when all milestones
+are already done. Closing remains possible
 only if the run is otherwise eligible; a decision does not promise
 publication or override the remaining completion and publication checks.
 
@@ -187,21 +211,22 @@ when there is no scope decision. A new worker uses this permit scope for
 partial/accept rendering, title, body, `Closes` and finalization guards.
 
 With a new worker and an old API, an absent field falls back to claim scope
-when the permit is at the same claim revision. If the permit revision is
-newer than the claim and the field is missing, finalization fails closed
-into the existing hold without opening a pull/merge request. An old worker
+only when the permit is at exactly the claim revision (default 1 when absent).
+If the permit revision differs and the field is missing, finalization fails
+closed into the existing hold without opening a pull/merge request. An old worker
 ignores the new API's additive field and retains its previous behavior:
 live-window decisions can still render claim-time scope. Upgrade **both API
-and worker** for the permit-scope guarantee. This adds no capability, state,
-endpoint, migration or claim field, and does not expand decision admission.
+and worker** for the permit-scope guarantee. The permit-scope addition itself
+adds no capability, state, endpoint, migration or claim field and does not expand decision admission. Durable non-closing
+intent has separate version requirements below.
 
 ## The honest limitation: same-worker-only context
 
 **Be aware that a completion hold's conversation continuity is not durable
-across workers.** The worker verifies and keeps the run's Git work safely
-captured regardless of which worker eventually resumes it — that part is
-never at risk. But the run's actual provider session (the live conversation
-state a same-worker resume continues without re-planning) survives only as
+across workers.** Verified captures can recover Git work on another worker.
+A degraded pre-push hold retains local work without verifying a recovery copy, so losing
+that worker can lose the latest work. The run's provider session (the live
+conversation state a same-worker resume continues without re-planning) survives only as
 long as the same worker that held it is still around to reclaim it, bounded
 by the same worker-affinity ceiling that already governs every other parked
 run (2 hours by default; see
@@ -218,9 +243,9 @@ is a separate, later piece of work — this page will be updated when it ships.
 ## Closing directives and the completion block
 
 Every interlocked run's merge/pull request has a completion block that uzi
-alone owns and rewrites; on a verified full delivery it's the only place
-`Closes #N` is ever written. Two rules keep that guarantee even when
-something goes wrong or a human has touched the request in between:
+alone owns and rewrites. On a verified full delivery the worker writes its
+`Closes #N` line there. These checks protect the worker-owned body even when
+publication fails or a human has touched the request in between:
 
 - **On a verified head, if the `Closes` write can't be confirmed** — the
   write itself fails, the read-back to confirm it fails, or the PR's head
@@ -250,15 +275,17 @@ something goes wrong or a human has touched the request in between:
   unreadable case uses, and is accepted on the same terms. This scan and
   rewrite apply to legacy runs too, not only interlocked ones.
 - **On a delivery the lead declared non-closing** (via `non_closing` on
-  `signal_done`), uzi also keeps the title and commit messages from closing
-  the issue, since both reach the default branch in the squash commit.
+  `signal_done`), uzi also guards title and commit messages against closing
+  the source issue. On interlocked issue runs the commit guard also covers
+  owner-partial and Stop-capped delivery.
   Before pushing, it checks the messages of every commit the push would
   publish (relative to the default branch, merge commits included, and again
   on the exact commit about to be pushed) with the same matcher as the
   body. On a hit it stops publication (no further push, no request opened or
-  updated, no history rewrite) and fails the run naming the offending
-  commit SHA(s); if the messages can't be read (including commits whose header declares a
-  non-UTF-8 encoding) it refuses the same way, but names no SHA. The
+  updated, no worker history rewrite). An interlocked run holds, naming up
+  to five offending commit SHAs and the remaining count. Unreadable messages
+  (including a non-UTF-8 encoding header) refuse publication without naming
+  a SHA. A legacy declared run still fails at this guard. The
   committed work is preserved for recovery, and fixing the commits needs a
   history rewrite left to the owner. A new
   request's title is the issue title with any closing keyword for the issue
@@ -269,10 +296,79 @@ something goes wrong or a human has touched the request in between:
   closes after re-reading, the run fails closed; the request stays open and
   must not be merged as-is. Owner-partial and scope-capped deliveries get the
   same title neutralisation and fail-closed title confirmation, because they
-  never close their issue either. Only declared runs get the commit-message
-  refusal, so on those partial runs a closing keyword in a commit message can
-  still close the issue via a merge commit or squash body. Full deliveries keep
-  today's title.
+  are intended to keep their issue open. Interlocked owner-partial and Stop
+  runs now also refuse earlier-flight closing commits before pushing,
+  reversing the declared-only exception from #2815. Legacy scope-capped runs
+  still guard title/body without the added commit guard, so a commit can
+  close their issue. Full and accept-closing deliveries keep the normal path.
+
+## Fixing a publication hold
+
+For a declared or owner-partial run whose offending commits are still
+unpublished, choose **Continue** and give guidance naming the logged SHAs:
+ask the lead to reword its own unpublished commits in the next turn. The
+worker does not rewrite history or force-push. Partial and accept decisions
+cannot fix commit history.
+
+If the history was already published, or the run has a Stop directive,
+cancel and manually deliver the preserved work through
+[run recovery](run-recovery.md#completion-publication-holds). A Stop resumes
+directly into finalization without another lead turn.
+
+Partial and accept irreversibly change this frozen contract. A separately
+approved, explicit milestone reconciliation reset can replace it and clear
+scope ceilings and completion decisions; stored non-closing intent survives
+that reset. See [the CLI reconciliation procedure](cli.md#commands).
+Stop is an owner directive on a running run. Wall parking follows #1497;
+provider-policy parking under #3068 is planned, not shipped.
+
+## Durable non-closing intent and remaining limits
+
+On interlocked issue runs, a supported worker records the first non-closing
+reason with a completion attempt and restores it on reclaim. The reason is
+NUL-stripped, trimmed and required to contain 1–500 Unicode code points;
+invalid values are refused, not truncated. It survives resume, holds,
+owner decisions and milestone reconciliation. It conservatively restricts
+publication; it does not waive scope or satisfy a criterion.
+
+Both harnesses carry this flight's latched declaration on every completion
+attempt. The lead must still redeclare it on each `signal_done`. If a
+`signal_done` is re-prompted before its attempt (for example by secret
+remediation), the declaration is not durable until the next recorded
+attempt. A park, reclaim or hold before that attempt can lose it.
+
+Upgrade API and workers together for `completion_non_closing_v1`. Without
+that API feature a new declared pre-push refusal remains terminal rather
+than holding; existing executor and post-push holds are unchanged and can
+lose the declaration. An old worker ignores restored claim intent. See
+[Worker versions and upgrades](worker-upgrades.md#completion-publication-compatibility).
+
+Before pushing an interlocked issue run, the worker obtains one running
+publication-start acknowledgement after prechecks. Its strict revision and
+deferred-ID projection selects the guard; it is not publication authority.
+Unknown running projections hold without exposing commit text; a non-running
+acknowledgement quietly stops this flight. Transport errors keep existing
+finalization-failure handling. After pushing, the normal exact-head permit
+must match that acknowledged revision and deferred-ID set.
+
+The commit scans cover default-branch..tip, including earlier flights,
+alignment bridge commits and an adopted own branch, and repeat on the exact
+candidate before push. They cannot unpublish earlier history or prevent an
+already-open request from being merged before a resumed guard runs. Claim
+loss accepted between acknowledgement and push remains possible: the API
+does not fence the Git push itself. Corruption outside supported writers is
+not detected before push; the later permit fails closed.
+
+MR rework (`mr_rework`) and branch-adopting CI fix (`ci_fix`) are excluded.
+Forgejo/Gitea can close an issue on any branch push; the non-branch checkpoint
+refs `refs/uzi-checkpoints` and held refs `refs/uzi-held` are outside that
+branch-push behavior. These two residuals share the recorded finding handoff
+#3b56e6e5-4352-4694-ae1c-4999d5719e9c (a finding ID, not a forge issue).
+
+This remains structural enforcement. #1230 D4 and #1231 remain open; there
+is no plan-time preauthorization or active semantic completion audit.
+Live deployment acceptance has not been performed; mocked tests or an
+existing PR do not establish it.
 
 ## Not the same as an owner pause
 
@@ -285,11 +381,10 @@ question (before the run has actually parked) is not a `paused` run at all,
 so the ordinary **Resume** control
 doesn't apply to it. An ordinary answer continues with guidance; use the run
 view or `uzi run decide <id>` for a formal continue, partial or accept
-decision. Once a run has parked in the hold, plain `uzi run resume` will
-technically move it back to `queued` too, but `uzi run decide <id>` is the
-right tool: it's the one path that can carry a decision — guidance on a
-continue, or a scope change on a partial/accept — to the resumed run and that
-records it against the hold it's answering.
+decision. Once a run has parked with `hold_reason: completion_blocked`, plain
+`uzi run resume` is refused. Use `uzi run decide <id>`; an eligible
+`uzi run set-token` switch can also resume it. Neither a credential switch
+nor ordinary guidance changes the frozen completion scope.
 
 Related: [Pausing and resuming a run](run-pause.md) ·
 [Autopilot](autopilot.md) · [CLI](cli.md)
