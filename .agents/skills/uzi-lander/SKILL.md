@@ -209,7 +209,9 @@ locally in step 4. The advisory still prints until the window expires.
    pass as the approved gate. Without the approved seq and with the run at `awaiting_approval`,
    treat it as the re-plan case below. `MAX` polls cover the run's remaining budget (`budget_total_seconds` minus
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
-   `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
+   `ELAPSED` / `RESULT=elapsed` (exit 3) stopped counting, not the run: re-snapshot
+   and re-launch under the existing grant, or record the coverage blocker. A stop-set
+   state exits 0 with `RESULT=stop:STATE`, not a generic success verdict. Re-arm after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
@@ -344,8 +346,9 @@ locally in step 4. The advisory still prints until the window expires.
      **A rework already running** (uzi starts one on new bot comments; a second `uzi run
      rework` then fails "already working this branch"): steer it with `uzi run follow-up
      REWORK_RUN -m 'GUIDANCE'` instead, and wait on that run itself
-     (`.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN completed,failed,cancelled 60`):
-     it predates any `$SINCE` you capture now, so `wait-mrrework.sh` would not see it.
+      (`.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN completed,failed,cancelled 60`):
+      it predates any `$SINCE` you capture now, so `wait-mrrework.sh` would not see it.
+      Its exit 3 / `RESULT=elapsed` ends coverage, not rework: re-snapshot and re-arm.
      A finding an earlier cycle declined that resurfaces
      with no new evidence: ask for a reasoned reply on the thread and no code change.
      **Steer with facts and acceptance criteria.** Steer text reaches the rework's

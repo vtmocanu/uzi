@@ -158,7 +158,13 @@ pause and terminal states), approved-plan watermark and explicit MAX covering th
 remaining budget. A terminal-only watch can miss a parked duty. Observation expiry
 must reach the owner as ended coverage, never as successful task completion.
 
-It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
+Exit 0 means a stop-set state, not necessarily a successful run; the final line is
+`RESULT=stop:STATE`. Exit 3 / `RESULT=elapsed` means coverage ended, **not done**:
+re-snapshot the run and re-arm under the existing task grant, or record an explicit
+blocker. Choose MAX to cover the remaining run budget; the default is only 240 polls.
+Preserve the log in a private owner-chosen path, not only the harness's shell-output file.
+
+It also exits 4 with `STOP=needs_attention` and final `RESULT=attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
 consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
 same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
@@ -266,8 +272,8 @@ recoverable from the durable sources or the worker's bare tracking ref, not guar
 Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a failed run's
 work from the worker PVC* below.
 
-- **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base
-  <branch>` run inherits the source branch's commits, so a maintainer workflow change on a
+- **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base BRANCH`
+  run inherits the source branch's commits, so a maintainer workflow change on a
   PR branch fails later runs on it until main or the target ref carries the same blob at
   that path; equivalent content on main under another commit SHA passes (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
   rule, #1846).
@@ -513,8 +519,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   (`<m>` counts the sources found, clones or the tracking ref the run tried to capture, plus
   attributed unreadable ones), exits 1 and does not advance `latest`; any archive that did verify
   is kept. When nothing is captured at all (no readable clone and no owned tracking ref), a failed
-  search instead logs `FAIL <run> (<label>) status=<st>: status saved, but the source search was
-  inconclusive (<reasons>); retry` (still exit 1, `latest` not advanced); each reason names the
+  search instead logs `FAIL RUN (LABEL) status=STATUS: status saved, but the source search was inconclusive (REASONS); retry`
+  (still exit 1, `latest` not advanced); each reason names the
   failing pod or namespace for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`,
   `listing Running pods in namespace <ns> failed`), an errored probe, an unreadable `.git`
   (`a candidate's .git on pod <ns>/<pod> could not be read`) and an attributed source listed but
