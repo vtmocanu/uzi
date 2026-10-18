@@ -21,6 +21,32 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+for (const [status, reason] of [[401, "hold_not_original_worker"],
+  [403, "capture_failure_requires_attention"], [409, "capture_manifest_integrity_mismatch"]] as const) {
+  it(`FINAL refusal ${status} preserves the reconciliation owner-attention reason`, async () => {
+    const { f, before } = await pendingReceiptFixture();
+    try {
+      const warnings: Array<{ message: string; fields?: Record<string, unknown> }> = [];
+      f.log.warn = (message, fields) => { warnings.push({ message, fields }); };
+      f.state.finalError = new RequestError("POST", "/release", status, JSON.stringify({ reason: "not_authorized" }));
+      f.client.reconcileRecoveryCapture = async (run, id, request) => ({
+        run_id: run, capture_id: id, generation: request.generation, outcome: "retained", reason,
+      });
+      const bundle = await fs.readFile(before.bundlePath!);
+      await f.make().resumePending(undefined, [before]);
+      const after = (await f.coordinator.inspect(before.runId))[0]!;
+      assert.equal(after.reason, reason);
+      assert.ok(warnings.some(warning => warning.message === "recovery: inventory requires owner attention" &&
+        warning.fields?.reason === reason));
+      assert.deepEqual(after.finalRequest, before.finalRequest);
+      assert.equal(after.finalAcknowledged, undefined);
+      assert.deepEqual(await fs.readFile(before.bundlePath!), bundle);
+      assert.equal(f.state.pinDeletes, 0);
+      assert.equal(f.state.uploads, 1);
+    } finally { await f.close(); }
+  });
+}
+
 for (const gate of ["inactive", "feature", "coverage"] as const) {
   it(`advisory saved FINAL local ${gate} void preserves reason and immediate eligibility`, async () => {
     const { f, before } = await pendingReceiptFixture();

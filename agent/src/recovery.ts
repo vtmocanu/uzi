@@ -1811,7 +1811,11 @@ export class RecoveryCoordinator {
         err instanceof RequestError && [403, 409].includes(err.status) ? "final_retry_refused" : "final_retry_unknown", err,
         cls.kind === "credential" || (err instanceof RequestError && [403, 409].includes(err.status)));
       if (cls.kind === "credential") this.credentialBlockedAt = this.now();
-      const reconciled = await this.reconcileInventory(record, prove, observedStatus);
+      // retainFinal changed the authenticated journal. Reconciliation's guarded reason
+      // write must compare against that snapshot, while keeping the same saved FINAL.
+      const latest = await this.readLatest(record);
+      const reconciled = latest.kind === "ok" && this.finalRetryIdentity(latest.record) === this.finalRetryIdentity(record)
+        ? await this.reconcileInventory(latest.record, prove, observedStatus) : undefined;
       if (reconciled && reconciled.reason !== "final_retry_unknown") return reconciled;
       return { state: record.state, captureId: record.captureId,
         reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
