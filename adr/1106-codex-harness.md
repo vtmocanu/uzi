@@ -494,6 +494,14 @@ it leaves uncaptured work in an ephemeral clone instead of moving capturable wor
 into the persistent worker bare. Local capture alone proves neither origin
 publication nor permission to dispose of the source.
 
+Codex background dependency installation also uses registered supervisor roots,
+with the existing runner identity, manager commands, replacement environment,
+HOME and caches. Its private setup binding grants no model or credential authority
+and is unavailable inside the Git capture lane. A primary child exit or fulfilled
+best-effort install result is insufficient: confirmed root cleanup is required
+before capture or boundary credential reconciliation. Unconfirmed cleanup remains
+separate from the dependency-install outcome. Claude's installer path is unchanged.
+
 The same supervisor mechanism has been measured with actual provider roots and
 separate process controls. M0 needs no different process primitive for command
 roots; registry coordination, environment enforcement and combined runner/handler

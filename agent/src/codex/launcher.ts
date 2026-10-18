@@ -44,6 +44,7 @@ import type { Readable, Writable } from "node:stream";
 import {
   CODEX_SESSION_GID,
   COMMAND_UID,
+  RUNNER_UID,
   WORKER_UID,
   commandRootCommand,
   runnerCommand,
@@ -61,6 +62,7 @@ import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
 import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
 import { assertCaptureLaunch } from "../credential-free-capture.js";
+import { assertSupervisedInstallRequest, type SupervisedInstallRequest } from "../js-deps.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -1035,6 +1037,68 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
     deps.reportRunnerTreeCleanupFailure
       ?? (() => process.stderr.write("codex runner-owned tree cleanup failed; retaining the tree\n")),
   );
+}
+
+/** Canonical worker setup at the existing installer uid, with native root lifecycle evidence.
+ * Match the installer's ignored stdio before even awaiting startup evidence.
+ */
+export async function launchCodexInstallerRoot(
+  request: SupervisedInstallRequest,
+  deps: LauncherDeps = {},
+): Promise<CodexRootHandle> {
+  try {
+    assertSupervisedInstallRequest(request);
+    if (!uidSplitActive(deps.env ?? process.env)) {
+      throw new CodexUnsupportedProfileError("Codex installer roots require the A1 uid split; refusing to launch");
+    }
+    const uid = (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
+    if (uid !== RUNNER_UID) {
+      throw new TrustedExecutionRefusal("installer requires the fixed runner uid");
+    }
+    const wrapped = runnerCommand(deps.helperBinsForTest?.supervisor ?? SUPERVISOR_BIN, [
+      "--expect-uid", String(RUNNER_UID), "--", request.command, ...request.args,
+    ]);
+    const startupCleanup = deps.startupCleanup;
+    if (startupCleanup) {
+      const { attempt, hardDeadlineAt } = startupCleanup;
+      if (typeof attempt !== "object" || attempt === null || usedStartupAttempts.has(attempt) ||
+        !Number.isFinite(hardDeadlineAt) || Date.now() >= hardDeadlineAt) {
+        throw new CodexLaunchError("unknown", "unconfirmed", undefined);
+      }
+      usedStartupAttempts.add(attempt);
+    }
+    // Ordinary trusted worker setup, not the credential-free Git capture exception.
+    // Repeat the actual request and current-epoch guard immediately at the spawn seam.
+    assertSupervisedInstallRequest(request);
+    let child: SupervisorProcess;
+    try {
+      child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
+        cwd: request.cwd,
+        env: { ...request.env },
+        stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+      });
+    } catch (cause) {
+      const error = new CodexLaunchError(spawnFailureClassification(cause), "unconfirmed", cause);
+      launchClassifications.set(error, error.classification);
+      throw error;
+    }
+    // Installer output has never been a logging surface. Drain without decoding or
+    // collecting bytes, including failed startup; stdin stays EOF as with stdio:ignore.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end();
+    child.stdout?.resume();
+    child.stderr?.resume();
+    const unregister = registerWorkerRunnerRoot(child.pid, deps.rootStartTime);
+    child.once("exit", () => unregister());
+    child.once("error", () => unregister());
+    return await createHandle(child, RUNNER_UID, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command",
+      startupCleanup, deps.armStartedDeadlineForTest);
+  } catch (cause) {
+    if (cause instanceof CodexLaunchError && launchClassifications.has(cause)) throw cause;
+    const error = new CodexLaunchError(classifyCodexLaunchFailure(cause), "unconfirmed", cause);
+    launchClassifications.set(error, error.classification);
+    throw error;
+  }
 }
 
 /** A generic supervised effect launch. Unlike {@link launchCodexRoot}, it creates

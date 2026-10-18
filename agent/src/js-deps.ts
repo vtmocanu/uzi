@@ -81,7 +81,7 @@
 import { spawn } from "node:child_process";
 import { constants as fsConstants, existsSync } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 
 /** The package managers whose lockfile we recognize. */
@@ -286,6 +286,97 @@ export interface InstallCommand {
    *  rejected plan, a cancel — must be able to reclaim the subprocess instead of
    *  blocking teardown on it for the full timeout. */
   signal?: AbortSignal;
+}
+
+declare const supervisedInstallBrand: unique symbol;
+
+/** Worker-private canonical install input; only prepareSupervisedInstall mints it. */
+export interface SupervisedInstallRequest {
+  readonly [supervisedInstallBrand]: true;
+  readonly command: "/usr/bin/env";
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<NodeJS.ProcessEnv>;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+}
+
+const supervisedInstalls = new WeakMap<SupervisedInstallRequest, {
+  readonly original: InstallCommand;
+  readonly baseEnv: Readonly<NodeJS.ProcessEnv>;
+  readonly spec: InstallSpec;
+  readonly beforeSpawn: () => void;
+}>();
+
+function sameInstallArgs(actual: readonly string[], expected: readonly string[]): boolean {
+  return actual.length === expected.length && actual.every((arg, index) => arg === expected[index]);
+}
+
+function sameInstallEnv(actual: NodeJS.ProcessEnv, expected: NodeJS.ProcessEnv): boolean {
+  const keys = Object.keys(actual);
+  return keys.length === Object.keys(expected).length && keys.every((key) =>
+    Object.hasOwn(expected, key) && actual[key] === expected[key] &&
+    !key.includes("\0") && !key.includes("=") &&
+    (actual[key] === undefined || (typeof actual[key] === "string" && !actual[key]!.includes("\0"))));
+}
+
+function canonicalInstallSpec(command: InstallCommand, baseEnv: NodeJS.ProcessEnv): InstallSpec {
+  if (!isAbsolute(command.cwd) || resolve(command.cwd) !== command.cwd || command.cwd.includes("\0") ||
+    !Number.isFinite(command.timeoutMs) || command.timeoutMs <= 0) {
+    throw new Error("installer requires a clean absolute cwd and positive finite timeout");
+  }
+  // At most the fixed manager table's entries; no manager or dispatcher comes from argv.
+  for (const spec of Object.values(INSTALL_COMMANDS)) {
+    const wrapped = runnerCommand(spec.command, spec.args);
+    if (command.command === wrapped.command && sameInstallArgs(command.args, wrapped.args) &&
+      sameInstallEnv(command.env, { ...baseEnv, ...spec.env })) return spec;
+  }
+  throw new Error("installer command or environment is not canonical");
+}
+
+/** Snapshot trusted setup before any asynchronous launch work. No spawn authority is exposed. */
+export function prepareSupervisedInstall(
+  command: InstallCommand,
+  baseEnv: NodeJS.ProcessEnv,
+  beforeSpawn: () => void,
+): SupervisedInstallRequest {
+  if (typeof beforeSpawn !== "function") throw new Error("installer requires a synchronous launch guard");
+  const capturedBase = Object.freeze({ ...baseEnv });
+  const original = Object.freeze({
+    ...command,
+    args: [...command.args],
+    env: Object.freeze({ ...command.env }),
+  });
+  Object.freeze(original.args);
+  const spec = canonicalInstallSpec(original, capturedBase);
+  const request = Object.freeze({
+    command: "/usr/bin/env" as const,
+    args: Object.freeze([spec.command, ...spec.args]),
+    cwd: original.cwd,
+    env: original.env,
+    timeoutMs: original.timeoutMs,
+    signal: original.signal,
+  }) as SupervisedInstallRequest;
+  supervisedInstalls.set(request, { original, baseEnv: capturedBase, spec, beforeSpawn });
+  assertSupervisedInstallRequest(request);
+  return request;
+}
+
+/** Repeat canonical validation, cancellation and the owner's current-epoch fence at spawn. */
+export function assertSupervisedInstallRequest(request: SupervisedInstallRequest): void {
+  const binding = supervisedInstalls.get(request);
+  if (!binding) throw new Error("installer request has no preparation provenance");
+  const spec = canonicalInstallSpec(binding.original, binding.baseEnv);
+  if (spec !== binding.spec || request.command !== "/usr/bin/env" ||
+    !sameInstallArgs(request.args, [spec.command, ...spec.args]) ||
+    request.cwd !== binding.original.cwd || request.timeoutMs !== binding.original.timeoutMs ||
+    request.signal !== binding.original.signal ||
+    !sameInstallEnv(request.env, { ...binding.baseEnv, ...spec.env })) {
+    throw new Error("installer request is not canonical");
+  }
+  request.signal?.throwIfAborted();
+  binding.beforeSpawn();
+  request.signal?.throwIfAborted();
 }
 
 /** The `detail` an install reports when it was aborted rather than run to a verdict.

@@ -1006,6 +1006,7 @@ export function createCodexExecutionSafety(
   // production, so the deadline is the default wall-clock timer.
   armDeadline?: ArmBoundaryDeadline,
 ): CodexExecutionSafetyImpl {
+  let terminalHookFailure: HarnessError | undefined;
   return new CodexExecutionSafetyImpl(
     registry,
     {
@@ -1015,13 +1016,31 @@ export function createCodexExecutionSafety(
         const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
         // `onDispose` (the executor's post-run sink token eviction) must run even if
         // `disposeTools` ever rejects — otherwise those tokens would leak. `disposeTools`
-        // catches internally today (never throws), so the `finally` is future-proofing;
-        // over-retention is the safe direction but eviction is the point.
-        try {
-          return await registry.disposeTools(request.deadlineMs);
-        } finally {
-          await onDispose?.(deadlineAt);
+        // catches internally today. Preserve primary failure independently, and latch
+        // hook refusal so cleared tables cannot manufacture a later disposed result.
+        let outcome: { ok: true; value: ToolDisposal } | { ok: false; error: unknown };
+        try { outcome = { ok: true, value: await registry.disposeTools(request.deadlineMs) }; }
+        catch (error) { outcome = { ok: false, error }; }
+        let hookError: unknown;
+        let hookFailed = false;
+        try { await onDispose?.(deadlineAt); }
+        catch (error) {
+          hookError = error;
+          hookFailed = true;
+          const evidence: HarnessError = { category: "tool",
+            message: `terminal cleanup hook failed (${safeErrorName(error)})` };
+          terminalHookFailure ??= evidence;
+          registry.poison(evidence);
         }
+        if (!outcome.ok) {
+          if (hookFailed) throw new AggregateError([outcome.error, hookError],
+            "codex registry disposal and terminal cleanup failed", { cause: outcome.error });
+          throw outcome.error;
+        }
+        if (terminalHookFailure) return { kind: "incomplete", errors: [
+          ...(outcome.value.kind === "incomplete" ? outcome.value.errors : []), terminalHookFailure,
+        ] };
+        return outcome.value;
       },
       spawnRoot,
       spawnProcess,

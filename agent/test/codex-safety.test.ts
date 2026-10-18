@@ -1016,6 +1016,46 @@ describe("CodexExecutionSafety.withBoundary: per-sink reconcile (m4)", () => {
     assert.equal(result, 6);
   });
 
+  it("#2852 terminal hook refusal remains incomplete after a later successful hook", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    let calls = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, () => {
+      if (++calls === 1) throw new Error("private cleanup detail");
+    });
+    const first = await safety.dispose(req("terminal"));
+    assert.equal(first.kind, "incomplete");
+    assert.equal(JSON.stringify(first).includes("private cleanup detail"), false);
+    const second = await safety.dispose(req("terminal"));
+    assert.equal(second.kind, "incomplete", "cleared tables cannot erase hook failure");
+    assert.equal(calls, 2, "independent cleanup is still attempted");
+    assert.equal(reg.isPoisoned(), true);
+  });
+
+  for (const hookFails of [false, true]) {
+    it(`#2852 registry disposal preserves primary failure with hook failure ${hookFails}`, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+      const primary = new Error("primary disposal failure");
+      const secondary = new Error("secondary cleanup failure");
+      reg.disposeTools = async () => { throw primary; };
+      let hooks = 0;
+      const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, () => {
+        hooks++;
+        if (hookFails) throw secondary;
+      });
+      await assert.rejects(safety.dispose(req("terminal")), error => {
+        if (hookFails) {
+          assert.ok(error instanceof AggregateError);
+          assert.equal(error.cause, primary);
+          assert.deepEqual(error.errors, [primary, secondary]);
+          assert.equal(error.message.includes(primary.message), false);
+          assert.equal(error.message.includes(secondary.message), false);
+        } else assert.equal(error, primary);
+        return true;
+      });
+      assert.equal(hooks, 1);
+    });
+  }
+
   it("dispose runs the onDispose terminal hook AFTER a post-run sink registered a token (F1: sink tokens are evicted)", async () => {
     // Models the executor's F1 wiring: a post-run sink reconcile registers a fresh token
     // into a set (via addSecret), and the terminal dispose the runner calls evicts it via

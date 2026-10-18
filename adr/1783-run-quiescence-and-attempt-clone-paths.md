@@ -283,6 +283,10 @@ removes the tree.
   capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate
   credential-presence check for the trusted worker identity `worker_pat`.
+  Codex dependency installation retains its runner identity and command/environment
+  contract while registering supervisor roots before launch. Its fulfilled result
+  grants no process proof without full clean root settlement; the setup binding
+  does not widen the Git-only capture lane or model/credential admission.
 
   Save credential-free session state before capture may drain the epoch. After
   failed or withdrawn pause, and before human or automatic changed-milestone gate

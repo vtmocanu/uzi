@@ -1,3 +1,4 @@
+import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
@@ -19545,4 +19546,349 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     try { await withTimeout(execution, 20_000, "actual executor cleanup"); }
     finally { proof.cleanup(); await api.close(); fx.cleanup(); }
   }
+});
+
+describe("#2852 default installer binding", () => {
+  const done = epochResponder("th-1", "tn-1", t => { t.push(signalDone()).push(turnCompleted()); });
+  async function fixture(mode: "clean" | "unclean" | "startup" = "clean", responder = done, observe?: (phase: "spawn" | "primary") => void,
+    options: { ctx?: Partial<RunContext>; configure?: (rig: Rig) => void; lockfile?: string } = {}) {
+    const scratch = path.resolve("../.uzi/scratch");
+    const dir = await fs.mkdtemp(path.join(scratch, "installer-binding-"));
+    const repo = path.join(dir, "repo");
+    await fs.mkdir(repo);
+    await fs.writeFile(path.join(repo, "package.json"), '{"name":"installer-fixture","private":true}');
+    await fs.writeFile(path.join(repo, options.lockfile ?? "package-lock.json"), '{"lockfileVersion":3}');
+    const native = nativeRootForTest(mode, observe);
+    const rig = makeRig({ responder });
+    rig.deps = { ...rig.deps, installDeps: undefined,
+      provisionRunTools: async () => ({ toolEnv: { PATH: "/fixture/bin" } }),
+      launchCodexInstallerRootForTest: native.launcher,
+    };
+    options.configure?.(rig);
+    const log = recordingLog();
+    const exec = new CodexExecutor(log.log, path.join(dir, "home"),
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+      { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+    const controller = new AbortController();
+    const { ctx, emitted } = makeCtx({ worktreePath: repo, signal: controller.signal, ...options.ctx });
+    let returned = false;
+    const run = exec.run(ctx).then(
+      value => ({ value, error: undefined }),
+      (error: unknown) => ({ value: undefined, error }),
+    ).finally(() => { returned = true; });
+    return { native, rig, exec, ctx, emitted, log, run, controller, returned: () => returned,
+      cleanup: async () => {
+        controller.abort(new Error("fixture cleanup"));
+        native.release();
+        await withTimeout(run, 5000, "#2852 owned run cleanup");
+        await native.destroy();
+        await fs.rm(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("#2852 primary exit zero retains the default installer root until full disposal", async t => {
+    const reservations: ExecutionRegistry[] = [];
+    let installer: ExecutionRegistry | undefined;
+    let primaryState: { roots: number; pending: number } | undefined;
+    const reserve = ExecutionRegistry.prototype.reserveLaunch;
+    t.mock.method(ExecutionRegistry.prototype, "reserveLaunch", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["reserveLaunch"]>
+    ) {
+      const result = reserve.apply(this, args);
+      if (args[0] === "command") reservations.push(this);
+      return result;
+    });
+    const fx = await fixture("clean", done, phase => {
+      if (phase === "spawn") installer = reservations.at(-1);
+      else if (installer) primaryState = { roots: installer.rootCount(), pending: installer.pendingLaunchCount() };
+    });
+    try {
+      await withTimeout(fx.native.disposing, 3000, "default installer disposal requested");
+      assert.ok(installer, "installer reservation existed before actual launch");
+      assert.deepEqual(primaryState, { roots: 1, pending: 0 }, "installer registered BEFORE primary wait");
+      assert.deepEqual(fx.native.events, ["spawn", "primary-wait", "dispose-request"]);
+      assert.equal(fx.rig.transport.turnStartCount, 0, "primary exit cannot start implementation");
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      assert.equal(fx.returned(), false);
+      fx.native.writeIgnoredOutput();
+      fx.native.release();
+      const result = await withTimeout(fx.run, 5000, "clean default installer run");
+      assert.equal(result.error, undefined);
+      assert.equal(fx.rig.transport.turnStartCount, 1);
+      assert.ok(fx.native.events.includes("drained"));
+      assert.ok(fx.emitted.some(m => JSON.stringify(m).includes("installed JS dependencies in .")));
+      assert.doesNotMatch(JSON.stringify([fx.emitted, fx.log.lines]), /installer-(output|error)-must-not-escape/);
+      const call = fx.native.calls[0]!;
+      assert.equal(call.options.cwd, fx.ctx.worktreePath);
+      assert.deepEqual(call.args.slice(-7), ["--expect-uid", "10002", "--", "/usr/bin/env", "npm", "ci", "--ignore-scripts"]);
+      assert.equal(call.options.env.HOME, path.join(path.dirname(fx.ctx.worktreePath), "home"));
+      assert.equal(call.options.env.PATH, "/fixture/bin");
+      assert.equal(call.options.env.GIT_TERMINAL_PROMPT, "0");
+      for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GITLAB_TOKEN", "UZI_WORKER_TOKEN", "NODE_OPTIONS"]) {
+        assert.equal(call.options.env[key], undefined, key);
+      }
+    } finally { await fx.cleanup(); }
+  });
+
+  it("#2852 cancel-purpose capture waits for full default installer drain independently of lifecycle", async () => {
+    const fx = await fixture();
+    const bodyEntered = installerBarrier();
+    const bodyRelease = installerBarrier();
+    let bodies = 0;
+    let capture: ReturnType<CodexExecutor["withCredentialFreeCapture"]> | undefined;
+    try {
+      await withTimeout(fx.native.disposing, 3000, "installer primary exited");
+      capture = fx.exec.withCredentialFreeCapture(5000, async () => {
+        bodies++;
+        bodyEntered.resolve();
+        await bodyRelease.promise;
+        return "captured";
+      }, "cancel", new AbortController().signal);
+      // The abort is delivered synchronously; disposal still owns the latch.
+      assert.equal(bodies, 0);
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      assert.equal(fx.rig.sessionOps.persist, 0);
+      assert.equal(fx.returned(), false);
+      fx.native.release();
+      await withTimeout(bodyEntered.promise, 3000, "capture after installer full drain");
+      assert.ok(fx.native.events.includes("drained"));
+      assert.equal(fx.returned(), false, "run finally cannot overtake held capture body");
+      await assert.rejects(fx.exec.run(fx.ctx), /codex (run already active|epoch admission closed for capture)/);
+      bodyRelease.resolve();
+      assert.deepEqual(await capture, { kind: "observed_empty", value: "captured" });
+      await withTimeout(fx.run, 5000, "capture-first run finally");
+      assert.equal(bodies, 1);
+    } finally {
+      bodyRelease.resolve(); fx.native.release();
+      if (capture) await capture;
+      await fx.cleanup();
+    }
+  });
+
+  for (const mode of ["unclean", "startup"] as const) {
+    it(`#2852 ${mode} default installer never grants capture or credential reconcile`, async () => {
+      const cacheEntered = installerBarrier();
+      const cacheRelease = installerBarrier();
+      const fx = await fixture(mode, done, undefined, { configure: rig => {
+        rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+          startCacheHolder: async token => ({ token, path: `/var/cache/uzi-codex-cmd/${token}`, alive: () => true,
+            release: async () => {
+              cacheEntered.resolve();
+              await cacheRelease.promise;
+              return { state: "removed", reason: "" };
+            },
+          }),
+        };
+      } });
+      let terminal: Promise<unknown> | undefined;
+      let bodies = 0;
+      try {
+        await withTimeout(fx.native.disposing, 3000, "uncertain root disposal requested");
+        fx.native.release();
+        const run = await withTimeout(fx.run, 5000, "uncertain installer terminal join");
+        assert.equal(fx.rig.transport.turnStartCount, 1, "best-effort failure remains a fulfilled installation fact");
+        assert.equal(run.error, undefined);
+        assert.ok(fx.emitted.some(m => JSON.stringify(m).includes(
+          mode === "unclean" ? "installer cleanup unconfirmed" : "installer startup failed")));
+        assert.equal(fx.emitted.some(m => JSON.stringify(m).includes("installed JS dependencies in .")), false,
+          "primary exit zero with unclean root cannot report success");
+        const releaseCalls = fx.rig.client.releaseCalls.length;
+        const refreshCalls = fx.rig.client.refreshCalls.length;
+        const capture = await fx.exec.withCredentialFreeCapture(1000, async () => { bodies++; }, "cancel");
+        assert.equal(capture.kind, "incomplete");
+        assert.equal(bodies, 0);
+        await assert.rejects(fx.exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 }, async () => {
+          bodies++;
+        }));
+        assert.equal(bodies, 0);
+        assert.equal(fx.rig.client.releaseCalls.length, releaseCalls);
+        assert.equal(fx.rig.client.refreshCalls.length, refreshCalls);
+        let terminalReturned = false;
+        terminal = fx.exec.safety!.dispose({ boundary: "finalize", deadlineMs: 5000 }).then(result => {
+          terminalReturned = true;
+          return result;
+        }, (error: unknown) => {
+          terminalReturned = true;
+          return { kind: "rejected", error: String(error) };
+        });
+        await withTimeout(cacheEntered.promise, 3000, "independent terminal cache cleanup");
+        assert.equal(terminalReturned, false, "uncertain installer cannot detach independent cache cleanup");
+        assert.ok(fx.log.removed.length > 0, "released tokens still evicted");
+        assert.ok(fx.rig.disposed() > 0, "independent provider cleanup still attempted");
+        cacheRelease.resolve();
+        const terminalResult = await terminal as { kind: string; error?: string };
+        assert.equal(terminalResult.kind, "incomplete",
+          `terminal disposal must return incomplete after independent cleanup; observed ${JSON.stringify(terminalResult)}`);
+      } finally {
+        cacheRelease.resolve();
+        if (terminal) await terminal;
+        await fx.cleanup();
+      }
+    });
+  }
+
+  it("#2852 normal production reconcile waits for clean installer settlement", async () => {
+    const turn = installerBarrier();
+    const quiet = epochResponder("th-1", "tn-1", () => { turn.resolve(); });
+    const fx = await fixture("clean", quiet, undefined, { ctx: { planApproved: false, approvedPlan: undefined, gatePlan: async () => ({ kind: "cancel" }) as never } });
+    let boundary: Promise<unknown> | undefined;
+    let sinks = 0;
+    try {
+      await withTimeout(turn.promise, 3000, "planning overlaps default install");
+      await withTimeout(fx.native.disposing, 3000, "installer disposal held");
+      boundary = fx.exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 5000 }, async () => {
+        assert.ok(fx.native.events.includes("drained"));
+        sinks++;
+      });
+      assert.equal(sinks, 0);
+      assert.equal(fx.rig.client.refreshCalls.length, 0);
+      fx.native.release();
+      await withTimeout(boundary, 3000, "production reconcile after full drain");
+      assert.equal(sinks, 1);
+      assert.equal(fx.rig.client.refreshCalls.length, 1, "real run-lane credential reconcile executes after clean settlement");
+    } finally {
+      fx.native.release();
+      if (boundary) await boundary;
+      await fx.cleanup();
+    }
+  });
+
+  for (const order of ["capture-first", "terminal-first"] as const) {
+    it(`#2852 ${order} serializes pending session save and terminal ownership`, async () => {
+      const turn = installerBarrier();
+      const persistEntered = installerBarrier();
+      const persistRelease = installerBarrier();
+      const bodyEntered = installerBarrier();
+      const bodyRelease = installerBarrier();
+      const homes = new Set<string>();
+      const sources: string[] = [];
+      let generation = 7;
+      let savedFiles = 1;
+      let bodies = 0;
+      const responder = epochResponder("th-1", "tn-1", t => {
+        turn.resolve();
+        if (order === "terminal-first") t.push(signalDone()).push(turnCompleted());
+      });
+      const fx = await fixture("clean", responder, undefined, { configure: rig => {
+        const launch = rig.deps.launchProviderRoot!;
+        rig.deps = { ...rig.deps,
+          launchProviderRoot: async (spec, mode) => {
+            const result = await launch(spec, mode);
+            const home = path.join(spec.ownedDataRoot, "codex");
+            homes.add(home);
+            return { ...result, root: { ...result.root,
+              reap: async ms => {
+                const reaped = await result.root.reap(ms);
+                if (reaped.ok) homes.delete(home);
+                return reaped;
+              },
+              dispose: async ms => { await result.root.dispose(ms); homes.delete(home); },
+            } };
+          },
+          sessionStore: {
+            inspect: async () => "present",
+            adopt: async () => ({ files: savedFiles }),
+            remove: async () => { savedFiles = 0; },
+            persist: async home => {
+              sources.push(home);
+              persistEntered.resolve();
+              await persistRelease.promise;
+              generation++;
+              savedFiles = homes.has(home) ? 1 : 0;
+              return { files: savedFiles, bytes: savedFiles };
+            },
+          },
+        };
+      } });
+      let capture: ReturnType<CodexExecutor["withCredentialFreeCapture"]> | undefined;
+      try {
+        await withTimeout(fx.native.disposing, 3000, "default installer root disposal");
+        fx.native.release();
+        await withTimeout(turn.promise, 3000, "provider turn entered");
+        if (order === "terminal-first") {
+          await withTimeout(persistEntered.promise, 3000, "terminal persist owns tail");
+          await assert.rejects(fx.exec.run(fx.ctx), /codex run already active/);
+        }
+        capture = fx.exec.withCredentialFreeCapture(5000, async () => {
+          bodies++;
+          bodyEntered.resolve();
+          await bodyRelease.promise;
+          return "saved capture";
+        }, "cancel", new AbortController().signal);
+        await withTimeout(persistEntered.promise, 3000, "persist before capture drain");
+        fx.controller.abort(new Error("external lifecycle cancelled"));
+        assert.equal(fx.rig.reaped(), 0, "neither capture nor terminal may drain before persist settles");
+        assert.equal(fx.rig.disposed(), 0);
+        assert.equal(fx.rig.transport.closes, 0);
+        assert.equal(fx.returned(), false);
+        assert.equal(bodies, 0);
+        assert.equal(generation, 7);
+        persistRelease.resolve();
+        if (order === "capture-first") {
+          await withTimeout(bodyEntered.promise, 3000, "capture owns body");
+          assert.equal(fx.returned(), false);
+          assert.equal(fx.rig.transport.closes, 0, "terminal harness close queues behind capture body");
+          assert.equal(fx.rig.disposed(), 0, "terminal disposal queues behind capture body");
+          await assert.rejects(fx.exec.run(fx.ctx), /codex (run already active|epoch admission closed for capture)/);
+        }
+        bodyRelease.resolve();
+        const result = await withTimeout(capture, 3000, "serialized capture result");
+        if (order === "capture-first") {
+          assert.deepEqual(result, { kind: "observed_empty", value: "saved capture" });
+          assert.equal(bodies, 1);
+        } else {
+          assert.equal(result.kind, "incomplete", "terminal disposal cannot manufacture a new capture proof");
+          assert.equal(bodies, 0);
+        }
+        await withTimeout(fx.run, 3000, "terminal run completion");
+        assert.equal(generation, 8, "missing HOME after reap must not publish a second empty generation");
+        assert.equal(savedFiles, 1);
+        assert.equal(sources.length, 1);
+        assert.ok(sources[0]!.endsWith("/codex"));
+        assert.equal(homes.size, 0, "the reaped provider HOME is absent in the fixture");
+        assert.ok(fx.rig.transport.closes > 0);
+      } finally {
+        persistRelease.resolve(); bodyRelease.resolve(); fx.native.release();
+        if (capture) await capture;
+        await fx.cleanup();
+      }
+    });
+  }
+
+  it("#2852 all manager requests preserve canonical argv and scrubbed per-run environment", async () => {
+    const keys = ["UZI_RUNNER_TMPDIR", "TMPDIR", "NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "LOCALE_ARCHIVE"];
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    Object.assign(process.env, { UZI_RUNNER_TMPDIR: "/fixture/tmp", TMPDIR: "/ambient/tmp",
+      NIX_SSL_CERT_FILE: "/fixture/nix.pem", SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale" });
+    try {
+      for (const [manager, lockfile, args] of [
+        ["npm", "package-lock.json", ["ci", "--ignore-scripts"]],
+        ["pnpm", "pnpm-lock.yaml", ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile", "--config.manage-package-manager-versions=false"]],
+        ["yarn", "yarn.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+        ["bun", "bun.lock", ["install", "--frozen-lockfile", "--ignore-scripts"]],
+      ] as const) {
+        const fx = await fixture("clean", done, undefined, { lockfile });
+        try {
+          await withTimeout(fx.native.disposing, 3000, `canonical ${manager} root`);
+          const call = fx.native.calls[0]!;
+          assert.deepEqual(call.args.slice(-(args.length + 5)),
+            ["--expect-uid", "10002", "--", "/usr/bin/env", manager, ...args]);
+          assert.deepEqual(call.options.env, {
+            HOME: path.join(path.dirname(fx.ctx.worktreePath), "home"), PATH: "/fixture/bin",
+            TMPDIR: "/fixture/tmp", GIT_TERMINAL_PROMPT: "0", NIX_SSL_CERT_FILE: "/fixture/nix.pem",
+            SSL_CERT_FILE: "/fixture/ssl.pem", LOCALE_ARCHIVE: "/fixture/locale",
+            ...(manager === "yarn" ? { YARN_IGNORE_PATH: "1" } : {}),
+          });
+          fx.native.release();
+          assert.equal((await withTimeout(fx.run, 5000, `canonical ${manager} completion`)).error, undefined);
+        } finally { await fx.cleanup(); }
+      }
+    } finally {
+      for (const key of keys) {
+        const value = saved[key];
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
 });

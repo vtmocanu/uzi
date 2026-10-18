@@ -93,7 +93,7 @@ import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
 import { asText } from "../tool-evidence.js";
-import { installJsDeps, type JsDepsInstall } from "../js-deps.js";
+import { installJsDeps, prepareSupervisedInstall, DEFAULT_INSTALL_TIMEOUT_MS, MAX_PROJECT_DIRS, type InstallExec, type JsDepsInstall } from "../js-deps.js";
 import { startDepsInstall, reportDepsInstall } from "../js-deps-provision.js";
 import {
   evidencesModelProcessing,
@@ -174,6 +174,8 @@ import {
   PROVIDER_CHILD_ARGV,
   SUPERVISOR_BIN,
   launchCodexEffectRoot,
+  launchCodexInstallerRoot,
+  classifyCodexLaunchFailure,
   launchCodexRoot,
   watchStartupCleanup,
   type StartupCleanupAuthorization,
@@ -887,6 +889,7 @@ export function createRunLaneInstallerReconcile(
   },
   timeoutNow?: () => number,
   abort = new AbortController(),
+  verifyOwnedInstallerProof: () => boolean = () => true,
 ) {
   const credentialReconcile = buildRunLaneReconcile(
     credentials.runId, credentials.client, credentials.binding, credentials.registerToken,
@@ -902,10 +905,10 @@ export function createRunLaneInstallerReconcile(
   } = { abort, cancellation: lifecycleSignal, reported: false, noted: false };
   const settle = async (deadlineAt?: number, signal?: AbortSignal, remaining?: () => number): Promise<boolean> => {
     state.abort.abort();
-    if (!state.promise) return true;
+    if (!state.promise) return verifyOwnedInstallerProof();
     if (deadlineAt === undefined) {
       await state.promise;
-      return true;
+      return verifyOwnedInstallerProof();
     }
     const left = remaining ?? (() => Math.max(0, deadlineAt - Date.now()));
     if (signal?.aborted || left() <= 0) return false;
@@ -916,7 +919,7 @@ export function createRunLaneInstallerReconcile(
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
         timer = chunkedTimeout(() => resolve(false), left(), { now: timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0 && verifyOwnedInstallerProof()));
       });
     } finally {
       timer?.cancel();
@@ -1768,6 +1771,8 @@ export interface CodexExecutorDeps {
   readonly initialCredentialAttempts?: number;
   readonly initialCredentialBaseDelayMs?: number;
   readonly installDeps?: typeof installJsDeps;
+  /** Fixed canonical installer request and native lifecycle; no generic spawn authority. */
+  readonly launchCodexInstallerRootForTest?: typeof launchCodexInstallerRoot;
   /** Adapts the real M3a launcher for a PROVIDER root; a test injects a fake returning a
    *  scripted in-memory transport (NO real Codex). Receives the harness's launch spec AND the
    *  immutable app-server auth mode; the credential NO LONGER rides into the launcher env — it
@@ -1939,7 +1944,7 @@ interface EpochSharedContext {
   readonly settleDepsInstall: () => Promise<void>;
   /** The FINAL epoch's safety.dispose hook: evicts the post-run sink tokens, then settles
    *  the run's command cache (issue #1598) within the dispose's absolute deadline
-   *  (`deadlineAt`, epoch ms) when one is known. Never throws. */
+   *  (`deadlineAt`, epoch ms) when one is known. Refuses unproven installer cleanup. */
   readonly onTerminalDispose: (deadlineAt?: number) => Promise<void>;
   /** Issue #1598: the run's held command cache, or undefined when none is held. */
   readonly commandCache: RunCommandCache | undefined;
@@ -2792,6 +2797,9 @@ export class CodexExecutor implements Executor {
       };
     };
     const installAbort = new AbortController();
+    // Exact claim-leg fact: only the ordinary installer finisher may mint it.
+    // Injected installDeps models processless work; production must prove real roots.
+    let installerCleanupClean = true;
     const installState = createRunLaneInstallerReconcile(
       lifecycleSignal,
       {
@@ -2800,6 +2808,7 @@ export class CodexExecutor implements Executor {
       },
       this.deps.timeoutNow,
       installAbort,
+      () => installerCleanupClean,
     );
     this.depsInstall = installState;
     const settleInstall = async (): Promise<void> => { await this.settleDepsInstall(undefined, undefined, installState); };
@@ -2868,7 +2877,130 @@ export class CodexExecutor implements Executor {
       }));
       provisionDir = provisioned.provisionDir; // removed in the terminal finally (best-effort)
       this.assertCaptureAdmission(setupRevision);
-      installState.promise = startDepsInstall(ctx, this.log, this.homeRoot, provisioned.toolEnv, installAbort.signal, this.deps.installDeps ?? installJsDeps)
+      let installDeps = this.deps.installDeps;
+      if (!installDeps) {
+        installerCleanupClean = false;
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
+        let admissionOpen = true;
+        // Discovery and the sequential manager count are bounded by installJsDeps.
+        // Every root also spends its original command deadline, never a renewed wait.
+        const installationDeadlineAt = Date.now() + MAX_PROJECT_DIRS * DEFAULT_INSTALL_TIMEOUT_MS;
+        let cleanupDeadlineAt = installationDeadlineAt;
+        const remaining = () => Math.max(0, Math.min(cleanupDeadlineAt - Date.now(),
+          this.captureCleanupRemaining?.() ?? Infinity));
+        const refuse = async (): Promise<never> => {
+          throw new TrustedExecutionRefusal("installer has no boundary authority");
+        };
+        const facade = createCodexExecutionSafety(registry, refuse, refuse, async (deadlineAt) => {
+          if (!await installState.settle(deadlineAt)) {
+            throw new TrustedExecutionRefusal("installer cleanup proof unavailable");
+          }
+        });
+        // Publish before discovery can launch and before the provider facade exists.
+        this.unverifiedEpochRegistries.add(registry);
+        this.epochSafeties.set(registry, facade);
+        this.safety = facade;
+        const dispose = facade.dispose.bind(facade);
+        facade.dispose = (request) => {
+          admissionOpen = false;
+          installAbort.abort();
+          const deadlineAt = Date.now() + Math.max(0, request.deadlineMs);
+          return (async () => {
+            // The finisher disposes the registry directly: never join its own facade.
+            await installState.settle(deadlineAt);
+            return dispose({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) });
+          })();
+        };
+        const execute = (baseEnv: NodeJS.ProcessEnv): InstallExec => async (command) => {
+          const guard = () => {
+            this.assertCaptureAdmission(setupRevision);
+            if (!admissionOpen) throw new TrustedExecutionRefusal("installer admission closed");
+            installAbort.signal.throwIfAborted();
+            command.signal?.throwIfAborted();
+          };
+          const request = prepareSupervisedInstall(command, baseEnv, guard);
+          guard();
+          cleanupDeadlineAt = Math.min(installationDeadlineAt, Date.now() + command.timeoutMs);
+          const hardDeadlineAt = cleanupDeadlineAt;
+          const startupCleanup = { attempt: {}, hardDeadlineAt };
+          const verified = watchStartupCleanup(startupCleanup);
+          const reservation = registry.reserveLaunch("command");
+          if (reservation.kind !== "reserved") return { ok: false, detail: "installer admission closed" };
+          let handle: CodexRootHandle;
+          try {
+            handle = await (this.deps.launchCodexInstallerRootForTest ?? launchCodexInstallerRoot)(
+              request, { startupCleanup });
+          } catch (error) {
+            const classification = classifyCodexLaunchFailure(error);
+            const unstarted = classification === "profile_quarantine" || classification.startsWith("spawn_");
+            if (!verified(error) && !unstarted) registry.markLaunchCleanupUnconfirmed();
+            registry.cancelReservation(reservation.reservation);
+            return { ok: false, detail: "installer startup failed" };
+          }
+          const commandRemaining = (budget = Infinity) => Math.max(0, Math.min(budget,
+            hardDeadlineAt - Date.now(), this.captureCleanupRemaining?.() ?? Infinity));
+          const root = registeredRoot({
+            ...handle,
+            dispose: (budget) => handle.dispose(commandRemaining(budget)),
+          }, "command", this.log);
+          const registered = registry.registerRoot(reservation.reservation, root);
+          if (!registered.ok) registry.retainRejectedRoot(reservation.reservation, root);
+          // One full-root cleanup owner, shared by abort and normal completion.
+          let cleanup: Promise<void> | undefined;
+          const stop = (): Promise<void> => cleanup ??= root.dispose(commandRemaining()).catch(() => {
+            registry.markLaunchCleanupUnconfirmed();
+          });
+          const abort = () => { void stop(); };
+          command.signal?.addEventListener("abort", abort, { once: true });
+          let ok = false;
+          try {
+            handle.transport.stdin?.on("error", () => undefined);
+            handle.transport.stdin?.end();
+            handle.transport.stdout?.resume();
+            handle.transport.stderr?.resume();
+            if (!registered.ok || command.signal?.aborted) await stop();
+            else {
+              const exit = await handle.waitChild(commandRemaining());
+              ok = exit.code === 0;
+            }
+          } catch { /* Short status only; never expose manager output or error text. */ }
+          finally {
+            await stop();
+            command.signal?.removeEventListener("abort", abort);
+          }
+          const clean = !registry.isPoisoned();
+          return { ok: ok && clean && !command.signal?.aborted, detail: command.signal?.aborted ? "cancelled"
+            : !clean ? "installer cleanup unconfirmed" : ok ? "exit 0" : "failed" };
+        };
+        installDeps = (root, env, options) => {
+          const capturedBaseEnv = { ...env };
+          return installJsDeps(root, env, { ...options, exec: execute(capturedBaseEnv) });
+        };
+        const boundInstall = installDeps;
+        installDeps = async (root, env, options) => {
+          try { return await boundInstall(root, env, options); }
+          finally {
+            admissionOpen = false;
+            let drained = false;
+            try {
+              const closed = await registry.quiesceChildren(remaining());
+              if (closed.kind === "quiescent") {
+                drained = (await registry.reapProcesses(remaining(), closed.epoch)).kind === "observed_empty";
+              }
+            } catch { /* Attempt disposal even after an unsuccessful observation. */ }
+            try {
+              const disposed = await registry.disposeTools(remaining());
+              installerCleanupClean = drained && disposed.kind === "disposed" && !registry.isPoisoned();
+            } catch { installerCleanupClean = false; }
+            if (installerCleanupClean) {
+              this.unverifiedEpochRegistries.delete(registry);
+              this.epochSafeties.delete(registry);
+              if (this.safety === facade) this.safety = undefined;
+            }
+          }
+        };
+      }
+      installState.promise = startDepsInstall(ctx, this.log, this.homeRoot, provisioned.toolEnv, installAbort.signal, installDeps)
         .then((result) => { installState.result = result; return result; });
 
       // The SCRUBBED command-identity env — NOTHING from process.env (cross-root credential
@@ -2948,12 +3080,15 @@ export class CodexExecutor implements Executor {
       };
       // Issue #1598: the same terminal point settles the command cache, AFTER the registry's
       // tools are disposed (safety.dispose runs disposeTools, then this hook) and so after every
-      // post-run sink's command-identity boundary process. The settle is idempotent and never
-      // throws, so a dispose can never change the run outcome.
+      // post-run sink's command-identity boundary process. Cache settlement is idempotent;
+      // unknown installer cleanup refuses terminal completion after token/cache cleanup.
       const onTerminalDispose = async (deadlineAt?: number): Promise<void> => {
         ctx.signal?.removeEventListener("abort", forwardLifecycleAbort);
         evictTokens();
         await settleCommandCache(deadlineAt);
+        if (!await installState.settle(deadlineAt)) {
+          throw new TrustedExecutionRefusal("installer cleanup proof unavailable");
+        }
       };
 
       // The per-run state every epoch is built from. Everything here is SHARED and closed over
