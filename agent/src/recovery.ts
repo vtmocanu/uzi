@@ -1,4 +1,6 @@
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceResources as M1MaintenanceResources } from "./recovery-maintenance.js";
+import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
@@ -1025,8 +1027,8 @@ export class RecoveryCoordinator {
       // generation) falls back to (runId, sourceSha) matching, exactly as before.
       const matches =
         input.generation !== undefined
-          ? (r: RecoveryRecord): boolean => r.generation === input.generation && !r.coverageDigest
-          : (r: RecoveryRecord): boolean => r.sourceSha === input.sourceSha && !r.coverageDigest;
+          ? (r: RecoveryRecord): boolean => r.generation === input.generation && !r.coverageDigest && classifyRecoveryOrigin(r.captureId) === "ordinary"
+          : (r: RecoveryRecord): boolean => r.sourceSha === input.sourceSha && !r.coverageDigest && classifyRecoveryOrigin(r.captureId) === "ordinary";
       // The unlocked observation only identifies WHICH record this pin updates; every decision and
       // write below is made on a re-read under the journal lock (issue #1995), so a concurrent
       // capture that bundled or uploaded the record meanwhile is never overwritten with a stale view.
@@ -1043,11 +1045,13 @@ export class RecoveryCoordinator {
           current = (await this.listRecords(input.runId)).find(matches);
         }
         if (current) {
+          if (!this.newProductionAllowed(current)) return undefined;
           const next = applyPin(current, input);
           if (next === current) return current;
           await this.writeRecordUnlocked(next);
           return next;
         }
+        if (!await this.newReconstructionRecords(input.runId, input.generation)) return undefined;
         // No surviving journal is permission to reopen a closed/discarded guarded hold.
         // Inventory-protocol creation requires a fresh exact open hold. An indeterminate
         // read retains the source without manufacturing a new journal.
@@ -1102,6 +1106,7 @@ export class RecoveryCoordinator {
     const { context } = input;
     return this.withCancellationAttempt({ runId: context.runId, generation: context.generation, inventoryGuarded: true } as RecoveryRecord, async () =>
       runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
+      if (!await this.newReconstructionRecords(context.runId, context.generation)) return undefined;
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
       const candidates = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(context.barePath, context.runId));
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;
@@ -1151,7 +1156,8 @@ export class RecoveryCoordinator {
           digest = coverage.fingerprint;
         }
         return this.withJournalLock(context.runId, async () => {
-          const records = await this.listRecords(context.runId);
+          const records = await this.newReconstructionRecords(context.runId, context.generation);
+          if (!records) return undefined;
           const matching = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
             r.coverageDigest === digest && r.sourceSha === sourceSha &&
             r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
@@ -1850,6 +1856,7 @@ export class RecoveryCoordinator {
     const clearHeld = async (why: string): Promise<RecoveryOutcome> => {
       const hold = await this.heldOperationState(record);
       if (hold !== "open") return this.heldStopped(record, hold);
+      if (!this.newProductionAllowed(record)) return kept();
       const cleared = await this.writeExistingRecord(record, cur =>
         !cur.finalAcknowledged && canonicalJson(cur.finalRequest) === canonicalJson(request)
           ? (() => { const next = { ...cur }; delete next.finalRequest; delete next.reason; return next; })()
@@ -1966,6 +1973,7 @@ export class RecoveryCoordinator {
     if (cur.finalRequest && cur.finalRequest.disposition.kind !== "held_publication") return "kept" as const;
     if (!cur.finalRequest) {
       if (!(await this.openInventoryHold(cur)) || residueQuarantine() !== undefined) return "kept" as const;
+      if (!this.newProductionAllowed(cur)) return "kept" as const;
       cur = await this.writeExistingRecord(cur, c => c.finalRequest || c.finalAcknowledged ? undefined : ({
         ...c, finalRequest: { disposition: { kind: "held_publication", publication_id: publicationId,
           source_sha: c.sourceSha, coverage_digest: c.coverageDigest! } },
@@ -2044,8 +2052,9 @@ export class RecoveryCoordinator {
       if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
           response.outcome !== "replaceable" || response.reason !== undefined ||
           !status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
-      if (!await this.openInventoryHold(record) || !await prove() ||
-          !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
+      if (!await this.openInventoryHold(record)) return;
+      if (!this.newProductionAllowed(record)) return { state: record.state, captureId: record.captureId, held: "kept" };
+      if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
       await this.writeExistingRecord(record, cur => {
         if (residueQuarantine() !== undefined || cur.finalAcknowledged ||
             !cur.inventoryGuarded || cur.generation !== record.generation ||
@@ -2200,6 +2209,9 @@ export class RecoveryCoordinator {
         // of absence: retry the same frozen pack through the API's existing
         // locked at-most-once invocation marker, never a second remote create.
       } catch { MaintenanceBudget.current()?.check(); return outcome("kept"); }
+    }
+    if (!this.newProductionAllowed(record)) {
+      return hasJournaledBundle(record) ? this.captureCycle({ ...input, record }) : outcome("kept");
     }
     const uncertainCreate = record.heldCreateUncertain === true;
     const v2 = this.client.hasHeldPublicationV2?.() === true;
@@ -2397,7 +2409,8 @@ export class RecoveryCoordinator {
         const hold = (await recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId))).holds.find(h =>
           h.generation === ctx.generation && h.inventory_guarded === true);
         if (!hold || !this.client.getRunOwnership) continue; // closed/discarded never reopened
-        const existing = await this.listRecords(ctx.runId);
+        const existing = await this.newReconstructionRecords(ctx.runId, ctx.generation);
+        if (!existing) continue;
         const probe = existing.find(r => r.generation === ctx.generation && r.exactHoldBinding) ??
           { runId: ctx.runId, generation: ctx.generation, inventoryGuarded: true } as RecoveryRecord;
         const materialize = async (): Promise<void> => {
@@ -2532,7 +2545,10 @@ export class RecoveryCoordinator {
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
         return { state: "needs_action", captureId: record.captureId, reason: record.reason };
       }
-      if (input.attemptedHeadSha && !record.attemptedHeadSha) {
+      if (!hasJournaledBundle(record) && !this.newProductionAllowed(record)) {
+        return { state: record.state, captureId: record.captureId, held: "kept" };
+      }
+      if (input.attemptedHeadSha && !record.attemptedHeadSha && this.newProductionAllowed(record)) {
         const attempted = input.attemptedHeadSha;
         record = await this.writeExistingRecord(record, (cur) =>
           cur.attemptedHeadSha ? undefined : { ...cur, attemptedHeadSha: attempted },
@@ -2590,6 +2606,8 @@ export class RecoveryCoordinator {
     | { kind: "already_published" }
     | { kind: "needs_action"; reason: string }
   > {
+    record = await this.requireRecord(record);
+    if (!this.newProductionAllowed(record)) return { kind: "needs_action", reason: "maintenance_admission_required" };
     // Resolve a FRESH, verified forge tip (D5) inside the reap-before-credentialed-git
     // boundary (the agent is already reaped at finalization). Best-effort: a fetch failure
     // falls back to a self-contained bundle rather than blocking capture. The runner clone's
@@ -2679,6 +2697,7 @@ export class RecoveryCoordinator {
         const cur = await this.requireRecord(snapshot);
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
+        if (!this.newProductionAllowed(cur)) return { kind: "source_advanced" as const };
         const header = cur.inventoryGuarded ? await readRecoveryBundleHeader(tmpPath, cur.sourceSha) : undefined;
         await ownedRecoveryIO(() => fs.rename(tmpPath, finalPath));
         const bundled: RecoveryRecord = {
@@ -3278,6 +3297,8 @@ export class RecoveryCoordinator {
     done: (outcome: string, reason?: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
+    record = await this.requireRecord(record);
+    if (!this.newProductionAllowed(record)) { done(record.state); return; }
     if (!record.finalizationPin) {
       await this.sweepMark(record, "early_pin_only_after_restart", done);
       return;
@@ -3929,9 +3950,52 @@ export class RecoveryCoordinator {
     return "acknowledged";
   }
 
+  /** Deny-only until a future charged producer entry supplies its own authority.
+   * Callers pass only records authenticated by readLatest/requireRecord/listRecords. */
+  private newProductionAllowed(record: RecoveryRecord): boolean {
+    const origin = classifyRecoveryOrigin(record.captureId);
+    if (origin === "ordinary") return true;
+    const display = (id: string | undefined): string =>
+      id && id.length <= 80 && /^[a-zA-Z0-9_-]+(?![\s\S])/.test(id) ? id : "[redacted]";
+    this.log.warn("recovery: new production denied; source retained", {
+      origin, reason: origin === "producer" ? "maintenance_admission_required" : "maintenance_origin_invalid",
+      run_id: display(record.runId),
+      generation: Number.isSafeInteger(record.generation) && record.generation! > 0 ? record.generation : undefined,
+      hold_id: display(record.exactHoldBinding?.holdId),
+    });
+    return false;
+  }
+
+  /** One metadata-only pass, no retries. A fresh discovery scope permits 32 MiB,
+   * 4096 entries and ten seconds; existing scopes share counters and the attempt clock.
+   * Failure blocks new reconstruction only. Immutable replay and frozenCoverageProven
+   * retain their existing proof, including every authenticated source record. */
+  private async newReconstructionRecords(runId: string, generation?: number): Promise<RecoveryRecord[] | undefined> {
+    const read = async (): Promise<RecoveryRecord[] | undefined> => {
+      const records = await this.checkedRecords(runId, {
+        signal: MaintenanceBudget.signal() ?? new AbortController().signal,
+        deadline: Date.now() + Math.min(10_000, MaintenanceBudget.current()?.remainingMs() ?? Infinity,
+          M1MaintenanceResources.remainingMsIfActive()),
+      }, true);
+      for (const record of records) {
+        // Unknown generations cannot exclude a producer from the target source proof.
+        if ((generation === undefined || record.generation === undefined || record.generation === generation) &&
+            !this.newProductionAllowed(record)) return undefined;
+      }
+      return records;
+    };
+    try {
+      return await (M1MaintenanceResources.active() ? read() : M1MaintenanceResources.runDiscovery(read));
+    } catch {
+      MaintenanceBudget.current()?.check();
+      this.log.warn("recovery: reconstruction provenance incomplete; source retained");
+      return undefined;
+    }
+  }
+
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
-  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }): Promise<RecoveryRecord[]> {
+  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false): Promise<RecoveryRecord[]> {
     if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("unsafe recovery run id");
     const root = path.resolve(this.recoveryRoot);
     const dir = this.runDir(runId);
@@ -3963,7 +4027,10 @@ export class RecoveryCoordinator {
           if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
           const entry = await directory.read();
           if (!entry) break;
-          if (names.length >= 256) throw new Error("report journal entry budget");
+          if (completeOrigin) {
+            M1MaintenanceResources.consumeIfActive("adminEntries", 1);
+            M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
+          } else if (names.length >= 256) throw new Error("report journal entry budget");
           names.push(entry.name);
         }
       } finally { await directory.close(); }
@@ -3971,12 +4038,29 @@ export class RecoveryCoordinator {
     const records: RecoveryRecord[] = [];
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
-      const result = await this.readRecordResult(path.join(dir, name), true, budget);
+      const result = await this.readRecordResult(path.join(dir, name), true, budget, completeOrigin);
       if (result.kind !== "ok" || result.record.runId !== runId ||
           name !== result.record.captureId + ".json") throw new Error("unverified recovery journal");
       records.push(result.record);
     }
+    if (completeOrigin) {
+      const bundles = new Set(records.map(record => record.captureId + ".bundle"));
+      for (const name of names) {
+        budget!.signal.throwIfAborted();
+        if (Date.now() >= budget!.deadline) throw new Error("origin journal deadline");
+        if (name.endsWith(".json")) continue;
+        // Unknown entries, including truncated namespace filenames and incomplete writes,
+        // cannot prove an empty or ordinary-only inventory. Names grant no origin authority.
+        if (!bundles.has(name) || !(await fs.lstat(path.join(dir, name))).isFile()) {
+          throw new Error("unknown recovery journal entry");
+        }
+      }
+    }
     const after = await fs.lstat(dir);
+    if (completeOrigin && budget) {
+      budget.signal.throwIfAborted();
+      if (Date.now() >= budget.deadline) throw new Error("origin journal deadline");
+    }
     if (budget && (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs ||
         before.ctimeMs !== after.ctimeMs)) throw new Error("report journal directory changed");
     return records;
@@ -4048,6 +4132,7 @@ export class RecoveryCoordinator {
     filePath: string,
     noFollow = false,
     budget?: { signal: AbortSignal; deadline: number },
+    quiet = false,
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
     if (!this.key) return { kind: "unreadable" };
     let raw: string;
@@ -4059,6 +4144,7 @@ export class RecoveryCoordinator {
           if (!before.isFile()) return { kind: "unreadable" };
           if (budget) {
             if (before.size > BigInt(1024 * 1024)) return { kind: "unreadable" };
+            if (quiet) M1MaintenanceResources.checkIfActive();
             const bytes = Buffer.alloc(1024 * 1024 + 1);
             let length = 0;
             while (length < bytes.length) {
@@ -4066,8 +4152,10 @@ export class RecoveryCoordinator {
               if (Date.now() >= budget.deadline) throw new Error("report journal deadline");
               const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
               if (!bytesRead) break;
+              if (quiet) M1MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
               length += bytesRead;
             }
+            if (quiet) M1MaintenanceResources.checkIfActive();
             if (length > 1024 * 1024) return { kind: "unreadable" };
             const after = await file.stat({ bigint: true });
             const named = await fs.lstat(filePath, { bigint: true });
@@ -4083,11 +4171,12 @@ export class RecoveryCoordinator {
     } catch (err) { MaintenanceBudget.current()?.check();
       return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
     }
+    if (quiet) M1MaintenanceResources.checkIfActive();
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch { MaintenanceBudget.current()?.check();
-      this.log.warn("recovery: unparseable journal record; refusing (needs_action)", { file: filePath });
+      if (!quiet) this.log.warn("recovery: unparseable journal record; refusing (needs_action)", { file: filePath });
       return { kind: "unreadable" };
     }
     if (typeof parsed !== "object" || parsed === null) return { kind: "unreadable" };
@@ -4098,17 +4187,20 @@ export class RecoveryCoordinator {
     delete rest.mac;
     const record = coerceRecord(rest);
     if (!record) {
-      this.log.warn("recovery: malformed journal record; refusing (needs_action)", { file: filePath });
+      if (!quiet) this.log.warn("recovery: malformed journal record; refusing (needs_action)", { file: filePath });
       return { kind: "unreadable" };
     }
     const expected = this.computeMac(record);
     if (!macEqual(mac, expected)) {
-      this.log.warn("recovery: journal MAC mismatch; refusing tampered record (needs_action)", {
+      if (!quiet) this.log.warn("recovery: journal MAC mismatch; refusing tampered record (needs_action)", {
         file: filePath,
         run_id: record.runId,
       });
       return { kind: "unreadable" };
     }
+    // Identity consistency is checked only after the normal MAC authentication.
+    if (path.basename(filePath) !== record.captureId + ".json" ||
+        path.basename(path.dirname(filePath)) !== record.runId) return { kind: "unreadable" };
     return { kind: "ok", record };
   }
 
