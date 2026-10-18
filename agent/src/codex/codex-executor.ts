@@ -2922,7 +2922,7 @@ export class CodexExecutor implements Executor {
           guard();
           cleanupDeadlineAt = Math.min(installationDeadlineAt, Date.now() + command.timeoutMs);
           const hardDeadlineAt = cleanupDeadlineAt;
-          const startupCleanup = { attempt: {}, hardDeadlineAt };
+          const startupCleanup = Object.freeze({ attempt: Object.freeze({}), hardDeadlineAt });
           const verified = watchStartupCleanup(startupCleanup);
           const reservation = registry.reserveLaunch("command");
           if (reservation.kind !== "reserved") return { ok: false, detail: "installer admission closed" };
@@ -3088,6 +3088,13 @@ export class CodexExecutor implements Executor {
         await settleCommandCache(deadlineAt);
         if (!await installState.settle(deadlineAt)) {
           throw new TrustedExecutionRefusal("installer cleanup proof unavailable");
+        }
+        // A healthy final epoch cannot certify a prior epoch whose cleanup was
+        // unproven. Clean intentional-capture epochs leave this set at teardown.
+        for (const registry of this.unverifiedEpochRegistries) {
+          if (this.epochSafeties.get(registry) !== this.safety) {
+            throw new TrustedExecutionRefusal("prior Codex epoch cleanup unproven");
+          }
         }
       };
 
