@@ -64,6 +64,10 @@ func (s *Service) admitApproval(ctx context.Context, owner, runID uuid.UUID, bod
 	if run.UserID != owner {
 		return SubmitInputResult{}, ErrRunNotFound
 	}
+	// Stop may commit after the outer read; recheck its refusal under the lock.
+	if len(run.PolicyStopResolution) != 0 {
+		return SubmitInputResult{}, stopReviewConflict("policy_stop_gate_resolved")
+	}
 	// Preserve expected-revision and terminal refusal precedence.
 	if opts.ExpectedGateRevision != nil {
 		if err := checkExpectedGateRevision(run, *opts.ExpectedGateRevision); err != nil {
