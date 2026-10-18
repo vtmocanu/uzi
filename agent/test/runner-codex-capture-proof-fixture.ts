@@ -4,7 +4,7 @@ import { setImmediate as tick } from "node:timers/promises";
 import { codexRig, drain } from "./runner-codex-sinks-fixture.js";
 import { git, client } from "./runner-harness.js";
 
-export function observe(opts: { vault?: boolean; refusal?: boolean } = {}) {
+export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?: string } = {}) {
   let armed = false, start = 0, active = false, entries = 0, returns = 0;
   let fullReap = false, done = false, injected = false;
   const authDeltas: unknown[] = [];
@@ -78,20 +78,20 @@ export function observe(opts: { vault?: boolean; refusal?: boolean } = {}) {
     try { return await boundary(req, action); }
     catch (error) { if (opts.vault) arm(); throw error; }
   };
-  const wip = git.commitWipMarker.bind(git);
-  git.commitWipMarker = async (...args) => {
-    if (armed) source.push({
+  const recordSource = (sourcePath?: string) => {
+    if (armed && (!opts.sourcePath || sourcePath === opts.sourcePath)) source.push({
       state: rig.registry.state(), pending: rig.registry.pendingLaunchCount(),
       callbacks: rig.registry.inFlightCallbackCount(), fullReap, active
     });
+  };
+  const wip = git.commitWipMarker.bind(git);
+  git.commitWipMarker = async (...args) => {
+    recordSource(args[0]);
     return wip(...args);
   };
   const status = git.worktreeStatus.bind(git);
   git.worktreeStatus = async (...args) => {
-    if (armed) source.push({
-      state: rig.registry.state(), pending: rig.registry.pendingLaunchCount(),
-      callbacks: rig.registry.inFlightCallbackCount(), fullReap, active
-    });
+    recordSource(args[0]);
     return status(...args);
   };
   const publish = client.publishCheckpoint.bind(client);
@@ -119,7 +119,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean } = {}) {
   };
   const observations = () => ({entries, returns, source, holds, pubs, acks, authDeltas, spawns:rig.processSpawns()-start});
   return {
-    rig, capture, arm, observations, isActive: () => active,
+    rig, capture, arm, recordSource, observations, isActive: () => active,
     execute: async (operation: Promise<void>) => { await operation.then(() => { done = true; }, error => { done = true; throw error; }); },
     restore: () => {git.commitWipMarker=wip; git.worktreeStatus=status; client.publishCheckpoint=publish; client.reportState=report;},
     assertProof: (publication: boolean, ack = false) => {

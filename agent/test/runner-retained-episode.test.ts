@@ -1,5 +1,7 @@
 import { it, afterEach, type TestContext } from "node:test";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { observe } from "./runner-codex-capture-proof-fixture.js";
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { loadConfig } from "../src/config.js";
 import { GitCache } from "../src/git.js";
@@ -1647,6 +1649,98 @@ it("late blocker finalization cannot change a replacement episode on the same so
     /recovery episode changed/);
   assert.deepEqual(readJournal(bare, clone.branch), replacement);
 });
+
+for (const stage of ["newcapture", "captured", "adopting", "missing-capability"] as const) {
+  it(`A retained public scope proof: ${stage}`, async t => {
+    const { claim, bare, clone, key } = await seed();
+    const source = { runId: claim.run_id, clonePath: clone.path };
+    if (stage === "captured" || stage === "adopting") {
+      const reservation = await git.reserveRecoveryIteration(bare, clone.branch, key, source, 2);
+      await git.commitWipMarker(clone.path);
+      await fixtureFetchTracking(git, bare, clone.path, clone.branch, claim.run_id, 2);
+      const tip = command(clone.path, "rev-parse", "HEAD");
+      await git.recordRecoveryCapture(bare, clone.branch, key, source, reservation.attempts, tip);
+      if (stage === "adopting") {
+        const seam = t.mock.method(git as any, "seedRunnerClone", async () => { throw new Error("setup interrupted after adopting journal"); });
+        await assert.rejects(git.prepareRecoverySuccessor(bare, clone.branch, key, source,
+          reservation.attempts, "20261008T171401Z-g2-0123456789abcdef"), /setup interrupted/);
+        seam.mock.restore();
+        assert.equal(readJournal(bare, clone.branch).recovery.stage, "adopting");
+      }
+    }
+    const observer = observe({ sourcePath: clone.path });
+    const before = readJournal(bare, clone.branch);
+    let verifiedCalls = 0, verifiedTrue = 0, facts = 0;
+    const factScopes: boolean[] = [];
+    const verify = git.verifiedRecoveryRestorePoint.bind(git);
+    t.mock.method(git, "verifiedRecoveryRestorePoint", async (...args: Parameters<typeof verify>) => {
+      observer.recordSource(clone.path);
+      verifiedCalls++;
+      const result = await verify(...args);
+      if (result) verifiedTrue++;
+      return result;
+    });
+    const record = git.recordRecoveryCapture.bind(git);
+    t.mock.method(git, "recordRecoveryCapture", async (...args: Parameters<typeof record>) => {
+      const result = await record(...args);
+      facts++; factScopes.push(observer.isActive());
+      return result;
+    });
+    let created = 0, models = 0, oldModels = 0, oldDisposed = false;
+    const make: ExecutorFactory = runId => {
+      const ordinal = ++created;
+      const rig = ordinal === 1 ? observer.rig : codexRig();
+      const dispose = rig.safety.dispose.bind(rig.safety);
+      return { homeDir: path.join(homeDir, runId), executor: {
+        sandboxesCommands: true,
+        safety: { ...rig.safety, dispose: async request => {
+          const result = await dispose(request);
+          if (ordinal === 1) oldDisposed = result.kind === "disposed";
+          return result;
+        } },
+        settleForCredentialFreeCapture: rig.settle,
+        ...(stage === "missing-capability" ? {} : {
+          withCredentialFreeCapture: ordinal === 1 ? observer.capture : rig.capture,
+        }),
+        run: async ctx => {
+          if (ordinal === 1) oldModels++;
+          models++;
+          try {
+            assert.equal(ordinal, 2);
+            assert.equal(oldDisposed, true);
+            assert.notEqual(ctx.worktreePath, clone.path);
+            assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
+          } catch (error) { callbackFailures.push(error); }
+          throw new Error("fixture model interruption");
+        },
+      } };
+    };
+    observer.arm();
+    try {
+      await observer.execute(runnerWith(make, fakeGitlab().gitlab, undefined, nullLogger(),
+        { recoveryRetryMs: 1 }).execute(claim));
+      console.log("RETAINED_FACTS", JSON.stringify({ stage, verifiedCalls, verifiedTrue, facts, factScopes, created, models, oldModels, oldDisposed }));
+      assert.equal(oldModels, 0);
+      assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+      if (stage === "missing-capability") {
+        observer.assertRefusal();
+        assert.equal(models, 0);
+        assert.equal(facts, 0);
+        assert.equal(readJournal(bare, clone.branch).clonePath, before.clonePath);
+      } else {
+        assert.equal(models, 1);
+        assert.equal(created, 2);
+        if (stage === "captured" || stage === "adopting") {
+          assert.equal(verifiedCalls, 1);
+          assert.equal(verifiedTrue, 1, "actual verified resume branch ran");
+        } else assert.equal(verifiedCalls, 0);
+        assert.equal(facts, 1);
+        assert.deepEqual(factScopes, [true], "capture held through actual journal capture fact");
+        observer.assertProof(true);
+      }
+    } finally { observer.restore(); }
+  });
+}
 
 it("capture-closing executor is replaced before actual resumed model execution", async () => {
   const { claim, bare, clone } = await seed();
