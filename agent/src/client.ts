@@ -2821,7 +2821,7 @@ export class WorkerClient {
       const value = body.exact_hold;
       if (value.run_id !== runId || value.hold_id !== selected.hold_id || value.generation !== generation ||
           !maintenanceUUID(value.repo_id) || (expected && value.repo_id !== expected.repoId) ||
-          value.original_worker_id !== worker || !completionSafeIdentifier(value.original_worker_identity) ||
+          value.original_worker_id !== worker || !maintenanceProvenanceLabel(value.original_worker_identity) ||
           value.inventory_guarded !== true || value.state !== "open" ||
           value.live_worker_id !== worker || value.live_run_id !== runId ||
           !["failed", "cancelled", "completed"].includes(value.run_status as string) ||
@@ -4678,6 +4678,11 @@ function completionPositiveInteger(value: unknown): value is number {
 }
 function completionForgeType(value: unknown): value is CompletedPublicationReceipt["forge_type"] {
   return value === "gitlab" || value === "forgejo" || value === "github";
+}
+// Worker names are provenance labels; authoritative custody comparisons use worker UUIDs.
+function maintenanceProvenanceLabel(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 2048 && value.trim().length > 0 &&
+    !/[\p{Cc}\p{Cf}]/u.test(value) && Buffer.byteLength(value, "utf8") <= 2048;
 }
 function completionSafeIdentifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 2048 &&

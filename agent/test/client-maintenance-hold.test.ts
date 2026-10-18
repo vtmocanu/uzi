@@ -237,13 +237,49 @@ test("administrative entries are charged before interpretation", async () => {
   }), /maintenance_resource_exhausted/);
 });
 
-test("unsupported and invalid inputs never request inventory", async () => {
+test("unsupported capability never requests inventory", async () => {
   const { client, state } = await setup([]);
-  assert.equal((await client.observeTerminalMaintenanceHold(run, 1)).ok, false);
+  assert.deepEqual(await client.observeTerminalMaintenanceHold(run, 1), { ok: false, reason: "unsupported" });
   assert.deepEqual(state.paths, []);
-  for (const generation of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.equal((await client.observeTerminalMaintenanceHold(run, generation)).ok, false);
+});
+
+test("supported invalid requests never request inventory", async () => {
+  const { client, state } = await setup();
+  const requests: [string, number, { holdId: string; repoId: string }?][] = [
+    ...[0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]
+      .map(generation => [run, generation] as [string, number]),
+    ...["", "bad", run + "\n"].map(id => [id, 1] as [string, number]),
+    ...["", "bad", hold + "\n"].map(holdId => [run, 1, { holdId, repoId: repo }] as [string, number, { holdId: string; repoId: string }]),
+    ...["", "bad", repo + "\n"].map(repoId => [run, 1, { holdId: hold, repoId }] as [string, number, { holdId: string; repoId: string }]),
+  ];
+  for (const [runId, generation, expected] of requests) {
+    assert.deepEqual(await client.observeTerminalMaintenanceHold(runId, generation, expected),
+      { ok: false, reason: "invalid_request" });
+    assert.deepEqual(state.paths, []);
   }
+});
+
+test("producer preserves valid worker provenance labels", async () => {
+  const { client, state } = await setup();
+  for (const identity of ["original", "My laptop", "Équipe 東京", " My laptop ", "x".repeat(2048), "é".repeat(1024)]) {
+    state.exact = { run_id: run, exact_hold: { ...exact(), original_worker_identity: identity } };
+    const result = await client.observeTerminalMaintenanceHold(run, 1);
+    assert.ok(result.ok, "valid worker label must be accepted unchanged");
+    assert.equal(result.hold.original_worker_identity, identity);
+    assert.equal(result.hold.original_worker_id, worker);
+  }
+});
+
+test("producer rejects unsafe or unbounded worker labels without logging them", async () => {
+  const { logger, lines } = recordingLogger();
+  const { client, state } = await setup([capability], logger);
+  for (const identity of [undefined, null, 1, "", "   ", "bad\nidentity", "bad\tidentity",
+    "bad\u007fidentity", "bad\u0085identity", "bad\u202eidentity", "bad\u2066identity",
+    "x".repeat(2049), "é".repeat(1025)]) {
+    state.exact = { run_id: run, exact_hold: { ...exact(), original_worker_identity: identity } };
+    assert.deepEqual(await client.observeTerminalMaintenanceHold(run, 1), { ok: false, reason: "invalid_exact_hold" });
+  }
+  assert.deepEqual(lines, []);
 });
 
 test("registration entry invalidates tokens even on same-worker failure or refresh", async () => {
