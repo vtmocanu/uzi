@@ -46,6 +46,7 @@ it("m2 done shares 60/90 seconds across preliminary reads and import children", 
   }).execute(gitlabClaim(312301));
   assert.equal(observed, true);
   assert.deepEqual(softBudgets, [60_000]);
+  assert.ok(clock.budgets.some(b => b.sink === "done_checkpoint"), "the done hard deadline was armed");
   assert.ok(clock.budgets.filter(b => b.sink === "done_checkpoint").every(b => b.ms === 90_000));
   assert.ok(childBudgets.some(ms => ms === 20_000), "preliminary read consumed the same soft allowance");
   assert.ok(childBudgets.every(ms => ms <= 60_000));
@@ -97,6 +98,7 @@ it("m2 started milestone import finishes readback and ancestry bridge after its 
     checkpointTestHooks: { armSoftDeadline: clock.arm },
   }).execute(gitlabClaim(312302, { kind: "task", branch: publishedBranch, open_mr: false }));
   assert.equal(advanced, true); assert.equal(observed, true);
+  assert.ok(clock.budgets.some(b => b.sink === "milestone_checkpoint"), "the milestone hard deadline was armed");
   assert.ok(clock.budgets.filter(b => b.sink === "milestone_checkpoint").every(b => b.ms === 30_000));
   assert.ok(!lines.some(line => (line as { msg?: string }).msg === "fetch-back on interruption failed; work may not be recoverable"));
   assert.ok(api.states.some(state => state.body.milestones_completed?.includes("m2")));
@@ -183,6 +185,7 @@ for (const failure of ["soft import", "ordinary import", "capture", "unread head
     }).execute(gitlabClaim(312303, { code_cross_check_required: true, claim_generation: 1 }));
     assert.equal(verified, true); assert.equal(submit.mock.callCount(), 1);
     assert.deepEqual(softBudgets, [60_000, 60_000]);
+    assert.ok(clock.budgets.some(b => b.sink === "done_checkpoint"), "the fresh hard deadline was armed");
     assert.ok(clock.budgets.filter(b => b.sink === "done_checkpoint").every(b => b.ms === 90_000));
   });
 }

@@ -343,6 +343,50 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     return Math.max(0, Math.ceil(deadlineAt - this.now()));
   }
 
+  /** Observe the late-bound shutdown proof without turning cooperative stop into revocation. */
+  private watchShutdown(
+    request: BoundaryRequest,
+    ceiling: number,
+    shrink: (deadlineAt: number) => void,
+    expire: () => void,
+  ): () => void {
+    const stop = request.checkpointStop;
+    let deadlineAt = ceiling;
+    let armed = false;
+    let authority: AbortSignal | undefined;
+    let cancel = () => {};
+    const observe = () => {
+      const proof = stop?.workerShutdown?.();
+      if (proof) {
+        if (authority !== proof.stopSignal) {
+          authority?.removeEventListener("abort", expire);
+          authority = proof.stopSignal;
+          authority.addEventListener("abort", expire, { once: true });
+        }
+        const next = Math.min(deadlineAt, proof.deadlineAt);
+        if (proof.deadlineAt < ceiling && (!armed || next < deadlineAt)) {
+          armed = true;
+          deadlineAt = next;
+          shrink(next);
+          cancel();
+          cancel = (this.seams.armDeadline ?? defaultArmDeadline)(request, this.remainingMs(next), expire);
+        }
+        if (authority.aborted || this.remainingMs(proof.deadlineAt) <= 0) expire();
+      }
+      try { checkCheckpointStop(stop); }
+      catch (error) { if (!(error instanceof CheckpointSoftDeadlineError)) expire(); }
+    };
+    stop?.signal.addEventListener("abort", observe);
+    stop?.lifecycleSignal?.addEventListener("abort", observe);
+    observe();
+    return () => {
+      cancel();
+      stop?.signal.removeEventListener("abort", observe);
+      stop?.lifecycleSignal?.removeEventListener("abort", observe);
+      authority?.removeEventListener("abort", expire);
+    };
+  }
+
   async withBoundary<T>(
     request: BoundaryRequest,
     action: (permit: BoundaryPermit) => Promise<T>,
@@ -362,14 +406,20 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
           // A cancelled queue slot cannot certify source cleanup. Keep credential
           // reconciliation behind its predecessor, bounded by the original deadline.
           let cancel = () => {};
+          let cancelShutdown = () => {};
           try {
             await MaintenanceBudget.waitFor(Promise.race([prior, new Promise<never>((_resolve, reject) => {
-              cancel = (this.seams.armDeadline ?? defaultArmDeadline)(request, this.remainingMs(deadlineAt), () => {
+              const refuse = (category: "timeout" | "authorization") => {
+                if (admissionExpired) return;
                 admissionExpired = true;
-                reject(new Error("codex source admission deadline expired"));
-              });
+                const message = category === "timeout" ? "codex source admission deadline expired" : "codex source admission authority revoked";
+                this.registry.poison({ category, message });
+                reject(new Error(message));
+              };
+              cancel = (this.seams.armDeadline ?? defaultArmDeadline)(request, this.remainingMs(deadlineAt), () => refuse("timeout"));
+              cancelShutdown = this.watchShutdown(request, deadlineAt, () => {}, () => refuse("authorization"));
             })]));
-          } finally { cancel(); }
+          } finally { cancel(); cancelShutdown(); }
         } else {
           await MaintenanceBudget.waitFor(waitCheckpointAdmission(prior, request.checkpointStop));
         }
@@ -457,17 +507,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const stopSignal = cause?.stopSignal;
     const maintenanceSignal = cause ? MaintenanceBudget.signal() : undefined;
     const authorityAbort = new AbortController();
-    const checkpointStop = request.checkpointStop;
-    let shutdownAuthority: AbortSignal | undefined;
-    const revoke = () => authorityAbort.abort();
-    const observeAuthority = () => {
-      const shutdown = checkpointStop?.workerShutdown?.();
-      if (shutdown && shutdownAuthority !== shutdown.stopSignal) {
-        shutdownAuthority = shutdown.stopSignal;
-        shutdownAuthority.addEventListener("abort", revoke, { once: true });
-      }
-      try { checkCheckpointStop(checkpointStop); }
-      catch (error) { if (!(error instanceof CheckpointSoftDeadlineError)) revoke(); }
+    const revoke = () => {
+      if (authorityAbort.signal.aborted) return;
+      firedStep = readStep(request);
+      authorityAbort.abort();
+      this.registry.poison({ category: "authorization", message: "codex shutdown checkpoint authority revoked" });
     };
     const boundarySignal = AbortSignal.any([boundaryAbort.signal, authorityAbort.signal,
       ...[stopSignal, maintenanceSignal].filter((s): s is AbortSignal => s !== undefined)]);
@@ -511,9 +555,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       throw new CodexBoundaryError(stage, errors, undefined, undefined, where);
     };
     let stage: "reconcile" | "quiesce" | "reap" | "action" = "reconcile";
+    const cancelShutdown = this.watchShutdown(request, deadlineAt, next => {
+      deadlineAt = next;
+      if (stage === "action") this.currentDeadlineAt = next;
+    }, revoke);
     try {
-    checkpointStop?.lifecycleSignal?.addEventListener("abort", observeAuthority);
-    observeAuthority();
     // (1.5) PRD #1171 m4: per-sink auth-mode reconciliation, AFTER the serialization queue
     // (in withBoundary) and BEFORE quiesce/reap/mint. A subscription run refreshes + durably
     // advances its generation here; an api_key run re-authorizes with zero refresh. A
@@ -655,8 +701,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       throw error;
     } finally {
       cancelDeadline();
-      checkpointStop?.lifecycleSignal?.removeEventListener("abort", observeAuthority);
-      shutdownAuthority?.removeEventListener("abort", revoke);
+      cancelShutdown();
     }
   }
 
