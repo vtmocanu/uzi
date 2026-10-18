@@ -135,6 +135,41 @@ func TestPolicyOwnerRunningStopAfterContinuationLiveDB(t *testing.T) {
 	}
 }
 
+func TestPolicyOwnerStopTransactionBindingLiveDB(t *testing.T) {
+	t.Run("constrained_requires_binding", func(t *testing.T) {
+		e := policyOwnerRunningContinuation(t)
+		e.svc.SetTxBeginner(nil)
+		before := policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID)
+		_, err := e.svc.SubmitInput(e.ctx, e.userID, e.runID, "stop", "", nil)
+		requirePolicyOwnerStopConflict(t, err, "policy_stop_review_unverifiable")
+		if policyOwnerStopSnapshot(t, e.codexTestEnv, e.runID) != before {
+			t.Fatal("unbound constrained Stop changed run, feedback or audits")
+		}
+	})
+	t.Run("ordinary_legacy_atomic_scope", func(t *testing.T) {
+		e := setupUsageTail(t)
+		if _, err := e.pool.Exec(e.ctx, `UPDATE runs SET kind='issue',issue_iid=103,status='running',
+ milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+ milestones_completed='["m1"]' WHERE id=$1`, e.runID); err != nil {
+			t.Fatal(err)
+		}
+		e.svc.SetTxBeginner(nil)
+		before := policyOwnerOrdinaryStopSnapshot(t, e)
+		result, err := e.svc.SubmitInput(e.ctx, e.userID, e.runID, "stop", "", nil)
+		if err != nil || result.Resumed || result.ScopeCeiling == nil || *result.ScopeCeiling != 1 || result.PolicyStop != nil {
+			t.Fatalf("legacy ordinary Stop: result=%+v err=%v", result, err)
+		}
+		got := mustRun(t, e.codexTestEnv, e.runID)
+		if PolicyOwnerConstrained(got) || got.Status != "running" || !got.ScopeCeiling.Valid || got.ScopeCeiling.Int32 != 1 || len(got.PolicyStopResolution) != 0 || policyOwnerOrdinaryStopSnapshot(t, e) != before {
+			t.Fatal("legacy ordinary Stop changed unrelated state")
+		}
+		var scopes int
+		if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='scope'", e.runID).Scan(&scopes); err != nil || scopes != 1 {
+			t.Fatalf("legacy scope audits=%d err=%v", scopes, err)
+		}
+	})
+}
+
 func TestPolicyOwnerStopRacingResumedRefusalLiveDB(t *testing.T) {
 	e := policyOwnerRunningContinuation(t)
 	r := mustRun(t, e.codexTestEnv, e.runID)

@@ -103,8 +103,9 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	}
 	// A Stop token always identifies this transaction, including an accepted replay
 	// after the run moved. Never fall through to an ordinary scope write.
-	// A running constrained run without that token or resolution retains ordinary Stop.
-	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || (PolicyOwnerConstrained(run) && run.Status != "running")) {
+	// A running constrained run with transaction binding and no such token/resolution
+	// retains ordinary Stop; an unbound service keeps the prior fail-closed behavior.
+	if kind == "stop" && (strings.HasPrefix(opts.ActionIfMatch, `"policy-`) || len(run.PolicyStopResolution) != 0 || (PolicyOwnerConstrained(run) && (run.Status != "running" || s.txBeginner == nil))) {
 		if opts.ExpectedGateRevision != nil {
 			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
 		}
