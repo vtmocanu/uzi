@@ -361,7 +361,10 @@ func newRunStopCmd(env Env, gf *globalFlags) *cobra.Command {
 			"milestone count: the run finalizes the committed slice (pushes the branch, opens the " +
 			"merge request when requested) and starts no further milestone — the same graceful " +
 			"finalize, just scoped to what is already done. Use `run scope --through N` instead to " +
-			"complete through a later milestone before finalizing.\n\n" +
+			"complete through a later milestone before finalizing. On an interlocked issue run, closing " +
+			"directives in earlier commits hold publication before push instead of opening the partial PR. " +
+			"A Stop gets no further lead turn to reword them: cancel and manually deliver the preserved " +
+			"work with corrected messages. Partial or accept decisions do not fix this hold.\n\n" +
 			"An optional message can accompany the stop (pass -m or pipe it on stdin). A stop on a " +
 			"run that has already finished answers 409 (exit 5).",
 		Args: cobra.ExactArgs(1),

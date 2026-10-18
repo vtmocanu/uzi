@@ -16,6 +16,26 @@ The register-only detail matters before you read any badge: a worker that went o
 through an upgrade still reports the version it ran *before*, so a failed upgrade is detected
 by watching the pod rather than by asking the worker.
 
+## Completion publication compatibility
+
+Coordinate API and worker upgrades for `completion_non_closing_v1`. A new
+API stores the first non-closing reason from a completion attempt and sends
+it back in claim configuration; new workers on both harnesses restore it.
+Old workers ignore that claim intent. Against an API without the feature,
+a new declared pre-push refusal still fails rather than holding. Existing
+executor and post-push hold behavior is unchanged and can lose declaration
+intent.
+
+Deploy the additive `00342_completion_non_closing.sql` migration before the
+new API. It adds one nullable column with no backfill, default or index;
+the ALTER TABLE still takes a table lock. Retain the column on application
+rollback rather than running its destructive Down migration.
+
+The separate permit-scope compatibility rule requires an omitted scope to
+fall back only at exactly the claim revision (default 1). A different
+revision without scope holds closed. Upgrade both components for current
+scope rendering; see [Completion holds](run-completion-hold.md).
+
 ## Display states
 
 | Badge | Meaning | Action |

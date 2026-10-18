@@ -44,6 +44,34 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+## Completion publication holds
+
+An interlocked issue run can hold before push when a non-closing delivery
+contains a commit message that closes its source issue, or when its current
+completion projection cannot be confirmed. The feed names up to five
+offending SHAs and a remaining count, or reports unreadable messages without
+a SHA. Unknown projection uses fixed copy without commit content.
+
+1. For unpublished commits on a declared or owner-partial run without Stop,
+   use `uzi run decide <id> --continue --guidance "<text>"`. Name the SHAs
+   and ask the lead to reword its own unpublished commits. The worker does
+   not rewrite history or force-push.
+2. For published history or a Stop directive, cancel and manually deliver
+   the preserved work through the recovery paths on this page. Stop resumes
+   into finalization without another lead turn. Partial and accept decisions
+   cannot repair commit history.
+3. Check the available recovery evidence before replacing the worker.
+   Pre-push holds skip remote checkpoint publication. If bounded capture
+   exhausts, a degraded hold can record an empty head and retain the clone
+   and session without a verified recovery copy. Latest work may exist only
+   on that worker; an older archive does not prove it contains that work.
+
+An accepted or ambiguous hold does not produce a failed terminal report;
+a definitive hold refusal can fail. An uncertain completion-attempt report
+still proceeds to the hold; stale claim ownership stops the flight while
+retaining its source. See [Completion holds](run-completion-hold.md) for scope
+decisions, plain-resume refusal and version limits.
+
 ## When plan-revision retries expire
 
 After bounded inner retries exhaust a provider transient during a human plan

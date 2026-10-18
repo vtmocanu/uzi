@@ -857,6 +857,39 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 - An owner can start one MR rework cycle on demand from a completed run's page or with uzi run rework, with optional guidance, even after the automatic cap; on-demand cycles never count against the cap. [user, #1202]
 
+## Decision #3090 — Non-closing publication and pending acceptance
+
+Approved M5 prose, 2026-10-18. Mechanism and residual boundaries are recorded
+in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum--non-closing-publication-and-pending-acceptance-2026-10-18-3090).
+
+- Plans isolate external acceptance in a final milestone; implementation,
+  docs, tests, mandatory gates, security and review remain worker obligations.
+  Formal owner partial records exact kept/deferred IDs and reason, including
+  ordinary coding scope. Answers, non-closing intent and auto-approval waive
+  nothing. Pending entries remain unchecked with ID, frozen title, reason
+  and not-delivered/not-verified status before owner closure; checkbox edits
+  authorize nothing. Accept-as-is leaves unmet criteria in the warning.
+- Interlocked declared, owner-partial and Stop-capped issue delivery holds
+  before pushing closing commits, including earlier-flight history. One
+  generation-bound running ACK selects the guard; the later exact-head
+  permit retains scope authority. Unknown projections hold without commit
+  text. Empty-attempt retries preserve I6 admission and may count more than
+  once; degraded capture retains local work without a verified-copy claim.
+- The first non-closing reason persists through attempts and reclaim with
+  `completion_non_closing_v1`, including reconciliation. It restricts
+  publication without changing scope. Coordinate API/worker rollout;
+  old workers and APIs retain the documented legacy limits.
+- Unpublished history without Stop can return to the lead via owner continue
+  guidance. Published history or Stop requires cancel/manual delivery.
+  Partial/accept cannot fix history; a separately approved reconciliation
+  reset can replace the frozen contract but cannot clear stored intent.
+- Excluded MR-rework/branch-adopting CI-fix lanes and Forgejo/Gitea branch-push
+  closing are recorded together as finding
+  #3b56e6e5-4352-4694-ae1c-4999d5719e9c, not a forge issue. #1230 D4/#1231
+  remain open; #3068 provider-policy parking is planned. No semantic
+  activation, plan preauthorization or completed live deployment acceptance
+  is claimed.
+
 ## Feature #1226 — Structural completion interlock
 
 Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done/1226-structural-completion-interlock.md`.
