@@ -41,7 +41,7 @@ export type MaintenanceDenial =
   | "maintenance_table_capacity" | "maintenance_config_changed" | "maintenance_lineage_invalid"
   | "maintenance_clock_invalid" | "maintenance_cycle_expired" | "maintenance_cycle_exhausted"
   | "maintenance_slot_spacing" | "maintenance_mutation_fenced" | "maintenance_token_invalid"
-  | "maintenance_resource_exhausted" | "maintenance_slot_active";
+  | "maintenance_resource_exhausted" | "maintenance_slot_active" | "maintenance_discovery_only";
 export type MaintenanceResult<T> = { ok: true; value: T } | { ok: false; reason: MaintenanceDenial };
 const deny = <T>(reason: MaintenanceDenial): MaintenanceResult<T> => ({ ok: false, reason });
 class MaintenanceRefusal extends Error {
@@ -333,6 +333,8 @@ export class RecoveryMaintenance {
     cycle.lastObserved = now;
   }
   async admit(input: MaintenanceEligibility, options: { deadline?: number; signal?: AbortSignal } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
+    // Metadata discovery cannot initialize storage, precharge work or mint a permit.
+    if (discovery.getStore()) return deny("maintenance_discovery_only");
     return this.transaction(async (root, table) => {
       this.eligible(input);
       const monotonicNow = this.options.monotonicNow ?? (() => performance.now());
@@ -394,6 +396,7 @@ export class RecoveryMaintenance {
       if (priorLive) priorLive.lastObserved = Math.max(priorLive.lastObserved, now);
       if (priorLive && (now >= priorLive.deadline || priorLive.signal?.aborted)) {
         priorLive.revoked = true;
+        priorLive.controller.abort(new Error("maintenance_token_invalid"));
       }
       if (active.get(root)?.has(id)) return deny("maintenance_slot_active");
       if (table.cycles.some(c => hash(c.identity) === id && c.fenced)) return deny("maintenance_mutation_fenced");
@@ -474,6 +477,7 @@ export class RecoveryMaintenance {
       if (siblings.some(c => now < c.lastObserved)) return deny("maintenance_clock_invalid");
       if (priorLive && (now >= priorLive.deadline || priorLive.signal?.aborted)) {
         priorLive.revoked = true;
+        priorLive.controller.abort(new Error("maintenance_token_invalid"));
       }
       if (active.get(root)?.has(id)) return deny("maintenance_slot_active");
       if (input.source !== input.identity.originalSource && !siblings.some(c => c.outputs.includes(input.source)))
@@ -514,6 +518,12 @@ export class RecoveryMaintenance {
 function checked(token: MaintenanceSlot): Live {
   const live = tokens.get(token);
   if (!live || live.revoked) refuse("maintenance_token_invalid");
+  try { MaintenanceBudget.current()?.check(); }
+  catch (error) {
+    live.revoked = true;
+    live.controller.abort(error);
+    throw error;
+  }
   const now = live.now();
   if (now < live.lastObserved) {
     live.revoked = true;
@@ -537,6 +547,8 @@ const discoveryLimits: Partial<Record<MaintenanceResource | "candidates", number
   metadataBytes: 32 * 1024 ** 2, adminEntries: 4096, rpcAttempts: 16, candidates: 4, launches: 512,
 };
 function checkDiscovery(scope: Discovery): void {
+  try { MaintenanceBudget.current()?.check(); }
+  catch (error) { scope.controller.abort(error); throw error; }
   if (scope.signal.aborted || Date.now() >= scope.deadline || performance.now() >= scope.monotonicDeadline) {
     scope.controller.abort(new Error("maintenance_resource_exhausted"));
     refuse("maintenance_resource_exhausted");

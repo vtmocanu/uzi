@@ -9,6 +9,7 @@ import { RecoveryMaintenance, MaintenanceResources, type MaintenanceEligibility 
 import { verifyClosureFrames } from "../src/recovery-closure.js";
 import { GitCache } from "../src/git.js";
 import { WorkerClient } from "../src/client.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { nullLogger } from "./helpers.js";
 import type { BoundaryProcessSpawner } from "../src/git.js";
 
@@ -109,6 +110,53 @@ test("metered native execution keeps execFile's default one-MiB output bound", a
     assert.equal(refused, true);
   });
 });
+
+for (const mode of ["production", "discovery"] as const) {
+  test(`${mode} metadata refuses at a tighter parent clock before timer dispatch`, async t => {
+    const f = await fixture(t);
+    let now = 0, delivered = 0;
+    const parent = new MaintenanceBudget(10, () => now);
+    t.after(() => parent.dispose());
+    const work = async () => {
+      now = 10;
+      MaintenanceResources.consumeIfActive("metadataBytes", 1);
+      delivered++;
+    };
+    await assert.rejects(MaintenanceBudget.run(parent, () => mode === "production"
+      ? MaintenanceResources.run(f.token, work)
+      : MaintenanceResources.runDiscovery(work)), /maintenance deadline/);
+    assert.equal(delivered, 0);
+  });
+}
+
+test("metadata discovery cannot initialize or charge a maintenance ledger", async t => {
+  const f = await fixture(t);
+  const parent = path.join(f.root, "uninitialized-data");
+  await fs.mkdir(parent);
+  const root = path.join(parent, "recovery-maintenance");
+  const ledger = new RecoveryMaintenance({ root, workerToken: "discovery-fixture" });
+  const result = await MaintenanceResources.runDiscovery(() => ledger.admit(f.input));
+  assert.deepEqual(result, { ok: false, reason: "maintenance_discovery_only" });
+  assert.deepEqual(await fs.readdir(parent), []);
+});
+
+for (const operation of ["admit", "revalidate"] as const) {
+  test(`${operation} peer revocation aborts its signal while retaining the reservation`, async t => {
+    let wall = 1_000_000;
+    const f = await fixture(t, 4096, { now: () => wall, monotonicNow: () => 0 });
+    const signal = MaintenanceResources.run(f.token, () => MaintenanceResources.signalIfActive()!);
+    let cancelled = 0;
+    signal.addEventListener("abort", () => cancelled++, { once: true });
+    wall = f.token.deadline;
+    const result = await f.ledger[operation](f.input);
+    assert.deepEqual(result, { ok: false, reason: "maintenance_slot_active" });
+    assert.equal(signal.aborted, true);
+    assert.equal(cancelled, 1);
+    assert.throws(() => MaintenanceResources.run(f.token, () => {}), /maintenance_token_invalid/);
+    const stored = JSON.parse(await fs.readFile(path.join(f.root, "recovery-maintenance", "complete.json"), "utf8")).value;
+    assert.equal(stored.cycles[0].slots.length, 1);
+  });
+}
 
 test("decoded slices are charged before hashing, framing alone uses metadata", async t => {
   const f = await fixture(t, 5);
@@ -238,6 +286,35 @@ test("stderr refusal cancels and joins the supervised owner before releasing its
     assert.deepEqual(await f.ledger.admit(f.input), { ok: false, reason: "maintenance_slot_active" });
     stdout.end(); close({ code: -1 });
     assert.match(String(await outcome), /maintenance_token_invalid|maintenance_resource_exhausted/);
+});
+
+test("streaming quota refusal waits for deferred supervised owner settlement", async t => {
+  const f = await fixture(t);
+  const stdout = new PassThrough();
+  let release!: (value: { code: number }) => void;
+  const completed = new Promise<{ code: number }>(resolve => { release = resolve; });
+  let cancellations = 0;
+  const spawner: BoundaryProcessSpawner = async () => ({
+    stdout, stderr: Readable.from([]), stdin: new Writable({ write(_chunk, _encoding, done) { done(); } }),
+    completed, cancel: async () => { cancellations++; await completed; },
+  });
+  await MaintenanceResources.run(f.token, async () => {
+    MaintenanceResources.consume("metadataBytes", metadataCap - 1);
+    let settled = false;
+    const pending = f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+      () => f.cache.readBare(f.bare, ["version"], { maxBytes: 0, timeoutMs: 5000 }));
+    const outcome = pending.then(() => { settled = true; return undefined; },
+      error => { settled = true; return error as unknown; });
+    await new Promise(resolve => setImmediate(resolve));
+    stdout.write(Buffer.from("xx"));
+    await new Promise(resolve => setImmediate(resolve));
+    const beforeRelease = { settled, cancellations };
+    release({ code: -1 });
+    const error = await outcome;
+    assert.ok(beforeRelease.cancellations > 0);
+    assert.equal(beforeRelease.settled, false, "quota refusal cannot release the owned reservation before settlement");
+    assert.match(String(error), /maintenance_/);
+  });
 });
 
 test("RPC attempts are charged once per transport and oversized error chunks before truncation", async t => {
