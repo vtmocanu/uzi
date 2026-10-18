@@ -258,14 +258,15 @@ const DindMaintenanceV1 = "dind_maintenance_v1"
 // WorkerMemoryPressureV1 negotiates memory reservations and owner-only holds.
 const WorkerMemoryPressureV1 = "worker_memory_pressure_v1"
 
+// CIArtifactsV1 negotiates guarded CI artifact evidence delivery and read access.
+const CIArtifactsV1 = "ci_artifacts_v1"
+
 // CIConfigGuardV1 is the PROTOCOL capability a worker self-reports (PRD #2865) to declare
 // that it enforces the unconditional CI-config push guard for a run carrying
 // runs.ci_config_guard. The ClaimRun clause for a guarded run reads it directly from
 // workers.protocol_capabilities, OUTSIDE required_capabilities and the capability_aware
 // kill-switch, so a worker image that predates the guard (and would ignore the flag and
 // push) can never claim a default-branch CI-repair run. Never a repo requirement.
-const CIArtifactsV1 = "ci_artifacts_v1"
-
 const CIConfigGuardV1 = "ci_config_guard_v1"
 
 var protocolVocabulary = map[string]struct{}{
