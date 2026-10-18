@@ -149,16 +149,13 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# The timeout bounds the whole package binary, not each test. Both long suites
-# default to 20m; slow runners can opt into a larger workersvc budget without
-# changing the test set, race instrumentation, or CI defaults. Reset other
-# packages to 10m on every iteration and stop on any failed pipeline.
+# Give handler and workersvc LiveDB suites 20m of timeout headroom on hosted workers.
+# This is not a speedup. Reset other packages to 10m on every iteration,
+# and stop on any failed pipeline before the next one.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/handler/..." ]; then
+  if [ "$p" = "./internal/handler/..." ] || [ "$p" = "./internal/workersvc/..." ]; then
     timeout=20m
-  elif [ "$p" = "./internal/workersvc/..." ]; then
-    timeout="${UZI_STORE_IT_WORKERSVC_TIMEOUT:-20m}"
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
