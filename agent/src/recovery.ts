@@ -4346,27 +4346,30 @@ export class RecoveryCoordinator {
               this.checkSavedMetadata();
             }
             if (quiet) M1MaintenanceResources.checkIfActive();
-            const bytes = Buffer.alloc(Math.min(1024 * 1024 + 1,
+            const precharged = M1MaintenanceResources.active();
+            // Reserve the entire stat bound before allocating or reading; failed/short reads keep it charged.
+            if (precharged) M1MaintenanceResources.consumeIfActive("metadataBytes", Number(before.size));
+            const bytes = Buffer.alloc(precharged ? Number(before.size) : Math.min(1024 * 1024 + 1,
               savedPass ? 32 * 1024 ** 2 - savedPass.bytes + 1 : Infinity));
             let length = 0;
             while (length < bytes.length) {
               this.checkJournalMetadata(budget);
               const { bytesRead } = await file.read(bytes, length, bytes.length - length, null);
-              M1MaintenanceResources.consumeIfActive("metadataBytes", bytesRead);
               this.checkSavedMetadata("bytes", bytesRead);
               this.checkJournalMetadata(budget);
               if (!bytesRead) break;
               length += bytesRead;
             }
             if (quiet) M1MaintenanceResources.checkIfActive();
-            if (length > 1024 * 1024) return { kind: "unreadable" };
+            if (length > 1024 * 1024 || (precharged && BigInt(length) !== before.size)) return { kind: "unreadable" };
             this.checkJournalMetadata(budget);
             const after = await file.stat({ bigint: true });
             this.checkJournalMetadata(budget);
             const named = await fs.lstat(filePath, { bigint: true });
             this.checkJournalMetadata(budget);
             if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
-                before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+                before.size !== after.size || before.size !== named.size ||
+                before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
                 before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) return { kind: "unreadable" };
             this.checkJournalMetadata(budget);
             raw = bytes.subarray(0, length).toString("utf8");

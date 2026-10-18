@@ -169,7 +169,7 @@ async function journalSlot(t: test.TestContext, f: Awaited<ReturnType<typeof fix
   return admitted.value;
 }
 
-test("active journal reader charges actual bytes on every nested inspect and keeps body quotas separate", async t => {
+test("active journal reader reserves exact body and name quotas on every nested inspect and keeps body quotas separate", async t => {
   const f = await fixture(t);
   await f.seal(f.partial(ordinary));
   const slot = await journalSlot(t, f);
@@ -185,7 +185,7 @@ test("active journal reader charges actual bytes on every nested inspect and kee
   });
 });
 
-test("active journal byte exhaustion refuses actual read bytes before decode and delivery", async t => {
+test("active journal byte exhaustion refuses all body bytes before decode and delivery", async t => {
   const f = await fixture(t);
   await f.seal(f.partial(ordinary));
   const size = (await fs.stat(f.file(ordinary))).size;
@@ -214,27 +214,59 @@ test("active journal byte exhaustion refuses actual read bytes before decode and
     MaintenanceResources.consume("metadataBytes",
       256 * 1024 ** 2 - 2 * (Buffer.byteLength(ordinary + ".json") + size) + 1);
     await assert.rejects(f.coordinator.inspect(f.context.runId), /maintenance_resource_exhausted|maintenance_token_invalid/);
-    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), size);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), 0);
     assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
     assert.equal(utf8Decodes, 0);
     assert.equal(jsonDecodes, 0);
   });
 });
 
-test("active journal growing after stat stays within the one-MiB read sentinel", async t => {
+test("active journal growing after stat reads at most the original stat size and refuses delivery", async t => {
   const f = await fixture(t);
   await f.seal(f.partial(ordinary));
+  const size = (await fs.stat(f.file(ordinary))).size;
   const reads = await observeJournalReads(t, f.file(ordinary), async () => {}, async () => {
     await fs.appendFile(f.file(ordinary), " ".repeat(2 * 1024 ** 2));
   });
   const slot = await journalSlot(t, f);
   await MaintenanceResources.run(slot, async () => {
     assert.deepEqual(await f.coordinator.inspect(f.context.runId), []);
-    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), 1024 * 1024 + 1);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), size);
     MaintenanceResources.consume("metadataBytes",
-      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - (1024 * 1024 + 1));
+      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - size);
     assert.throws(() => MaintenanceResources.consume("metadataBytes", 1), /maintenance_resource_exhausted/);
   });
+});
+
+test("active journal short reads retain the full stat reservation", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const size = (await fs.stat(f.file(ordinary))).size;
+  const reads = await observeJournalReads(t, f.file(ordinary), async () => {}, async () => {
+    await fs.truncate(f.file(ordinary), size - 1);
+  });
+  const slot = await journalSlot(t, f);
+  await MaintenanceResources.run(slot, async () => {
+    assert.deepEqual(await f.coordinator.inspect(f.context.runId), []);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), size - 1);
+    MaintenanceResources.consume("metadataBytes",
+      256 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - size);
+    assert.throws(() => MaintenanceResources.consume("metadataBytes", 1), /maintenance_resource_exhausted/);
+  });
+});
+
+test("discovery journal byte exhaustion refuses all body bytes", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial(ordinary));
+  const size = (await fs.stat(f.file(ordinary))).size;
+  const reads = await observeJournalReads(t, f.file(ordinary), async () => {});
+  await MaintenanceResources.runDiscovery(async () => {
+    MaintenanceResources.consumeIfActive("metadataBytes",
+      32 * 1024 ** 2 - Buffer.byteLength(ordinary + ".json") - size + 1);
+    await assert.rejects(f.coordinator.inspect(f.context.runId), /maintenance_resource_exhausted/);
+    assert.equal(reads.reduce((sum, r) => sum + r.bytes, 0), 0);
+    assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+  }).catch(err => { assert.match(String(err), /maintenance_resource_exhausted/); });
 });
 
 for (const strict of [false, true]) {
