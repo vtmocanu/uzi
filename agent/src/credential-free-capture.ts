@@ -173,11 +173,11 @@ export function validateCaptureGitRequest(
       const canonical = environments[0]!;
       const trustedPins = Array.from({ length: Number(canonical.GIT_CONFIG_COUNT) }, (_, n) =>
         `${canonical[`GIT_CONFIG_KEY_${n}`]}=${canonical[`GIT_CONFIG_VALUE_${n}`]}`);
-      const readerPins = ["core.untrackedCache=false", "core.ignoreStat=false", "core.checkStat=default",
+      const fixedPins = ["protocol.file.allow=user", "core.untrackedCache=false", "core.ignoreStat=false", "core.checkStat=default",
         "core.trustctime=true", "core.fileMode=true", "core.ignoreCase=false", "core.excludesFile=/dev/null",
         "commit.gpgsign=false"];
       if (forbiddenConfig(config.split("=")[0]!) || credentialText(config) ||
-          (!trustedPins.includes(config) && !readerPins.includes(config))) refuse();
+          (!trustedPins.includes(config) && !fixedPins.includes(config))) refuse();
     }
   }
 }

@@ -10,6 +10,9 @@ import { CodexLaunchError, type CodexEffectLaunchSpec, type CodexRootHandle } fr
 import type { BoundaryProcessRequest, CredentialFreeCaptureContext } from "../src/harness.js";
 import { assertCaptureLaunch, captureGitSpawner, validateCaptureGitRequest } from "../src/credential-free-capture.js";
 import { nullLogger } from "./helpers.js";
+import fs from "node:fs";
+import path from "node:path";
+import { credentialFreeGitFixture, latch } from "./credential-free-git-fixture.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -329,6 +332,120 @@ describe("credential-free capture foundation (#2852)", () => {
   });
 });
 
+describe("credential-free real Git producer positives", () => {
+  it("restores latest worker-bare FETCH content through the public caller and waits for full disposal", async () => {
+    const r = await credentialFreeGitFixture();
+    const drain = latch();
+    try {
+      fs.writeFileSync(path.join(r.clone, "capture.txt"), "latest captured content\n");
+      r.gitIn(r.clone, ["add", "capture.txt"]);
+      r.gitIn(r.clone, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+        "commit", "-m", "latest capture"]);
+      const latest = r.gitIn(r.clone, ["rev-parse", "HEAD"]);
+      r.holdDisposal(drain.promise);
+      let completed = false;
+      const pending = r.capture(() => r.git.fetchAgentBranch(r.bare, r.clone, r.branch, r.run, r.opts))
+        .then(result => { completed = true; return result; });
+      // A policy refusal must surface as that refusal, not hang waiting for a handle.
+      const reached = await Promise.race([
+        r.disposing.promise.then(() => "disposing"),
+        pending.then(() => "completed"),
+      ]);
+      assert.equal(reached, "disposing");
+      try {
+        await r.primary.promise;
+        await setImmediate();
+        assert.equal(completed, false, "primary exit cannot complete capture");
+        assert.equal(r.registry.rootCount(), r.requests.length, "fetch root remains registered until disposal");
+        assert.equal(r.requests.at(-1)!.argv.includes("fetch"), true);
+        assert.equal(r.disposed(), r.requests.length - 1, "fetch disposal is still pending");
+      } finally { drain.resolve(); }
+      const result = await pending;
+      assert.equal(result.kind, "observed_empty");
+      if (result.kind !== "observed_empty") return;
+      assert.equal(result.value.kind, "updated");
+      assert.equal(r.gitIn(r.bare, ["rev-parse", "refs/uzi-runner/" + r.branch]), latest);
+      assert.equal(r.gitIn(r.bare, ["show", latest + ":capture.txt"]), "latest captured content");
+      const index = r.requests.findIndex(request => request.argv.includes("fetch"));
+      assert.ok(index >= 0, "actual fetch launched");
+      const fetch = r.requests[index]!;
+      assert.equal(fetch.identity, "worker_pat");
+      assert.equal(fetch.cwd, "/");
+      assert.equal(fetch.argv[fetch.argv.indexOf("-C") + 1], r.bare);
+      assert.ok(fetch.argv.includes("file://" + r.clone));
+      assert.equal(fetch.argv[fetch.argv.indexOf("protocol.file.allow=user") - 1], "-c");
+      assert.equal(r.specs[index]!.command, fetch.argv[0], "worker-bare Git is not the command sandbox");
+      for (const request of r.requests) {
+        const pairs = Array.from({ length: Number(request.env.GIT_CONFIG_COUNT) }, (_, i) =>
+          [request.env[`GIT_CONFIG_KEY_${i}`], request.env[`GIT_CONFIG_VALUE_${i}`]]);
+        for (const key of ["credential.helper", "core.askpass"]) {
+          assert.equal(pairs.filter(pair => pair[0] === key && pair[1] === "").length, 1, key);
+        }
+      }
+      const cloneRead = await r.capture(() => r.git.worktreeStatus(r.clone));
+      assert.equal(cloneRead.kind, "observed_empty");
+      assert.equal(r.requests.at(-1)!.identity, "command", "clone Git keeps command identity");
+      assert.equal(r.specs.at(-1)!.command, "/usr/local/bin/uzi-codex-command-sandbox");
+      assert.equal(r.disposed(), r.requests.length, "every primary joined full modeled disposal");
+    } finally { drain.resolve(); r.cleanup(); }
+  });
+
+  it("refuses missing generation before launch and mismatched run identity before fetch", async () => {
+    const r = await credentialFreeGitFixture();
+    try {
+      await r.capture(async () => {
+        const invalid = { ...r.opts, context: { ...r.opts.context, generation: undefined } };
+        await assert.rejects(r.git.fetchAgentBranch(r.bare, r.clone, r.branch, r.run,
+          invalid as unknown as typeof r.opts), /invalid owed candidate context/);
+        assert.equal(r.requests.length, 0);
+        await assert.rejects(r.git.fetchAgentBranch(r.bare, r.clone, r.branch,
+          "28522852-aaaa-bbbb-cccc-555555555555", r.opts), /run identity mismatch/);
+      });
+      assert.equal(r.requests.some(request => request.argv.includes("fetch")), false);
+    } finally { r.cleanup(); }
+  });
+
+  it("admits the actual fixed cancellation helper as a fully registered command root", async () => {
+    const r = await credentialFreeGitFixture();
+    try {
+      const result = await r.capture(() => r.git.credentialFreeCancelCleanHead(r.clone, r.bare, r.base));
+      assert.equal(result.kind, "observed_empty");
+      if (result.kind !== "observed_empty") return;
+      assert.equal(result.value, r.base, "clean content matches the worker-trusted start");
+      const helper = r.requests.find(request => request.argv[0] === process.execPath);
+      assert.ok(helper, "the real producer reached its private fixed helper");
+      assert.equal(helper.identity, "command");
+      assert.equal(r.disposed(), r.requests.length, "helper and Git roots fully disposed");
+      assert.equal(r.registry.rootCount(), r.requests.length, "roots remain in the ownership inventory");
+
+      // Replay DATA only through the actual validator, before trusted registration.
+      // Never execute a substituted script, executable, argv or environment.
+      const alters: Array<[string, BoundaryProcessRequest]> = [
+        ["script", { ...helper, argv: helper.argv.map((arg, i) => i === 2 ? arg + "\n// substituted" : arg) }],
+        ["executable", { ...helper, argv: ["/capture/substituted-node", ...helper.argv.slice(1)] }],
+        ["argv", { ...helper, argv: [...helper.argv, "substituted"] }],
+        ["environment", { ...helper, env: { ...helper.env, NODE_OPTIONS: "--substituted" } }],
+        ["identity", { ...helper, identity: "worker_pat" }],
+      ];
+      const launches = r.requests.length;
+      for (const [name, altered] of alters) {
+        await r.safety.withCredentialFreeCapture(10_000, async context => {
+          const spawn = captureGitSpawner(context, request => validateCaptureGitRequest(
+            request, [helper.env], "/usr/bin/git", process.execPath, helper.argv[2]!));
+          await assert.rejects(async () => spawn(altered), /credential-free capture launch refused/, name);
+        });
+      }
+      assert.equal(r.requests.length, launches, "substitutions never reach the actual launcher");
+      fs.writeFileSync(path.join(r.clone, "capture.txt"), "untrusted changed content\n");
+      const changed = await r.capture(() => r.git.credentialFreeCancelCleanHead(r.clone, r.bare, r.base));
+      assert.equal(changed.kind, "observed_empty");
+      if (changed.kind === "observed_empty") assert.equal(changed.value, null);
+      assert.equal(r.requests.filter(request => request.argv[0] === process.execPath).length, 1,
+        "changed clone content never reaches the helper launcher");
+    } finally { r.cleanup(); }
+  });
+});
+
 // Supplemental policy cells. These use a genuine safety context and the internal
 // policy adapter, not a claim that a runner or GitCache exposes arbitrary spawn.
 describe("credential-free canonical policy before launcher admission", () => {
@@ -337,6 +454,38 @@ describe("credential-free canonical policy before launcher admission", () => {
     identity: "command", env: gitEnv(),
   });
   const cases: Array<[string, (request: BoundaryProcessRequest) => BoundaryProcessRequest]> = [
+    ...["credential.helper", "core.askpass"].flatMap(key => [
+      [key + " missing", (r: BoundaryProcessRequest) => {
+        const env = { ...r.env };
+        const i = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, n) => n)
+          .find(n => env[`GIT_CONFIG_KEY_${n}`] === key)!;
+        delete env[`GIT_CONFIG_VALUE_${i}`];
+        return { ...r, env };
+      }],
+      [key + " nonempty", (r: BoundaryProcessRequest) => {
+        const env = { ...r.env };
+        const i = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, n) => n)
+          .find(n => env[`GIT_CONFIG_KEY_${n}`] === key)!;
+        env[`GIT_CONFIG_VALUE_${i}`] = "capture-sentinel";
+        return { ...r, env };
+      }],
+      [key + " duplicate", (r: BoundaryProcessRequest) => {
+        const env = { ...r.env }; const n = Number(env.GIT_CONFIG_COUNT);
+        env.GIT_CONFIG_COUNT = String(n + 1);
+        env[`GIT_CONFIG_KEY_${n}`] = key; env[`GIT_CONFIG_VALUE_${n}`] = "";
+        return { ...r, env };
+      }],
+    ] as Array<[string, (request: BoundaryProcessRequest) => BoundaryProcessRequest]>),
+    ...["", "-1", "02", "2.5", "NaN"].map(count =>
+      ["malformed count " + JSON.stringify(count), (r: BoundaryProcessRequest) =>
+        ({ ...r, env: { ...r.env, GIT_CONFIG_COUNT: count } })] as [string, (request: BoundaryProcessRequest) => BoundaryProcessRequest]),
+    ["caller-added empty helper pin", r => ({ ...r, argv: [...r.argv, "-c", "credential.helper="] })],
+    ["subsection helper", r => ({ ...r, argv: [...r.argv, "-c", "credential.https://example.invalid.helper="] })],
+    ["includeIf", r => ({ ...r, argv: [...r.argv, "-c", "includeIf.gitdir:/capture/.path=/capture/config"] })],
+    ["mixed-case Authorization", r => ({ ...r, argv: [...r.argv, "-c", "http.extraHeader=aUtHoRiZaTiOn: capture-sentinel"] })],
+    ["URL rewrite environment key", r => ({ ...r, env: { ...r.env,
+      "url.https://capture-user@example.invalid/.insteadOf": "local" } })],
+    ["local file pin widened", r => ({ ...r, argv: [...r.argv, "-c", "protocol.file.allow=always"] })],
     ["config override", r => ({ ...r, argv: [...r.argv, "-c", "credential.helper=sentinel-helper"] })],
     ["empty duplicate config argv", r => ({ ...r, argv: [...r.argv, "-c", "core.askpass="] })],
     ["indexed duplicate", r => { const env = { ...r.env }; const n = Number(env.GIT_CONFIG_COUNT);
