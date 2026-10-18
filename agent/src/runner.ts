@@ -94,7 +94,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -1818,15 +1818,6 @@ type SourceGenesis = Readonly<{
   attemptId: string;
 }>;
 
-type ClosedSourceObservation = Readonly<{
-  genesis: SourceGenesis;
-  family?: Readonly<{
-    originals: ReadonlyArray<SourceGenesis & { identity: string }>;
-    observedExecution: Readonly<{ runId: string; generation: number }>;
-    metadata: string;
-  }>;
-}>;
-
 interface RunFlight {
   sourceInherited?: ClosedSourceObservation;
   sourceFamilyMatched?: boolean;
@@ -3127,10 +3118,20 @@ export class RunRunner {
       }
       observation = await this.executeClaim(claim, inherited || undefined);
     } finally {
-      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
-      // Only callers that captured this pending tail can receive the observation.
-      // Nothing survives in the map after the final reservation is released.
-      release(observation);
+      try {
+        if (observation?.family && (observation.terminal === "normal_failed" || observation.terminal === "normal_blocked")) {
+          void this.recovery.resumeTerminalSource(runId, tail, claim.claim_generation ?? 0, this.shutdownSignal.signal).catch(() => {
+            this.log.warn("recovery: terminal saved evidence pass failed; source retained");
+          });
+        }
+      } catch {
+        this.log.warn("recovery: terminal saved evidence pass failed; source retained");
+      } finally {
+        if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+        // Only callers that captured this pending tail can receive the observation.
+        // Nothing survives in the map after the final reservation is released.
+        release(observation);
+      }
     }
   }
 
@@ -3344,8 +3345,9 @@ export class RunRunner {
         (flight.steering.lifecycleSignal().aborted && !(flight.steering.lifecycleSignal().reason instanceof PauseNowSignal)) ||
         flight.active?.shuttingDown || this.shuttingDownGlobal || residueQuarantine() !== undefined) return;
     if (blocked && !family) return;
-    if (!family) return claim.inventory_guarded === true ? undefined : Object.freeze({ genesis });
-    return Object.freeze({ genesis, family: Object.freeze({
+    const terminal = blocked ? "normal_blocked" : normalFailed ? "normal_failed" : "normal_park";
+    if (!family) return claim.inventory_guarded === true ? undefined : Object.freeze({ genesis, terminal });
+    return Object.freeze({ genesis, terminal, family: Object.freeze({
       originals: Object.freeze(family.sources.map(source => Object.freeze({
         ...originals!.find(original => original.clonePath === source.clonePath)!, identity: source.identity,
       }))),

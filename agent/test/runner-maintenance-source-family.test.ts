@@ -16,6 +16,7 @@ function command(cwd: string, ...args: string[]): string {
 }
 type Observation = {
   genesis: { runId: string; generation: number; clonePath: string; attemptId: string };
+  terminal?: string;
   family?: { originals: Array<{ runId: string; generation: number; clonePath: string; attemptId: string; identity: string }>;
     observedExecution: { runId: string; generation: number }; metadata: string };
 };
@@ -159,6 +160,7 @@ it(`#3031 actual pending fresh guarded park family: ${mode}`, async (t) => {
     else {
       assert.ok(original?.family, "fresh surviving G1 family is positively observed");
       assert.equal(original.family.observedExecution.generation, 1);
+      assert.equal(original.terminal, "normal_park");
     }
     await second;
     const result = await secondTail;
@@ -169,6 +171,7 @@ it(`#3031 actual pending fresh guarded park family: ${mode}`, async (t) => {
       });
       assert.ok(result?.family, "normal blocked G2 returns a positive family: " + JSON.stringify(diagnostic));
       assert.equal(result.family.observedExecution.generation, 2);
+      assert.equal(result.terminal, "normal_blocked", "current blocked execution does not inherit park tag");
       assert.equal(result.genesis.generation, 1);
       assert.deepEqual(result.family.originals, original!.family!.originals);
     } else assert.equal(result, undefined, "uncertain history cannot acquire source knowledge");
@@ -253,6 +256,7 @@ it(`#3031 actual pending fresh guarded park family: ${mode}`, async (t) => {
     finishCleanup.resolve();
     releaseAck.resolve();
     runner.shutdown();
+    await runner.shutdownRecoveries();
     await Promise.allSettled([first, second]);
   }
 });

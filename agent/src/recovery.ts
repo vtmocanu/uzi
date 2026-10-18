@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { MaintenanceResources as M1MaintenanceResources } from "./recovery-maintenance.js";
 import { classifyRecoveryOrigin } from "./recovery-origin.js";
@@ -52,6 +53,17 @@ import type {
   RunKind,
 } from "./protocol.js";
 import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+
+/** Ephemeral execution metadata only; never custody or production admission authority. */
+export type ClosedSourceObservation = Readonly<{
+  genesis: Readonly<{ runId: string; generation: number; clonePath: string; attemptId: string }>;
+  terminal: "normal_park" | "normal_failed" | "normal_blocked";
+  family?: Readonly<{
+    originals: ReadonlyArray<ClosedSourceObservation["genesis"] & { identity: string }>;
+    observedExecution: Readonly<{ runId: string; generation: number }>;
+    metadata: string;
+  }>;
+}>;
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -3119,6 +3131,96 @@ export class RecoveryCoordinator {
     return this.trackPass(() => this.resumePendingPass(signal, snapshot, discover));
   }
 
+  /** Register before the runner releases its exact local tail. The observation selects
+   * saved evidence only; every replay retains its own locks and fresh source proofs. */
+  resumeTerminalSource(runId: string, tail: Promise<ClosedSourceObservation | void>, generation: number,
+    signal?: AbortSignal): Promise<void> {
+    if (!this.enabled || this.passShutdown.signal.aborted || signal?.aborted ||
+        residueQuarantine() !== undefined) return Promise.resolve();
+    const passSignal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
+    return this.trackPass(async () => {
+      // Join actual settlement even if shutdown arrives while the execution still owns work.
+      const observation = await tail;
+      if (passSignal.aborted || residueQuarantine() !== undefined || !observation ||
+          !/^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(runId) || observation.genesis.runId !== runId ||
+          !Number.isSafeInteger(observation.genesis.generation) || observation.genesis.generation <= 0 || observation.genesis.generation > generation ||
+          (observation.terminal !== "normal_failed" && observation.terminal !== "normal_blocked")) return;
+      const family = observation.family;
+      if (!family || family.observedExecution.runId !== runId || family.observedExecution.generation !== generation ||
+          !Number.isSafeInteger(family.observedExecution.generation) || family.observedExecution.generation <= 0 ||
+          (observation.terminal === "normal_failed" &&
+            family.observedExecution.generation !== observation.genesis.generation) ||
+          family.originals.length === 0 || !family.metadata ||
+          !family.originals.every(source => source.runId === runId &&
+            Number.isSafeInteger(source.generation) && source.generation > 0 && source.generation <= generation && !!source.identity) ||
+          !family.originals.some(source => source.generation === observation.genesis.generation &&
+            source.clonePath === observation.genesis.clonePath && source.attemptId === observation.genesis.attemptId)) return;
+      const records = await this.savedSourceCandidates(runId, passSignal);
+      const attempts = new Map<string, MaintenanceBudget>();
+      try {
+        await this.savedEvidenceOnly.run(true, async () => {
+          // One bounded candidate snapshot, one attempt per record; failure retains that
+          // record and does not block independent siblings. No discovery authority survives.
+          for (const snap of records) {
+            if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) break;
+            if (!this.finalRetryReady(snap)) continue;
+            try {
+              await this.withCancellationAttempt(snap, async () =>
+                runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+                  if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
+                  const current = await this.readRecord(this.recordPath(snap));
+                  if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
+                  await this.pendingStep(current, passSignal);
+                }), attempts);
+            } catch {
+              this.log.warn("recovery: terminal saved evidence retained");
+            }
+          }
+        });
+      } finally { for (const budget of attempts.values()) budget.dispose(); }
+    });
+  }
+
+  private readonly savedEvidenceOnly = new AsyncLocalStorage<boolean>();
+
+  private savedSourceCandidate(record: RecoveryRecord): boolean {
+    return !!(record.finalRequest || record.finalAcknowledged || record.completionReceipt ||
+      record.heldCreateUncertain || hasJournaledBundle(record));
+  }
+
+  /** Advisory per-run metadata enumeration. Partial results never prove completeness,
+   * emptiness or permission to bootstrap. Discovery ends before expensive replay proofs. */
+  private async savedSourceCandidates(runId: string, signal: AbortSignal): Promise<RecoveryRecord[]> {
+    const records: RecoveryRecord[] = [];
+    try {
+      await M1MaintenanceResources.runDiscovery(async () => {
+        const dir = await this.checkedRecordDirectory(runId);
+        if (!dir) return;
+        const budget = { signal, deadline: Date.now() + Math.min(10_000, M1MaintenanceResources.remainingMsIfActive()) };
+        const directory = await fs.opendir(dir);
+        try {
+          for (;;) {
+            signal.throwIfAborted();
+            M1MaintenanceResources.checkIfActive();
+            const entry = await directory.read();
+            if (!entry) break;
+            // Charge raw names before filtering, including malformed producer siblings.
+            M1MaintenanceResources.consumeIfActive("adminEntries", 1);
+            M1MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(entry.name));
+            if (!entry.name.endsWith(".json")) continue;
+            const result = await this.readRecordResult(path.join(dir, entry.name), true, budget, true);
+            if (result.kind === "ok" && result.record.runId === runId && this.savedSourceCandidate(result.record)) {
+              records.push(result.record);
+            }
+          }
+        } finally { await directory.close(); }
+      }, { signal });
+    } catch { this.log.warn("recovery: terminal saved evidence discovery incomplete"); }
+    // Ordinary saved originals lead; authenticated immutable producer evidence remains eligible.
+    return records.sort((a, b) => Number(classifyRecoveryOrigin(a.captureId) !== "ordinary") -
+      Number(classifyRecoveryOrigin(b.captureId) !== "ordinary"));
+  }
+
   /** Close admission synchronously, abort owned passes, and join their actual settlement.
    * No new pass can extend this finite snapshot; a failed pass does not skip its siblings. */
   async shutdown(): Promise<void> {
@@ -3965,6 +4067,7 @@ export class RecoveryCoordinator {
   /** Deny-only until a future charged producer entry supplies its own authority.
    * Callers pass only records authenticated by readLatest/requireRecord/listRecords. */
   private newProductionAllowed(record: RecoveryRecord): boolean {
+    if (this.savedEvidenceOnly.getStore()) return false;
     const origin = classifyRecoveryOrigin(record.captureId);
     if (origin === "ordinary") return true;
     const display = (id: string | undefined): string =>
@@ -3983,6 +4086,7 @@ export class RecoveryCoordinator {
    * Failure blocks new reconstruction only. Immutable replay and frozenCoverageProven
    * retain their existing proof, including every authenticated source record. */
   private async newReconstructionRecords(runId: string, generation?: number): Promise<RecoveryRecord[] | undefined> {
+    if (this.savedEvidenceOnly.getStore()) return undefined;
     const read = async (): Promise<RecoveryRecord[] | undefined> => {
       const records = await this.checkedRecords(runId, {
         signal: MaintenanceBudget.signal() ?? new AbortController().signal,
@@ -4005,18 +4109,16 @@ export class RecoveryCoordinator {
     }
   }
 
-  /** One bounded pass over physical JSON files; any failed read blocks authority.
-   * Paths must resolve inside this coordinator's root, with no symlink file reads. */
-  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false): Promise<RecoveryRecord[]> {
-    if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("unsafe recovery run id");
+  /** Shared directory containment checks; no filename or record grants authority. */
+  private async checkedRecordDirectory(runId: string): Promise<string | undefined> {
+    if (!/^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(runId)) throw new Error("unsafe recovery run id");
     const root = path.resolve(this.recoveryRoot);
     const dir = this.runDir(runId);
-    let names: string[];
     for (const directory of [root, dir]) {
       let stat;
       try { stat = await fs.lstat(directory); }
       catch (err) { MaintenanceBudget.current()?.check();
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw err;
       }
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe recovery directory");
@@ -4028,6 +4130,15 @@ export class RecoveryCoordinator {
     if (await fs.realpath(dir) !== path.join(realRoot, path.basename(dir))) {
       throw new Error("symlink recovery directory");
     }
+    return dir;
+  }
+
+  /** One bounded pass over physical JSON files; any failed read blocks authority.
+   * Paths must resolve inside this coordinator's root, with no symlink file reads. */
+  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false): Promise<RecoveryRecord[]> {
+    const dir = await this.checkedRecordDirectory(runId);
+    if (!dir) return [];
+    let names: string[];
     // Disappearance after a positive directory check is unknown, not empty proof.
     const before = await fs.lstat(dir);
     if (budget) {

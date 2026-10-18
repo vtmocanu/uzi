@@ -16,10 +16,10 @@ installHarness();
 function command(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
 }
-type Observation = { genesis: { runId: string; generation: number; clonePath: string; attemptId: string }; family?: unknown };
+type Observation = { terminal?: string; genesis: { runId: string; generation: number; clonePath: string; attemptId: string }; family?: unknown };
 type Tails = { executionTails: ReadonlyMap<string, Promise<Observation | undefined>> };
 
-for (const mode of ["normal", "unapplied", "lost", "stale", "wrong-status", "missing-status",
+for (const mode of ["normal", "notification-throw", "notification-reject", "unapplied", "lost", "stale", "wrong-status", "missing-status",
   "missing-process", "missing-reproof", "unverified", "failed-reap", "late-fence",
   "failed-home", "failed-skills", "failed-owed", "record-none", "prior-record-none", "reclaimed", "nonmatching-error", "post-run-error"] as const) {
 it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
@@ -164,6 +164,26 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       }));
     });
   }
+  const scanEntered = deferred(), scanRelease = deferred();
+  const open = fs.opendir.bind(fs);
+  if (mode === "normal") t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+    if (notifiedTail && String(args[0]) === path.join(git.recoveryRoot, claim.run_id)) {
+      scanEntered.resolve();
+      await scanRelease.promise;
+    }
+    return open(...args);
+  });
+  let notifiedTail: Promise<unknown> | undefined;
+  let notifiedWhileReserved = false;
+  const resume = RecoveryCoordinator.prototype.resumeTerminalSource;
+  t.mock.method(RecoveryCoordinator.prototype, "resumeTerminalSource", function (this: RecoveryCoordinator,
+    ...args: Parameters<typeof resume>) {
+    notifiedTail = args[1];
+    notifiedWhileReserved = (runner as unknown as Tails).executionTails.get(claim.run_id) === args[1];
+    if (mode === "notification-throw") throw new Error("notification failure fixture");
+    if (mode === "notification-reject") return Promise.reject(new Error("notification failure fixture"));
+    return resume.apply(this, args);
+  });
   const executing = runner.execute(claim);
   const tails = (runner as unknown as Tails).executionTails;
   const tail = tails.get(claim.run_id)!;
@@ -200,7 +220,22 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     assert.equal(config.includes('"state":"reclaimed"'), mode === "reclaimed");
     assert.ok(config.includes('"state":"live"'), "live attempt attribution remains");
     const observed = await tail;
-    if (mode === "normal") {
+    if (mode === "normal" || mode === "notification-throw" || mode === "notification-reject") {
+      assert.equal(notifiedTail, tail, "automatic notification captures the exact pending local tail");
+      assert.equal(notifiedWhileReserved, true, "notification precedes original map deletion");
+      assert.equal(observed?.terminal, "normal_failed");
+      if (mode === "normal") {
+        await scanEntered.promise;
+        let joined = false;
+        const drain = runner.shutdownRecoveries().then(() => { joined = true; });
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(joined, false, "execute returned while coordinator still owns the metadata child");
+        scanRelease.resolve();
+        await drain;
+      } else {
+        assert.ok(JSON.stringify(log.lines).includes("recovery: terminal saved evidence pass failed; source retained"));
+        assert.ok(!JSON.stringify(log.lines).includes("notification failure fixture"));
+      }
       assert.ok(observed?.family, "fresh normal FAILED returns positive source family: " + JSON.stringify(log.lines.slice(-5)));
       assert.equal(observed.genesis.clonePath, source);
       assert.equal(observed.genesis.generation, 1);
@@ -209,7 +244,9 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     assert.equal(tails.has(claim.run_id), false);
   } finally {
     releaseAck.resolve();
+    scanRelease.resolve();
     runner.shutdown();
+    await runner.shutdownRecoveries();
     await executing;
   }
 });
