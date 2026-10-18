@@ -67,7 +67,7 @@ function fixture() {
       workerShutdown: () => proof, now: () => now },
   };
   return { safety, registry, installer, request, lifecycle, soft, authority, shutdown, advance,
-    now: () => now, timers, budgets, spawns: () => spawns, releases: () => releases,
+    now: () => now, elapseWithoutTimers: (ms: number) => { now += ms; }, timers, budgets, spawns: () => spawns, releases: () => releases,
     proof: () => proof };
 }
 
@@ -93,6 +93,30 @@ for (const notification of ["soft", "lifecycle"] as const) {
     assert.equal(f.registry.isPoisoned(), true);
     assert.equal(f.timers.size, 0);
   });
+}
+
+for (const deadline of ["shutdown", "original"] as const) {
+  for (const identity of ["command", "worker_pat"] as const) {
+    it("absolute " + deadline + " expiry refuses " + identity + " admission before delayed timers fire", async () => {
+      const f = fixture();
+      await assert.rejects(f.safety.withBoundary(f.request, async permit => {
+        if (deadline === "shutdown") f.shutdown();
+        f.elapseWithoutTimers(deadline === "shutdown" ? 15_001 : 90_001);
+        assert.equal(permit.signal.aborted, false, "the timer callback has deliberately not run");
+        await assert.rejects(async () => {
+          const child = await f.safety.spawnBoundaryProcess(permit, {
+            argv: ["/inert"], cwd: "/unused", env: {}, identity,
+          });
+          await child.completed;
+        });
+        assert.equal(permit.signal.aborted, true, "admission applies the hard fence synchronously");
+        assert.equal(f.spawns(), 0, "no owned work is admitted after the absolute deadline");
+        assert.equal(f.registry.rootCount(), 0);
+      }), CodexBoundaryError);
+      assert.equal(f.registry.isPoisoned(), true);
+      assert.equal(f.timers.size, 0);
+    });
+  }
 }
 
 it("shutdown expiry wakes production quiescence while retaining the unsettled reservation", async () => {

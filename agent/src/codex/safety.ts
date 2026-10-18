@@ -325,6 +325,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   // Live only while an action is running under a held permit.
   private heldPermit: BoundaryPermit | undefined;
   private currentDeadlineAt = 0;
+  private expireCurrentDeadline: (() => void) | undefined;
   private pendingActions: Promise<unknown>[] = [];
 
   constructor(
@@ -542,10 +543,11 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // Issue #1900: record the caller's active step at fire time, before the abort lets the
     // action move on to another step. Only the first fire counts.
     let firedStep: BoundaryStep | undefined;
-    const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, () => {
+    const expireDeadline = () => {
       if (!boundaryAbort.signal.aborted) firedStep = readStep(request);
       boundaryAbort.abort();
-    });
+    };
+    const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, expireDeadline);
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
       requireAuthority(stage);
       if (!boundarySignal.aborted && this.remainingMs(deadlineAt) > 0 &&
@@ -625,6 +627,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const permit = mintPermit(epoch, request.boundary, boundarySignal);
     this.heldPermit = permit;
     this.currentDeadlineAt = deadlineAt;
+    this.expireCurrentDeadline = expireDeadline;
     this.pendingActions = [];
 
     let outcome: { ok: true; value: T } | { ok: false; error: unknown };
@@ -652,6 +655,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     }
 
     this.heldPermit = undefined;
+    this.expireCurrentDeadline = undefined;
 
     if (stopSignal?.aborted || authorityAbort.signal.aborted) {
       this.registry.poison({ category: "authorization", message: "codex shutdown checkpoint authority revoked" });
@@ -705,12 +709,25 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     }
   }
 
+  /** A delayed timer must not turn an expired absolute allowance into a new launch. */
+  private requireBoundaryProcessBudget(permit: BoundaryPermit): number {
+    const remaining = this.remainingMs(this.currentDeadlineAt);
+    if (remaining <= 0) this.expireCurrentDeadline?.();
+    if (permit.signal.aborted || remaining <= 0) {
+      if (!this.registry.isPoisoned()) this.registry.poison({
+        category: "timeout", message: "codex boundary process deadline exceeded before admission",
+      });
+      throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
+    }
+    return remaining;
+  }
+
   async spawnBoundaryProcess(
     permit: BoundaryPermit,
     request: BoundaryProcessRequest,
   ): Promise<BoundaryProcessHandle> {
     if (this.heldPermit !== permit) throw new TrustedExecutionRefusal("codex boundary process refused: stale permit");
-    if (permit.signal.aborted) throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
+    this.requireBoundaryProcessBudget(permit);
     if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
       throw new TrustedExecutionRefusal("codex boundary process timeout must be positive and finite");
     }
@@ -733,14 +750,20 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(error);
       throw new TrustedExecutionRefusal(error.message);
     }
-    const childDeadlineAt = this.now() + Math.min(request.timeoutMs ?? Infinity, this.remainingMs(this.currentDeadlineAt));
+    const childDeadlineAt = Math.min(this.currentDeadlineAt, this.now() + (request.timeoutMs ?? Infinity));
     const startupCleanup: StartupCleanupAuthorization | undefined = request.recoverableTimeout
       ? Object.freeze({ hardDeadlineAt: this.currentDeadlineAt, attempt: Object.freeze({}) })
       : undefined;
     const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
+    let hardRemaining: number;
+    try { hardRemaining = this.requireBoundaryProcessBudget(permit); }
+    catch (error) {
+      this.registry.cancelReservation(reservation.reservation);
+      throw error;
+    }
     let launched: SpawnedBoundaryProcess;
     try {
-      const launch = this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - this.now()), startupCleanup);
+      const launch = this.seams.spawnProcess(request, Math.min(hardRemaining, Math.max(1, childDeadlineAt - this.now())), startupCleanup);
       this.pendingActions.push(launch.then(() => undefined, () => undefined));
       launched = await launch;
     } catch (cause) {
