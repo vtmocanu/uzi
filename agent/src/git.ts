@@ -13650,10 +13650,14 @@ export class GitCache {
                   if (!records.length) throw new Error("owed pin has no discovery metadata");
                   // cat-file -t only reads object type; no decoded closure verification.
                   await this.requireOwedCommit(current.barePath, match[2]!);
+                  const producing = records.map(record => record.c).sort((a, b) =>
+                    a.generation === null ? (b.generation === null ? this.contextName(a).localeCompare(this.contextName(b)) : -1)
+                      : b.generation === null ? 1 : a.generation - b.generation ||
+                        this.contextName(a).localeCompare(this.contextName(b)));
                   for (const record of records) {
                     const list = pins.get(record.contextName) ?? [];
                     list.push({ sha: record.sha, pinRef: `refs/uzi-owed/${record.runId}/${record.sha}`,
-                      contexts: [record.c] });
+                      contexts: producing });
                     pins.set(record.contextName, list);
                   }
                 }

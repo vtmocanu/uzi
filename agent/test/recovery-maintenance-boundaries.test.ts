@@ -436,6 +436,11 @@ test("producer cursor counts logical fanout, continues pages, and preserves ordi
     .map(item => `${item.context.barePath}:${item.context.generation}`).sort();
   assert.deepEqual(observed, ordinary.map(item => `${item.context.barePath}:${item.context.generation}`).sort());
   assert.equal(new Set(observed).size, 9);
+  for (const item of pages.flatMap(page => page.selected)) {
+    const expected = ordinary.find(other => other.context.barePath === item.context.barePath &&
+      other.context.generation === item.context.generation)!;
+    assert.deepEqual(item.candidates, expected.candidates, "shared pin provenance must remain complete");
+  }
   assert.deepEqual(await f.cache.discoverOwedCandidates(), ordinary);
 });
 
