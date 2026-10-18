@@ -351,7 +351,7 @@ A few worth knowing:
   missing witness. An ordinary `awaiting_input` question is not a
   completion-decision state; see `run answer` and `run decide` below.
 
-  Deploy the API and migration `00340` before upgraded workers. The API
+  Deploy the API and migration `00342` before upgraded workers. The API
   advertises `milestone_reconciliation_v1`; upgraded workers attempt the gate
   checkpoint when that feature is advertised and the milestone list changes.
   An older worker cannot supply the required witness. After reset, claiming

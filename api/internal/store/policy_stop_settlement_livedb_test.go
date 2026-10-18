@@ -41,7 +41,9 @@ func TestPolicyStopSettlementMigrationLiveDB(t *testing.T) {
 	}
 	u.Path = "/" + name
 	dsn := u.String()
-	if err := MigrateTo(ctx, dsn, 340); err != nil {
+	holdVersion := migrationVersionByName(t, "policy_hold")
+	stopVersion := migrationVersionByName(t, "policy_stop_resolution")
+	if err := MigrateTo(ctx, dsn, holdVersion); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := OpenPool(ctx, dsn)
@@ -75,7 +77,7 @@ func TestPolicyStopSettlementMigrationLiveDB(t *testing.T) {
 	if err := pool.QueryRow(ctx, "INSERT INTO run_user_inputs(run_id,kind,body,gate_binding,gate_revision,consumed_at,consumed_claim_generation) VALUES($1,'revise_plan',' exact feedback ','bound',7,now(),1) RETURNING id", run).Scan(&human); err != nil {
 		t.Fatal(err)
 	}
-	if err := MigrateTo(ctx, dsn, 341); err != nil {
+	if err := MigrateTo(ctx, dsn, stopVersion); err != nil {
 		t.Fatal(err)
 	}
 	// New columns must remain absent on historical rows until an explicit settlement.
@@ -109,13 +111,13 @@ func TestPolicyStopSettlementMigrationLiveDB(t *testing.T) {
 	reject("DELETE FROM cross_checks WHERE id=$1", cc)
 	// Resource bookkeeping is independent of the immutable revision evidence.
 	exec("UPDATE cross_checks SET wait_credited=true WHERE id=$1", cc)
-	if err := MigrateDownTo(ctx, dsn, 340); err == nil {
+	if err := MigrateDownTo(ctx, dsn, holdVersion); err == nil {
 		t.Fatal("Down erased new settlement semantics")
 	}
 	// Run deletion remains the ordinary retention boundary and cascades the evidence.
 	exec("DELETE FROM runs WHERE id=$1", run)
 	exec("UPDATE runs SET policy_revision_source='{\"kind\":\"human\",\"input_id\":1}' WHERE id=$1", other)
-	if err := MigrateDownTo(ctx, dsn, 340); err == nil {
+	if err := MigrateDownTo(ctx, dsn, holdVersion); err == nil {
 		t.Fatal("Down erased source provenance")
 	}
 	exec("UPDATE runs SET policy_revision_source=NULL WHERE id=$1", other)
@@ -124,14 +126,14 @@ func TestPolicyStopSettlementMigrationLiveDB(t *testing.T) {
 	reject("UPDATE runs SET policy_stop_resolution=NULL WHERE id=$1", other)
 	reject("UPDATE runs SET policy_revision_source='{}' WHERE id=$1", other)
 	reject("DELETE FROM run_user_inputs WHERE id=$1", wrongScope)
-	if err := MigrateDownTo(ctx, dsn, 340); err == nil {
+	if err := MigrateDownTo(ctx, dsn, holdVersion); err == nil {
 		t.Fatal("Down erased accepted resolution")
 	}
 	exec("DELETE FROM runs WHERE id=$1", other)
-	if err := MigrateDownTo(ctx, dsn, 340); err != nil {
+	if err := MigrateDownTo(ctx, dsn, holdVersion); err != nil {
 		t.Fatal(err)
 	}
-	if err := MigrateTo(ctx, dsn, 341); err != nil {
+	if err := MigrateTo(ctx, dsn, stopVersion); err != nil {
 		t.Fatal(err)
 	}
 }
