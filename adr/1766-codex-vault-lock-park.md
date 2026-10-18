@@ -27,12 +27,16 @@ open/seal calls or a same-operation retry's coherent durable recovery evidence. 
 checks still precede the vault outcome and are revalidated before the reply; the narrowly tolerated
 quarantine refusal grants evidence-check coordinates, not credential release authority (D1).
 
-Rather than fail the run, the worker **parks** it: it confirms the run is still `running`, brings
-its Codex processes to a stop without touching the credential (a **credential-free settle**), then
-makes a **verified capture** of the work done so far, publishing it credential-free when it can. It
-reports `recovery_wait` with cause `vault_locked`, **keeps custody** of the run's source, and does
-**not open the merge request** while the vault stays locked. The park is promoted back to `queued`
-by a best-effort promotion on the owner's explicit successful vault unlock (issue #1792), with
+**DRAFT — slice A, Refs #2852 (2026-10-18):** the held-capture and epoch-recreation
+amendments below await tests, review and integration gates; final executor ownership
+is still being completed. Earlier accepted protocol decisions retain their scope.
+
+Rather than fail the run, the worker **parks** it: it confirms the run is still `running`,
+settles Codex execution without touching the credential, and holds credential-free
+capture through verified GitCache capture, attempted authorized publication and full
+supervised-child settlement. It reports `recovery_wait` with cause `vault_locked`,
+keeps the exact source and custody, and does not open the merge request while the vault
+stays locked. The park is promoted back to `queued` by a best-effort promotion on the owner's explicit successful vault unlock (issue #1792), with
 the ordinary recovery timer as a backstop. A queued run whose vault is still locked idles at claim
 and shows "your vault is locked, so this run can't start" until an unlocked claim succeeds.
 It is then re-claimed and resumes — the resume costs at least one model turn, then finalize may
@@ -64,12 +68,13 @@ worker advertising `codex_account_park_v1` answers HTTP 409 with
 Message text, a generic refusal or the worker's account interpretation grants no authority.
 
 The worker interprets this boundary reply as `account_unavailable` and uses D3's
-credential-free ordering: confirm running ownership, settle execution, WIP commit,
-fetch-back into the bare tracking ref, verify, attempt publication, then report the park.
+credential-free ordering: confirm running ownership, settle execution, then hold the
+capture callback through WIP commit, fetch-back into the bare tracking ref, verification,
+attempted authorized publication and supervised-child settlement before reporting the park.
 Publication is best-effort, not a promise of an available server archive. Until capture
 and acknowledgement are verified, local work and session are retained and retried with
-capped backoff. After the park ACK, the tracking ref and session remain recovery sources;
-the live clone may retire under the independent quiescence checks. The custody hold is
+capped backoff. After the park ACK, the exact clone and existing journal stay retained
+even when covered; the tracking ref and session remain recovery sources. The custody hold is
 not settled by this path, and `worker_id` remains the source worker. Resume prefers that
 worker under the existing affinity rules, rather than guaranteeing it in every case.
 
@@ -181,10 +186,13 @@ credential is in hand, whatever additionally caused the block.
 ## D3: settle before capture, and no completion authority while locked
 
 The worker's park sequence, in order: confirm the run is still `running` (a stale or already-parked
-run does not re-park); stop the run's Codex processes without any credential operation (a
-**credential-free settle** — nothing in this path may attempt another refresh or release, since that
-would just re-hit the same lock); make a **verified capture** of the work completed so far,
-published credential-free when the publish path allows it; report `recovery_wait` with cause
+run does not re-park); stop Codex execution without any credential operation, then
+hold safety serialization, the epoch fence and closed admission through source reads,
+WIP commit, fetch-back, verification, authorized credential-free publication and full
+supervised-child settlement. The intentionally poisoned, successfully settled registry
+admits this narrow capture lane, with no provider turn, normal callback, admission
+reopen, credential reconciliation, refresh or release, PAT, credential-bearing environment
+or overlay. An incomplete proof grants no capture authority. Then report `recovery_wait` with cause
 `vault_locked` when the api advertises the `recovery_cause_vault_locked` protocol feature, else an
 untyped `recovery_wait`; keep the custody hold. The run does not open its merge request while parked this
 way — finalize, and the completion authority that would open the MR, run only after a successful
@@ -203,7 +211,8 @@ described below.
 
 The blocked-proof retention exception covers `vault_locked`, `refresh_unknown` and
 `account_unavailable` (the #1595 amendment above).
-Settlement must still be observed empty; quiescence, WIP commit, fetch-back, tracking-ref
+Settlement must be observed empty before the callback, and capture must complete with
+its supervised children settled; quiescence, WIP commit, fetch-back, tracking-ref
 verification, canonical and foreign-residue checks, and completion proofs remain required.
 A blocked proof retains the clone, session and custody with capped waits and no terminal
 blocked-capture cap for these three deferrals; it does not permit a park or completion without the
@@ -211,6 +220,17 @@ proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Can
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
 semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`), subject to the narrow actual
 graceful-shutdown durability exception below.
+
+Owner pause uses this held credential-free capture discipline. Save the credential-free
+session before capture can drain the provider epoch. After a failed or withdrawn pause
+that may have drained it, continuing execution recreates a provider through the existing
+epoch path from the saved session. Changed-milestone gate revision, human or automatic,
+likewise recreates before another provider turn. Newer cancellation, pause and vault-lock
+state are checked before credentials or model execution; a vault lock on recreation takes
+this ADR's credential-deferral park. The approval path still skips persistence from the
+old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
+change fresh-path retained recovery. See [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+for A's scope and the unshipped B/C gaps.
 
 ### Amendment #3101: actual graceful-shutdown durability
 

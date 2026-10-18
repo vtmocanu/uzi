@@ -465,12 +465,34 @@ descendants, including daemons that change process groups. A command is not an
 app-server descendant merely because a callback requested it.
 
 Provider roots receive only their own provider credential; command roots receive
-a sparse credential-free environment. At a boundary, close admission, settle
-accepted launches and callbacks, then drain and verify **every** root for that
-frozen epoch. Lost supervision or an unconfirmed result poisons the run. The
+a sparse credential-free environment. At a credentialed boundary, close admission,
+settle accepted launches and callbacks, then drain and verify the registered roots
+for that frozen epoch. The
 [outer safety gate](../e2e/codex-m0/harness-contract.md#lifecycle-operation-order-and-evidence)
-owns the matching-epoch permit and holds it through every runner sink; it also
-preserves primary-error independence and the unchanged Claude branch.
+holds the matching-epoch permit through the runner action and its owned work,
+preserving primary-error independence and the unchanged Claude branch.
+
+**DRAFT — slice A, Refs #2852 (2026-10-18):** acceptance remains pending tests,
+review and integration gates; final executor ownership is still being completed.
+A separate credential-free GitCache capture callback holds safety serialization,
+the epoch fence and closed admission through source reads, WIP commit, fetch-back,
+verification, authorized publication and full supervised-child settlement. An
+intentionally poisoned registry admits this narrow lane after confirmed settlement;
+it admits no provider turn or normal callback, admission reopen, credential
+reconciliation, refresh or release, PAT, credential-bearing environment or overlay.
+Lost supervision or incomplete settlement grants no capture authority. This context
+mints neither a credentialed nor a completion permit. See the
+[remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+
+GitCache binds the restricted launch policy: the canonical environment includes
+exactly one empty `credential.helper` and one empty `core.askpass`, with no
+credential-bearing override. Trusted-worker bare Git keeps its worker identity;
+`worker_pat` is the historical identity name, not evidence of credential presence.
+Credential presence is checked separately; free capture does not downgrade bare
+Git to the isolated clone identity. Blanket refusal of free capture was rejected:
+it leaves uncaptured work in an ephemeral clone instead of moving capturable work
+into the persistent worker bare. Local capture alone proves neither origin
+publication nor permission to dispose of the source.
 
 The same supervisor mechanism has been measured with actual provider roots and
 separate process controls. M0 needs no different process primitive for command

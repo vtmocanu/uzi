@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { type CredentialFreeSettleOutcome, type RunContext } from "../src/executor.js";
+import { type Executor, type RunContext } from "../src/executor.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { CodexCredentialDeferredError } from "../src/codex/codex-executor.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
@@ -46,7 +46,7 @@ import {
   receiptError,
   sessionKept,
   countPublishes,
-  settleOnceIncomplete,
+  captureOnceIncomplete,
   installRecoveryRootCleanup,
 } from "./runner-codex-sinks-fixture.js";
 
@@ -65,7 +65,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
         commitInTree(ctx.worktreePath, "VAULT.txt", "work before the vault locked\n");
         head = headOf(ctx.worktreePath);
         return { branch: ctx.branch };
-      }, rig.settle);
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1766);
       const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
       const custody = spyCustodySettle(runner);
@@ -95,7 +95,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "VAULT.txt", "work\n");
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1767);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
     const parks = parkReports(claim.run_id);
@@ -117,7 +117,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       head = headOf(ctx.worktreePath);
       await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1768);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 1, "parked at recovery_wait");
@@ -137,7 +137,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       commitInTree(ctx.worktreePath, "PLAN.txt", "approved plan work\n");
       statesAtThrow = api.states.length;
       throw new CodexCredentialDeferredError();
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1769);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
     const after = api.states.slice(statesAtThrow).filter((s) => s.runId === claim.run_id).map((s) => s.body.status);
@@ -156,7 +156,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       commitInTree(ctx.worktreePath, "STALE.txt", "work\n");
       deferred = true;
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1770);
     api.failStateWhen(claim.run_id, (b) => deferred && b.status === "running", {
       runStatus: "running",
@@ -190,7 +190,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       deferred = true;
       api.setOwnershipStatus(claim.run_id, "running", 6);
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     // The confirming running report is lost (a non-retried 400), so only the probe can decide.
     api.failStateWhen(claim.run_id, (b) => deferred && b.status === "running", { httpStatus: 400 });
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
@@ -209,7 +209,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       deferred = true;
       api.setOwnershipStatus(claim.run_id, "running", 5);
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     api.failStateWhen(claim.run_id, (b) => deferred && b.status === "running", { httpStatus: 400 });
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 1, "the probe proved running at this generation: parked");
@@ -226,7 +226,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RESUME.txt", "work saved across the vault lock\n");
       return { branch: ctx.branch };
-    }, rig1.settle);
+    }, undefined, rig1.capture);
     await runnerWith(() => ({ executor: exec1 }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 1, "flight 1 parked");
     assert.equal(calls.length, 0, "flight 1 opened no MR");
@@ -257,7 +257,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
         assert.equal(resumedContent, "work saved across the vault lock\n",
           "recaptured content is present before model execution");
         return { branch: ctx.branch };
-      }, rig.settle) };
+      }, undefined, rig.capture) };
     };
     await runnerWith(resumeFactory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 })
       .execute({ ...claim, claim_generation: 2, session_id: "predecessor-session" });
@@ -290,7 +290,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       commitInTree(ctx.worktreePath, "RETRY.txt", "work\n");
       armed = true;
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1774);
     api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", { httpStatus: 400 });
     let parkAttempts = 0;
@@ -323,7 +323,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "MIDTURN.txt", "work done before the vault locked\n");
       throw new CodexCredentialDeferredError();
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1789);
     api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", { httpStatus: 400 });
     let parkAttempts = 0;
@@ -358,18 +358,18 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     let incomplete = 0;
     let reachedTwice!: () => void;
     const twice = new Promise<void>((r) => (reachedTwice = r));
-    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+    const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
       if (!allow) {
         incomplete += 1;
         if (incomplete === 2) reachedTwice();
         return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
       }
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     };
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       fs.writeFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "only copy\n");
       return { branch: ctx.branch };
-    }, settle);
+    }, undefined, capture);
     const claim = gitlabClaim(1775);
     const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
     const execution = runner.execute(claim);
@@ -414,7 +414,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "LEAK.txt", "work\n");
       return { branch: ctx.branch };
-    }, rig.settle);
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1776);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 1);
@@ -455,7 +455,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
         const at = { completedCount: 1, total: 2 };
         parkedResult = await ctx.parkForPause?.(at);
         return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
-      }, rig.settle);
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1764);
       await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 }).execute(claim);
       assert.equal(parkedResult, true, "the owner pause was ACKed as paused");
@@ -520,7 +520,7 @@ describe("RunRunner milestone2 — pre-settle reap diagnostics", () => {
       const claim = gitlabClaim(2365, { claim_generation: 3, secrets: { forge_pat: secret } });
       const exec = new FakeCodexExecutor(rig.safety, async () => {
         throw new Error("execution failed");
-      });
+      }, undefined, rig.capture);
       await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
         recovery: coord,
       }).execute(claim);
@@ -616,14 +616,14 @@ describe("RunRunner #1766 — vault-lock exits capture before cleanup, and every
     let incomplete = 0;
     let ctxRef: () => RunContext | undefined = () => undefined;
     // The run stays in the vault park loop (settle incomplete) until the cancel is seen.
-    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+    const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
       if (!ctxRef()?.cancelRequested?.()) {
         if (++incomplete === 2) waiting();
         return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
       }
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     };
-    const w = workThenDefer(rig, settle);
+    const w = workThenDefer(rig, undefined, capture);
     ctxRef = w.ctx;
     const claim = gitlabClaim(1783);
     // The first cancel report is lost in transport; the retry is visible and then lands.
@@ -884,7 +884,7 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
     const claim = gitlabClaim(1792);
-    const w = workThenDefer(rig, settleOnceIncomplete(rig, () => api.setOwnershipStatus(claim.run_id, "failed")));
+    const w = workThenDefer(rig, undefined, captureOnceIncomplete(rig, () => api.setOwnershipStatus(claim.run_id, "failed")));
     const pubs = countPublishes(() => w.deferred());
     try {
       const { logger, lines } = recordingLogger();
@@ -961,7 +961,7 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
     const claim = gitlabClaim(1795);
-    const w = workThenDefer(rig, settleOnceIncomplete(rig, () => api.setOwnershipNotOwned(claim.run_id)));
+    const w = workThenDefer(rig, undefined, captureOnceIncomplete(rig, () => api.setOwnershipNotOwned(claim.run_id)));
     const { logger, lines } = recordingLogger();
     await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 0);
@@ -1004,14 +1004,14 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     const settleRetried = new Promise<void>((r) => (waiting = r));
     let incomplete = 0;
     let ctxRef: () => RunContext | undefined = () => undefined;
-    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+    const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
       if (!ctxRef()?.cancelRequested?.()) {
         if (++incomplete === 2) waiting();
         return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
       }
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     };
-    const w = workThenDefer(rig, settle);
+    const w = workThenDefer(rig, undefined, capture);
     ctxRef = w.ctx;
     const fetch = git.fetchAgentBranch.bind(git);
     git.fetchAgentBranch = (async (...args: Parameters<typeof fetch>) => {
@@ -1054,14 +1054,14 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     const settleRetried = new Promise<void>((r) => (waiting = r));
     let incomplete = 0;
     let ctxRef: () => RunContext | undefined = () => undefined;
-    const settle = async (ms: number): Promise<CredentialFreeSettleOutcome> => {
+    const capture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal) => {
       if (!ctxRef()?.cancelRequested?.()) {
         if (++incomplete === 2) waiting();
         return { kind: "incomplete", errors: [{ category: "timeout", message: "a writer survived" }] };
       }
-      return rig.settle(ms);
+      return rig.capture(ms, action, purpose, signal);
     };
-    const w = workThenDefer(rig, settle);
+    const w = workThenDefer(rig, undefined, capture);
     ctxRef = w.ctx;
     const claim = gitlabClaim(1798);
     api.failStateWhen(claim.run_id, (b) => b.status === "failed" && b.failure_reason === "run cancelled", {

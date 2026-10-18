@@ -482,6 +482,21 @@ export interface BoundaryPermit {
   readonly signal: AbortSignal;
 }
 
+declare const credentialFreeCaptureBrand: unique symbol;
+declare const completedCaptureBrand: unique symbol;
+
+/** Bounded capture scope; only GitCache can bind its restricted subprocess lane. */
+export interface CredentialFreeCaptureContext {
+  readonly [credentialFreeCaptureBrand]: true;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+}
+
+/** Exact completed acquisition evidence, not permission for ordinary admission. */
+export interface CompletedCredentialFreeCapture {
+  readonly [completedCaptureBrand]: true;
+}
+
 export interface BoundaryProcessRequest {
   /** argv[0] is a trusted absolute executable path; relative/PATH resolution is forbidden. */
   readonly argv: readonly string[];

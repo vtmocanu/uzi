@@ -60,6 +60,7 @@ import {
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
 import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
+import { assertCaptureLaunch } from "../credential-free-capture.js";
 
 // ─── Bounds (fixture-derived; supervisor-side limits are matched, not trusted) ────
 const MAX_EVIDENCE_LINES = 256;
@@ -1109,6 +1110,7 @@ async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps)
   }
   let child: SupervisorProcess;
   try {
+    assertCaptureLaunch(spec);
     child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
       cwd: spec.cwd,
       // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither

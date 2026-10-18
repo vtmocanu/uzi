@@ -13575,7 +13575,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.equal(events[events.length - 1], `persist:${homeOf(2)}`, "the terminal persist is the fresh epoch's");
   });
 
-  it("(B8 pause) an owner `now` that lands during the refused, reaping park stays pending and parks after the epoch is recreated (issue #1782)", async () => {
+  it("(B8 pause) an owner `now` that lands during the refused, reaping park parks before credential release or epoch recreation (issue #1782)", async () => {
     const rig = makeMultiEpochRig([quietEpoch("th-1"), quietEpoch("th-1")]);
     const { events, homeOf } = persistSpy(rig);
     let exec!: CodexExecutor;
@@ -13607,7 +13607,7 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     assert.ok(result.pausedAt, "the pending `now` was honoured after the refused park");
     assert.equal(parks.length, 1, "parkForPause ran once");
     assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the reaped epoch got no further turn/start");
-    assert.notEqual(exec.safety, safetyAtPark, "the refused park recreated the epoch before the pause was handled");
+    assert.equal(exec.safety, safetyAtPark, "the newer pause was handled before credential release or epoch recreation");
     // The recreated epoch never launched, so its home never adopted the session: persisting it
     // would replace the generation persisted before the park with an empty one.
     assert.equal(rig.providerLaunches(), 1, "the recreated epoch never launched a provider root");
@@ -19314,10 +19314,10 @@ describe("2833 Codex inline summaries", () => {
         const result = await executor.run(ctx);
         assert.equal(!!(result.walled || result.pausedAt || result.completionHeld), accepted);
       }
-      assert.deepEqual(observations, [sink !== "request"]);
-      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
+      assert.deepEqual(observations, [true]);
+      assert.deepEqual(posts, []);
       resolve("Late"); await drain();
-      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
+      assert.deepEqual(posts, []);
     });
   }
   it("2833 advisory failures leave a successful seeded run unchanged", async () => {

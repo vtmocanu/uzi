@@ -15,7 +15,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
-import type { BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
+import type { BoundaryRequest } from "../src/harness.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { recordingLogger } from "./helpers.js";
 import {
@@ -223,7 +223,7 @@ describe("M2 serial post-permit completion custody", () => {
         assert.equal((await outbox.journalFinalize(claim.run_id, generation)).written, true);
         saved = fs.readFileSync(finalize);
         return { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       api.setRegisterProtocolFeatures(["claim_generation_fence"]);
       await client.register("m2-codex");
       api.setPublicationState(claim.run_id, [], 1);
@@ -332,7 +332,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "PERMIT-DEADLINE.txt", "permit retry must stop\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1916, {
       config: { completion_contract_version: 1, contract_revision: 1 },
     });
@@ -399,7 +399,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "IMPL.txt", "codex work\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1200);
     await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
 
@@ -448,7 +448,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
         commitInTree(ctx.worktreePath, "TERMINAL.txt", "report after boundary\n");
         return { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1221);
       await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
 
@@ -478,7 +478,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "LATE-BOUNDARY.txt", "published before boundary error\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1222);
     await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
 
@@ -504,7 +504,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       commitInTree(ctx.worktreePath, "M1.txt", "milestone 1\n");
       await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1201);
     await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
     assert.ok(rig.boundaries.includes("checkpoint"), `checkpoint boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
@@ -521,7 +521,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
         commitInTree(ctx.worktreePath, "PARK.txt", "committed before the limit\n");
         throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1202, { wait_on_limit: true });
       await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
       assert.ok(rig.boundaries.includes("park"), `park boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
@@ -549,7 +549,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
           fs.writeFileSync(path.join(home, rel, "entry"), "cached\n");
         }
         throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1809, { wait_on_limit: true });
       await runnerWith(() => ({ executor: exec, homeDir: home }), gitlab).execute(claim);
       assert.ok(statuses(claim.run_id).includes("limit_wait"), "precondition: the run parked at limit_wait");
@@ -574,7 +574,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
         started();
         await new Promise<void>((_, reject) => ctx.signal!.addEventListener("abort", () => reject(new Error("aborted mid-run")), { once: true }));
         return { branch: ctx.branch };
-      }) }), gitlab);
+      }, undefined, rig.capture) }), gitlab);
       const p = runner.execute(gitlabClaim(1203, { wait_on_limit: true }));
       await startedP;
       runner.shutdown();
@@ -605,7 +605,7 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
         commitInTree(ctx.worktreePath, "REC.txt", "recovered work\n");
         throw new TransientRecoveryError();
-      });
+      }, undefined, rig.capture);
       await runnerWith(() => ({ executor: exec }), gitlab).execute(gitlabClaim(1204));
       assert.ok(rig.boundaries.includes("shutdown"), `recovery boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
       assert.ok(
@@ -626,7 +626,7 @@ describe("RunRunner m4 — per-sink reconcile before the boundary", () => {
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "IMPL.txt", "codex work\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1210);
     await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
 
@@ -651,7 +651,7 @@ describe("RunRunner m4 — per-sink reconcile before the boundary", () => {
     const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "IMPL.txt", "codex work\n");
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     const claim = gitlabClaim(1211);
     await runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
 
@@ -701,7 +701,7 @@ describe("RunRunner #1864 — a Codex boundary failure names its stage, checkpoi
         commitInTree(ctx.worktreePath, "M1.txt", "milestone 1\n");
         await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
         return { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(issue);
       await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
       const reasons = api.states
@@ -782,7 +782,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
         parkedResult = await ctx.parkForPause?.(at);
         boundariesAtPause = [...rig.boundaries]; // capture the moment the pause sink returns
         return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1220);
       await runnerWith(() => ({ executor: exec, homeDir: path.join(homeRoot, "h") }), gitlab).execute(claim);
       assert.equal(parkedResult, true, "the pause parked (its credential-free publish landed)");
@@ -818,7 +818,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
         const at = { completedCount: 1, total: 2 };
         parkedResult = await ctx.parkForPause?.(at);
         return parkedResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
-      });
+      }, undefined, rig.capture);
       const claim = gitlabClaim(1222);
       await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
       assert.equal(parkedResult, true, "the pause parked");
@@ -843,13 +843,13 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
   // or reports pause_failed and preserves the session for a requeue. Either way no finalize runs,
   // so no permit is minted and no Codex credential reconcile fires, and the finally still disposes
   // the Codex registry exactly once.
-  const planPhasePauseNow = (safety: CodexExecutionSafety, runHome: string): FakeCodexExecutor =>
-    new FakeCodexExecutor(safety, async (ctx) => {
+  const planPhasePauseNow = (rig: CodexRig, runHome: string): FakeCodexExecutor =>
+    new FakeCodexExecutor(rig.safety, async (ctx) => {
       fs.mkdirSync(runHome, { recursive: true });
       fs.writeFileSync(path.join(runHome, "session.marker"), "plan session\n");
       commitInTree(ctx.worktreePath, "PLAN-WORK.txt", "committed before the plan-phase pause\n");
       throw new PauseNowSignal();
-    });
+    }, undefined, rig.capture);
 
   it("(T12 parked) a Codex plan-phase PauseNowSignal parks through the runner catch: paused, HOME kept, no terminal, no permit/reconcile, registry disposed", async () => {
     const { gitlab, calls } = fakeGitlab();
@@ -858,7 +858,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
     try {
       const rig = codexRig({ authMode: "subscription" });
       const runHome = path.join(homeRoot, "h");
-      const exec = planPhasePauseNow(rig.safety, runHome);
+      const exec = planPhasePauseNow(rig, runHome);
       const claim = gitlabClaim(1225);
       await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
       const st = statuses(claim.run_id);
@@ -893,7 +893,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
     try {
       const rig = codexRig({ authMode: "subscription" });
       const runHome = path.join(homeRoot, "h");
-      const exec = planPhasePauseNow(rig.safety, runHome);
+      const exec = planPhasePauseNow(rig, runHome);
       const claim = gitlabClaim(1226);
       await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
       const st = statuses(claim.run_id);
@@ -921,7 +921,7 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
       await ctx.checkpoint!({ reap: false });
       boundariesAfterCheckpoint = [...rig.boundaries];
       return { branch: ctx.branch };
-    });
+    }, undefined, rig.capture);
     await runnerWith(() => ({ executor: exec }), gitlab).execute(gitlabClaim(1221));
     assert.deepEqual(
       boundariesAfterCheckpoint,
@@ -957,7 +957,7 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
       probe.refresh = rig.refreshCalls();
       probe.release = rig.releaseCalls();
       return { branch: ctx.branch, walled: { reason: WALL_REASON } };
-    });
+    }, undefined, rig.capture);
 
   const assertKept = (iid: number, runId: string, runHome: string, rig: CodexRig): void => {
     const st = statuses(runId);
@@ -1018,7 +1018,7 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
           probe.refresh = rig.refreshCalls();
           probe.release = rig.releaseCalls();
           return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
-        });
+        }, undefined, rig.capture);
         const claim = gitlabClaim(1785);
         await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
         assert.equal(probe.outcome, true, "the hold was entered");

@@ -152,6 +152,7 @@ interface RootRecord {
   reaped: boolean;
   reapPromise?: Promise<ReapOutcome>;
   disposed: boolean;
+  admissionRejected?: true;
 }
 
 function keyOf(k: CallbackKey): string {
@@ -194,17 +195,15 @@ export type CaptureSettlement =
   | { kind: "observed_empty" }
   | { kind: "incomplete"; errors: readonly HarnessError[] };
 
-/** Resolve with `work`'s value, or undefined once `ms` elapses first. The timer is unref'd. */
+/** Legacy settlement may return incomplete at its deadline. Capture actions instead
+ * join the same root promises before releasing their safety-owned queue slot. */
 async function raceDeadline<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      work,
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), ms);
-        timer.unref?.();
-      }),
-    ]);
+    return await Promise.race([work, new Promise<undefined>(resolve => {
+      timer = setTimeout(() => resolve(undefined), ms);
+      timer.unref?.();
+    })]);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -221,6 +220,13 @@ export class ExecutionRegistry {
   private readonly epochValue: LocalExecutionEpoch;
   private currentState: RegistryState = "open";
   private readonly poisonList: HarnessError[] = [];
+  private poisonRevision: object = {};
+  private captureLane: object | undefined;
+  private capturePoisonRevision: object | undefined;
+  private readonly completedCaptures = new WeakMap<object, {
+    revision: object; roots: number; launches: number; callbacks: number; continuation: boolean;
+  }>();
+  private readonly captureObservations = new WeakMap<object, object>();
   // STICKY poison witness. `state()` reports "poisoned" only until disposal masks
   // it as "disposed" (poison then survives ONLY in poisonList); this flag is set on
   // ANY poison and NEVER cleared, so callers can ask "was this epoch ever poisoned?"
@@ -232,6 +238,7 @@ export class ExecutionRegistry {
   // so `settleForCapture` consults this flag, not the state enum, to refuse reading the
   // cleared (falsely empty) counts.
   private tablesCleared = false;
+  private launchCleanupUnconfirmed = false;
 
   private readonly launches = new Map<string, LaunchReservation>();
   private readonly roots: RootRecord[] = [];
@@ -327,6 +334,7 @@ export class ExecutionRegistry {
   /** Record a poison. STICKY: once poisoned the registry stays poisoned until
    *  disposed. May be called from any non-disposed state. */
   poison(errors: HarnessError | readonly HarnessError[]): void {
+    this.poisonRevision = {};
     const list = Array.isArray(errors) ? errors : [errors];
     // Append only while under MAX_POISON_ERRORS; once at the cap we stop retaining
     // reasons (keeping the FIRST, most-diagnostic ones). This is the unconditional
@@ -346,6 +354,55 @@ export class ExecutionRegistry {
     // would suppress it.
     this.maybeSignalQuiesce();
     if (this.currentState !== "disposed") this.currentState = "poisoned";
+  }
+
+  /** Called only after observed_empty, while the safety owner's queue slot is held. */
+  beginCapture(observation: CaptureSettlement): { live: () => boolean; reserve: () => LaunchReservationResult; complete: () => object | undefined; close: () => void } {
+    if (this.captureObservations.get(observation) !== this.poisonRevision || this.currentState !== "poisoned" || this.tablesCleared || this.captureLane ||
+        this.launches.size || this.inFlightCallbackCount() || this.roots.some(r => !r.reaped)) {
+      throw new Error("capture lane requires observed empty poisoned registry");
+    }
+    this.captureObservations.delete(observation);
+    const lane = {};
+    const revision = this.poisonRevision;
+    this.captureLane = lane;
+    const live = () => this.captureLane === lane && this.currentState === "poisoned" &&
+      !this.tablesCleared && this.poisonRevision === revision;
+    return {
+      live,
+      reserve: () => {
+        if (!live()) return { kind: "denied", reason: "admission_closed" };
+        this.launchSeq += 1;
+        const reservation: LaunchReservation = { id: `launch-${this.launchSeq}`, kind: "boundary_action" };
+        this.launches.set(reservation.id, reservation);
+        return { kind: "reserved", reservation };
+      },
+      complete: () => {
+        if (!live() || this.launches.size || this.inFlightCallbackCount() || this.roots.some(r => !r.reaped)) return undefined;
+        const proof = Object.freeze({});
+        this.completedCaptures.set(proof, { revision, roots: this.roots.length,
+          launches: this.launchSeq, callbacks: this.callbackAdmissionSequence,
+          continuation: this.capturePoisonRevision === revision });
+        return proof;
+      },
+      close: () => { if (this.captureLane === lane) this.captureLane = undefined; },
+    };
+  }
+
+  /** Uses retained revision evidence even after disposal cleared the tables. */
+  acceptsCompletedCapture(proof: object): boolean {
+    const completed = this.completedCaptures.get(proof);
+    return completed !== undefined && completed.continuation && !this.captureLane &&
+      completed.revision === this.poisonRevision && completed.roots === this.roots.length &&
+      completed.launches === this.launchSeq && completed.callbacks === this.callbackAdmissionSequence &&
+      this.roots.every(root => root.reaped);
+  }
+
+  /** No root identity or authentic cleanup proof exists for this launch.
+   * This uncertainty is permanent; later empty tables cannot settle it. */
+  markLaunchCleanupUnconfirmed(): void {
+    this.launchCleanupUnconfirmed = true;
+    this.poison({ category: "tool", message: "launch cleanup unconfirmed" });
   }
 
   // --- launch reservations ----------------------------------------------------
@@ -393,6 +450,14 @@ export class ExecutionRegistry {
     // A launch reservation just settled; a bounded quiesce wait may now be complete.
     this.maybeSignalQuiesce();
     return { ok: true };
+  }
+
+  /** Safety retains custody when admission rejects a root already launched. */
+  retainRejectedRoot(reservation: LaunchReservation, root: RegisteredRoot): void {
+    if (!this.roots.some(rec => rec.root === root)) {
+      this.roots.push({ root, reaped: false, disposed: false, admissionRejected: true });
+    }
+    this.cancelReservation(reservation);
   }
 
   /** Settle a launch reservation as aborted (nothing spawned). */
@@ -694,7 +759,9 @@ export class ExecutionRegistry {
    * unsettled at the deadline. It never calls {@link reapProcesses} or {@link quiesceChildren}
    * (both refuse a poisoned registry) and never mints a permit.
    */
-  async settleForCapture(deadlineMs: number, pollMs: number = CAPTURE_SETTLE_POLL_MS): Promise<CaptureSettlement> {
+  async settleForCapture(
+    deadlineMs: number, pollMs: number = CAPTURE_SETTLE_POLL_MS, joinCleanup = false,
+  ): Promise<CaptureSettlement> {
     if (this.currentState === "disposed" || this.tablesCleared) {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "settleForCapture: registry disposed" }] };
     }
@@ -702,6 +769,7 @@ export class ExecutionRegistry {
     const remaining = MaintenanceBudget.current()?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
     if (this.currentState !== "poisoned") {
       this.poison({ category: "protocol", message: "codex credential deferral: settling for capture" });
+      this.capturePoisonRevision = this.poisonRevision;
     }
     const failed = new Set<RootRecord>();
     const drained = (): boolean =>
@@ -712,11 +780,14 @@ export class ExecutionRegistry {
       if (this.state() === "disposed" || this.tablesCleared || failed.size > 0 || remaining() <= 0) break;
       const pending = this.roots.filter((r) => !r.reaped && !failed.has(r));
       if (pending.length > 0) {
-        const outcomes = await raceDeadline(
-          Promise.all(pending.map(async (rec) => ({ rec, outcome: await this.reapRecord(rec, remaining()) }))),
-          remaining(),
+        // The callback acquisition joins each root's deadline/cleanup promise.
+        // Direct registry callers retain the legacy bounded incomplete response.
+        // Root failures are collected independently, so one cannot skip siblings.
+        const cleanup = Promise.all(
+          pending.map(async (rec) => ({ rec, outcome: await this.reapRecord(rec, remaining()) })),
         );
-        if (outcomes === undefined) break; // the deadline elapsed mid-reap
+        const outcomes = joinCleanup ? await cleanup : await raceDeadline(cleanup, remaining());
+        if (outcomes === undefined) break;
         for (const { rec, outcome } of outcomes) {
           if (!outcome.ok) {
             failed.add(rec);
@@ -725,7 +796,7 @@ export class ExecutionRegistry {
         }
         continue;
       }
-      if (drained()) break;
+      if (drained() || this.launchCleanupUnconfirmed) break;
       const wait = Math.min(Math.max(1, pollMs), remaining());
       if (wait <= 0) break;
       await new Promise<void>((resolve) => {
@@ -756,8 +827,13 @@ export class ExecutionRegistry {
     if (unreaped > 0) {
       errors.push({ category: "tool", message: `settleForCapture: ${unreaped} root(s) not cleanly reaped` });
     }
+    if (this.launchCleanupUnconfirmed) {
+      errors.push({ category: "tool", message: "settleForCapture: launch cleanup unconfirmed" });
+    }
     if (errors.length > 0) return { kind: "incomplete", errors };
-    return { kind: "observed_empty" };
+    const observation = { kind: "observed_empty" } as const;
+    this.captureObservations.set(observation, this.poisonRevision);
+    return observation;
   }
 
   /**
@@ -782,6 +858,9 @@ export class ExecutionRegistry {
           message: `disposeTools: root dispose failed (${safeErrorName(e)})`,
         });
       }
+    }
+    if (this.launchCleanupUnconfirmed || this.roots.some(rec => rec.admissionRejected && !rec.reaped)) {
+      errors.push({ category: "tool", message: "disposeTools: launch cleanup unconfirmed" });
     }
     this.callbacks.clear();
     this.launches.clear();

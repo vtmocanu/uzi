@@ -70,7 +70,9 @@ removes the tree.
    - an owner pause that cannot prove quiescence reports `pause_failed` and the
      run keeps running, under the existing pause rule (PRD #1190 D8: no
      durable checkpoint, no park) rather than
-     parking on unproven ground;
+     parking on unproven ground. If capture may have drained a Codex epoch before
+     pause failure or withdrawal, continuation first recreates it from saved
+     session state; a vault lock on recreation takes ADR-1766 credential deferral;
    - finalize fails the run with the typed `fail_origin` `worker_residue_blocked`;
    - terminal retire keeps the clone rather than removing it;
    - graceful shutdown, milestone checkpoint, and restore-point capture are all
@@ -216,8 +218,10 @@ removes the tree.
   This work addresses the ACCIDENTAL escape path (a detached shell, a stray
   background job); it is not a defense against an agent deliberately trying to
   survive its own reaper.
-- Every pause now kills the attempt's background processes and removes its
-  clone-bound containers — this is new coverage, not a pre-existing behavior.
+- A Claude/stub pause that reaches its Linux proof boundary reaps attributed
+  background processes. Codex owner-pause capture uses A's held supervisor capture
+  (DRAFT amendment below). Clone-bound Docker teardown remains best-effort cleanup,
+  not writer-exclusion proof.
 - **M3 canonical-path quarantine (`freeCanonicalClonePath`/`quarantineCanonical`
   in `agent/src/git.ts`) runs on EVERY worker, wired or not**: `attemptSeedOptions`
   returns `undefined` when the worker has no Docker endpoint, so
@@ -242,9 +246,10 @@ removes the tree.
 
 ## Invariants future code must respect
 
-- **The process reaper's `quiescent` state is the only proof of quiescence a
-  seed or capture sweep can ever get, and where it applies it alone is
-  blocking.** `teardownDocker` never returns `quiescent`, ever — its three
+- **Where a seed or capture sweep uses the process reaper, its `quiescent`
+  result is the process proof; a non-quiescent result blocks that operation.**
+  Codex's held supervisor capture is a separate proof path, described below.
+  `teardownDocker` never returns `quiescent`, ever — its three
   states are `not_wired`, `docker_unconfirmed`, and `docker_error` — so there
   is no Docker result to pair a process proof with. Every Docker outcome is
   treated as best-effort cleanup, never as proof: `docker_unconfirmed` is
@@ -258,42 +263,58 @@ removes the tree.
   scan regardless of executor (those paths have no supervisor behind them),
   and so does a Claude/stub run's own-mode proof.
 
-  **For an own-mode Codex sink that is credentialed through `reapForSink` or
-  `withCodexBoundaryOnly`** — the limit park, the graceful-shutdown publish,
-  the milestone checkpoint, the pre-settle reap, and finalize — the Codex
-  supervisor's own `withBoundary` boundary is what proves the run's processes
-  have drained before the sink runs, substituting for the skipped reaper scan.
-  **The remaining sinks split three ways, not two.** The pause park
-  (credential-free publish, no permit minted at all — per the m4 structural
-  rule, a path mints a permit iff it does a PAT-bearing overlay publish or a
-  terminal/finalize reap) and terminal retire (no publish at all) call
-  `quiesceRun` directly and get no boundary anywhere
-  (`codex-executor.ts`: "`parkForPause` does not reap the provider root").
-  The wall park and the completion hold instead route their credentialed
-  publish through the shared `captureHoldContext`, whose publish runs under
-  its own `withCodexBoundaryOnly` — but only the publish: the status read,
-  the WIP marker commit and the fetch-back that precede it run with no
-  boundary and no process proof. `captureRecoveryRestorePoint` (the
-  `recovery_capture` and `credential_switch` sites) has the identical shape:
-  a direct `quiesceRun` call, then an unboundaried status read/WIP
-  marker/fetch-back, then a `withCodexBoundaryOnly`-wrapped publish — except
-  its credential-free branch (`opts.credentialFree`, taken by the Codex
-  vault-lock park and its retries): there the executor's
-  `settleForCredentialFreeCapture` first poisons and drains the Codex
-  registry, and the publish then opens NO Codex boundary. So on a
-  Codex run: pause park and terminal retire have no process proof at any
-  point; the wall park, the completion hold, and `captureRecoveryRestorePoint`'s
-  two sites have no process proof over their pre-publish steps, with the
-  supervisor boundary picking up only the publish itself (on the
-  credential-free vault-lock capture, the settle drain precedes those steps
-  and the publish is unboundaried instead). **In every one of
-  these unboundaried steps, `quiesceRun`'s own `executor.killAgentTree?.()`
-  call kills nothing for Codex**: `CodexExecutor` deliberately does not
-  implement `killAgentTree` ("This class deliberately does NOT implement
-  `killAgentTree`"), so the optional call is a no-op there and the only thing
-  that ever runs against a Codex run's processes at an unboundaried step is
-  the best-effort Docker teardown — a disclosed gap (see *Follow-ups* below),
-  not a design intent.
+  Own-mode Codex sinks routed end to end through `reapForSink` or
+  `withCodexBoundaryOnly` retain their credentialed supervisor boundary: limit
+  park, actual graceful-shutdown durability, milestone checkpoint, pre-settle
+  reap and finalize.
+
+  **DRAFT — slice A, Refs #2852 (2026-10-18):** tests, review and integration
+  gates remain pending; final executor ownership is still being completed.
+  A separate credential-free GitCache capture callback covers owner pause and
+  credential-free recovery, memory-pressure and retained-source captures. It
+  holds safety serialization, the epoch fence and closed admission through source
+  reads, WIP commit, fetch-back, verification, authorized publication and full
+  supervised-child settlement. A successfully settled, intentionally poisoned
+  registry admits this narrow capture lane with no provider turn, normal callback,
+  admission reopen, credential reconciliation, refresh or release, PAT,
+  credential-bearing environment or overlay. Incomplete settlement grants no
+  capture authority. The capture context mints neither a credentialed nor a
+  completion permit; absence of that permit does not mean absence of a held
+  capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
+  records the canonical empty helper/askpass launch policy and separate
+  credential-presence check for the trusted worker identity `worker_pat`.
+
+  Save credential-free session state before capture may drain the epoch. After
+  failed or withdrawn pause, and before human or automatic changed-milestone gate
+  revision continues the model, recreate a possibly drained provider through the
+  existing epoch path. Check newer cancellation, pause and vault-lock state before
+  credentials or model execution; recreation-time vault lock takes
+  [ADR-1766's deferral](1766-codex-vault-lock-park.md#d3-settle-before-capture-and-no-completion-authority-while-locked).
+  The approval path still skips persistence from the old drained HOME. This does
+  not make an open approval gate parkable or change retained recovery's fresh
+  path/session policy.
+
+  The healthy credentialed wall park, completion hold and recovery/credential-switch
+  captures still have the pre-publish status/WIP/fetch-back gap; wrapping publish
+  alone does not close it. That is slice B, **unshipped** in A. Terminal paths
+  already have executor disposal; the remaining gap is snapshot coverage before
+  writer-exclusion proof, not a blanket absence of disposal. Strengthened terminal
+  process proof is slice C, **unshipped**. `CodexExecutor` has no `killAgentTree`
+  implementation, so the direct optional call is not Codex process proof.
+  Neither the held capture nor a process scan proves Docker writer exclusion;
+  accepted-but-invisible daemon creates (#1860) and Claude residuals remain.
+
+  A accounts for **R1857-01 and the credential-free half of R1857-05**, using
+  shared R1857-07/08 controls. It does not complete #2852 or claim B/C coverage.
+  Per-attempt cgroups (#1862) remain unshipped, not an available proof. #1858
+  still forbids automatic retention reclaim. Preservation authority is not
+  deletion authority: #2746's custody SETTLE and physical CLEANUP stay separate.
+  #3031 is independent, not a prerequisite; A changes no model-free coverage,
+  producers, ledger, custody or settlement protocol. Whichever lands second
+  rebases for coexistence. A shutdown label alone grants no exception or capture
+  authority; the existing typed graceful-shutdown authority remains separate
+  from execution cancellation, as recorded under ADR-1766's #3101 amendment.
+
 - Never mark `UZI_WORKER_SPAWN` on anything other than a worker-authored,
   fixed-argv spawn. Marking a repo- or agent-invoked command breaks the
   attribution the reaper depends on to distinguish worker infrastructure from
@@ -324,27 +345,12 @@ removes the tree.
 
 ## Consequences
 
-The worker can now prove that a run's OWN processes have stopped before every
-destructive or credentialed operation gated on it, and fails closed rather than
-guessing when it cannot. This is narrower than proving the clone itself is
-safe to touch: the reaper's process scan is gated to run at all only on Linux
-workers (`agent/src/runner.ts`'s `process.platform === "linux"` check), and
-for a Codex run's own-mode proof the scan is skipped outright. Where that
-own-mode sink is credentialed through `reapForSink`/`withCodexBoundaryOnly`
-(the limit park, graceful shutdown, the milestone checkpoint, the pre-settle
-reap, and finalize), the Codex supervisor's own `withBoundary` boundary
-substitutes as the process proof (see the invariant above). The pause park
-and terminal retire call `quiesceRun` directly with no boundary anywhere; the
-wall park, the completion hold, and `captureRecoveryRestorePoint`'s
-`recovery_capture`/`credential_switch` sites route their credentialed publish
-through their own `withCodexBoundaryOnly`, so only their pre-publish steps
-(status read, WIP marker, fetch-back) run with no process proof. In every one
-of these unboundaried steps, `quiesceRun`'s `killAgentTree?.()` call is a
-no-op on Codex (`CodexExecutor` deliberately does not implement
-`killAgentTree`), so nothing kills a Codex run's processes there and only the
-best-effort Docker teardown runs — a disclosed gap, not a design intent (see
-*Follow-ups* below). The reaper itself is the proof only for a Claude/stub
-run, or for a `seed`/`capture` sweep (which runs regardless of executor). It also says nothing about a Docker
+Process proof remains limited to the boundary that actually runs: the Linux
+reaper where enabled, the existing credentialed Codex supervisor boundary, or
+A's callback-held credential-free GitCache capture (DRAFT amendment above).
+The held capture covers its action and supervised children; it does not close
+B's healthy credentialed pre-publish gaps or strengthen C's terminal release
+proof. Claude/stub process handling is unchanged. This says nothing about a Docker
 container — the Docker teardown that runs alongside it is best-effort cleanup,
 not proof, so a container that still binds the clone path can, in principle,
 outlive the checks that gate on process quiescence alone. Attempt-unique clone
@@ -617,28 +623,18 @@ The original follow-ups are recorded below with their later disposition where kn
   complete after the process proof and clean listings. #2852's terminal/Docker
   writer-exclusion remainder is not fixed. Currently unwired status is not durable
   proof that a path was never exposed to a daemon.
-- **Follow-up 4 — on a Codex run, several sinks have a process-proof gap,
-  though not all the same gap.** `handlePausePark` and terminal retire call
-  `quiesceRun` directly and get no boundary anywhere: no process proof runs
-  at any point, and `quiesceRun`'s `killAgentTree?.()` call is a no-op on
-  Codex (the executor deliberately does not implement it), so only the
-  best-effort Docker teardown ever touches a Codex run's processes there.
-  `enterWallPark`, the completion hold, and `captureRecoveryRestorePoint`'s
-  `recovery_capture`/`credential_switch` sites are narrower: their
-  credentialed publish is wrapped in its own `withCodexBoundaryOnly`
-  (`captureHoldContext`'s publish, and `captureRecoveryRestorePoint`'s own),
-  so the supervisor's drain proof does cover the publish itself, but the
-  status read, WIP marker commit, and fetch-back that precede it run with no
-  boundary and no process proof. The credential-free (vault-lock)
-  `recovery_capture` branch is the inverse: the executor's
-  `settleForCredentialFreeCapture` drains the Codex registry before those
-  steps, and the publish itself opens no boundary. Unlike the limit park, graceful shutdown,
-  the milestone checkpoint, the pre-settle reap, and finalize (which get the
-  supervisor's `withBoundary` drain proof over their whole credentialed
-  region because they are routed through `reapForSink`/`withCodexBoundaryOnly`
-  end to end), none of these six sites gets that coverage for their
-  pre-publish steps. This is disclosed here for the maintainer to file as its
-  own tracking issue, not filed yet.
+- **Follow-up 4 — #2852 remains partial after slice A (DRAFT).** A holds owner
+  pause and credential-free recovery, memory-pressure and retained-source capture
+  through supervised-child settlement, including the narrow lane of an intentionally
+  poisoned, successfully settled registry. It restores neither normal admission
+  nor credentialed authority. Failed/withdrawn pause after possible drain and
+  changed-milestone gate revision recreate a saved-session provider epoch before
+  continuing; vault lock on recreation takes credential deferral. Slice B's healthy
+  wall/hold/recovery/switch pre-publish closure and slice C's strengthened terminal
+  proof remain unshipped. Existing credentialed permits remain required at their
+  sinks; A's capture context is separate. Existing terminal executor disposal does
+  not close the gap between snapshot coverage and writer-exclusion proof. A provides no daemon mediation,
+  per-attempt cgroup proof or safe automatic retention reclaim. Refs #2852.
 - **Follow-up 5 — a per-attempt cgroup v2 boundary.** Proper per-run process
   ownership would resolve the remaining concurrent-claim and single-uid
   lockout. This direction is parked in #1862.

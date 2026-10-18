@@ -24,6 +24,17 @@ release paths also keep the exact clone and existing journal even when covered. 
 retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
 limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852).
 
+**DRAFT — slice A, Refs #2852 (2026-10-18):** tests, review and integration gates
+remain pending; final executor ownership is still being completed. A holds
+credential-free GitCache capture and its supervised children, including retained-source
+capture, under closed admission and an epoch fence. This preservation boundary grants
+no disposal authority: stopped and parked sources remain retained under this ADR.
+Existing terminal executor disposal does not close the gap between snapshot coverage
+and writer-exclusion proof; strengthened terminal proof (C) and healthy credentialed pre-publish closure (B)
+remain unshipped. Docker writer exclusion, including accepted-but-invisible daemon
+creates (#1860), and per-attempt cgroups (#1862) are not supplied by A. #1858 grants
+no automatic reclaim, and #2746 custody SETTLE remains separate from physical CLEANUP.
+
 None of the following is proof: a successor's claim, a released hold (including a successor's
 release of a predecessor hold), a terminal run status, or a capture result remembered from
 earlier in the exit. Guarded FINAL over bare roots does not authorize disposal either.

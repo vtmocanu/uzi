@@ -16,6 +16,8 @@ import type { Logger } from "./log.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
+import type { CredentialFreeCaptureContext } from "./harness.js";
+import { captureGitSpawner, validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
@@ -581,6 +583,7 @@ const PATCH_SCAN_TIMEOUT_MS = 2 * 60_000;
 export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
 
 interface BoundaryProcessScope {
+  capture?: CredentialFreeCaptureContext;
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
   /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
@@ -2077,10 +2080,83 @@ export class GitCache {
     action: () => Promise<T>,
     hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number } = {},
   ): Promise<T> {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture spawner cannot be replaced");
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
       action,
     );
+  }
+
+  /** Bind the opaque safety context privately. The runner supplies no command spawner. */
+  withCredentialFreeCapture<T>(context: CredentialFreeCaptureContext, action: () => Promise<T>): Promise<T> {
+    if (this.boundaryProcesses.getStore()) throw new Error("capture scope cannot overlay a process scope");
+    const base = gitEnv();
+    // Enumerate only worker-owned, fixed decorations used by the capture readers.
+    // No caller credential/config overlay enters. The canonical worker-owned global
+    // config path (used by isolated forge fixtures) stays exactly as gitEnv built it.
+    const environments: NodeJS.ProcessEnv[] = [];
+    const fixedDecorations = [
+      { GIT_OPTIONAL_LOCKS: "0" },
+      { GIT_NO_REPLACE_OBJECTS: "1" },
+      { GIT_SHALLOW_FILE: "/dev/null" },
+      { GIT_GRAFT_FILE: "/dev/null" },
+    ];
+    let bases: NodeJS.ProcessEnv[] = [base];
+    // Four fixed flags produce at most sixteen bases; no I/O or retry.
+    for (const decoration of fixedDecorations) bases = [...bases, ...bases.map(env => ({ ...env, ...decoration }))];
+    for (const env of bases) {
+      environments.push(env, workerSpawnEnv(env));
+      const runner = { ...env, PATH: runnerPath() };
+      const tmp = runnerTmpdir();
+      for (const decorated of [runner, ...(tmp ? [{ ...runner, TMPDIR: tmp }] : [])]) {
+        environments.push(unmarkedSpawnEnv(decorated), workerSpawnEnv(decorated),
+          { ...workerSpawnEnv(decorated), GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL });
+      }
+    }
+    for (const env of environments) Object.freeze(env);
+    const spawn = captureGitSpawner(context, request => {
+      // Dynamic object-DB synthesis values are produced by existing private GitCache
+      // helpers. Their values are checked independently; config pins remain canonical.
+      const dynamic = this.captureSynthesisEnvironment(request.env);
+      const candidates = Object.keys(dynamic).length ? environments.map(env => ({ ...env, ...dynamic })) : environments;
+      validateCaptureGitRequest(request, candidates, GIT_BIN, process.execPath, CANCEL_CONTENT_HELPER);
+    });
+    return this.boundaryProcesses.run({ capture: context, spawn, signal: context.signal }, action);
+  }
+
+  /** Credentialed overlays are refused at their entry, before any source work. */
+  assertCredentialedCaptureAllowed(): void {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("credentialed overlay unavailable during capture");
+  }
+
+  private captureSynthesisEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const result: NodeJS.ProcessEnv = {};
+    for (const [key, value] of Object.entries(env)) {
+      if (key === "GIT_AUTHOR_NAME" || key === "GIT_COMMITTER_NAME") {
+        if (value !== AGENT_GIT_IDENTITY.name) throw new Error("capture author identity refused");
+      } else if (key === "GIT_AUTHOR_EMAIL" || key === "GIT_COMMITTER_EMAIL") {
+        if (value !== AGENT_GIT_IDENTITY.email) throw new Error("capture author identity refused");
+      } else if (key === "GIT_AUTHOR_DATE" || key === "GIT_COMMITTER_DATE") {
+        if (!value || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value)))
+          throw new Error("capture commit date refused");
+      } else if (key === "GIT_INDEX_FILE" || key === "GIT_WORK_TREE") {
+        const prefix = key === "GIT_INDEX_FILE" ? "uzi-ckpt-idx-" : "uzi-ckpt-work-";
+        if (!value || path.dirname(value) !== os.tmpdir() || !path.basename(value).startsWith(prefix) ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(path.basename(value).slice(prefix.length)))
+          throw new Error("capture synthesis path refused");
+      } else continue;
+      result[key] = value;
+    }
+    return result;
+  }
+
+  private assertCaptureDecoration(extra: NodeJS.ProcessEnv | undefined): void {
+    if (!this.boundaryProcesses.getStore()?.capture || !extra) return;
+    const allowed: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", ...this.captureSynthesisEnvironment(extra) };
+    if (Object.entries(extra).some(([key, value]) => !Object.hasOwn(allowed, key) || allowed[key] !== value)) {
+      throw new Error("capture environment overlay refused");
+    }
   }
 
   /** issue #1597 M2: run `fn` holding the per-bare serialization lock (the same one every bare
@@ -3302,6 +3378,7 @@ export class GitCache {
   /** The recursive delete itself (see {@link deleteRetainedArtifact}, and M3's
    *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
   private async runRunnerUidDelete(target: string): Promise<void> {
+    if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture cannot run an unsupervised delete");
     const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
     if (!split) {
       await fs.rm(target, { recursive: true, force: true });
@@ -12208,6 +12285,9 @@ export class GitCache {
   }
 
   private async runGit(cwd: string | undefined, args: string[], pat?: string, scope?: string, username?: string): Promise<string> {
+    if (this.boundaryProcesses.getStore()?.capture && (pat !== undefined || scope !== undefined || username !== undefined)) {
+      throw new Error("capture credentials refused");
+    }
     const env = gitEnv(pat, scope, username);
     // Log args only; the PAT lives in env (GIT_CONFIG_VALUE_n), never in args.
     this.log.debug("git", { cwd, args });
@@ -12240,6 +12320,7 @@ export class GitCache {
     args: string[],
     extraEnv: NodeJS.ProcessEnv,
   ): Promise<string> {
+    this.assertCaptureDecoration(extraEnv);
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
     try {
@@ -12291,6 +12372,7 @@ export class GitCache {
     stdin?: string,
     opts: SpawnGitOptions = {},
   ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
+    this.assertCaptureDecoration(opts.env);
     const env = { ...gitEnv(), ...opts.env };
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
@@ -12454,6 +12536,7 @@ export class GitCache {
   ): Promise<Buffer> {
     const boundary = this.boundaryProcesses.getStore();
     if (!boundary) throw new Error("bounded runner stdout requires a trusted boundary spawner");
+    if (boundary.capture) throw new Error("arbitrary bounded stdout helpers are unavailable during capture");
     if (!path.isAbsolute(cwd) || !argv[0] || !path.isAbsolute(argv[0])) {
       throw new Error("bounded runner stdout requires trusted absolute executable and clone cwd");
     }
@@ -12516,6 +12599,7 @@ export class GitCache {
    * security-relevant key.
    */
   private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+    this.assertCaptureDecoration(opts.env);
     const base = { ...gitEnv(), ...opts.env };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
@@ -12652,6 +12736,7 @@ export class GitCache {
   /** Run git, returning the exit code (0 on success) instead of throwing. */
   private async tryGit(cwd: string | undefined, args: string[], pat?: string): Promise<number> {
     // issue #2213: built outside the try so a quarantine refusal is never read as an exit code.
+    if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
     const env = gitEnv(pat);
     try {
       await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
@@ -12672,6 +12757,7 @@ export class GitCache {
    *  keeps its historical coerce-to-1 for callers that only care whether the op succeeded; this
    *  sibling exists for callers (ancestry) that MUST NOT treat a broken read as a data answer. */
   private async tryGitExit(cwd: string | undefined, args: string[], pat?: string): Promise<number | null> {
+    if (this.boundaryProcesses.getStore()?.capture && pat !== undefined) throw new Error("capture credentials refused");
     const env = gitEnv(pat);
     try {
       await this.execScoped("git", withDir(cwd, args), { env, timeout: GIT_TIMEOUT_MS });
