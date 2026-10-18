@@ -9,6 +9,7 @@ import { StubExecutor } from "../src/executor.js";
 import type { StateRequest } from "../src/protocol.js";
 import {
   api,
+  client,
   assistant,
   homeDir,
   input,
@@ -138,6 +139,24 @@ function mrPutBody(calls: { method: string; body?: string }[]): Record<string, u
 }
 
 describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D5)", () => {
+  it("M2 runner callback forwards declaration through the negotiated client", async () => {
+    api.setRegisterProtocolFeatures(["completion_non_closing_v1"]);
+    await client.register("m2-worker");
+    api.completionAttemptWire = () => ({ unmet: [], attempt_count: 1 });
+    const forge = fakeGitlab();
+    const claim = interlockedClaim(3090);
+    const nonClosing = { reason: "Human acceptance pending" };
+    await runner({ run: async ctx => {
+      const result = await new StubExecutor(nullLogger()).run(ctx);
+      await ctx.recordCompletionAttempt!({ declared: [], head: null, worktreeFingerprint: null, nonClosing });
+      return { ...result, nonClosing };
+    } }, forge.gitlab).execute(claim);
+    assert.equal(api.completionAttemptRequests.length, 1);
+    assert.deepEqual(api.completionAttemptRequests[0]!.non_closing, nonClosing);
+    assert.ok(completedBody(claim.run_id));
+    assert.doesNotMatch(forge.pr.description, /Closes #3090/);
+  });
+
 
   for (const decision of ["partial", "accept", "missing scope"] as const) {
     it(`issue3089 Claude live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async () => {
@@ -203,6 +222,7 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
       const recheck = prompts[1]!;
       assert.match(recheck, /owner answered the completion question/i);
       assert.match(recheck, /Worker instruction: call `signal_done` again/);
+      assert.match(recheck, /re-declare `non_closing`.*every `signal_done`/);
       assert.doesNotMatch(recheck, /Deferred integration|Approved two-milestone plan|chose to CONTINUE|Milestones:|^- m2\b/m);
       const tag = recheck.match(/\n<(follow_up_[a-f0-9]+)>\n/)?.[1];
       assert.ok(tag);
@@ -568,10 +588,11 @@ function cappedExecutor(): StubExecutor {
 }
 
 describe("interlocked capped MR delivery", () => {
-  for (const guard of ["scope cap", "non-closing declaration"] as const) {
+  for (const guard of ["scope cap", "non-closing declaration", "stored non-closing declaration"] as const) {
     it(`issue3089 accept does not override ${guard}`, async () => {
       const claim = interlockedClaim(3089);
       api.completionPermitScope = { accepted: [{ id: "m2.c1", milestone_id: "m2", text: "Integration check", reason: "Owner accepts check" }] };
+      if (guard === "stored non-closing declaration") claim.config!.non_closing = { reason: "Stored remaining work" };
       const executor = guard === "scope cap" ? cappedExecutor() : new StubExecutor(nullLogger());
       if (guard === "non-closing declaration") {
         const run = executor.run.bind(executor);

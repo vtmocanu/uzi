@@ -43,6 +43,18 @@ full multi-milestone plan, and the third before submitting it:
   and earlier steering answer to a plan mechanism and its verification. Name any
   unmet clause explicitly; do not silently drop or weaken it.
 
+Source issue closing directives must never go in commit messages; the worker
+controls issue closing via the PR body. Put human/live acceptance in a separate,
+final informative milestone naming the remaining verification, why the worker
+cannot perform it, the actor and actionable steps. Coding, docs, tests, mandatory
+gates, security and review remain worker obligations; mixed or ambiguous
+milestones block completion. Environment limits, permissions and automatic
+approval supply no waiver. Pending acceptance needs a formal owner partial
+decision with exact kept/deferred milestone IDs and a reason. Never describe
+unperformed checks as accepted or done. For an approved issue delivery that
+leaves the issue open, re-declare `non_closing` with a reason in every
+`signal_done`, including after an owner answer; it never waives frozen scope.
+
 Before you call `submit_plan`, make the plan carry its own evidence: for every
 mechanism it asserts, name the file that implements it and quote the line. Get
 those citations by sending the allocated read-only validators over the plan in
