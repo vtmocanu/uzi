@@ -35,7 +35,9 @@ function deferred<T>() {
   return { promise, resolve };
 }
 async function fixture(t: { after(fn: () => Promise<void>): void }, content = "first\nsecond\n") {
-  const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/ci-harness-"));
+  const prefix = path.resolve("../.uzi/scratch/ci-harness-");
+  await fs.mkdir(path.dirname(prefix), { recursive: true, mode: 0o700 });
+  const root = await fs.mkdtemp(prefix);
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const home = path.join(root, "home");
   const clone = path.join(root, "clone");

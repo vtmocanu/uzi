@@ -14,7 +14,9 @@ for (const [harness, content, truncated] of [
   ["codex", '\\\"'.repeat(40_000), true],
 ] as const) {
   test(`${harness} reusable adapter proof preserves files across a genuine generation advance${truncated ? " and bounds escaped replies" : ""}`, async t => {
-    const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/ci-proof-"));
+    const prefix = path.resolve("../.uzi/scratch/ci-proof-");
+    await fs.mkdir(path.dirname(prefix), { recursive: true, mode: 0o700 });
+    const root = await fs.mkdtemp(prefix);
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const home = path.join(root, "home"), clone = path.join(root, "clone");
     await fs.mkdir(clone);
