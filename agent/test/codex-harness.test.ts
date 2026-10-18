@@ -939,6 +939,16 @@ describe("CodexHarness: closed usage diagnostics", () => {
     } }) });
   cases.push({ label: "pricing fallback", detail: "pricing evidence incomplete",
     mutate: n => ({ ...n, usage: { ...n.usage, pricingEvidenceComplete: false } }) });
+  cases.push({ label: "estimate last raw-vs-decoded mismatch", detail: "raw-vs-decoded mismatch (last.totalTokens)",
+    mutate: n => {
+      const estimate = tokenUsage(total, { totalTokens: 50 }, n.threadId, n.turnId);
+      rec(raw(estimate).last).totalTokens = 51;
+      return estimate;
+    } });
+  for (const value of [-5, 1.5]) {
+    cases.push({ label: `estimate last unsafe ${value}`, detail: "unsafe or negative (last.totalTokens)", real: true,
+      mutate: n => tokenUsage(total, { totalTokens: value }, n.threadId, n.turnId) });
+  }
   cases.push({ label: "untyped", detail: "untyped usage notification",
     mutate: n => ({ kind: "activity", method: n.method,
       params: { ...rec(n.params), tokenUsage: { "provider-key-sentinel": "provider-value-sentinel" },
@@ -1042,7 +1052,7 @@ describe("CodexHarness: resumed usage evidence", () => {
   };
   for (const authMode of ["api_key", "subscription"] as const) {
     for (const scenario of ["live estimate", "live oversized estimate", "historical estimate",
-      "unobserved response", "full-context reset", "nonzero last mismatch"] as const) {
+      "unobserved response", "full-context reset", "full-context replay", "nonzero last mismatch"] as const) {
       it(`${authMode}: compaction usage ${scenario} through real transport`, async () => {
         const accountant = new CodexUsageAccountant();
         const notices: string[] = [];
@@ -1060,7 +1070,9 @@ describe("CodexHarness: resumed usage evidence", () => {
         const finalTotal = { inputTokens: 900, cachedInputTokens: 180, outputTokens: 270,
           reasoningOutputTokens: 90, totalTokens: 1170 };
         const sequence = [
-          scenario === "historical estimate"
+          scenario === "full-context replay"
+            ? tokenUsage({ totalTokens: 5000 }, estimate, "resumed-1", "historical")
+            : scenario === "historical estimate"
             ? tokenUsage(historical, estimate, "resumed-1", "historical") : replay(),
           turnStarted("resumed-1"),
           ...(scenario === "unobserved response" ? [] : [tokenUsage(next, response, "resumed-1")]),
@@ -1091,12 +1103,15 @@ describe("CodexHarness: resumed usage evidence", () => {
         try {
           const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
           assert.equal(terminal(events).outcome, "success");
-          assert.equal(accountant.hasBaseline("resumed-1"), true);
+          assert.equal(accountant.hasBaseline("resumed-1"), scenario !== "full-context replay");
           const model = accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"];
           assert.ok(model);
           const { costUSD, costStatus, ...tokens } = model;
-          assert.deepEqual(tokens, { inputTokens: 480, cacheReadInputTokens: 120,
-            cacheCreationInputTokens: 0, outputTokens: 180, reasoningOutputTokens: 60 });
+          assert.deepEqual(tokens, scenario === "full-context replay"
+            ? { inputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+              outputTokens: 0, reasoningOutputTokens: 0 }
+            : { inputTokens: 480, cacheReadInputTokens: 120, cacheCreationInputTokens: 0,
+              outputTokens: 180, reasoningOutputTokens: 60 });
           const healthy = scenario.endsWith("estimate");
           assert.equal(costStatus, healthy ? "metered" : "unreported");
           if (healthy) {
@@ -1117,8 +1132,11 @@ describe("CodexHarness: resumed usage evidence", () => {
               assert.deepEqual(notices, []);
             } else {
               assert.equal(notices.length, 1);
-              assert.match(notices[0]!, scenario === "full-context reset"
+              assert.match(notices[0]!, scenario.startsWith("full-context")
                 ? /bucket relationship \(total.totalTokens\)/ : /bucket relationship \(last.totalTokens\)/);
+              if (scenario === "full-context replay")
+                assert.equal(events.filter(e => e.kind === "usage_record").length, 0,
+                  "a synthetic cumulative reset cannot establish a billing baseline");
             }
           }
         } finally {
