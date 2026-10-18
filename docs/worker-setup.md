@@ -664,8 +664,14 @@ it is an operator action: apply updated chart values with the new cap. The
 controller Deployment gets the updated `UZI_WORKER_MAX_CONCURRENT_RUNS` env and
 restarts; the restarted controller renders a changed worker pod-template hash.
 Reconciliation then rolls each worker under the existing drain rules: busy workers
-are cordoned and allowed to finish, bounded by the drain deadline and the operator
-force-roll override (see [ADR-422](../adr/0422-decouple-worker-version.md)). No new
+are cordoned when admitted and wait indefinitely for genuine idle, including
+assigned queued, paused and waiting/gated runs. Run-bound workers remain outside
+pacing but follow the same busy-drift policy. The unchanged 24h drain deadline now
+bounds only independent nondrifted pressure/nix-size maintenance; shortening it
+cannot force this template upgrade. Global emergency ForceRoll may interrupt runs
+and lose all capacity, while custody-held data and independent DinD guards remain
+authoritative (see [ADR-422](../adr/0422-decouple-worker-version.md) and
+[Draining and cordoned](./hosted-workers.md#draining-and-cordoned)). No new
 published controller or chart release is required. Size the preset to hold that
 many concurrent runs. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)

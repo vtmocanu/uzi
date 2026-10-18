@@ -144,8 +144,10 @@ func main() {
 	}
 	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather
-	// than hard-killed. The DrainPolicy carries M5's two overrides: the bounded deadline
-	// after which a cordoned busy worker rolls anyway, and the emergency force-roll.
+	// than hard-killed. DrainPolicy retains the independent NONDRIFTED maintenance
+	// deadline and the GLOBAL emergency force-roll. Drift waits indefinitely for idle;
+	// force-roll may interrupt runs and lose all capacity, without bypassing custody
+	// or independent DinD guards (#3103).
 	// The RecyclePolicy carries M4's disk self-heal toggle + cooldown (PRD #837): a
 	// worker reporting disk pressure has its /nix and /data volumes recycled (teardown +
 	// reprovision), unless self-heal is disabled or the worker was just recycled within

@@ -526,23 +526,23 @@ workers:
 
   # --- the drain policy (PRD #422 M5) ---------------------------------------------
   #
-  # How the controller resolves a deliberate image roll (advancing workers.image.tag)
-  # of a worker that is BUSY. Only an admitted worker is cordoned; workers waiting
-  # for their turn keep claiming. An admitted busy worker defers until idle or the
-  # deadline, while pacing, capacity and hold gates remain authoritative.
+  # Busy spec-hash/generation drift (image pin, template or size) waits indefinitely
+  # for genuine idle (#3103), including run-bound workers outside pacing. Only an
+  # admitted paced worker is cordoned; waiting peers keep claiming. An admitted busy
+  # drainer consumes a slot without replacement coverage, canary proof or post-promotion proof.
   #
-  # drainDeadline: how long an admitted, roll-cordoned busy worker delays replacement
-  #   before its in-flight run requeues (Decision 4). It never bypasses admission,
-  #   capacity or a stalled-pool hold. An ordinary Go
-  #   duration ("24h", "1h", "30m"). The reconcile loop is stateless, so the elapsed time
-  #   is measured from the api-supplied draining_since, not from any controller memory.
+  # drainDeadline: busy deferral for independent NONDRIFTED pressure/nix-size
+  #   maintenance only; it may interrupt runs and delete /data unless custody-held.
+  #   No elapsed timer authorizes busy drift replacement, associated recycle or
+  #   automatic uncordon, even with no pacing entry/plain drain. Ordinary Go duration
+  #   ("24h", "1h", "30m"); default and positive-only parsing are unchanged. Age is
+  #   measured from API draining_since. A shorter deadline cannot force image upgrades.
   drainDeadline: "24h"
-  # forceRoll: the EMERGENCY override — roll every drifted worker immediately regardless
-  #   of busy, accepting the in-flight requeue (e.g. a CVE that must not wait on a drain).
-  #   Explicitly bypasses pacing, hold and promotion evidence, and can remove all
-  #   remaining capacity; custody and independent maintenance protection still apply.
-  #   It only accelerates a PENDING roll (a drifted worker); it never invents one. Leave
-  #   false in normal operation and flip it true only for the duration of the emergency.
+  # forceRoll: GLOBAL emergency bypass of pacing, hold, incarnation proof and busy
+  #   deferral for drift, plus busy deferral for independent maintenance. May interrupt
+  #   runs and lose ALL capacity; neither targeted nor a recovery guarantee. Custody-held
+  #   data and independent DinD readiness/identity/pod-absence guards remain authoritative;
+  #   DinD has no deadline or ForceRoll bypass. Leave false outside the emergency.
   forceRoll: false
   # Replacements admitted concurrently AFTER canary promotion. Positive integer.
   rollConcurrency: 1
