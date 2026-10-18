@@ -5800,8 +5800,7 @@ export class GitCache {
         }
         await this.assertRecoveryBare(barePath);
         const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
-        // Charge every raw entry before filtering, parsing, or deduplicating.
-        MaintenanceResources.consumeMetadataEntriesIfActive(config, "\0");
+        // runGit charges every raw null-list entry before delivering this snapshot.
         const canonical = this.runnerClonePath(barePath, key);
         for (const source of known) {
           if (this.clonePathShape(source.clonePath, canonical)?.attemptId !== source.attemptId)
@@ -5891,6 +5890,10 @@ export class GitCache {
             new Set(known.map(s => s.clonePath)).size !== known.length) throw new Error("incomplete known family");
         const sources: Array<{ runId: string; clonePath: string; attemptId: string; identity: string }> = [];
         // Stream actual siblings; unknown entries and unsafe artifacts protect.
+        for (const ancestor of [path.resolve(this.runnerRoot), path.dirname(canonical)]) {
+          const stat = await fs.lstat(ancestor);
+          if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("unsafe source ancestor");
+        }
         const directory = await fs.opendir(path.dirname(canonical), { bufferSize: 1 });
         try {
           for (;;) {

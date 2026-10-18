@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { SteeringChannel } from "../src/steering.js";
@@ -182,6 +183,27 @@ it(`#3031 actual pending fresh guarded park family: ${mode}`, async (t) => {
       const match = (k = key, r = claim.run_id, members = known) =>
         git.matchMaintenanceSourceFamily(bare, branch, k, r, members);
       assert.ok(await match(), "ordinary family qualifies before metadata probes");
+      const movedFixture = await fs.mkdtemp(path.join(os.tmpdir(), "source-family-"));
+      try {
+        for (const ancestor of [path.dirname(source), path.dirname(path.dirname(source))]) {
+          const moved = path.join(movedFixture, "moved");
+          const before = await fs.lstat(source);
+          await fs.rename(ancestor, moved);
+          let linked = false;
+          try {
+            await fs.symlink(moved, ancestor, "dir");
+            linked = true;
+            const after = await fs.lstat(source);
+            assert.equal(after.dev + ":" + after.ino, before.dev + ":" + before.ino,
+              "ancestor substitution preserves known source inode");
+            assert.equal(await match(), undefined,
+              "source ancestor moved outside runner and replaced by symlink refuses: " + ancestor);
+          } finally {
+            if (linked) await fs.unlink(ancestor);
+            await fs.rename(moved, ancestor);
+          }
+        }
+      } finally { await fs.rmdir(movedFixture); }
       const activeKey = "uzi-recovery." + branch + ".clone";
       const protectedKey = "uzi-retained." + claim.run_id + ".journal";
       const active = command(bare, "config", "--get", activeKey);
