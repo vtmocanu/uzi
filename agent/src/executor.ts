@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -279,6 +280,10 @@ export interface RunContext {
    *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
    *  the IMPLEMENT prompt instead (first turn only). */
   priorWork?: PriorWork;
+  /** M2 immutable clone provenance; independent of session survival and evidence availability. */
+  interruptedSnapshot?: InterruptedSnapshot;
+  /** M3 must call immediately before prompt delivery, after any planning wait. May throw lifecycle errors. */
+  getInterruptedCalls?(): InterruptedCalls | undefined;
   /** issue #222: this run was picked up again (a resume), so the runner clone was rebuilt
    *  on this claim (wiped and re-seeded; on a Docker-wired worker, issue #1783 M2, seeded at a
    *  fresh attempt path with the predecessor retained out of reach), so any uncaptured

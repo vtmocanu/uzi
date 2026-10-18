@@ -1,4 +1,5 @@
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
+import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
@@ -10358,6 +10359,31 @@ export class RunRunner {
     // run. Only an mr_rework run injects the memo; the others just learn `enabled` (which
     // exposes the signal_done param). The body is never logged: only a fixed message plus
     // the error class and HTTP status.
+    const interruptedIdentity = this.client.interruptedCallsRegistration;
+    const interruptedLifecycle = flight.steering.lifecycleSignal();
+    const interruptedCancel = AbortSignal.any([
+      interruptedLifecycle, flight.steering.terminalLifecycleSignal(),
+      flight.cancel.signal, this.shutdownSignal.signal,
+    ]);
+    const getInterruptedCalls = await prepareInterruptedCalls({
+      kind: resolveRunKind(claim.kind), generation: flight.claimGeneration,
+      fetch: () => interruptedIdentity
+        ? this.client.getInterruptedCalls(runId, flight.claimGeneration, interruptedIdentity, interruptedCancel)
+        : Promise.resolve(undefined),
+      check: () => {
+        // Lifecycle failures propagate even when the optional read failed.
+        MaintenanceBudget.current()?.check();
+        interruptedCancel.throwIfAborted();
+        flight.steering.lifecycleSignal().throwIfAborted();
+        return interruptedIdentity !== undefined &&
+          this.client.interruptedCallsRegistration === interruptedIdentity &&
+          flight.active !== undefined && this.activeRuns.get(runId) === flight.active &&
+          !flight.active.shuttingDown && !this.shuttingDownGlobal &&
+          flight.steering.claimFence() === undefined && !flight.steering.isCancelled();
+      },
+      redact: flight.redactText,
+    });
+    const recoveredSnapshot = interruptedSnapshot(flight.claimGeneration, runnerClone);
     let decisionsMemoEnabled = false;
     let decisionsMemo: string | undefined;
     const claimKind = resolveRunKind(claim.kind);
@@ -11151,6 +11177,8 @@ export class RunRunner {
       // on this worker (issue #105).
       sessionId,
       priorWork,
+      interruptedSnapshot: recoveredSnapshot,
+      getInterruptedCalls,
       // issue #222: this run executed before (it reported a session), so this claim's
       // reseed rebuilt the tree (wiped it, or in attempt-path mode seeded a fresh attempt
       // path), so whatever an earlier attempt left uncaptured is not in it. Read the RAW
