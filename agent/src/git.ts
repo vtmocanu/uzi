@@ -10528,7 +10528,6 @@ export class GitCache {
    * quiescence, output and permit checks; this grants no producer authority and
    * does not bound Git/filter input. No discovery or unsupervised fallback.
    */
-  // @ts-expect-error TS6133: read-only precursor intentionally has no production caller yet.
   private async maintenanceWipInput(
     cwd: string,
     limits: { sourceBytes?: number; sourceEntries?: number; metadataBytes?: number } = {},
@@ -10568,6 +10567,201 @@ export class GitCache {
     } catch {
       throw new Error("maintenance_wip_input_refused");
     }
+  }
+
+  /**
+   * Producer primitive only: callbacks must prove the charged slot, durable prefixed
+   * origin/index, exact open custody, nonstopped family and process quiescence.
+   * Initial quiescence belongs to the caller; afterRunnerGit joins/reproves after
+   * every attempted status/add/commit, including failure. No flight or authority
+   * is created here. Output journaling, transfer and C-side closure remain owed.
+   */
+  async captureMaintenanceWip(
+    clonePath: string,
+    oldHead: string,
+    callbacks: {
+      beforeStep: (step: "status" | "add" | "commit") => Promise<void>;
+      afterRunnerGit: (step: "status" | "add" | "commit") => Promise<void>;
+    },
+  ): Promise<{ kind: "clean"; head: string; parent: null } | { kind: "committed"; head: string; parent: string }> {
+    const refused = () => new Error("maintenance_wip_capture_refused");
+    const boundary = this.boundaryProcesses.getStore();
+    MaintenanceResources.check();
+    // Bound input before path.resolve or any helper/path preparation.
+    if (Buffer.byteLength(clonePath, "utf8") > 4096) throw refused();
+    let cloneDepth = 0;
+    for (let i = 0; i < clonePath.length; i++) {
+      if (clonePath[i] !== "/" && (i === 0 || clonePath[i - 1] === "/") && ++cloneDepth > 128) throw refused();
+    }
+    if (!boundary || MaintenanceResources.discoveryActive() ||
+        !path.isAbsolute(clonePath) || path.resolve(clonePath) !== clonePath ||
+        oldHead.length !== 40 || !/^[0-9a-f]{40}$/.test(oldHead) ||
+        typeof callbacks?.beforeStep !== "function" || typeof callbacks?.afterRunnerGit !== "function") throw refused();
+    const check = () => {
+      MaintenanceResources.check();
+      boundary.signal.throwIfAborted();
+      this.checkRecoveryInterruption();
+    };
+    check();
+    const env = { ...READ_ONLY_STATUS.env, GIT_GRAFT_FILE: "/dev/null", GIT_SHALLOW_FILE: "/dev/null" };
+    const pins = [
+      "--no-replace-objects", "--no-optional-locks",
+      "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
+      "-c", "core.ignoreStat=false", "-c", "core.checkStat=default",
+      "-c", "core.trustctime=true", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+      "-c", "commit.gpgsign=false",
+    ];
+    const read = async (args: string[]) => {
+      check();
+      try { return await this.runGitAsRunner(clonePath, [...pins, ...args], { env }); }
+      catch { throw refused(); } // Never include clone-config diagnostics or filenames.
+    };
+    // Count actual raw rows before allocating split/filter arrays. Source rows do
+    // not borrow the much smaller administrative-entry allowance.
+    const rows = (raw: string, resource: "sourceEntries" | "adminEntries"): string[] => {
+      for (let start = 0; start < raw.length;) {
+        MaintenanceResources.consume(resource, 1);
+        const end = raw.indexOf("\0", start);
+        if (end < 0 || end === start) throw refused();
+        start = end + 1;
+      }
+      if (raw.includes("\uFFFD")) throw refused();
+      return raw ? raw.slice(0, -1).split("\0") : [];
+    };
+    const subject = `${WIP_PARK_COMMIT_PREFIX} interrupted work auto-saved on usage-limit park (throwaway; restored uncommitted on resume)`;
+    // Conservative known seed/pin configuration. Unknown extensions and config
+    // redirects are unsupported, even if a later inline pin would neutralize them.
+    const fixed = new Map<string, string>([
+      ["core.repositoryformatversion", "0"], ["core.bare", "false"],
+      ["core.filemode", "true"], ["core.logallrefupdates", "true"],
+      ["core.ignorecase", "false"], ["core.precomposeunicode", "true"],
+      ["core.untrackedcache", "false"], ["core.ignorestat", "false"],
+      ["core.checkstat", "default"], ["core.trustctime", "true"],
+      ["core.hookspath", EMPTY_GIT_HOOKS_DIR], ["safe.directory", "*"],
+      ["maintenance.auto", "false"], ["gc.auto", "0"], ["commit.gpgsign", "false"],
+      ...GIT_CODE_EXEC_KEY_PINS.map(([key, value]) => [key.toLowerCase(), value] as [string, string]),
+    ]);
+    const safety = async (): Promise<string> => {
+      check();
+      // The fixed helper has five realpath calls and at most fifteen lstat
+      // calls. Charge every call for the entire canonical path: cloneDepth
+      // components, at most two suffix components, and the filesystem root.
+      // Per visit, reserve a full path string (longest suffix < 32 UTF8 bytes)
+      // and 1024 bytes for stat/prefix bookkeeping, even for absent entries.
+      // This bounds this helper's canonical-path preparation, not Git's
+      // internal filesystem reads; their integration audit remains owed.
+      const helperVisits = 20 * (cloneDepth + 3);
+      MaintenanceResources.consume("adminEntries", helperVisits);
+      MaintenanceResources.consume("metadataBytes",
+        helperVisits * (Buffer.byteLength(clonePath, "utf8") + 32 + 1024));
+      // Runner-owned, read-only metadata inspection; no directory enumeration or
+      // clone-supplied program. execScoped owns launch, output and settlement.
+      const metadata = await this.execScoped(process.execPath, ["-e", `
+const fs = require("node:fs"), path = require("node:path"), root = process.argv[1];
+try {
+  if (fs.realpathSync(root) !== root) throw Error();
+  const git = path.join(root, ".git");
+  if (!fs.lstatSync(git).isDirectory() || fs.realpathSync(git) !== git) throw Error();
+  for (const name of ["config", "HEAD", "index"]) {
+    const st = fs.lstatSync(path.join(git, name));
+    if (!st.isFile() || st.isSymbolicLink()) throw Error();
+  }
+  for (const name of ["info", "objects", "refs"]) {
+    const p = path.join(git, name);
+    if (!fs.lstatSync(p).isDirectory() || fs.realpathSync(p) !== p) throw Error();
+  }
+  try {
+    const st = fs.lstatSync(path.join(git, "info/exclude"));
+    if (!st.isFile() || st.isSymbolicLink()) throw Error();
+  } catch (e) { if (e.code !== "ENOENT") throw e; }
+  for (const name of ["commondir", "config.worktree", "modules", "info/attributes",
+                      "info/sparse-checkout", "info/grafts", "shallow"]) {
+    try { fs.lstatSync(path.join(git, name)); } catch (e) { if (e.code === "ENOENT") continue; throw e; }
+    throw Error();
+  }
+  process.stdout.write("safe\\n");
+} catch { process.exitCode = 1; }
+`, clonePath], { cwd: "/", env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }), timeout: 5000, maxBuffer: 64 }, "command");
+      if (metadata.stdout !== "safe\n" || metadata.stderr) throw refused();
+      const config = rows(await read(["config", "--null", "--list"]), "adminEntries");
+      for (const row of config) {
+        const nl = row.indexOf("\n");
+        if (nl < 1) throw refused();
+        const key = row.slice(0, nl).toLowerCase(), value = row.slice(nl + 1);
+        if (fixed.has(key)) { if (fixed.get(key) !== value) throw refused(); }
+        else if (!/^(user\.(name|email)|remote\.[^.]+\.(url|fetch)|branch\.[^.]+\.(remote|merge))$/.test(key)) throw refused();
+      }
+      if (await read(["rev-parse", "--shared-index-path"]) !== "") throw refused();
+      const staged = await read(["ls-files", "--stage", "-z"]);
+      for (const row of rows(staged, "sourceEntries")) {
+        if (!/^(100644|100755|120000) [0-9a-f]{40} 0\t[^\0]+$/.test(row)) throw refused();
+      }
+      for (const row of rows(await read(["ls-files", "-v", "-z"]), "sourceEntries")) {
+        if (!/^H [^\0]+$/.test(row)) throw refused();
+      }
+      if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
+      return staged;
+    };
+    let sourceDigest: string | undefined;
+    let commitIndex = "";
+    // Three attempts maximum, sharing the original scope/counters/deadline.
+    // Any refusal stops the sequence; no reset, fence clearing or retry.
+    for (const step of ["status", "add", "commit"] as const) {
+      await callbacks.beforeStep(step);
+      check();
+      const index = await safety();
+      const input = await this.maintenanceWipInput(clonePath);
+      if (sourceDigest !== undefined && sourceDigest !== input.digest) throw refused();
+      sourceDigest = input.digest;
+      await callbacks.beforeStep(step);
+      check(); // Fresh eligibility/slot/signal check immediately before dispatch.
+      let output: string;
+      try {
+        output = await this.runGitAsRunner(clonePath, [...pins, ...(step === "status"
+          ? ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"]
+          : step === "add" ? ["add", "-A"] : ["commit", "-m", subject])], { env });
+      } finally {
+        await callbacks.afterRunnerGit(step);
+      }
+      check();
+      if (step === "status") {
+        if (output === "") {
+          if (await read(["rev-parse", "--verify", "HEAD^{commit}"]) !== oldHead + "\n") throw refused();
+          return { kind: "clean", head: oldHead, parent: null };
+        }
+        const statusRows = rows(output, "sourceEntries");
+        for (let i = 0; i < statusRows.length; i++) {
+          const row = statusRows[i]!;
+          if (!/^(?:\?\?|[ MTADRC]{2}) [^\0]+$/.test(row) || row.startsWith("  ")) throw refused();
+          if (row[0] === "R" || row[0] === "C" || row[1] === "R" || row[1] === "C") {
+            if (!statusRows[++i]) throw refused();
+          }
+        }
+      }
+      if (step === "commit") commitIndex = index;
+    }
+    const headOutput = await read(["rev-parse", "--verify", "HEAD^{commit}"]);
+    if (headOutput.length !== 41 || !/^[0-9a-f]{40}\n$/.test(headOutput)) throw refused();
+    const head = headOutput.slice(0, -1);
+    if (head === oldHead) throw refused();
+    const commit = await read(["cat-file", "commit", head]);
+    const separator = commit.indexOf("\n\n");
+    if (separator < 0) throw refused();
+    const headers = commit.slice(0, separator).split("\n");
+    const parents = headers.filter(row => row.startsWith("parent "));
+    if (parents.length !== 1 || parents[0] !== "parent " + oldHead ||
+        commit.slice(separator + 2) !== subject + "\n") throw refused();
+    const index = await read(["ls-files", "--stage", "-z"]);
+    rows(index, "sourceEntries");
+    if (index !== commitIndex) throw refused();
+    const tree = rows(await read(["ls-tree", "-r", "-z", head]), "sourceEntries");
+    const expected = tree.map(row => {
+      const match = /^(100644|100755|120000) blob ([0-9a-f]{40})\t([^\0]+)$/.exec(row);
+      if (!match) throw refused();
+      return match[1] + " " + match[2] + " 0\t" + match[3] + "\0";
+    }).join("");
+    if (expected !== index) throw refused();
+    return { kind: "committed", head, parent: oldHead };
   }
 
   /**
@@ -10629,6 +10823,7 @@ export class GitCache {
    */
   async commitWipMarker(clonePath: string): Promise<boolean> {
     MaintenanceResources.consumeIfActive("sourceBytes", 0);
+    if (MaintenanceResources.active()) throw new Error("maintenance_wip_guard_required");
     try {
       const status = await this.runGitAsRunner(clonePath, ["status", "--porcelain"]);
       if (status.split("\n").filter((l) => l.length > 0).length === 0) {
