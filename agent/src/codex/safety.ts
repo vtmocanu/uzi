@@ -423,6 +423,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       if (proof.kind === "incomplete") return proof;
       if (remaining() <= 0) return { kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] };
       if (!action) return proof;
+      if (!this.seams.spawnProcess) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "credential-free capture launch wiring unavailable" }] };
+      }
       const lane = this.registry.beginCapture(proof);
       const controller = new AbortController();
       const abort = () => controller.abort();

@@ -68,6 +68,40 @@ function rig(options: { drain?: Promise<void>; primary?: Promise<void> } = {}) {
 }
 
 describe("credential-free capture foundation (#2852)", () => {
+  it("refuses missing process wiring before callback entry or reads without reconciliation", async () => {
+    let entries = 0;
+    let reads = 0;
+    let reconciles = 0;
+    const safety = createCodexExecutionSafety(
+      new ExecutionRegistry(newLocalExecutionEpoch(2852)),
+      async () => { throw new Error("unexpected generic spawn"); },
+      async () => { reconciles++; return { kind: "ready" }; },
+    );
+    const result = await safety.withCredentialFreeCapture(10_000, async () => {
+      entries++;
+      reads++;
+      return "must not read";
+    });
+    assert.equal(entries, 0, "capture callback entered without process wiring");
+    assert.equal(reads, 0);
+    assert.equal(reconciles, 0);
+    assert.equal(result.kind, "incomplete");
+    const legacy = createCodexExecutionSafety(
+      new ExecutionRegistry(newLocalExecutionEpoch(2852)),
+      async () => { throw new Error("unexpected generic spawn"); },
+    );
+    assert.equal((await legacy.settleForCredentialFreeCapture(10_000)).kind, "observed_empty");
+    const wired = rig();
+    let wiredEntries = 0;
+    const control = await wired.safety.withCredentialFreeCapture(10_000, async () => {
+      wiredEntries++;
+      return "wired read";
+    });
+    assert.equal(control.kind, "observed_empty");
+    if (control.kind === "observed_empty") assert.equal(control.value, "wired read");
+    assert.equal(wiredEntries, 1);
+  });
+
   it("joins ignored startup and rejected-admission cleanup before releasing capture custody", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
     const launch = deferred<void>();

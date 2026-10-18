@@ -16,11 +16,13 @@ import { fileURLToPath } from "node:url";
 import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
+  CodexLaunchError,
   classifyCodexLaunchFailure,
   TMP_RETAINED_REASONS,
   launchCodexRoot,
   launchCodexEffectRoot,
   type CodexLaunchSpec,
+  type CodexEffectLaunchSpec,
   type LauncherDeps,
   type RunnerTreeRequest,
   type SupervisorProcess,
@@ -38,6 +40,11 @@ import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
+import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { createCaptureContext, captureGitSpawner, validateCaptureGitRequest, assertCaptureRequest } from "../src/credential-free-capture.js";
+import { gitEnv } from "../src/git.js";
+import type { BoundaryProcessRequest } from "../src/harness.js";
+
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 
 resetResidueQuarantineAfterEach();
@@ -2112,4 +2119,222 @@ describe("launcher observation contract", () => {
     if (outcome.state === "unavailable") assert.equal(outcome.reason, "transport");
     assert.equal((await handle.dispose()).clean, false);
   });
+});
+
+// Every candidate below is data. Only the injected supervisor sees launch strings.
+describe("C2 real effect launcher capture policy", () => {
+  type Alter = (r: BoundaryProcessRequest) => BoundaryProcessRequest;
+  const indexed = (key: string, value: string, at: number): Alter => r => {
+    const env = { ...r.env };
+    const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+      [env[`GIT_CONFIG_KEY_${i}`]!, env[`GIT_CONFIG_VALUE_${i}`]!]);
+    pairs.splice(at, 0, [key, value]);
+    env.GIT_CONFIG_COUNT = String(pairs.length);
+    pairs.forEach(([k, v], i) => { env[`GIT_CONFIG_KEY_${i}`] = k; env[`GIT_CONFIG_VALUE_${i}`] = v; });
+    return { ...r, env };
+  };
+  const cells: Array<[string, Alter]> = [];
+  for (const [key, value] of [
+    ["credential.helper", "sentinel"], ["credential.https://example.invalid.helper", ""],
+    ["CrEdEnTiAl.helper", ""], ["include.path", "/capture/config"],
+    ["includeIf.gitdir:/capture/.path", "/capture/config"],
+    ["InClUdEiF.gitdir:/capture/.path", "/capture/config"],
+    ["http.extraHeader", "Authorization: sentinel"],
+    ["http.https://example.invalid/.extraheader", "aUtHoRiZaTiOn: sentinel"],
+    ["url.https://capture-user@example.invalid/.insteadOf", "local"],
+    ["credential.helper", ""], ["core.askpass", ""], ["core.askpass", "sentinel"],
+  ]) {
+    for (const at of [0, 2, Number(gitEnv().GIT_CONFIG_COUNT)]) {
+      cells.push([`indexed ${key}=${value} at ${at}`, indexed(key!, value!, at)]);
+    }
+    for (const at of [1, 2, 3]) {
+      for (const prefix of ["split", "joined"]) cells.push([
+        `argv ${prefix} ${key}=${value} at ${at}`,
+        r => { const argv = [...r.argv]; argv.splice(at, 0,
+          ...(prefix === "split" ? ["-c", `${key}=${value}`] : [`-c${key}=${value}`]));
+          return { ...r, argv }; },
+      ]);
+    }
+  }
+  for (const key of ["GIT_ASKPASS", "SSH_ASKPASS", "GIT_CREDENTIAL_HELPER", "GIT_CREDENTIAL_USEHTTPPATH",
+    "GCM_INTERACTIVE", "GCM_CREDENTIAL_STORE", "GIT_CONFIG_PARAMETERS"]) {
+    for (const value of ["", "sentinel"]) cells.push([`${key} presence ${JSON.stringify(value)}`,
+      r => ({ ...r, env: { ...r.env, [key]: value } })]);
+  }
+  for (const arg of ["--config-env=credential.helper=EMPTY", "--config-env=core.askpass=EMPTY",
+    "--config-env=core.fileMode=EMPTY", "--config-env", "https://capture-user:sentinel@example.invalid/repo"]) {
+    for (const at of [1, 2, 3]) cells.push([`argument ${arg} at ${at}`,
+      r => { const argv = [...r.argv]; argv.splice(at, 0, arg); return { ...r, argv }; }]);
+  }
+  for (const count of ["", "-1", "02", "2.5", "NaN", "0", "999999999999999999999"]) {
+    cells.push([`count ${JSON.stringify(count)}`, r => ({ ...r, env: { ...r.env, GIT_CONFIG_COUNT: count } })]);
+  }
+  cells.push(
+    ["index gap", r => { const env = { ...r.env }; delete env.GIT_CONFIG_KEY_1; return { ...r, env }; }],
+    ["value gap", r => { const env = { ...r.env }; delete env.GIT_CONFIG_VALUE_1; return { ...r, env }; }],
+    ["surplus index", r => ({ ...r, env: { ...r.env, GIT_CONFIG_KEY_999: "core.fileMode", GIT_CONFIG_VALUE_999: "true" } })],
+    ["reordered block", r => { const env = { ...r.env };
+      [env.GIT_CONFIG_KEY_0, env.GIT_CONFIG_KEY_1] = [env.GIT_CONFIG_KEY_1, env.GIT_CONFIG_KEY_0];
+      [env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_VALUE_1] = [env.GIT_CONFIG_VALUE_1, env.GIT_CONFIG_VALUE_0];
+      return { ...r, env }; }],
+  );
+  for (const identity of ["worker_pat", "command"] as const) {
+    function fixture(options: { revoke?: boolean; invalidateCanonical?: boolean; alterRequest?: Alter; mutate?: (spec: CodexEffectLaunchSpec) => void } = {}) {
+      let live = true;
+      let checks = 0;
+      let prepared = false;
+      let actual = false;
+      let boundRequest: BoundaryProcessRequest;
+      const canonical = gitEnv();
+      const fake = newFake({ uid: identity === "command" ? COMMAND_UID : WORKER_UID });
+      const request: BoundaryProcessRequest = {
+        identity, cwd: "/capture/runner", argv: ["/usr/bin/git", "status", "--porcelain"], env: gitEnv(),
+      };
+      const adapter = boundaryProcessSpawnerForTest("required", async spec => {
+        await Promise.resolve(); // actual async preparation, after production binding
+        prepared = true;
+        if (options.invalidateCanonical) delete canonical.GIT_CONFIG_KEY_0;
+        if (options.alterRequest) {
+          const altered = options.alterRequest(boundRequest);
+          if (altered.env !== boundRequest.env) Object.assign(boundRequest.env, altered.env);
+          if (altered.argv !== boundRequest.argv) (boundRequest.argv as string[]).splice(0, boundRequest.argv.length, ...altered.argv);
+        }
+        options.mutate?.(spec);
+        return launchCodexEffectRoot(spec, baseDeps(fake, {
+          resolveCommandUid: () => COMMAND_UID,
+          resolveWorkerUid: () => WORKER_UID,
+          spawnSupervisor: (command, args, opts) => {
+            actual = true;
+            spawnCalls.push({ command, args, options: opts });
+            fake.emitChildExit(0);
+            return fake as unknown as SupervisorProcess;
+          },
+          // This getter is evaluated inside launchEffectRoot before its synchronous check.
+          ...(options.revoke ? identity === "command"
+            ? { resolveCommandUid: () => { live = false; return COMMAND_UID; } }
+            : { resolveWorkerUid: () => { live = false; return WORKER_UID; } } : {}),
+        }));
+      });
+      const context = createCaptureContext(new AbortController().signal, Date.now() + 10_000,
+        async r => {
+          boundRequest = r;
+          const child = await adapter(r, 10_000);
+          return {
+            stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
+            get completed() {
+              return (async () => {
+                const exit = await child.waitChild(1000);
+                assert.equal((await child.root.reap(1000)).ok, true);
+                return exit;
+              })();
+            },
+            cancel: async () => { await child.root.dispose(1000); },
+          };
+        }, () => live);
+      const spawn = captureGitSpawner(context, r => {
+        checks++;
+        validateCaptureGitRequest(r, [canonical], "/usr/bin/git", process.execPath, "unused-helper");
+      });
+      return { request, spawn, context, revoke: () => { live = false; },
+        state: () => ({ checks, prepared, actual }) };
+    }
+
+    it(identity + " C5c ordinary authenticated effect launch remains allowed outside capture", async () => {
+      const fake = newFake({ uid: identity === "command" ? COMMAND_UID : WORKER_UID });
+      const handle = await launchCodexEffectRoot({
+        identity, command: "/usr/bin/git", args: ["status"], cwd: "/capture/runner",
+        env: { ...gitEnv(), GIT_ASKPASS: "/capture/legitimate-auth-helper" },
+        supervisorBin: SUPERVISOR_BIN,
+      }, baseDeps(fake, {
+        resolveCommandUid: () => COMMAND_UID, resolveWorkerUid: () => WORKER_UID,
+      }));
+      assert.equal(spawnCalls.length, 1);
+      assert.equal(spawnCalls[0]!.options.env.GIT_ASKPASS, "/capture/legitimate-auth-helper");
+      assert.equal((await handle.dispose()).clean, true);
+    });
+
+    it(identity + " ordered canonical block launches through real synchronous check", async () => {
+      const r = fixture();
+      const env = r.request.env;
+      const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+      for (const key of ["credential.helper", "core.askpass"]) {
+        assert.deepEqual(pairs.filter(([k]) => k === key), [[key, ""]]);
+      }
+      const handle = await r.spawn(r.request);
+      assert.equal(r.state().actual, true);
+      assert.equal(r.state().checks, 3, "complete validator did not repeat at actual spawn");
+      assert.equal(spawnCalls.length, 1);
+      assert.equal((await handle.completed).code, 0);
+    });
+
+    for (const [name, alter] of cells) {
+      it(identity + " EARLY rejects " + name, async () => {
+        const r = fixture();
+        await assert.rejects(async () => r.spawn(alter(r.request)), /credential-free capture launch refused/);
+        assert.equal(r.state().prepared, false);
+        assert.equal(spawnCalls.length, 0);
+      });
+    }
+
+    for (const [name, alter] of cells) {
+      it(identity + " ACTUAL preparation frozen request refuses " + name, async () => {
+        const r = fixture({ alterRequest: alter });
+        await assert.rejects(r.spawn(r.request), TypeError);
+        assert.equal(r.state().prepared, true);
+        assert.equal(r.state().actual, false, "freeze refusal must not be reported as a reached spawn check");
+        assert.equal(spawnCalls.length, 0);
+      });
+    }
+
+    it(identity + " ACTUAL repeats complete validator after async preparation", async () => {
+      const r = fixture({ invalidateCanonical: true });
+      await assert.rejects(r.spawn(r.request), error => {
+        assert.ok(error instanceof CodexLaunchError);
+        assert.match(String(error.cause), /credential-free capture launch refused/);
+        return true;
+      });
+      assert.equal(r.state().checks, 3);
+      assert.equal(r.state().prepared, true);
+      assert.equal(spawnCalls.length, 0);
+    });
+
+    it(identity + " ACTUAL repeats capability check after async preparation", async () => {
+      const r = fixture({ revoke: true });
+      await assert.rejects(r.spawn(r.request), error => {
+        assert.ok(error instanceof CodexLaunchError);
+        assert.match(String(error.cause), /credential-free capture launch refused/);
+        return true;
+      });
+      assert.equal(r.state().prepared, true);
+      assert.equal(r.state().checks, 2, "revoked acquisition must fail before calling the validator again");
+      assert.equal(r.state().actual, false);
+      assert.equal(spawnCalls.length, 0);
+    });
+
+    it(identity + " refuses forged provenance and stale acquisition before preparation", async () => {
+      const r = fixture();
+      assert.throws(() => assertCaptureRequest(r.context, { ...r.request }), /capture launch refused/);
+      r.revoke();
+      await assert.rejects(async () => r.spawn(r.request), /capture launch refused/);
+      assert.equal(r.state().prepared, false);
+      assert.equal(spawnCalls.length, 0);
+    });
+
+    for (const [name, mutate] of [
+      ["request argv", (spec: CodexEffectLaunchSpec) => { (spec.args as string[]).push("https://user@example.invalid/"); }],
+      ["environment", (spec: CodexEffectLaunchSpec) => { spec.env.GIT_ASKPASS = ""; }],
+      ["transformed wrapper", (spec: CodexEffectLaunchSpec) => {
+        Object.assign(spec, { command: "/capture/substitute" });
+      }],
+    ] as const) {
+      it(identity + " frozen " + name + " mutation refuses before native spawn", async () => {
+        const r = fixture({ mutate });
+        await assert.rejects(r.spawn(r.request), TypeError);
+        assert.equal(r.state().prepared, true);
+        assert.equal(r.state().actual, false);
+        assert.equal(spawnCalls.length, 0);
+      });
+    }
+  }
 });
