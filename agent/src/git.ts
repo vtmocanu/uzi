@@ -638,6 +638,7 @@ interface BoundaryProcessScope {
    * broker I/O; it must never abort an active child output collector. */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
+  now?: () => number;
   /** issue #1597 M2: awaited by {@link GitCache.withLock} AFTER its critical section and BEFORE the
    *  per-bare lock is released, so a scope (the mid-turn checkpoint tick) can settle a cancelled child
    *  and remove a lock file it provably owned while no other bare mutation can interleave. Never
@@ -1831,6 +1832,7 @@ export interface FetchAgentBranchOptions {
   expectedCandidateSha?: string;
   /** Milestone policy soft-stops only while waiting for the bare lock. */
   checkpointImportMode?: "done" | "milestone";
+  checkpointStep?: (step: BoundaryStep) => void;
 }
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
@@ -2139,7 +2141,7 @@ export class GitCache {
     spawner: BoundaryProcessSpawner,
     signal: AbortSignal,
     action: () => Promise<T>,
-    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number } = {},
+    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
@@ -4389,16 +4391,19 @@ export class GitCache {
     };
     if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
     else await prepare();
+    opts.checkpointStep?.("checkpoint_import_lock_wait");
     return this.withLock(barePath, async () => {
       const importBranch = async (): Promise<TrackingUpdateResult> => {
         this.checkCheckpointCooperation();
         const observed = await this.observeTrackingUnderLock(barePath, branch);
         const stage = `refs/uzi-incoming/${randomUUID()}`;
+        opts.checkpointStep?.("checkpoint_import_transport");
         // Ordinary transport failures (including boundary aborts) deliberately throw.
         await this.runGit(barePath, [
           "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
           "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
         ]);
+        opts.checkpointStep?.("checkpoint_import_poststage");
         const incoming = await this.resolveCommitStrict(barePath, stage);
         await this.requireOwedCommit(barePath, incoming);
         if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
@@ -4426,7 +4431,7 @@ export class GitCache {
         if (result.kind === "not_updated") {
           await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
           if (checkpointScope?.softSignal?.aborted ||
-              (checkpointScope?.softDeadlineAt ?? Infinity) <= Date.now()) return result;
+              (checkpointScope?.softDeadlineAt ?? Infinity) <= (checkpointScope?.now ?? Date.now)()) return result;
         }
         this.checkCheckpointCooperation();
         {
@@ -12290,7 +12295,7 @@ export class GitCache {
     MaintenanceBudget.current()?.check();
     const scope = this.boundaryProcesses.getStore();
     if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-    if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && Date.now() >= scope.softDeadlineAt)) {
+    if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && (scope.now ?? Date.now)() >= scope.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
   }
@@ -12310,7 +12315,7 @@ export class GitCache {
       await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
       return result;
     }
-    this.checkCheckpointCooperation();
+    await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
     return result;
   }
 
@@ -12444,10 +12449,10 @@ export class GitCache {
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
     if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
-    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
     const childTimeout = recovery
       ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
       : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
@@ -12676,10 +12681,10 @@ export class GitCache {
     recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
-      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
       const childTimeout = recovery
         ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
         : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
@@ -13123,7 +13128,7 @@ export class GitCache {
     const c = opts.context;
     return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
       remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
-      checkpointImportMode: opts.checkpointImportMode };
+      checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
@@ -13523,8 +13528,10 @@ export class GitCache {
       if (abort) throw abort;
       return { kind: "not_updated", reason: preservationReason(cause) };
     }
+    opts.checkpointStep?.("checkpoint_import_premutation");
     this.checkCheckpointCooperation();
     return this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
+      opts.checkpointStep?.("checkpoint_import_mutation");
       try {
         if (displacedContext && observed.sha) {
           // Only this run's confirmation can discharge its own debt.

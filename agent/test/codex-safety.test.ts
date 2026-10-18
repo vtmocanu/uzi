@@ -2107,3 +2107,48 @@ for (const refusal of ["vault", "account", "response", "lifecycle", "stale"] as 
     if (refusal === "account" && outcome.kind === "blocked") assert.equal(outcome.deferral, "account_unavailable");
   });
 }
+
+it("m2 acquisition preserves authority attribution after source reconciliation", async () => {
+  const reg = new ExecutionRegistry(newLocalExecutionEpoch(3143));
+  const lifecycle = new AbortController(), soft = new AbortController();
+  const safety = createCodexExecutionSafety(reg, spawnCounter().seam, async () => {
+    lifecycle.abort();
+    return { kind: "ready" };
+  });
+  await assert.rejects(safety.withBoundary({
+    boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 10_000,
+    checkpointStop: { signal: soft.signal, lifecycleSignal: lifecycle.signal },
+  }, async () => assert.fail("revoked authority cannot reach the action")), (error: unknown) => {
+    assert.ok(error instanceof CodexBoundaryError);
+    assert.equal(error.stage, "reconcile");
+    assert.equal(error.errors[0]?.category, "authorization");
+    assert.equal(reg.isPoisoned(), true);
+    return true;
+  });
+});
+
+for (const reason of ["owner_cancel", "claim_loss", "normal_wall", "shutdown_revoked", "worker_shutdown"] as const) {
+  it("m2 mutation permit retains hard authority for " + reason, async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3142));
+    const lifecycle = new AbortController(), soft = new AbortController(), authority = new AbortController();
+    let shutdown: { stopSignal: AbortSignal; deadlineAt: number } | undefined;
+    let observedAbort: boolean | undefined;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
+    const boundary = safety.withBoundary({ boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 10_000,
+      checkpointStop: { signal: soft.signal, lifecycleSignal: lifecycle.signal, workerShutdown: () => shutdown },
+    }, async permit => {
+      // Import mutation masks only cooperative cancellation. The permit is its hard signal.
+      soft.abort();
+      assert.equal(permit.signal.aborted, false);
+      if (reason === "worker_shutdown" || reason === "shutdown_revoked") {
+        shutdown = { stopSignal: authority.signal, deadlineAt: Date.now() + 10_000 };
+      }
+      lifecycle.abort(new Error(reason));
+      if (reason === "shutdown_revoked") authority.abort();
+      observedAbort = permit.signal.aborted;
+    });
+    await assert.rejects(boundary, reason === "worker_shutdown" ? CheckpointSoftDeadlineError : CodexBoundaryError);
+    assert.equal(observedAbort, reason !== "worker_shutdown");
+    assert.equal(reg.isPoisoned(), reason !== "worker_shutdown");
+  });
+}

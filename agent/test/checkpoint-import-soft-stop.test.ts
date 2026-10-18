@@ -148,10 +148,11 @@ for (const mode of ["done", "milestone"] as const) {
       const incoming = f.commit("incoming");
       const stop = new AbortController();
       const options = { ...f.options, checkpointImportMode: mode };
-      await assert.rejects(f.cache.withBoundaryProcessSpawner(realSpawner(args => {
+      const imported = f.cache.withBoundaryProcessSpawner(realSpawner(args => {
         if (args.includes("fetch")) stop.abort();
-      }), new AbortController().signal, () => f.fetch(options), { softSignal: stop.signal }),
-      CheckpointSoftDeadlineError);
+      }), new AbortController().signal, () => f.fetch(options), { softSignal: stop.signal });
+      if (mode === "done") await assert.rejects(imported, CheckpointSoftDeadlineError);
+      else assert.equal((await imported).kind, "updated", "started milestone finishes under its hard budget");
       const stages = git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/");
       if (mode === "done") {
         assert.equal(stages, incoming);

@@ -8,6 +8,9 @@ export interface CheckpointStop {
   readonly lifecycleSignal?: AbortSignal;
   /** Late-bound SteeringChannel.workerShutdown proof, for admission classification only. */
   readonly workerShutdown?: () => GracefulShutdownCheckpoint | undefined;
+  /** Test clock shared with the owning hard allowance. */
+  readonly now?: () => number;
+  readonly authorityRevoked?: () => boolean;
 }
 
 /** A cooperative stop is skippable only after all owned work has settled cleanly. */
@@ -42,8 +45,9 @@ export class CheckpointUnsafeCleanupError extends TrustedExecutionRefusal {
 export function checkCheckpointStop(stop?: CheckpointStop): void {
   if (!stop) return;
   const shutdown = stop.workerShutdown?.();
-  if (shutdown?.stopSignal.aborted || (shutdown && Date.now() >= shutdown.deadlineAt) ||
-      (stop.lifecycleSignal?.aborted && !shutdown)) {
+  const now = stop.now ?? Date.now;
+  if (shutdown?.stopSignal.aborted || (shutdown && now() >= shutdown.deadlineAt) ||
+      stop.authorityRevoked?.() || (stop.lifecycleSignal?.aborted && !shutdown)) {
     throw new GitBoundaryAbortError("checkpoint authority revoked");
   }
   if (stop.signal.aborted) throw new CheckpointSoftDeadlineError();
@@ -73,6 +77,15 @@ export async function waitCheckpointAdmission(prior: Promise<void>, stop?: Check
 export function cleanCheckpointAdmission(stop: CheckpointStop | undefined, lifecycle?: AbortSignal): boolean {
   if (!stop?.signal.aborted) return false;
   const shutdown = stop.workerShutdown?.();
-  if (shutdown?.stopSignal.aborted || (shutdown && Date.now() >= shutdown.deadlineAt)) return false;
+  const now = stop.now ?? Date.now;
+  if (stop.authorityRevoked?.() || shutdown?.stopSignal.aborted || (shutdown && now() >= shutdown.deadlineAt)) return false;
   return !lifecycle?.aborted || shutdown !== undefined;
+}
+
+/** Preserve hard/unsafe errors across advisory catches, including legacy Codex names. */
+export function isCheckpointBoundaryFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const boundary = (error as { checkpointBoundary?: unknown }).checkpointBoundary;
+  return boundary === "soft" || boundary === "hard" || boundary === "unsafe_cleanup" ||
+    error.name === "CodexBoundaryError" || error instanceof TrustedExecutionRefusal;
 }

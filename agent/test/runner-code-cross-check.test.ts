@@ -476,7 +476,7 @@ for (const failure of ["refused import", "failed import", "unavailable reap", "u
       assert.equal(blockedProofs, 2, "checkpoint and fresh code gate each reprove quiescence");
       assert.equal(failedPhaseImports, 0, "unverified quiescence prevented import");
     } else {
-      assert.equal(refused, 1, "second checkpoint attempted import despite the unchanged tip");
+      assert.equal(refused, 2, "checkpoint and one fresh snapshot each attempt the unchanged candidate");
     }
   });
 }

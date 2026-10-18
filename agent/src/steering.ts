@@ -1406,6 +1406,10 @@ export class SteeringChannel {
   private readonly shutdownStop = new AbortController();
   private shutdownCheckpoint?: GracefulShutdownCheckpoint;
 
+  workerShutdownCheckpoint(): GracefulShutdownCheckpoint | undefined {
+    return this.shutdownCheckpoint;
+  }
+
   /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
   workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
     if (this.shutdownCheckpoint) return this.shutdownCheckpoint;
@@ -2418,6 +2422,7 @@ export class SteeringChannel {
         if (this.pauseMode === "disk") break;
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
+          this.shutdownStop.abort();
           const signal = new PauseNowSignal();
           if (!this.cancel.signal.aborted) this.cancel.abort(signal);
           this.abortLifecycle(signal, false);

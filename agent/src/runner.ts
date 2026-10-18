@@ -1,3 +1,4 @@
+import { isCheckpointBoundaryFailure, type CheckpointStop } from "./checkpoint-stop.js";
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
 import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
@@ -340,6 +341,9 @@ const CODEX_BOUNDARY_STAGES: ReadonlySet<string> = new Set(["reconcile", "quiesc
 const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
   "checkpoint", "park", "shutdown", "terminal", "finalize", "credentialed_git",
 ]);
+const DONE_CHECKPOINT_SOFT_MS = 60_000;
+const DONE_CHECKPOINT_HARD_MS = 90_000;
+
 const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
 /** Issues #1900 and #1914: closed set of safe boundary step names. */
 const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
@@ -347,6 +351,16 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
   "completion_permit", "pr_description_prepare", "mr_create", "post_mr",
   "checkpoint_lock_wait", "checkpoint_overlay", "scratch_preflight", "checkpoint_pack",
   "checkpoint_upload", "checkpoint_report",
+  "checkpoint_sink_wait",
+  "checkpoint_import_context",
+  "checkpoint_import_lock_wait",
+  "checkpoint_import_transport",
+  "checkpoint_import_poststage",
+  "checkpoint_import_premutation",
+  "checkpoint_import_mutation",
+  "checkpoint_import_readback",
+  "checkpoint_code_head",
+  "checkpoint_bridge",
 ]);
 
 /** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
@@ -425,6 +439,7 @@ class BoundaryStepTracker {
     private readonly log: Logger,
     private readonly now: () => number,
     private readonly event: "finalize step" | "checkpoint step",
+    private readonly sink?: BoundarySink,
   ) {}
 
   enter(step: BoundaryStep): void {
@@ -444,7 +459,9 @@ class BoundaryStepTracker {
     const active = this.active;
     if (!active) return;
     this.active = undefined;
-    const fields: Record<string, unknown> = { step: active.step, durationMs: this.now() - active.startedAt };
+    const elapsed = this.now() - active.startedAt;
+    const fields: Record<string, unknown> = { step: active.step, durationMs: Number.isFinite(elapsed) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, elapsed)) : 0,
+      ...(this.sink ? { sink: this.sink } : {}) };
     if (outcome) fields.outcome = outcome;
     this.log.info(this.event, fields);
   }
@@ -769,6 +786,8 @@ type MidTurnTickOutcome =
 type CheckpointBodyOpts = Parameters<NonNullable<RunContext["checkpoint"]>>[0] & {
   /** No `running` reportState (the mid-turn tick). */
   quiet?: boolean;
+  donePermit?: BoundaryPermit;
+  doneAttempt?: { stop: CheckpointStop; deadlineAt: number; softDeadlineAt?: number; now: () => number; steps: BoundaryStepTracker };
   /** The tick's cancellation signal: checked between steps and handed to the publish RPC. */
   signal?: AbortSignal;
   /** Run the secret scan under a tighter sub-scope (the tick's 60s scan deadline). */
@@ -2174,6 +2193,10 @@ export interface CheckpointTestHooks {
   heldPackMaxBytes?: number;
   /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
   softDeadlineMs?: number;
+  /** Done-only timing seams; production is 60s cooperative / 90s hard. */
+  doneSoftDeadlineMs?: number;
+  doneHardDeadlineMs?: number;
+  absoluteNow?: () => number;
   /** Test-only backoff before the second and third checkpoint publish request; production is 250 ms then 1000 ms. */
   retryBackoffMs?: readonly [number, number];
   /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
@@ -10491,9 +10514,70 @@ export class RunRunner {
     let codeGate: CodeCrossCheckGate | undefined;
     let codeDefaultCommit: string | undefined;
     let codeEmptyPrompt = false;
+    let doneCandidate: string | null | undefined;
+    let doneCandidateRecorded = false;
+    const clearCodeSnapshot = () => { codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false; };
+    const withDoneAttempt = async (action: (permit: BoundaryPermit, attempt: NonNullable<CheckpointBodyOpts["doneAttempt"]>) => Promise<void>, fresh = false): Promise<void> => {
+      const now = this.checkpointTestHooks?.absoluteNow ?? Date.now;
+      const started = now();
+      const steps = new BoundaryStepTracker(runLog, now, "checkpoint step", "done_checkpoint");
+      steps.enter("checkpoint_sink_wait");
+      const softMs = this.checkpointTestHooks?.doneSoftDeadlineMs ?? DONE_CHECKPOINT_SOFT_MS;
+      const hardMs = this.checkpointTestHooks?.doneHardDeadlineMs ?? DONE_CHECKPOINT_HARD_MS;
+      const controller = new AbortController();
+      const lifecycle = steering.lifecycleSignal();
+      const stop: CheckpointStop = { signal: controller.signal, lifecycleSignal: lifecycle, now,
+        workerShutdown: () => steering.workerShutdownCheckpoint(),
+        authorityRevoked: () => ["now", "wall", "disk"].includes(steering.getPauseMode() ?? "") };
+      const interrupt = () => controller.abort();
+      lifecycle.addEventListener("abort", interrupt, { once: true });
+      this.shutdownSignal.signal.addEventListener("abort", interrupt, { once: true });
+      if (lifecycle.aborted || this.shutdownSignal.signal.aborted) interrupt();
+      const armed = this.checkpointTestHooks?.armSoftDeadline?.(interrupt, softMs);
+      const timer = armed ? undefined : setTimeout(interrupt, softMs);
+      timer?.unref();
+      const attempt = { stop, now, steps, deadlineAt: started + hardMs,
+        softDeadlineAt: armed ? armed.deadlineAt : started + softMs };
+      const acquire = () => this.reapForSink(executor, { boundary: "checkpoint", sink: "done_checkpoint",
+        deadlineMs: Math.max(0, attempt.deadlineAt - now()), checkpointStop: stop, activeStep: () => steps.current() }, async permit => {
+          if (!permit) throw new Error("done checkpoint permit unavailable");
+          await this.git.withBoundaryProcessSpawner(request => executor.safety!.spawnBoundaryProcess(permit, request),
+            permit.signal, () => action(permit, attempt),
+            { softSignal: stop.signal, softDeadlineAt: attempt.softDeadlineAt, now });
+        }, flight, { keepClone: false });
+      let entered = false;
+      let outcome: "completed" | "soft_stop" | "failed" = "completed";
+      try {
+        try {
+          await flight.sinkGate.run(async () => {
+            entered = true;
+            await this.awaitTickSurvivorsGone(flight);
+            await acquire();
+          }, stop);
+        } catch (error) {
+          // A forfeited gate has no source-clean certificate. Reconcile behind the
+          // safety queue under the original hard allowance, without acquiring the sink again.
+          if (!entered && error instanceof CheckpointSoftDeadlineError) await acquire();
+          else throw error;
+        }
+      } catch (error) {
+        outcome = error instanceof CheckpointSoftDeadlineError ? "soft_stop" : "failed";
+        throw error;
+      } finally {
+        steps.end(outcome === "failed" ? "failed" : "ok");
+        const elapsed = now() - started;
+        runLog.info("checkpoint attempt", { sink: "done_checkpoint", outcome, retry: fresh ? "fresh" : "original",
+          durationMs: Number.isFinite(elapsed) ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, elapsed)) : 0 });
+        armed?.cancel(); if (timer) clearTimeout(timer);
+        lifecycle.removeEventListener("abort", interrupt);
+        this.shutdownSignal.signal.removeEventListener("abort", interrupt);
+      }
+    };
+
     const captureImportedCodeHead = async (head: string | null): Promise<void> => {
-      codeSnapshot = undefined;
+      clearCodeSnapshot();
       if (!barePath || !head || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      await this.requireTrackingOwned(flight, barePath, runnerClone.branch, head);
       const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath);
       const defaultCommit = defaultBranch ? await this.git.originBranchTip(barePath, defaultBranch) : null;
       if (!defaultCommit) return;
@@ -10519,11 +10603,13 @@ export class RunRunner {
       // `barePath` is the outer `let` (string | undefined); it is set before the run
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
-      const checkpointSteps = opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step") : undefined;
+      const checkpointSteps = opts.doneAttempt?.steps ?? (opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step", opts.sink) : undefined);
+      if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_code_head");
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
       // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
       const cloneTip = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+      if (opts.doneAttempt && claim.code_cross_check_required === true) doneCandidate = cloneTip;
       const trackTip = await this.git.trackingTip(barePath, runnerClone.branch);
       const tipUnmovedSinceFetch =
         trackTip !== null && cloneTip !== null && trackTip === cloneTip &&
@@ -10543,7 +10629,8 @@ export class RunRunner {
       // issue #1597 M2: the class this body ended in — read by the mid-turn tick (the gated
       // ctx.checkpoint discards it). Default: nothing new to publish.
       let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
-      let checkpointSoft: { signal: AbortSignal; deadlineAt: number | undefined; permit: BoundaryPermit } | undefined;
+      let checkpointSoft: { signal: AbortSignal; deadlineAt: number | undefined; permit: BoundaryPermit } | undefined =
+        opts.doneAttempt && opts.donePermit ? { signal: opts.doneAttempt.stop.signal, deadlineAt: opts.doneAttempt.softDeadlineAt, permit: opts.donePermit } : undefined;
       const withCheckpointSoftGit = <T>(action: () => Promise<T>): Promise<T> => {
         const soft = checkpointSoft;
         return soft
@@ -10551,7 +10638,7 @@ export class RunRunner {
               (request) => executor.safety!.spawnBoundaryProcess(soft.permit, request),
               soft.permit.signal,
               action,
-              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt },
+              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt, now: opts.doneAttempt?.now },
             )
           : action();
       };
@@ -10579,8 +10666,12 @@ export class RunRunner {
         const codeDoneSnapshot = claim.code_cross_check_required === true && codeGate === undefined
           && opts.reap && opts.sink === "done_checkpoint";
         // This read is inside the checkpoint's quiescent boundary, before import and bridging.
-        const originalCodeHead = codeDoneSnapshot ? await this.git.branchTip(runnerClone.path, runnerClone.branch) : null;
-        if (codeDoneSnapshot) codeSnapshot = undefined;
+        const originalCodeHead = codeDoneSnapshot ? (opts.doneAttempt ? doneCandidate ?? null : await this.git.branchTip(runnerClone.path, runnerClone.branch)) : null;
+        if (codeDoneSnapshot) {
+          doneCandidate = originalCodeHead;
+          doneCandidateRecorded = false;
+          codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false;
+        }
         let fetchedBack: FetchBackOutcome = { kind: "updated" };
         if (!tipUnmovedSinceFetch || codeDoneSnapshot) {
           // Fetch back, credential-free (#218's helper): brings the committed work into
@@ -10591,6 +10682,9 @@ export class RunRunner {
             runnerClone.branch,
             flight,
             runLog,
+            { checkpointStep: step => checkpointSteps?.enter(step), checkpointImportMode: opts.doneAttempt ? "done" : opts.reap && executor.safety ? "milestone" : undefined,
+              ...(codeDoneSnapshot && originalCodeHead ? { expectedCandidateSha: originalCodeHead } : {}) },
+            opts.reap && !opts.doneAttempt ? withCheckpointSoftGit : undefined,
           );
         } else {
           runLog.info("checkpoint fetch skipped: branch tip unmoved since last checkpoint", {
@@ -10599,13 +10693,22 @@ export class RunRunner {
           });
         }
 
+        if (codeDoneSnapshot && fetchedBack.kind !== "updated") { codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false; }
         if (fetchedBack.kind === "refused") {
+          if (opts.doneAttempt) throw new PreservationRefusedError();
           bodyOutcome = "no_new_work";
           return;
         }
         if (codeDoneSnapshot && fetchedBack.kind === "updated") {
-          try { await captureImportedCodeHead(originalCodeHead); }
-          catch (err) { runLog.warn("code snapshot unavailable", { error: errMessage(err) }); }
+          try {
+            checkpointSteps?.enter("checkpoint_code_head");
+            await captureImportedCodeHead(originalCodeHead);
+          }
+          catch (err) {
+            codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false;
+            if (isCheckpointBoundaryFailure(err)) throw err;
+            runLog.warn("code snapshot unavailable", { error: errMessage(err) });
+          }
         }
         const fetchedTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
 
@@ -10622,6 +10725,7 @@ export class RunRunner {
         // the publish, non-destructively bridge a divergent tracking tip so the checkpoint pack —
         // and therefore a reseed on resume — carries B instead of the rewritten H. Best-effort:
         // a checkpoint must never crash the run (D4), so "failed"/"unknown" only log and continue.
+        if (opts.doneAttempt) checkpointSteps?.enter("checkpoint_bridge");
         const bridgeOutcome = await this.bridgeBareTrackingRefIfDivergent(
           barePath,
           runnerClone.branch,
@@ -10629,10 +10733,13 @@ export class RunRunner {
           runLog,
         );
         if (bridgeOutcome.kind === "preservation_refused") {
+          if (codeDoneSnapshot) clearCodeSnapshot();
+          if (opts.doneAttempt) throw new PreservationRefusedError();
           bodyOutcome = "no_new_work";
           return;
         }
         if (bridgeOutcome.kind === "failed" || bridgeOutcome.kind === "unknown") {
+          if (codeDoneSnapshot) clearCodeSnapshot();
           runLog.info("PRD #1416 M3: mid-run checkpoint bridge did not advance the tracking ref", {
             run_id: runId,
             branch: runnerClone.branch,
@@ -10868,6 +10975,7 @@ export class RunRunner {
           await doCheckpointPublishOwned(...args);
         } catch (error) {
           if (!(error instanceof PreservationRefusedError)) throw error;
+          if (opts.doneAttempt) { clearCodeSnapshot(); throw error; }
           // Losing ownership at any attribution boundary skips only this checkpoint.
           bodyOutcome = "no_new_work";
         }
@@ -10900,7 +11008,7 @@ export class RunRunner {
         // This budget starts with the Codex checkpoint boundary. It aims to
         // leave 20 seconds before the 30-second hard deadline for verified
         // child reap and boundary drain; local fetch-back still runs first.
-        const softController = executor.safety ? new AbortController() : undefined;
+        const softController = executor.safety && !opts.doneAttempt ? new AbortController() : undefined;
         const softBudgetMs = this.checkpointTestHooks?.softDeadlineMs ?? 10_000;
         let softDeadlineAt: number | undefined = Date.now() + softBudgetMs;
         let cancelSoftTimer: (() => void) | undefined;
@@ -10917,28 +11025,26 @@ export class RunRunner {
           }
         }
         try {
-          await this.reapForSink(
+          const checkpointAction = async (permit?: BoundaryPermit) => {
+              if (permit && softController) checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
+              checkpointSteps?.enter("checkpoint_overlay");
+              await doCheckpointPublish(hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined, permit !== undefined);
+          };
+          if (opts.doneAttempt) await checkpointAction(opts.donePermit);
+          else await this.reapForSink(
             executor,
             {
               boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink,
               activeStep: () => checkpointSteps?.current(),
             },
-            async (permit) => {
-              if (permit && softController) {
-                checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
-              }
-              checkpointSteps?.enter("checkpoint_overlay");
-              await doCheckpointPublish(
-                hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined,
-                permit !== undefined,
-              );
-            },
+            checkpointAction,
             flight,
             { keepClone: false },
           );
         } catch (err) {
           checkpointFailed = !(err instanceof RunResidueBlockedError || err instanceof CheckpointSoftDeadlineError);
           if (err instanceof CheckpointSoftDeadlineError) {
+            if (opts.doneAttempt) throw err;
             bodyOutcome = "soft_deadline";
             this.reportPublishOutcome(flight, "soft_deadline", "checkpoint publish skipped: soft deadline", {
               step: checkpointSteps?.current(),
@@ -11821,12 +11927,23 @@ export class RunRunner {
       // credential-bearing-CLASS op here is the fetch-back, itself credential-free
       // (file://, no PAT) — so a future credentialed git op MUST stay after the reap.
       // Best-effort throughout: a checkpoint must NEVER fail the run.
-      checkpoint: (opts) =>
-        // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
-        this.runGatedSink(flight, async () => {
-          if (opts.reap && opts.sink === "done_checkpoint" && !codeGate) { codeSnapshot = undefined; codeEmptyPrompt = false; }
+      checkpoint: async (opts) => {
+        if (opts.reap && opts.sink === "done_checkpoint" && executor.safety) {
+          if (!codeGate) clearCodeSnapshot();
+          // A new actual completion attempt resets only its fallback identity.
+          doneCandidate = undefined; doneCandidateRecorded = false;
+          try { await withDoneAttempt((permit, attempt) => checkpointBody({ ...opts, donePermit: permit, doneAttempt: attempt }).then(() => undefined)); }
+          catch (error) {
+            clearCodeSnapshot();
+            if (!(error instanceof CheckpointSoftDeadlineError || error instanceof PreservationRefusedError || error instanceof RunResidueBlockedError)) throw error;
+          }
+          return;
+        }
+        await this.runGatedSink(flight, async () => {
+          if (opts.reap && opts.sink === "done_checkpoint" && !codeGate) clearCodeSnapshot();
           await checkpointBody({ reap: opts.reap, progress: opts.progress, sink: opts.sink });
-        }),
+        });
+      },
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
       secretRemediationGate: () =>
         this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone)),
@@ -11834,7 +11951,7 @@ export class RunRunner {
         && isCodePublishingKind(claim.kind ?? "issue") ? {
         codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
           if (completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
-          const decision = await this.runGatedSink(flight, async () => {
+          const done = async () => {
             codeGate ??= new CodeCrossCheckGate({
             client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
             readInstructions: async (instructionsCommit: string, signal: AbortSignal) => {
@@ -11844,43 +11961,61 @@ export class RunRunner {
               return "text" in read ? read.text : "";
             },
             snapshot: async () => {
-              if (!barePath) return { reason_class: "snapshot_failed" as const };
-              if (!completion.interlocked) codeSnapshot = undefined;
+              if (!barePath || (executor.safety && (steering.lifecycleSignal().aborted || this.shuttingDownGlobal))) {
+                clearCodeSnapshot();
+                return { reason_class: "snapshot_failed" as const };
+              }
+              if (!completion.interlocked) clearCodeSnapshot();
               let snapshot: { head_commit: string; base_commit: string; repo_instructions_commit: string } | undefined;
               try {
-                // Both completion paths prove fresh quiescence and retain the credentialed fetch
-                // and durable pin inside reapForSink's held boundary/process spawner.
-                await this.reapForSink(executor,
-                  { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: "done_checkpoint" },
-                  async () => {
-                    if (!completion.interlocked) {
-                      const original = await this.git.branchTip(runnerClone.path, runnerClone.branch);
-                      const imported = await this.fetchBackBestEffort(barePath!, runnerClone.path, runnerClone.branch, flight, runLog);
-                      if (imported.kind === "updated") await captureImportedCodeHead(original);
+                const snapshotAction = async (_permit?: BoundaryPermit, attempt?: NonNullable<CheckpointBodyOpts["doneAttempt"]>) => {
+                  attempt?.steps.enter("checkpoint_code_head");
+                  if (!completion.interlocked || !codeSnapshot) {
+                    if (!completion.interlocked && doneCandidate === undefined) doneCandidate = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+                    const original = doneCandidate;
+                    if (!original || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== original) {
+                      clearCodeSnapshot(); return;
                     }
-                    if (codeEmptyPrompt || !codeSnapshot || !codeDefaultCommit) return;
-                    const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath!);
-                    if (!defaultBranch) throw new Error("code instructions default branch unavailable");
-                    const instructionsCommit = await this.git.fetchDefaultTip(
-                      barePath!, defaultBranch, claim.secrets.forge_pat,
-                      claim.repo.clone_url, claim.secrets.forge_username,
-                    );
-                    // codeDefaultCommit remains the captured diff input even if default advanced.
-                    const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
-                    codeFreshReceipt = pinned.freshReceipt;
-                    snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,
-                      repo_instructions_commit: instructionsCommit };
-                  }, flight, { keepClone: false });
+                    const imported = await this.fetchBackBestEffort(barePath!, runnerClone.path, runnerClone.branch, flight, runLog,
+                      { expectedCandidateSha: original, ...(executor.safety ? { checkpointImportMode: "done" as const } : {}),
+                        checkpointStep: step => attempt?.steps.enter(step) });
+                    if (imported.kind !== "updated") { clearCodeSnapshot(); return; }
+                    await this.requireTrackingOwned(flight, barePath!, runnerClone.branch, original);
+                    attempt?.steps.enter("checkpoint_code_head");
+                    await captureImportedCodeHead(original);
+                  }
+                  if (codeEmptyPrompt || !codeSnapshot || !codeDefaultCommit) return;
+                  const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath!);
+                  if (!defaultBranch) throw new Error("code instructions default branch unavailable");
+                  attempt?.steps.enter("default_fetch");
+                  const instructionsCommit = await this.git.fetchDefaultTip(
+                    barePath!, defaultBranch, claim.secrets.forge_pat,
+                    claim.repo.clone_url, claim.secrets.forge_username,
+                  );
+                  const pinned = await this.git.pinCodeSnapshot(barePath!, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
+                  codeFreshReceipt = pinned.freshReceipt;
+                  snapshot = { head_commit: pinned.head_commit, base_commit: pinned.base_commit,
+                    repo_instructions_commit: instructionsCommit };
+                };
+                if (executor.safety) await withDoneAttempt(snapshotAction, true);
+                else await this.reapForSink(executor,
+                  { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: "done_checkpoint" },
+                  snapshotAction, flight, { keepClone: false });
               } catch (err) {
-                runLog.warn("code snapshot unavailable", { error: errMessage(err) });
+                clearCodeSnapshot();
+                if (!(err instanceof CheckpointSoftDeadlineError) && isCheckpointBoundaryFailure(err)) throw err;
+                runLog.warn("code snapshot unavailable", { outcome: "snapshot_failed" });
                 return { reason_class: "snapshot_failed" as const };
               }
               if (codeEmptyPrompt) return undefined;
+              if (!snapshot) clearCodeSnapshot();
               return snapshot ?? { reason_class: "snapshot_failed" as const };
             },
             });
             return codeGate.done({ repairAvailable: completion.repairAvailable !== false });
-          });
+          };
+          // Codex snapshots own their gate admission and clock; legacy callers retain the outer gate.
+          const decision = await (executor.safety ? done() : this.runGatedSink(flight, done));
           const summary = codeGate?.observed();
           const record = summary && !("incomplete" in summary) ? summary : undefined;
           if (codeEmptyPrompt) return { action: "proceed" as const };
@@ -12082,8 +12217,8 @@ export class RunRunner {
       // declaration + head + worktree fingerprint to the worker completion/attempt endpoint, which
       // union-merges the declaration into milestones_completed, recomputes unmet server-side, and
       // records a bounded attempt — returning the server-authoritative unmet set + attempt count.
-      recordCompletionAttempt: ({ declared, head, worktreeFingerprint, nonClosing }) =>
-        this.client.recordCompletionAttempt(runId, {
+      recordCompletionAttempt: async ({ declared, head, worktreeFingerprint, nonClosing }) => {
+        const result = await this.client.recordCompletionAttempt(runId, {
           milestonesCompleted: declared,
           nonClosing,
           head,
@@ -12091,7 +12226,13 @@ export class RunRunner {
           // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
           // stamps) so a released/superseded stale flight's attempt records nothing server-side.
           claimGeneration: flight.claimGeneration,
-        }),
+        });
+        if (!doneCandidateRecorded) {
+          if (doneCandidate == null) doneCandidate = head;
+          doneCandidateRecorded = true;
+        }
+        return result;
+      },
       // PRD #1226 M4 (D3/D6): the recoverable completion-hold seam is now WIRED. On a repeated
       // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
       // server's budget_exhausted steer, the executor calls this INSTEAD of throwing a terminal
@@ -12245,11 +12386,11 @@ export class RunRunner {
   shutdown(): void {
     this.shutdownDeadlineAt ??= Date.now() + Math.min(this.codexBoundaryDeadlineMs, this.shutdownPublishTimeoutMs);
     this.shuttingDownGlobal = true;
-    if (!this.shutdownSignal.signal.aborted) this.shutdownSignal.abort();
     for (const a of this.activeRuns.values()) {
       a.shuttingDown = true;
       a.gracefulShutdownCheckpoint = a.steering.workerShutdown(this.shutdownDeadlineAt);
     }
+    if (!this.shutdownSignal.signal.aborted) this.shutdownSignal.abort();
   }
 
   /**
@@ -12311,10 +12452,11 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
-    const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
+    const now = req.checkpointStop?.now ?? Date.now;
+    const deadlineAt = Math.min(now() + Math.max(0, req.deadlineMs),
       req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
-    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - Date.now()));
-    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
+    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - now()));
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -12614,10 +12756,11 @@ export class RunRunner {
     req: BoundaryRequest,
     action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
-    const deadlineAt = Math.min(Date.now() + Math.max(0, req.deadlineMs),
+    const now = req.checkpointStop?.now ?? Date.now;
+    const deadlineAt = Math.min(now() + Math.max(0, req.deadlineMs),
       req.gracefulShutdownCheckpoint?.deadlineAt ?? Infinity);
-    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - Date.now()));
-    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
+    await executor.closeAndSettlePlanSummary?.(Math.max(0, deadlineAt - now()));
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -12678,7 +12821,12 @@ export class RunRunner {
         ? { ...identity, generation: null, legacy: true }
         : { ...identity, generation });
     })();
-    const context = await flight.owedContext;
+    const initializer = flight.owedContext;
+    let context: OwedCandidateContext;
+    try { context = await initializer; } catch (error) {
+      if (error instanceof CheckpointSoftDeadlineError && flight.owedContext === initializer) flight.owedContext = undefined;
+      throw error;
+    }
     if (context.barePath !== barePath || context.branch !== branch) throw new Error("owed candidate flight context changed");
     return { context, remotelyConfirmedSha: flight.lastCheckpointRefTip };
   }
@@ -13058,11 +13206,14 @@ export class RunRunner {
     return sha;
   }
 
-  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
-    const result = await this.git.fetchAgentBranch(
-      barePath, worktreePath, branch, flight.runId, await this.owedOptions(flight, barePath, branch),
-    );
+  private async fetchTracking(flight: RunFlight, barePath: string, worktreePath: string, branch: string, options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {}, importScope: <T>(action: () => Promise<T>) => Promise<T> = action => action()): Promise<Extract<TrackingUpdateResult, { kind: "updated" }>> {
+    options.checkpointStep?.("checkpoint_import_context");
+    const owed = await this.owedOptions(flight, barePath, branch);
+    const result = await importScope(() => this.git.fetchAgentBranch(
+      barePath, worktreePath, branch, flight.runId, { ...owed, ...options },
+    ));
     if (result.kind === "not_updated") throw this.preservationRefused(flight, result.reason);
+    options.checkpointStep?.("checkpoint_import_readback");
     await this.requireTrackingOwned(flight, barePath, branch, result.candidateSha);
     if (result.divergence === "divergent") {
       const heads = result.displacedSha && result.retainedShas.includes(result.displacedSha) ? [result.displacedSha] : [];
@@ -13082,11 +13233,14 @@ export class RunRunner {
     branch: string,
     flight: RunFlight,
     runLog: Logger,
+    options: Pick<FetchAgentBranchOptions, "expectedCandidateSha" | "checkpointImportMode" | "checkpointStep"> = {},
+    importScope?: <T>(action: () => Promise<T>) => Promise<T>,
   ): Promise<FetchBackOutcome> {
     try {
-      await this.fetchTracking(flight, barePath, worktreePath, branch);
+      await this.fetchTracking(flight, barePath, worktreePath, branch, options, importScope);
       return { kind: "updated" };
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) return { kind: "refused" };
       // PRD #1809 D6: name a fetch-back that failed because the data volume (where the worker
       // bare lives) is full, and start a reclaim pass so the resume has room. Not awaited and not
@@ -13317,6 +13471,7 @@ export class RunRunner {
       }
       await this.requireTrackingOwned(flight, barePath, branch, update.candidateSha);
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
       runLog.warn("PRD #1416 M3: could not advance the tracking ref to the bridge", {
         run_id: flight.runId,
@@ -13362,6 +13517,7 @@ export class RunRunner {
       }
       return o;
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) return { kind: "preservation_refused" };
       if (e instanceof ScratchPublicationError) {
         logScratchPublicationRefused(runLog, flight.redactText, e, "park_bridge");
@@ -13924,6 +14080,7 @@ export class RunRunner {
         }),
       };
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof PreservationRefusedError) throw e;
       return await failOrProceed(`gate_threw: ${errMessage(e)}`);
     }
@@ -14435,6 +14592,7 @@ export class RunRunner {
       );
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
+      if (isCheckpointBoundaryFailure(e)) throw e;
       if (e instanceof SecretRemediationPendingError) {
         this.reportPublishOutcome(flight, "secret:remediation", "checkpoint publish skipped: secret_remediation_pending");
         return { published: false, reason: "secret_remediation_pending" };

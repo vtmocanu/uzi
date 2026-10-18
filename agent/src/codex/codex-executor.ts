@@ -922,8 +922,9 @@ export function createRunLaneInstallerReconcile(
     }
   };
   const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+    const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
+    const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const cancellation = AbortSignal.any([signal, authoritySignal,
       ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
@@ -933,7 +934,7 @@ export function createRunLaneInstallerReconcile(
       message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
         : "codex dependency install did not settle before reconcile",
     }] });
-    const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
+    const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
       cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
     if (cause && cancellation.aborted) return refused();
     if (!await settle(deadlineAt, cancellation, remaining)) {
@@ -948,7 +949,7 @@ export function createRunLaneInstallerReconcile(
       }
       return refused();
     }
-    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
   };
   return Object.assign(state, { settle, reconcile });
 }
@@ -992,12 +993,13 @@ export function buildRunLaneReconcile(
   let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
   let operationUncertain = false;
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
+    const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(Date.now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
+    const deadlineAt = Math.min(now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const signal = AbortSignal.any([boundarySignal,
       ...[authoritySignal, request.checkpointStop?.signal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
-    const expired = () => signal.aborted || Date.now() >= deadlineAt ||
+    const expired = () => signal.aborted || now() >= deadlineAt ||
       (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
@@ -1009,7 +1011,7 @@ export function buildRunLaneReconcile(
     // Only a pre-exchange stop can be clean. A shutdown proof explains lifecycle
     // cancellation for admission, never authorizes ordinary credential work.
     const cleanStop = () => !cause && !operationUncertain && !boundarySignal.aborted &&
-      Date.now() < deadlineAt && !isVaultLocked?.() &&
+      now() < deadlineAt && !isVaultLocked?.() &&
       (binding.authMode !== "subscription" || (committed.value !== undefined &&
         Number.isSafeInteger(committed.value) && committed.value >= binding.generation)) &&
       cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal);
