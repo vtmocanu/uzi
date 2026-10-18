@@ -3199,7 +3199,8 @@ export class RecoveryCoordinator {
     });
   }
 
-  /** Origin only: no capture permit, SOURCE, refs, tracking or owed mutations. */
+  /** Charged local WIP capture after durable origin publication; no bare transfer,
+   * tracking/owed publication, bundle production or remote preservation permit. */
   private async admitTerminalOrigin(observation: ClosedSourceObservation, signal: AbortSignal): Promise<void> {
     const original = observation.originalContext, family = observation.family;
     const ledger = this.maintenance, boundary = this.withTerminalSourceBoundary;
