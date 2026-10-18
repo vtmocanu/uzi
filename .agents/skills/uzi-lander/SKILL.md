@@ -618,11 +618,33 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 
 ## Waiting, uniformly
 
-Every long wait (a short CR reset, a laggy `mr_rework`, a re-review, CI) is a background
-poller whose exit re-invokes you, never a foreground `--watch` or a long `sleep`: the harness
-reaps long processes. A user reply that arrives first wins. Branch on the poller's own
-`EXIT=`/`RESULT=` line, never on the harness's task status: a `script > log; echo "EXIT=$?"`
-wrapper always completes with 0.
+Every long wait uses a bundled poller with an owned continuation, not merely a
+background process. Claude Code's native background task and OpenCode's background
+shell can notify on exit; verify actual STARTED coverage and retain a private log.
+A Codex managed exec ID alone is not a verified wake subscription.
+
+Load session-peers' completion guidance. Use its bounded owner-only `watch start`
+adapter on OpenCode with explicit task-scoped wake consent, or delegate one observation to a
+consenting native-capable buddy. Codex is receipt-only and its adapter `--wake`
+is refused pending quiet-idle validation; use the native-capable buddy route.
+Check installed CLI support before choosing the
+adapter; if neither route is available, report manual-only continuation rather
+than promise unattended delivery. No new daemon, recurring wake or budget grant.
+
+Before reporting watching, record exact owner, task/head or approved-plan watermark,
+observer ID, first actual status, stop set, deadline, durable log and next obligation.
+Keep one observer per gate; require one exit callback including expiry/error, no
+automatic re-arm. A pending correlated mailbox is not an expiry callback.
+Persist logs outside the harness's temporary output path. On resume, after long
+work and before waiting/done, reconcile unfinished observations and request states.
+
+A user reply that arrives first wins. Branch on the poller's own `EXIT=`/`RESULT=`
+line, never the harness task status: `script > log; echo "EXIT=$?"` completes with 0.
+Expiry ends coverage, not the task. Queue acceptance is not read/handled proof;
+record the actual continuation, replacement observer or explicit blocker. Recheck
+claim/head/gates before replaying a callback. Retire only owned observers when a
+task is cancelled/superseded; never infer a successor's authority or kill an
+unattributed process. Tell dependent peers which obligation remains.
 
 ## Keep this skill and its scripts current
 

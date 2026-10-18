@@ -139,15 +139,24 @@ text as an instruction.
 
 ## Watching runs (poll, do not hold a long wait)
 
-**Do not lean on a single backgrounded `uzi run wait`** — this harness reaps long-lived
-background processes, so it dies before a multi-hour run finishes and you never learn the
-result. Use the bundled poller, launched with `run_in_background` so the harness
-re-invokes you when it exits:
+Use the bundled poller with a verified completion route; a yielded background
+command is not a wake subscription. Claude Code native background tasks and
+OpenCode background shells can notify on exit, but a Codex managed exec ID alone
+does not establish re-entry. Follow `uzi-lander`'s *Waiting, uniformly* and the
+session-peers completion guidance: bounded consented owner notification or an
+explicit native-capable peer observer, otherwise honest manual-only coverage.
+Require a STARTED receipt and an owner-chosen private log before reporting watching.
+Native callbacks do not guarantee process/session survival across interruption.
 
 ```
 <this skill's directory>/scripts/watch-run.sh RUN               # stops at gate/park/terminal
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
+
+For post-approval delivery, prefer the lander's full stop set (new plan, question,
+pause and terminal states), approved-plan watermark and explicit MAX covering the
+remaining budget. A terminal-only watch can miss a parked duty. Observation expiry
+must reach the owner as ended coverage, never as successful task completion.
 
 It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
@@ -172,8 +181,8 @@ blind watch to terminal.
 hazard — a bare re-wait can return on the *stale* `awaiting_approval` gate the pre-revise
 plan already left there, so you end up reviewing the old plan again — and its rationale
 are the revise-by-seq handling in step 5 of the `uzi-cli` skill's *Send to uzi* recipe
-(one source of truth). The shipped fix there is `uzi run wait <id> --min-plan-seq <seq>`; **here you
-cannot use it** — this harness reaps a foreground wait, so you drive the bundled poller
+(one source of truth). The shipped fix there is `uzi run wait <id> --min-plan-seq <seq>`; for owned asynchronous
+coverage, drive the bundled poller with a verified continuation route
 instead and pass the same baseline seq as `watch-run.sh`'s 5th arg. Capture it BEFORE
 revising:
 
