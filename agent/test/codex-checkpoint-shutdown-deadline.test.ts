@@ -74,22 +74,28 @@ function fixture() {
 for (const notification of ["soft", "lifecycle"] as const) {
   it("late shutdown " + notification + " notification shrinks child budget and revokes the live permit", async () => {
     const f = fixture();
+    let entered = false;
+    let beforeExpiry: boolean | undefined, afterExpiry: boolean | undefined;
     await assert.rejects(f.safety.withBoundary(f.request, async permit => {
+      entered = true;
       f.shutdown(notification);
-      assert.equal(permit.signal.aborted, false);
+      beforeExpiry = permit.signal.aborted;
       assert.equal(f.registry.isPoisoned(), false);
       const child = await f.safety.spawnBoundaryProcess(permit, {
         argv: ["/inert"], cwd: "/unused", env: {}, identity: "command",
       });
       await child.completed;
-      assert.deepEqual(f.budgets, [15_000]);
       f.advance(15_000);
-      assert.equal(permit.signal.aborted, true);
+      afterExpiry = permit.signal.aborted;
       await assert.rejects(f.safety.spawnBoundaryProcess(permit, {
         argv: ["/inert"], cwd: "/unused", env: {}, identity: "command",
       }));
-      assert.equal(f.spawns(), 1);
     }), CodexBoundaryError);
+    assert.equal(entered, true);
+    assert.equal(beforeExpiry, false);
+    assert.equal(afterExpiry, true);
+    assert.deepEqual(f.budgets, [15_000]);
+    assert.equal(f.spawns(), 1);
     assert.equal(f.registry.isPoisoned(), true);
     assert.equal(f.timers.size, 0);
   });
@@ -99,20 +105,26 @@ for (const deadline of ["shutdown", "original"] as const) {
   for (const identity of ["command", "worker_pat"] as const) {
     it("absolute " + deadline + " expiry refuses " + identity + " admission before delayed timers fire", async () => {
       const f = fixture();
+      let entered = false;
+      let beforeAdmission: boolean | undefined, afterAdmission: boolean | undefined;
       await assert.rejects(f.safety.withBoundary(f.request, async permit => {
+        entered = true;
         if (deadline === "shutdown") f.shutdown();
         f.elapseWithoutTimers(deadline === "shutdown" ? 15_001 : 90_001);
-        assert.equal(permit.signal.aborted, false, "the timer callback has deliberately not run");
+        beforeAdmission = permit.signal.aborted;
         await assert.rejects(async () => {
           const child = await f.safety.spawnBoundaryProcess(permit, {
             argv: ["/inert"], cwd: "/unused", env: {}, identity,
           });
           await child.completed;
         });
-        assert.equal(permit.signal.aborted, true, "admission applies the hard fence synchronously");
-        assert.equal(f.spawns(), 0, "no owned work is admitted after the absolute deadline");
-        assert.equal(f.registry.rootCount(), 0);
+        afterAdmission = permit.signal.aborted;
       }), CodexBoundaryError);
+      assert.equal(entered, true);
+      assert.equal(beforeAdmission, false, "the timer callback has deliberately not run");
+      assert.equal(afterAdmission, true, "admission applies the hard fence synchronously");
+      assert.equal(f.spawns(), 0, "no owned work is admitted after the absolute deadline");
+      assert.equal(f.registry.rootCount(), 0);
       assert.equal(f.registry.isPoisoned(), true);
       assert.equal(f.timers.size, 0);
     });
@@ -176,18 +188,21 @@ it("queued source expiry forfeits only its slot and keeps successors behind the 
 
 it("the earlier done hard ceiling retains timeout precedence over a later shutdown deadline", async () => {
   const f = fixture();
+  let beforeExpiry: boolean | undefined, afterExpiry: boolean | undefined;
   await assert.rejects(f.safety.withBoundary(f.request, async permit => {
     f.advance(85_000);
     f.shutdown();
-    assert.equal(permit.signal.aborted, false);
+    beforeExpiry = permit.signal.aborted;
     f.advance(5_000);
-    assert.equal(permit.signal.aborted, true);
+    afterExpiry = permit.signal.aborted;
   }), (error: unknown) => {
     assert.ok(error instanceof CodexBoundaryError);
     assert.ok(error.errors.length > 0);
     assert.ok(error.errors.every(item => item.category === "timeout"));
     return true;
   });
+  assert.equal(beforeExpiry, false);
+  assert.equal(afterExpiry, true);
   assert.equal(f.registry.isPoisoned(), true);
   assert.equal(f.timers.size, 0);
 });
