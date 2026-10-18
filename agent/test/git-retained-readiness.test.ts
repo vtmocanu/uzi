@@ -186,6 +186,42 @@ test("special file reaches fstat guard (nonblocking descriptor)", () => {
   } finally { f.cleanup(); }
 });
 
+for (const mutation of ["mode600", "mode440", "owner"]) {
+  test("classification handoff refuses " + mutation + " before fchmod", () => {
+    const f = fixture();
+    try {
+      const p = f.file("open-drift", mutation === "owner" ? 0o440 : 0o400);
+      let reached = false;
+      const guarded = { ...f.adapter, openSync(name: fs.PathLike, flags: fs.OpenMode) {
+        if (!reached && String(name).endsWith("/open-drift") && typeof flags === "number" && (flags & 0x200000) === 0) {
+          reached = true;
+          if (mutation === "owner") f.set(p, { uid: 10001 });
+          else fs.chmodSync(p, mutation === "mode600" ? 0o600 : 0o440);
+        }
+        return fs.openSync(name, flags);
+      } };
+      assert.equal(f.run({ fs: guarded }), "refused classification_drift\n");
+      assert.equal(reached, true, "metadata changed at the O_PATH-to-readable handoff");
+      assert.deepEqual(f.chmods, [], "classification drift is refused before mutation");
+    } finally { f.cleanup(); }
+  });
+}
+
+test("byte-exact alternate target comparison rejects replacement-decoded bytes", () => {
+  const f = fixture();
+  try {
+    const selected = f.bare + "\uFFFD";
+    fs.renameSync(f.bare, selected);
+    f.roots[3] = selected;
+    f.roots[4] = path.join(selected, "objects");
+    const alternate = f.file("info/alternates", 0o640);
+    fs.writeFileSync(alternate, Buffer.concat([Buffer.from(f.bare), Buffer.from([255]), Buffer.from("/objects\n")]));
+    fs.chmodSync(alternate, 0o440);
+    assert.equal(f.run(), "refused alternates\n");
+    assert.deepEqual(f.chmods, []);
+  } finally { f.cleanup(); }
+});
+
 test("pre and post chmod classification drift refuse at the intended guard", () => {
   for (const after of [false, true]) {
     const f = fixture();

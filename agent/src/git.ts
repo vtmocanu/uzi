@@ -14129,7 +14129,7 @@ function alternates(fd) {
   if (!before.isFile() || before.size > PATH_LIMIT + 1) refuse("alternates");
   const buf = Buffer.alloc(PATH_LIMIT + 2);
   const n = fs.readSync(fd, buf, 0, buf.length, 0);
-  if (buf.subarray(0,n).toString("utf8") !== roots[4] + "\n" ||
+  if (!buf.subarray(0,n).equals(Buffer.from(roots[4] + "\n", "utf8")) ||
       signature(before) !== signature(fs.fstatSync(fd))) refuse("alternates");
 }
 function walk(fd, relative, depth) {
@@ -14161,7 +14161,9 @@ function walk(fd, relative, depth) {
         classify(initial);
         child = open(fp(fd) + "/" + name, C.O_RDONLY | C.O_NOFOLLOW |
           (initial.isDirectory() ? C.O_DIRECTORY : C.O_NONBLOCK));
-        if (id(fs.fstatSync(child)) !== id(initial)) refuse("displaced_root");
+        const readable = fs.fstatSync(child);
+        if (id(readable) !== id(initial)) refuse("displaced_root");
+        if (signature(readable) !== signature(initial)) refuse("classification_drift");
       } catch (e) { if (child !== undefined) close(child); throw e; }
       finally { close(pinned); }
       links.push({ parent: fd, name, fd: child });
