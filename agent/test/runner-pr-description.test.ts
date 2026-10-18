@@ -17,6 +17,7 @@ import {
   REGION_START,
   closingDirectiveFor,
   parseOwnedBlocks,
+  renderCompletionBlock,
 } from "../src/pr-description.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { FakePrDescApi } from "./fake-pr-desc-api.js";
@@ -106,6 +107,106 @@ function interlockedClaim(iid: number, scope?: { deferred: { milestone_id: strin
 function statuses(runId: string): string[] {
   return api.states.filter((s) => s.runId === runId).map((s) => s.body.status);
 }
+
+function partialDeliveryFeed(runId: string): string[] {
+  return api.messages(runId)
+    .filter(m => m.kind === "status" && typeof m.payload?.text === "string")
+    .map(m => m.payload!.text as string)
+    .filter(text => text.startsWith("Retained scope delivered;"));
+}
+
+describe("M4 owner-deferred work", () => {
+  it("refresh and verified reconcile reset checked work and preserve ordinary lead guidance", async () => {
+    const iid = 3090;
+    const secret = "glpat-" + "abcdefghijklmnopqrst";
+    const scope = { deferred: [
+      { milestone_id: "m2", title: `Build **export** ${COMPLETION_END} ${secret}`, reason: "coding remains" },
+      { milestone_id: "m3", title: "Live acceptance", reason: `Closes #3090\n${COMPLETION_END}\n/close ${secret}` },
+    ] };
+    const guidance = "Lead guidance: deploy the retained change and inspect the export in the staging UI.";
+    const checked = renderCompletionBlock({ issueIid: iid, branch: "old", closes: false, completionScope: scope })
+      .replaceAll("> - [ ]", "> - [x]");
+    const existing = `${guidance}\n\n${SIZE_REGION}\n\n${checked}\n\nHuman review notes.`;
+    const { gitlab, pr } = fakeGitlab({ head: H, existing });
+    const claim = interlockedClaim(iid, scope);
+    claim.secrets.forge_pat = secret;
+    api.setCompletionPermitResponse(true);
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    const parsed = parseOwnedBlocks(pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.completion);
+    assert.equal((parsed.completion.match(/^> - \[ \]/gm) ?? []).length, 2);
+    const explanation = "Not delivered or verified by this run; must be completed or verified before closing the source issue.";
+    for (const id of ["m2", "m3"]) {
+      const item = parsed.completion.split("\n").find(line => line.startsWith(`> - [ ] \`${id}\` — `));
+      assert.ok(item, `${id} is an unchecked item`);
+      assert.ok(item.endsWith(`. ${explanation}`), `${id} carries its own explanation`);
+      if (id === "m2") {
+        assert.ok(item.includes("Build \\*\\*export\\*\\*"));
+        assert.ok(item.includes("\\*\\*\\*REDACTED\\*\\*\\*"), "registered title secret was redacted before escaping");
+      } else {
+        assert.ok(item.includes("Live acceptance"));
+        assert.ok(item.includes("\\*\\*\\*REDACTED\\*\\*\\*"), "registered reason secret was redacted before escaping");
+      }
+    }
+    assert.ok(!parsed.completion.includes("> - [x]"));
+    assert.ok(!pr.description.includes(secret), "registered provider token is redacted before escaping");
+    assert.equal(pr.description.split(COMPLETION_END).length, 2, "metadata cannot forge markers");
+    assert.equal(closingDirectiveFor(pr.description, iid, "org/repo"), false);
+    assert.ok(pr.description.startsWith(guidance + "\n\n"));
+    assert.ok(pr.description.endsWith("\n\nHuman review notes."));
+    assert.ok(!parsed.completion.includes("staging UI"), "no inferred verification steps in authoritative block");
+    assert.deepEqual(partialDeliveryFeed(claim.run_id), [
+      "Retained scope delivered; 2 deferred milestone(s) still not delivered or verified by this run. The owner must complete or verify them before closing the source issue.",
+    ]);
+  });
+
+  it("successful coding-only partial publishes generic unchecked work and the partial success summary", async () => {
+    const scope = { deferred: [{ milestone_id: "m2", title: "Implement export", reason: "coding remains" }] };
+    const claim = interlockedClaim(3092, scope);
+    const { gitlab, pr } = fakeGitlab({ head: H });
+    api.setCompletionPermitResponse(true);
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.deepEqual(partialDeliveryFeed(claim.run_id), [
+      "Retained scope delivered; 1 deferred milestone(s) still not delivered or verified by this run. The owner must complete or verify them before closing the source issue.",
+    ]);
+    assert.ok(pr.description.split("\n").includes("> - [ ] `m2` — I\u200bmplement export: coding remains. Not delivered or verified by this run; must be completed or verified before closing the source issue."));
+    assert.doesNotMatch(pr.description, /acceptance.*pending|pending.*acceptance/i);
+  });
+
+  it("prompt partial completes without an owner source-issue handoff", async () => {
+    const scope = { deferred: [{ milestone_id: "m2", title: "Implement export", reason: "coding remains" }] };
+    const claim = { ...interlockedClaim(3093, scope), kind: "prompt" as const, issue_iid: null };
+    const { gitlab, pr } = fakeGitlab({ head: H });
+    api.setCompletionPermitResponse(true);
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.deepEqual(partialDeliveryFeed(claim.run_id), []);
+    assert.doesNotMatch(JSON.stringify(api.messages(claim.run_id)), /The owner must complete or verify them before closing the source issue/);
+    assert.match(pr.description, /Ad-hoc scheduled prompt run/);
+    assert.doesNotMatch(pr.description, /before closing the source issue/);
+  });
+
+  for (const outcome of ["hold", "fail", "full", "accept-only"] as const) {
+    it(`emits no partial success summary for ${outcome}`, async () => {
+      const scope = outcome === "hold" || outcome === "fail"
+        ? { deferred: [{ milestone_id: "m2", title: "Implement export", reason: "later" }] } : undefined;
+      const claim = interlockedClaim(3091, scope);
+      if (outcome === "accept-only") api.completionPermitScope = {
+        accepted: [{ id: "c1", milestone_id: "m1", text: "criterion", reason: "owner accepted" }],
+      };
+      const { gitlab } = fakeGitlab({ head: outcome === "hold" ? OTHER : H,
+        ...(outcome === "fail" ? { putStatus: 403, existing: adoptedBody(3091, "Notes.") } : {}) });
+      api.setCompletionPermitResponse(true);
+      await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined,
+        { recoveryRetryMs: 1 }).execute(claim);
+      assert.deepEqual(partialDeliveryFeed(claim.run_id), []);
+      if (outcome === "hold") assert.equal(api.completionHoldRequests.length, 1);
+      else assert.ok(statuses(claim.run_id).includes(outcome === "fail" ? "failed" : "completed"));
+    });
+  }
+});
 
 const SIZE_REGION = [REGION_START, "**Size:** code +1 −0 · 1 file", REGION_END].join("\n");
 
