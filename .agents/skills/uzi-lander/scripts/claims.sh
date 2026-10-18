@@ -41,7 +41,9 @@
 # Exit codes:
 #   0  ok
 #   2  usage
-#   3  error (state dir, jq, gh)
+#   3  error (state dir, jq, gh), or ambiguous/unverifiable native OpenCode identity
+#      (whoami, claim, release --if-mine). Explicit SESSION_PEERS_NAME/UUID/KIND
+#      overrides select an owner without automatic identity discovery.
 #   4  claim: held by ANOTHER LIVE session (its name/uuid printed: message it, do not steal;
 #      --force takes it anyway, say why in the trail); release --if-mine: not ours, kept
 set -uo pipefail
