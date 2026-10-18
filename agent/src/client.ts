@@ -2147,12 +2147,6 @@ export class WorkerClient {
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
-            runId: fields.runId,
-            workerId: fields.workerId,
-            workerIdentityMatches: !!this.registeredWorkerId && fields.workerId === this.registeredWorkerId,
-            sentClaimGeneration: body.claim_generation,
-            completionProjection: fields.completionProjection,
-            completionAttempts: fields.completionAttempts,
           };
           // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
           // match and no decline/switch disposition is present. Generation/nonce stay in the
@@ -2166,6 +2160,19 @@ export class WorkerClient {
               fields.memoryEpisode === memoryPark.binding.memory_episode) {
             Object.defineProperty(ack, "memoryParkAccepted", { value: memoryPark.binding, enumerable: true });
           }
+          if (typeof fields.runId === "string" && fields.runId.trim().length > 0)
+            ack.runId = fields.runId;
+          if (typeof fields.workerId === "string" && fields.workerId.trim().length > 0) {
+            ack.workerId = fields.workerId;
+            if (this.registeredWorkerId)
+              ack.workerIdentityMatches = fields.workerId === this.registeredWorkerId;
+          }
+          if (body.claim_generation !== undefined)
+            ack.sentClaimGeneration = body.claim_generation;
+          if (fields.completionProjection !== undefined)
+            ack.completionProjection = fields.completionProjection;
+          if (fields.completionAttempts !== undefined)
+            ack.completionAttempts = fields.completionAttempts;
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
               ack.completedPublicationReason = "unsupported_feature";

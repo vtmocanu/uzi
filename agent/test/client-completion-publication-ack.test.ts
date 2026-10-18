@@ -82,6 +82,33 @@ describe("M3 running ACK byte bound and cohesive projection", () => {
       assert.equal(ack.completionAttempts, expected);
     });
   }
+  for (const registered of [false, true]) {
+    for (const workerId of [undefined, null, {}, 42, "", " ", WORKER, "other-worker"]) {
+      it(`optional ACK identities registered=${registered}, worker=${JSON.stringify(workerId)}`, async t => {
+        t.mock.method(globalThis, "fetch", async (url: string | URL | Request) =>
+          String(url).endsWith("/register")
+            ? Response.json({ worker_id: WORKER, protocol_features: ["claim_generation_fence"] })
+            : Response.json({ run: { id: "run", worker_id: workerId, status: "running" } }));
+        const client = newClient();
+        if (registered) await client.register("m3");
+        const ack = await client.reportState("run", { status: "running" });
+        assert.equal(ack.runId, "run");
+        const meaningful = typeof workerId === "string" && workerId.trim().length > 0;
+        assert.equal("workerId" in ack, meaningful);
+        assert.equal("workerIdentityMatches" in ack, registered && meaningful);
+        if (registered && meaningful) assert.equal(ack.workerIdentityMatches, workerId === WORKER);
+        for (const key of ["sentClaimGeneration", "completionProjection", "completionAttempts"])
+          assert.equal(key in ack, false, key);
+      });
+    }
+  }
+  for (const runId of [undefined, null, {}, 42, "", " "]) {
+    it(`invalid run identity ${JSON.stringify(runId)} stays absent`, async t => {
+      t.mock.method(globalThis, "fetch", async () => Response.json({ run: { id: runId, status: "running" } }));
+      const ack = await newClient().reportState("run", { status: "running" });
+      assert.equal("runId" in ack, false);
+    });
+  }
   for (const strip of [false, true]) {
     it(`records actual outbound generation after strict-decode fallback strip=${strip}`, async t => {
       const posts: Record<string, unknown>[] = [];

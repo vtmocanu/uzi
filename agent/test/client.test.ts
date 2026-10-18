@@ -617,7 +617,7 @@ describe("reportState", () => {
     const ack = await client.reportState("run-1", { status: "failed", failure_reason: "boom" });
     // completedCount rides every ACK now: the RunDTO's milestones_completed is null (a nil Go
     // slice, no progress reported), which readRunAck reads as the fresh completed count 0.
-    assert.deepStrictEqual(ack, { applied: false, status: "cancelled", completedCount: 0 });
+    assert.deepStrictEqual(ack, { applied: false, status: "cancelled", runId: "run-1", completedCount: 0 });
     assert.strictEqual(api.states.length, 0);
   });
 
@@ -639,7 +639,7 @@ describe("reportState acknowledgement (PRD #35)", () => {
     const ack = await client.reportState("run-1", { status: "limit_wait", rate_limit_type: "five_hour" });
     // completedCount 0 rides the ACK: the parked RunDTO's milestones_completed is null (no
     // progress reported yet), which readRunAck reads as a fresh completed count of 0.
-    assert.deepStrictEqual(ack, { applied: true, status: "limit_wait", completedCount: 0 });
+    assert.deepStrictEqual(ack, { applied: true, status: "limit_wait", runId: "run-1", completedCount: 0 });
   });
 
   // 🔴 THE DISCRIMINATING CASE. Everything else in this file passes against an
