@@ -472,8 +472,7 @@ for that frozen epoch. The
 holds the matching-epoch permit through the runner action and its owned work,
 preserving primary-error independence and the unchanged Claude branch.
 
-**DRAFT — slice A, Refs #2852 (2026-10-18):** acceptance remains pending tests,
-review and integration gates; final executor ownership is still being completed.
+**Slice A candidate contract, Refs #2852 (2026-10-18):**
 A separate credential-free GitCache capture callback holds safety serialization,
 the epoch fence and closed admission through source reads, WIP commit, fetch-back,
 verification, authorized publication and full supervised-child settlement. An
@@ -486,7 +485,10 @@ mints neither a credentialed nor a completion permit. See the
 
 GitCache binds the restricted launch policy: the canonical environment includes
 exactly one empty `credential.helper` and one empty `core.askpass`, with no
-credential-bearing override. Trusted-worker bare Git keeps its worker identity;
+credential-bearing override. The strict GitCache builder policy matches the complete
+canonical environment, including indexed config order; it rejects extra helper or
+askpass entries, credential-bearing config and unapproved argv overrides.
+Trusted-worker bare Git keeps its worker identity;
 `worker_pat` is the historical identity name, not evidence of credential presence.
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:

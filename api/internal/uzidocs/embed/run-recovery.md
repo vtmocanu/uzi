@@ -77,8 +77,12 @@ hold's retained custody. After discarded/released precedence, an OPEN hold at
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
 
-The worker attempts preservation using its existing recovery path. Failed
-or uncertain capture keeps local source custody; there is no archive or
+The worker attempts preservation using its existing recovery path. Under the
+**slice A candidate contract (Refs #2852)**, Codex credential-free capture keeps
+execution closed through capture and settlement of the supervised capture processes,
+including credential-free recovery and retained-source capture. This does not prove
+that latest work is archived or authorize source deletion.
+Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
 uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
 the quiet threshold for the configured dwell are required before another
@@ -620,6 +624,18 @@ non-closing #1858 change disables unsafe automatic retention reclaim on every
 worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
+
+**Slice A candidate contract (Refs #2852):** credential-free capture, including owner pause,
+keeps execution closed without changing these retention rules. If a failed or withdrawn
+pause may have drained Codex execution, the saved session is loaded into a recreated
+provider epoch before work continues. Human or automatic gate revision after changed
+milestones follows the same rule. Newer cancellation, pause and vault-lock state are
+checked before credentials or another model turn; a locked vault can defer recreation
+into credential recovery. This does not make an open approval gate parkable. Healthy
+credentialed capture gaps (B) and the terminal snapshot/late-writer limitation (C)
+remain open; existing terminal disposal does not remove that snapshot limitation.
+A does not complete #2852. Independent #3031 work is not a prerequisite and gains no
+model-free capture coverage or changes to producers, ledger, custody or settlement.
 
 Retained bytes, identity metadata and the safety inventory have no retention
 bound. Existing per-seed process/teardown scope over non-live paths and ledger

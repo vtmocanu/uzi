@@ -27,9 +27,9 @@ open/seal calls or a same-operation retry's coherent durable recovery evidence. 
 checks still precede the vault outcome and are revalidated before the reply; the narrowly tolerated
 quarantine refusal grants evidence-check coordinates, not credential release authority (D1).
 
-**DRAFT — slice A, Refs #2852 (2026-10-18):** the held-capture and epoch-recreation
-amendments below await tests, review and integration gates; final executor ownership
-is still being completed. Earlier accepted protocol decisions retain their scope.
+**Slice A candidate contract, Refs #2852 (2026-10-18):** the held-capture and
+epoch-recreation amendments below define the candidate behavior. Earlier accepted
+protocol decisions retain their scope.
 
 Rather than fail the run, the worker **parks** it: it confirms the run is still `running`,
 settles Codex execution without touching the credential, and holds credential-free

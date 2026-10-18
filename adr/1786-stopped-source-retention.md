@@ -24,8 +24,7 @@ release paths also keep the exact clone and existing journal even when covered. 
 retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
 limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852).
 
-**DRAFT — slice A, Refs #2852 (2026-10-18):** tests, review and integration gates
-remain pending; final executor ownership is still being completed. A holds
+**Slice A candidate contract, Refs #2852 (2026-10-18):** A holds
 credential-free GitCache capture and its supervised children, including retained-source
 capture, under closed admission and an epoch fence. This preservation boundary grants
 no disposal authority: stopped and parked sources remain retained under this ADR.

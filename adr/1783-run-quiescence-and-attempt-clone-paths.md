@@ -220,7 +220,7 @@ removes the tree.
   survive its own reaper.
 - A Claude/stub pause that reaches its Linux proof boundary reaps attributed
   background processes. Codex owner-pause capture uses A's held supervisor capture
-  (DRAFT amendment below). Clone-bound Docker teardown remains best-effort cleanup,
+  (candidate contract below). Clone-bound Docker teardown remains best-effort cleanup,
   not writer-exclusion proof.
 - **M3 canonical-path quarantine (`freeCanonicalClonePath`/`quarantineCanonical`
   in `agent/src/git.ts`) runs on EVERY worker, wired or not**: `attemptSeedOptions`
@@ -268,8 +268,7 @@ removes the tree.
   park, actual graceful-shutdown durability, milestone checkpoint, pre-settle
   reap and finalize.
 
-  **DRAFT — slice A, Refs #2852 (2026-10-18):** tests, review and integration
-  gates remain pending; final executor ownership is still being completed.
+  **Slice A candidate contract, Refs #2852 (2026-10-18):**
   A separate credential-free GitCache capture callback covers owner pause and
   credential-free recovery, memory-pressure and retained-source captures. It
   holds safety serialization, the epoch fence and closed admission through source
@@ -351,7 +350,7 @@ removes the tree.
 
 Process proof remains limited to the boundary that actually runs: the Linux
 reaper where enabled, the existing credentialed Codex supervisor boundary, or
-A's callback-held credential-free GitCache capture (DRAFT amendment above).
+A's callback-held credential-free GitCache capture (candidate contract above).
 The held capture covers its action and supervised children; it does not close
 B's healthy credentialed pre-publish gaps or strengthen C's terminal release
 proof. Claude/stub process handling is unchanged. This says nothing about a Docker
@@ -627,7 +626,7 @@ The original follow-ups are recorded below with their later disposition where kn
   complete after the process proof and clean listings. #2852's terminal/Docker
   writer-exclusion remainder is not fixed. Currently unwired status is not durable
   proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial after slice A (DRAFT).** A holds owner
+- **Follow-up 4 — #2852 remains partial under the slice A candidate contract.** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission

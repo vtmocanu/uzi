@@ -77,11 +77,11 @@ hold's retained custody. After discarded/released precedence, an OPEN hold at
 otherwise `source_only`, before available unguarded archives or capture progress.
 Other custody attention decisions retain their existing ordering.
 
-The worker attempts preservation using its existing recovery path. **DRAFT —
-slice A, Refs #2852:** Codex credential-free capture keeps execution closed through
-capture and settlement of the supervised capture processes, including credential-free
-recovery and retained-source capture. Acceptance awaits tests, review and integration
-gates. This does not prove that latest work is archived or authorize source deletion.
+The worker attempts preservation using its existing recovery path. Under the
+**slice A candidate contract (Refs #2852)**, Codex credential-free capture keeps
+execution closed through capture and settlement of the supervised capture processes,
+including credential-free recovery and retained-source capture. This does not prove
+that latest work is archived or authorize source deletion.
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
 uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
@@ -625,7 +625,7 @@ worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
 
-**DRAFT — slice A, Refs #2852:** credential-free capture, including owner pause,
+**Slice A candidate contract (Refs #2852):** credential-free capture, including owner pause,
 keeps execution closed without changing these retention rules. If a failed or withdrawn
 pause may have drained Codex execution, the saved session is loaded into a recreated
 provider epoch before work continues. Human or automatic gate revision after changed
