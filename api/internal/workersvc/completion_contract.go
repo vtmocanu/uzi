@@ -23,14 +23,14 @@ import (
 // `completion_contract_version IS NOT NULL AND completion_contract IS NULL` so it freezes
 // once, idempotently, and only for an interlocked run.
 const (
-	// contractProfileStructural is the only profile M1 emits. #1230 adds semantic profiles.
+	// contractProfileStructural remains the only profile production freeze sites emit.
 	contractProfileStructural = "structural"
 	// contractRevisionInitial is the revision a freshly frozen contract carries; a permit
 	// fences on it and #1227 bumps it.
 	contractRevisionInitial = 1
 )
 
-// completionContract is the frozen structural contract's top-level shape.
+// completionContract is the single structural or dormant semantic contract shape.
 //
 // PRD #1227 M1 extends it with two OPTIONAL top-level blocks — `scope` and `accepted` — that an
 // owner decision writes at a bumped revision. Both are `omitempty`: a revision-1 contract (the
@@ -47,7 +47,12 @@ type completionContract struct {
 	Scope *scopeBlock `json:"scope,omitempty"`
 	// Accepted is the list of owner-accepted unmet criteria on a #1227 `accept` revision. nil on
 	// a revision-1 contract.
-	Accepted []acceptedEntry `json:"accepted,omitempty"`
+	Accepted                 []acceptedEntry                 `json:"accepted,omitempty"`
+	Sources                  []apitypes.SemanticSourceRef    `json:"sources,omitempty"`
+	PlanHash                 string                          `json:"plan_hash,omitempty"`
+	CandidateIdentityVersion string                          `json:"candidate_identity_version,omitempty"`
+	SourceOutcome            string                          `json:"source_outcome,omitempty"`
+	Coverage                 *apitypes.SemanticCoverageState `json:"coverage,omitempty"`
 }
 
 // scopeBlock is the in/out milestone split a `partial` decision records (PRD #1227 D2).
@@ -76,15 +81,21 @@ type acceptedEntry struct {
 	Revision    int    `json:"revision"`
 }
 
-// completionCriterion is one server-minted structural criterion (one per frozen milestone).
+// completionCriterion carries structural fields and optional semantic fields.
+// Structural criteria remain one per frozen milestone; omitted semantic fields preserve their JSON.
 // Audit is a nil pointer so it marshals to JSON `null` (a reserved slot, no omitempty);
 // FindingIDs is initialized to the empty slice so it marshals to `[]`, never `null`.
 type completionCriterion struct {
-	ID          string           `json:"id"`
-	MilestoneID string           `json:"milestone_id"`
-	Text        string           `json:"text"`
-	Audit       *json.RawMessage `json:"audit"`
-	FindingIDs  []string         `json:"finding_ids"`
+	ID                   string                       `json:"id"`
+	MilestoneID          string                       `json:"milestone_id"`
+	Text                 string                       `json:"text"`
+	Audit                *json.RawMessage             `json:"audit"`
+	FindingIDs           []string                     `json:"finding_ids"`
+	Kind                 string                       `json:"kind,omitempty"`
+	DoneWhen             string                       `json:"done_when,omitempty"`
+	Citations            []apitypes.SemanticCitation  `json:"citations,omitempty"`
+	EvidenceRequirements []apitypes.SemanticEvidence  `json:"evidence_requirements,omitempty"`
+	Maintainer           *apitypes.SemanticMaintainer `json:"maintainer,omitempty"`
 }
 
 // buildCompletionContract builds the frozen structural completion contract jsonb (PRD #1226

@@ -173,6 +173,27 @@ export function findValidPrdCore(
   return firstValid;
 }
 
+/** All detected cores for bounded semantic capture, including invalid candidates.
+ * Unlike findValidPrdCore this never chooses a preferred document or drops an
+ * unsafe candidate. The semantic caller bounds the complete issue before scanning.
+ */
+export function findSemanticPrdPaths(text: string): string[] {
+  const paths = new Set<string>();
+  // Keep unsafe/control-bearing candidates whole rather than accepting a valid prefix.
+  for (const match of text.matchAll(/[^\s`"'<>()[\]?#]+/g)) {
+    const token = match[0];
+    const start = token.indexOf("prds/");
+    if (start < 0 || !token.slice(start).includes(".md")) continue;
+    const prefix = token.slice(0, start);
+    // Blob URLs share the existing parser's clone-relative core semantics.
+    // Other prefixes (absolute/traversal/backslash) must remain unsafe paths.
+    const core = prefix === "" || /^https?:\/\/.+\/(?:-\/)?blob\/.+\/$/.test(prefix)
+      ? token.slice(start) : token;
+    paths.add(core.replace(/(\.md)[,.;:!]+$/, "$1"));
+  }
+  return [...paths];
+}
+
 export interface PrdInput {
   prdPath: string | null;
   prdText: string | null;
@@ -261,8 +282,8 @@ export interface BarePrdReader {
   readBare(
     barePath: string,
     args: readonly string[],
-    opts: { maxBytes: number; timeoutMs?: number; signal?: AbortSignal },
-  ): Promise<{ text: string; truncated: boolean }>;
+    opts: { maxBytes: number; timeoutMs?: number; signal?: AbortSignal; includeBytes?: boolean },
+  ): Promise<{ text: string; truncated: boolean; bytes?: Uint8Array }>;
 }
 
 /**

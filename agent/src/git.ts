@@ -877,6 +877,8 @@ const PREPARED_ABORT_GRACE_MS = 5_000;
 
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
+  /** Preserve exact bounded stdout bytes for trusted source capture; text callers are unchanged. */
+  includeBytes?: boolean;
   /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
    *  Must be finite and non-negative; readBare throws otherwise. */
   maxBytes: number;
@@ -911,6 +913,7 @@ interface SpawnGitOptions {
 export interface BoundedRead {
   text: string;
   truncated: boolean;
+  bytes?: Uint8Array;
 }
 
 // PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
@@ -10411,8 +10414,9 @@ export class GitCache {
       const text = (truncated: boolean): BoundedRead => {
         // StringDecoder.write holds back an incomplete trailing sequence: a cut through a
         // multi-byte character drops that character instead of rendering U+FFFD.
-        const decoded = new StringDecoder("utf8").write(Buffer.concat(chunks, bytes));
-        return { text: decoded, truncated };
+        const raw = Buffer.concat(chunks, bytes);
+        const decoded = new StringDecoder("utf8").write(raw);
+        return { text: decoded, truncated, ...(opts.includeBytes ? { bytes: raw } : {}) };
       };
       const onData = (chunk: Buffer | string): void => {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
