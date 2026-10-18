@@ -45,7 +45,7 @@ async function fixture(t: test.TestContext) {
   const client: RecoveryArchiveClient = {
     observeTerminalMaintenanceHold: async () => {
       holdCalls++;
-      MaintenanceResources.consumeIfActive("rpcAttempts", 1);
+      MaintenanceResources.consumeIfActive("rpcAttempts", 2);
       if (closed) return { ok: false, reason: "invalid_exact_hold" };
       return { ok: true, token, hold: { run_id: runId, generation: 1, hold_id: holdId, repo_id: repo,
         original_worker_id: workerId, original_worker_identity: "human-label",
@@ -79,7 +79,15 @@ async function fixture(t: test.TestContext) {
       return { entered: true, value: await action({
         open: () => open && !executing,
         isLivePath: () => executing,
-        quiesce: async () => { quiesceCalls++; events.push("quiesce"); return quiescent; },
+        quiesce: async () => { throw new Error("bridge owns quiescence"); },
+        captureWip: async (_path, oldHead, callbacks) => {
+          quiesceCalls++; events.push("quiesce");
+          if (!quiescent) throw new Error("not quiescent");
+          await callbacks.beforeStep("status");
+          await callbacks.beforeStep("status");
+          await callbacks.afterRunnerGit("status");
+          return { kind: "clean", head: oldHead, parent: null };
+        },
       }) };
     },
   });
@@ -218,7 +226,8 @@ test("terminal origin missing indexed artifact cannot charge or mint after chang
   assert.ok(published[0]);
   assert.equal((await f.coordinator.inspect(runId)).length, 1);
   const before = (await f.table()).cycles[0];
-  assert.deepEqual(before.outputs, [digest(path.basename(published[0], ".json"))]);
+  assert.deepEqual(before.outputs, [digest(path.basename(published[0], ".json")),
+    digest(["maintenance-wip-v1", before.identity, sha])]);
   assert.equal(before.slots.length, 1);
   await fs.unlink(path.join(f.dir, published[0]));
   f.headChanged();

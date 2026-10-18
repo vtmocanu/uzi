@@ -3304,6 +3304,8 @@ export class RecoveryCoordinator {
           if (!ctx.open() || residueQuarantine() !== undefined || !current(held.token) ||
               family.originals.some(s => ctx.isLivePath(s.clonePath))) refused("boundary_closed");
         };
+        if (typeof ctx.captureWip !== "function") return refused("boundary_closed");
+        const captureWip = ctx.captureWip;
         // Renew exact custody under discovery counters, outside discovery at charge.
         stage = "exact_hold_refused";
         const chargedHold = await M1MaintenanceResources.runDiscovery(async () => {
@@ -3332,48 +3334,75 @@ export class RecoveryCoordinator {
             chargedSignal = M1MaintenanceResources.signalIfActive();
             stage = "source_unverified";
             check();
-            if (!await freshFamily() || !await ctx.quiesce(family.originals.map(s => s.clonePath))) return refused(stage);
-            check();
             if (!await freshFamily() || await originDigest(original.barePath, original.cloneUrl) !== origin) return refused(stage);
             const sourceSha = await head(genesis.clonePath);
             if (!sourceSha || !/^[a-f0-9]{40}$/.test(sourceSha)) return refused(stage);
             check();
-            const fresh = async () => {
+            const fresh = async (expectedHead?: string) => {
               check();
               if (!await freshFamily() || await originDigest(original.barePath, original.cloneUrl) !== origin ||
-                  await head(genesis.clonePath) !== sourceSha) refused("source_unverified");
+                  (expectedHead !== undefined && await head(genesis.clonePath) !== expectedHead)) refused("source_unverified");
               const exact = await observe(genesis.runId, genesis.generation, binding, signal);
               check();
               if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token) ||
                   exact.hold.original_worker_id !== admission.identity.custodian ||
                   !current(chargedHold.token)) refused("exact_hold_refused");
             };
-            await this.withJournalLock(genesis.runId, async () => {
-              // A single bounded second view closes replay/publication races.
-              stage = "metadata_incomplete";
-              const existing = await records();
-              if (!localBindingsMatch(existing, binding)) return refused("local_binding_mismatch");
-              if (existing.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary" || this.savedSourceCandidate(r)))
-                return refused("source_protected_or_ambiguous");
-              stage = "source_unverified";
-              await fresh();
+            let published = false;
+            const revalidate = async () => {
               stage = "history_refused";
               const validation = await ledger.revalidate(slot, { ...admission, quiescent: true, sourceOutputContinuity: true });
               if (!validation.ok) return refused(validation.reason);
-              const captureId = "maintenance-v1-" + randomUUID();
-              if (captureId.length !== 51 || classifyRecoveryOrigin(captureId) !== "producer") return refused("invalid_context");
-              const mutation = await ledger.beforeMutation(slot, [hash(captureId)]);
-              if (!mutation.ok) return refused(mutation.reason);
-              await fresh();
-              stage = "publication_unverified";
-              await this.writeProducerOriginUnlocked({
-                version: JOURNAL_VERSION, runId: genesis.runId, generation: genesis.generation,
-                captureId, sourceSha, kind: original.kind, branch: original.branch,
-                createdAt: this.now(), state: "pinned", inventoryGuarded: true,
-                bareDir: path.basename(original.barePath), defaultBranch: original.defaultBranch,
-                exactHoldBinding: binding,
-              }, check, fresh);
-            }, signal);
+            };
+            const result = await captureWip(genesis.clonePath, sourceSha, {
+              beforeStep: async step => {
+                // The bridge has positively joined the family before this first callback.
+                // Publish once, before the primitive enumerates or hashes any raw source.
+                if (published) { await fresh(sourceSha); await revalidate(); return; }
+                if (step !== "status") return refused("source_unverified");
+                await this.withJournalLock(genesis.runId, async () => {
+                  // A single bounded second view closes replay/publication races.
+                  stage = "metadata_incomplete";
+                  const existing = await records();
+                  if (!localBindingsMatch(existing, binding)) return refused("local_binding_mismatch");
+                  if (existing.some(r => classifyRecoveryOrigin(r.captureId) !== "ordinary" || this.savedSourceCandidate(r)))
+                    return refused("source_protected_or_ambiguous");
+                  stage = "source_unverified";
+                  await fresh(sourceSha);
+                  await revalidate();
+                  const captureId = "maintenance-v1-" + randomUUID();
+                  if (captureId.length !== 51 || classifyRecoveryOrigin(captureId) !== "producer") return refused("invalid_context");
+                  check();
+                  const mutation = await ledger.beforeMutation(slot, [hash(captureId)]);
+                  if (!mutation.ok) return refused(mutation.reason);
+                  check();
+                  stage = "publication_unverified";
+                  await this.writeProducerOriginUnlocked({
+                    version: JOURNAL_VERSION, runId: genesis.runId, generation: genesis.generation,
+                    captureId, sourceSha, kind: original.kind, branch: original.branch,
+                    createdAt: this.now(), state: "pinned", inventoryGuarded: true,
+                    bareDir: path.basename(original.barePath), defaultBranch: original.defaultBranch,
+                    exactHoldBinding: binding,
+                  }, check, () => fresh(sourceSha));
+                }, signal);
+                published = true;
+              },
+              afterRunnerGit: async step => {
+                // Commit has changed HEAD; the primitive verifies its exact parent/result.
+                await fresh(step === "commit" ? undefined : sourceSha);
+                await revalidate();
+              },
+            });
+            if (!published || !result || typeof result.head !== "string" || !/^[a-f0-9]{40}$/.test(result.head) ||
+                (result.kind !== "clean" && result.kind !== "committed") ||
+                (result.kind === "clean" ? result.head !== sourceSha || result.parent !== null :
+                  result.head === sourceSha || result.parent !== sourceSha)) return refused("source_unverified");
+            await fresh(result.head);
+            await revalidate();
+            check();
+            const indexed = await ledger.beforeMutation(slot, [hash(["maintenance-wip-v1", admission.identity, result.head])]);
+            if (!indexed.ok) return refused(indexed.reason);
+            check();
           }, { signal, durationMs: Math.min(slot.deadline - Date.now(), M1MaintenanceResources.remainingMsIfActive()) }));
         } finally {
           // Publication ambiguity keeps the precharged fence even on readback failure.
@@ -3381,7 +3410,7 @@ export class RecoveryCoordinator {
           const finished = await ledger.finish(slot, "transient");
           if (!finished.ok) report(finished.reason);
         }
-      });
+      }, signal);
       if (!entered.entered) report("boundary_closed");
     } catch {
       report(stage);

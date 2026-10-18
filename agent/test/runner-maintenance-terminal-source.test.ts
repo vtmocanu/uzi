@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { DataVolumeGuard } from "../src/disk-full.js";
 import { WorkerClient } from "../src/client.js";
 import { SteeringChannel } from "../src/steering.js";
 import { rmTreePinned } from "../src/rmtree.js";
 import type { Executor } from "../src/executor.js";
 import { MaintenanceResources } from "../src/recovery-maintenance.js";
-import { RecoveryCoordinator } from "../src/recovery.js";
+import { canonicalJson, RecoveryCoordinator } from "../src/recovery.js";
 import { recordingLogger, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, deferred, runnerWith } from "./runner-harness.js";
 
@@ -178,9 +178,25 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
           tracked: await fs.readFile(path.join(source, "README.md"), "utf8"),
           untracked: await fs.readFile(path.join(source, "unique-untracked"), "utf8"),
         });
-        const before = await snapshot(), beforeAttempts = attempts;
+        if (mode === "origin-admission") await fs.writeFile(path.join(source, "maintenance-wip"), unique);
+        const before = await snapshot(), beforeAttempts = attempts, beforeModels = models;
+        const upload = t.mock.method(client, "uploadRecoveryBundle");
+        const reserve = t.mock.method(client, "reserveRecoveryCapture");
+        const held = t.mock.method(client, "publishHeld");
         const result = await action(ctx);
-        assert.deepEqual(await snapshot(), before, "origin publication leaves source, refs, tracking and owed untouched");
+        assert.equal(models, beforeModels);
+        assert.equal(upload.mock.callCount(), 0);
+        assert.equal(reserve.mock.callCount(), 0);
+        assert.equal(held.mock.callCount(), 0);
+        upload.mock.restore(); reserve.mock.restore(); held.mock.restore();
+        const after = await snapshot();
+        if (mode === "origin-admission") {
+          assert.notEqual(after.head, before.head);
+          assert.notDeepEqual(after.index, before.index);
+          assert.deepEqual({ ...after, head: before.head, index: before.index }, before);
+          assert.equal(command(source, "rev-parse", "HEAD^"), before.head);
+          assert.equal(command(source, "status", "--porcelain"), "");
+        } else assert.deepEqual(after, before, "refusal leaves source unchanged");
         assert.equal(attempts, beforeAttempts, "origin publication grants no capture permit");
         return result;
       }));
@@ -289,7 +305,15 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       } else {
         const prefix = prefixes[0];
         assert.ok(prefix);
-        assert.equal(prefix.sourceSha, command(source, "rev-parse", "HEAD"));
+        const resultHead = command(source, "rev-parse", "HEAD");
+        assert.equal(prefix.sourceSha, command(source, "rev-parse", "HEAD^"), JSON.stringify(log.lines.slice(-5)));
+        assert.equal(prefix.attemptedHeadSha, undefined);
+        const ledger = JSON.parse(await fs.readFile(path.join(git.recoveryRoot, "..", "recovery-maintenance", "complete.json"), "utf8")).value;
+        const cycle = ledger.cycles[0];
+        const output = createHash("sha256").update(canonicalJson(["maintenance-wip-v1", cycle.identity, resultHead])).digest("hex");
+        assert.ok(cycle.outputs.includes(output));
+        assert.equal(cycle.slots.length, 1);
+        assert.equal(cycle.fenced, true);
         assert.equal(prefix.heldPolicy, undefined);
         assert.equal(prefix.generation, 1);
       }
