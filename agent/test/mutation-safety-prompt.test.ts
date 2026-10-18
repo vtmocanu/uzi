@@ -14,9 +14,12 @@ function assertMutationSafety(prompt: string): void {
   for (const rule of [
     /deliberate mutation checks only in a disposable scratch export/,
     /including intended uncommitted edits, not a stale committed version/,
+    /copy the intended uncommitted candidate files and any required untracked test files into your own export/,
     /Never mutate the primary or shared candidate/,
     /restore command, trap or finally cannot protect it from worker death/,
     /cannot run in isolation, report it as blocked/,
+    /files or dependencies are unavailable in permitted scratch, the mutation check remains unvalidated/,
+    /never waive it or claim it passed/,
     /Never copy a mutant back or commit it/,
     /keep complete equality and ordering checks/,
     /report only a bounded first mismatch/,
