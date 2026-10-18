@@ -499,6 +499,7 @@ for (const resumed of [false, true]) test(`Codex executor prepares current evide
           nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
         supervisorPid: 200, transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => ({ event: "child_exit", code: 0 }),
         dispose: async () => {
           stdin.end(); stdout.end(); stderr.end();
