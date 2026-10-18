@@ -158,6 +158,7 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
   };
   const executor: Executor = {
     safety,
+    withCredentialFreeCapture: (ms, action, _purpose, signal) => inner.withCredentialFreeCapture(ms, action, signal),
     settleForCredentialFreeCapture: (ms) => inner.settleForCredentialFreeCapture(ms),
     run: async (ctx: RunContext): Promise<ExecutorResult> => {
       if (flight === 1) {

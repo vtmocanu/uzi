@@ -539,6 +539,7 @@ export class CodexHarness implements RunHarness {
   private readonly childUsageLanes = new Map<string, Readonly<HarnessAttribution>>();
   private readonly pendingChildUsage = new Map<string, Extract<HarnessEvent, { kind: "usage_record" }>[]>();
   private closed = false;
+  private closeCompletion?: Promise<void>;
 
   // PRD #1332 C4a: the executor-claim-leg token accountant. It holds the IMMUTABLE thread->model
   // map and survives provider-epoch recreation inside this executor invocation. Each terminal emits
@@ -1036,8 +1037,17 @@ export class CodexHarness implements RunHarness {
    *  reap — that is quiesce/reap/dispose. Public so the executor's terminal cleanup can
    *  close the transport (rejecting any straggler request) after the registry reaps the
    *  provider root; the per-turn `HarnessTurn.close` seam routes here too. */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closeCompletion) return this.closeCompletion;
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const completion = new Promise<void>((done, fail) => { resolve = done; reject = fail; });
+    this.closeCompletion = completion;
+    void this.closeOwned().then(resolve, reject);
+    return completion;
+  }
+
+  private async closeOwned(): Promise<void> {
     this.closed = true;
     this.turnClosed = true;
     this.stopRequested = true;
@@ -1045,11 +1055,16 @@ export class CodexHarness implements RunHarness {
     // than hang on that await while the transport is torn down underneath it.
     this.stopTurn?.();
     this.appServerAuth?.closeAdmissionAndCancel();
-    try {
-      await this.transport?.close();
-    } finally {
-      await this.appServerAuth?.drainInterceptedRequests();
+    let primary: unknown;
+    let failed = false;
+    try { await this.transport?.close(); }
+    catch (error) { primary = error; failed = true; }
+    try { await this.appServerAuth?.drainInterceptedRequests(); }
+    catch (error) {
+      if (failed) throw new AggregateError([primary, error], "codex harness close failed");
+      throw error;
     }
+    if (failed) throw primary;
   }
 
   /** Shared stop path for an owner abort / watchdog / requestStop / close: interrupt the

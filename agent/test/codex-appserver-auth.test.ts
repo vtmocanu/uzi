@@ -11,6 +11,13 @@ import {
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import { CodexCredentialDeferredError } from "../src/codex/codex-executor.js";
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 const INITIAL = { accessToken: "initial-access-token", accountId: "server-account-1" };
 const REFRESHED = { accessToken: "refreshed-access-token", accountId: "server-account-1" };
 
@@ -132,6 +139,44 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 describe("Codex app-server auth: pinned startup ordering and modes", () => {
+  it("checks delivery admission synchronously and retains the operation after refusal", async () => {
+    let admitted = true;
+    const operations: string[] = [];
+    const auth = createCodexAppServerAuth({
+      mode: "subscription", initial: INITIAL,
+      bridge: { refresh: async ({ operationId }) => {
+        operations.push(operationId);
+        admitted = false;
+        return REFRESHED;
+      } },
+      assertRefreshAdmission: () => { if (!admitted) throw new Error("capture fence"); },
+    });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    await auth.handleServerRequest(transport, refreshRequest(1));
+    assert.ok(responses(transport).every(call => !("result" in (call.response as object))));
+    await auth.handleServerRequest(transport, refreshRequest(2));
+    assert.equal(operations.length, 2);
+    assert.equal(operations[0], operations[1]);
+  });
+
+  it("drains direct accepted handlers through raw settlement and response delivery", async () => {
+    const raw = deferred<ServerVerifiedCodexAuthTokens>();
+    const entered = deferred<void>();
+    const auth = subscription({ refresh: () => { entered.resolve(); return raw.promise; } });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+    const handling = auth.handleServerRequest(transport, refreshRequest(1));
+    await entered.promise;
+    let drained = false;
+    const draining = auth.drainInterceptedRequests().then(() => { drained = true; });
+    assert.equal(drained, false);
+    raw.resolve(REFRESHED);
+    await draining;
+    assert.equal(responses(transport).length, 1, "drain includes the direct handler's delivery");
+    await handling;
+  });
+
   it("subscription sends initialize, initialized, then server-verified chatgptAuthTokens login", async () => {
     const transport = new FakeTransport();
     const auth = subscription({ refresh: async () => REFRESHED });
@@ -433,7 +478,16 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     assert.equal(bridgeCalls, 0);
   });
 
-  it("retains poison when an abort-ignoring bridge races close", async () => {
+  it("retains poison when an abort-ignoring bridge races close", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const graceScheduled = deferred<void>();
+    const schedule = globalThis.setTimeout;
+    t.mock.method(globalThis, "setTimeout", (...args: Parameters<typeof setTimeout>) => {
+      const timer = schedule(...args);
+      if (args[1] === 250) graceScheduled.resolve();
+      return timer;
+    });
+    const raw = deferred<ServerVerifiedCodexAuthTokens>();
     let markEntered!: () => void;
     const entered = new Promise<void>((resolve) => {
       markEntered = resolve;
@@ -443,7 +497,7 @@ describe("Codex app-server auth: intercepted request ownership", () => {
         markEntered();
         // Deliberately ignores AbortSignal. The 250ms cancellation-settlement guard must
         // poison this accepted operation, and shutdown must retain that poison.
-        return new Promise<ServerVerifiedCodexAuthTokens>(() => {});
+        return raw.promise;
       },
     });
     const transport = new FakeTransport();
@@ -451,17 +505,29 @@ describe("Codex app-server auth: intercepted request ownership", () => {
     assert.equal(transport.emitServerRequest(refreshRequest(1)), true);
     await entered;
 
+    const poisoned = deferred<void>();
+    const close = transport.close.bind(transport);
+    transport.close = () => { poisoned.resolve(); return close(); };
     auth.closeAdmissionAndCancel();
-    await transport.close();
-    await assert.rejects(
-      withTimeout(auth.drainInterceptedRequests(), 500, "uncooperative bridge poison"),
+    const drain = auth.drainInterceptedRequests();
+    let drained = false;
+    const checked = assert.rejects(drain,
       (error: unknown) => {
         assert.ok(error instanceof CodexAppServerAuthError);
         assert.equal(error.poisoned, true);
         assert.match(error.message, /did not settle after cancellation/);
         return true;
       },
-    );
+    ).finally(() => { drained = true; });
+    await graceScheduled.promise;
+    t.mock.timers.tick(250);
+    // The intercepted handler closes transport after observing the sticky poison.
+    // That event is independent of the still-owned raw bridge promise.
+    await poisoned.promise;
+    assert.equal(drained, false, "raw bridge still owns drain after cancellation grace");
+    raw.resolve(REFRESHED);
+    await checked;
+    await assert.rejects(auth.drainInterceptedRequests(), /did not settle after cancellation/);
   });
 
   it("retains malformed-response poison accepted immediately before close", async () => {

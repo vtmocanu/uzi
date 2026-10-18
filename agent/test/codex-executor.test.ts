@@ -839,6 +839,12 @@ describe("M3 actual runner memory Codex delivery", () => {
           assert.ok(captured, "actual RunRunner supplies trusted captured memory before Codex admission");
           return executor.run(ctx);
         },
+        withCredentialFreeCapture: async (ms, action, purpose, signal) => {
+          assert.ok(ms > 0 && ms <= 5000, "settlement stays inside the finite owner budget");
+          const result = await executor.withCredentialFreeCapture(ms, action, purpose, signal);
+          settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
+          return result;
+        },
         settleForCredentialFreeCapture: async (...args) => {
           assert.ok(args[0] > 0 && args[0] <= 5000, "settlement stays inside the finite owner budget");
           const result = await executor.settleForCredentialFreeCapture(...args);
@@ -1698,7 +1704,26 @@ describe("#2493 initial credential release", () => {
         const url = await api.listen();
         const fx = makeFixture();
         const rig = makeMultiEpochRig([]);
-        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+        const effect = rig.deps.launchEffectRoot!;
+        rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1,
+          launchEffectRoot: async (spec, deadline) => {
+            const handle = await effect(spec, deadline);
+            const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+              ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+            if (argv[0] !== "/usr/bin/git") return handle;
+            // Capture now uses the production supervised adapter. The rig's
+            // otherwise-never-ending fileop streams cannot stand in for Git output.
+            const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+            const timer = setTimeout(() => child.kill(), deadline);
+            const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+              child.once("error", error => { clearTimeout(timer); reject(error); });
+              child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+            });
+            return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+              waitChild: async () => exited,
+              dispose: async ms => { await exited; return handle.dispose(ms); } };
+          },
+        };
         const diagnostics = recordingLog();
         const client = new WorkerClient(url, "recovery-release-worker", "test", diagnostics.log,
           { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
@@ -2734,6 +2759,14 @@ describe("m1 credential-free owner cancel", () => {
           },
           get safety() { return executor.safety; },
           sandboxesCommands: true,
+          withCredentialFreeCapture: async (ms, action, purpose, signal) => {
+            settlingCancel = purpose === "cancel";
+            try {
+              const result = await executor.withCredentialFreeCapture(ms, action, purpose, signal);
+              settlementKind = result.kind;
+              return result;
+            } finally { settlingCancel = false; }
+          },
           settleForCredentialFreeCapture: async (ms, purpose) => {
             settlingCancel = purpose === "cancel";
             try {
@@ -20118,7 +20151,7 @@ describe("#2852 default installer binding", () => {
         if (order === "capture-first") {
           await withTimeout(bodyEntered.promise, 3000, "capture owns body");
           assert.equal(fx.returned(), false);
-          assert.equal(fx.rig.transport.closes, 0, "terminal harness close queues behind capture body");
+          assert.equal(fx.rig.transport.closes, 1, "capture closes auth transport before its body");
           assert.equal(fx.rig.disposed(), 0, "terminal disposal queues behind capture body");
           await assert.rejects(fx.exec.run(fx.ctx), /codex (run already active|epoch admission closed for capture)/);
         }

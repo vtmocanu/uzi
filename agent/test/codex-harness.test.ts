@@ -333,6 +333,13 @@ function completedItem(item: Record<string, unknown>, threadId = "th-1"): CodexN
 }
 
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 describe("m1 response usage", () => {
   const records = (events: HarnessEvent[]) => events.filter((e): e is Extract<HarnessEvent, { kind: "usage_record" }> => e.kind === "usage_record");
   const last = { inputTokens: 100, cachedInputTokens: 30, cacheWriteInputTokens: 20, outputTokens: 40, totalTokens: 140 };
@@ -5586,6 +5593,61 @@ describe("CodexHarness: error precedence + lifecycle", () => {
     turn.requestStop("cancel");
     assert.deepEqual(await collect(turn.events), []);
     assert.equal(transport.requests.length, 0, "the stopped lazy turn launches no model work");
+  });
+
+  it("reentrant transport close observes the shared pending completion and sticky rejection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    const cleanup = deferred<void>();
+    const failure = new Error("reentrant transport close failed");
+    let reentered: Promise<void> | undefined;
+    let closes = 0;
+    transport.close = () => {
+      closes++;
+      reentered = harness.close();
+      return cleanup.promise;
+    };
+    const first = harness.close();
+    assert.ok(reentered);
+    const settled: unknown[] = [];
+    const observe = (work: Promise<void>) => work.then(
+      () => { settled.push("fulfilled"); }, error => { settled.push(error); });
+    const joined = Promise.all([observe(first), observe(reentered)]);
+    try {
+      await tick();
+      assert.deepEqual(settled, [], "a reentrant close cannot finish before owned cleanup");
+      cleanup.reject(failure);
+      await joined;
+      assert.deepEqual(settled, [failure, failure]);
+      await assert.rejects(harness.close(), error => error === failure);
+      assert.equal(closes, 1);
+    } finally { cleanup.reject(failure); await joined; }
+  });
+
+  it("concurrent and repeated close callers share pending completion and rejection", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("completed")).end();
+    await collect(harness.startTurn(makeRequest()).events);
+    const cleanup = deferred<void>();
+    const failure = new Error("transport close failed");
+    let closes = 0;
+    transport.close = () => { closes++; return cleanup.promise; };
+    const first = harness.close();
+    const second = harness.close();
+    const settled: unknown[] = [];
+    const observe = (work: Promise<void>) => work.then(
+      () => { settled.push("fulfilled"); }, error => { settled.push(error); });
+    const joined = Promise.all([observe(first), observe(second)]);
+    try {
+      await tick();
+      assert.deepEqual(settled, [], "every close caller waits for owned cleanup");
+      cleanup.reject(failure);
+      await joined;
+      assert.deepEqual(settled, [failure, failure]);
+      await assert.rejects(harness.close(), error => error === failure);
+      assert.equal(closes, 1);
+    } finally { cleanup.reject(failure); await joined; }
   });
 
   it("close() is idempotent and does NOT reap / dispose / quiesce the registry", async () => {

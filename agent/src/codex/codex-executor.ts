@@ -2695,7 +2695,20 @@ export class CodexExecutor implements Executor {
       beforeReapPersist = epoch.persistSession();
       await beforeReapPersist;
     };
-    this.beforeCaptureDrain = beforeReapingSink;
+    this.beforeCaptureDrain = async () => {
+      const capturedEpoch = epoch;
+      let primary: unknown;
+      let failed = false;
+      try { await beforeReapingSink(); }
+      catch (error) { primary = error; failed = true; }
+      try { await capturedEpoch?.harness.close(); }
+      catch (error) {
+        capturedEpoch?.registry.poison({ category: "protocol", message: "codex capture: auth cleanup failed" });
+        if (failed) throw new AggregateError([primary, error], "codex capture save and auth cleanup failed");
+        throw error;
+      }
+      if (failed) throw primary;
+    };
     this.captureMayHaveDrained = () => reapedSinceLastPersist;
     // Issue #1764: route a completion hold, persisting first when the hold sink will be invoked
     // (the same condition routeCompletionHold applies).
@@ -4240,7 +4253,15 @@ export class CodexExecutor implements Executor {
         ? {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
-            bridge: buildAppServerRefreshBridge(ctx.runId, this.opts.client, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked()),
+            assertRefreshAdmission: () => this.assertCaptureAdmission(revision),
+            bridge: buildAppServerRefreshBridge(ctx.runId, {
+              refreshCodex: async (...args) => {
+                this.assertCaptureAdmission(revision);
+                const result = await this.opts.client.refreshCodex(...args);
+                this.assertCaptureAdmission(revision);
+                return result;
+              },
+            }, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked()),
           }
         : { mode: "api_key", apiKey: initialToken };
       const appServerAuth = createCodexAppServerAuth(authConfig);
