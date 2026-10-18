@@ -83,8 +83,9 @@ involve no source that could be lost and refusing them would strand custody:
   that the unlatched flow sends at completion; and
 - the pre-clone park's hold release, where no source exists.
 
-A completed run's clone is therefore kept until cleaned up by hand. No sweep removes
-it.
+A completed run's clone is therefore kept. Attributed sources may use the existing
+guarded operator discard; quarantine still refuses that operation while latched.
+No automatic retention sweep removes it (see #1858 below).
 
 ### Why the ordinary settle is not reused
 
@@ -135,7 +136,7 @@ report a fixed text), and gets no archive; detection is a side effect of every
 process-scanning check, so which of the two a run hits depends on what stops it, not
 on which run detected the process. Checks that do not stop the run when they block
 include, for example, the milestone checkpoint, pause, limit or wall park, completion
-hold, shutdown requeue, credential-switch capture, attempt retention, the pre-settle
+hold, shutdown requeue, credential-switch capture, the pre-settle
 reap and the terminal retire: a run that continues fails at a later step in one of
 the two ways; a park or requeue stands and the run resumes on another worker, or here
 after the restart; at the terminal retire the run has already reported. Where the capture
@@ -182,8 +183,8 @@ credentialed git child and no new provider turn starts once the latch is held.
 - **No revocation.** Credentials exposed before detection are not revoked.
 - **Forced latches.** Any run can force a latch: a fail-closed denial of service on a
   shared worker, bounded by a restart and attributed in Health.
-- **Completed-run clone.** Kept forever while latched and after, until cleaned by
-  hand.
+- **Completed-run clone.** Kept while latched and after, until an existing guarded
+  operator discard is authorized; restarting alone does not authorize deletion.
 - **Skipped terminal quiesce.** Any run whose failure path already set
   `preserveRecoveryClone` (latched when it fails, or a latch caught before its settle)
   skips the `terminal_retire` quiesce, as residue-blocked runs did before.
@@ -203,46 +204,86 @@ credentialed git child and no new provider turn starts once the latch is held.
 
 ## Amendment 2026-10-14 — #1859: residue retention veto
 
-Current canonical reseeding and attempt seeding share per-key residue retention
-in `agent/src/git.ts` (`sweepResidue`). Canonical retention runs under the bare
-lock after successful canonical free and before the new seed; attempt retention
-runs after seed/live registration. Abandoned-attempt and orphaned-skills phases
-remain exclusive to the attempt path. The original ADR-1783 Docker-only sweep
-gap is historical; [its current-coverage amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-14--1859-shared-per-key-residue-retention)
-records the shared helper and the inherited Docker Follow-up 3 risk.
+**Historical implementation record — superseded by #1858 below.** The entire
+quoted description records #1859's sweep and veto, not current deletion policy.
 
-Residue deletion requires fresh readable journal evidence (protecting a named
-candidate or descendant), a non-live path and an affirmative scoped seed-process
-verdict. Quarantine is checked before and after proof and synchronously at the
-deletion boundary after awaited validation. An active or newly latched
-`unreadable_unattributed` worker quarantine keeps all residue entries.
-Fresh-attempt seeding's unreadable-process relaxation never authorizes deletion.
-False, absent or unverified process proof and generic thrown proof keep entries
-with bounded diagnostics; classified control/recovery interruptions propagate.
-Off-Linux absence of a process verdict keeps entries. The latch's cause,
-lifetime, credential protections and custody semantics are unchanged.
+> Current canonical reseeding and attempt seeding share per-key residue retention
+> in `agent/src/git.ts` (`sweepResidue`). Canonical retention runs under the bare
+> lock after successful canonical free and before the new seed; attempt retention
+> runs after seed/live registration. Abandoned-attempt and orphaned-skills phases
+> remain exclusive to the attempt path. The original ADR-1783 Docker-only sweep
+> gap is historical; [its historical-coverage amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-14--1859-shared-per-key-residue-retention)
+> records the shared helper and the inherited Docker Follow-up 3 risk.
+>
+> Residue deletion requires fresh readable journal evidence (protecting a named
+> candidate or descendant), a non-live path and an affirmative scoped seed-process
+> verdict. Quarantine is checked before and after proof and synchronously at the
+> deletion boundary after awaited validation. An active or newly latched
+> `unreadable_unattributed` worker quarantine keeps all residue entries.
+> Fresh-attempt seeding's unreadable-process relaxation never authorizes deletion.
+> False, absent or unverified process proof and generic thrown proof keep entries
+> with bounded diagnostics; classified control/recovery interruptions propagate.
+> Off-Linux absence of a process verdict keeps entries. The latch's cause,
+> lifetime, credential protections and custody semantics are unchanged.
+>
+> The best-effort target is five exact parser-valid
+> `.uzi-residue-<key>.residue-<uuid>` direct siblings of the same key. Parent
+> validation and complete enumeration within a private fixed 4096-direct-entry
+> enumeration budget precede reclamation; overflow skips all residue reclamation.
+> No excess returns without redundant journal discovery. Selection uses the
+> original oldest excess slice by lstat mtime and basename tie-break; refusal
+> keeps that entry without deleting a newer substitute. Protected or unproven
+> entries can leave more than five, so this is no hard disk bound.
+>
+> Each sweep attempts at most 16 residue candidates from that oldest excess slice.
+> A bounded 128-key LRU cursor rotates past refusals and revisits them on later
+> sweeps; it caches no journal, live, process or quarantine verdict. No excess
+> clears the cursor, and restart/eviction restarts from the oldest. The newest five
+> are never compensating candidates. The attempt cap bounds work, not wall time;
+> existing operation/deletion settlement and safety deadlines remain unchanged.
+>
+> Canonical retention forwards existing configured best-effort Docker handling;
+> unwired workers gain no daemon obligation. Attempt retention remains
+> `processOnly: true`, with no new container verdict. Existing uid/path/name
+> checks and deletion deadlines remain; a possibly alive rm stops further cleanup,
+> and file/symlink residue is unlinked as an entry without following its target.
+> There is no new background timer or custody change. The opt-in Linux
+> `task test:clone-quiescence` image build timed out before actual cases;
+> actual Linux uid verification from that leg remains uncompleted.
 
-The best-effort target is five exact parser-valid
-`.uzi-residue-<key>.residue-<uuid>` direct siblings of the same key. Parent
-validation and complete enumeration within a private fixed 4096-direct-entry
-enumeration budget precede reclamation; overflow skips all residue reclamation.
-No excess returns without redundant journal discovery. Selection uses the
-original oldest excess slice by lstat mtime and basename tie-break; refusal
-keeps that entry without deleting a newer substitute. Protected or unproven
-entries can leave more than five, so this is no hard disk bound.
+## Amendment 2026-10-18 — #1858: automatic retention reclaim disabled
 
-Each sweep attempts at most 16 residue candidates from that oldest excess slice.
-A bounded 128-key LRU cursor rotates past refusals and revisits them on later
-sweeps; it caches no journal, live, process or quarantine verdict. No excess
-clears the cursor, and restart/eviction restarts from the oldest. The newest five
-are never compensating candidates. The attempt cap bounds work, not wall time;
-existing operation/deletion settlement and safety deadlines remain unchanged.
+Refs #1858 is retention-only, non-closing delivery. Canonical and attempt seeding
+now call read-only `diagnoseRetainedArtifacts`, retaining shared own-key residue,
+disposable-kind attempts (abandoned and crash-window live orphans), and orphaned
+skills on every worker. The former five-residue target, sixteen-candidate deletion
+budget and rotating deletion cursor are historical; 3 attempts / 5 residue / any
+orphan are diagnostic thresholds only. No safe automatic reclaim exists.
 
-Canonical retention forwards existing configured best-effort Docker handling;
-unwired workers gain no daemon obligation. Attempt retention remains
-`processOnly: true`, with no new container verdict. Existing uid/path/name
-checks and deletion deadlines remain; a possibly alive rm stops further cleanup,
-and file/symlink residue is unlinked as an entry without following its target.
-There is no new background timer or custody change. The opt-in Linux
-`task test:clone-quiescence` image build timed out before actual cases;
-actual Linux uid verification from that leg remains uncompleted.
+The latch's cause, lifetime, credential and claim guards, archival capture, custody,
+normal cleanup and guarded operator discard contracts are unchanged. Retention
+diagnostics do not prove quiescence or delete, rename or append retirement state.
+No process scan, daemon listing (even repeated clean listings), time, age, count or
+disk pressure authorizes retention deletion. Currently unwired status is not
+durable proof of no prior daemon exposure.
+
+Diagnostics observe lower-bound counts/completeness within 4096 direct siblings
+of a validated parent, without a recursive byte walk. Overflow/read failures yield
+partial/unknown evidence; existing protection predicates fail closed and
+protected-or-unreadable custody makes classification partial without a second
+probe. Known excess (>3 attempts, >5 residue, >0 orphaned skills) can warn
+`runner clone retention: automatic reclaim disabled` with a sanitized, truncated
+key. The one-hour rate limit uses full canonical keys in a 128-key LRU; restart or
+eviction may warn again. These bounds cover diagnostics, not retained bytes,
+identity metadata or safety inventory. Compaction retains present-path identities;
+existing per-seed process/teardown scope over non-live paths and compaction work
+grow with inventory, without caps skipping safety checks.
+
+Unchanged `beforeFree` / `freeCanonicalClonePath` and quarantine retain the
+process-proof / daemon pending-create residual. #1860 separately owns daemon
+mediation; #2852's terminal/Docker writer-exclusion remainder is not fixed.
+Attributed attempts and paired skills may use existing guarded
+[retained-source discard](../docs/run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard);
+shared residue and orphaned skills have no supported generic reclaim route.
+API custody discard alone is not local writer-exclusion proof. No proxy, marker,
+ledger, API, schema, configuration flag or new infrastructure is introduced.
