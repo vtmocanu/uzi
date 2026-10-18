@@ -21,6 +21,144 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+for (const gate of ["inactive", "feature", "coverage"] as const) {
+  it(`advisory saved FINAL local ${gate} void preserves reason and immediate eligibility`, async () => {
+    const { f, before } = await pendingReceiptFixture();
+    try {
+      const coordinator = f.make(true);
+      if (gate === "inactive") f.state.status = "running";
+      if (gate === "feature") f.state.feature = false;
+      if (gate === "coverage") f.state.cloneReadable = false;
+      const initial = f.finals.length;
+      await coordinator.resumePending(undefined, [before]);
+      const retained = (await coordinator.inspect(before.runId))[0]!;
+      assert.deepEqual(retained, before, "local void must not rewrite the saved FINAL");
+      assert.equal(f.finals.length, initial, "local gate must not send FINAL");
+      assert.equal(coordinator["finalRetry"].size, 0, "local void must not create a retry delay");
+      f.state.status = "failed"; f.state.feature = true; f.state.cloneReadable = true;
+      await coordinator.resumePending(undefined, [retained]);
+      assert.equal(f.finals.length, initial + 1, "gate clearing permits recovery at the same clock time");
+      assert.equal((await coordinator.inspect(before.runId))[0]!.finalAcknowledged, true);
+    } finally { await f.close(); }
+  });
+}
+
+it("advisory due FINAL retry local gate does not advance an existing delay", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    const coordinator = f.make();
+    f.state.finalError = new RequestError("POST", "/release", 403, JSON.stringify({ reason: "not_authorized" }));
+    await coordinator.resumePending(undefined, [before]);
+    const retry = structuredClone(coordinator["finalRetry"].get(before.captureId));
+    assert.ok(retry);
+    const retained = (await coordinator.inspect(before.runId))[0]!;
+    f.state.now = retry.nextAt;
+    f.state.status = "running";
+    await coordinator.resumePending(undefined, [retained]);
+    assert.deepEqual(coordinator["finalRetry"].get(before.captureId), retry);
+    assert.deepEqual((await coordinator.inspect(before.runId))[0], retained);
+    assert.equal(f.finals.length, 2);
+    f.state.status = "failed"; f.state.finalError = undefined;
+    await coordinator.resumePending(undefined, [retained]);
+    assert.equal(f.finals.length, 3, "clearing the gate does not owe another retry delay");
+    assert.equal((await coordinator.inspect(before.runId))[0]!.finalAcknowledged, true);
+  } finally { await f.close(); }
+});
+
+for (const answer of ["throw", "malformed", "available", "missing"] as const) {
+  it(`advisory saved FINAL unknown reconciliation remains paced ${answer}`, async () => {
+    const { f, before } = await pendingReceiptFixture();
+    try {
+      const coordinator = f.make();
+      let reads = 0, reconciliations = 0;
+      f.client.getRecoveryCaptureStatus = async () => { reads++; throw new Error("status unavailable"); };
+      if (answer === "missing") delete f.client.reconcileRecoveryCapture;
+      else f.client.reconcileRecoveryCapture = async (run, id, req) => {
+        reconciliations++;
+        if (answer === "throw") throw new Error("reconcile unavailable");
+        return answer === "malformed" ? {} as never : {
+          run_id: run, generation: req.generation, capture_id: id,
+          outcome: "retained", reason: "capture_available",
+        };
+      };
+      for (let pass = 0; pass < 2; pass++) await coordinator.resumePending(undefined, [before]);
+      assert.equal(reads, 1, "unknown reconciliation must bound repeated status probes");
+      assert.equal(reconciliations, answer === "missing" ? 0 : 1);
+      assert.equal((await coordinator.inspect(before.runId))[0]!.reason, "final_retry_unknown");
+      f.state.now += 60_000;
+      await coordinator.resumePending();
+      assert.equal(reads, 2, "unknown reconciliation remains eligible when due");
+      assert.equal(f.finals.length, 1, "unhealthy capture never sends another FINAL");
+    } finally { await f.close(); }
+  });
+}
+
+it("advisory unchanged settled FINAL reason performs no journal write", async () => {
+  const f = await v2FrozenFixture("ci_fix", true);
+  try {
+    f.state.finalError = new Error("save FINAL");
+    await f.capture(f.record);
+    const before = (await f.coordinator.inspect(f.context.runId))[0]!;
+    const exact = await (f.client as RecoveryArchiveClient).getExactRecoveryHold!(before.runId, 7, before.exactHoldBinding!);
+    await patchAuthenticated(f, before, {
+      holdSettlement: closedExactFixture(before, exact!, "discarded"), reason: "inventory_hold_settled",
+    });
+    const coordinator = f.make(true);
+    let writes = 0;
+    const write = coordinator["writeRecordUnlocked"].bind(coordinator);
+    Object.assign(coordinator, { writeRecordUnlocked: async (...args: Parameters<typeof write>) => {
+      writes++; return write(...args);
+    } });
+    for (let pass = 0; pass < 3; pass++) await coordinator.resumePending();
+    assert.equal(writes, 0, "unchanged settled reason is a diagnostic-only retention");
+    assert.equal(f.finals.length, 1);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { await f.close(); }
+});
+
+it("advisory thrown finalization error bypasses pacing and keeps its diagnostic", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  try {
+    const coordinator = f.make();
+    const errors: unknown[] = [];
+    f.log.warn = (_message, fields) => { if (fields?.error) errors.push(fields.error); };
+    Object.assign(coordinator, {
+      withInventorySourceBoundary: async () => { throw new Error("original finalization failure"); },
+      writeRecordUnlocked: async () => { throw new Error("pacing masked original"); },
+    });
+    await coordinator.resumePending(undefined, [before]);
+    assert.ok(errors.some(error => String(error).includes("original finalization failure")));
+    assert.ok(!errors.some(error => String(error).includes("pacing masked original")));
+    assert.equal(coordinator["finalRetry"].size, 0, "thrown finalization cannot schedule pacing");
+    assert.deepEqual((await coordinator.inspect(before.runId))[0], before);
+  } finally { await f.close(); }
+});
+
+it("advisory finalization budget exhaustion does not enter pacing", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  let mono = 0, expired = false, lateReads = 0;
+  const budget = new MaintenanceBudget(600_000, () => mono);
+  try {
+    const coordinator = f.make();
+    const read = coordinator["readLatest"].bind(coordinator);
+    Object.assign(coordinator, {
+      withInventorySourceBoundary: async () => {
+        expired = true; mono = 600_000; budget.check();
+      },
+      readLatest: async (...args: Parameters<typeof read>) => {
+        if (expired) lateReads++;
+        return read(...args);
+      },
+    });
+    await assert.rejects(MaintenanceBudget.run(budget, () => coordinator.resumePending(undefined, [before])),
+      error => error === budget.signal.reason);
+    assert.equal(expired, true, "the budget expires inside finalization");
+    assert.equal(lateReads, 0, "expired finalization must not enter pacing journal IO");
+    assert.equal(coordinator["finalRetry"].size, 0);
+    assert.deepEqual((await coordinator.inspect(before.runId))[0], before);
+  } finally { budget.dispose(); await f.close(); }
+});
+
 // M1 repair assertions were observed red on the unchanged product baseline.
 for (const status of [403, 409, 429, 503, "network"] as const) {
   it(`M1 R2987-05a binding-less immutable FINAL capped retry ${status}`, async t => {

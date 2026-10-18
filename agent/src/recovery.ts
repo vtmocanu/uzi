@@ -904,7 +904,7 @@ export class RecoveryCoordinator {
     const identity = this.finalRetryIdentity(record);
     if (!identity || residueQuarantine() !== undefined) return;
     const current = persist ? await this.writeExistingRecord(record, cur =>
-      this.finalRetryIdentity(cur) === identity && !["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(cur.reason ?? "")
+      this.finalRetryIdentity(cur) === identity && cur.reason !== reason && !["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(cur.reason ?? "")
         ? { ...cur, reason } : undefined) : await this.requireRecord(record);
     if (this.finalRetryIdentity(current) !== identity) return;
     // Only known protocol reasons can enter diagnostics; RequestError text/body is untrusted.
@@ -930,7 +930,9 @@ export class RecoveryCoordinator {
   }
 
   private async paceFinalRetry(record: RecoveryRecord, outcome: RecoveryOutcome | void): Promise<void> {
-    if (residueQuarantine() !== undefined) return;
+    if (residueQuarantine() !== undefined || !outcome?.reason ||
+        !["upload_transient", "storage_quota_exceeded", "final_retry_refused", "final_retry_unknown",
+          "stale_ownership", "upload_rejected"].includes(outcome.reason)) return;
     const latest = await this.readLatest(record);
     if (latest.kind !== "ok" || this.finalRetryIdentity(latest.record) !== this.finalRetryIdentity(record) ||
         !this.finalRetryIdentity(latest.record)) {
@@ -939,8 +941,6 @@ export class RecoveryCoordinator {
       return;
     }
     if (["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(latest.record.reason ?? "")) return;
-    if (outcome?.reason && !["upload_transient", "storage_quota_exceeded", "final_retry_refused", "final_retry_unknown",
-      "stale_ownership", "upload_rejected"].includes(outcome.reason)) return;
     if (latest.record.reason === "credential_rejected") return;
     if (latest.record.holdSettlement && !await this.finalHoldAllowsReplay(latest.record, "settled")) return;
     const identity = this.finalRetryIdentity(latest.record)!;
@@ -949,7 +949,7 @@ export class RecoveryCoordinator {
     const failures = Math.min((previous?.identity === identity ? previous.failures : 0) + 1, maxFailures);
     this.finalRetry.set(record.captureId, { identity, failures,
       nextAt: this.now() + Math.min(this.liveBackoffBaseMs * 2 ** failures, this.liveBackoffCapMs) });
-    if (!outcome && latest.record.reason !== "final_retry_refused" && latest.record.reason !== "final_retry_unknown") {
+    if (outcome.reason === "final_retry_unknown" && latest.record.reason !== "final_retry_refused" && latest.record.reason !== "final_retry_unknown") {
       await this.retainFinal(latest.record, "final_retry_unknown");
     }
   }
@@ -1812,7 +1812,7 @@ export class RecoveryCoordinator {
         cls.kind === "credential" || (err instanceof RequestError && [403, 409].includes(err.status)));
       if (cls.kind === "credential") this.credentialBlockedAt = this.now();
       const reconciled = await this.reconcileInventory(record, prove, observedStatus);
-      if (reconciled) return reconciled;
+      if (reconciled && reconciled.reason !== "final_retry_unknown") return reconciled;
       return { state: record.state, captureId: record.captureId,
         reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
@@ -1971,17 +1971,20 @@ export class RecoveryCoordinator {
   /** One atomic reconciliation attempt; failures keep custody and every saved identity. */
   private async reconcileInventory(record: RecoveryRecord, prove: () => Promise<boolean>, status?: RecoveryCaptureStatusResponse): Promise<RecoveryOutcome | void> {
     if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
-        !hasJournaledBundle(record) || !this.client.reconcileRecoveryCapture ||
-        !this.client.hasFeature?.("recovery_inventory_v1")) return;
+        !hasJournaledBundle(record) || !this.client.hasFeature?.("recovery_inventory_v1")) return;
+    const unknown = (): RecoveryOutcome | void => record.finalRequest
+      ? { state: record.state, captureId: record.captureId, reason: "final_retry_unknown" } : undefined;
     try {
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
+      if (!this.client.reconcileRecoveryCapture) return unknown();
       const response = await recoveryRPC(() => this.client.reconcileRecoveryCapture!(record.runId, record.serverCaptureId!, {
         generation: record.generation!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
         checksum: record.checksum!, byte_size: record.byteSize!,
       }));
+      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       if (!response || typeof response !== "object" || Array.isArray(response) ||
-          residueQuarantine() !== undefined || response.run_id !== record.runId ||
-          response.generation !== record.generation || response.capture_id !== record.serverCaptureId!) return;
+          response.run_id !== record.runId || response.generation !== record.generation ||
+          response.capture_id !== record.serverCaptureId!) return unknown();
       if (response.outcome === "accepted") {
         const receipt = response.final_receipt;
         const saved = record.finalRequest;
@@ -1998,7 +2001,7 @@ export class RecoveryCoordinator {
               typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
             canonicalJson(receipt) !== canonicalJson(saved.disposition) ||
             response.release_evidence !== saved.evidence ||
-            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return;
+            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return unknown();
         if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
@@ -2016,9 +2019,9 @@ export class RecoveryCoordinator {
           "capture_manifest_invalid", "capture_failure_requires_attention",
           "available_capture_expiry_invalid", "capture_available", "capture_state_unknown"]);
         if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
-            typeof response.reason !== "string" || !reasons.has(response.reason)) return;
+            typeof response.reason !== "string" || !reasons.has(response.reason)) return unknown();
         const reason = response.reason;
-        if (reason === "capture_available" || reason === "generation_not_ended") return;
+        if (reason === "capture_available" || reason === "generation_not_ended") return unknown();
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && !cur.finalAcknowledged &&
           canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
@@ -2030,7 +2033,7 @@ export class RecoveryCoordinator {
       }
       if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
           response.outcome !== "replaceable" || response.reason !== undefined ||
-          !status || !replaceableInventoryStatus(status, record, this.now())) return;
+          !status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
       if (!await this.openInventoryHold(record) || !await prove() ||
           !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
       await this.writeExistingRecord(record, cur => {
@@ -2053,6 +2056,7 @@ export class RecoveryCoordinator {
     } catch (err) { MaintenanceBudget.current()?.check();
       if (record.finalRequest) await this.retainFinal(record, "final_retry_unknown", err);
       else this.log.warn("recovery: capture reconciliation pending; custody retained", { run_id: record.runId, error: errText(err) });
+      return unknown();
     }
   }
 
@@ -2331,9 +2335,8 @@ export class RecoveryCoordinator {
     // In particular, a verified empty inventory has no bundle or bare to rebuild.
     let archiveFallback = false;
     if (record.finalRequest) {
-      let outcome: RecoveryOutcome | void = undefined;
-      try { outcome = await this.finalizeInventory(record); }
-      finally { await this.paceFinalRetry(record, outcome); }
+      const outcome = await this.finalizeInventory(record);
+      await this.paceFinalRetry(record, outcome);
       const latest = await this.readLatest(record);
       if (latest.kind !== "ok" || latest.record.finalRequest || latest.record.finalAcknowledged) return outcome;
       archiveFallback = outcome?.held === "fallback";
