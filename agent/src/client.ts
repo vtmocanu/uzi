@@ -1137,6 +1137,35 @@ function decodeMemoryReservation(value: unknown, request: MemoryReservationReque
     authorizing: obj.authorizing, ...(obj.outcome === undefined ? {} : { outcome: obj.outcome }) };
 }
 
+/** Producer discovery facts only. repo_id is server settlement identity, not local repo proof. */
+export type TerminalMaintenanceHoldObservation =
+  | { ok: true; hold: Readonly<RecoveryExactHold>; token: Readonly<object> }
+  | { ok: false; reason: "invalid_request" | "registration_changed" | "unsupported" | "invalid_inventory" | "ambiguous_hold" | "invalid_exact_hold" | "unavailable" };
+
+// Keep producer UUID admission exact without changing legacy recovery readers.
+function maintenanceUUID(value: unknown): value is string {
+  return terminalUUID(value) && value.length === 36;
+}
+
+function validMaintenanceHoldRow(value: unknown, runId: string, worker: string): value is Record<string, unknown> {
+  if (!isRecord(value) || !maintenanceUUID(value.hold_id) || !terminalGeneration(value.generation) ||
+      value.generation <= 0 || typeof value.inventory_guarded !== "boolean" ||
+      typeof value.has_available_capture !== "boolean" ||
+      (value.capture_state !== undefined && (typeof value.capture_state !== "string" ||
+        !["", "preparing", "uploading", "available", "needs_action", "expired", "discarded"].includes(value.capture_state))) ||
+      (value.completed_publication_reason !== undefined && decodeCompletedPublicationReason(value.completed_publication_reason) === undefined))
+    return false;
+  if (value.completed_publication_receipt !== undefined) {
+    const receipt = value.completed_publication_receipt;
+    if (!isRecord(receipt) ||
+        !["hold_id", "run_id", "worker_id", "repo_id", "owner_id", "connection_id"].every(key => maintenanceUUID(receipt[key])) ||
+        !validExactClosedProof({ ...value, run_id: runId, original_worker_id: worker, repo_id: receipt.repo_id,
+          state: "released", release_evidence: "completed_publication",
+          final_receipt: { kind: "completed_publication", coverage_digest: "" } })) return false;
+  }
+  return true;
+}
+
 const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
 const COMPLETION_HOLDS_MAX_ITEMS = 1024;
 const COMPLETION_BINDINGS_MAX = 4096;
@@ -1157,6 +1186,7 @@ export class WorkerClient {
   private completionIncarnation = 0;
   // Input observations are invalidated at registration entry, including same-ID failures.
   private inputObservationEpoch = 0;
+  private readonly maintenanceObservations = new WeakMap<object, { worker: string; epoch: number; incarnation: number }>();
   private completionRetirementIncarnation: Readonly<object> = {};
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
@@ -2726,6 +2756,109 @@ export class WorkerClient {
       if (value.live_worker_id !== undefined || value.live_run_id !== undefined || !validExactClosedProof(value)) return undefined;
     } else return undefined;
     return value as unknown as RecoveryExactHold;
+  }
+
+  /**
+   * Strict producer-only bootstrap: one complete inventory followed by one exact read,
+   * with no retries or completion/ACK bookkeeping. Unknown repo identity is learned only
+   * for settlement; callers must independently prove local source/output continuity.
+   * Re-observe with the same expected identities before charging/effects, and call
+   * isCurrentTerminalMaintenanceHold immediately before each effect. Neither a fresh
+   * observation nor its currency token grants producer admission or cleanup authority.
+   */
+  async observeTerminalMaintenanceHold(
+    runId: string,
+    generation: number,
+    expected?: { holdId: string; repoId: string },
+    signal?: AbortSignal,
+  ): Promise<TerminalMaintenanceHoldObservation> {
+    expected = expected === undefined ? undefined : { ...expected };
+    const worker = this.registeredWorkerId;
+    const epoch = this.inputObservationEpoch;
+    const incarnation = this.completionIncarnation;
+    const current = () => worker !== undefined && worker === this.registeredWorkerId &&
+      epoch === this.inputObservationEpoch && incarnation === this.completionIncarnation;
+    if (!maintenanceUUID(runId) || !terminalGeneration(generation) || generation <= 0 ||
+        (expected !== undefined && (!maintenanceUUID(expected.holdId) || !maintenanceUUID(expected.repoId))))
+      return { ok: false, reason: "invalid_request" };
+    if (!maintenanceUUID(worker) || !this.hasExactHoldCapability) return { ok: false, reason: "unsupported" };
+    try {
+      const read = async (query: string): Promise<unknown> => {
+        const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds${query}`;
+        const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
+        // Do not retain or interpret error bodies (including an old API's 404).
+        if (res.status !== 200) {
+          // Best effort: a stalled cancellation must not delay refusal (#2888).
+          void res.body?.cancel().catch(() => undefined);
+          throw new Error("maintenance observation unavailable");
+        }
+        return JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal));
+      };
+      const listing = await read("");
+      if (!current()) return { ok: false, reason: "registration_changed" };
+      if (!isRecord(listing) || !Array.isArray(listing.holds))
+        return { ok: false, reason: "invalid_inventory" };
+      MaintenanceResources.consumeIfActive("adminEntries", listing.holds.length);
+      if (listing.run_id !== runId || listing.holds.length > COMPLETION_HOLDS_MAX_ITEMS)
+        return { ok: false, reason: "invalid_inventory" };
+      const ids = new Set<string>(), generations = new Set<number>();
+      let selected: Record<string, unknown> | undefined;
+      // At most 1024 siblings, one pass. Any bad sibling refuses the whole observation.
+      for (const row of listing.holds) {
+        if (!validMaintenanceHoldRow(row, runId, worker)) return { ok: false, reason: "invalid_inventory" };
+        const id = (row.hold_id as string).toLowerCase(), gen = row.generation as number;
+        if (ids.has(id) || generations.has(gen)) return { ok: false, reason: "ambiguous_hold" };
+        ids.add(id); generations.add(gen);
+        if (gen === generation) selected = row;
+      }
+      if (!selected || selected.inventory_guarded !== true ||
+          (expected && selected.hold_id !== expected.holdId)) return { ok: false, reason: "ambiguous_hold" };
+      const body = await read(`?generation=${generation}`);
+      if (!current()) return { ok: false, reason: "registration_changed" };
+      MaintenanceResources.consumeIfActive("adminEntries", 1);
+      if (!isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold))
+        return { ok: false, reason: "invalid_exact_hold" };
+      const value = body.exact_hold;
+      if (value.run_id !== runId || value.hold_id !== selected.hold_id || value.generation !== generation ||
+          !maintenanceUUID(value.repo_id) || (expected && value.repo_id !== expected.repoId) ||
+          value.original_worker_id !== worker || !completionSafeIdentifier(value.original_worker_identity) ||
+          value.inventory_guarded !== true || value.state !== "open" ||
+          value.live_worker_id !== worker || value.live_run_id !== runId ||
+          !["failed", "cancelled", "completed"].includes(value.run_status as string) ||
+          !terminalGeneration(value.current_claim_generation) || value.current_claim_generation < generation ||
+          typeof value.claim_released !== "boolean" ||
+          (value.run_worker_id !== undefined && !maintenanceUUID(value.run_worker_id)) ||
+          (value.recovery_wait_cause !== undefined && typeof value.recovery_wait_cause !== "string") ||
+          value.release_evidence !== undefined || value.final_receipt !== undefined ||
+          value.completed_publication_receipt !== undefined || selected.completed_publication_receipt !== undefined ||
+          (value.completed_publication_reason !== undefined &&
+            decodeCompletedPublicationReason(value.completed_publication_reason) === undefined))
+        return { ok: false, reason: "invalid_exact_hold" };
+      const token = Object.freeze({});
+      this.maintenanceObservations.set(token, { worker, epoch, incarnation });
+      // Project known custody facts only; extra response fields never leave this seam.
+      const observed: RecoveryExactHold = {
+        run_id: runId, hold_id: selected.hold_id as string, generation, repo_id: value.repo_id,
+        original_worker_id: worker, original_worker_identity: value.original_worker_identity as string,
+        live_worker_id: worker, live_run_id: runId, inventory_guarded: true, state: "open",
+        run_status: value.run_status as string, current_claim_generation: value.current_claim_generation,
+        claim_released: value.claim_released as boolean,
+        ...(value.run_worker_id === undefined ? {} : { run_worker_id: value.run_worker_id as string }),
+      };
+      return { ok: true, hold: Object.freeze(observed), token };
+    } catch {
+      MaintenanceResources.checkIfActive();
+      MaintenanceBudget.current()?.check();
+      return { ok: false, reason: current() ? "unavailable" : "registration_changed" };
+    }
+  }
+
+  /** Local, synchronous, no-effect registration fence; does not refresh server custody. */
+  isCurrentTerminalMaintenanceHold(token: Readonly<object>): boolean {
+    const binding = this.maintenanceObservations.get(token);
+    return binding !== undefined && binding.worker === this.registeredWorkerId &&
+      binding.epoch === this.inputObservationEpoch && binding.incarnation === this.completionIncarnation &&
+      this.hasExactHoldCapability;
   }
 
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
