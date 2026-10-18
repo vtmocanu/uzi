@@ -15,7 +15,17 @@ import { nullLogger } from "./helpers.js";
 import { api, client, git, homeDir, fakeGitlab, gitlabClaim, input, installHarness,
   runnerWith, worktreeDirFor } from "./runner-harness.js";
 
+import { codexRig } from "./runner-codex-sinks-fixture.js";
+
 installHarness();
+
+function realCapture(prepare: () => void | Promise<void> = () => {}): NonNullable<Executor["withCredentialFreeCapture"]> {
+  const rig = codexRig();
+  return (deadlineMs, action, purpose, signal) => rig.capture(deadlineMs, async context => {
+    await prepare();
+    return action(context);
+  }, purpose, signal);
+}
 
 const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 100,
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
@@ -257,14 +267,13 @@ for (const verdict of ["empty", "capture_failure", "ambiguous", "rotated", "dead
     let rescueTimer: ReturnType<typeof setTimeout> | undefined;
     fs.writeFileSync(homeDir + "/session-proof", "original session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         const operation = captureScope.getStore();
         assert.ok(operation, "owner settlement runs inside a bounded Git recovery operation");
         operation.ownerCapture = true;
         prepared = true;
         assert.equal(fs.existsSync(homeDir + "/session-proof"), true);
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         const recoveryOperation = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) => recoveryOperation(signal, deadline,
@@ -357,7 +366,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     const register = f.memory.commands.register.bind(f.memory.commands);
     f.memory.commands.register = (...args) => { enrollments++; return register(...args); };
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         try {
           assert.equal(api.states.at(-1)!.body.status, "running",
@@ -682,7 +691,7 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
   git.worktreeStatus = async () => ["M fixture"];
   git.commitWipMarker = async () => false;
   const executor: Executor = {
-    settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+    withCredentialFreeCapture: realCapture(),
     run: async ctx => {
       const command = enroll(ctx);
       original = command.captured.flight as MemoryFlightProof;
@@ -719,7 +728,7 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await client.register("memory-fixture", "base");
     const next = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
     api.setOwnershipStatus(next.run_id, "running", 8);
-    const nextExecutor: Executor = { run: async ctx => {
+    const nextExecutor: Executor = { withCredentialFreeCapture: realCapture(), run: async ctx => {
       successor = ctx.capturedMemory!();
       await successorRelease.promise;
       throw new Error("successor proof complete");
@@ -775,7 +784,7 @@ for (const interruption of ["registration", "generation", "shutdown", "cancel"] 
     let original: MemoryFlightProof | undefined;
     let reads = 0, writes = 0, fetches = 0;
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         const recover = git.withRecoveryOperation.bind(git);
         git.withRecoveryOperation = (signal, deadline, action) =>
@@ -1097,7 +1106,7 @@ for (const phase of ["drain", "feedback", "preserve"] as const) {
       return recover(signal, deadline, action);
     };
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         const captured = ctx.capturedMemory!()!;
         original = captured.flight as MemoryFlightProof;
@@ -1169,14 +1178,13 @@ for (const mode of ["now", "milestone"] as const) for (const originalFailure of 
     let pauseSent = false;
     fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         if (!pauseSent) {
           pauseSent = true;
           api.appendInputs(f.claim.run_id, [input("pause", mode)]);
           await until(() => context?.pauseModeRequested?.() === mode);
         }
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         context = ctx;
         try {
@@ -1222,7 +1230,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
     let runner: ReturnType<typeof runnerWith>;
     fs.writeFileSync(homeDir + "/pause-session-proof", "retained session");
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => {
+      withCredentialFreeCapture: realCapture(async () => {
         entered = true;
         if (scenario !== "already-parked") {
           api.appendInputs(f.claim.run_id, [input("pause", scenario === "wall" ? "wall" : "now")]);
@@ -1247,8 +1255,7 @@ for (const scenario of ["wall", "disk", "withdrawn", "cancel", "shutdown", "clai
           if (scenario === "unsettled") await release.promise; // Deliberately ignore cancellation.
           if (scenario === "expired") await new Promise(resolve => setTimeout(resolve, 250));
         }
-        return { kind: "observed_empty" };
-      },
+      }),
       run: async ctx => {
         context = ctx;
         try {
@@ -1304,7 +1311,7 @@ for (const rejection of ["generation", "non-running", "released", "not-owned"] a
     const fetch = git.fetchAgentBranch.bind(git);
     const publish = client.publishCheckpoint.bind(client);
     const executor: Executor = {
-      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      withCredentialFreeCapture: realCapture(),
       run: async ctx => {
         try {
           const command = enroll(ctx);

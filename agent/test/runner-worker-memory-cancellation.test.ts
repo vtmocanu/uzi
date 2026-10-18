@@ -2,6 +2,11 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RunRunner } from "../src/runner.js";
+import { SinkGate } from "../src/sink-gate.js";
+import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { git, installHarness } from "./runner-harness.js";
+
+installHarness();
 
 for (const generation of [7, undefined, 8]) {
   it(`memory preservation observes cancellation before further work (generation ${generation})`, async () => {
@@ -13,6 +18,8 @@ for (const generation of [7, undefined, 8]) {
     const incarnation = {};
     const flight = {
       runId: "memory-cancel-fixture", claimGeneration: 7, cancel,
+      executor: { withCredentialFreeCapture: codexRig().capture },
+      sinkGate: new SinkGate(), survivingTickGroups: [],
       retainedLocalCustody: true, preserveRecoveryClone: true, preserveSession: true,
       steering: {
         terminalLifecycleSignal: () => lifecycle.signal,
@@ -20,7 +27,7 @@ for (const generation of [7, undefined, 8]) {
         pendingCredentialSwitch: () => undefined, getPauseMode: () => null,
         markCancelled: () => { cancelled = true; }, abortLifecycle: () => lifecycle.abort(),
       },
-      workerMemory: { incarnation, ended: false },
+      workerMemory: { incarnation, ended: false, claim: { secrets: { codex: {} } } },
       runLog: { warn: () => {
         warnings++;
         assert.equal(cancelled, true, "the ownership response itself latches cancellation");
@@ -34,11 +41,16 @@ for (const generation of [7, undefined, 8]) {
       shutdownSignal: new AbortController(),
       cancellationBudgetFactory: () => { factories++; return budget; },
       client: { memoryIncarnation: incarnation, getRunOwnership: async () => ({ status: "cancelled", claim_generation: generation }) },
-      git: { withRecoveryOperation: async (signal: AbortSignal, _deadline: number, action: (signal: AbortSignal) => Promise<void>) => action(signal) },
+      git,
+      freeCaptureFlights: new WeakMap(),
+      runFreeCapture: RunRunner.prototype["runFreeCapture"],
+      runGatedSink: RunRunner.prototype["runGatedSink"],
+      assertHeldFreeCapture: RunRunner.prototype["assertHeldFreeCapture"],
+      awaitTickSurvivorsGone: RunRunner.prototype["awaitTickSurvivorsGone"],
+      tickSurvivorsRemain: RunRunner.prototype["tickSurvivorsRemain"],
       retainedTerminalGuard: RunRunner.prototype["retainedTerminalGuard"],
       getObservedRunOwnership: RunRunner.prototype["getObservedRunOwnership"],
       observeCancellation: RunRunner.prototype["observeCancellation"],
-      settleForCredentialCapture: async () => { laterWork++; return { kind: "observed_empty" }; },
       captureRecoveryRestorePoint: async () => { laterWork++; },
     } as unknown as RunRunner;
     try {

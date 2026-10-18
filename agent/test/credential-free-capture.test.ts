@@ -333,6 +333,61 @@ describe("credential-free capture foundation (#2852)", () => {
 });
 
 describe("credential-free real Git producer positives", () => {
+  it("verifies full worker-bare recovery closure through exec readers and streaming cat-file with canonical pins", async () => {
+    const r = await credentialFreeGitFixture();
+    try {
+      const result = await r.capture(() => r.git.verifyRecoveryClosure(r.bare, r.base));
+      assert.equal(result.kind, "observed_empty");
+      if (result.kind !== "observed_empty") return;
+      assert.equal(result.value, true, "complete trusted closure must be read and hashed");
+      assert.deepEqual(r.requests.map(request => request.argv.slice(3)), [
+        ["--no-replace-objects", "rev-parse", "--verify", r.base + "^{commit}"],
+        ["--no-replace-objects", "rev-list", "--objects", "--no-object-names", "--missing=error", r.base],
+        ["--no-replace-objects", "cat-file", "--batch-check"],
+        ["--no-replace-objects", "cat-file", "--batch"],
+      ], "all three exec readers and the streaming producer actually launched");
+      assert.deepEqual(r.requests.map(request => request.cwd), ["/", "/", "/", r.bare]);
+      for (const [i, request] of r.requests.entries()) {
+        assert.equal(request.identity, "worker_pat");
+        assert.equal(r.specs[i]!.identity, "worker_pat");
+        assert.equal(r.specs[i]!.command, "/usr/bin/git");
+        assert.equal(request.argv[2], r.bare);
+        for (const env of [request.env, r.specs[i]!.env]) {
+          const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, n) =>
+            [env[`GIT_CONFIG_KEY_${n}`], env[`GIT_CONFIG_VALUE_${n}`]]);
+          for (const key of ["credential.helper", "core.askpass"]) {
+            assert.deepEqual(pairs.filter(pair => pair[0] === key), [[key, ""]], key);
+          }
+          assert.equal(env.GIT_NO_LAZY_FETCH, "1");
+          assert.equal(env.GIT_ALLOW_PROTOCOL, "none");
+          assert.equal(env.GIT_NO_REPLACE_OBJECTS, "1");
+          assert.equal(env.GIT_SHALLOW_FILE, "/dev/null");
+          assert.equal(env.GIT_GRAFT_FILE, "/dev/null");
+        }
+      }
+      assert.equal(r.disposed(), 4, "every exec and streaming root joined full modeled cleanup");
+      assert.equal(r.registry.pendingLaunchCount(), 0);
+      assert.equal(r.registry.rootCount(), 4, "drained roots remain in the ownership inventory");
+      assert.equal(r.safety.acceptsCompletedCapture(result.proof), true);
+
+      // Screen altered request DATA only; no substituted request reaches an OS process.
+      const reader = r.requests[0]!;
+      for (const [key, value] of [
+        ["GIT_ALLOW_PROTOCOL", "file"], ["GIT_ALLOW_PROTOCOL", "https"],
+        ["GIT_NO_LAZY_FETCH", "0"], ["GIT_NO_REPLACE_OBJECTS", "0"],
+        ["GIT_SHALLOW_FILE", r.bare], ["GIT_GRAFT_FILE", r.bare],
+      ]) {
+        await r.safety.withCredentialFreeCapture(10_000, async context => {
+          const spawn = captureGitSpawner(context, request =>
+            validateCaptureGitRequest(request, [reader.env], "/usr/bin/git", process.execPath, "unused-helper"));
+          await assert.rejects(async () => spawn({ ...reader, env: { ...reader.env, [key!]: value } }),
+            /credential-free capture launch refused/, key);
+        });
+      }
+      assert.equal(r.requests.length, 4, "wrong transport and decorations never launch");
+    } finally { r.cleanup(); }
+  });
+
   it("restores latest worker-bare FETCH content through the public caller and waits for full disposal", async () => {
     const r = await credentialFreeGitFixture();
     const drain = latch();

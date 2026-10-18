@@ -45,7 +45,12 @@ export async function credentialFreeGitFixture() {
     const request = current;
     requests.push(request);
     specs.push(spec);
-    assert.ok(request.cwd === (request.identity === "worker_pat" ? "/" : clone), "fixed producer cwd");
+    if (request.identity === "worker_pat" && request.cwd === bare) {
+      assert.deepEqual(request.argv, ["/usr/bin/git", "-C", bare,
+        "--no-replace-objects", "cat-file", "--batch"], "fixed closure streaming producer");
+    } else {
+      assert.equal(request.cwd, request.identity === "worker_pat" ? "/" : clone, "fixed producer cwd");
+    }
     const argv = spec.identity === "command"
       ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
     assert.deepEqual(argv, request.argv);

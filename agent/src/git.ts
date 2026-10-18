@@ -2100,9 +2100,10 @@ export class GitCache {
       { GIT_NO_REPLACE_OBJECTS: "1" },
       { GIT_SHALLOW_FILE: "/dev/null" },
       { GIT_GRAFT_FILE: "/dev/null" },
+      { GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL },
     ];
     let bases: NodeJS.ProcessEnv[] = [base];
-    // Four fixed flags produce at most sixteen bases; no I/O or retry.
+    // Five fixed flags produce at most thirty-two bases; no I/O or retry.
     for (const decoration of fixedDecorations) bases = [...bases, ...bases.map(env => ({ ...env, ...decoration }))];
     for (const env of bases) {
       environments.push(env, workerSpawnEnv(env));
@@ -2153,7 +2154,8 @@ export class GitCache {
   private assertCaptureDecoration(extra: NodeJS.ProcessEnv | undefined): void {
     if (!this.boundaryProcesses.getStore()?.capture || !extra) return;
     const allowed: NodeJS.ProcessEnv = { GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1",
-      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", ...this.captureSynthesisEnvironment(extra) };
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1",
+      GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL, ...this.captureSynthesisEnvironment(extra) };
     if (Object.entries(extra).some(([key, value]) => !Object.hasOwn(allowed, key) || allowed[key] !== value)) {
       throw new Error("capture environment overlay refused");
     }
@@ -6116,8 +6118,9 @@ export class GitCache {
     // or added alternates within this operation can escape re-hashing when directory
     // identities and cached type/size metadata match.
     // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
-    const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
-      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+    const decoration = { GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
+      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: RUNNER_GIT_NO_PROTOCOL };
+    const env = { ...gitEnv(), ...decoration };
     const read = async (args: string[], input?: string): Promise<string> =>
       (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
         { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
@@ -6156,7 +6159,7 @@ export class GitCache {
       if (objects.length > 0) {
         producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"],
           objects.map(object => object.oid).join("\n") + "\n",
-          { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
+          { env: decoration, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
         await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
         if (await producer.exited !== 0) return false;
       }
