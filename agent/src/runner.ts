@@ -19,6 +19,7 @@ import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
+  RetainedReadinessCleanupUnconfirmedError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -18120,7 +18121,8 @@ export class RunRunner {
       // report, not recovery authority. A new ownership GET could fail independently
       // of the fenced state endpoint and leave an exhausted claim cycling again.
       if (episode && episode.stage !== "blocked" && episode.claimGeneration === flight.claimGeneration &&
-          Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
+          Date.now() >= episode.deadline && blocker !== "decoded_history_limit" &&
+          blocker !== "readiness_cleanup_unconfirmed") blocker = "budget_exhausted";
       let persistence = "";
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -18311,6 +18313,10 @@ export class RunRunner {
       } catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+        if (error instanceof RetainedReadinessCleanupUnconfirmedError) {
+          blocker = "readiness_cleanup_unconfirmed";
+          await fail();
+        }
         if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (error === finalize || blocker === "quiescence_failed") await fail();

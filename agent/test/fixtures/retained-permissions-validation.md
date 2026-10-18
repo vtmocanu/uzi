@@ -104,3 +104,44 @@ same provisioned dependencies and hermetic preload (log
 `.uzi/scratch/gate-log.tqvBba`), exit 0 and one test each, no skips. This comparison
 is inconclusive: it does not establish that the full-gate failure is unrelated.
 Final delivery still requires a successful full agent gate.
+
+## M2: run-local terminal cleanup regression
+
+The human selected a run-only terminal failure for unconfirmed readiness-helper
+cleanup, including startup cleanup, and explicitly kept the worker quarantine
+policy unchanged. The accepted interruption/persistence limit is recorded in
+ADR-1197; there is no new durable pre-launch marker or command-UID scan.
+
+The final regression file was copied into an isolated export of production
+`59936bbc1d8e1a36490ce9891e3d72c88a4ad88b`, with the provisioned dependencies
+linked unchanged. The primary worktree was not reset or replaced. Command:
+
+```sh
+cd agent
+node --import tsx --test --test-timeout=120000 \
+  --test-name-pattern='runner first readiness result then clean helpers' \
+  test/git-retained-readiness.test.ts
+```
+
+Baseline log `.uzi/scratch/gate-log.PGfr6B`, exit 1: seven tests,
+four failed and three passed, no skips/cancellations. Unclean disposal, throwing
+disposal and unconfirmed startup cleanup each reached the injected fault and
+failed because two helpers launched instead of one. Cleanup at the deadline
+failed because its persisted blocker was `budget_exhausted`. Clean disposal,
+verified startup cleanup and ordinary helper-refusal controls all passed.
+
+After the fix, `.uzi/scratch/gate-log.NO5zkw`, exit 0: the entire readiness
+file plus `git-recovery-claim-window.test.ts` passed all 92 tests, no skips or
+cancellations. Terminal cases assert one helper launch, the parsed persisted
+`readiness_cleanup_unconfirmed` blocker, no successor preparation/adoption or
+model start, and preserved dirty bytes, source refs, journal attribution, pin and
+custody. Positive controls complete the real successor preparation and inspect
+its durable ready-for-model handoff before a controlled test stop. Further
+focused cases cover cleanup overriding an ordinary refusal and preserving its
+classification when an operation aborts during disposal. A persisted cleanup
+blocker remains blocked across a later claim and deadline expiry.
+
+These are host runner/fake-supervisor fault tests, not replacements for the
+separate real distinct-UID permission and credential proofs. No surviving
+process was manufactured or claimed. Final M3 delivery still requires its
+complete integration gates and real-UID proof.

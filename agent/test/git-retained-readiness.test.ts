@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 import { PassThrough } from "node:stream";
 import { test, describe, after } from "node:test";
-import { GitCache } from "../src/git.js";
-import { SUPERVISOR_BIN, type CodexRootHandle, type CodexEffectLaunchSpec } from "../src/codex/launcher.js";
-import type { RecoverySource } from "../src/recovery-progress.js";
+import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
+import { CodexLaunchError, SUPERVISOR_BIN, type CodexRootHandle, type CodexEffectLaunchSpec } from "../src/codex/launcher.js";
+import { recoveryProgress, type RecoverySource } from "../src/recovery-progress.js";
 import type { Logger } from "../src/log.js";
 
 const worktree = fileURLToPath(new URL("../../", import.meta.url));
@@ -334,6 +335,175 @@ describe("runner retained readiness ordering and custody", async () => {
     else process.env.TMPDIR = oldTmp;
   });
   h.installHarness();
+
+  function command(cwd: string, ...args: string[]): string {
+    return execFileSync("git", ["-C", cwd, ...args], {
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+      encoding: "utf8", stdio: "pipe",
+    }).trim();
+  }
+
+  function journal(bare: string, branch: string): RecoveryJournalEntry {
+    return JSON.parse(command(bare, "config", "--get", `uzi-recovery.${branch}.clone`));
+  }
+
+  for (const fault of ["cleanup", "dispose_throw", "startup_unconfirmed", "cleanup_deadline", "clean", "startup_verified", "helper_refusal"] as const) {
+    test("runner first readiness result then clean helpers: " + fault, async t => {
+      const terminal = fault === "cleanup" || fault === "dispose_throw" || fault === "startup_unconfirmed" || fault === "cleanup_deadline";
+      h.client.protocolFeatures = ["claim_generation_fence"];
+      const claim = h.gitlabClaim(3059, { claim_generation: 2, session_id: "readiness-predecessor" });
+      const bare = await h.git.ensureClone(h.fx.originPath);
+      const clone = await h.git.createOrAttachRunnerClone(bare, 3059, noProofReseed, claim.run_id);
+      await h.git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+      const expected = { runId: claim.run_id, clonePath: clone.path };
+      const sourceHead = await h.git.worktreeHead(clone.path);
+      const capturedTip = await h.git.revParse(bare, "HEAD");
+      assert.ok(capturedTip);
+      const reservation = await h.git.reserveRecoveryIteration(bare, clone.branch, "issue-3059", expected, 1, 2);
+      await h.git.recordRecoveryCapture(bare, clone.branch, "issue-3059", expected, reservation.attempts, capturedTip);
+      const before = journal(bare, clone.branch);
+      const retainedFile = path.join(clone.path, "retained.txt");
+      if (terminal) fs.writeFileSync(retainedFile, "only local dirty work\n");
+      const sourceBytes = fs.readFileSync(path.join(clone.path, "README.md"));
+      const sourceRefs = command(clone.path, "show-ref", "--head");
+      const pin = "refs/uzi-recovery-episode/" + claim.run_id + "/" + capturedTip;
+      const trackingTip = await h.git.revParse(bare, "refs/uzi-runner/" + clone.branch);
+      h.api.setOwnershipStatus(claim.run_id, "running", 2);
+
+      let launches = 0, faults = 0, disposals = 0, prepares = 0, adoptions = 0, models = 0, releases = 0;
+      let sourceReads = 0, resumedReads = 0;
+      let adopted: RecoveryJournalEntry | undefined;
+      let successorPath: string | undefined;
+      const events: string[] = [];
+      // Inject exactly once. Every later helper is clean, so an illicit retry can
+      // reach successor preparation rather than hiding behind repeated failures.
+      (h.git as unknown as { retainedReadinessLaunch: typeof import("../src/codex/launcher.js").launchCodexEffectRoot })
+        .retainedReadinessLaunch = async () => {
+          const first = ++launches === 1;
+          events.push("launch");
+          if (first && fault.startsWith("startup_")) {
+            faults++;
+            throw new CodexLaunchError("started_deadline",
+              fault === "startup_unconfirmed" ? "unconfirmed" : "verified", Error("fixture startup failure"));
+          }
+          const stdout = new PassThrough(), stderr = new PassThrough();
+          return {
+            started: { uid: 10003, liveCapsZero: true, noNewPrivs: true },
+            transport: { stdin: new PassThrough(), stdout, stderr },
+            async waitChild() {
+              if (first && fault === "helper_refusal") faults++;
+              stdout.end(first && fault === "helper_refusal" ? "refused owner\n" : "ok 1 0\n");
+              stderr.end();
+              return { code: 0 };
+            },
+            async dispose() {
+              disposals++;
+              events.push("dispose");
+              if (first && (fault === "cleanup" || fault === "dispose_throw" || fault === "cleanup_deadline")) {
+                faults++;
+                if (fault === "cleanup_deadline") t.mock.method(Date, "now", () => reservation.deadline + 1);
+                if (fault === "dispose_throw") throw Error("fixture dispose failure");
+                return { clean: false };
+              }
+              return { clean: true };
+            },
+          } as unknown as CodexRootHandle;
+        };
+      const status = h.git.worktreeStatus.bind(h.git);
+      h.git.worktreeStatus = async (...args) => { sourceReads++; return status(...args); };
+      const verify = h.git.verifiedRecoveryRestorePoint.bind(h.git);
+      h.git.verifiedRecoveryRestorePoint = async (...args) => {
+        resumedReads++;
+        events.push("resumed_read");
+        return verify(...args);
+      };
+      const prepare = h.git.prepareRecoverySuccessor.bind(h.git);
+      h.git.prepareRecoverySuccessor = async (...args) => {
+        prepares++;
+        if (terminal) throw Error("unexpected successor preparation after unconfirmed cleanup");
+        const successor = await prepare(...args);
+        adoptions++;
+        successorPath = successor.path;
+        adopted = journal(bare, clone.branch);
+        // Stop only AFTER the real clone and durable ready-for-model handoff.
+        // Assertions below remain outside runner callbacks, where failures cannot be swallowed.
+        throw Error("controlled stop after completed successor adoption");
+      };
+      h.client.releaseRecoveryCustody = async () => { releases++; throw Error("custody release forbidden"); };
+      const log = recordingLogger();
+      const r = h.runnerWith(runId => ({
+        homeDir: path.join(h.homeDir, runId),
+        executor: {
+          sandboxesCommands: true,
+          run: async () => { models++; throw Error("model admission forbidden"); },
+          settleForCredentialFreeCapture: async () => {
+            events.push("settle");
+            return { kind: "observed_empty" };
+          },
+        },
+      }), h.fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 });
+      await r.execute(claim);
+
+      assert.equal(faults, fault === "clean" ? 0 : 1, "the requested first-launch fault was reached");
+      assert.equal(launches, terminal || fault === "clean" ? 1 : 2,
+        "unconfirmed cleanup must terminate this claim before any otherwise-clean helper can launch");
+      assert.equal(disposals, launches - (fault.startsWith("startup_") ? 1 : 0));
+      assert.ok(events.indexOf("settle") < events.indexOf("launch"));
+      assert.equal(models, 0);
+      assert.equal(releases, 0);
+      assert.equal(fs.existsSync(clone.path), true);
+      assert.deepEqual(fs.readFileSync(path.join(clone.path, "README.md")), sourceBytes);
+      assert.equal(await h.git.worktreeHead(clone.path), sourceHead);
+      assert.equal(command(clone.path, "show-ref", "--head"), sourceRefs, "predecessor refs remain unchanged");
+      assert.equal(await h.git.revParse(bare, pin), capturedTip, "existing episode pin remains in custody");
+      assert.equal(await h.git.revParse(bare, "refs/uzi-runner/" + clone.branch), trackingTip);
+      assert.equal(h.api.states.some(s => s.body.status === "recovery_wait"), false);
+      const after = journal(bare, clone.branch);
+      if (terminal) {
+        assert.equal(prepares, 0);
+        assert.equal(adoptions, 0);
+        assert.equal(sourceReads, 0);
+        assert.equal(resumedReads, 0);
+        assert.equal(after.runId, before.runId);
+        assert.equal(after.clonePath, before.clonePath);
+        assert.equal(after.attemptId, before.attemptId);
+        assert.deepEqual(after.retainedSources, before.retainedSources);
+        assert.equal(fs.readFileSync(retainedFile, "utf8"), "only local dirty work\n");
+        assert.equal(after.restoreTip, capturedTip);
+        const progress = recoveryProgress(after.recovery);
+        assert.equal(progress.stage, "blocked");
+        assert.deepEqual(progress.source, before.recovery?.source);
+        assert.equal(progress.restoreTip, capturedTip);
+        assert.equal(progress.blocker, "readiness_cleanup_unconfirmed", "persist the typed cleanup blocker");
+        assert.equal(progress.attempts, reservation.attempts + 1, "charge only the failed readiness iteration");
+        assert.equal(progress.successor, undefined);
+        assert.ok(h.api.states.some(s => s.body.status === "failed" && s.body.claim_generation === 2));
+        assert.match(JSON.stringify(log.lines), /readiness_cleanup_unconfirmed/);
+      } else {
+        assert.equal(prepares, 1);
+        assert.equal(adoptions, 1, "original prepareRecoverySuccessor completed");
+        assert.ok(resumedReads > 0);
+        assert.ok(events.indexOf("dispose") < events.indexOf("resumed_read"));
+        assert.ok(adopted);
+        assert.ok(successorPath);
+        assert.notEqual(successorPath, clone.path);
+        assert.equal(adopted.clonePath, successorPath);
+        const progress = recoveryProgress(adopted.recovery);
+        assert.equal(progress.stage, "ready-for-model");
+        assert.equal(progress.blocker, undefined);
+        assert.equal(progress.successor?.clonePath, successorPath);
+        assert.equal(progress.attempts, reservation.attempts + launches);
+        assert.ok(adopted.retainedSources?.some(s => s.clonePath === clone.path));
+        assert.equal(await h.git.worktreeHead(successorPath), sourceHead);
+        assert.deepEqual(fs.readFileSync(path.join(successorPath, "README.md")), sourceBytes);
+        assert.equal(after.recovery?.stage, "ready-for-model", "controlled stop preserves completed adoption evidence");
+        if (fault !== "clean") {
+          assert.match(JSON.stringify(log.lines), /retained recovery iteration failed; reserved budget retained/);
+          assert.match(JSON.stringify(log.lines), fault === "startup_verified" ? /retained_readiness_launch/ : /retained_readiness_owner/);
+        }
+      }
+    });
+  }
   for (const fault of ["cleanup", "malformed", "none", "resumed", "resumed_cleanup", "profile", "legacy"]) test("runner gate: " + fault, async () => {
     const claim = h.gitlabClaim(3059, { claim_generation: 2, session_id: "readiness-predecessor" });
     const bare = await h.git.ensureClone(h.fx.originPath);
@@ -405,7 +575,7 @@ describe("runner retained readiness ordering and custody", async () => {
       assert.equal(sourceReads, 0);
       assert.equal(resumedReads, 0);
       assert.equal(adoptions, 0);
-      assert.match(JSON.stringify(log.lines), /retained_readiness_/);
+      assert.match(JSON.stringify(log.lines), fault.endsWith("cleanup") ? /readiness_cleanup_unconfirmed/ : /retained_readiness_/);
     }
     assert.equal(models, 0);
     assert.equal(releases, 0);
@@ -438,7 +608,7 @@ type GuardSeam = {
   checkedRecovery: () => Promise<object>;
   classifyOwnerClonePath: () => Promise<"canonical" | undefined>;
 };
-for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr", "cancelled", "deadline", "nonzero", "malformed", "helper_refusal", "stdout_overflow", "stderr_overflow", "cleanup", "dispose_throw", "launch", "displaced", "journal_changed", "identity", "child"]) {
+for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr", "cancelled", "deadline", "nonzero", "malformed", "helper_refusal", "stdout_overflow", "stderr_overflow", "cleanup", "cleanup_cancelled", "refusal_cleanup", "dispose_throw", "startup_unconfirmed", "startup_verified", "launch", "displaced", "journal_changed", "identity", "child"]) {
   test("supervised readiness refusal/settlement: " + fault, async t => {
     const f = fixture();
     const controller = new AbortController();
@@ -457,6 +627,8 @@ for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr",
       retainedReadinessLaunchForTest: async request => {
         launches++; spec = request;
         if (fault === "launch") throw Error("private failure path");
+        if (fault.startsWith("startup_")) throw new CodexLaunchError("started_deadline",
+          fault === "startup_unconfirmed" ? "unconfirmed" : "verified", Error("private startup failure"));
         const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
         return {
           started: { uid: fault === "identity" ? 10002 : 10003, liveCapsZero: true, noNewPrivs: true },
@@ -470,7 +642,7 @@ for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr",
               fs.renameSync(f.objects, f.objects + "-old");
               fs.mkdirSync(f.objects);
             }
-            stdout.end(fault === "malformed" ? "private malformed" : fault === "helper_refusal" ? "refused hardlinked_mutation\n" : fault === "stdout_overflow" ? "x".repeat(4097) : "ok 1 0\n");
+            stdout.end(fault === "malformed" ? "private malformed" : fault === "helper_refusal" || fault === "refusal_cleanup" ? "refused hardlinked_mutation\n" : fault === "stdout_overflow" ? "x".repeat(4097) : "ok 1 0\n");
             stderr.end(fault === "stderr_overflow" ? "x".repeat(4097) : "");
             waited = true;
             if (fault === "child") throw Error("private child failure");
@@ -480,7 +652,8 @@ for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr",
             disposals++;
             assert.equal(waited, true);
             if (fault === "dispose_throw") throw Error("private cleanup path");
-            return { clean: fault !== "cleanup" };
+            if (fault === "cleanup_cancelled") controller.abort();
+            return { clean: fault !== "cleanup" && fault !== "cleanup_cancelled" && fault !== "refusal_cleanup" };
           },
         } as unknown as CodexRootHandle;
       },
@@ -495,12 +668,13 @@ for (const fault of ["none", "missing_pipe", "missing_stdout", "missing_stderr",
       if (fault === "none") await run();
       else {
         const reason = fault.startsWith("missing_") ? "missing_pipe" : fault.endsWith("_overflow") ? "output_limit"
-          : fault === "dispose_throw" ? "cleanup" : fault === "displaced" ? "displaced_root"
+          : ["dispose_throw", "cleanup_cancelled", "refusal_cleanup", "startup_unconfirmed"].includes(fault) ? "cleanup"
+          : fault === "startup_verified" ? "launch" : fault === "displaced" ? "displaced_root"
           : fault === "helper_refusal" ? "hardlinked_mutation" : fault;
         await assert.rejects(run, new RegExp("^Error: retained_readiness_" + reason + "$"));
       }
       assert.equal(launches, 1);
-      if (fault !== "launch") {
+      if (fault !== "launch" && !fault.startsWith("startup_")) {
         assert.equal(waits, 1);
         assert.equal(disposals, 1);
       }

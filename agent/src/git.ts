@@ -1,5 +1,5 @@
 import { MaintenanceBudget } from "./maintenance-budget.js";
-import { launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
+import { CodexLaunchError, launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
@@ -1186,6 +1186,11 @@ export class BareCacheIdentityError extends Error {
     super(`bare cache identity check failed: ${bareName}`);
     this.name = "BareCacheIdentityError";
   }
+}
+
+/** A supervised retained-readiness effect has no positive cleanup proof. */
+export class RetainedReadinessCleanupUnconfirmedError extends Error {
+  constructor() { super("retained_readiness_cleanup"); }
 }
 
 export class RetainedRecoveryBlockedError extends Error {
@@ -5904,6 +5909,9 @@ export class GitCache {
   ): Promise<void> {
     const operation = this.recoveryOperations.getStore();
     if (!operation) throw new Error("retained_readiness_operation_required");
+    // The lock may report an expired operation after its callback settles. Keep
+    // this operation-local cleanup fact so that cannot authorize another attempt.
+    let cleanupFailure: RetainedReadinessCleanupUnconfirmedError | undefined;
     try {
       await this.withLock(barePath, async () => {
         const refuse = (code: string): never => { throw new Error("retained_readiness_" + code); };
@@ -5963,6 +5971,10 @@ export class GitCache {
         if (workDeadline <= Date.now()) refuse("deadline");
         let root: CodexRootHandle | undefined;
         let error: string | undefined;
+        const unconfirmedCleanup = () => {
+          error = "cleanup";
+          cleanupFailure ??= new RetainedReadinessCleanupUnconfirmedError();
+        };
         let child: Promise<void> | undefined;
         let output = "", outBytes = 0, errBytes = 0;
         const stopped = new AbortController();
@@ -6008,20 +6020,24 @@ export class GitCache {
             else stopped.signal.addEventListener("abort", () => resolve(), { once: true });
           });
           await Promise.race([Promise.all([child, ...pipeEnds]), abort]);
-        } catch { error ??= "launch"; }
+        } catch (cause) {
+          if (cause instanceof CodexLaunchError && cause.cleanupStatus === "unconfirmed") unconfirmedCleanup();
+          else error ??= "launch";
+        }
         finally {
           if (root) {
             // Wiring failures must join the child too. Both waits are owned here;
             // disposal starts without waiting for a cancelled child to exit first.
             child ??= root.waitChild(Math.max(1, workDeadline - Date.now()))
               .then(() => undefined, () => { error ??= "child"; });
-            try { if (!(await root.dispose(Math.max(1, hardDeadline - Date.now()))).clean) error = "cleanup"; }
-            catch { error = "cleanup"; }
+            try { if (!(await root.dispose(Math.max(1, hardDeadline - Date.now()))).clean) unconfirmedCleanup(); }
+            catch { unconfirmedCleanup(); }
             await child;
           }
           clearTimeout(timer);
           operation.signal.removeEventListener("abort", cancelled);
         }
+        if (cleanupFailure) throw cleanupFailure;
         if (error) refuse(error);
         check();
         const success = /^ok ([1-9][0-9]{0,6}) (0|[1-9][0-9]{0,6})\n(?![\s\S])/.exec(output);
@@ -6037,6 +6053,9 @@ export class GitCache {
         check();
       });
     } catch (error) {
+      // Preserve cleanup uncertainty even if the operation deadline expired during
+      // disposal. The runner still gives actual lifecycle controls precedence.
+      if (cleanupFailure) throw cleanupFailure;
       if (operation.signal.aborted) throw new Error("retained_readiness_cancelled");
       if (error instanceof Error && /^retained_readiness_[a-z_]+(?![\s\S])/.test(error.message)) throw error;
       throw new Error("retained_readiness_validation");
@@ -6425,7 +6444,7 @@ export class GitCache {
     reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
     guard?: () => void,
   ): Promise<void> {
-    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(reason)) throw new Error("invalid blocker");
+    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
