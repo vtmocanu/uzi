@@ -125,6 +125,7 @@ describe("SteeringChannel follow-up inclusion receipts (issue #1800)", () => {
   it("drops an id whose receipt says the claim is no longer active, and sends nothing for a later mark", async () => {
     const ch = channel();
     const { first, second } = await pullSevenAndEight(ch);
+    await ch.awaitReceiptSettlement();
     api.setInputClaimGeneration(RUN, GENERATION + 1); // a newer claim took the run
     ch.markFollowUpIncluded(first);
     await until(() => api.inclusionCalls.length >= 1);

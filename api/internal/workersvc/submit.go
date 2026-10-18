@@ -129,6 +129,16 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		}
 		return s.reconcileMilestoneApproval(ctx, userID, run, body, sel, opts)
 	}
+	if kind == "approve_plan" {
+		return s.admitApproval(ctx, userID, runID, body, sel, opts)
+	}
+	return s.submitInputForRun(ctx, userID, runID, run, kind, body, sel, opts)
+}
+
+// submitInputForRun uses the caller's run snapshot and query binding. Approval
+// admission calls it only while holding the run lock through commit.
+func (s *Service) submitInputForRun(ctx context.Context, userID, runID uuid.UUID, run store.Run, kind, body string, sel *AgentSelection, opts SubmitInputOptions) (SubmitInputResult, error) {
+	var err error
 	// PRD #1795 M2 (D5): an expected gate revision is checked up front against the run just
 	// read, BEFORE the terminal guard, so a verdict sent against a gate the run no longer shows
 	// (a newer revision, no gate yet, or a run that has since finished) is answered with the

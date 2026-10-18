@@ -112,6 +112,7 @@ const FIXED_REASONS = new Set<string>([
   "codex run paused",
   "codex run deferred: vault locked",
   "codex run reached its implement/review iteration budget without completing",
+  "completion blocked: the lead requested an owner decision while the frozen completion contract still has unmet milestones. Held for an owner decision rather than shipping an incomplete run.",
   "completion blocked: the lead declared the run complete but the frozen completion contract still has unmet milestones, and repeated completion attempts made no progress (the same unmet set, branch head and worktree across attempts). Held for an owner decision rather than shipping an incomplete run.",
   "completion budget exhausted: the server flagged this run past its completion budget after a completion attempt. Held for an owner decision rather than continuing to spend budget.",
   "denied by guardrail: git push is not permitted (the worker opens MRs; the agent never pushes)",

@@ -17,10 +17,9 @@ S/claims.sh list          # PRs another lander already holds: leave them to thei
 conflict (SKILL.md step 5). Classify every PR up front: **green / red-repo-wide /
 red-defect / stale-base / Renovate-class** (references/renovate.md).
 
-- **In-flight uzi runs.** `uzi run list`: auto-CI-fix can open a `ci_fix` run (often parked
-  at `awaiting_approval`) and a PR mid-batch. Read its plan before re-diagnosing
-  (`uzi run get <id>`, `uzi run logs <id>`); `uzi run reject <id> -m "<why>"` one you
-  supersede.
+- **In-flight uzi runs.** Auto-CI-fix can open a `ci_fix` run and a PR mid-batch.
+  Follow SKILL.md's *CI-fix branch ownership*: refresh, decide wait/cancel with the
+  buddy, record the decision and review the pushed delta before merging.
 - **Migration collisions.** Two PRs adding the same `NNNNN_*.sql` under
   `api/internal/store/migrations/` both land as distinct files and brick strict-goose boot.
   Note which PRs add a migration at or below the live head

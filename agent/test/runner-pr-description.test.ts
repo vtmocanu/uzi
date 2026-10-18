@@ -90,6 +90,7 @@ const H = "1111111111111111111111111111111111111111";
 const OTHER = "2222222222222222222222222222222222222222";
 
 function interlockedClaim(iid: number, scope?: { deferred: { milestone_id: string; title: string; reason: string }[] }) {
+  api.completionPermitScope = scope ?? {};
   return gitlabClaim(iid, {
     config: { completion_contract_version: 1, contract_revision: 1, ...(scope ? { completion_scope: scope } : {}) },
   });

@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import { CredentialSwitchSignal } from "../src/steering.js";
+import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #1247 M5b — the SdkExecutor half of a held-state credential switch, driven directly (the
@@ -24,6 +24,12 @@ const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
 const nonexistentWorktree = nonexistentWorktreeFactory("uzi-switch-sdk");
+
+function barrier<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
   return {
@@ -196,6 +202,155 @@ function doneTurn(sessionId = "sess-1"): SDKMessage[] {
     resultSuccess(sessionId),
   ];
 }
+
+describe("SdkExecutor — sticky terminal cancellation", () => {
+  for (const interruption of ["switch", "pause"] as const) {
+    it(`interrupts a live provider turn after a declined ${interruption} spent the shared listener`, { timeout: 10_000 }, async (t) => {
+      const shared = new AbortController();
+      const terminal = new AbortController();
+      const resumed = barrier<AbortSignal>();
+      t.after(() => terminal.abort());
+      let recoveries = 0;
+      const { queryFn, turnCount } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        (signal) => {
+          shared.abort(interruption === "switch" ? new CredentialSwitchSignal() : new PauseNowSignal());
+          return hangUntilAbort(signal);
+        },
+        (signal) => {
+          resumed.resolve(signal);
+          return hangUntilAbort(signal);
+        },
+      ]);
+      const { ctx } = makeCtx({
+        signal: shared.signal,
+        terminalLifecycleSignal: terminal.signal,
+        attemptCredentialSwitch: async () => { recoveries++; return "gave_up"; },
+        parkForPause: async () => { recoveries++; return false; },
+      });
+      const rejected = assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run cancelled/);
+      const currentSignal = await resumed.promise;
+      assert.equal(shared.signal.aborted, true, "the shared once-listener has already fired");
+      assert.equal(currentSignal.aborted, false, "recovery started a genuinely live SDK turn");
+      assert.equal(recoveries, 1);
+      terminal.abort();
+      assert.equal(currentSignal.aborted, true, "the stable signal aborts the current provider controller");
+      await rejected;
+      assert.equal(turnCount(), 3, "no turn starts after terminal cancellation");
+    });
+  }
+
+  for (const phase of ["planning", "implementation"] as const) {
+    for (const terminalKind of ["signal", "claim fence"] as const) {
+      it(`does not restart ${phase} after terminal ${terminalKind} during awaited switch settlement`, { timeout: 10_000 }, async () => {
+        const shared = new AbortController();
+        const terminal = new AbortController();
+        const settling = barrier<void>();
+        const cleanup = barrier<"gave_up">();
+        let fenced = false;
+        let attempts = 0;
+        const interrupted: Script = (signal) => {
+          shared.abort(new CredentialSwitchSignal());
+          return hangUntilAbort(signal);
+        };
+        const scripts: Script[] = phase === "planning"
+          ? [interrupted, [submitPlan("# Plan"), resultSuccess()], doneTurn()]
+          : [[submitPlan("# Plan"), resultSuccess()], interrupted, doneTurn()];
+        const { queryFn, turnCount } = fakeTurns(scripts);
+        const { ctx } = makeCtx({
+          signal: shared.signal,
+          ...(terminalKind === "signal" ? { terminalLifecycleSignal: terminal.signal } : {}),
+          claimFenced: () => fenced,
+          attemptCredentialSwitch: async () => {
+            attempts++;
+            settling.resolve();
+            return cleanup.promise;
+          },
+        });
+        const rejected = assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run cancelled/);
+        await settling.promise;
+        const before = turnCount();
+        assert.equal(shared.signal.reason instanceof CredentialSwitchSignal, true);
+        // The switch owns the first trip. Terminal arrives while marker cleanup is still awaited.
+        if (terminalKind === "signal") terminal.abort();
+        else fenced = true;
+        assert.equal(turnCount(), before);
+        cleanup.resolve("gave_up");
+        await rejected;
+        assert.equal(attempts, 1, "the earlier switch reached settlement");
+        assert.equal(turnCount(), phase === "planning" ? 1 : 2, "recovery must not start another provider turn");
+      });
+    }
+  }
+
+  it("does not restart implementation when terminal arrives during a declined pause refusal", { timeout: 10_000 }, async () => {
+    const shared = new AbortController();
+    const terminal = new AbortController();
+    const refusing = barrier<void>();
+    const refusal = barrier<boolean>();
+    let parks = 0;
+    const { queryFn, turnCount } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      (signal) => {
+        shared.abort(new PauseNowSignal());
+        return hangUntilAbort(signal);
+      },
+      doneTurn(),
+    ]);
+    const { ctx } = makeCtx({
+      signal: shared.signal,
+      terminalLifecycleSignal: terminal.signal,
+      parkForPause: async () => {
+        parks++;
+        refusing.resolve();
+        return refusal.promise;
+      },
+    });
+    const rejected = assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run cancelled/);
+    await refusing.promise;
+    terminal.abort();
+    refusal.resolve(false);
+    await rejected;
+    assert.equal(parks, 1, "the earlier pause won its trip and reached the refusal barrier");
+    assert.equal(turnCount(), 2, "no provider turn starts after the refusal settles");
+  });
+
+  it("rejects an already-aborted stable signal before starting a provider turn", async () => {
+    const terminal = new AbortController();
+    terminal.abort();
+    const { queryFn, turnCount } = fakeTurns([doneTurn()]);
+    const { ctx } = makeCtx({ terminalLifecycleSignal: terminal.signal });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run cancelled/);
+    assert.equal(turnCount(), 0);
+  });
+
+  it("rejects an already-fenced claim without a terminal signal", async () => {
+    const { queryFn, turnCount } = fakeTurns([doneTurn()]);
+    const { ctx } = makeCtx({ claimFenced: () => true });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run cancelled/);
+    assert.equal(turnCount(), 0);
+  });
+
+  for (const setupError of [false, true]) {
+    it(`removes the stable listener on ${setupError ? "phaseSetup error" : "normal completion"}`, async (t) => {
+      const terminal = new AbortController();
+      const add = t.mock.method(terminal.signal, "addEventListener");
+      const remove = t.mock.method(terminal.signal, "removeEventListener");
+      const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], doneTurn()]);
+      const { ctx } = makeCtx({
+        terminalLifecycleSignal: terminal.signal,
+        ...(setupError ? { oauthToken: "" } : {}),
+      });
+      const run = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      if (setupError) await assert.rejects(run, /OAuth/i);
+      else await run;
+      assert.equal(add.mock.callCount(), 1);
+      assert.equal(remove.mock.callCount(), 1);
+      assert.equal(add.mock.calls[0]!.arguments[0], "abort");
+      assert.equal(remove.mock.calls[0]!.arguments[1], add.mock.calls[0]!.arguments[1], "remove the exact installed callback");
+    });
+  }
+});
 
 describe("SdkExecutor — credential switch handled IN PLACE (PRD #1247 M5b data-integrity fix)", () => {
   it("RUNNING switch → attemptCredentialSwitch 'released' → run() ENDS with switchReleased, no throw", async () => {

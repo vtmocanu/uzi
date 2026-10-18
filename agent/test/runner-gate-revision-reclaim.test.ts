@@ -220,7 +220,7 @@ describe("gate presentation id choice on a reclaim (PRD #1795 decision 7)", () =
     send(runId, row("reject_plan", "not this", { gate_binding: "bound", gate_revision: 4 }));
     const exec = new GateExecutor([PLAN], { resumesAtGate: true });
     await execute(exec, resumeClaim(runId, 2));
-    assert.deepStrictEqual(exec.verdicts, [{ kind: "reject", reason: "not this" }]);
+    assert.deepStrictEqual(exec.verdicts, [{ kind: "reject", reason: "not this", sourceGateRevision: 4 }]);
     assert.equal(gates(runId).length, 0, "never re-presented");
     assert.ok(statuses(runId).includes("failed"));
   });

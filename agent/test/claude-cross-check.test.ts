@@ -8,7 +8,7 @@ import path from "node:path";
 import type { HookCallbackMatcher, HookInput, HookJSONOutput, Options as SdkOptions, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import { buildClaudeCrossCheckOptions, ClaudeCrossCheck, stubClaudeCrossCheckQueryFn } from "../src/claude-cross-check.js";
 import { CrossCheckRunner } from "../src/cross-check-runner.js";
-import { CrossCheckMalformedError } from "../src/codex/cross-check.js";
+import { CrossCheckMalformedError, crossCheckBrief } from "../src/codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import { buildIsolatedPreToolUse, type InitGate, type IsolationSurface } from "../src/isolated-executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
@@ -267,7 +267,10 @@ describe("ClaudeCrossCheck.run", () => {
     assert.match(prompt, /issue_body_[a-f0-9]{32}/);
     let brief = "";
     const probe = new ClaudeCrossCheck(nullLogger(), { secretPaths: ["/run/secrets/"], queryFn: ((p: { options: SdkOptions }) => {
-      brief = JSON.stringify(p.options.systemPrompt);
+      const system = p.options.systemPrompt;
+      assert.ok(system && typeof system === "object" && !Array.isArray(system) && system.type === "preset");
+      brief = system.append ?? "";
+      assert.equal(brief, crossCheckBrief("Read, Grep and Glob"), "shared plan policy is the trusted system append");
       return (async function* () { yield initFrame(); yield resultFrame(APPROVE); })();
     }) as unknown as SdkQueryFn });
     await probe.run(claudeClaim(), "/checkout", "/home", r.controller.signal, async () => {});

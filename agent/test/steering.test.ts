@@ -51,6 +51,56 @@ function makeChannel(batches: UserInput[][], cancel = new AbortController()): { 
   return { ch, cancel };
 }
 
+describe("D2b cancellation observation", () => {
+  it("API cancellation is sticky without observer recursion or input receipts", async () => {
+    let observations = 0;
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { observations++; },
+    });
+    cancel.abort(new PauseNowSignal());
+    ch.abortLifecycle(new PauseNowSignal());
+    ch.rearmLifecycle();
+    const lifecycle = ch.lifecycleSignal();
+    ch.markCancelled();
+    ch.markCancelled();
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(observations, 0);
+    ch.abortLifecycle();
+    ch.rearmLifecycle();
+    assert.equal(ch.lifecycleSignal(), lifecycle);
+    assert.equal(lifecycle.aborted, true);
+    assert.deepEqual(await ch.awaitVerdict(), { kind: "cancel" });
+  });
+
+  it("first observer runs after sticky cancel before abort listeners", async () => {
+    const cancel = new AbortController();
+    const events: string[] = [];
+    const ch = new SteeringChannel(fakeClient([[inp("cancel")]]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { assert.equal(ch.isCancelled(), true); events.push("observe"); },
+    });
+    cancel.signal.addEventListener("abort", () => events.push("model"));
+    ch.lifecycleSignal().addEventListener("abort", () => events.push("lifecycle"));
+    ch.start();
+    await ch.awaitVerdict();
+    assert.deepEqual(events, ["observe", "model", "lifecycle"]);
+    await ch.stop();
+  });
+
+  it("throwing cancellation observer still stops model and lifecycle", async () => {
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([[inp("cancel")]]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { throw new Error("observer fixture"); },
+    });
+    ch.start();
+    for (let n = 0; n < 100 && !cancel.signal.aborted; n++) await tick(1);
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(cancel.signal.aborted, true);
+    assert.equal(ch.lifecycleSignal().aborted, true);
+    await ch.stop();
+  });
+});
+
 describe("#2493 terminal lifecycle", () => {
   it("identity survives pause rearm and recoverable switch; terminal abort keeps first reason", () => {
     const { ch } = makeChannel([[]]);
@@ -1611,7 +1661,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("#2493 fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
+  it("#2493 refuses a waiting report and later gate waits when APPLIED keeps failing on the active claim", async () => {
     for (const kind of ["approve_plan", "follow_up"] as const) {
       const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
       let applies = 0;
@@ -1634,6 +1684,7 @@ describe("input receipts", () => {
         assert.strictEqual(applies, 30, "bounded on the active claim");
         assert.equal(terminal.aborted, true);
         assert.equal((terminal.reason as Error).name, "InputReceiptError");
+        assert.equal(ch.claimFence(), undefined, "an unconfirmed receipt does not prove loss of the claim");
         const reason = terminal.reason;
         ch.rearmLifecycle();
         assert.equal(ch.terminalLifecycleSignal(), terminal);

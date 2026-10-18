@@ -54,6 +54,7 @@
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
+import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
 import { PolicyResumeRejected, ProviderPolicyRefusal } from "../provider-policy-refusal.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
@@ -72,13 +73,14 @@ import { TransientRecoveryError } from "../sdk-executor.js";
 import { classifyLimitEvidence, LimitReachedError } from "../limit.js";
 import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
-import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
   completionAttemptFingerprint,
   updateCompletionStreak,
@@ -107,7 +109,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -157,6 +159,7 @@ import {
 } from "./delegation.js";
 import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
+import { codexSubagentWriteCapabilities } from "./render.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
 import { wireFileopHelper, type FileopHelperHandle } from "./fileop-client.js";
@@ -1982,27 +1985,33 @@ export class CodexExecutor implements Executor {
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    const budget = MaintenanceBudget.current();
+    const remaining = budget?.cap(deadlineMs) ?? (() => Math.max(0, deadlineAt - Date.now()));
+    const expired = (): boolean => remaining() <= 0;
+    const timeout = (): CredentialFreeCaptureSettlement => ({ kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] });
     this.summaryLifecycleClosed = true;
     if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
-    await this.closeAndSettlePlanSummary(Math.max(0, deadlineAt - Date.now()));
+    await this.closeAndSettlePlanSummary(remaining());
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
       // Close admission and drain before joining the installer, then observe the drain again:
       // setup/installer completion may have registered work during the join.
       this.depsInstall?.abort.abort();
+      if (expired()) return timeout();
       const safety = this.safety;
       if (safety !== undefined && !(safety instanceof CodexExecutionSafetyImpl)) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
       }
       const first = safety instanceof CodexExecutionSafetyImpl
-        ? await safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        ? await safety.settleForCredentialFreeCapture(remaining())
         : undefined;
-      const joined = await this.settleDepsInstall(deadlineAt);
+      if (expired()) return first?.kind === "incomplete" ? first : timeout();
+      const joined = await this.settleDepsInstall(deadlineAt, budget?.signal, this.depsInstall, remaining);
       if (!joined) {
         return { kind: "incomplete", errors: [{ category: "timeout", message: "codex dependency install did not settle before cancel" }] };
       }
       if (first?.kind === "incomplete") return first;
-      if (Date.now() >= deadlineAt) {
+      if (expired()) {
         return { kind: "incomplete", errors: [{ category: "timeout", message: "codex cancel settle expired" }] };
       }
       const current = this.safety;
@@ -2010,17 +2019,19 @@ export class CodexExecutor implements Executor {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: unsupported safety facade" }] };
       }
       const currentProof = current instanceof CodexExecutionSafetyImpl
-        ? await current.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()))
+        ? await current.settleForCredentialFreeCapture(remaining())
         : undefined;
+      if (expired()) return currentProof?.kind === "incomplete" ? currentProof : timeout();
       // One bounded settle per known registry, all sharing the absolute cancel deadline.
-      // A failed sibling does not skip the others; disposed/cleared tables refuse the proof.
+      // While time remains, a failed sibling does not skip others; cleared tables refuse proof.
       const outstanding = [...this.unverifiedEpochRegistries];
       const proofs = await Promise.all(outstanding.map(async registry => {
+        if (expired()) return timeout();
         if (!(registry instanceof ExecutionRegistry)) {
           return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: unsupported epoch registry" }] };
         }
         try {
-          return await registry.settleForCapture(Math.max(0, deadlineAt - Date.now()));
+          return await registry.settleForCapture(remaining());
         } catch {
           return { kind: "incomplete" as const, errors: [{ category: "protocol" as const, message: "codex cancel settle: epoch registry drain failed" }] };
         }
@@ -2028,14 +2039,19 @@ export class CodexExecutor implements Executor {
       if (currentProof?.kind === "incomplete") return currentProof;
       const incomplete = proofs.find(proof => proof.kind === "incomplete");
       if (incomplete) return incomplete;
+      if (expired()) return timeout();
       if ([...this.unverifiedEpochRegistries].some(registry => !outstanding.includes(registry))) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "codex cancel settle: epoch registry created during drain" }] };
       }
       return { kind: "observed_empty" };
     }
-    if (!await this.settleDepsInstall(deadlineAt, this.depsInstall?.cancellation)) {
+    this.depsInstall?.abort.abort();
+    if (expired()) return timeout();
+    const installSignal = budget ? (this.depsInstall?.cancellation ? AbortSignal.any([budget.signal, this.depsInstall.cancellation]) : budget.signal) : this.depsInstall?.cancellation;
+    if (!await this.settleDepsInstall(deadlineAt, installSignal, this.depsInstall, remaining)) {
       return { kind: "incomplete", errors: [{ category: "protocol", message: "codex dependency install did not settle before capture" }] };
     }
+    if (expired()) return timeout();
     const safety = this.safety;
     if (safety === undefined) {
       const outstanding = this.unverifiedEpochRegistries.size;
@@ -2048,7 +2064,10 @@ export class CodexExecutor implements Executor {
         }],
       };
     }
-    if (safety instanceof CodexExecutionSafetyImpl) return safety.settleForCredentialFreeCapture(Math.max(0, deadlineAt - Date.now()));
+    if (safety instanceof CodexExecutionSafetyImpl) {
+      const proof = await safety.settleForCredentialFreeCapture(remaining());
+      return proof.kind === "incomplete" ? proof : expired() ? timeout() : proof;
+    }
     return {
       kind: "incomplete",
       errors: [{ category: "protocol", message: "codex capture settle: unsupported safety facade" }],
@@ -2074,22 +2093,23 @@ export class CodexExecutor implements Executor {
    * Each bounded wait has one deadline and removes its own timer/listener on every exit.
    * Expiry/cancellation blocks this boundary, leaving the run to actually join at terminal.
    */
-  private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall): Promise<boolean> {
+  private async settleDepsInstall(deadlineAt?: number, signal?: AbortSignal, state = this.depsInstall, remaining?: () => number): Promise<boolean> {
     state?.abort.abort();
     if (!state?.promise) return true;
     if (deadlineAt === undefined) {
       await state.promise;
       return true;
     }
-    if (signal?.aborted || Date.now() >= deadlineAt) return false;
+    const left = remaining ?? (() => Math.max(0, deadlineAt - Date.now()));
+    if (signal?.aborted || left() <= 0) return false;
     let timer: ReturnType<typeof chunkedTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     try {
       return await new Promise<boolean>((resolve) => {
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
-        timer = chunkedTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()), { now: this.deps.timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && Date.now() < deadlineAt));
+        timer = chunkedTimeout(() => resolve(false), left(), { now: this.deps.timeoutNow });
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
       });
     } finally {
       timer?.cancel();
@@ -2171,17 +2191,19 @@ export class CodexExecutor implements Executor {
     for (const flight of flights) { flight.closed = true; flight.ctrl.abort(); }
     const bound = Math.min(this.opts.summarySettleMs ?? 3_000, Math.max(0, deadlineMs ?? Infinity));
     const deadlineAt = Date.now() + bound;
+    const remaining = MaintenanceBudget.current()?.cap(bound) ?? (() => Math.max(0, deadlineAt - Date.now()));
     await Promise.all([
-      this.settleIntentSummary(deadlineAt),
+      this.settleIntentSummary(deadlineAt, remaining),
       ...flights.map(async flight => {
         if (flight.abandoned) return;
+        if (remaining() <= 0) { flight.abandoned = true; return; }
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           const settled = await Promise.race([
             flight.done.then(() => true, () => true),
-            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now())); }),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), remaining()); }),
           ]);
-          if (!settled) {
+          if (!settled || remaining() <= 0) {
             flight.abandoned = true;
             this.log.warn("plan summary did not settle within the bound");
           }
@@ -2193,20 +2215,25 @@ export class CodexExecutor implements Executor {
   private readonly summaryRunner: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
 
   /** Abort once and join within one bound; abandonment drops all late results and usage. */
-  private async settleIntentSummary(deadlineAt?: number): Promise<void> {
+  private async settleIntentSummary(deadlineAt?: number, remaining?: () => number): Promise<void> {
     const flight = this.intentFlight;
     if (!flight) return;
     flight.ctrl.abort();
     if (flight.abandoned) return;
     const bound = Math.min(this.opts.summarySettleMs ?? 3_000,
-      deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+      remaining ? remaining() : deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+    if (bound <= 0) {
+      flight.abandoned = true;
+      this.log.warn("intent summary did not settle within the bound");
+      return;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const settled = await Promise.race([
         flight.done.then(() => true),
         new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), bound); }),
       ]);
-      if (!settled) {
+      if (!settled || (remaining && remaining() <= 0)) {
         flight.abandoned = true;
         this.log.warn("intent summary did not settle within the bound");
       }
@@ -2894,7 +2921,7 @@ export class CodexExecutor implements Executor {
           },
         };
       };
-      const drivePlan = async (initialPrompt: string) => {
+      const drivePlan = async (initialPrompt: string, humanRevision = false) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
         // before the next prompt is built; the call-site gates remain the guarantee.
         assertResidueQuarantineOpen("provider_turn");
@@ -2905,8 +2932,18 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const guidance = policyGuidance(prompt);
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", guidance.prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, false, undefined, guidance.included);
+          let turn: Awaited<ReturnType<CodexExecutor["driveTurnWithWallPark"]>>;
+          try {
+            if (humanRevision) await ctx.beforePlanRevisionTurn?.();
+            const guidance = policyGuidance(prompt);
+            turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", guidance.prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, false, undefined, guidance.included);
+          } catch (error) {
+            if (!humanRevision || !(error instanceof TransientRecoveryError) || !error.providerOrigin || !ctx.retryPlanRevisionTurn) throw error;
+            // The runner hook owns backoff and control checks. Redrive without a new cap,
+            // wall-budget reset, or epoch; clarification/prose recovery state stays local.
+            await ctx.retryPlanRevisionTurn(error);
+            continue;
+          }
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
           // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
           if (turn.kind === "paused") throw new PauseNowSignal();
@@ -2992,8 +3029,13 @@ export class CodexExecutor implements Executor {
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
         let revisions = 0;
         let automaticRound = 0;
+        let serverAcceptedReplacement = false;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
+          // PlanRevisionReplacedError carries a live server-accepted human replacement.
+          // Consume its admission once; later ordinary verdicts retain the local guard.
+          const acceptedReplacement = !automatic && serverAcceptedReplacement;
+          serverAcceptedReplacement = false;
           if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
@@ -3004,7 +3046,7 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_feedback", agent: "worker",
             payload: automatic ? { feedback, automatic: true, cross_check_round: automaticRound } : { feedback } });
           if (!automatic) {
-            if (revisions >= maxRevisions) {
+            if (!acceptedReplacement && revisions >= maxRevisions) {
               throw new TrustedExecutionRefusal("codex plan revision budget exhausted");
             }
             revisions++;
@@ -3015,9 +3057,17 @@ export class CodexExecutor implements Executor {
           ctx.emit({ kind: "plan_revising", agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
           // The revise turn resumes the plan thread, which holds the plan being revised.
-          const reviseTurn = await drivePlan(verdict.automatic === true
-            ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
-            : buildRevisePlanPrompt(feedback));
+          let reviseTurn: Awaited<ReturnType<typeof drivePlan>>;
+          try {
+            reviseTurn = await drivePlan(verdict.automatic === true
+              ? buildAutomaticRevisionPrompt("plan", { summary: feedback, items: verdict.items ?? [] }, undefined)
+              : buildRevisePlanPrompt(feedback), !automatic);
+          } catch (error) {
+            if (!(error instanceof PlanRevisionReplacedError)) throw error;
+            verdict = error.verdict;
+            serverAcceptedReplacement = verdict.automatic !== true;
+            continue;
+          }
           if (reviseTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (reviseTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: reviseTurn.reason } };
           planResult = reviseTurn.result;
@@ -3027,7 +3077,7 @@ export class CodexExecutor implements Executor {
           }
           verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles);
         }
-        if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
+        if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         pauseNow.vaultLock.gateOpen = false;
         if (verdict.approval === "cross_check") {
@@ -3109,9 +3159,11 @@ export class CodexExecutor implements Executor {
       let iteration = 0;
       let completionAttempted = false;
       let completionHeld: { reason: string } | undefined;
+      let walledAtRequest = false;
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
+      let completionAnswered = false;
       // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
@@ -3292,11 +3344,14 @@ export class CodexExecutor implements Executor {
         // implement prompt only. It is a per-turn prefix (outside the owner follow-up's fence) so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
-        // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
-        // the clarification continuation below) carries the shared milestone tracker guidance.
+        // Ordinary work and clarification turns retain the milestone tracker. A completion
+        // answer gets a neutral recheck turn because the old frozen scope may have changed.
         // Issue #1800: a system text (completion-rework, secret-remediation or clarification)
         // owns the turn outright, so the owner follow-up is neither pulled nor rendered on it.
-        const systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        let systemFollowUp = clarificationPrompt ?? completionFollowUp;
+        if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
+          systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}`;
+        }
         if (systemFollowUp === undefined && ctx.policyHoldResume !== true) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
         const onOwnerFirstEvent = ownerRides
@@ -3321,13 +3376,14 @@ export class CodexExecutor implements Executor {
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
         const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = systemFollowUp !== undefined
-          ? withMilestoneNote(systemFollowUp, milestoneNote())
+          ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
         const guidance = policyGuidance(implementBody);
         const turnPrompt = safetySteer
           ? `The worker detected a problem and is steering you. This is authoritative guidance from uzi itself, not user input — follow it:\n${safetySteer}\n\n${guidance.prompt}`
           : guidance.prompt;
         completionFollowUp = undefined;
+        completionAnswered = false;
         // PRD #1497 M2: drive the implement turn through the wall-park wrapper — a wall trip (the own
         // timer's REASON_WALL, or a `wall` PauseNowSignal) parks the run (capture-first, reusing the
         // runner's captureHoldContext) instead of failing it.
@@ -3499,12 +3555,15 @@ export class CodexExecutor implements Executor {
           reapedSinceLastPersist = true;
           await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           const { unmet } = await ctx.recordCompletionAttempt!({
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
           });
           completionAttempted = true;
+          if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
           if (unmet.length === 0) {
             const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
             if (codeDecision?.action === "repair") {
@@ -3517,22 +3576,82 @@ export class CodexExecutor implements Executor {
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;
-          let guidance: string | undefined;
-          if (completionStallStreak >= STALL_LIMIT) {
-            const decision = await ctx.askCompletionQuestion?.(unmet);
+          let answer: { kind: "answered"; guidance?: string } | undefined;
+          const leadRequest = result.ownerDecisionRequested;
+          const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
+            if (!leadRequest) return false;
+            const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
+            liftWall(wall, fresh?.totalWallSeconds ?? fresh?.wallSeconds);
+            // Preserve Codex's budget-before-pause precedence.
+            const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
+              : iteration >= maxIterations ? REASON_MAX_ITERATIONS
+              : wall.remainingMs <= 0 || ctx.pauseModeRequested?.() === "wall" ? REASON_WALL : undefined;
+            if (bound) {
+              if (await routeHold(bound, true)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: bound };
+                return true;
+              }
+              if (bound === REASON_WALL) {
+                const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+                const pauseToken = pauseNow.capture();
+                const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
+                if (outcome === "parked") {
+                  walledAtRequest = true;
+                  return true;
+                }
+                if (outcome === "refused") {
+                  refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
+                  return false;
+                }
+              }
+              throw new Error(bound);
+            }
+            if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
+              const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: milestones?.length };
+              const pauseToken = pauseNow.capture();
+              if (await this.requestPause(ctx, at)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                pausedAt = at;
+                return true;
+              }
+              pauseNow.consume(pauseToken);
+            }
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            return false;
+          };
+          if (await checkRequestBoundary()) {
+            if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+            break;
+          }
+          if (leadRequest || completionStallStreak >= STALL_LIMIT) {
+            const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
+            const decision = await ctx.askCompletionQuestion?.(unmet, leadRequest
+              ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+            if (ctx.cancelRequested?.() || lifecycleSignal.aborted) throw new Error(REASON_CANCEL);
+            // A timeout keeps the question open; do not report running to resolve it.
+            if (await checkRequestBoundary(decision?.outcome === "continue")) {
+              if (walledAtRequest) return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+              break;
+            }
             if (decision?.outcome === "continue") {
-              guidance = decision.guidance;
+              answer = { kind: "answered", guidance: decision.guidance };
               lastCompletionFingerprint = undefined;
               completionStallStreak = 0;
             } else {
-              if (await routeHold(REASON_COMPLETION_NO_PROGRESS, completionAttempted)) {
-                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+              if (await routeHold(holdReason, completionAttempted)) {
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+                completionHeld = { reason: holdReason };
                 break;
               }
-              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+              throw new Error(holdReason);
             }
           }
-          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, guidance);
+          completionFollowUp = buildCompletionReworkFollowUp(unmet, milestones, answer,
+            ctx.completionInterlock === true && isIssueRun && !ctx.interactive);
+          completionAnswered = answer !== undefined;
           if (iteration >= maxIterations) pendingIterationExhaustion = true;
           // Re-check the fresh ACK's cap before exhaustion or any new provider epoch.
           epochNeedsRecreate = true;
@@ -4765,12 +4884,14 @@ export class CodexExecutor implements Executor {
       leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
       const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
-      // The roster (and, for a repo roster, the untrusted-content passage) rides EVERY implement
-      // prompt built here, so the base prompt and every replacement prompt (completion rework,
-      // safety steer, clarification continuation, resume-reject restart) carry it: the resumed thread's developer
-      // instructions alone are not enough on a turn that bypasses implementPrompt.
-      prompt = [prompt, "", delegatesLine(Object.keys(agents)), ...(repoSourced ? [REPO_SUBAGENT_UNTRUSTED_APPEND] : [])].join("\n");
+      // Every implement request, including replacement and continuation prompts,
+      // carries the repo roster's untrusted-content passage. The resumed thread's
+      // developer instructions alone are not enough. Both phases get the roster below.
+      if (repoSourced) prompt += `\n\n${REPO_SUBAGENT_UNTRUSTED_APPEND}`;
     }
+    prompt = [prompt, "", delegatesLine(Object.keys(agents), codexSubagentWriteCapabilities(agents)),
+      ...(phase === "plan" && Object.keys(agents).length > 0 ? ["These annotations describe implementation capabilities. All planning dispatches are read-only."] : []),
+    ].join("\n");
     if (ctx.config?.override_subagent_model) {
       for (const agent of Object.values(agents)) agent.model = undefined;
     }
@@ -4784,6 +4905,7 @@ export class CodexExecutor implements Executor {
       prompt,
       systemPrompt,
       phase,
+      ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
       policyHoldSupported: ctx.policyHoldSupported,
       policyHoldResume: ctx.policyHoldResume,
@@ -4890,7 +5012,9 @@ export class CodexExecutor implements Executor {
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${body}\n\n${review}` : body;
     const restoredState = ctx.reviewedPlanResume === true && !ctx.sessionId ? `${CURRENT_EXECUTION_STATE_GUIDANCE}\n\n` : "";
-    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}`;
+    const completionGuidance = ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive
+      ? `\n\n${COMPLETION_CONTRACT_GUIDANCE}` : "";
+    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}${completionGuidance}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);

@@ -121,7 +121,7 @@ import type {
   TurnStreamEnd,
 } from "./harness.js";
 import { evidencesModelProcessing } from "./harness.js";
-import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
@@ -130,6 +130,7 @@ import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
+  REASON_COMPLETION_LEAD_REQUESTED,
   REASON_COMPLETION_BUDGET_EXHAUSTED,
   completionAttemptFingerprint,
   updateCompletionStreak,
@@ -233,13 +234,16 @@ export class TransientRecoveryError extends Error {
    *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
+  /** Session resolved by the final failed attempt; undefined means resume no session. */
+  public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
+    this.sessionId = opts.sessionId;
   }
 }
 
@@ -599,6 +603,7 @@ interface TurnResult {
   decisionsMemo?: string;
   /** Latest accepted declaration that an issue delivery leaves the issue open. */
   nonClosing?: { reason: string };
+  ownerDecisionRequested?: { reason: string };
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -1202,41 +1207,55 @@ export class SdkExecutor implements Executor {
     this.spentSwitchSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
-    const drive = await this.phaseSetup(ctx);
+    let liveState: RunDrive | undefined;
+    const onTerminal = (): void => {
+      if (liveState) this.trip(liveState, REASON_CANCELLED);
+      this.activeDeps?.abort.abort();
+    };
+    ctx.terminalLifecycleSignal?.addEventListener("abort", onTerminal, { once: true });
     try {
-      const early = await this.phasePlanGate(ctx, drive);
-      if (early !== undefined) return (summaryResult = early);
-      return (summaryResult = await this.phaseRunLoop(ctx, drive));
-    } finally {
-      // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
-      // open, so its observed usage is emitted rather than dropped by a closed batcher.
-      await this.closeAndSettlePlanSummary();
-      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.()
-        || (ctx.signal?.aborted && ctx.signal !== this.spentSwitchSignal) || ctx.terminalLifecycleSignal?.aborted)) {
-        delete summaryResult.summaryPlan;
-        delete summaryResult.summaryDeltas;
+      this.throwIfTerminal(ctx);
+      const drive = await this.phaseSetup(ctx, (state) => {
+        liveState = state;
+        if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) onTerminal();
+      });
+      try {
+        const early = await this.phasePlanGate(ctx, drive);
+        if (early !== undefined) return (summaryResult = early);
+        return (summaryResult = await this.phaseRunLoop(ctx, drive));
+      } finally {
+        // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
+        // open, so its observed usage is emitted rather than dropped by a closed batcher.
+        await this.closeAndSettlePlanSummary();
+        if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.()
+          || (ctx.signal?.aborted && ctx.signal !== this.spentSwitchSignal) || ctx.terminalLifecycleSignal?.aborted)) {
+          delete summaryResult.summaryPlan;
+          delete summaryResult.summaryDeltas;
+        }
+        this.disarmWall(drive.state);
+        if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
+        // PRD #121 M2: no install may outlive the run. On every path that never reached
+        // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
+        // install may still be in flight, and the runner tears the clone down and pushes
+        // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
+        // kill rather than by the install's own 10-minute cap (that is what stops a
+        // rejected plan blocking on deps nobody needs); the promise already carries its
+        // own catch, so awaiting it can never throw here and mask the real failure.
+        drive.depsAbort.abort();
+        await drive.depsInstall;
+        this.depsJoined = true;
+        this.activeDeps = undefined;
+        // Reap every agent subprocess before returning, so none survives into the
+        // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
+        // too, not just the runner's explicit pre-push call.
+        this.killAgentTree();
+        // Remove the per-run provisioning dir (the synthesized devbox.json + profile
+        // symlinks). The nix STORE is global (on the data volume), NOT here, so this
+        // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
+        if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
       }
-      this.disarmWall(drive.state);
-      if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
-      // PRD #121 M2: no install may outlive the run. On every path that never reached
-      // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
-      // install may still be in flight, and the runner tears the clone down and pushes
-      // with the PAT the moment this returns. Abort FIRST so the await is bounded by a
-      // kill rather than by the install's own 10-minute cap (that is what stops a
-      // rejected plan blocking on deps nobody needs); the promise already carries its
-      // own catch, so awaiting it can never throw here and mask the real failure.
-      drive.depsAbort.abort();
-      await drive.depsInstall;
-      this.depsJoined = true;
-      this.activeDeps = undefined;
-      // Reap every agent subprocess before returning, so none survives into the
-      // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
-      // too, not just the runner's explicit pre-push call.
-      this.killAgentTree();
-      // Remove the per-run provisioning dir (the synthesized devbox.json + profile
-      // symlinks). The nix STORE is global (on the data volume), NOT here, so this
-      // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
-      if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
+    } finally {
+      ctx.terminalLifecycleSignal?.removeEventListener("abort", onTerminal);
     }
   }
 
@@ -1248,7 +1267,7 @@ export class SdkExecutor implements Executor {
    * before the split. Returns the populated carrier; the cancel listener it registers
    * closes over the same `state`/`depsAbort` objects it stores on the carrier.
    */
-  private async phaseSetup(ctx: RunContext): Promise<DriveState> {
+  private async phaseSetup(ctx: RunContext, observeState: (state: RunDrive) => void): Promise<DriveState> {
     const oauthToken = ctx.oauthToken?.trim();
     if (!oauthToken) {
       // OAuth is the sole supported credential (no API keys). Detect its
@@ -1518,6 +1537,7 @@ export class SdkExecutor implements Executor {
     let signalParkRun = false;
     const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
       buildSignalMcpServer({
+        ownerDecisionRequested: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -1682,6 +1702,7 @@ export class SdkExecutor implements Executor {
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
     };
+    observeState(state);
     const idleMs = seconds(
       ctx.config?.idle_timeout_seconds,
       DEFAULT_IDLE_TIMEOUT_SECONDS,
@@ -2139,7 +2160,7 @@ export class SdkExecutor implements Executor {
               text: "the owner rejected the submitted plan before the claim was released — failing the run without offering it again",
             },
           });
-          throw new PlanRejectedError(pending.reason);
+          throw new PlanRejectedError(pending.reason, pending.sourceGateRevision);
         }
         const resumedRevise = pending?.kind === "revise" ? pending : undefined;
         if (resumedRevise) {
@@ -2253,8 +2274,13 @@ export class SdkExecutor implements Executor {
         }
         let revisions = 0;
         let automaticRound = 0;
+        let serverAcceptedReplacement = false;
         while (verdict.kind === "revise") {
           const automatic = verdict.automatic === true;
+          // PlanRevisionReplacedError carries a live server-accepted human replacement.
+          // Consume its admission once; later ordinary verdicts retain the local guard.
+          const acceptedReplacement = !automatic && serverAcceptedReplacement;
+          serverAcceptedReplacement = false;
           if (verdict.automatic === true) automaticRound = nextAutomaticRound(verdict.round, automaticRound);
           // issue #2213: a quarantined worker stops before recording feedback or building a revise prompt.
           assertResidueQuarantineOpen("provider_turn");
@@ -2274,7 +2300,7 @@ export class SdkExecutor implements Executor {
           // submit time and won't enqueue a revise past it, so this should never trip. If it
           // does, DO NOT run another planning turn — record it and re-gate the current plan so
           // the run stays fail-closed rather than revising unbounded.
-          if (!automatic && revisions >= maxRevisions) {
+          if (!automatic && !acceptedReplacement && revisions >= maxRevisions) {
             this.log.warn(
               "plan revision budget exhausted; re-gating without a turn",
               { run_id: ctx.runId, max_revisions: maxRevisions },
@@ -2329,10 +2355,19 @@ export class SdkExecutor implements Executor {
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
           const runRevisionTurn = () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
-          const turn = ctx.deferCredentialSwitch
-            ? await ctx.deferCredentialSwitch(runRevisionTurn)
-            : await runRevisionTurn();
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
+          let turn: TurnResult & { plan: string };
+          try {
+            turn = ctx.deferCredentialSwitch
+              ? await ctx.deferCredentialSwitch(runRevisionTurn)
+              : await runRevisionTurn();
+          } catch (error) {
+            if (!(error instanceof PlanRevisionReplacedError)) throw error;
+            resumeId = error.sessionId;
+            verdict = error.verdict;
+            serverAcceptedReplacement = verdict.automatic !== true;
+            continue;
+          }
           resumeId = turn.sessionId ?? resumeId;
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
@@ -2355,7 +2390,7 @@ export class SdkExecutor implements Executor {
           verdict = gRev.value;
         }
         if (verdict.kind === "reject")
-          throw new PlanRejectedError(verdict.reason);
+          throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
         // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
         // bug (e.g. a future verdict variant) and must never fall through into implement.
@@ -2570,6 +2605,7 @@ export class SdkExecutor implements Executor {
       // remediation): worker-authored turn prompts that own the next implement turn outright.
       // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
       let followUp: string | undefined;
+      let completionRework: { text: string; answered: boolean } | undefined;
       // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
       // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
@@ -2698,6 +2734,7 @@ export class SdkExecutor implements Executor {
         // unaffected: it aborts the LIVE turn, which throws Error(REASON_CANCELLED) from driveTurn
         // before control returns here. Throwing the same error takes the identical terminal cancel
         // path, so a late cancel is honored exactly like an in-flight one.
+        this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         // PRD #1809 D4: a worker-local `disk` stop parks at the next boundary, UNCONDITIONALLY. Its
         // turn drop is first-wins with every other trip (trip()), so a stop that landed while a
@@ -2712,6 +2749,7 @@ export class SdkExecutor implements Executor {
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
         const served = finalizing ? undefined : await ctx.reportIteration?.(iteration, latestProgress);
+        this.throwIfTerminal(ctx);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
@@ -2848,8 +2886,10 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
-        if (followUp === undefined) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
-        const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
+        const reworkForTurn = completionRework;
+        completionRework = undefined;
+        if (followUp === undefined && !reworkForTurn) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
+        const ownerRides = followUp === undefined && !reworkForTurn ? ownerFollowUp : undefined;
         const onFirstEvent = ownerRides
           ? () => {
               if (ownerFollowUp?.id !== ownerRides.id) return;
@@ -2894,7 +2934,7 @@ export class SdkExecutor implements Executor {
           implementConfig,
           "implement",
           resumeId,
-          checkedContext + buildImplementPrompt({
+          (reworkForTurn?.answered ? "" : checkedContext) + buildImplementPrompt({
             branch: ctx.branch,
             subagentNames: selectedNames,
             // PRD #266 M1: the implement roster's OWN capability map (selectedCanWrite),
@@ -2927,6 +2967,8 @@ export class SdkExecutor implements Executor {
             // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
             followUp: followUp ?? ownerRides?.body,
+            completionRework: reworkForTurn,
+            ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn
             // could not have. Correct on the revise path too: the join runs after the LAST
@@ -2986,6 +3028,7 @@ export class SdkExecutor implements Executor {
         // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
         // Both provider interruptions and idle park waits use the same lifecycle precedence.
         const handlePauseNow = async (at: { completedCount: number; total?: number }): Promise<boolean> => {
+          this.throwIfTerminal(ctx);
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
@@ -3004,6 +3047,7 @@ export class SdkExecutor implements Executor {
             pausedAt = at;
             return true;
           }
+          this.throwIfTerminal(ctx);
           state.tripReason = undefined;
           throwIfDiskStop(ctx);
           return false;
@@ -3156,9 +3200,11 @@ export class SdkExecutor implements Executor {
               break;
             }
             if (outcome === "gave_up") {
+              this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
             throw err;
@@ -3169,6 +3215,7 @@ export class SdkExecutor implements Executor {
               total: frozenMilestones?.length,
             };
             if (await handlePauseNow(at)) break;
+            completionRework = reworkForTurn;
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3208,8 +3255,10 @@ export class SdkExecutor implements Executor {
             // fall-through below re-throws REASON_WALL, the legacy terminal, byte-identical to before.
             if (outcome === "refused") {
               ctx.clearWallMode?.();
+              this.throwIfTerminal(ctx);
               state.tripReason = undefined;
               throwIfDiskStop(ctx);
+              completionRework = reworkForTurn;
               continue;
             }
           }
@@ -3433,6 +3482,8 @@ export class SdkExecutor implements Executor {
             //    use; the session transcript survives on disk so the SAME session resumes.
             await this.closeAndSettlePlanSummary();
             await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
             //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
             //    fingerprint is unresolvable — then head is null too, which the server accepts).
@@ -3447,6 +3498,8 @@ export class SdkExecutor implements Executor {
             //    milestones_completed, recomputes unmet over the merged set (server authoritative)
             //    and records a bounded attempt. Pass only this turn's declaration — the server
             //    unions it with prior report_progress.
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const { unmet } = await ctx.recordCompletionAttempt({
               declared: turn.milestonesCompleted ?? [],
               head,
@@ -3456,6 +3509,8 @@ export class SdkExecutor implements Executor {
             // arms once at least one attempt has actually completed. A thrown attempt call leaves
             // this false, so the run fails legacy-style (no hold), which is correct.
             completionAttempted = true;
+            this.throwIfTerminal(ctx);
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
             if (unmet.length === 0) {
@@ -3483,15 +3538,81 @@ export class SdkExecutor implements Executor {
               completionStallStreak,
             );
             lastCompletionFingerprint = completionFingerprint;
-            if (completionStallStreak >= STALL_LIMIT) {
-              // No progress across STALL_LIMIT identical completion attempts. The run is
-              // STRUCTURALLY blocked (not resource-exhausted): this is the completion-question
+            const leadRequest = turn.ownerDecisionRequested;
+            const checkRequestBoundary = async (refresh = true): Promise<boolean> => {
+              if (!leadRequest) return false;
+              // Refresh the running ACK at the current iteration; this is not another model turn.
+              const fresh = refresh ? await ctx.reportIteration?.(iteration, latestProgress) : undefined;
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              if (fresh?.maxIterations && fresh.maxIterations > maxIterations) maxIterations = fresh.maxIterations;
+              const wallSeconds = fresh?.totalWallSeconds ?? fresh?.wallSeconds;
+              if (typeof wallSeconds === "number" && wallSeconds * 1000 > maxServedWallMs) {
+                state.wallRemainingMs += wallSeconds * 1000 - maxServedWallMs;
+                maxServedWallMs = wallSeconds * 1000;
+              }
+              const at = { completedCount: fresh?.completedCount ?? latestProgress?.completed.length ?? 0, total: frozenMilestones?.length };
+              // Preserve Claude's pause-before-budget precedence.
+              if (fresh?.pauseRequested || ctx.pauseModeRequested?.() === "now" || ctx.pauseModeRequested?.() === "wall") {
+                if (ctx.pauseModeRequested?.() === "wall") {
+                  const stopped = await handlePauseNow(at);
+                  if (!stopped && !ctx.parkForWall) throw new Error(REASON_WALL);
+                  return stopped;
+                }
+                if (await this.requestPause(ctx, at)) {
+                  if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  pausedAt = at;
+                  return true;
+                }
+              }
+              const bound = fresh?.budgetExhausted ? REASON_COMPLETION_BUDGET_EXHAUSTED
+                : iteration >= maxIterations ? REASON_MAX_ITERATIONS
+                : state.wallRemainingMs <= 0 ? REASON_WALL : undefined;
+              if (bound) {
+                if (await this.routeSummaryHold(ctx, bound, true)) {
+                  if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  completionHeld = { reason: bound };
+                  return true;
+                }
+                if (bound === REASON_WALL) {
+                  const outcome = await this.parkForWall(ctx, at);
+                  if (outcome === "parked" || outcome === "undeliverable") {
+                    walled = { reason: REASON_WALL };
+                    return true;
+                  }
+                  if (outcome === "cancelled" || ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                  if (outcome === "refused") {
+                    ctx.clearWallMode?.();
+                    this.throwIfTerminal(ctx);
+                    state.tripReason = undefined;
+                    throwIfDiskStop(ctx);
+                    return false;
+                  }
+                }
+                throw new Error(bound);
+              }
+              this.throwIfTerminal(ctx);
+              if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+              return false;
+            };
+            if (await checkRequestBoundary()) break;
+            if (leadRequest || completionStallStreak >= STALL_LIMIT) {
+              const holdReason = leadRequest ? REASON_COMPLETION_LEAD_REQUESTED : REASON_COMPLETION_NO_PROGRESS;
+              // An explicit lead request or STALL_LIMIT identical completion attempts opens
+              // the completion-question window with the actual trigger. This is the completion-question
               // moment (PRD #1226 M5 D6) — "completion is blocked; owner, continue with guidance or
               // let it park?". When the LIVE-window seam is wired, ask the owner and give them up to
               // completion_hold_window_seconds (default 900s) to answer BEFORE parking; when it is
               // NOT wired the behaviour is byte-for-byte the M4 direct-park below.
               if (completionAttempted && ctx.askCompletionQuestion) {
-                const decision = await ctx.askCompletionQuestion(unmet);
+                this.throwIfTerminal(ctx);
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                const decision = await ctx.askCompletionQuestion(unmet, leadRequest
+                  ? { kind: "lead_request", reason: leadRequest.reason } : { kind: "no_progress" });
+                this.throwIfTerminal(ctx);
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                // A timeout keeps the question open; do not report running to resolve it.
+                if (await checkRequestBoundary(decision.outcome === "continue")) break;
                 if (decision.outcome === "continue") {
                   // The owner answered within the window: resume the SAME session for another
                   // completion attempt, folding any guidance into the rework follow-up, and RESET
@@ -3502,16 +3623,15 @@ export class SdkExecutor implements Executor {
                     kind: "status",
                     agent: "worker",
                     payload: {
-                      text: decision.guidance
-                        ? "owner chose to continue with guidance — resuming for another completion attempt"
-                        : "owner chose to continue — resuming for another completion attempt",
+                      text: "owner answered — resuming for a server-authoritative completion recheck",
                     },
                   });
-                  followUp = buildCompletionReworkFollowUp(
-                    unmet,
-                    frozenMilestones,
-                    decision.guidance,
-                  );
+                  followUp = undefined;
+                  completionRework = {
+                    text: buildCompletionReworkFollowUp(unmet, frozenMilestones,
+                      { kind: "answered", guidance: decision.guidance }),
+                    answered: true,
+                  };
                   resetStallState(); // owner input is new input → breaks any #281 refusal streak
                   lastCompletionFingerprint = undefined;
                   completionStallStreak = 0;
@@ -3529,20 +3649,21 @@ export class SdkExecutor implements Executor {
                 kind: "status",
                 agent: "worker",
                 payload: {
-                  text: `completion blocked: ${unmet.length} frozen milestone(s) still not complete after ${completionStallStreak} attempts with no progress`,
+                  text: leadRequest ? `completion blocked: lead requested an owner decision with ${unmet.length} unmet frozen milestone(s)` : `completion blocked: ${unmet.length} frozen milestone(s) still not complete after ${completionStallStreak} attempts with no progress`,
                 },
               });
               if (
                 await this.routeSummaryHold(
                   ctx,
-                  REASON_COMPLETION_NO_PROGRESS,
+                  holdReason,
                   completionAttempted,
                 )
               ) {
-                completionHeld = { reason: REASON_COMPLETION_NO_PROGRESS };
+                if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+                completionHeld = { reason: holdReason };
                 break;
               }
-              throw new Error(REASON_COMPLETION_NO_PROGRESS);
+              throw new Error(holdReason);
             }
             // Progress is still possible: inject the unmet ids as an AUTONOMOUS same-session
             // follow-up (like a queued owner follow-up, NOT the interactive owner
@@ -3557,7 +3678,12 @@ export class SdkExecutor implements Executor {
                 text: `completion check: ${unmet.length} frozen milestone(s) not yet complete (${unmet.join(", ")}) — returning to the lead`,
               },
             });
-            followUp = buildCompletionReworkFollowUp(unmet, frozenMilestones);
+            followUp = undefined;
+            completionRework = {
+              text: buildCompletionReworkFollowUp(unmet, frozenMilestones, undefined,
+                ctx.completionInterlock === true && isIssueRun && !ctx.interactive),
+              answered: false,
+            };
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
             continue;
@@ -3923,19 +4049,25 @@ export class SdkExecutor implements Executor {
     let attempt = run;
     for (;;) {
       try {
+        this.throwIfTerminal(ctx);
         return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
         const outcome = await this.attemptCredentialSwitch(ctx);
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
+          this.throwIfTerminal(ctx);
           state.tripReason = undefined;
           this.markSwitchSignalSpent(ctx);
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
           if (options?.reopenPlanSummary) this.reopenPlanSummary(ctx);
-          attempt = continueWait ? () => continueWait(run) : run;
+          const guardedRun = (): Promise<T> => {
+            this.throwIfTerminal(ctx);
+            return run();
+          };
+          attempt = continueWait ? () => continueWait(guardedRun) : guardedRun;
           continue;
         }
         throw err; // no hook wired: let the runner's outer catch handle it, as before this fix
@@ -3969,6 +4101,7 @@ export class SdkExecutor implements Executor {
     state: RunDrive,
     idleMs: number,
     budget: { asked: number },
+    humanRevision = false,
   ): Promise<TurnResult & { plan: string }> {
     // issue #2213: a quarantined worker stops at the planning boundary, before the prompt is used;
     // the queryFn call-site gate remains the guarantee.
@@ -3991,15 +4124,28 @@ export class SdkExecutor implements Executor {
       // wrapper — which throws BEFORE the REASON_NO_PLAN control below is reached. A
       // NON-empty turn that neither planned nor asked still falls through to
       // REASON_NO_PLAN, so un-gated work is never pushed (contract preserved).
-      const turn = await this.driveTurnWithEmptyRecovery(
-        ctx,
-        config,
-        "plan",
-        resumeId,
-        turnPrompt,
-        state,
-        idleMs,
-      );
+      let turn: TurnResult;
+      try {
+        if (humanRevision) await ctx.beforePlanRevisionTurn?.();
+        turn = await this.driveTurnWithEmptyRecovery(
+          ctx, config, "plan", resumeId, turnPrompt, state, idleMs,
+        );
+      } catch (error) {
+        if (humanRevision && error instanceof TransientRecoveryError && error.providerOrigin && ctx.retryPlanRevisionTurn) {
+          resumeId = error.sessionId;
+          try {
+            // The runner hook owns backoff and control checks; this redrive adds no retry cap
+            // or wall-budget reset and keeps the current clarification/prose recovery state.
+            await ctx.retryPlanRevisionTurn(error);
+          } catch (control) {
+            if (control instanceof PlanRevisionReplacedError) control.sessionId = resumeId;
+            throw control;
+          }
+          continue;
+        }
+        if (error instanceof PlanRevisionReplacedError) error.sessionId = resumeId;
+        throw error;
+      }
       resumeId = turn.sessionId ?? resumeId;
       // Issue #1593: a whitespace-only plan is not a plan (aligned with Codex); it falls through
       // to the prose-only / no-plan handling below instead of reaching the gate.
@@ -4126,6 +4272,7 @@ export class SdkExecutor implements Executor {
     // the same turn (driveTurnWithEmptyRecovery) calls it again, so the handler must be idempotent.
     onFirstEvent?: () => void,
   ): Promise<TurnResult> {
+    this.throwIfTerminal(ctx);
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);
 
@@ -4196,6 +4343,7 @@ export class SdkExecutor implements Executor {
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
       const request: RunTurnRequest = {
+        ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
         // The neutral fields below are carried as-is; the placeholders
         // (systemPrompt/agents/leadSkills) are NOT read by the Claude adapter, which
@@ -4559,7 +4707,7 @@ export class SdkExecutor implements Executor {
         : undefined,
       // lastProviderErr is cleared by any attempt that returned (even positively empty), so it
       // is set here only when the FINAL attempt threw the provider error.
-      { providerOrigin: lastProviderErr !== undefined },
+      { providerOrigin: lastProviderErr !== undefined, sessionId: resumeId },
     );
   }
 
@@ -4768,6 +4916,10 @@ export class SdkExecutor implements Executor {
       agent: "worker",
       payload: { text: `skills plugin failed to load (${desc}); continuing without it` },
     });
+  }
+
+  private throwIfTerminal(ctx: RunContext): void {
+    if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) throw new Error(REASON_CANCELLED);
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */

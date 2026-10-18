@@ -75,8 +75,9 @@ func (f *FakeClient) ListFindings(_ context.Context, bucket, repo, run string) (
 // FileFinding records the id it was asked to file and returns the canned result. FileFindingErr
 // wins over the blanket Err so a test can model a 409/404 on the WRITE precisely, while the id
 // capture still proves the write was reached.
-func (f *FakeClient) FileFinding(_ context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error) {
+func (f *FakeClient) FileFinding(_ context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error) {
 	f.LastFileFindingID = id
+	f.LastFileFindingSendToUzi = sendToUzi
 	if f.FileFindingErr != nil {
 		return apitypes.IncidentalFindingFileResultDTO{}, f.FileFindingErr
 	}

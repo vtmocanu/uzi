@@ -324,8 +324,9 @@ func classifyGateReport(ctx context.Context, q Store, locked store.Run, req Stat
 	if !gateReportAdmissible(locked.Status) {
 		return gateDecision{class: gateClassDeclined}, nil
 	}
-	// The existing runs counter is captured under the same lock as the witness.
-	// Any subsequently accepted revise invalidates readiness, even after delivery.
+	// New witnessed publications capture the runs counter under the same lock.
+	// An accepted revise invalidates reset readiness, even after delivery; exact
+	// current-presentation replays retain their original capture below.
 	if f.checkpointWitness != nil {
 		count := locked.ReviseCount
 		f.reviseCount = &count
@@ -363,6 +364,11 @@ func classifyGateReport(ctx context.Context, q Store, locked store.Run, req Stat
 	pid := pgconv.UUID(*req.PresentationID)
 	if locked.GatePresentationID.Valid && uuid.UUID(locked.GatePresentationID.Bytes) == *req.PresentationID {
 		// The current presentation. A retry after a lost adoption ACK lands here too.
+		if f.checkpointWitness != nil && hasSnapshot && base.CheckpointWitness != nil && base.ReviseCount != nil {
+			// Replay identity uses the immutable captured count, never a refreshed
+			// witness. Reset admission still compares that count with the live row.
+			f.reviseCount = base.ReviseCount
+		}
 		same, serr := sameAsPresented()
 		if serr != nil {
 			return gateDecision{}, serr

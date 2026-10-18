@@ -672,9 +672,13 @@ export interface JobRunnerOptions {
   splitActive?: boolean;
 }
 
+/** Stop without another terminal outcome when the server already cancelled this flight. */
+class JobAlreadyTerminal extends Error {}
+
 /** How the SDK session ended, decided after the query loop. */
 type SessionOutcome =
   | { kind: "finished" }
+  | { kind: "already_terminal" }
   | { kind: "cancelled" }
   | { kind: "deadline" }
   | { kind: "policy"; reason: string }
@@ -848,6 +852,10 @@ export class JobRunner {
         productSkills = await this.prepareProductSkills(claim, ws, batcher, runLog);
         await openJobWorkspace(ws);
       } catch (err) {
+        if (err instanceof JobAlreadyTerminal) {
+          await batcher.close().catch(() => undefined);
+          return;
+        }
         const reason =
           err instanceof JobFileFailure
             ? err.message
@@ -909,6 +917,10 @@ export class JobRunner {
       const through = batcher.currentSeq();
       await this.finish(claim, outcome, store, through, runLog, redactText, budgetSeconds, { workDir: ws.work, deadlineAt: uploadPhaseDeadline(startedAt + budgetMs) });
     } catch (err) {
+      if (err instanceof JobAlreadyTerminal) {
+        if (batcher) await batcher.close().catch(() => undefined);
+        return;
+      }
       const reason = redactText(errMessage(err));
       runLog.warn("job run failed", { error: reason });
       if (batcher) await batcher.close().catch(() => undefined);
@@ -975,6 +987,7 @@ export class JobRunner {
     const { session, log } = args;
     const deadlineAt = args.startedAt + args.budgetMs;
     let cancelled = false;
+    let alreadyTerminal = false;
     let timedOut = false;
     const timer = chunkedTimeout(() => {
       timedOut = true;
@@ -982,12 +995,14 @@ export class JobRunner {
       session.abort();
     }, Math.max(0, deadlineAt - Date.now()), { unref: true });
     const stopPoll = new AbortController();
-    const poll = this.watchCancel(args.runId, args.generation, stopPoll.signal, log, () => {
-      cancelled = true;
+    const poll = this.watchCancel(args.runId, args.generation, stopPoll.signal, log, (terminal) => {
+      alreadyTerminal = terminal;
+      cancelled = !terminal;
       session.abort();
     });
     // The stated reason for an interrupted setup, in the order the session lane decides it.
     const interruption = (): string | undefined => {
+      if (alreadyTerminal) throw new JobAlreadyTerminal();
       if (cancelled) return "run cancelled";
       if (timedOut || Date.now() >= deadlineAt) return `the job exceeded its wall-clock budget of ${args.budgetSeconds}s and was stopped`;
       return args.transportReason();
@@ -1072,6 +1087,7 @@ export class JobRunner {
   }): Promise<SessionOutcome> {
     const { runId, generation, session, batcher, log } = args;
     let cancelled = false;
+    let alreadyTerminal = false;
     let timedOut = false;
     let policyReason: string | undefined;
     const pids = new Set<number>();
@@ -1097,8 +1113,9 @@ export class JobRunner {
 
     // The cancel poll: an owner cancel is a run input of kind `cancel`.
     const stopPoll = new AbortController();
-    const poll = this.watchCancel(runId, generation, stopPoll.signal, log, () => {
-      cancelled = true;
+    const poll = this.watchCancel(runId, generation, stopPoll.signal, log, (terminal) => {
+      alreadyTerminal = terminal;
+      cancelled = !terminal;
       session.abort();
       reap();
     });
@@ -1149,6 +1166,7 @@ export class JobRunner {
       reap();
     }
 
+    if (alreadyTerminal) return { kind: "already_terminal" };
     if (cancelled) return { kind: "cancelled" };
     if (timedOut) return { kind: "deadline" };
     if (policyReason) return { kind: "policy", reason: policyReason };
@@ -1171,10 +1189,17 @@ export class JobRunner {
 
   /** Poll the run's inputs; on a `cancel`, receipt it and trip `onCancel`. Resolves when `signal`
    *  aborts or a cancel was found. Never throws. */
-  private async watchCancel(runId: string, generation: number, signal: AbortSignal, log: Logger, onCancel: () => void): Promise<void> {
+  private async watchCancel(runId: string, generation: number, signal: AbortSignal, log: Logger, onCancel: (alreadyTerminal: boolean) => void): Promise<void> {
     while (!signal.aborted) {
       try {
-        const { inputs, receipts } = await this.client.getInputs(runId, generation);
+        const { inputs, receipts, terminalCancelled, staleObservation } = await this.client.getInputs(runId, generation);
+        if (signal.aborted) return;
+        if (staleObservation) { await sleep(this.cancelPollMs, signal); continue; }
+        if (terminalCancelled?.run_id === runId && Number.isSafeInteger(generation) && generation > 0 &&
+          terminalCancelled.generation === generation) {
+          onCancel(true);
+          return;
+        }
         const cancels = inputs.filter((i) => (i.kind as InputKind) === "cancel");
         if (cancels.length > 0) {
           if (receipts) {
@@ -1183,7 +1208,8 @@ export class JobRunner {
             await this.client.ackInputs(runId, ids, generation).catch((e) => log.warn("job cancel ack failed", { error: errMessage(e) }));
             await this.client.applyInputs(runId, ids, generation).catch((e) => log.warn("job cancel applied receipt failed", { error: errMessage(e) }));
           }
-          onCancel();
+          if (signal.aborted) return;
+          onCancel(false);
           return;
         }
       } catch (err) {
@@ -1208,6 +1234,8 @@ export class JobRunner {
     const runId = claim.run_id;
     const generation = claim.claim_generation;
     switch (outcome.kind) {
+      case "already_terminal":
+        return;
       case "cancelled":
         // A live worker cannot report `cancelled`; the consumed cancel input's stop verdict turns
         // this failed report into the cancelled terminal server-side.
@@ -1239,8 +1267,10 @@ export class JobRunner {
     const uploadAbort = new AbortController();
     const stopUploadPoll = new AbortController();
     let cancelledInUpload = false;
-    const uploadPoll = this.watchCancel(runId, generation!, stopUploadPoll.signal, log, () => {
-      cancelledInUpload = true;
+    let terminalInUpload = false;
+    const uploadPoll = this.watchCancel(runId, generation!, stopUploadPoll.signal, log, (terminal) => {
+      terminalInUpload = terminal;
+      cancelledInUpload = !terminal;
       uploadAbort.abort();
     });
     // An output file whose own name carries a secret is never uploaded (its display name rides the
@@ -1271,6 +1301,7 @@ export class JobRunner {
       stopUploadPoll.abort();
       await uploadPoll.catch(() => undefined);
     }
+    if (terminalInUpload) return;
     if (cancelledInUpload) return this.fail(runId, generation, "run cancelled");
     // POST the result FIRST: the api fails a job that completes with no stored result. The files the
     // worker dropped itself ride along so the api can record them as refusals.

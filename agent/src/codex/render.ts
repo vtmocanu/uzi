@@ -431,6 +431,14 @@ function sortDiagnostics(diagnostics: MutableDiagnostics): readonly CodexRenderD
 
 // --- public builders ----------------------------------------------------------
 
+/** Implementation capabilities use the broker's canonical tool grants. Plan
+ * phase restrictions are separate: apply_patch stays listed but is denied there. */
+export function codexSubagentWriteCapabilities(agents: Readonly<Record<string, HarnessAgent>>): Record<string, boolean> {
+  return Object.fromEntries(Object.entries(agents).map(([role, agent]) => [
+    role, buildAllowedTools(agent.tools, agent.deniedTools, false, role, []).has("apply_patch"),
+  ]));
+}
+
 /**
  * Render a Codex run turn: resolved model/effort, the lead + per-role grants, and
  * the lead + subagent prompt text. Pure and deterministic; never mutates `request`.
@@ -445,6 +453,7 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const lead: ResolvedCodexModel = { model: requestModel, modelReasoningEffort: requestEffort };
 
   const leadGrants: RunGrants = {
+    ownerDecisionRequested: request.ownerDecisionRequested,
     role: LEAD_ROLE,
     phase: request.phase,
     allowedTools: sortedSet([

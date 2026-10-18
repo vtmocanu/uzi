@@ -72,9 +72,9 @@ export type PlanVerdict =
         claimGeneration: number;
       };
     }
-  | { kind: "reject"; reason: string }
+  | { kind: "reject"; reason: string; sourceGateRevision?: number }
   | { kind: "cancel" }
-  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number }
+  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number; sourceGateRevision?: number }
   | { kind: "revise"; automatic: true; feedback: string; round: number;
       items?: PlanCrossCheckFindings["items"]; inputId?: never };
 
@@ -84,6 +84,8 @@ export type AnswerVerdict =
   { kind: "answer"; answers: string[] } | { kind: "cancel" };
 
 export interface SteeringOptions {
+  /** Observe authenticated cancellation before synchronous model/lifecycle abort listeners. */
+  onCancel?: () => void;
   /** Injectable sleep so tests can drive the poll loop deterministically. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** PRD #41: emit a short feed notice (as a worker `status` message) when a verdict
@@ -328,9 +330,9 @@ const ACTIVE_APPLY_ATTEMPTS = 30;
  *  a full HTTP timeout, so the attempt count alone could hold a report for many minutes. */
 const ACTIVE_APPLY_DEADLINE_MS = 60_000;
 
-/** Issue #1673: the applied receipt for a routed batch could not be confirmed. Thrown to every
- *  state report still waiting on it and to the parked waiters, so the run fails instead of
- *  reporting a resume the server's applied-only guards would not recognise. */
+/** Issue #1673: the applied receipt for a routed batch could not be confirmed. State reports
+ *  waiting on it and parked gates reject with this error so the runner can report failure.
+ *  The source rows stay unapplied for a later claim to replay. */
 class InputReceiptError extends Error {
   constructor(message: string) {
     super(message);
@@ -339,8 +341,8 @@ class InputReceiptError extends Error {
 }
 
 /** Issue #1673: a receipt said this claim was released or superseded (or the run is terminal).
- *  The old flight's GETs would never see its inputs again, so it ends; its reports are refused
- *  by the server's claim fence. */
+ *  The old flight ends; runner state reports check the local fence on entry and after waiting
+ *  for receipt settlement. */
 class ClaimFencedSignal extends Error {
   constructor(readonly reason: string) {
     super(`input claim is no longer active (${reason})`);
@@ -477,6 +479,8 @@ export class SteeringChannel {
   // An interruption while an id is in (i), (iv) or (v) leaves it unapplied, so the next claim
   // replays it.
   private readonly awaitingGateIds = new Set<number>();
+  /** Server-settled revision receipts remembered only for this flight. */
+  private readonly persistedRevisionIds = new Set<number>();
   private readonly disposedApproves = new Set<number>();
   /** The discard lane: disposed approve ids awaiting POST /inputs/discarded, the lane's loop, and
    *  its bounded-retry state. Nothing waits on it: a discard that cannot land leaves the row
@@ -648,8 +652,8 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
   }
 
-  /** Give up the applied receipt of a routed batch on an active claim: stop polling, fail every
-   *  report waiting on it and every parked waiter. The rows stay unapplied for a later claim. */
+  /** Give up the applied receipt on an active claim: stop execution and fail server-visibly.
+   *  An unconfirmed receipt is not a server fence. Rows stay unapplied for a later claim. */
   private failReceipts(err: InputReceiptError): void {
     this.log.error("steering: giving up the applied receipt; failing the run", { run_id: this.runId, error: err.message });
     this.receiptFailure = err;
@@ -662,8 +666,8 @@ export class SteeringChannel {
     this.rejectParkedWaiters(err);
   }
 
-  /** The claim is released or superseded: route nothing more and end the old flight. A waiting
-   *  report is let go; the server refuses it as a stale claim. */
+  /** End a fenced flight and route nothing more. Receipt waiters are released; runner state
+   *  reports check the local fence on entry and again after receipt settlement. */
   private endFencedFlight(reason: string): void {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
@@ -674,9 +678,17 @@ export class SteeringChannel {
     // A fenced flight owes nothing more: an APPLIED still in flight is let go with the rest.
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
     this.stopped = true;
-    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
-    this.abortLifecycle(signal);
-    this.rejectParkedWaiters(signal);
+    try {
+      // This exact server cancellation starts the same maintenance clock as an input cancel.
+      // Install the fence first: observing cancellation grants no report or custody authority.
+      if (reason === "terminal_cancelled") this.onCancel?.();
+    } finally {
+      try { if (!this.cancel.signal.aborted) this.cancel.abort(signal); }
+      finally {
+        this.abortLifecycle(signal);
+        this.rejectParkedWaiters(signal);
+      }
+    }
   }
 
   /** Issue #1673: a failed receipt request. A fence reason ends the flight or drops the batch;
@@ -735,7 +747,7 @@ export class SteeringChannel {
   /** An id this channel tracks as a plan-gate input receipt (awaiting, ready or in flight). Such an
    *  id is never ACKed again, re-routed, or applied with a held batch. */
   private isGateReceiptId(id: number): boolean {
-    return this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
+    return this.persistedRevisionIds.has(id) || this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
       this.disposedApproves.has(id) || this.parkedReady.includes(id);
   }
 
@@ -747,6 +759,20 @@ export class SteeringChannel {
     if (this.ready) this.ready.ids.push(...fresh);
     else this.ready = { ids: fresh, readyAt: this.now() };
     this.kickReady();
+  }
+
+  /** Retire only receipts confirmed by the atomic revised-plan persistence ACK.
+   * No APPLIED is sent: predecessor supersession is not successful plan production.
+   */
+  retirePersistedRevision(id: number, supersededIds: readonly number[]): void {
+    for (const settled of [id, ...supersededIds]) {
+      this.awaitingGateIds.delete(settled);
+      this.persistedRevisionIds.add(settled);
+    }
+    for (let i = this.reviseQueue.length - 1; i >= 0; i--) {
+      const queuedId = this.reviseQueue[i]!.id;
+      if (queuedId !== undefined && this.persistedRevisionIds.has(queuedId)) this.reviseQueue.splice(i, 1);
+    }
   }
 
   /**
@@ -933,6 +959,7 @@ export class SteeringChannel {
       const ids = this.discardQueue.slice(0, MAX_INPUT_BATCH);
       try {
         const receipt = await this.client.discardInputs(this.runId, ids, this.claimGeneration);
+        if (this.fence !== undefined) return;
         if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input discarded response");
         this.discardFailures = 0;
         this.discardFirstFailureAt = undefined;
@@ -944,6 +971,7 @@ export class SteeringChannel {
         }
         continue;
       } catch (err) {
+        if (this.fence !== undefined) return;
         if (this.onDiscardFailure(err, ids) === "stop") return;
       }
       await this.sleepFn(this.pollMs);
@@ -1021,8 +1049,9 @@ export class SteeringChannel {
       let next: "stop" | "retry" | "continue";
       try {
         const receipt = await this.client.applyInputs(this.runId, ids, this.claimGeneration);
-        if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input applied response");
         this.readyInFlight = false;
+        if (this.fence !== undefined) return;
+        if (!validReceipt(receipt, ids)) throw new InvalidInputResponse("invalid input applied response");
         this.readyFailures = 0;
         if (this.ready) {
           this.ready.ids = this.ready.ids.filter((id) => !ids.includes(id));
@@ -1036,6 +1065,7 @@ export class SteeringChannel {
         continue;
       } catch (err) {
         this.readyInFlight = false;
+        if (this.fence !== undefined) return;
         next = this.onReadyFailure(err, ids, reviseBatch);
         this.log.warn("steering: a gate input's applied receipt failed", { run_id: this.runId, error: errMessage(err) });
       }
@@ -1270,7 +1300,7 @@ export class SteeringChannel {
     const buffered = this.bufferedVerdict;
     if (buffered?.verdict.kind === "reject" && this.gateMatch(buffered.binding, epoch, buffered.epoch) === "take") {
       this.bufferedVerdict = undefined;
-      return buffered.verdict;
+      return this.withSourceRevision(buffered.verdict, buffered.binding);
     }
     return undefined;
   }
@@ -1418,7 +1448,7 @@ export class SteeringChannel {
    *  it with a CredentialSwitchSignal when a held-state switch trips (PRD #1247 M5b): a run idling
    *  at the plan gate has no live SDK turn to abort, so the waiter itself must reject. */
   private gateWaiter:
-    { epoch: number; resolve: (v: PlanVerdict) => void; reject: (err: Error) => void } | undefined;
+    { epoch: number; recovery?: { sourceRevision: number; afterInputId: number }; resolve: (v: PlanVerdict) => void; reject: (err: Error) => void } | undefined;
   /** An answer that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the QUESTION ID it named. Latest-wins if several land before a read.
    *
@@ -1446,6 +1476,7 @@ export class SteeringChannel {
     | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
+  private readonly onCancel: (() => void) | undefined;
   /** PRD #517 M3: clock the follow-up park's idle window measures against. */
   private readonly now: () => number;
   /** PRD #1247 M5b: the claim-lane generation this channel guards a credential switch against. */
@@ -1464,6 +1495,7 @@ export class SteeringChannel {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
+    this.onCancel = opts.onCancel;
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
     this.inclusions = new InclusionReporter(client, runId, this.claimGeneration, log);
@@ -1547,6 +1579,12 @@ export class SteeringChannel {
    *  re-fire, so this sticky flag is the durable record the loop re-checks. */
   isCancelled(): boolean {
     return this.cancelled;
+  }
+
+  /** Record authenticated API cancellation without routing an input or notifying onCancel.
+   * The runner installs its maintenance budget before aborting model/lifecycle listeners. */
+  markCancelled(): void {
+    this.cancelled = true;
   }
 
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
@@ -1691,11 +1729,28 @@ export class SteeringChannel {
    * Only one gate is awaited at a time (one plan turn is in flight per run).
    */
   awaitGateEvent(epoch: number, signal?: AbortSignal): Promise<PlanVerdict> {
+    return this.waitGateEvent(epoch, signal);
+  }
+
+  /** Recovery takes only an exact source-bound replacement or rejection, or sticky cancel.
+   * Approvals, follow-ups and rows with unknown/stale bindings remain untouched.
+   */
+  awaitRevisionRecoveryEvent(sourceRevision: number, afterInputId: number, signal?: AbortSignal): Promise<PlanVerdict> {
+    if (!Number.isSafeInteger(sourceRevision) || sourceRevision <= 0 ||
+        !Number.isSafeInteger(afterInputId) || afterInputId <= 0)
+      return Promise.reject(new Error("invalid revision recovery identity"));
+    return this.waitGateEvent(this.gateEpoch, signal, { sourceRevision, afterInputId });
+  }
+
+  private waitGateEvent(epoch: number, signal?: AbortSignal,
+    recovery?: { sourceRevision: number; afterInputId: number }): Promise<PlanVerdict> {
     if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("gate wait aborted"));
     // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced. Checked
     // first: an event taken now would mark inputs ready with no lane left to apply them.
     if (this.flightEnded) return Promise.reject(this.flightEnded);
-    const v = this.takeGateEvent(epoch);
+    if (this.gateWaiter && (recovery || this.gateWaiter.recovery))
+      return Promise.reject(new Error("gate waiter already active"));
+    const v = recovery ? this.takeRevisionRecoveryEvent(recovery.sourceRevision, recovery.afterInputId) : this.takeGateEvent(epoch);
     if (v) return Promise.resolve(v);
     // Issue #1604: a switch that tripped with no waiter parked (a switch deferred across a revision
     // turn trips as soon as the window closes, before this gate wait is armed) releases the claim
@@ -1708,6 +1763,7 @@ export class SteeringChannel {
       };
       const waiter = {
         epoch,
+        recovery,
         resolve: (v: PlanVerdict): void => { done(); resolve(v); },
         reject: (err: Error): void => { done(); reject(err); },
       };
@@ -2015,7 +2071,7 @@ export class SteeringChannel {
           this.takenApproveIds.add(id);
           this.markReady([id]);
         }
-        return verdict;
+        return this.withSourceRevision(verdict, binding);
       }
       // Verdict-specific notice so the feed reads correctly for either kind. Issue #1604: a stale
       // reject is final and applied on its own; a stale approve is never applied.
@@ -2042,8 +2098,44 @@ export class SteeringChannel {
         this.disposeStale("revise_plan", r.id, "epoch");
         continue;
       }
+      const verdict = this.withSourceRevision({ kind: "revise", feedback: r.feedback, ...(r.id === undefined ? {} : { inputId: r.id }) }, r.binding);
       this.confirmedGateRevision = undefined;
-      return r.id === undefined ? { kind: "revise", feedback: r.feedback } : { kind: "revise", feedback: r.feedback, inputId: r.id };
+      return verdict;
+    }
+    return undefined;
+  }
+
+  private withSourceRevision(verdict: PlanVerdict, binding: GateBinding): PlanVerdict {
+    const b = this.effectiveBinding(binding);
+    return b.kind === "bound" && (verdict.kind === "reject" || (verdict.kind === "revise" && !verdict.automatic))
+      ? { ...verdict, sourceGateRevision: b.revision } : verdict;
+  }
+
+  private takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number): PlanVerdict | undefined {
+    if (this.cancelled) return { kind: "cancel" };
+    const index = this.reviseQueue.findIndex((r) => {
+      const b = this.effectiveBinding(r.binding);
+      return b.kind === "bound" && b.revision === sourceRevision &&
+        r.id !== undefined && Number.isSafeInteger(r.id) && r.id > afterInputId && !!r.feedback.trim();
+    });
+    if (index >= 0) {
+      const r = this.reviseQueue.splice(index, 1)[0]!;
+      this.confirmedGateRevision = undefined;
+      return { kind: "revise", feedback: r.feedback, inputId: r.id, sourceGateRevision: sourceRevision };
+    }
+    return this.takeRevisionRecoveryControl(sourceRevision);
+  }
+
+  /** Backoff observes cancel/reject without taking a replacement before expiry. */
+  takeRevisionRecoveryControl(sourceRevision: number): PlanVerdict | undefined {
+    if (this.cancelled) return { kind: "cancel" };
+    const buffered = this.bufferedVerdict;
+    if (buffered?.verdict.kind === "reject") {
+      const b = this.effectiveBinding(buffered.binding);
+      if (b.kind === "bound" && b.revision === sourceRevision) {
+        this.bufferedVerdict = undefined;
+        return { ...buffered.verdict, sourceGateRevision: sourceRevision };
+      }
     }
     return undefined;
   }
@@ -2126,7 +2218,8 @@ export class SteeringChannel {
   /** After routing an input, deliver to a parked gate waiter if one is now due. */
   private serviceGate(): void {
     if (!this.gateWaiter) return;
-    const v = this.takeGateEvent(this.gateWaiter.epoch);
+    const { recovery, epoch } = this.gateWaiter;
+    const v = recovery ? this.takeRevisionRecoveryEvent(recovery.sourceRevision, recovery.afterInputId) : this.takeGateEvent(epoch);
     if (!v) return;
     const w = this.gateWaiter;
     this.gateWaiter = undefined;
@@ -2269,8 +2362,11 @@ export class SteeringChannel {
         // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
         // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
         this.cancelled = true;
-        if (!this.cancel.signal.aborted) this.cancel.abort();
-        this.abortLifecycle();
+        try { this.onCancel?.(); }
+        finally {
+          try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
+          finally { this.abortLifecycle(); }
+        }
         break;
       case "stop":
         // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
@@ -2375,6 +2471,7 @@ export class SteeringChannel {
     if (held.phase === "applied") {
       this.requestStage = "applied";
       const receipt = await this.client.applyInputs(this.runId, held.ids, this.claimGeneration);
+      if (this.fence !== undefined || (this.terminalLifecycle.signal.aborted && !this.cancelled)) return;
       if (!validReceipt(receipt, held.ids)) throw new InvalidInputResponse("invalid input applied response");
       // Settled either way: active, or already applied before the claim was fenced, in which
       // case a released or superseded claim still ends this flight.
@@ -2385,6 +2482,7 @@ export class SteeringChannel {
     if (held.phase !== "ack") return;
     this.requestStage = "ack";
     const receipt = await this.client.ackInputs(this.runId, held.ids, this.claimGeneration);
+    if (this.fence !== undefined || (this.terminalLifecycle.signal.aborted && !this.cancelled)) return;
     if (!validReceipt(receipt, held.ids)) throw new InvalidInputResponse("invalid input ACK response");
     if (!receipt.active) {
       // Route nothing; the rows belong to the next claim. A released or superseded claim ends
@@ -2431,7 +2529,14 @@ export class SteeringChannel {
       try {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
-          const { inputs: read, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
+          const { inputs: read, staleObservation, terminalCancelled, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
+          if (this.fence !== undefined || this.terminalLifecycle.signal.aborted) break;
+          if (staleObservation) { await this.sleepFn(this.pollMs); continue; }
+          if (terminalCancelled?.run_id === this.runId && Number.isSafeInteger(this.claimGeneration) && this.claimGeneration > 0 &&
+            terminalCancelled.generation === this.claimGeneration) {
+            this.endFencedFlight("terminal_cancelled");
+            break;
+          }
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
           // PRD #2603: the newest poll's Now-summary setting; absent ⇒ off.
           this.nowSummary = nowSummary === true;
@@ -2478,6 +2583,7 @@ export class SteeringChannel {
         }
         if (this.held) await this.advanceHeld();
       } catch (err) {
+        if (this.fence !== undefined) break;
         // Issue #1673: a fenced claim ends the flight; any other 4xx is definitive for these ids
         // (drop the batch, the server replays whatever is unapplied); a failing applied receipt
         // on the active claim is bounded.
@@ -2496,6 +2602,7 @@ export class SteeringChannel {
           error: errMessage(err),
         });
       }
+      if (this.fence !== undefined) break;
       // PRD #2603: tell the Now-summary controller a poll flipped its setting, only after this
       // tick's routing, and never as an input-poll failure.
       if (this.nowSummary !== this.notifiedNowSummary) {
@@ -2535,6 +2642,7 @@ export class SteeringChannel {
       // Issue #1800: report follow-ups an executor has put into a prompt. Its own request, never
       // thrown: a failing api cannot disturb the input poll.
       await this.inclusions.flush();
+      if (this.fence !== undefined) break;
       // Issue #1673: the applied receipt starts on the next tick with these same ids, after
       // every waiter has seen the routed batch. A failed reply retries without GET or route.
       // Issue #1604: without the plan-gate inputs tracked on their own (a batch with nothing else
@@ -2767,7 +2875,9 @@ export class ChatSteering implements ChatInputSource {
       }
       try {
         if (!this.held && !this.stopped && !this.cancel.signal.aborted) {
-          const { inputs, receipts } = await this.client.getInputs(this.runId, this.claimGeneration);
+          // Chat does not consume the non-chat terminalCancelled control.
+          const { inputs, receipts, staleObservation } = await this.client.getInputs(this.runId, this.claimGeneration);
+          if (staleObservation) { await this.sleepFn(this.pollMs); continue; }
           if (!validBatch(inputs)) throw new Error("invalid input GET response");
           if (!receipts) {
             // Issue #1673: a consume-on-read reply (an older api pod): route now, no receipts.

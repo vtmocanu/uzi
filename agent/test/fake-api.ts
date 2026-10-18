@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
+  CompletionPermitResponse,
   OutgoingMessage,
   RunOrphanClassificationResponse,
   StateRequest,
@@ -296,6 +297,13 @@ export class FakeApi {
    *  reason, and an id-less report allocates. The applied ACK carries top-level gate_revision.
    *  Off by default, so every existing test sees an older api's exact wire. */
   gateRevisions = false;
+  /** Opt-in M2 source fencing and atomic revision publication receipts. */
+  planRevisionRetries = false;
+  private readonly revisionReceipts = new Map<string, { body: string; revision: number; inputId: number; superseded: number[] }>();
+  private readonly supersededByRun = new Map<string, Set<number>>();
+  isInputSuperseded(runId: string, id: number): boolean {
+    return this.supersededByRun.get(runId)?.has(id) ?? false;
+  }
   /** Stamp the approve/reject/revise rows set through setInputs/appendInputs like the api's M2
    *  verdict inserts: bound(revision) while the run is awaiting_approval at a revision above 0,
    *  no binding (legacy) at revision 0, unbound in any other status. A row that already carries
@@ -376,13 +384,18 @@ export class FakeApi {
   // Issue #1600: the budget_total_seconds / budget_used_seconds the wall-park RunDTO carries.
   private wallParkBudget: { total?: number; used?: number } | undefined;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
-  // a configurable decision — {granted:true} by default, or {granted:false, deny_reason} — at a
+  // a configurable decision — a revision-bound grant by default, or {granted:false, deny_reason} — at a
   // configurable HTTP status (a non-200 models a transport/HTTP error the client THROWS on, distinct
   // from the granted:false denial which is a normal 200 body).
   readonly completionPermitRequests: Array<{
     runId: string;
     body: Record<string, unknown>;
   }> = [];
+  /** Opt-in raw HTTP fixtures; exercise the real WorkerClient mapping, not a patched result. */
+  completionPermitWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
+  completionAttemptWire: ((body: Record<string, unknown>) => Record<string, unknown>) | undefined;
+  readonly completionAttemptRequests: Record<string, unknown>[] = [];
+  completionPermitScope: NonNullable<CompletionPermitResponse["permit"]>["completion_scope"] = {};
   private completionPermitGranted = true;
   private completionPermitDenyReason: string | undefined;
   private completionPermitHttpStatus = 200;
@@ -1409,6 +1422,12 @@ export class FakeApi {
         return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
+      if (this.planRevisionRetries && (!o || o.httpStatus === 200)) return send(res, 200, {
+        status: o?.status ?? this.lastRecordedStatus.get(runId) ?? "running",
+        claim_generation: o?.generation ?? this.receiptGeneration.get(runId),
+        gate_revision: this.gateByRun.get(runId)?.revision ?? 0,
+        claim_released: false,
+      });
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
         return send(res, o.httpStatus, { error: "run not found for this worker" });
@@ -1461,6 +1480,12 @@ export class FakeApi {
     // PRD #1226 M4 (D5): the completion-permit endpoint. Records the request and answers the
     // configured decision. A non-200 httpStatus models a transport/HTTP error (the client throws);
     // otherwise {granted} rides a 200, with deny_reason on a denial.
+    const attemptMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/attempt$/.exec(p);
+    if (req.method === "POST" && attemptMatch && this.completionAttemptWire) {
+      this.completionAttemptRequests.push(json);
+      return send(res, 200, this.completionAttemptWire(json));
+    }
+
     const permitMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/permit$/.exec(p);
     if (req.method === "POST" && permitMatch) {
       const runId = permitMatch[1] as string;
@@ -1471,7 +1496,13 @@ export class FakeApi {
       if (this.completionPermitHttpStatus !== 200 && failing) {
         return send(res, this.completionPermitHttpStatus, { error: "injected permit failure" });
       }
+      if (this.completionPermitWire) return send(res, 200, this.completionPermitWire(json));
       const body: Record<string, unknown> = { granted: this.completionPermitGranted };
+      if (this.completionPermitGranted) body.permit = {
+        id: `permit-${runId}`, contract_revision: json.contract_revision,
+        branch: json.branch, head: json.head, issued_at: "2026-10-17T00:00:00Z", finding_ids: [],
+        ...(this.completionPermitScope !== undefined ? { completion_scope: this.completionPermitScope } : {}),
+      };
       if (!this.completionPermitGranted && this.completionPermitDenyReason !== undefined) {
         body["deny_reason"] = this.completionPermitDenyReason;
       }
@@ -1722,6 +1753,15 @@ export class FakeApi {
     ) {
       return send(res, 409, { error: "run is not running", run: { id: runId, status: lastStatus } });
     }
+    const receipt = this.revisionReceipts.get(runId);
+    const receiptReplay = this.planRevisionRetries && receipt !== undefined &&
+      receipt.body === JSON.stringify(body) &&
+      this.gateByRun.get(runId)?.currentId === body.presentation_id &&
+      this.gateByRun.get(runId)?.revision === receipt.revision;
+    if (this.planRevisionRetries && body.expected_gate_revision !== undefined &&
+        body.expected_gate_revision !== this.gateByRun.get(runId)?.revision && !receiptReplay) {
+      return send(res, 409, { reason: "stale_revision_source", run: { id: runId, status: lastStatus ?? "running" } });
+    }
     // PRD #1795 M1: classify an awaiting_approval report under the modelled run-row lock, before
     // anything is recorded: a refusal publishes nothing.
     let gateRevision: number | undefined;
@@ -1744,6 +1784,19 @@ export class FakeApi {
         return send(res, 409, { run: { id: runId, status }, reason: verdict.refused });
       }
       gateRevision = verdict.revision;
+    }
+    if (this.planRevisionRetries && gateRevision !== undefined && body.revision_input_id !== undefined) {
+      const superseded = body.superseded_revision_input_ids ?? [];
+      const applied = this.appliedByRun.get(runId) ?? new Set<number>();
+      applied.add(body.revision_input_id);
+      for (const id of superseded) applied.add(id);
+      this.appliedByRun.set(runId, applied);
+      const retired = this.supersededByRun.get(runId) ?? new Set<number>();
+      for (const id of superseded) retired.add(id);
+      this.supersededByRun.set(runId, retired);
+      this.revisionReceipts.set(runId, {
+        body: JSON.stringify(body), revision: gateRevision, inputId: body.revision_input_id, superseded: [...superseded],
+      });
     }
     if (this.checkedTransport && body.status === "awaiting_approval") this.checkedFencedRuns.add(runId);
     this.states.push({ runId, body });
@@ -1791,6 +1844,10 @@ export class FakeApi {
       } : {}),
       // PRD #1795 M1 (decision 5): the revision this report was answered with, top-level.
       ...(gateRevision !== undefined ? { gate_revision: gateRevision } : {}),
+      ...(this.planRevisionRetries && gateRevision !== undefined && body.revision_input_id !== undefined ? {
+        revision_input_id: body.revision_input_id,
+        superseded_revision_input_ids: body.superseded_revision_input_ids ?? [],
+      } : {}),
       run: {
         id: runId,
         // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves

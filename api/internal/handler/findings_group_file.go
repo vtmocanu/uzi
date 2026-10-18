@@ -199,7 +199,8 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 		return
 	}
-	if err := f.EnsureLabels(callCtx, repo.ForgeProjectID, []forge.Label{{Name: marker}}); err != nil {
+	filedLabels, requiredLabels := h.findingFilingLabels(callCtx, marker, req.Labels, req.SendToUzi)
+	if err := f.EnsureLabels(callCtx, repo.ForgeProjectID, requiredLabels); err != nil {
 		if callCtx.Err() != nil {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 			return
@@ -223,7 +224,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		writeStoppedFindingGroup(w, op.ID, dispositionIDs, "in_flight")
 		return
 	}
-	created, err := f.CreateIssue(callCtx, repo.ForgeProjectID, title, description, assembleFindingLabels(marker, req.Labels))
+	created, err := f.CreateIssue(callCtx, repo.ForgeProjectID, title, description, filedLabels)
 	if err != nil {
 		if forge.IsCreateIssueDefinitiveRejection(err) {
 			if !h.releaseDefinitiveFindingGroup(user.ID, op.ID) {

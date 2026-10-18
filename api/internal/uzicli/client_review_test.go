@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -247,6 +248,48 @@ func TestGetFindingGroupIssueDraftStatusMapping(t *testing.T) {
 	}
 }
 
+func TestFileFindingSendToUziWire(t *testing.T) {
+	for _, group := range []bool{false, true} {
+		for _, send := range []bool{false, true} {
+			t.Run(fmt.Sprintf("group=%v/send=%v", group, send), func(t *testing.T) {
+				var method, path, body string
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					method, path = r.Method, r.URL.EscapedPath()
+					b, _ := io.ReadAll(r.Body)
+					body = string(b)
+					w.WriteHeader(http.StatusCreated)
+					_, _ = w.Write([]byte(`{"issue":{"iid":7,"title":"filed"}}`))
+				}))
+				defer srv.Close()
+				c := newTestClient(srv)
+				wantBody, wantPath := "{}", "/api/findings/f%2F1/issue"
+				if group {
+					wantPath = "/api/findings/issue"
+					wantBody = `{"ids":["a","b"]}`
+					if send {
+						wantBody = `{"ids":["a","b"],"send_to_uzi":true}`
+					}
+					res, accepted, err := c.FileFindingGroup(context.Background(), []string{"a", "b"}, send)
+					if err != nil || accepted || res.Issue == nil || res.Issue.IID != 7 {
+						t.Fatalf("res=%+v accepted=%v err=%v", res, accepted, err)
+					}
+				} else {
+					if send {
+						wantBody = `{"send_to_uzi":true}`
+					}
+					res, err := c.FileFinding(context.Background(), "f/1", send)
+					if err != nil || res.Issue.IID != 7 {
+						t.Fatalf("res=%+v err=%v", res, err)
+					}
+				}
+				if method != http.MethodPost || path != wantPath || body != wantBody {
+					t.Errorf("method=%q path=%q body=%q want POST %s %s", method, path, body, wantPath, wantBody)
+				}
+			})
+		}
+	}
+}
+
 func TestFileFindingGroupWire(t *testing.T) {
 	for _, tc := range []struct {
 		status   int
@@ -264,7 +307,7 @@ func TestFileFindingGroupWire(t *testing.T) {
 			w.WriteHeader(tc.status)
 			_, _ = w.Write([]byte(tc.body))
 		}))
-		res, accepted, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a", "b"})
+		res, accepted, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a", "b"}, false)
 		srv.Close()
 		if err != nil {
 			t.Fatalf("%d: %v", tc.status, err)
@@ -284,7 +327,7 @@ func TestFileFindingGroupStatusMapping(t *testing.T) {
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(`{"error":"x"}`))
 		}))
-		_, _, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a"})
+		_, _, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a"}, false)
 		srv.Close()
 		var ee *ExitError
 		if !errors.As(err, &ee) || ee.Code != want {

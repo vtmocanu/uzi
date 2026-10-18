@@ -395,6 +395,13 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
+  /** Only human revision drivers call this after typed provider retry exhaustion.
+   * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
+   * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   */
+  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
+  /** Check the captured source before each human revision provider turn, including continuations. */
+  beforePlanRevisionTurn?(): Promise<void>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
@@ -715,10 +722,10 @@ export interface RunContext {
    *  path. */
   enterCompletionHold?(reason: string): Promise<boolean>;
   /** PRD #1226 M5 (D6): the completion-question LIVE window. Called at the completion-STALL point
-   *  ONLY (STALL_LIMIT identical no-progress completion attempts) INSTEAD of routing straight to the
+   *  or on an eligible lead request with authoritative unmet milestones, instead of routing straight to the
    *  hold. Authors a completion-interlock question (reports `awaiting_input` marked
    *  `completion_question` so the api stamps runs.completion_question_at and the owner
-   *  continue-decision endpoint resolves THIS question), then awaits the owner's continue decision
+   *  completion-decision endpoint resolves THIS question), then awaits the owner's answer
    *  for up to the claim's `completion_hold_window_seconds` (default 900s).
    *
    *  Resolves `{ outcome: "continue", guidance? }` on an owner answer WITHIN the window — the
@@ -732,6 +739,7 @@ export interface RunContext {
    *  exactly as M4 behaved. Only reached on an interlocked run (see completionInterlock). */
   askCompletionQuestion?(
     unmet: string[],
+    trigger?: import("./completion-attempt.js").CompletionQuestionTrigger,
   ): Promise<{ outcome: "continue"; guidance?: string } | { outcome: "expired" }>;
 }
 
@@ -871,9 +879,17 @@ export interface ExecutorResult {
  * never a secret.
  */
 export class PlanRejectedError extends Error {
-  constructor(readonly reason: string) {
+  constructor(readonly reason: string, readonly sourceGateRevision?: number) {
     super(reason);
     this.name = "PlanRejectedError";
+  }
+}
+
+/** An accepted replacement ends the failed individual revision driver. */
+export class PlanRevisionReplacedError extends Error {
+  constructor(readonly verdict: Extract<PlanVerdict, { kind: "revise" }>, public sessionId?: string) {
+    super("plan revision replaced");
+    this.name = "PlanRevisionReplacedError";
   }
 }
 
@@ -1556,7 +1572,7 @@ export class StubExecutor implements Executor {
         // future PlanVerdict variant is added, these lines stop type-checking, forcing it
         // to be handled rather than silently falling through to an unapproved plan.
         if (verdict.kind === "reject")
-          throw new PlanRejectedError(verdict.reason);
+          throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error("run cancelled");
         // Stub implementation is fixed behaviour and does not implement the approved plan text.
         if (verdict.approval === "cross_check")

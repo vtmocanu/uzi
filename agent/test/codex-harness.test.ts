@@ -917,6 +917,156 @@ describe("#2878 M2 harness terminal", () => {
   }
 });
 
+describe("CodexHarness: closed usage diagnostics", () => {
+  const total = bd({ inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 5,
+    outputTokens: 20, reasoningOutputTokens: 5, totalTokens: 120 });
+  const last = bd({ inputTokens: 40, cachedInputTokens: 5, cacheWriteInputTokens: 2,
+    outputTokens: 10, reasoningOutputTokens: 2, totalTokens: 50 });
+  const prefix = "Codex token accounting is incomplete: invalid raw token usage. The proved baseline is retained; proven usage remains available. Cost is unreported for the affected model. Execution continues.";
+  type Note = Extract<CodexNotification, { kind: "token_usage_updated" }>;
+  const fresh = () => tokenUsage(total, last, "resumed-1");
+  const raw = (note: Note) => rec(rec(note.params).tokenUsage);
+  const cases: { label: string; detail: string; mutate: (note: Note) => CodexNotification; real?: boolean }[] = [];
+  for (const shape of [undefined, null, [], "provider-object-sentinel"]) {
+    cases.push({ label: `params ${String(shape)}`, detail: "missing container",
+      mutate: n => ({ ...n, params: shape }) });
+    cases.push({ label: `container ${String(shape)}`, detail: "missing container",
+      mutate: n => ({ ...n, params: { ...rec(n.params), tokenUsage: shape } }) });
+  }
+  for (const name of ["total", "last"] as const) {
+    for (const shape of [undefined, null, [], "provider-object-sentinel"]) {
+      cases.push({ label: `${name} breakdown ${String(shape)}`, detail: `missing breakdown (${name})`,
+        mutate: n => { raw(n)[name] = shape; return n; } });
+    }
+    for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+      "outputTokens", "reasoningOutputTokens", "totalTokens"] as const) {
+      cases.push({ label: `${name} missing ${key}`, detail: `missing bucket (${name}.${key})`,
+        real: ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"].includes(key),
+        mutate: n => { delete rec(raw(n)[name])[key]; return n; } });
+      for (const value of [undefined, null, "provider-value-sentinel", { secret: "provider-object-sentinel" }]) {
+        cases.push({ label: `${name} non-number ${key} ${value === null ? "null" : typeof value}`, detail: `non-number (${name}.${key})`,
+          real: value !== undefined && ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens"].includes(key),
+          mutate: n => { rec(raw(n)[name])[key] = value; return n; } });
+      }
+      for (const value of [-87654321, Number.MAX_SAFE_INTEGER + 1, 1.5, NaN, Infinity]) {
+        cases.push({ label: `${name} unsafe ${key} ${value}`, detail: `unsafe or negative (${name}.${key})`,
+          mutate: n => { rec(raw(n)[name])[key] = value; return n; } });
+      }
+      cases.push({ label: `${name} mismatch ${key}`, detail: `raw-vs-decoded mismatch (${name}.${key})`,
+        mutate: n => { rec(raw(n)[name])[key] = n.usage[name][key] + 1; return n; } });
+    }
+    for (const [key, value] of [["cachedInputTokens", 99], ["reasoningOutputTokens", 99], ["totalTokens", 999]] as const) {
+      cases.push({ label: `${name} relationship ${key}`, detail: `bucket relationship (${name}.${key})`,
+        mutate: n => {
+          const changed = { ...n.usage[name], [key]: value };
+          raw(n)[name] = changed;
+          return { ...n, usage: { ...n.usage, [name]: changed } };
+        } });
+    }
+  }
+  const exceeds: [keyof CodexUsageBreakdown, Partial<CodexUsageBreakdown>][] = [
+    ["inputTokens", { inputTokens: 101, totalTokens: 111 }],
+    ["cachedInputTokens", { cachedInputTokens: 21 }],
+    ["cacheWriteInputTokens", { cacheWriteInputTokens: 6 }],
+    ["outputTokens", { outputTokens: 21, totalTokens: 61 }],
+    ["reasoningOutputTokens", { reasoningOutputTokens: 6 }],
+  ];
+  for (const [key, overrides] of exceeds) {
+    cases.push({ label: `last exceeds ${key}`, detail: `last > total (last.${key})`,
+      mutate: n => {
+        return tokenUsage(total, { ...last, ...overrides }, n.threadId, n.turnId);
+      } });
+  }
+  cases.push({ label: "total precedes last and fixed bucket order", detail: "missing bucket (total.inputTokens)",
+    mutate: n => {
+      delete rec(raw(n).total).inputTokens;
+      delete rec(raw(n).total).cachedInputTokens;
+      raw(n).last = null;
+      return n;
+    } });
+  cases.push({ label: "untyped skips raw usage inspection", detail: "untyped usage notification",
+    mutate: n => ({ kind: "activity", method: n.method, params: {
+      threadId: n.threadId, turnId: n.turnId,
+      get tokenUsage() { throw new Error("untyped raw usage must not be inspected"); },
+    } }) });
+  cases.push({ label: "pricing fallback", detail: "pricing evidence incomplete",
+    mutate: n => ({ ...n, usage: { ...n.usage, pricingEvidenceComplete: false } }) });
+  cases.push({ label: "untyped", detail: "untyped usage notification",
+    mutate: n => ({ kind: "activity", method: n.method,
+      params: { ...rec(n.params), tokenUsage: { "provider-key-sentinel": "provider-value-sentinel" },
+        id: "provider-id-sentinel" } }) });
+
+  for (const c of cases) {
+    it(c.label, async () => {
+      const accountant = new CodexUsageAccountant();
+      const notices: string[] = [];
+      // Pricing false deliberately accompanies raw failures to prove diagnostic precedence.
+      let bad = c.mutate(fresh());
+      if (bad.kind === "token_usage_updated")
+        bad = { ...bad, usage: { ...bad.usage, pricingEvidenceComplete: false } };
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const bits = makeHarness({ accountant, onTokenUsageIncomplete: text => { notices.push(text); },
+        ...(c.real ? { launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) } : {}) });
+      const sequence = [
+        tokenUsage(last, last, "resumed-1", "historical"),
+        turnStarted("resumed-1"), bad, turnCompleted("completed", undefined, "resumed-1"),
+      ];
+      let buffer = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffer += chunk;
+        let end: number;
+        while ((end = buffer.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffer.slice(0, end)));
+          buffer = buffer.slice(end + 1);
+          if (typeof frame.method !== "string" || frame.id === undefined) continue;
+          inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+          if (frame.method === "turn/start") {
+            // Finite ordered frames; a write failure stops this test's delivery.
+            for (const n of sequence)
+              inbound.write(JSON.stringify({ method: n.method, params: n.params }) + "\n");
+          }
+        }
+      });
+      try {
+        if (!c.real) {
+          for (const n of sequence) bits.transport.push(n);
+          bits.transport.end();
+        }
+        const events = await withTimeout(collect(bits.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events), 5000, c.label);
+        assert.ok(events.some(e => e.kind === "turn_finished" && e.terminal.outcome === "success"));
+        assert.equal(accountant.hasBaseline("resumed-1"), true);
+        assert.deepEqual(notices, [prefix + " Diagnostic: " + c.detail + "."], "exact closed diagnostic");
+        for (const sentinel of ["provider-value-sentinel", "provider-object-sentinel", "provider-key-sentinel",
+          "provider-id-sentinel", "-87654321", "9007199254740992", "1.5"])
+          assert.equal(notices[0]!.includes(sentinel), false);
+      } finally {
+        await bits.harness.close();
+        transport.close();
+        inbound.destroy(); outbound.destroy();
+      }
+    });
+  }
+  it("accepts explicit undefined pricing evidence", async () => {
+    const accountant = new CodexUsageAccountant();
+    const notices: string[] = [];
+    const { harness, transport } = makeHarness({ accountant, onTokenUsageIncomplete: text => { notices.push(text); } });
+    const accepted = fresh();
+    const note = { ...accepted, usage: { ...accepted.usage, pricingEvidenceComplete: undefined } };
+    transport.push(tokenUsage(last, last, "resumed-1", "historical"))
+      .push(turnStarted("resumed-1")).push(note)
+      .push(turnCompleted("completed", undefined, "resumed-1")).end();
+    try {
+      await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+      assert.deepEqual(notices, []);
+      assert.equal(accountant.usageIncomplete, false);
+      assert.equal(accountant.aggregateByModel()?.["gpt-6-astra"]?.inputTokens, 42);
+    } finally { await harness.close(); }
+  });
+});
+
 // U1 resumed-claim accounting through completed turns, both credential modes.
 describe("CodexHarness: resumed usage evidence", () => {
   const incompleteModels = (retained = false) => ({
@@ -4302,6 +4452,65 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     if (!cond()) throw new Error(`timed out waiting for ${label}`);
   }
 
+  for (const key of ["prompt", "task", "input", "message", "description"] as const) {
+    it(`Codex runtime discovery projects a scrubbed bounded ${key} assignment without changing execution`, async () => {
+      let harnessRef!: CodexHarness;
+      const assignment = `Review SECRET\u001b ${"🧪".repeat(200)}`;
+      const broker = stubBroker(async (rt, _name, args) => {
+        assert.equal((args as Record<string, unknown>)[key], assignment, "the delegate receives its original assignment");
+        harnessRef.registerChildSink("th-c", { push: () => {} });
+        harnessRef.bindChildDispatch("th-c", rt, "coder");
+        harnessRef.unregisterChildSink("th-c");
+        return { ok: true, output: {} };
+      });
+      const { harness, transport } = makeHarness({ broker, scrubProjected });
+      harnessRef = harness;
+      transport.push(threadStarted()).push(toolCall(1, "spawn_agent", {
+        subagent_type: "coder", description: "[m1] review", [key]: assignment,
+      }, "th-1", "tn-1", "c-1"));
+      const pending = collect(harness.startTurn(makeRequest()).events);
+      await waitUntil(() => transport.responses.length === 1, "assignment reply");
+      transport.push(turnCompleted("completed")).end();
+      const events = await withTimeout(pending, 2000, "assignment projection");
+      const item = frames(events)[0]!.items[0]!;
+      assert.ok(item.kind === "tool" && item.phase === "started");
+      const input = item.input as { prompt: string; description: string };
+      assert.match(input.prompt, /^Review \*\*\*/);
+      assert.ok(Buffer.byteLength(input.prompt, "utf8") <= 256, "the excerpt shares the label's UTF-8 byte bound");
+      assert.ok(!input.prompt.includes("SECRET") && !input.prompt.includes("\u001b") && !input.prompt.includes("\ufffd"));
+      if (key !== "description") assert.equal(input.description, "[m1] review", "milestone labels remain unchanged");
+    });
+  }
+
+  it("Codex runtime discovery omits assignment text if scrubbing fails", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async rt => {
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      harnessRef.unregisterChildSink("th-c");
+      return { ok: true, output: {} };
+    });
+    const { harness, transport } = makeHarness({ broker, scrubProjected: (text) => {
+      if (text.includes("SECRET")) throw new Error("scrub failed");
+      return text;
+    } });
+    harnessRef = harness;
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] review", prompt: "SECRET" }, "th-1", "tn-1", "c-1"));
+    const pending = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "scrub failure reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(pending, 2000, "scrub failure turn");
+    const item = frames(events)[0]?.items[0];
+    assert.ok(item?.kind === "tool" && item.phase === "started", "Agent started frame survives assignment scrubbing failure");
+    assert.equal(item.name, "Agent");
+    const input = item.input as Record<string, unknown>;
+    assert.equal(input.subagent_type, "coder");
+    assert.equal(input.description, "[m1] review");
+    assert.ok(!Object.hasOwn(input, "prompt"));
+    assert.ok(!JSON.stringify(events).includes("SECRET"));
+    assert.equal(events.at(-1)?.kind, "turn_finished");
+  });
+
   it("binds nothing when the parent key is ambiguous (two in-flight calls share an empty call id)", async () => {
     let harnessRef!: CodexHarness;
     let entered = 0;
@@ -4397,7 +4606,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     harnessRef = harness;
     transport
       .push(threadStarted())
-      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] SECRET label" }, "th-1", "tn-1", "c-1"));
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] SECRET label", prompt: "Review SECRET changes", task: "ignored fallback" }, "th-1", "tn-1", "c-1"));
     const eventsP = collect(harness.startTurn(makeRequest()).events);
     await waitUntil(() => transport.responses.length === 1, "the parent reply");
     transport.push(turnCompleted("completed")).end();
@@ -4410,7 +4619,7 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     assert.deepEqual(dispatch.origin, { kind: "main" });
     assert.deepEqual(dispatch.attribution, { agent: "lead" });
     assert.deepEqual(dispatch.items, [
-      { kind: "tool", phase: "started", id: dispatchId, name: "Agent", input: { subagent_type: "coder", description: "[m1] *** label" } },
+      { kind: "tool", phase: "started", id: dispatchId, name: "Agent", input: { subagent_type: "coder", description: "[m1] *** label", prompt: "Review *** changes" } },
     ]);
     assert.deepEqual(child.origin, { kind: "subagent", role: "coder", instanceId: dispatchId });
     assert.deepEqual(child.attribution, { agent: "coder", agentInstance: dispatchId, agentLabel: "[m1] *** label" });

@@ -102,8 +102,9 @@ and the snapshot replacement, both directions carrying `kind <> 'chat'`:
 - **`ReadoptRunsFromSnapshot`** restores a `queued` run-lane run owned by this worker whose
   listed generation equals `runs.claim_generation` and whose `claim_released_at IS NULL` to
   its listed phase.
-- **`RequeueRunsMissingFromSnapshot`** requeues a `running` run-lane run owned by this
-  worker that the snapshot does not list at its current generation, with no unexpired lease,
+- **`RequeueRunsMissingFromSnapshot`** requeues a `running`, `awaiting_approval`,
+  `awaiting_input` or `awaiting_followup` run-lane run owned by this worker that the
+  snapshot does not list at its current generation, with no unexpired lease,
   `claim_released_at IS NULL`, and `status_since < now() - (WORKER_HEARTBEAT_STALE +
   WORKER_HEARTBEAT_INTERVAL)`.
 
@@ -215,6 +216,38 @@ no schema, protocol, worker, lease, custody, eligibility or outage subsystem cha
 does not repair flights whose capabilities were already revoked before rollout. #1595
 remains unchanged; #1419 and #2986 are outside scope, and #2747's hosted follow-up belongs
 to the maintainer rather than this unit's gate.
+
+## Amendment — 2026-10-15 (#3001, missing held executions)
+
+The D4 missing-execution path also covers `awaiting_approval`, `awaiting_input`
+and `awaiting_followup`. A live gate retains its execution promise and remains in
+the worker's active snapshot. Its absence at the current generation, after the
+existing status-age fence, is therefore execution-loss evidence even when the
+worker still heartbeats for other runs.
+
+Reconcile only an applied, nonce/epoch-valid snapshot, under the existing worker,
+parent and checker locks. Preserve the unreleased-claim guard, current-generation
+absence, terminal-pending lease and overflow protections, and chat exclusion.
+A listed gate, a young status, a released claim and a worker without the negotiated
+snapshot feature retain their existing behavior. Owner parks (`paused`,
+`limit_wait`, `pool_wait`, `recovery_wait`) are not missing executions.
+
+A durable owner cancel takes precedence over both requeue and exhausted-requeue
+hold/failure under those same loss fences. Complete that cancellation without
+waiting for another claim or another owner request; retain the recorded reason
+and existing custody and pending-outcome safeguards. Without that authorized
+cancel, preserve the existing episode budget and evidence-based exhausted
+disposition. Publish transitions only after the heartbeat transaction commits.
+
+Bank the approval/input waiting interval once when leaving that status; retain
+the existing follow-up accounting distinction. Do not let an unbanked held
+interval alone exclude a lost gate through the running wall-budget predicate.
+A genuine missing-execution requeue still revokes the Codex capability as required
+by #3029; it is not a provisional stale-worker requeue or readoption.
+
+This amendment grants no custody discard, source deletion or broader approval
+authority. An expired revision waiting on its live poller is still listed and busy,
+so bounded provider retries alone do not unblock a hosted image roll.
 
 ## Operational seams
 

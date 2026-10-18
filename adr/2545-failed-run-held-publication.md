@@ -1,9 +1,10 @@
-# ADR-2545: a failed run's held work is published to a forge ref before custody release; the archive is the fallback
+# ADR-2545: terminal held work is published to a forge ref before custody release
 
 **Status**: Accepted (implemented in API, worker, CLI and web; live and deployment acceptance not claimed here)
 **Date**: 2026-10-12
 **Issue**: [vtmocanu/uzi#2545](https://github.com/vtmocanu/uzi/issues/2545)
-**Refs**: #2545, #2507, #1867, #1810, #1964 (and the #1296 custody model it extends)
+**Refs**: #2545, #3030, #2507, #1867, #1810, #1964 (and the #1296 custody model it extends)
+**Amended**: 2026-10-15 (#3030 terminal held publication V2)
 
 ## Context
 
@@ -16,31 +17,47 @@ listed #2545 (failed-run publication) as out of scope.
 
 A failed run's held work is usually ordinary commits on the run branch. Putting
 them on the run's own forge, under a namespace no CI watches, gives the owner a
-plain `git fetch` and keeps the bytes out of the API database. The archive stays
-available whenever publication cannot be proved.
+plain `git fetch` and keeps the bytes out of the API database. The archive stays the fallback when publication cannot be proved; release still
+requires its existing coverage and verification guards.
 
 ## Decision
 
 ### Scope
 
-Only a run whose server status is `failed` qualifies, and not when its
-`fail_origin` is `push_secret_blocked` or `worker_residue_blocked`: the run
-already knows its branch carries a secret or a worker residue. Cancelled and
-parked runs keep the archive path. Four places enforce this independently:
+V1 remains failed-current-generation publication. Widening requires both the
+server feature and worker capability `recovery_held_publication_v2`. Under V2,
+the server run must be terminal (`failed`, `cancelled` or `completed`), with
+neither `push_secret_blocked` nor `worker_residue_blocked` as its failure origin.
+Parked runs are outside this extension. Hold-opening kinds remain issue,
+MR-rework, self-improvement, `ci_fix`, prompt and task.
 
-- the worker defers archive capture only for a failed, non-excluded terminal
-  against an API that advertises the feature (`heldEligibleTerminal` in
-  `agent/src/runner.ts`). It starts the held step only after the server's own
-  terminal ACK says `failed`;
-- step A's scope check (`heldScope` in `api/internal/workersvc/held_publish.go`)
-  also requires an open, inventory-guarded hold for the exact claim generation,
-  live on the calling worker, with the same repo, user and original worker;
+The exact positive generation must have ended and be no later than the current
+claim generation. Its inventory-guarded hold must still be open and live on the
+calling original custodian, with matching run, user and repository. The run's
+current worker need not be that original worker. This grants no adoption or
+impersonation authority and does not widen live-predecessor settlement.
+
+Four sites enforce the boundary:
+
+- worker terminal selection and ordering (`heldEligibleTerminal` in
+  `agent/src/runner.ts`, and `agent/src/recovery.ts`);
+- step A's scope check (`heldScope` in `api/internal/workersvc/held_publish.go`);
 - step B's locked eligibility (`heldStateEligible` in
   `api/internal/recovery/held_final.go`);
-- the `held_publication` branch of `recovery_inventory_hold_guard`
-  (migration `00333_held_publication.sql`). A cancelled run, including one with
-  a NULL `fail_origin`, a stale generation or an excluded origin can never
-  release this way, whatever the application code does.
+- the `held_publication` branch of `recovery_inventory_hold_guard`, replaced by
+  migration `00340_terminal_held_publication.sql` from migration 338, preserving
+  its non-held disposition branches. The database guard binds the publication
+  to the exact generation, original worker, live custody, tip and coverage.
+
+Failed and cancelled runs try held publication before deferred capture, with
+archive fallback on the same frozen record. Completed runs without an applicable
+completed-publication receipt stay archive-first: a self-contained archive FINAL
+or fully verified empty inventory remains sufficient, including for `ci_fix`,
+prompt and task. Only a prerequisite-bearing thin archive or structured typed
+oversize/quota refusal permits the held alternative on that same record. A
+success report or unverified head is not publication proof. A receipt covers its
+own completing generation; it cannot cover or suppress an earlier generation.
+Earlier-generation work is preserved normally, with no new discard policy.
 
 ### Namespace: `refs/uzi-held/<run-id>/<generation>`
 
@@ -72,8 +89,8 @@ the tip, the generation and the coverage digest. The API derives the
 repository, user, worker, ref and connection from the hold and the run, applies
 the SSRF gate, and pushes with the owner's stored forge connection
 credential. The forge PAT never enters the runner clone's Git config or the
-worker. The held step runs after the failed terminal was ACKed and never
-reopens agent execution.
+worker. The held step requires server-proven terminal custody and never reopens agent
+execution.
 
 ### Worker preparation (merge-aware scan, #1964 gate, same range packed)
 
@@ -90,10 +107,12 @@ root and the WIP marker commit. The worker:
    stored credential may lack workflow scope;
 5. packs that same range object (capped at the route's 64 MiB) and uploads it.
 
-Any finding, untrusted or timed-out scan, unresolved range, pending
-remediation, workflow change or unknown workflow check, pack-tip mismatch,
-oversize pack, upload failure, or answer other than `created` for this exact
-ref and tip falls back to the archive on the same frozen record.
+A finding, untrusted or timed-out scan, unresolved range, pending remediation,
+workflow refusal, pack-tip mismatch, oversize pack or definitive create refusal
+can use archive fallback on the same frozen record. V2 unknown create/upload
+outcomes retain the invocation and journal for read-back instead of starting an
+archive. Release requires a qualifying complete archive or the source remains
+protected; committed-only coverage cannot discharge unproven residue.
 
 ### Step A: create the ref (`POST /api/worker/runs/{id}/held-publication`)
 
@@ -114,7 +133,13 @@ ref and tip falls back to the archive on the same frozen record.
   re-checks scope, upserts the `run_held_publications` row for
   `(run, generation)` and commits a monotonic `create_invoked_at` marker
   *before* the network create. Only the request that sets the marker sends.
-  Every other request, and every retry, only lists the ref.
+  Every other request after that marker only lists the ref. If the worker's
+  first request never arrived, an empty reconciliation probe can return
+  `pack_invalid`. That response is not proof of absence: the worker may
+  re-verify and resend the same frozen identity's pack through this same
+  locked marker. A late original request and the retry still have only one
+  create winner. Preparation failure or another ambiguous answer keeps custody
+  and the uncertainty marker; it does not authorize archive fallback.
 - **Unknown outcomes only reconcile.** The broker reports `created` only on a
   read-back at the tip, and `refused` only on an explicit `ng` with no ref of
   ours. Everything else, including a deadline the forge outlives, is
@@ -129,15 +154,16 @@ ref and tip falls back to the archive on the same frozen record.
 
 Three independent facts must hold:
 
-- the worker reports the protocol capability `recovery_held_publication_v1`
+- the worker reports the matching protocol capability: `recovery_held_publication_v1`
+  for V1, or `recovery_held_publication_v2` for the widened paths
   (`api/internal/capability/capability.go`);
-- the API advertises the server feature of the same name in its own group of
-  `protocol_features` (`api/internal/handler/worker_protocol.go`). The worker
-  defers capture only when it sees it;
-- the switch `UZI_HELD_PUBLICATION` (default on) is set. Off removes the
-  advertisement and makes steps A and B answer unsupported. It never gates
-  cleanup or the owner routes, so refs already published stay visible and
-  deletable.
+- the API advertises the matching server feature in `protocol_features`
+  (`api/internal/handler/worker_protocol.go`). Failed/cancelled V2 paths defer
+  capture for held publication; completed inventory remains archive-first;
+- the switch `UZI_HELD_PUBLICATION` (default on) is set. Off removes both
+  advertisements and refuses new publications and new held FINALs. Exact-hold
+  reconciliation, immutable FINAL replay, cleanup and owner routes remain
+  available, so existing refs stay visible and deletable.
 
 ### Step B: journaled FINAL `{kind:"held_publication"}`
 
@@ -169,16 +195,62 @@ NULL-safe CHECKs tie `final_disposition = 'held_publication'` to a non-null
 `final_publication_id` and to the matching evidence class in both directions. A
 RESTRICT FK keeps the receipt from dangling. The retention clock
 (`expires_at = acknowledged_at + UZI_RECOVERY_READY_RETENTION`) starts at
-acknowledgement, not at ref creation.
+acknowledgement, not at ref creation. The persisted `expires_at` is not renewed
+by reuse or replay; the default retention is 168 hours (7 days). Retention below
+one second refuses new held FINAL; without a qualifying fallback, custody stays
+protected.
 
 Retained answers are HTTP 200 with a bounded reason. `held_publication_unavailable`
 is transient: the worker keeps the journaled request and the open hold.
 `held_publication_ref_missing`, `held_publication_ref_mismatch`,
 `held_publication_not_eligible` and `held_publication_unsupported`, as well as a
-400 from an API that does not know the kind, clear the held request. The worker
-then archives on the same record. A held ACK runs the same local cleanup as an
+400 from an API that does not know the kind, clear the held request. Provided the exact hold is still open and the attempt budget permits, the worker
+then attempts an archive on the same record; a known concurrent settlement or
+policy discard permits neither a new FINAL nor fallback. A held ACK runs the same local cleanup as an
 archive FINAL ACK without needing a self-contained bundle, because the forge ref
 is the retained copy.
+
+### Exact reconciliation and bounded cancellation (#3030)
+
+`GET /api/worker/runs/{id}/recovery-holds?generation=G` adds an optional
+exact-generation V2 original-custodian read, scoped to the user, repository and
+original worker. Open evidence must match guarded, live custody and an ended
+generation of a terminal run before new held publication. Closed persisted
+evidence and receipt observation are not a FINAL ACK. Missing, foreign,
+malformed or unknown evidence retains protection. Disabling new publication
+keeps this exact read available.
+
+An immutable journaled FINAL is replayed before mutable checks, including after
+a lost ACK. Cleanup requires the actual ACK from posting that original receipt.
+A known settled or policy-discarded concurrent close authorizes neither a new
+FINAL nor archive fallback. Executing-flight guards may defer FINAL until the
+tail closes; existing boot and live recovery redrive saved FINALs.
+
+Cancellation observation starts one 600,000 ms attempt budget measured by
+`performance.now()`. Lock waits, freeze, scans, packing, create/read-back, FINAL
+and cleanup share it; retries and fallback do not reset it, and operation caps
+are limited by the remaining time. Late outputs confer no new authority. At
+expiry the model stays stopped and custody/source stay protected. A later
+existing recovery pass may start a fresh bounded attempt.
+
+The create-marker transaction serializes admission with hold settlement. After
+settlement, no new create is authorized. A forge mutation admitted before that
+settlement may finish later; an unknown outcome is reconciled, not resent. An
+unlocked read cannot revoke an already admitted request.
+
+### Accepted residual: terminal late writers (#3030)
+
+The maintainer accepted on 2026-10-14 that an undetected terminal late writer can
+lose bytes written after immutable capture under existing cleanup, matching the
+failed-run held-publication boundary. Detected or unproven writers fail closed;
+this is not proof of writer exclusion. There is no new post-release retention
+of cancelled source or pins across hosted GC, controller teardown or recycling.
+A reviewing peer preferred durable post-release retention across that lifecycle;
+that alternative was rejected because of its size and because it would recreate
+custody after release.
+
+Held-ref visibility follows the repository. Copies fetched from a public
+repository before ref deletion cannot be revoked.
 
 ### Cleanup and deletion authority
 
@@ -220,20 +292,21 @@ secret-scrubbed before it is stored or shown.
 
 ## Consequences
 
-- A failed run's held work normally lands on its own forge, where `git fetch
+- Eligible terminal held work can land on its own forge, where `git fetch
   origin refs/uzi-held/<run-id>/<generation>` restores it. The archive remains
-  the fallback for every unproved case, so no failed run loses its
-  pre-existing recovery path.
-- The ref is deleted when retention expires (or after an owner early expiry),
-  the same bounded lifetime as an archive.
+  the fallback within the same attempt and coverage guards; an unproved
+  disposition keeps source custody protected.
+- The acknowledged ref becomes due for deletion when retention expires (or
+  after an owner early expiry), subject to open-hold exclusion and forge
+  reconciliation. Failed deletion does not extend the persisted expiry.
 - **Accepted limit: `create_unknown` has no terminal exit on absence.** It
   stays reconcile-only until a listing finds the ref at the tip; no code path
   records a refusal from `create_unknown`, so that listing is the only exit. Until then its `live_run_id` keeps blocking removal of the repo
   and the forge connection, and the owner has no abandon path for it.
 - **Accepted limit: the worker treats `held_publication_unsupported` as
   definitive** and falls back to the archive, although the server considers it
-  non-definitive (the switch or capability can return). An archive FINAL is
-  always a safe disposition, and waiting on a withdrawn feature would strand
+  non-definitive (the switch or capability can return). A qualifying complete archive FINAL remains
+  a safe disposition, and waiting on a withdrawn feature would strand
   the hold. A briefly disabled switch can therefore leave a created,
   never-acknowledged ref. Once the run's holds close, the orphan lane deletes
   it.
@@ -247,5 +320,8 @@ secret-scrubbed before it is stored or shown.
   rescanned. This is the same invariant as the #1597 checkpoint path: each
   commit in the pack is either scanned now or already reachable from a
   published checkpoint or the default branch.
-- Completed runs keep #2507's receipt policy. #2544 (quota) and #2506 (failed
-  thin release) remain out of scope.
+- Completed runs keep #2507's exact-generation receipt policy. V2 adds the
+  bounded archive-first alternative above, not a general thin-archive release.
+  It adds no model-free blocked/orphan producer (#3031), live-predecessor
+  widening (#2969), writer design (#2852), plan-rejection producer/discard policy
+  (#2884), zero-write fast path or workflow-file editing authority.

@@ -498,27 +498,29 @@ type FakeClient struct {
 	LastFindingsRepo   string
 	LastFindingsRun    string
 
-	FileFindingResult apitypes.IncidentalFindingFileResultDTO
-	LastFileFindingID string
-	FileFindingErr    error
+	FileFindingResult        apitypes.IncidentalFindingFileResultDTO
+	LastFileFindingID        string
+	LastFileFindingSendToUzi bool
+	FileFindingErr           error
 
 	// Grouped filing (issue #1724). FindingDrafts maps an evidence id to its canned issue draft
 	// (an id with no entry is a 404); FileFindingGroup captures the disposition ids and returns
 	// FileFindingGroupResult with FileFindingGroupAccepted as the 201/202 flag;
 	// ReleaseFindingGroup captures the operation id. *Err fields win over Err.
-	FindingDrafts             map[string]apitypes.IncidentalFindingIssueDraftDTO
-	LastFindingDraftIDs       []string
-	FindingIssueDraftErr      error
-	FindingGroupDraftResult   apitypes.FindingGroupDraftDTO
-	LastFindingGroupDraftIDs  []string
-	FindingGroupDraftErr      error
-	FileFindingGroupResult    apitypes.FindingGroupFileResultDTO
-	FileFindingGroupAccepted  bool
-	LastFileFindingGroupIDs   []string
-	FileFindingGroupErr       error
-	ReleaseFindingGroupResult apitypes.FindingGroupReleaseResultDTO
-	LastReleaseFindingGroupOp string
-	ReleaseFindingGroupErr    error
+	FindingDrafts                 map[string]apitypes.IncidentalFindingIssueDraftDTO
+	LastFindingDraftIDs           []string
+	FindingIssueDraftErr          error
+	FindingGroupDraftResult       apitypes.FindingGroupDraftDTO
+	LastFindingGroupDraftIDs      []string
+	FindingGroupDraftErr          error
+	FileFindingGroupResult        apitypes.FindingGroupFileResultDTO
+	FileFindingGroupAccepted      bool
+	LastFileFindingGroupIDs       []string
+	LastFileFindingGroupSendToUzi bool
+	FileFindingGroupErr           error
+	ReleaseFindingGroupResult     apitypes.FindingGroupReleaseResultDTO
+	LastReleaseFindingGroupOp     string
+	ReleaseFindingGroupErr        error
 
 	LastDismissFindingID     string
 	LastDismissFindingReason string
@@ -724,8 +726,9 @@ func (f *FakeClient) FindingIssueDraft(_ context.Context, evidenceID string) (ap
 }
 
 // FileFindingGroup records the disposition ids and returns the canned result and accepted flag.
-func (f *FakeClient) FileFindingGroup(_ context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
+func (f *FakeClient) FileFindingGroup(_ context.Context, dispositionIDs []string, sendToUzi bool) (apitypes.FindingGroupFileResultDTO, bool, error) {
 	f.LastFileFindingGroupIDs = append([]string(nil), dispositionIDs...)
+	f.LastFileFindingGroupSendToUzi = sendToUzi
 	if f.FileFindingGroupErr != nil {
 		return apitypes.FindingGroupFileResultDTO{}, false, f.FileFindingGroupErr
 	}

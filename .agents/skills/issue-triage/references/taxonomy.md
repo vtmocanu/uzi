@@ -28,13 +28,14 @@ GitHub label descriptions mirror the one-liners below; keep both in sync.
 | Label | When |
 |---|---|
 | `priority::urgent` | credible ongoing credential exposure, irreversible work or data loss, or a core outage with no workaround |
-| `priority::high` | recurrent core-run failure, a broken security or completion guarantee, or a prerequisite blocking the current maintainer goal |
+| `priority::high` | prevents failed runs (any verified run-failure cause, recurring or not), a broken security or completion guarantee, or a prerequisite blocking the current maintainer goal |
 | `priority::normal` | concrete useful improvement, or a contained bug with a workable workaround |
 | `priority::low` | speculative capability, cosmetic, or optimization without demonstrated impact |
 
 - Record the reason as one sentence in the triage comment: "High because X happens under Y; workaround Z."
 - Within a bucket: prerequisites first, then recurring impact and workaround burden; smaller scope breaks ties.
 - Recurrence evidence is a "hit again: run X / PR #N" comment; it warrants reconsidering priority, not raising it automatically.
+- High or urgent still needs AGENTS.md's independent opus/xhigh architecture review before filing, raising or dispatch.
 - Priority never authorizes a run, and readiness is separate: an urgent issue with an open design question needs investigation first.
 
 ## Recurring

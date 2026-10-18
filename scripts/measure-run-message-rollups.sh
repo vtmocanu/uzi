@@ -83,7 +83,8 @@ if ! docker image inspect "$PGIMAGE" >/dev/null 2>&1; then
 fi
 
 say "starting throwaway Postgres ($NAME) on 127.0.0.1:$PORT"
-docker run -d --rm --name "$NAME" \
+# Give PostgreSQL dynamic shared memory headroom for concurrent readers.
+docker run -d --rm --shm-size=1g --name "$NAME" \
   -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi -e POSTGRES_PASSWORD="$PGPASS" \
   -p "127.0.0.1:$PORT:5432" "$PGIMAGE" >/dev/null
 

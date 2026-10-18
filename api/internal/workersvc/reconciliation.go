@@ -25,6 +25,8 @@ type LeadReconciliation struct {
 }
 
 type StateReportResult struct {
+	RevisionInputID             *int64                                `json:"-"`
+	SupersededRevisionInputIDs  []int64                               `json:"-"`
 	CompletedPublicationReceipt *apitypes.CompletedPublicationReceipt `json:"-"`
 	CompletedPublicationReason  string                                `json:"-"`
 	Run                         store.Run                             `json:"-"`
@@ -97,6 +99,10 @@ func (s *Service) SetStateReportWithReconciliation(ctx context.Context, worker s
 		return StateReportResult{Run: run}, err
 	}
 	result.Run, result.Applied = run, applied
+	if applied && result.GateRevision > 0 && req.RevisionInputID != nil {
+		result.RevisionInputID = req.RevisionInputID
+		result.SupersededRevisionInputIDs = req.SupersededRevisionInputIDs
+	}
 	if req.State == "completed" && applied && completedPublicationCapable(worker, req) {
 		result.CompletedPublicationReceipt, result.CompletedPublicationReason = s.verifyCompletedPublication(ctx, worker, runID, req)
 	}

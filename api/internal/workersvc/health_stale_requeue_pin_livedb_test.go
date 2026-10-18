@@ -72,15 +72,17 @@ func (p *pinAgreementEnv) requeue(t *testing.T, statusSince, updatedAge time.Dur
 }
 
 // healthPinned reports whether the real health path (the ListActiveRunsForHealth projection
-// through healthTargetFor, so the below-threshold bypass is included) shows the pin reason.
+// through healthTargetFor, so the below-threshold bypass is included) shows either expected owner-hold reason.
 func (p *pinAgreementEnv) healthPinned(t *testing.T, now time.Time, run uuid.UUID) bool {
 	t.Helper()
 	row := p.e.healthRowFor(t, run)
 	_, rawPinned := p.svc.staleRequeuePin(now, row)
+	_, ownerHeld := p.svc.ownerHold(now, row)
+	rawPinned = rawPinned || ownerHeld
 	flag, reason := p.svc.healthTargetFor(p.e.ctx, now, row, healthThresholds{queued: p.queuedThreshold})
 	shown := flag == healthWaitingWorker && isStaleRequeuePinReason(reason)
 	if shown != rawPinned {
-		t.Fatalf("healthTargetFor pin=%v (%q, %q) disagrees with staleRequeuePin=%v", shown, flag, reason, rawPinned)
+		t.Fatalf("healthTargetFor pin=%v (%q, %q) disagrees with combined owner holds=%v", shown, flag, reason, rawPinned)
 	}
 	return shown
 }

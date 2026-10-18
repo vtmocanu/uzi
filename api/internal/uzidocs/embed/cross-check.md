@@ -47,8 +47,14 @@ plan. Checker findings arrive as fenced, potentially wrong or hostile
 advice. The revision prompt tells the lead to verify them against the code,
 issue and uzi rules, and to decline conflicting advice.
 
-The default budget allows two automatic revisions (three checked candidates).
-Superseded attempts count too, including recovery after worker loss; they do
+The default budget allows four automatic revisions (five checked candidates),
+with a configurable integer range of 0–4. Explicit choices remain authoritative;
+existing sequences keep their immutable first-candidate enabled/limit snapshots,
+so configuration changes affect new checks only. Older `.env` files explicitly
+setting `PLAN_CROSS_CHECK_MAX_REVISIONS=2` keep 2 after upgrading until the
+operator removes the line or sets it to 4; only installations without the line
+take the new default. Superseded attempts count across generations too,
+including recovery after worker loss; they do
 not spend your human revision allowance. Exhaustion parks with
 `plan cross-check: revisions exhausted`. A round-capable worker with a zero
 budget exhausts on REVISE; an older worker keeps the changes-requested human
@@ -118,6 +124,38 @@ vault remains a transient wait. A pinned Claude model the account cannot use
 (the SDK reports `model_not_found`) is treated the same way. A checker session
 whose confinement cannot be confirmed at startup fails the check with
 `confinement_failed`.
+
+### Automatic plan revision contract
+
+The complete automatically revised `plan_md` must include the exact heading
+**Cross-check dispositions**, with one disposition for each item delivered by
+the immediately preceding check: addressed (where and how in the plan), or
+declined (rationale and inspectable evidence). Older entries are optional.
+Round 1 does not require dispositions; missing or incomplete entries in round 2
+and later call for ordinary REVISE, never BLOCK solely for that omission.
+The checker engages with the rationale and accepts evidence-supported declines
+as appropriate. An uninspectable instruction claim must be explicitly unverified;
+it alone cannot establish an exception to an inspectable requirement. Actual
+instruction precedence is unchanged.
+
+Lead and checker plan prompts share a bounded, static worker fact: temporary
+file-tool and shell artifacts, including test logs and review exports, belong
+under `.uzi/scratch/` in the worktree. Environment overrides are evaluated by
+actual effects, including inherited children; the plan must name the effects
+it relies on. Relocating script logs and inherited Go build/test temporary files
+to permitted scratch is not alone a bypass. Neither a variable name nor its
+destination proves harmlessness: effects on configuration, credentials and test
+behavior need inspectable evidence. Reject overrides that skip, select, narrow
+or otherwise weaken required validation, or violate an applicable explicit
+restriction.
+
+This is a prompt contract: dispositions remain inside the exact candidate
+digest as untrusted plan content, not authorization. It adds no fields, parser,
+transport, history or authority. Code cross-check guidance is unchanged.
+Deterministic fixtures and mock tests do not prove model convergence; live
+hosted/model attempts, cost and latency are unmeasured, with no universal
+convergence guarantee. The [configuration notes](./configuration.md#cross-check-settings)
+explain the bounded additional wait and lead revision cost.
 
 ## 3. Read the evidence and decide
 

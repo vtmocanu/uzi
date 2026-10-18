@@ -132,6 +132,8 @@ type CompletionPermitDTO struct {
 	Head             string    `json:"head"`
 	IssuedAt         time.Time `json:"issued_at"`
 	FindingIDs       []string  `json:"finding_ids"`
+	// CompletionScope is always present; {} means no owner-deferred or accepted work.
+	CompletionScope *CompletionScopeConfig `json:"completion_scope"`
 }
 
 // CompletionPermitResult is the permit endpoint's decision (PRD #1226 M2). Granted true carries
@@ -580,7 +582,9 @@ func (s *Service) requestCompletionPermitLocked(ctx context.Context, wkr store.W
 	if err != nil {
 		return CompletionPermitResult{}, err
 	}
-	return CompletionPermitResult{Granted: true, Permit: permitToDTO(permit)}, nil
+	// Bind scope to the same locked run whose revision authorized this permit.
+	scope := CompletionScopeClaim(run.CompletionContract)
+	return CompletionPermitResult{Granted: true, Permit: permitToDTO(permit, scope)}, nil
 }
 
 // RecordCompletionAttempt is the same-lead nudge endpoint (M3) (PRD #1226 M2/M3, D4). It applies
@@ -1102,7 +1106,10 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 }
 
 // permitToDTO maps a stored permit to its coordinate-free wire shape.
-func permitToDTO(p store.RunCompletionPermit) *CompletionPermitDTO {
+func permitToDTO(p store.RunCompletionPermit, scope *CompletionScopeConfig) *CompletionPermitDTO {
+	if scope == nil {
+		scope = &CompletionScopeConfig{}
+	}
 	findings := p.FindingIds
 	if findings == nil {
 		findings = []string{}
@@ -1114,5 +1121,6 @@ func permitToDTO(p store.RunCompletionPermit) *CompletionPermitDTO {
 		Head:             p.Head,
 		IssuedAt:         p.IssuedAt.Time,
 		FindingIDs:       findings,
+		CompletionScope:  scope,
 	}
 }

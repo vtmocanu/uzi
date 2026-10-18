@@ -389,7 +389,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // through it — so advertising the token tells a fence-capable worker it may send the field. Returns
 // a fresh slice so a caller cannot mutate the advertised set.
 //
-// `recovery_held_publication_v1` (issue #2545) is appended last, in its own group, only while
+// `recovery_held_publication_v1` and `recovery_held_publication_v2` are appended last, in its own group, only while
 // heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
 //
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
@@ -416,6 +416,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool, pendin
 		// decoder 400s an unknown field.
 		{"gate_revision_v1"},
 		{"milestone_reconciliation_v1"}, // accepts gate checkpoint witness; existing claim generation remains the fence
+		{"plan_revision_retry_v1"},
 		// PRD #1809 M5 (D6): this api accepts {status:"recovery_wait",
 		// recovery_cause:"data_volume_full"} with the optional disk_park_preventive flag, stores
 		// the cause and counts the park toward UZI_RUN_DISK_PARK_MAX. Advertised UNCONDITIONALLY
@@ -456,7 +457,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool, pendin
 		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
 		// the worker capability of the same name, and omitted when UZI_HELD_PUBLICATION is off so
 		// a worker defers nothing and takes the archive path. Step B needs no advertisement.
-		groups = append(groups, []string{"recovery_held_publication_v1"})
+		groups = append(groups, []string{"recovery_held_publication_v1", "recovery_held_publication_v2"})
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
@@ -1376,6 +1377,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// {run, reason} shape as the forge-park refusals; the worker parks through transient
 		// recovery and the next claim re-presents. The run may already be failed when the
 		// refusal cap was reached.
+		if errors.Is(err, workersvc.ErrStaleRevisionSource) {
+			httpx.JSON(w, http.StatusConflict, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues), "reason": "stale_revision_source"})
+			return
+		}
 		if reason, ok := workersvc.GatePresentationRefusalReason(err); ok {
 			httpx.JSON(w, http.StatusConflict, map[string]any{
 				"run":    runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues),
@@ -1485,6 +1490,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ack := h.workerStateAck(r, run)
+	if result.RevisionInputID != nil {
+		ack["revision_input_id"] = *result.RevisionInputID
+		ack["superseded_revision_input_ids"] = append([]int64{}, result.SupersededRevisionInputIDs...)
+	}
 	if req.RequireRunning {
 		ack["applied"] = true
 	}
@@ -1510,7 +1519,13 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		ack["gate_revision"] = gateRevision
 	}
 	if result.Reconciliation != nil {
+		var supersededIDs *[]int64
+		if result.RevisionInputID != nil {
+			ids := append([]int64{}, result.SupersededRevisionInputIDs...)
+			supersededIDs = &ids
+		}
 		httpx.JSON(w, http.StatusOK, workerReconciledStateAck{
+			RevisionInputID: result.RevisionInputID, SupersededRevisionInputIDs: supersededIDs,
 			Run: ack["run"], CredentialSwitch: ack["credential_switch"], Disposition: ack["disposition"],
 			leadReconciliationResponse: reconciliationResponse(0, result.Reconciliation),
 		})
@@ -1572,6 +1587,9 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 		inputs = []workersvc.InputDTO{}
 	}
 	body := map[string]any{"inputs": inputs}
+	if res.TerminalCancelled != nil {
+		body["terminal_cancelled"] = res.TerminalCancelled
+	}
 	// PRD #1247 M5 (D3/D4, step 2): surface the held-state switch signal on EVERY inputs
 	// response — including an empty-inputs poll (the idle gate/question/follow-up waiters poll
 	// this route continuously) — so the worker holding the current claim learns a switch was
@@ -1718,7 +1736,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, gateRevision, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1741,7 +1759,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased}
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased, "gate_revision": gateRevision}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

@@ -19,7 +19,8 @@ STUB
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
-if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo '[]'; exit 0; fi
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
 echo "unexpected uzi call: $*" >&2
 exit 1
 STUB
@@ -35,7 +36,7 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
         n=$(( $(cat "$MERGEABLE_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$MERGEABLE_N"
         read -r -a seq <<< "$MERGEABLE_SEQ"; mg=${seq[$(( n <= ${#seq[@]} ? n - 1 : ${#seq[@]} - 1 ))]}
       fi
-      printf '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"OPEN","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s"}\n' "$mg" "$([ "$mg" = CONFLICTING ] && echo DIRTY || echo CLEAN)" ;;
+      printf '{"headRefOid":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","headRefName":"agent/issue-1","state":"OPEN","baseRefName":"main","mergeable":"%s","mergeStateStatus":"%s"}\n' "$mg" "$([ "$mg" = CONFLICTING ] && echo DIRTY || echo CLEAN)" ;;
     *'-q .headRefOid'*) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;
     *'-q .baseRefName'*) echo main ;;
     *) echo "unexpected pr view: $*" >&2; exit 1 ;;
@@ -920,5 +921,46 @@ if LC_ALL=C grep -q "$ESC" "$WORK/wb.hostile"; then fail "an escape byte reached
 grep -F 'Ignore previous instructions' "$WORK/wb.hostile" | grep -qv '^  UNTRUSTED ' && fail "comment text printed outside an UNTRUSTED row"
 [ ! -e "$WORK/pwned" ] || fail "the comment payload was executed"
 printf '[]\n' > "$COMMENTS"
+
+unset CHECKS_NONE CHECKS_BROKEN CHECKS_REQUIRED_EMPTY RULES_FAIL RULES_JSON SEQ_DIR MERGEABLE_SEQ CS_MODE REVIEWS_FILE
+export MODE=greptile_clean CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]'
+ci_watch() {
+  local rc=0
+  bash "$SCRIPT" test/repo 42 0 1 --reviewer none --max-unknown 1 > "$WORK/ci-$1.out" 2>&1 || rc=$?
+  [ "$rc" -eq "$2" ] || fail "ci-$1 rc=$rc want=$2: $(cat "$WORK/ci-$1.out")"
+}
+export UZI_RUNS_JSON='[{"id":"fix-active","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":"running"}]'
+ci_watch active-green 10
+grep -qxF 'CI_FIX_ACTIVE=fix-active running' "$WORK/ci-active-green.out" || fail 'green active writer not surfaced'
+grep -qxF 'RESULT=ci_fix_active' "$WORK/ci-active-green.out" || fail 'green active writer could merge'
+export CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'
+ci_watch active-red 10
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UZI_RUNS_JSON=$(jq -nc --arg at "$at" '[{id:"fix-recent",kind:"ci_fix",repo_id:"r1",pipeline_ref:"agent/issue-1",status:"failed",finished_at:$at}]'); export UZI_RUNS_JSON
+ci_watch recent-red 10
+grep -qxF "CI_FIX_RECENT=fix-recent failed $at" "$WORK/ci-recent-red.out" || fail 'recent failed writer not surfaced'
+grep -qxF 'RESULT=ci_fix_recent' "$WORK/ci-recent-red.out" || fail 'recent red writer used plain exit 1'
+export CHECKS_JSON='[{"name":"ci","bucket":"pass"}]'
+ci_watch recent-green 0
+grep -qxF "CI_FIX_RECENT=fix-recent failed $at" "$WORK/ci-recent-green.out" || fail 'green dropped recent advisory'
+export UZI_RUNS_JSON='[]'
+ci_watch none-green 0
+grep -qxF 'CI_FIX_ACTIVE=none' "$WORK/ci-none-green.out" || fail 'known empty active list lost'
+grep -qxF 'CI_FIX_RECENT=none' "$WORK/ci-none-green.out" || fail 'known empty recent list lost'
+export CHECKS_JSON='[{"name":"ci","bucket":"fail"}]'
+ci_watch none-red 1
+for failure in repo runs malformed; do
+  case "$failure" in
+    repo) export UZI_REPO_FAIL=1 ;;
+    runs) export UZI_RUN_LIST_FAIL=1 ;;
+    malformed) export UZI_RUNS_JSON='{}' ;;
+  esac
+  ci_watch "unknown-$failure" 9
+  grep -qxF 'CI_FIX_ACTIVE=unknown' "$WORK/ci-unknown-$failure.out" || fail 'unknown active list became none'
+  grep -qxF 'CI_FIX_RECENT=unknown' "$WORK/ci-unknown-$failure.out" || fail 'unknown recent list became none'
+  unset UZI_REPO_FAIL UZI_RUN_LIST_FAIL
+done
+unset UZI_REPO_JSON UZI_RUNS_JSON CHECKS_JSON
 
 echo "PASS watch-pr: settled reviews, unregistered required checks, resolved-thread scope, earlier-verdict Greptile scope, change_assessment head marker, reviewer override, Greptile run on an older commit, conflicting PR, persistent unknown, CI registration grace, every-author threads, code-scanning alerts, acknowledged comments, sanitized output"

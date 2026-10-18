@@ -161,13 +161,18 @@ describe("interlocked zero capped slice", () => {
     assert.equal(forge.all.length, 0);
   });
 
-  for (const failure of ["denied", "missing head", "missing revision"] as const) {
+  for (const failure of ["denied", "missing head", "missing revision", "new revision missing scope"] as const) {
     it(`${failure} never journals a successful empty capped completion`, async () => {
       const claim = gitlabClaim(2081, {
         claim_generation: 3,
         config: { completion_contract_version: 1, ...(failure === "missing revision" ? {} : { contract_revision: 1 }) },
       });
       api.setCompletionPermitResponse(false, { denyReason: "scope_cap_not_reached" });
+      if (failure === "new revision missing scope") {
+        api.setStateAckCompletionRevision(claim.run_id, 2);
+        api.setCompletionPermitResponse(true);
+        api.completionPermitScope = undefined; // intentional older-API response after a revision change
+      }
       if (failure === "missing head") git.branchTip = async () => null;
       let pushes = 0;
       git.pushBranch = async () => { pushes++; throw new Error("empty slice must not push"); };
@@ -181,8 +186,8 @@ describe("interlocked zero capped slice", () => {
       const journal = await outbox.readTerminalJournal(claim.run_id, 3);
       assert.notEqual(journal?.body.status, "completed");
       assert.ok(api.completionHoldRequests.length > 0 || api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), "uses the existing hold/fail path");
-      assert.equal(api.completionPermitRequests.length, failure === "denied" ? 1 : 0);
-      if (failure === "denied") assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
+      assert.equal(api.completionPermitRequests.length, failure === "denied" || failure === "new revision missing scope" ? 1 : 0);
+      if (failure === "denied" || failure === "new revision missing scope") assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true);
       assert.equal(pushes, 0);
       assert.equal(forge.all.length, 0);
     });

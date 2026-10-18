@@ -23,6 +23,8 @@ func TestTranslateGateSubmitErr(t *testing.T) {
 		{"nil", nil, nil},
 		{"revision mismatch", mismatch, slacksvc.ErrGateRevisionMismatch},
 		{"wrapped revision mismatch", fmt.Errorf("submit: %w", mismatch), slacksvc.ErrGateRevisionMismatch},
+		{"revision pending", workersvc.ErrPlanRevisionPending, slacksvc.ErrPlanRevisionPending},
+		{"wrapped revision pending", fmt.Errorf("submit: %w", workersvc.ErrPlanRevisionPending), slacksvc.ErrPlanRevisionPending},
 		{"revise cap", workersvc.ErrReviseCapReached, slacksvc.ErrReviseCapReached},
 		{"approval milestones moved", workersvc.ErrApprovalMilestonesMoved, slacksvc.ErrGateRevisionMismatch},
 		{"invalid selection", workersvc.ErrInvalidSelection, slacksvc.ErrSelectionRejected},

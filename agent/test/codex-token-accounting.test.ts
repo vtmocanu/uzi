@@ -16,6 +16,41 @@ const MODEL_ROOT = "gpt-6-astra";
 const MODEL_CHILD = "gpt-5.6-sol";
 const ROOT = "th-root";
 
+describe("closed usage diagnostic formatting", () => {
+  const prefix = "Codex token accounting is incomplete: invalid raw token usage. The proved baseline is retained; proven usage remains available. Cost is unreported for the affected model. Execution continues.";
+  it("appends a typed diagnostic and retains the first notice and claim latch", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.markIncomplete(ROOT, "invalid_raw_usage", false,
+      { predicate: "missing bucket", breakdown: "last", bucket: "outputTokens" });
+    assert.equal(acct.incompleteNoticeText, prefix + " Diagnostic: missing bucket (last.outputTokens).");
+    assert.equal(acct.takeIncompleteNotice(), true);
+    acct.markIncomplete(ROOT, "invalid_raw_usage", false, { predicate: "missing container" });
+    assert.equal(acct.incompleteNoticeText, prefix + " Diagnostic: missing bucket (last.outputTokens).");
+    assert.equal(acct.takeIncompleteNotice(), false);
+  });
+  it("selects only fixed literals even when an untyped caller supplies arbitrary fields", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    const diagnostic = { predicate: "missing bucket", breakdown: "provider-breakdown-sentinel",
+      bucket: "provider-key-sentinel", id: "provider-id-sentinel", value: "provider-value-sentinel" };
+    acct.markIncomplete(ROOT, "invalid_raw_usage", false,
+      diagnostic as unknown as NonNullable<Parameters<CodexUsageAccountant["markIncomplete"]>[3]>);
+    assert.equal(acct.incompleteNoticeText, prefix + " Diagnostic: missing bucket.");
+    const other = new CodexUsageAccountant();
+    other.registerThread(ROOT, MODEL_ROOT, false);
+    other.markIncomplete(ROOT, "invalid_raw_usage", false,
+      { predicate: "provider-predicate-sentinel" } as unknown as NonNullable<Parameters<CodexUsageAccountant["markIncomplete"]>[3]>);
+    assert.equal(other.incompleteNoticeText, prefix);
+  });
+  it("ignores diagnostics for other causes", () => {
+    const acct = new CodexUsageAccountant();
+    acct.registerThread(ROOT, MODEL_ROOT, false);
+    acct.markIncomplete(ROOT, "invalid_identity", false, { predicate: "missing container" });
+    assert.equal(acct.incompleteNoticeText, prefix.replace("invalid raw token usage", "invalid token usage identity"));
+  });
+});
+
 function bd(overrides: Partial<CodexUsageBreakdown> = {}): CodexUsageBreakdown {
   return {
     inputTokens: 0,

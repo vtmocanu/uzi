@@ -1,3 +1,8 @@
+import type { FileFindingRequest, FindingGroupFileRequest } from "./apiTypes";
+import fileFindingRequestZero from "../../../fixtures/api-contract/file_finding_request.zero.json";
+import fileFindingRequestFull from "../../../fixtures/api-contract/file_finding_request.full.json";
+import findingGroupFileRequestZero from "../../../fixtures/api-contract/finding_group_file_request.zero.json";
+import findingGroupFileRequestFull from "../../../fixtures/api-contract/finding_group_file_request.full.json";
 import { describe, expect, it } from "vitest";
 import type { PlanCrossCheckSummary } from "./apiTypes";
 import { readFileSync } from "node:fs";
@@ -1640,6 +1645,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // resolved_at) are ALL omitempty, so its zero.json carries no null — the same shape as
   // AgentMemoryDTO, declared nullable:false rather than manufacturing a null by dropping an
   // existing field's omitempty (which would change the live findings wire).
+  { stem: "file_finding_request", nullable: true },
+  { stem: "finding_group_file_request", nullable: true },
   { stem: "finding", nullable: false },
   // PRD #1255 M2a — the forge-view read DTOs.
   // pull: conflicts + run_id are nullable, so zero.json carries a null.
@@ -1811,4 +1818,32 @@ describe("issue-input history contract", () => {
 it("release-check partial is omitted at zero and true when populated", () => {
   expect(releaseCheckStatusZero).not.toHaveProperty("partial");
   expect(releaseCheckStatusFull.partial).toBe(true);
+});
+
+
+{
+  const missing: never = null as unknown as Exclude<keyof FileFindingRequest, keyof typeof fileFindingRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof fileFindingRequestFull, keyof FileFindingRequest>;
+  const zero: ZeroOf<FileFindingRequest> = fileFindingRequestZero;
+  const full: Widen<FileFindingRequest> = fileFindingRequestFull;
+  void missing; void extra; void zero; void full;
+}
+
+
+{
+  const missing: never = null as unknown as Exclude<keyof FindingGroupFileRequest, keyof typeof findingGroupFileRequestFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof findingGroupFileRequestFull, keyof FindingGroupFileRequest>;
+  const zero: ZeroOf<FindingGroupFileRequest> = findingGroupFileRequestZero;
+  const full: Widen<FindingGroupFileRequest> = findingGroupFileRequestFull;
+  void missing; void extra; void zero; void full;
+}
+
+it("finding requests record true and omit the default send_to_uzi field", () => {
+  for (const [zero, full] of [
+    [fileFindingRequestZero, fileFindingRequestFull],
+    [findingGroupFileRequestZero, findingGroupFileRequestFull],
+  ] as const) {
+    expect(zero).not.toHaveProperty("send_to_uzi");
+    expect(full.send_to_uzi).toBe(true);
+  }
 });

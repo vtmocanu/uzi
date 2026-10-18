@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
 import type { RecoveryReleaseResponse, RunOwnershipResponse, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
@@ -21,13 +22,19 @@ interface Rig {
   events: string[];
   releases: Array<{ runId: string; generation?: number; evidence?: string; disposition?: unknown }>;
   coordinator: RecoveryCoordinator;
+  cloneCalls: number;
+  modelCalls: number;
+  budgets: Array<MaintenanceBudget | undefined>;
+  createdBudgets: MaintenanceBudget[];
   run: (iid: number, ensureClone: () => Promise<never>, prepare?: (runId: string) => Promise<void>) => Promise<string>;
 }
 
-function rig(opts: { releaseFails?: boolean; parkAck?: StateAck;
+function rig(opts: { releaseFails?: boolean; releaseAck?: Partial<RecoveryReleaseResponse>; runningAck?: StateAck; parkAck?: StateAck;
   parkTransportFailure?: "once" | "always"; ownership?: RunOwnershipResponse } = {}): Rig {
   const events: string[] = [];
   const releases: Rig["releases"] = [];
+  const budgets: Rig["budgets"] = [];
+  const createdBudgets: MaintenanceBudget[] = [];
   client.protocolFeatures = ["recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"];
   client.hasFeature = (name: string) => name === "recovery_inventory_v1";
   let parkReports = 0;
@@ -35,6 +42,7 @@ function rig(opts: { releaseFails?: boolean; parkAck?: StateAck;
     events.push(`report:${body.status}`);
     if (body.status === "recovery_wait" && opts.parkTransportFailure &&
         (opts.parkTransportFailure === "always" || parkReports++ === 0)) throw new Error("lost park acknowledgement");
+    if (body.status === "running" && opts.runningAck) return opts.runningAck;
     return body.status === "recovery_wait" ? (opts.parkAck ?? { applied: true, status: "recovery_wait" }) : { applied: true, status: body.status };
   };
   client.getRunOwnership = async () => opts.ownership ?? ({ status: "failed", claim_generation: GEN, inventory_guarded: true });
@@ -44,26 +52,35 @@ function rig(opts: { releaseFails?: boolean; parkAck?: StateAck;
   ] });
   client.releaseRecoveryCustody = async (id, generation, evidence, disposition): Promise<RecoveryReleaseResponse> => {
     events.push("release");
+    budgets.push(MaintenanceBudget.current());
     releases.push({ runId: id, generation, evidence, disposition });
     if (opts.releaseFails) throw new Error("not ready");
-    return { run_id: id, generation, released: true, holds_released: 1 };
+    return { run_id: id, generation, released: true, holds_released: 1, ...opts.releaseAck };
   };
   const coordinator = new RecoveryCoordinator({
     client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: "journal-key",
     unadoptedSettleRetryDelaysMs: [0, 0, 0],
   });
-  return {
-    events, releases, coordinator,
+  const result: Rig = {
+    events, releases, coordinator, budgets, createdBudgets, cloneCalls: 0, modelCalls: 0,
     run: async (iid, ensureClone, prepare) => {
       const claim = gitlabClaim(iid, { claim_generation: GEN, inventory_guarded: true });
       runId = claim.run_id;
       await prepare?.(runId);
-      git.ensureClone = ensureClone;
+      git.ensureClone = async () => { result.cloneCalls++; return ensureClone(); };
       const { gitlab } = fakeGitlab();
-      await runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key", { recovery: coordinator }).execute(claim);
+      await runner({ run: async () => { result.modelCalls++; return { branch: "task" }; } }, gitlab, "journal-key", {
+        recovery: coordinator,
+        cancellationBudgetFactory: () => {
+          const budget = new MaintenanceBudget();
+          createdBudgets.push(budget);
+          return budget;
+        },
+      }).execute(claim);
       return runId;
     },
   };
+  return result;
 }
 
 function trackSettled(): Array<[string, number]> {
@@ -71,6 +88,86 @@ function trackSettled(): Array<[string, number]> {
   (client as unknown as { markInventoryGuardedClaimSettled: (r: string, g: number) => void })
     .markInventoryGuardedClaimSettled = (r, g) => { marked.push([r, g]); };
   return marked;
+}
+
+it("first running cancelled refusal releases the empty guarded generation after the ACK", async () => {
+  const r = rig({ runningAck: { applied: false, status: "cancelled" } });
+  const marked = trackSettled();
+  const runId = await r.run(9130, async () => { throw new Error("must never clone"); });
+  assert.deepEqual(r.releases, [{ runId, generation: GEN, evidence: "forge_no_output",
+    disposition: { kind: "settled", coverage_digest: EMPTY_DIGEST } }],
+  "first running terminal refusal must release the empty guarded generation");
+  assert.deepEqual(r.events, ["report:running", "release"], "release follows ACK with no terminal re-report");
+  assert.equal(r.cloneCalls, 0);
+  assert.equal(r.modelCalls, 0);
+  assert.deepEqual(marked, [[runId, GEN]]);
+  assert.equal(r.createdBudgets.length, 1, "cancellation creates one maintenance budget");
+  assert.equal(r.budgets.length, 1);
+  assert.equal(r.budgets[0], r.createdBudgets[0], "settlement reuses the observed cancellation budget");
+
+  const events = [...r.events];
+  let bundles = 0;
+  let reservations = 0;
+  git.produceRecoveryBundle = async () => { bundles++; throw new Error("unexpected bundle"); };
+  client.reserveRecoveryCapture = async () => { reservations++; throw new Error("unexpected capture"); };
+  await r.coordinator.resumePending(undefined, undefined, true);
+  await r.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: Date.now() });
+  assert.equal(bundles, 0, "boot/live must not produce a bundle after empty settlement");
+  assert.equal(reservations, 0, "boot/live must not reserve preservation after empty settlement");
+  assert.deepEqual(r.events, events, "boot/live do not rediscover or release the settled empty generation");
+  assert.deepEqual(await r.coordinator.snapshotBootRecords(), []);
+});
+
+it("first running stale cancelled ACK retains custody without cloning or re-reporting", async () => {
+  const r = rig({ runningAck: { applied: false, status: "cancelled", reason: "stale_claim", staleClaim: true } });
+  const marked = trackSettled();
+  await r.run(9131, async () => { throw new Error("must never clone"); });
+  assert.deepEqual(r.releases, []);
+  assert.deepEqual(marked, []);
+  assert.deepEqual(r.events, ["report:running"]);
+  assert.equal(r.cloneCalls, 0);
+  assert.equal(r.modelCalls, 0);
+});
+
+for (const source of ["journal", "owed pin", "retained clone"] as const) {
+  it(`first running cancelled refusal keeps existing ${source} custody`, async () => {
+    const r = rig({ runningAck: { applied: false, status: "cancelled" } });
+    const marked = trackSettled();
+    await r.run(9132, async () => { throw new Error("must never clone"); }, async (runId) => {
+      if (source === "journal") {
+        await r.coordinator.pin({ runId, generation: GEN, kind: "issue", branch: "task",
+          sourceSha: "a".repeat(40), inventoryGuarded: true });
+        return;
+      }
+      const bare = git.barePathFor(gitlabClaim(9132).repo.clone_url);
+      fs.mkdirSync(bare, { recursive: true });
+      git.resolveRecoveryBareDir = async () => bare;
+      git.enumerateOwedCandidates = async () => source === "owed pin"
+        ? [{ sha: "b".repeat(40), pinRef: "refs/x", contexts: [{ runId }] }] as never : [];
+      git.readInventoryCloneHeads = async () => ({ kind: "verified", heads: [],
+        clones: source === "retained clone" ? [{ path: "retained" }] : [], foreignOwners: [] }) as never;
+    });
+    assert.deepEqual(r.releases, []);
+    assert.deepEqual(marked, []);
+    assert.deepEqual(r.events, ["report:running"]);
+    assert.equal(r.cloneCalls, 0);
+    assert.equal(r.modelCalls, 0);
+  });
+}
+
+for (const releaseAck of [
+  { run_id: "another-run" }, { generation: GEN + 1 }, { released: false }, { holds_released: 0 }, { retained: true },
+] as const) {
+  it(`first running cancelled refusal keeps custody on unconfirmed release ${JSON.stringify(releaseAck)}`, async () => {
+    const r = rig({ runningAck: { applied: false, status: "cancelled" }, releaseAck });
+    const marked = trackSettled();
+    await r.run(9133, async () => { throw new Error("must never clone"); });
+    assert.equal(r.releases.length, 1, "the release is attempted but its ACK is not confirmation");
+    assert.deepEqual(marked, []);
+    assert.deepEqual(r.events, ["report:running", "release"]);
+    assert.equal(r.cloneCalls, 0);
+    assert.equal(r.modelCalls, 0);
+  });
 }
 
 for (const status of ["failed", "cancelled"] as const) {

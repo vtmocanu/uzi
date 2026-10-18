@@ -124,12 +124,12 @@ const (
 	// runs.health_reason is free text). The sweeper (SweepTaskNeverDispatched) expires
 	// the run to 'failed' with a terminal failure_reason after DispatchGrace.
 	reasonHandoffSetup = "handoff setup has not finished"
-	// reasonStaleRequeuePinPrefix (issue #2705) opens the queued reason for a run the stale-worker
-	// sweeper requeued and ClaimRun is still holding for its returning worker. Unlike its fixed
+	// reasonStaleRequeuePinPrefix opens both expected owner-hold reasons: stale requeue
+	// (#2705) and draining or maintenance (#3000). Unlike its fixed
 	// siblings it embeds values (the deadline and the worker name), so it is matched by prefix
 	// (isStaleRequeuePinReason), and ListWaitingWorkerRuns and ListOwnersWaitingNoCapacity carry
 	// the same literal in SQL (pinned in sync by a workersvc test,
-	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). No other reason starts with it.
+	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL).
 	reasonStaleRequeuePinPrefix = "waiting until "
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
@@ -429,10 +429,10 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// episode) DMs the owner, and only if the cooldown has elapsed since the last
 		// nudge. The sweeper is the single writer of health_notified_at, so it stamps
 		// it here — in the same SetRunHealth write — exactly when it emits a nudge.
-		// Issue #2705: a run leaving the stale-requeue pin explanation for another flag starts a
+		// Issue #2705: a run leaving either expected owner-hold explanation for another flag starts a
 		// new episode, as if it came from ok: nudge-eligible again (cooldown still applies) and
-		// health_since restamped. Without it a run that stays stuck after the grace would never
-		// nudge (its flag was already waiting_worker) and would carry the grace in its "stuck for".
+		// health_since restamped. Without it a run that stays stuck after the hold would never
+		// nudge (its flag was already waiting_worker) and would carry the hold in its "stuck for".
 		leftPin := target != healthOK && r.Health == healthWaitingWorker && r.HealthReason.Valid &&
 			isStaleRequeuePinReason(r.HealthReason.String) && !isStaleRequeuePinReason(reason)
 		nudge := target != healthOK && (r.Health == healthOK || leftPin) &&
@@ -463,9 +463,8 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		if reason == reasonHandoffSetup {
 			nudge = false
 		}
-		// Issue #2705: the pin reason is expected waiting for a worker that is likely coming back
-		// within the grace; a "waiting for a worker" nudge would be noise. Keyed off the reason
-		// prefix because the reason embeds the deadline and worker name.
+		// Issues #2705/#3000: both owner-hold reasons are expected waiting; a worker-pickup
+		// nudge would be noise. Match the prefix shared by their deadline and worker name.
 		if isStaleRequeuePinReason(reason) {
 			nudge = false
 		}
@@ -532,12 +531,14 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 		}
 		// Issue #2705: a run held for its returning worker is explained from the first tick of the
 		// hold, not after the queued threshold. Issue #2501: the unambiguous, persistent
-		// docker-allowlist block is also surfaced early. Below the threshold ONLY those two bypass
+		// docker-allowlist block is also surfaced early. Both owner holds and that block bypass
 		// the age gate: any other reason queuedReason resolves (vault, custody, codex, egress)
 		// stays quiet until th.queued, exactly as for an unpinned run. th.queued == 0 above still
 		// switches every queued flag off.
 		if !olderThan(now, r.StatusSince, th.queued) {
-			if _, pinned := s.staleRequeuePin(now, r); pinned {
+			_, stalePinned := s.staleRequeuePin(now, r)
+			_, ownerHeld := s.ownerHold(now, r)
+			if stalePinned || ownerHeld {
 				if reason := s.queuedReason(ctx, now, r); isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
@@ -1090,8 +1091,8 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// custodyHoldLimit holds of its own is not exempt and gets it like new work. A non-positive limit DISABLES the gate on the claim
 	// side too, so this rung stays silent then. The per-run read sits behind the
 	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick except for a run held by
-	// the stale-requeue pin below that threshold (healthTargetFor computes queuedReason for it, once per
-	// tick until its grace ends) and the early docker-allowlist probe; a read error
+	// either owner hold below that threshold (healthTargetFor computes queuedReason for it, once per
+	// tick until its hold ends) and the early docker-allowlist probe; a read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
 	// Hold-free cross-check children bypass custody admission independently of
@@ -1117,6 +1118,10 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
 	if r.EgressProfileID.Valid {
 		return s.isolatedLaneReason(ctx, r)
+	}
+	// Draining or maintenance holds take precedence when both owner holds overlap.
+	if until, held := s.ownerHold(now, r); held {
+		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
 	// Issue #2705: ClaimRun is holding this stale-requeued run for its returning worker, so no
 	// fleet reason below is the cause. After every fundamental block above (none of which a
@@ -1753,6 +1758,26 @@ func olderThan(now time.Time, ts pgtype.Timestamptz, d time.Duration) bool {
 	return ts.Valid && now.Sub(ts.Time) >= d
 }
 
+// ownerHold mirrors ClaimRun's draining/maintenance hold. The projection supplies the
+// non-time predicate; updated_at plus the affinity ceiling is inclusive, with no
+// heartbeat, generation or stale-grace requirement.
+func (s *Service) ownerHold(now time.Time, r store.ListActiveRunsForHealthRow) (time.Time, bool) {
+	if !r.OwnerHoldPinnable || !r.UpdatedAt.Valid {
+		return time.Time{}, false
+	}
+	until := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling)
+	return until, !now.After(until)
+}
+
+func ownerHoldReason(until time.Time, workerName string) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who +
+		" to finish draining or maintenance; another worker may take it after that"
+}
+
 // staleRequeuePin reports whether ClaimRun is holding this queued run for its returning worker
 // right now (issue #2705) and, if so, the instant the hold ends. It is the Go mirror of the
 // effective pin E the provisioning queries use: the non-time half (stale_requeue_pinnable) comes
@@ -1787,8 +1812,9 @@ func staleRequeuePinReason(until time.Time, workerName string) string {
 		" to return; another worker may take it after that"
 }
 
-// isStaleRequeuePinReason reports whether a stored health reason is the stale-requeue pin
-// explanation. Prefix-matched because the reason embeds the deadline and worker name.
+// isStaleRequeuePinReason matches BOTH expected owner holds: stale requeue and
+// draining/maintenance. The existing name is retained for the shared lifecycle.
+// Prefix-matched because both reasons embed the deadline and worker name.
 func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix)
 }

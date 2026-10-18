@@ -23,6 +23,7 @@ func TestConfiguredRunWallCeilingFreezeLiveDB(t *testing.T) {
 				params.RunTimeout = 6 * time.Hour
 				params.RunWallCeiling = 13 * time.Hour
 				svc := New(e.q, newBox(t), params)
+				svc.SetTxBeginner(e.pool)
 				if path == "approve" {
 					e.exec(t, `UPDATE runs SET status='awaiting_approval' WHERE id=$1`, id)
 					if _, err := svc.SubmitInput(e.ctx, e.userID, id, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {

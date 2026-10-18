@@ -7,8 +7,8 @@
 # requires: REPO_ID UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  -
-# restores: -
+# mutates:  stub compose:agent recreated with fast recovery retry spacing before handoff dispatch
+# restores: prior recovery timing environment and worker recreation on success/failure (stub only)
 # =============================================================================
 # PRD #966 M5 — the `task` run kind (dispatched by `uzi handoff`, alias `task`) had zero
 # wire coverage. Unlike an issue or a scheduled run, handoff drives git CLIENT-SIDE from
@@ -42,6 +42,32 @@
 # UZI_RUN.md + one "uzi stub" commit, and ALWAYS pushes the branch back (even for a
 # no-MR task), giving the topology seed ← marker ← stub on uzi/task/<id>.
 say "PRD #966 M5: task/handoff run kind via \`uzi handoff\` (+ host-gitconfig transport)"
+
+# The receipt wait is a bounded fixture assertion, not a production scheduling SLO.
+# Retained cleanup records can fill several four-record live passes. Use the existing
+# stub-only clock before dispatch, then restore the worker even if this phase fails.
+if [ "$EXECUTOR" = stub ]; then
+  HANDOFF_TIMING_WAS_SET="${UZI_E2E_RECOVERY_FAST_REDRIVE+x}"
+  HANDOFF_TIMING_WAS="${UZI_E2E_RECOVERY_FAST_REDRIVE:-}"
+  restore_handoff_recovery_timing() {
+    local status=$?
+    trap - EXIT
+    if [ "$HANDOFF_TIMING_WAS_SET" = x ]; then
+      export UZI_E2E_RECOVERY_FAST_REDRIVE="$HANDOFF_TIMING_WAS"
+    else
+      unset UZI_E2E_RECOVERY_FAST_REDRIVE
+    fi
+    if ! "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate agent >/dev/null || ! wait_worker_online; then
+      echo 'handoff timing restore failed: worker recreation or registration failed' >&2
+      status=1
+    fi
+    exit "$status"
+  }
+  trap restore_handoff_recovery_timing EXIT
+  export UZI_E2E_RECOVERY_FAST_REDRIVE=1
+  "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate agent >/dev/null || fail "handoff: fast recovery worker recreation failed"
+  wait_worker_online || fail "handoff: fast recovery worker registration failed"
+fi
 
 # --- Setup: a host-side clone of forge-fake's git smart-HTTP endpoint ---------
 # hgit runs the phase's OWN host git (clone/commit/fetch/ls-remote/remote) — these are

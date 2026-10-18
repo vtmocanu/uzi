@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 // issue #1783 (R0/R3/R5 + Docker teardown) — prove a run's clone is QUIESCENT before the worker
 // parks it, retires it, or finalizes from it.
 //
@@ -773,6 +774,8 @@ function defaultKill(pid: number): void {
  * final scan.
  */
 export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Promise<ProcessQuiescence> {
+  const ambient = MaintenanceBudget.current();
+  const remaining = ambient?.cap(deps.deadlineMs ?? REAP_DEADLINE_MS);
   // A test view stands in for the real table only when the caller injected none.
   const view = deps.table === undefined && testView !== undefined ? viewReapDeps(testView) : undefined;
   const reportBudget: { signal?: AbortSignal; deadline: number } | undefined = deps.reportBudget ??
@@ -784,6 +787,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   let bytes = 0;
   const bounded = <T>(read: () => T, cap?: number): T => {
     try {
+      ambient?.check();
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
       const result = read();
@@ -800,7 +804,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       throw error;
     }
   };
-  const table: ProcTable = reportBudget ? {
+  const table: ProcTable = reportBudget || ambient ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
       if (pids.length > 4096) throw new Error("process PID budget");
@@ -820,21 +824,28 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const killed: number[] = [];
   let last: ScanResult;
   for (;;) {
+    if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
+      return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
+    }
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError || tableFailure || (reportBudget && Date.now() >= reportBudget.deadline)) {
+    if (last.tableError || tableFailure || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
       return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? "process proof deadline") };
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
-    if ((last.kill.length === 0 && last.unverified.length === 0) || now() >= deadline) break;
+    if ((last.kill.length === 0 && last.unverified.length === 0) || (reportBudget ? now() >= deadline : remaining ? remaining() <= 0 : now() >= deadline)) break;
     for (const p of last.kill) {
       const statRead = tryRead(() => table.readStat(p.pid));
       const currentStartTime = statRead.ok ? parseStat(statRead.value)?.startTime : undefined;
       if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
+      ambient?.check();
+      if (remaining && remaining() <= 0) break;
       kill(p.pid);
       killed.push(p.pid);
     }
-    await sleep(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS);
+    const delay = deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS;
+    if (ambient) await ambient.raceIO(() => sleep(Math.min(delay, remaining!())));
+    else await sleep(delay);
   }
   const stuck: QuiesceProcess[] = last.kill.map((p) => ({
     pid: p.pid,
@@ -981,11 +992,17 @@ function runFixedAsRunner(
   timeoutMs: number,
   budget?: { signal: AbortSignal; deadline: number },
 ): Promise<{ status: number | null; stdout: string }> {
+  const ambient = MaintenanceBudget.current();
+  ambient?.check();
+  const remaining = ambient?.cap(timeoutMs);
   if (budget) {
     budget.signal.throwIfAborted();
     if (Date.now() >= budget.deadline) return Promise.reject(new Error("report helper setup deadline"));
   }
   const w = wrap(command, args);
+  ambient?.check();
+  const duration = remaining ? Math.floor(remaining()) : timeoutMs;
+  if (remaining && duration <= 0) return Promise.reject(new Error("maintenance helper operation expired"));
   return new Promise((resolve, reject) => {
     let settled = false;
     const child = spawn(w.command, w.args, {
@@ -999,17 +1016,18 @@ function runFixedAsRunner(
       cancellation = new Error("report helper setup cancelled");
       killRunnerGroup(child.pid);
     };
+    ambient?.signal.addEventListener("abort", cancel, { once: true });
     budget?.signal.addEventListener("abort", cancel, { once: true });
-    if (budget?.signal.aborted) cancel();
+    if (budget?.signal.aborted || ambient?.signal.aborted) cancel();
     const timer = setTimeout(() => {
       if (settled) return;
       killRunnerGroup(child.pid);
-      if (budget) cancellation = new Error("report helper setup deadline");
+      if (budget || ambient) cancellation = new Error("report helper setup deadline");
       else {
         settled = true;
         reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
       }
-    }, budget ? Math.max(1, Math.min(timeoutMs, budget.deadline - Date.now())) : timeoutMs);
+    }, Math.min(duration, budget ? Math.max(1, Math.min(timeoutMs, budget.deadline - Date.now())) : timeoutMs));
     let out = "";
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (c: string) => {
@@ -1022,7 +1040,7 @@ function runFixedAsRunner(
     });
     child.on("error", (err) => {
       if (settled) return;
-      if (budget) { cancellation = err; return; }
+      if (budget || ambient) { cancellation = err; if (ambient) killRunnerGroup(child.pid); return; }
       settled = true;
       clearTimeout(timer);
       reject(err);
@@ -1031,7 +1049,12 @@ function runFixedAsRunner(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      ambient?.signal.removeEventListener("abort", cancel);
       budget?.signal.removeEventListener("abort", cancel);
+      try {
+        ambient?.check();
+        if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
+      } catch (error) { cancellation = error as Error; }
       if (cancellation) reject(cancellation);
       else resolve({ status, stdout: out });
     });
@@ -1148,6 +1171,8 @@ async function reapProcessesViaHelper(
   req: ScanRequest,
   opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
+  const ambient = MaintenanceBudget.current();
+  const remaining = ambient?.cap(opts.timeoutMs ?? HELPER_TIMEOUT_MS);
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
   try {
@@ -1158,13 +1183,18 @@ async function reapProcessesViaHelper(
   const helperTmp = opts.helperTmp ?? defaultHelperTmp;
   let tmpDir: string;
   try {
+    ambient?.check();
     opts.reportBudget?.signal.throwIfAborted();
     if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
     tmpDir = await helperTmp.make(opts.reportBudget);
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
-  // Owned temporary cleanup needs a fresh maintenance budget: an aborted proof signal
+  try {
+    ambient?.check();
+    if (remaining && Math.floor(remaining()) <= 0) throw new Error("helper setup cap expired");
+  } catch { return unverified("maintenance helper setup expired"); }
+  // Report-proof temporary cleanup retains its separate wall-clock deadline: an aborted proof signal
   // cannot finish rm. This budget grants no report authority, and runFixedAsRunner
   // still awaits CLOSE if its cleanup deadline fires after the command starts.
   const cleanupBudget = () => ({ signal: new AbortController().signal,
@@ -1179,7 +1209,7 @@ async function reapProcessesViaHelper(
     }
   };
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
-    await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    if (!ambient) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
   }
   const wrapped = runnerCommand(process.execPath, argv);
@@ -1192,7 +1222,16 @@ async function reapProcessesViaHelper(
       settled = true;
       if (timer) clearTimeout(timer);
       opts.reportBudget?.signal.removeEventListener("abort", cancelReport);
-      if (opts.reportBudget) {
+      ambient?.signal.removeEventListener("abort", cancelReport);
+      if (ambient) {
+        // Only admit private-temp cleanup while this attempt still has time; join it once admitted.
+        try {
+          ambient.check();
+          Promise.resolve(helperTmp.remove(tmpDir, opts.reportBudget)).then(
+            () => { try { ambient.check(); resolve(r); } catch { resolve(unverified("maintenance helper cleanup expired")); } },
+            () => resolve(unverified("maintenance helper cleanup failed")));
+        } catch { resolve(unverified("maintenance helper expired")); }
+      } else if (opts.reportBudget) {
         // Settlement includes the already-started cleanup; expiry never releases
         // source or journal boundaries while a helper command is still running.
         Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
@@ -1208,6 +1247,8 @@ async function reapProcessesViaHelper(
       killRunnerGroup(child.pid);
     };
     try {
+      ambient?.check();
+      if (remaining && Math.floor(remaining()) <= 0) throw new Error("maintenance helper operation expired");
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
         env: workerSpawnEnv(helperEnv),
@@ -1216,14 +1257,15 @@ async function reapProcessesViaHelper(
       done(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
       return;
     }
+    ambient?.signal.addEventListener("abort", cancelReport, { once: true });
     opts.reportBudget?.signal.addEventListener("abort", cancelReport, { once: true });
-    if (opts.reportBudget?.signal.aborted) cancelReport();
+    if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      if (opts.reportBudget) reportFailure = unverified("quiescence helper timed out");
+      if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper timed out");
       else done(unverified("quiescence helper timed out"));
-    }, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
-      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS);
+    }, Math.min(remaining ? Math.max(1, remaining()) : opts.timeoutMs ?? HELPER_TIMEOUT_MS, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
+      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS));
     const out: Buffer[] = [];
     let outBytes = 0;
     child.stdout?.on("data", (c: Buffer) => {
@@ -1231,7 +1273,7 @@ async function reapProcessesViaHelper(
       outBytes += c.length;
       if (outBytes > HELPER_STDOUT_MAX) {
         killRunnerGroup(child.pid);
-        if (opts.reportBudget) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+        if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
         else done(unverified("quiescence helper output exceeded 1 MiB"));
         return;
       }
@@ -1241,13 +1283,16 @@ async function reapProcessesViaHelper(
     // A helper that dies before reading its request fails this write (EPIPE); the close handler
     // below reports that exit, so the write error itself is only swallowed here.
     child.stdin?.on("error", () => undefined);
-    child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
     child.on("error", (err) => {
       const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
-      if (opts.reportBudget) reportFailure = failure;
+      if (opts.reportBudget || ambient) { reportFailure = failure; if (ambient) killRunnerGroup(child.pid); }
       else done(failure);
     });
     child.on("close", (code, signal) => {
+      try {
+        ambient?.check();
+        if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
+      } catch { reportFailure = unverified("maintenance helper expired"); }
       if (reportFailure) { done(reportFailure); return; }
       if (code !== 0) {
         done(unverified(`quiescence helper exited ${code ?? signal ?? "abnormally"}`));
@@ -1255,6 +1300,13 @@ async function reapProcessesViaHelper(
       }
       done(parseHelperVerdict(Buffer.concat(out).toString("utf8")));
     });
+    if (ambient) {
+      try {
+        ambient.check();
+        if (remaining!() <= 0) throw new Error("helper input cap expired");
+        child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
+      } catch { cancelReport(); }
+    } else child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
   });
 }
 
@@ -1343,7 +1395,9 @@ function dockerRequest(
   urlPath: string,
   timeoutMs: number,
   maxBodyBytes: number = DOCKER_BODY_MAX,
+  signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     let settled = false;
     let res: http.IncomingMessage | undefined;
@@ -1351,6 +1405,7 @@ function dockerRequest(
       if (settled) return;
       settled = true;
       clearTimeout(absolute);
+      signal?.removeEventListener("abort", cancel);
       if (err) reject(err);
       else resolve(value!);
     };
@@ -1376,6 +1431,7 @@ function dockerRequest(
       r.on("error", (err) => finish(err));
       r.on("aborted", () => finish(new Error(`docker ${method} ${urlPath} response aborted`)));
     });
+    const cancel = () => abort(new Error("maintenance docker cancelled"));
     const absolute = setTimeout(
       () => abort(new Error(`docker ${method} ${urlPath} exceeded its ${timeoutMs}ms deadline`)),
       Math.max(0, timeoutMs),
@@ -1383,7 +1439,9 @@ function dockerRequest(
     absolute.unref();
     req.on("timeout", () => abort(new Error(`docker ${method} ${urlPath} timed out`)));
     req.on("error", (err) => finish(err));
-    req.end();
+    signal?.addEventListener("abort", cancel, { once: true });
+    if (signal?.aborted) cancel();
+    else req.end();
   });
 }
 
@@ -1426,7 +1484,9 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   const sleep = opts.sleep ?? defaultSleep;
   const now = opts.now ?? Date.now;
   const reqTimeout = opts.requestTimeoutMs ?? 5_000;
+  const ambient = MaintenanceBudget.current();
   const deadline = now() + (opts.deadlineMs ?? 15_000);
+  const remainingTime = ambient?.cap(opts.deadlineMs ?? 15_000) ?? (() => deadline - now());
   const interval = opts.intervalMs ?? 1_000;
   const removed = new Set<string>();
   const expired = (what: string): DockerTeardown => ({
@@ -1437,7 +1497,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   let clean = 0;
   try {
     for (;;) {
-      let remaining = deadline - now();
+      let remaining = remainingTime();
       if (remaining <= 0) return expired("the container listing");
       const list = await dockerRequest(
         ep,
@@ -1445,7 +1505,9 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
         "/containers/json?all=1",
         Math.min(reqTimeout, remaining),
         opts.maxBodyBytes,
+        ambient?.signal,
       );
+      ambient?.check();
       if (list.status !== 200) throw new Error(`container listing returned HTTP ${list.status}`);
       const ids = boundContainers(list.body, opts.targetPaths);
       if (ids.length === 0) {
@@ -1460,7 +1522,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       } else {
         clean = 0;
         for (const id of ids) {
-          remaining = deadline - now();
+          remaining = remainingTime();
           if (remaining <= 0) return expired("a container deletion");
           const del = await dockerRequest(
             ep,
@@ -1468,13 +1530,16 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
             `/containers/${encodeURIComponent(id)}?force=1&v=1`,
             Math.min(reqTimeout, remaining),
             opts.maxBodyBytes,
+            ambient?.signal,
           );
+          ambient?.check();
           if (del.status === 204 || del.status === 200 || del.status === 404) removed.add(sanitizeForLog(id, 128));
         }
       }
-      remaining = deadline - now();
+      remaining = remainingTime();
       if (remaining <= 0) return expired("the next listing");
-      await sleep(Math.min(interval, remaining));
+      if (ambient) await ambient.raceIO(() => sleep(Math.min(interval, remaining)));
+      else await sleep(Math.min(interval, remaining));
     }
   } catch (err) {
     return { state: "docker_error", removed: [...removed], detail: sanitizeForLog((err as Error).message) };
@@ -1557,6 +1622,10 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
   const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
     (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
   );
+  const ambient = MaintenanceBudget.current();
+  if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
+    processResult = { state: "unverified", processes: [], killed: processResult?.killed ?? [], detail: "maintenance deadline exhausted" };
+  }
   return { process: processResult, docker };
 }
 

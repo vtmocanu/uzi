@@ -225,6 +225,8 @@ func contractCases() []contractCase {
 		// shape as AgentMemoryDTO. The zero-fixture check stays non-vacuous by pinning the
 		// always-present key set.
 		newContractCase[IncidentalFindingDTO]("finding"),
+		newContractCase[FileFindingRequest]("file_finding_request"),
+		newContractCase[FindingGroupFileRequest]("finding_group_file_request"),
 		// PRD #1255 M2a: the forge-view read DTOs (pulls list + drill-in, CI runs list +
 		// drill-in). PullDetailDTO embeds PullDTO and CIRunDetailDTO embeds CIRunDTO, so
 		// their full fixtures carry the embedded scalars inline (like RunListItemDTO).
@@ -405,6 +407,34 @@ func TestContractFullFixtureDecodesStrict(t *testing.T) {
 					"a wire key the struct lacks is a runtime 400", c.name, err)
 			}
 			assertFixtureEqual(t, c.name+".full.json", mustMarshalIndent(t, v))
+		})
+	}
+}
+
+// Explicit false is omitted even when the request edits are populated.
+func TestFindingRequestsFalseOmitsSendToUzi(t *testing.T) {
+	var single FileFindingRequest
+	var group FindingGroupFileRequest
+	apitypestest.Populate(&single)
+	apitypestest.Populate(&group)
+	single.SendToUzi = false
+	group.SendToUzi = false
+	for _, c := range []struct {
+		name  string
+		value any
+	}{
+		{"single", single},
+		{"group", group},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			raw := mustMarshalIndent(t, c.value)
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := fields["send_to_uzi"]; present {
+				t.Fatal("false send_to_uzi must be omitted")
+			}
 		})
 	}
 }

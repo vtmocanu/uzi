@@ -4660,6 +4660,22 @@ export interface IncidentalFindingFiledIssue {
   title: string;
 }
 
+// Optional properties allow client omission; null also mirrors the Go request wire.
+export interface FileFindingRequest {
+  title?: string | null;
+  description?: string | null;
+  labels?: string[] | null;
+  send_to_uzi?: boolean;
+}
+
+export interface FindingGroupFileRequest {
+  ids: string[] | null;
+  title?: string | null;
+  description?: string | null;
+  labels?: string[] | null;
+  send_to_uzi?: boolean;
+}
+
 // IncidentalFindingFileResult is the POST /api/findings/{id}/issue response (M5): the created
 // forge issue plus a non-empty `warning` when the issue WAS created but its local disposition
 // could not settle (created-with-warning — a success, never a retry signal).

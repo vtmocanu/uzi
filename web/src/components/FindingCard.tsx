@@ -5,7 +5,13 @@ import { Badge } from "./ui";
 import { BugIcon } from "./icons";
 import { stripUnsafeChars } from "../lib/safeText";
 import { TriageActions } from "./triage/TriageActions";
-import { IssueDraftCard, type IssueDraftSeed, type IssueDraftValues } from "./triage/IssueDraftCard";
+import {
+  IssueDraftCard,
+  SEND_TO_UZI_HELP,
+  SEND_TO_UZI_CONFIRMED,
+  type IssueDraftSeed,
+  type IssueDraftValues,
+} from "./triage/IssueDraftCard";
 import { TriageStateChip } from "./triage/TriageStateChip";
 import { TriageDisposedRow } from "./triage/TriageDisposedRow";
 import { findingState } from "./triage/triageCopy";
@@ -49,7 +55,7 @@ import { findingState } from "./triage/triageCopy";
 type FindingCardState =
   | { kind: "open" }
   | { kind: "drafting" }
-  | { kind: "filed"; issue: IncidentalFindingFiledIssue; warning: string }
+  | { kind: "filed"; issue: IncidentalFindingFiledIssue; warning: string; queued?: boolean }
   | { kind: "dismissed"; reason: "wont_do" | "not_an_issue" }
   // A human Mark done: the disposition id is what Undo keys on; resolvedAt feeds "resolved Xh ago".
   | { kind: "done"; dispositionId: string; resolvedAt: string }
@@ -123,8 +129,14 @@ export function FindingCard({
         title: values.title,
         description: values.description,
         labels: values.labels,
+        ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
       });
-      setState({ kind: "filed", issue: res.issue, warning: res.warning ?? "" });
+      setState({
+        kind: "filed",
+        issue: res.issue,
+        warning: res.warning ?? "",
+        queued: values.send_to_uzi === true,
+      });
       onMutation?.();
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -294,11 +306,17 @@ export function FindingCard({
         </div>
 
         {state.kind === "drafting" && (
-          <IssueDraftCard loadDraft={loadDraft} onCreate={onCreate} onCancel={() => setState({ kind: "open" })} />
+          <IssueDraftCard allowSendToUzi loadDraft={loadDraft} onCreate={onCreate} onCancel={() => setState({ kind: "open" })} />
         )}
 
         {/* Filed shows only the "Filed #N ↗" chip in the state slot; a created-with-warning line
             (the issue WAS created but its local disposition could not settle) stays under it. */}
+        {state.kind === "filed" && state.queued && (
+          <div className="text-xs text-muted">
+            <p>{SEND_TO_UZI_CONFIRMED}</p>
+            <p>{SEND_TO_UZI_HELP}</p>
+          </div>
+        )}
         {state.kind === "filed" && state.warning && <p className="text-xs text-muted">{state.warning}</p>}
 
         {state.kind === "dismissed" && (

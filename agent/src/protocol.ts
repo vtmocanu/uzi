@@ -897,7 +897,7 @@ export interface ClaimConfig {
    *  k8s. Absent or <= 0 from an older server ⇒ the worker's own defaults. */
   question_max?: number;
   question_timeout_seconds?: number;
-  /** PRD #1226 M5 (D6): the live owner-continue window (seconds) before a completion-blocked
+  /** PRD #1226 M5 (D6): the live owner-decision window (seconds) before a completion-blocked
    *  run parks. The worker's completion-question timer uses THIS instead of
    *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
    *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
@@ -1939,6 +1939,7 @@ export interface CompletionPermitResponse {
     head: string;
     issued_at: string;
     finding_ids: string[];
+    completion_scope?: ClaimConfig["completion_scope"];
   };
 }
 
@@ -2404,6 +2405,10 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Source gate and receipts for negotiated plan_revision_retry_v1 writes. */
+  expected_gate_revision?: number;
+  revision_input_id?: number;
+  superseded_revision_input_ids?: number[];
   /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
   require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
@@ -2445,8 +2450,8 @@ export interface StateRequest {
    *  would park and then be unresumable no matter what the user answered. */
   open_question_id?: string;
   /** PRD #1226 M5 (D6): marks an `awaiting_input` report as a COMPLETION-interlock question (the
-   *  live owner-continue window), NOT an ordinary #88 clarification. The api stamps
-   *  runs.completion_question_at and the owner continue-decision endpoint resolves THIS question by
+   *  live owner-decision window), NOT an ordinary #88 clarification. The api stamps
+   *  runs.completion_question_at and the owner completion-decision endpoint resolves THIS question by
    *  delivering an `answer` naming open_question_id. Sent (true) ONLY on the completion-question park
    *  (the worker's askCompletionQuestion); an ordinary ask_user park omits it. Additive + optional
    *  and OMITTED ENTIRELY (never `false`) on every other report, so an old worker's payload and an
@@ -2749,6 +2754,9 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  revisionInputId?: number;
+  supersededRevisionInputIds?: number[];
+  staleRevisionSource?: boolean;
   /** Validated by WorkerClient against registration, request and known inventory. */
   completedPublicationReceipt?: CompletedPublicationReceipt;
   completedPublicationReason?: CompletedPublicationReason;
@@ -2890,6 +2898,8 @@ export interface UserInput {
 
 export interface InputsResponse {
   inputs: UserInput[];
+  /** Already cancelled server-side: stop this exact flight without another terminal report. */
+  terminal_cancelled?: { run_id: string; generation: number };
   /** PRD #1247 M5b: the held-state credential-switch signal, surfaced on EVERY inputs response —
    *  including an empty-inputs poll (the idle gate/question/follow-up waiters poll this route
    *  continuously) — so the worker holding the current claim learns a switch was requested. Present
@@ -2909,6 +2919,8 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row gate identity; unknown ownership never authorizes a provider start. */
+  gate_revision?: number;
   /** Same-row park classification; omission cannot prove an ordinary owner pause. PRD #1733: the
    *  worker reads a `paused` + `provider_unavailable` pair as an accepted provider-outage park whose
    *  ack was lost; an absent field (an api that does not expose it) is never read as that pair. */
@@ -3154,6 +3166,28 @@ export interface RecoveryHold {
   generation: number;
   has_available_capture: boolean;
   capture_state?: string;
+}
+
+/** Verified persisted custody facts only; never a release ACK or cleanup authority. */
+export interface RecoveryExactHold {
+  run_id: string;
+  hold_id: string;
+  generation: number;
+  repo_id: string;
+  original_worker_id: string;
+  original_worker_identity: string;
+  live_worker_id?: string;
+  live_run_id?: string;
+  inventory_guarded: boolean;
+  state: "open" | "released" | "discarded";
+  run_status: string;
+  current_claim_generation: number;
+  claim_released: boolean;
+  release_evidence?: string;
+  final_receipt?: { kind: string; capture_id?: string; publication_id?: string; source_sha?: string; coverage_digest: string };
+  completed_publication_receipt?: CompletedPublicationReceipt;
+  run_worker_id?: string;
+  recovery_wait_cause?: string;
 }
 
 /** RecoveryHoldsResponse is the worker's post-clone hold inventory for one run (PRD #1349

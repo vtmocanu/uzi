@@ -14,6 +14,14 @@ import (
 
 func newAutomaticRoundsFixture(t *testing.T, limit int32) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
 	t.Helper()
+	p := testParams()
+	p.PlanCrossCheckMaxRevisions = limit
+	p.PlanCrossCheckMaxRevisionsSet = true
+	return newAutomaticRoundsFixtureWithParams(t, p)
+}
+
+func newAutomaticRoundsFixtureWithParams(t *testing.T, p Params) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
+	t.Helper()
 	env := setupCodexLiveDB(t)
 	user, worker, repo := env.seedCodexInfra(t)
 	secret := env.seedStaticAPIKey(t, user, "rounds", "fixture-"+uuid.NewString())
@@ -22,13 +30,30 @@ func newAutomaticRoundsFixture(t *testing.T, limit int32) (codexTestEnv, *Servic
 	lead := uuid.New()
 	env.exec(`INSERT INTO runs(id,user_id,repo_id,worker_id,issue_iid,issue_title,issue_description,status,harness,auto_approve,plan_cross_check_required,claim_generation)
  VALUES($1,$2,$3,$4,2150,'round issue','body','running','claude',true,true,1)`, lead, user, repo, worker)
-	p := testParams()
-	p.PlanCrossCheckMaxRevisions = limit
-	p.PlanCrossCheckMaxRevisionsSet = true
 	svc := New(env.q, env.box, p)
 	svc.SetTxBeginner(env.pool)
 	c := PlanCrossCheckCandidate{PlanMd: "plan", Milestones: []byte("[]"), RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s", BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
 	return env, svc, store.Worker{ID: worker, UserID: user}, lead, c
+}
+
+func newAutomaticRoundsHarnessFixture(t *testing.T, limit int32, harness string) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
+	t.Helper()
+	p := testParams()
+	p.PlanCrossCheckMaxRevisions = limit
+	p.PlanCrossCheckMaxRevisionsSet = true
+	return newAutomaticRoundsHarnessFixtureWithParams(t, p, harness)
+}
+
+func newAutomaticRoundsHarnessFixtureWithParams(t *testing.T, p Params, harness string) (codexTestEnv, *Service, store.Worker, uuid.UUID, PlanCrossCheckCandidate) {
+	t.Helper()
+	env, svc, worker, lead, candidate := newAutomaticRoundsFixtureWithParams(t, p)
+	// Other LiveDB tests sweep global health state in this shared database.
+	t.Cleanup(func() { env.exec(`DELETE FROM users WHERE id=$1`, worker.UserID) })
+	// Keep both credentials usable so a same-family checker cannot hide a direction bug.
+	seedDefaultAnthropicToken(t, env, worker.UserID)
+	env.exec("UPDATE workers SET protocol_capabilities=ARRAY['cross_check_v1','cross_check_rounds_v1','cross_check_codex_lead_v1'] WHERE id=$1", worker.ID)
+	env.exec("UPDATE runs SET harness=$2 WHERE id=$1", lead, harness)
+	return env, svc, worker, lead, candidate
 }
 
 func TestPlanCrossCheckAutomaticRoundsBudgetLiveDB(t *testing.T) {

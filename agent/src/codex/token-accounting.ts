@@ -165,6 +165,31 @@ function responsesReconcileDelta(responseSum: Cumulative, delta: Cumulative): bo
   );
 }
 
+/** Closed validation vocabulary; provider values and identities never enter notices. */
+export interface CodexUsageDiagnostic {
+  readonly predicate: "missing container" | "missing breakdown" | "missing bucket" |
+    "non-number" | "unsafe or negative" | "raw-vs-decoded mismatch" |
+    "bucket relationship" | "last > total" | "pricing evidence incomplete" |
+    "untyped usage notification";
+  readonly breakdown?: "total" | "last";
+  readonly bucket?: keyof CodexUsageBreakdown;
+}
+
+function formatUsageDiagnostic(diagnostic: CodexUsageDiagnostic): string {
+  // Select the fixed literals themselves, never interpolate the supplied fields.
+  const predicate = (["missing container", "missing breakdown", "missing bucket",
+    "non-number", "unsafe or negative", "raw-vs-decoded mismatch", "bucket relationship",
+    "last > total", "pricing evidence incomplete", "untyped usage notification"] as const)
+    .find(value => value === diagnostic.predicate);
+  if (predicate === undefined) return "";
+  const breakdown = (["total", "last"] as const).find(value => value === diagnostic.breakdown);
+  const bucket = (["inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+    "outputTokens", "reasoningOutputTokens", "totalTokens"] as const)
+    .find(value => value === diagnostic.bucket);
+  const location = breakdown === undefined ? "" : ` (${breakdown}${bucket === undefined ? "" : `.${bucket}`})`;
+  return ` Diagnostic: ${predicate}${location}.`;
+}
+
 /** Closed internal causes; no provider text enters the diagnostic. */
 type IncompleteCause = "missing_replay_boundary" | "attempted_resume_without_baseline" | "invalid_identity" | "invalid_raw_usage" | "advancing_regression";
 
@@ -219,14 +244,14 @@ export class CodexUsageAccountant {
   private incompleteNoticeTaken = false;
 
   /** Sticky across all provider epochs of this claim; execution remains independent. */
-  markIncomplete(threadId: string, cause: IncompleteCause, liveWithoutBaseline = false): void {
+  markIncomplete(threadId: string, cause: IncompleteCause, liveWithoutBaseline = false, diagnostic?: CodexUsageDiagnostic): void {
     const acct = this.threads.get(threadId);
     if (!acct) return;
     acct.incompleteCauses.add(cause);
     if (acct.baseline === undefined && acct.resumed &&
         (liveWithoutBaseline || cause === "missing_replay_boundary" || cause === "attempted_resume_without_baseline"))
       acct.attributionQuarantined = true;
-    this.noticeText ??= `Codex token accounting is incomplete: ${INCOMPLETE_CAUSES[cause]}. ${this.hasBaseline(threadId) ? "The proved baseline is retained; proven usage remains available." : "The baseline is unavailable; only proven usage is recorded."} Cost is unreported for the affected model. Execution continues.`;
+    this.noticeText ??= `Codex token accounting is incomplete: ${INCOMPLETE_CAUSES[cause]}. ${this.hasBaseline(threadId) ? "The proved baseline is retained; proven usage remains available." : "The baseline is unavailable; only proven usage is recorded."} Cost is unreported for the affected model. Execution continues.${cause === "invalid_raw_usage" && diagnostic !== undefined ? formatUsageDiagnostic(diagnostic) : ""}`;
   }
   get usageIncomplete(): boolean {
     return [...this.threads.values()].some(acct => acct.incompleteCauses.size > 0);

@@ -354,8 +354,9 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
     await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
-  if (ack.staleClaim) {
-    // 409 stale_claim: a newer claim superseded this generation. Local-retire (D11) — increments
+  if (ack.staleClaim || ack.staleRevisionSource) {
+    // An obsolete claim or source gate cannot authorize this terminal outcome.
+    // Local-retire (D11) — increments
     // stale_retired, writes NOTHING to the server, and NEVER rebinds the outcome to a new generation.
     await outbox.staleRetireTerminal(runId, claimGeneration);
     return;

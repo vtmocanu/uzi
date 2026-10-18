@@ -48,7 +48,7 @@ import { TriageSummary } from "./RunView";
 import { useSetFindingsOpen } from "../components/FindingsOpenContext";
 import { TriageActions } from "../components/triage/TriageActions";
 import { TriageStateChip } from "../components/triage/TriageStateChip";
-import { IssueDraftCard } from "../components/triage/IssueDraftCard";
+import { IssueDraftCard, SEND_TO_UZI_HELP, SEND_TO_UZI_CONFIRMED } from "../components/triage/IssueDraftCard";
 import { findingState } from "../components/triage/triageCopy";
 import { SelectAllCheckbox } from "../components/triage/SelectAllCheckbox";
 import { MultiSelectBar } from "./findings/MultiSelectBar";
@@ -163,7 +163,13 @@ export function Findings() {
   // File as one issue is disabled while the card is open, so a changed selection cannot be posted
   // under an old draft (and the user's edits are never silently discarded by a reload).
   const [groupTarget, setGroupTarget] = useState<{ ids: string[]; repoLabel: string } | null>(null);
-  const [notice, setNotice] = useState("");
+  const [notice, setNoticeText] = useState("");
+  const [groupConfirmation, setGroupConfirmation] = useState<{ url: string; iid: number; queued: boolean } | null>(null);
+  const setNotice = useCallback((text: string) => {
+    setNoticeText(text);
+    setGroupConfirmation(null);
+  }, []);
+  const [queuedFindings, setQueuedFindings] = useState<Set<string>>(new Set());
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Publishes the canonical open count to the nav badge (PRD #1183 M4, the BLK-BADGE pattern). A
@@ -214,7 +220,7 @@ export function Findings() {
     setSelected(new Set());
     setGroupTarget(null);
     setNotice("");
-  }, [bucket, repoFilter, runAnchor]);
+  }, [bucket, repoFilter, runAnchor, setNotice]);
 
   // The repo scope selector's options. Best-effort (a failure leaves All-repos as the only option,
   // and the backlog still renders); the selector defaults to All-repos-grouped.
@@ -288,7 +294,7 @@ export function Findings() {
   }, []);
 
   const fileFinding = useCallback(
-    async (findingID: string, body: { title: string; description: string; labels: string[] }) => {
+    async (findingID: string, body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => {
       setActionErr("");
       try {
         const res = await api.fileFinding(findingID, body);
@@ -298,6 +304,13 @@ export function Findings() {
           status: "filed",
           filed_issue_iid: res.issue.iid,
           filed_issue_url: res.issue.web_url,
+        });
+        // Only this local, confirmed submission can show the queued caveat.
+        setQueuedFindings((s) => {
+          const next = new Set(s);
+          if (body.send_to_uzi === true) next.add(findingID);
+          else next.delete(findingID);
+          return next;
         });
         setFiledWarnings((m) => ({ ...m, [findingID]: res.warning ?? "" }));
         // Filing moves a coordinate to_file → filed, so the tabs and the nav badge change.
@@ -323,7 +336,7 @@ export function Findings() {
   // rethrows so the card keeps the user's edits and shows the error. The web has no release action,
   // so a 202 (no issue) points at the CLI release after the user inspects the forge.
   const fileGroup = useCallback(
-    async (ids: string[], body: { title: string; description: string; labels: string[] }) => {
+    async (ids: string[], body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => {
       setActionErr("");
       setNotice("");
       try {
@@ -339,6 +352,7 @@ export function Findings() {
               ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
               : filed,
           );
+          setGroupConfirmation({ url: res.issue.web_url, iid: res.issue.iid, queued: body.send_to_uzi === true });
         } else {
           const detail = res.warning ? `${res.warning} ` : "";
           setNotice(
@@ -359,7 +373,7 @@ export function Findings() {
         throw e;
       }
     },
-    [load, reloadStats],
+    [load, reloadStats, setNotice],
   );
 
   // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
@@ -541,9 +555,10 @@ export function Findings() {
     selected: canSelect(f) && f.disposition_id ? selected.has(f.disposition_id) : false,
     onToggleSelect: () => f.disposition_id && toggleSelect(f.disposition_id),
     repoLabel: stripUnsafeChars(maskRepoPath(f.repo_path, demo)),
+    queued: !!f.finding_id && queuedFindings.has(f.finding_id),
     warning: f.finding_id ? filedWarnings[f.finding_id] : undefined,
     resolved: f.finding_id ? resolvedIds.has(f.finding_id) : false,
-    onFile: (body: { title: string; description: string; labels: string[] }) =>
+    onFile: (body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) =>
       f.finding_id ? fileFinding(f.finding_id, body) : Promise.resolve(),
     onDismiss: (reason: "wont_do" | "not_an_issue") => {
       if (f.disposition_id) dismiss([f.disposition_id], reason);
@@ -572,6 +587,23 @@ export function Findings() {
       {notice && (
         <div role="status" className="rounded-lg border border-info/30 bg-info/[0.06] px-3 py-2 text-sm text-muted">
           {notice}
+          {groupConfirmation && (
+            <>
+              <TriageStateChip
+                {...findingState({
+                  status: "filed",
+                  filed_issue_iid: groupConfirmation.iid,
+                  filed_issue_url: groupConfirmation.url,
+                })}
+              />
+              {groupConfirmation.queued && (
+                <>
+                  <p>{SEND_TO_UZI_CONFIRMED}</p>
+                  <p>{SEND_TO_UZI_HELP}</p>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
 
@@ -648,6 +680,7 @@ export function Findings() {
             File {groupTarget.ids.length} findings as one issue
           </p>
           <IssueDraftCard
+            allowSendToUzi
             key={groupTarget.ids.join(",")}
             fixedRepoLabel={groupTarget.repoLabel}
             loadDraft={async () => {
@@ -664,6 +697,7 @@ export function Findings() {
                 title: values.title,
                 description: values.description,
                 labels: values.labels,
+                ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
               })
             }
             onCancel={() => setGroupTarget(null)}
@@ -786,6 +820,7 @@ export function FindingRow({
   onToggleSelect,
   repoLabel,
   warning,
+  queued,
   resolved,
   onFile,
   onDismiss,
@@ -797,8 +832,9 @@ export function FindingRow({
   onToggleSelect: () => void;
   repoLabel: string;
   warning?: string;
+  queued?: boolean;
   resolved: boolean;
-  onFile: (body: { title: string; description: string; labels: string[] }) => Promise<void>;
+  onFile: (body: { title: string; description: string; labels: string[]; send_to_uzi?: boolean }) => Promise<void>;
   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
   onMarkDone: () => void;
 }) {
@@ -857,6 +893,12 @@ export function FindingRow({
               <TriageStateChip {...state} />
             )}
           </div>
+          {finding.status === "filed" && queued && (
+            <div className="mt-1 text-xs text-muted">
+              <p>{SEND_TO_UZI_CONFIRMED}</p>
+              <p>{SEND_TO_UZI_HELP}</p>
+            </div>
+          )}
           {finding.status === "filed" && warning && (
             // warning is a server-authored constant (created-with-warning), not model text.
             <p className="mt-1 text-xs text-muted">· {warning}</p>
@@ -892,6 +934,7 @@ export function FindingRow({
       {actionable && filing && finding.finding_id && (
         <div className="border-t border-edge px-3 py-2.5">
           <IssueDraftCard
+            allowSendToUzi
             fixedRepoLabel={repoLabel}
             loadDraft={async () => {
               const draft = await api.findingIssueDraft(finding.finding_id!);
@@ -907,6 +950,7 @@ export function FindingRow({
                 title: values.title,
                 description: values.description,
                 labels: values.labels,
+                ...(values.send_to_uzi ? { send_to_uzi: true } : {}),
               });
               setFiling(false);
             }}

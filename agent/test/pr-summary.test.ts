@@ -239,7 +239,7 @@ describe("implement prompt pr_summary ask (PRD #1798 M2)", () => {
     for (const first of [true, false]) {
       const p = buildImplementPrompt({ branch: "b", subagentNames: ["coder"], first, iteration: first ? 1 : 2 });
       assert.ok(p.includes(PR_SUMMARY_GUIDANCE));
-      assert.ok(p.indexOf("call the `signal_done` tool exactly once") < p.indexOf("pr_summary"), "it follows the signal_done line");
+      assert.ok(p.indexOf("call the `signal_done` tool for a completion check") < p.indexOf("pr_summary"), "it follows the signal_done line");
     }
     assert.match(PR_SUMMARY_GUIDANCE, /behaviour-level/);
     assert.match(PR_SUMMARY_GUIDANCE, /ONLY the checks\s+you actually ran/);

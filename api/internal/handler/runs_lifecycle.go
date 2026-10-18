@@ -945,6 +945,8 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrStaleClaim):
 			httpx.Error(w, http.StatusConflict, "policy hold changed; upgrade your client and refetch the presented action")
+		case errors.Is(err, workersvc.ErrPlanRevisionPending):
+			httpx.ErrorReason(w, http.StatusConflict, "Pending plan feedback must finish or be replaced by a new revision before approval. You can cancel, reject, or request another revision (within the revision limit). Approval cannot resume an expired revision.", "plan_revision_pending")
 		case errors.Is(err, workersvc.ErrReconciliationRequired):
 			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "milestone_reconciliation_required")
 		case errors.Is(err, workersvc.ErrReconciliationConflict):

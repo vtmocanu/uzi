@@ -60,7 +60,8 @@ if ! docker image inspect "$PGIMAGE" >/dev/null 2>&1; then
 fi
 
 say "starting throwaway Postgres ($NAME) on 127.0.0.1:$PORT"
-docker run -d --rm --name "$NAME" \
+# Give PostgreSQL dynamic shared memory headroom for concurrent readers.
+docker run -d --rm --shm-size=1g --name "$NAME" \
   -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi -e POSTGRES_PASSWORD="$PGPASS" \
   --mount "type=bind,source=$ROOT/e2e/test-database-marker.sql,target=/docker-entrypoint-initdb.d/10-uzi-test-database-marker.sql,readonly" \
   -p "127.0.0.1:$PORT:5432" "$PGIMAGE" >/dev/null
@@ -208,6 +209,29 @@ if [ "${UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E:-}" = "1" ]; then
     exit 1
   fi
   rm -f "$E2E_LOG"
+fi
+
+# Explicit opt-in only: the ordinary Go-only LiveDB sweep does not prove this Node composition.
+if [ "${UZI_STALE_WORKER_CANCEL_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  E2E_LOG="$(mktemp "$ROOT/.uzi/scratch/gate-log.XXXXXX")"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestStaleWorkerCancelE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  # Named positive controls, and zero skips at every indentation level.
+  if ! grep -q '^=== RUN   TestStaleWorkerCancelE2E$' "$E2E_LOG" ||
+    ! grep -q '^--- PASS: TestStaleWorkerCancelE2E ' "$E2E_LOG" ||
+    grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "stale worker cancel proof did not run and pass without skips: $E2E_LOG" >&2
+    exit 1
+  fi
+  for fixture_case in plan-empty question-empty stale-generation ordinary-outage; do
+    if ! grep -q "^=== RUN   TestStaleWorkerCancelE2E/$fixture_case$" "$E2E_LOG" ||
+      ! grep -q -- "--- PASS: TestStaleWorkerCancelE2E/$fixture_case " "$E2E_LOG"; then
+      echo "stale worker cancel case did not run and pass: $fixture_case ($E2E_LOG)" >&2
+      exit 1
+    fi
+  done
+  printf 'Stale worker cancel combined proof log: %s\n' "$E2E_LOG"
 fi
 
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

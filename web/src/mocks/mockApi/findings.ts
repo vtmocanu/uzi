@@ -1,6 +1,8 @@
 import {
   type CreatedIssue,
   type FindingGroupDraft,
+  type FileFindingRequest,
+  type FindingGroupFileRequest,
   type FindingGroupFileResult,
   type IssueDraft,
   type IncidentalFinding,
@@ -196,7 +198,7 @@ export const findingsApi = {
     };
     return delay(draft, 80);
   },
-  fileFinding: async (id: string, body?: { title?: string; description?: string; labels?: string[] }) => {
+  fileFinding: async (id: string, body?: FileFindingRequest) => {
     const me = requireSession();
     const f = findings.find((x) => x.finding_id === id && x.user_id === me.id);
     if (!f) throw new ApiError(404, "finding not found");
@@ -234,11 +236,11 @@ export const findingsApi = {
   },
   // fileFindingGroup files every member as ONE issue (issue #1724): all members flip to `filed`
   // sharing one new iid and web_url. Same validation as the draft; returns the 201 shape.
-  fileFindingGroup: async (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) => {
-    const members = resolveGroup(body.ids);
+  fileFindingGroup: async (body: FindingGroupFileRequest) => {
+    const members = resolveGroup(body.ids ?? []);
     // Like the server, an explicitly empty title is rejected; an omitted one falls back to the first
     // member's title (demo convenience).
-    if (body.title !== undefined && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
+    if (body.title != null && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
     const iid = nextFiledIssueIid++;
     const webURL = `https://gitlab.example.com/${members[0].repo_path}/-/issues/${iid}`;
     const now = new Date().toISOString();

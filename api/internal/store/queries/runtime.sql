@@ -7138,7 +7138,7 @@ RETURNING r.id, r.user_id, r.status;
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs    WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7147,6 +7147,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7181,7 +7183,7 @@ JOIN parent_mapping mapping ON mapping.run_id = runs.id
 CROSS JOIN parent_lock_set locks
     WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7190,6 +7192,8 @@ CROSS JOIN parent_lock_set locks
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7215,14 +7219,14 @@ FOR UPDATE OF runs;
 -- evidence or unresolved custody is recorded, else FAILED worker_lost (fail-first with the requeue
 -- twin below). The failure path SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
 -- the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
--- restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+-- restore). Active approval/input/followup holds are targets too. Chat is a target restriction
 -- (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 -- window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7231,6 +7235,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7270,7 +7276,7 @@ WITH candidates AS MATERIALIZED (
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7279,6 +7285,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7304,7 +7312,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = ANY(locks.ids)
       AND runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7313,6 +7321,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7370,7 +7380,7 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= @max_requeues
@@ -7379,6 +7389,8 @@ WHERE runs.worker_id = @worker_id
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7401,14 +7413,14 @@ RETURNING runs.id, runs.user_id, runs.status;
 -- PRD #1390 M2b (SC2, under cap): the requeue twin of FailRunsMissingFromSnapshot — a `running`
 -- run-lane run this worker OWNS but no longer lists, past the fence and within budget, is REQUEUED
 -- through the existing requeue path. Its SET list mirrors RequeueRunsOfStaleWorkers (health reset,
--- park-time bank for approval/input — a no-op here since only status='running' is targeted, codex
+-- park-time bank for approval/input (followup keeps its existing accounting), codex
 -- cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
 -- never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
@@ -7417,6 +7429,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7481,7 +7495,7 @@ WITH candidates AS MATERIALIZED (
                   AND runs.claim_released_at IS NULL
                   AND (runs.worker_id = @worker_id
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < @missing_cutoff
   AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
@@ -7490,6 +7504,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -7517,7 +7533,7 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
     updated_at = now()
 WHERE runs.worker_id = @worker_id
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
   AND (runs.requeue_count - runs.requeue_episode_baseline) < @max_requeues
@@ -7526,6 +7542,8 @@ WHERE runs.worker_id = @worker_id
     AND runs.started_at < (sqlc.arg('now')::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM (sqlc.arg('now')::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST(sqlc.arg('now')::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -9462,6 +9480,8 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- from the status_since and updated_at already projected here. COALESCE keeps a NULL
 -- stale_requeue_generation false rather than NULL. The name is the owner worker's, an empty string when the
 -- owner row is gone (COALESCE keeps the scan target a plain string).
+-- #3000: owner_hold_pinnable projects ClaimRun's independent draining/maintenance
+-- hold; Go applies the inclusive updated_at + affinity ceiling and reuses the owner name.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -9473,6 +9493,10 @@ SELECT id, user_id, status, auto_approve,
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
+       COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
+                AND runs.worker_id IS NOT NULL
+                AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id
+                            AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)::boolean AS owner_hold_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
        (SELECT MIN(evidence.since) FROM (
@@ -10110,6 +10134,12 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -10319,6 +10349,12 @@ WHERE r.status = 'queued'
   -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
   -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
   AND r.egress_profile_id IS NULL
+  -- #3000: draining or maintenance owners hold independently of stale-requeue grace.
+  AND NOT COALESCE(
+        r.worker_id IS NOT NULL AND r.kind <> 'cross_check'
+    AND r.updated_at >= @affinity_cutoff::timestamptz
+    AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = r.worker_id
+                AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced)), false)
   -- #2705: a run that ClaimRun is holding for its returning worker is not demand yet. This is
   -- the "effective pin" E, the claim pin plus the affinity ceiling, so it is true only while
   -- ClaimRun really blocks every peer:
@@ -11011,7 +11047,7 @@ WHERE run_id = @run_id AND consumed_at IS NULL AND contract_revision < @new_revi
 -- usable workers" is what makes waiting_worker a CAPACITY failure rather than one of its
 -- other causes (vault locked, custody limit, all workers busy) — those surface through
 -- queue.waiting by age instead. Rows held for a returning worker (issue #2705, the
--- 'waiting until ' stale-requeue pin reason) are excluded, see the predicate below.
+-- 'waiting until ' stale-requeue or draining/maintenance reason) are excluded below.
 -- Expected plan cross-check waits are excluded:
 -- an owned check finishing is not a lead waiting for worker admission.
 SELECT r.user_id, r.id AS run_id, r.health_since, r.health_reason,
@@ -11020,13 +11056,11 @@ FROM runs r
 WHERE r.health = 'waiting_worker'
   AND r.kind <> 'cross_check'
   AND r.health_reason IS DISTINCT FROM 'waiting for plan cross-check'
-  -- Issue #2705: during the stale-requeue grace a run is explicitly held for its returning owner
-  -- (workersvc reasonStaleRequeuePinPrefix, 'waiting until ...'), so it is not a capacity failure
-  -- yet. The pin reason is flagged from the first detector tick after the requeue (below the queued
-  -- threshold), so without this the 5m danger threshold would fire inside the grace, clear at the
-  -- pin exit and fire again. Excluding the pin row keeps today's timing: the age runs from the first
-  -- non-pin flag, about max(grace, health_queued_seconds) after the requeue. A NULL health_reason
-  -- must stay included, hence the COALESCE.
+  -- Issues #2705/#3000: both the stale-requeue and draining/maintenance holds use
+  -- workersvc reasonStaleRequeuePinPrefix. They are expected waiting, explained from the
+  -- first detector tick even below the queued threshold. Capacity age starts at the first
+  -- genuine-wait flag after both holds end. A NULL health_reason must stay included,
+  -- hence the COALESCE.
   AND NOT COALESCE(r.health_reason LIKE 'waiting until %', false)
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -11044,7 +11078,7 @@ FROM runs
 WHERE health = 'waiting_worker'
   AND kind <> 'cross_check'
   AND health_reason IS DISTINCT FROM 'waiting for plan cross-check'
-  -- Issue #2705 M3: a run held for its returning worker (workersvc reasonStaleRequeuePinPrefix,
+  -- Issues #2705/#3000: either owner hold (workersvc reasonStaleRequeuePinPrefix,
   -- 'waiting until ...') is expected waiting, not a queue.waiting age signal. Only a positively
   -- identified pin row is excluded; waiting_worker rows with a NULL health_reason must stay
   -- included: the LIKE is wrapped in COALESCE(..., false) under the NOT rather than written as a

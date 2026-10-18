@@ -273,6 +273,10 @@ func (g *Gatekeeper) approve(ctx context.Context, a BlockAction, userID, runID u
 			g.ephemeral(ctx, a, gateSupersededText)
 			return
 		}
+		if errors.Is(err, ErrPlanRevisionPending) {
+			g.ephemeral(ctx, a, "Pending plan feedback must finish or be replaced by a new revision before approval. Open the run in uzi to cancel, reject, or request another revision (within the revision limit). Approval cannot resume an expired revision.")
+			return
+		}
 		if errors.Is(err, ErrSelectionRejected) {
 			g.ephemeral(ctx, a, "That agent choice is no longer valid for this run (the roster may have changed) — reopen the plan in uzi.")
 			return

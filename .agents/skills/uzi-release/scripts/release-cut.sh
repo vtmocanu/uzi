@@ -34,7 +34,8 @@
 #     --stable        cut a plain vX.Y.Z from main's tip (the old one-step model). An
 #                     escape for a docs-only release; REFUSED while an RC is in flight.
 #
-#   --changelog-file  a drafted `## [X.Y.Z]` section that REPLACES the [Unreleased] fold.
+#   --changelog-file  a drafted `## [X.Y.Z]` section replacing the legacy fold;
+#                     refused before mutation when changelog.d/ fragments are pending.
 #   --no-commit       stage every edit but do not commit (and so do not run the oracle).
 #                     Applies to the main half only; rejected with --promote.
 #   --prev-tag TAG    override the derived coverage-window base tag (a repair).
@@ -163,7 +164,7 @@ prev_stable_below() {
 }
 # changelog_unreleased_body -> the body between `## [Unreleased]` and the next `## [`.
 changelog_unreleased_body() {
-  awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
+  printf '%s\n' "$PENDING_BODY"
 }
 # shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
 # a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
@@ -236,6 +237,62 @@ fi
 if [ -n "$PREV_OVERRIDE" ] && ! git rev-parse -q --verify "refs/tags/$PREV_OVERRIDE" >/dev/null; then
   echo "release-cut: --prev-tag '$PREV_OVERRIDE' does not exist" >&2; exit 3
 fi
+# Validate and capture the complete pending inventory before any release mutation.
+# Clean tracked inputs plus an exact HEAD mode check exclude local/untracked notes.
+STARTING_SHA="$(git rev-parse HEAD)" || exit 3
+FRAGMENT_CLI="$ROOT/scripts/changelog-fragments.sh"
+if ! FRAGMENT_LIST="$(bash "$FRAGMENT_CLI" list)"; then exit 3; fi
+INCORPORATED=()
+while IFS= read -r fragment; do
+  [ -n "$fragment" ] || continue
+  if [ "$(git ls-tree "$STARTING_SHA" -- "$fragment" | awk '{print $1}')" != 100644 ]; then
+    echo "release-cut: pending fragment must be committed as a regular non-executable file in HEAD: $fragment" >&2
+    exit 3
+  fi
+  INCORPORATED+=("$fragment")
+done <<< "$FRAGMENT_LIST"
+if [ -n "$CL_FILE" ] && [ "${#INCORPORATED[@]}" -gt 0 ]; then
+  echo "release-cut: --changelog-file is refused with pending fragments" >&2; exit 3
+fi
+# Explicit promotion-only does not consume main's notes; a fragment-free draft replaces
+# the legacy body. Read that body only for diagnostics, without imposing its grammar.
+# Keep the renderer's bounded snapshot and byte/section checks on these routes.
+raw_pending_body() (
+  export LC_ALL=C
+  # shellcheck source=scripts/lib/changelog-fragments.sh
+  . "$ROOT/scripts/lib/changelog-fragments.sh"
+  [ ! -L CHANGELOG.md ] && [ -f CHANGELOG.md ] || return 1
+  mkdir -p .uzi/scratch || return 1
+  work="$(mktemp -d .uzi/scratch/release-legacy.XXXXXX)" || return 1
+  trap 'rm -rf "$work"' EXIT
+  changelog_fragment_snapshot CHANGELOG.md "$work/source" 16777216 || return 1
+  changelog_fragment_no_nul "$work/source" || return 1
+  # list already checks the combined pending byte budget, including fragments.
+  awk '
+    /^## \[Unreleased\]$/ { seen++; active=1; next }
+    /^## \[/ { active=0 }
+    active {
+      if ($0 ~ /\330\234|\342\200[\216\217\252-\256]|\342\201[\246-\251]/) bad="direction control in input"
+      printable=$0; gsub(/\t/, "", printable)
+      if (printable ~ /[[:cntrl:]]/) bad="control byte in input"
+      print
+    }
+    END {
+      if (seen != 1) bad="expected exactly one [Unreleased] section"
+      if (bad != "") {
+        print "release-cut: " bad > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$work/source"
+)
+if [ "$VERB" = --promote-only ] || [ -n "$CL_FILE" ]; then
+  if ! PENDING_BODY="$(raw_pending_body)"; then exit 3; fi
+else
+  if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+fi
+OWNED_PATHS=(CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh "${INCORPORATED[@]}")
+
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
 # reachable origin, e.g. an offline fixture repo.
 git fetch --tags --quiet origin >/dev/null 2>&1 || true
@@ -349,6 +406,12 @@ if [ "$OP" != "nextrc" ] && [ -n "$S" ] && [ "$(ver_cmp "$VERSION" "${S#v}")" !=
   echo "release-cut: $VERSION must be above the highest stable tag $S." >&2; exit 3
 fi
 
+# Later-RC and skip-promote routes fold legacy notes rather than applying a draft.
+# Keep their consuming reader strict even when a --changelog-file was supplied.
+if [ -n "$CL_FILE" ] && { [ "$OP" = nextrc ] || [ "$OP" = skiprc ]; }; then
+  if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+fi
+
 # --- resolve TAG / chart version / base / prev --------------------------------
 case "$OP" in
   rc1|skiprc|promote) TAG="v$VERSION-rc.1"; CHARTVER="$VERSION-rc.1"; BASE="$VERSION" ;;
@@ -377,13 +440,6 @@ fold_or_insert() { # writes the [BASE] section into CHANGELOG (fold [Unreleased]
       END{ if(!done){ print "release-cut: no [Unreleased] heading found" > "/dev/stderr"; exit 7 } }
     ' CHANGELOG.md > "$tmp" || { echo "release-cut: CHANGELOG insert failed" >&2; rm -f "$tmp"; exit 3; }
   else
-    local body; body="$(changelog_unreleased_body | tr -d '[:space:]')"
-    # A window whose only shipping merges are dependency bumps has nothing in [Unreleased]
-    # (the per-PR check spared them) but still has something to release: open the section
-    # and let autocite_dependency_merges fill it.
-    if [ -z "$body" ] && [ -z "$DEP_REFS" ]; then
-      echo "release-cut: [Unreleased] is empty and no --changelog-file given — nothing to release" >&2; rm -f "$tmp"; exit 3
-    fi
     awk -v ver="$base" -v d="$TODAY" '
       /^## \[Unreleased\]/ && !done { print "## [Unreleased]"; print ""; print "## [" ver "] - " d; done=1; next }
       { print }
@@ -392,27 +448,16 @@ fold_or_insert() { # writes the [BASE] section into CHANGELOG (fold [Unreleased]
   mv "$tmp" CHANGELOG.md
 }
 
-rename_and_fold() { # skiprc: rename `## [IB]`->`## [NEW]` (date today), move [Unreleased] body under it
-  local from="$1" to="$2" tmp bodyf; tmp="$(mktemp)"; bodyf="$(mktemp)"
-  # The [Unreleased] body goes through a FILE, never `awk -v`: BSD awk rejects a newline
-  # in a -v value ("newline in string"). getline reads it when the renamed heading lands.
-  changelog_unreleased_body > "$bodyf"
-  awk -v from="$from" -v to="$to" -v d="$TODAY" -v bodyf="$bodyf" '
-    /^## \[Unreleased\]/ && !u { print "## [Unreleased]"; print ""; u=1; skipu=1; next }
-    skipu && /^## \[/ { skipu=0 }
-    skipu { next }
-    $0 ~ "^## \\[" from "\\]" && !r {
-      print "## [" to "] - " d
-      nb = 0; hasbody = 0
-      while ((getline line < bodyf) > 0) { buf[++nb] = line; if (line ~ /[^[:space:]]/) hasbody = 1 }
-      close(bodyf)
-      while (nb > 0 && buf[nb] ~ /^[[:space:]]*$/) nb--   # trim trailing blanks
-      if (hasbody) { print ""; for (i = 1; i <= nb; i++) print buf[i] }
-      r = 1; next
+rename_and_fold() { # skiprc: rename the open heading, then use the guarded category fold
+  local from="$1" to="$2" tmp; tmp="$(mktemp)"
+  awk -v from="$from" -v to="$to" -v d="$TODAY" '
+    index($0, "## [" from "]") == 1 && !r {
+      print "## [" to "] - " d; r = 1; next
     }
     { print }
-  ' CHANGELOG.md > "$tmp" || { rm -f "$tmp" "$bodyf"; echo "release-cut: skip-promote rename/fold failed" >&2; exit 1; }
-  mv "$tmp" CHANGELOG.md; rm -f "$bodyf"
+  ' "$CHANGELOG_VIEW" > "$tmp" || { rm -f "$tmp"; echo "release-cut: skip-promote rename failed" >&2; exit 1; }
+  fold_into_open "$to" "$tmp"
+  rm -f "$tmp"
 }
 
 # fold_line_tags <base> <file>: sorted `section<TAB>subsection<TAB>line` for every non-blank,
@@ -426,8 +471,10 @@ fold_line_tags() {
   ' "$2" | LC_ALL=C sort
 }
 
-# fold_into_open <base>: nextrc: move the [Unreleased] body into the open `## [base]`
-# section, subsection by subsection (D3, amended): each `### X` bucket is appended to the
+# fold_into_open <base> [writer-input] [pending-view]: move canonical [Unreleased]
+# into the open `## [base]` section, subsection by subsection (D3, amended).
+# The pending view supplies buckets and guard input; the writer preserves published order.
+# Each `### X` bucket is appended to the
 # end of the section's own `### X`, or opens that subsection at the section's end. PRs
 # land their entries in [Unreleased], so a re-spin nearly always has some. Guarded, because
 # a malformed merge is invisible to the oracle and changelog-links --check: refuses (exit 3,
@@ -435,7 +482,7 @@ fold_line_tags() {
 # Changelog's six, a duplicate `###` in the result, or any line lost, invented or moved to
 # another subsection. A `### X` repeated inside [Unreleased] is collapsed, with a NOTE.
 fold_into_open() {
-  local base="$1" tmp; tmp="$(mktemp)"
+  local base="$1" input="${2:-CHANGELOG.md}" pending="${3:-${2:-CHANGELOG.md}}" tmp; tmp="$(mktemp)"
   awk -v base="$base" '
     function flush(   n, i, lines) {   # append the bucket for the current subsection
       if (sub_ != "" && (sub_ in bucket)) {
@@ -490,7 +537,7 @@ fold_into_open() {
         for (i = 1; i <= no; i++) if ((order[i] in bucket) && !(order[i] in used)) { print ""; print "### " order[i]; n = split(bucket[order[i]], L, "\n"); print ""; for (j = 1; j < n; j++) print L[j] }
       }
     }
-  ' CHANGELOG.md CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: [Unreleased] fold into [$base] refused; CHANGELOG untouched" >&2; exit 3; }
+  ' "$pending" "$input" > "$tmp" || { rm -f "$tmp"; echo "release-cut: [Unreleased] fold into [$base] refused; CHANGELOG untouched" >&2; exit 3; }
 
   # Guard 1: no subsection appears twice in the open section.
   local dups
@@ -500,7 +547,7 @@ fold_into_open() {
   # Headings are excluded as lines: folding a bucket into an existing subsection, or
   # collapsing a repeated one, drops a heading by design.
   local before after
-  before="$(fold_line_tags "$base" CHANGELOG.md)"
+  before="$(fold_line_tags "$base" "$pending")"
   after="$(fold_line_tags "$base" "$tmp")"
   if [ -n "$dups" ] || [ "$before" != "$after" ] || [ -n "$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f' "$tmp" | tr -d '[:space:]')" ]; then
     echo "release-cut: [Unreleased] fold into [$base] failed its guard (duplicate subsection in [$base]: ${dups:-none}; a line lost, invented or moved: $([ "$before" = "$after" ] && echo no || echo yes)); CHANGELOG untouched" >&2
@@ -708,10 +755,11 @@ verify_fail() {
   echo "release-cut: VERIFY FAILED — $1" >&2
   echo "  undoing the release commit (git reset --soft HEAD~1); your edits are kept staged." >&2
   git reset --soft HEAD~1
+  print_recovery verify-failure
   exit 1
 }
 commit_and_verify() { # $1 tag  $2 prev  $3 base
-  git commit -q -m "chore(release): $1" || { echo "release-cut: commit failed" >&2; exit 1; }
+  git commit -q -m "chore(release): $1" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
   if ! bash scripts/assert-changelog-covers-release.sh HEAD "$2" "$3"; then
     verify_fail "changelog coverage oracle rejected the release commit"
   fi
@@ -721,6 +769,19 @@ commit_and_verify() { # $1 tag  $2 prev  $3 base
 }
 
 echo "=== release-cut $TAG (op=$OP) on $DEFBRANCH ==="
+
+# Print before mutation: interruption cannot rely on a later error handler.
+print_recovery() {
+  echo "Recovery ($1): starting SHA $STARTING_SHA"
+  echo "  Inspect worktree/index: git status --short; git diff; git diff --cached"
+  echo "  Before commit, finish deliberate preparation and verify; or restore owned paths:"
+  printf '  git restore --source=%s --staged --worktree --' "$STARTING_SHA"
+  printf ' %q' "${OWNED_PATHS[@]}"; printf '\n'
+  echo "  After commit (possibly clean), inspect and verify; to undo deliberately first:"
+  echo "  git reset --soft $STARTING_SHA"
+  echo "  Then run the explicit restore above. Inspect/remove any leftover provisional stable tag deliberately after interruption."
+}
+print_recovery precommit
 
 # --- promote half (before touching main) --------------------------------------
 PROMOTED_TAG=""; PROMOTE_FINALIZED=0
@@ -777,14 +838,16 @@ if [ "$OP" = promote ] || [ "$OP" = promoteonly ]; then
 $SHIPPING_SHAS
 EOF
   unrel="$(changelog_unreleased_body | tr -d '[:space:]')"
+  [ "${#INCORPORATED[@]}" -eq 0 ] || unrel=fragments
   # A combined promotion must have notes for the next candidate before tagging the stable.
   # Dependency-only shipping work also requires notes here; plain cuts still autocite it.
   if [ "$OP" = promote ] && [ "$merges" -gt 0 ] && [ -z "$unrel" ] && [ -z "$CL_FILE" ]; then
     {
-      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but [Unreleased] is empty and no --changelog-file given."
+      echo "release-cut: --promote REFUSED -- shipping commits landed since $INFLIGHT but pending notes (legacy [Unreleased] plus fragments) are empty and no --changelog-file given."
       echo "  Shipping SHAs:"
       printf '    %s\n' "$SHIPPING_SHAS"
-      echo "  Either write next candidate entries under [Unreleased] OR pass --changelog-file with a drafted ## [$BASE] section, then re-run."
+      echo "  Add cited next-candidate UUID-v4 fragments under changelog.d/ and commit them, then re-run."
+      echo "  With no pending fragments, legacy [Unreleased] entries or --changelog-file with a drafted ## [$BASE] section remain supported."
     } >&2
     exit 3
   fi
@@ -824,7 +887,39 @@ if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
   exit 3
 fi
 
+# Refuse empty new-base cuts before publishing the assembled view. Dependency-only
+# plain cuts still open a section for autocitation; promotion has its earlier guard.
+case "$OP" in
+  rc1|stable|promote)
+    if [ -z "$CL_FILE" ] && [ -z "$(changelog_unreleased_body | tr -d '[:space:]')" ] && [ -z "$DEP_REFS" ]; then
+      echo "release-cut: [Unreleased] is empty and no --changelog-file given — nothing to release" >&2
+      exit 3
+    fi ;;
+esac
+
 # --- CHANGELOG (main half) ----------------------------------------------------
+# Every fold reads canonical pending categories. Keep the original writer input for
+# next RCs until fold_into_open has checked the assembled view, so refusal preserves bytes.
+CHANGELOG_VIEW=CHANGELOG.md
+if [ -z "$CL_FILE" ]; then
+  mkdir -p .uzi/scratch || exit 1
+  assembled="$(mktemp .uzi/scratch/release-notes.XXXXXX)" || exit 1
+  pending="$(mktemp .uzi/scratch/release-body.XXXXXX)" || { rm -f "$assembled"; exit 1; }
+  printf '%s\n' "$PENDING_BODY" > "$pending" || exit 1
+  if ! awk -v body="$pending" '
+    /^## \[Unreleased\]$/ { print; print ""; while ((getline line < body) > 0) print line; close(body); print ""; skip=1; next }
+    skip && /^## \[/ { skip=0 }
+    !skip { print }
+  ' CHANGELOG.md > "$assembled"; then
+    rm -f "$assembled" "$pending"; exit 1
+  fi
+  rm -f "$pending"
+  CHANGELOG_VIEW="$assembled"
+  case "$OP" in
+    nextrc|skiprc) ;; # guarded folds publish only after validation
+    *) mv "$assembled" CHANGELOG.md || exit 1; CHANGELOG_VIEW=CHANGELOG.md ;;
+  esac
+fi
 case "$OP" in
   rc1|stable)
     fold_or_insert "$BASE" ;;
@@ -833,7 +928,7 @@ case "$OP" in
       echo "release-cut: no open '## [$BASE]' section for the next candidate; expected it from the first RC." >&2; exit 3
     fi
     if [ -n "$(changelog_unreleased_body | tr -d '[:space:]')" ]; then
-      fold_into_open "$BASE"
+      fold_into_open "$BASE" CHANGELOG.md "$CHANGELOG_VIEW"
       echo "  CHANGELOG: [Unreleased] folded into the open [$BASE] section"
     fi ;;
   skiprc)
@@ -842,6 +937,7 @@ case "$OP" in
     refresh_section_date "$IB"
     fold_or_insert "$BASE" ;;
 esac
+[ "$CHANGELOG_VIEW" = CHANGELOG.md ] || rm -f "$CHANGELOG_VIEW"
 echo "  CHANGELOG: [$BASE] section applied ($OP)"
 autocite_dependency_merges "$BASE"
 # A cut of a NEW base also reconciles the previous stable's heading date (a no-op unless that
@@ -863,7 +959,12 @@ bash scripts/changelog-section.sh check-rc-bullets "$TAG" || {
   exit 3
 }
 
-git add -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh 2>/dev/null || true
+# Only the captured HEAD inputs are consumed; subsequent RCs cannot replay them.
+for fragment in "${INCORPORATED[@]}"; do
+  rm -- "$fragment" || exit 1
+done
+git add -- "${OWNED_PATHS[@]}" || { echo "release-cut: staging failed" >&2; exit 1; }
+print_recovery staged
 
 if [ "$DO_COMMIT" -eq 0 ]; then
   echo
@@ -876,12 +977,13 @@ fi
 
 if [ -z "$PREV" ]; then
   # First release ever: the oracle self-skips with no previous tag. Commit without it.
-  git commit -q -m "chore(release): $TAG" || { echo "release-cut: commit failed" >&2; exit 1; }
+  git commit -q -m "chore(release): $TAG" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
   if ! bash scripts/changelog-links.sh --check; then verify_fail "changelog-links --check found stale links"; fi
 else
   commit_and_verify "$TAG" "$PREV" "$BASE"
 fi
 
+print_recovery aftercommit
 PROMOTE_FINALIZED=1   # the RC cut committed and verified; the promote tag (if any) stands
 echo
 echo "=== $TAG cut and verified on main (NOT pushed) ==="

@@ -15,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -32,11 +33,11 @@ import (
 // body's title/description are accepted only as edits and are re-run through the same
 // write-boundary sanitisers, never trusted to have preserved their inertness. Labels are
 // assembled server-side (D5): the config-overridable marker (settings.FindingLabel) is unioned
-// with the user's sanitised, capped selection, marker always present.
+// with the user's sanitised, capped selection and explicit send_to_uzi opt-in, marker always present.
 //
 // Ordering is claim-first (D4): ClaimFindingForFiling (open→filing, a guarded UPDATE) so of two
 // concurrent POSTs on one coordinate exactly one reaches the forge and the loser is a 409; then
-// EnsureLabels the marker BEFORE CreateIssue (D5/R5 — Forgejo resolves label ids and errors on
+// EnsureLabels the marker and opted-in run labels BEFORE CreateIssue (D5/R5 — Forgejo resolves label ids and errors on
 // an unknown name); then CreateIssue on the caller's own connection; then SettleFindingFiled.
 // Any post-claim, pre-CreateIssue failure REVERTS the claim (filing→open, re-fileable). A settle
 // failure AFTER a successful CreateIssue is created-with-warning: the forge issue is real, so we
@@ -118,17 +119,17 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// (4) Labels are assembled server-side (D5): the config-overridable marker unioned with the
-	// user's sanitised, capped selection, marker ALWAYS first and present. The API gives the
+	// user's sanitised, capped selection and explicit send-to-uzi opt-in, marker ALWAYS first and present. The API gives the
 	// client no way to attach a trigger label that skips the marker.
 	//
-	// LABEL POSTURE (auditor question, confirmed): the ONLY inputs are the server marker and the
-	// human's req.Labels. The agent-authored suggestions stored on finding.Labels are NOT read
+	// LABEL POSTURE: inputs are the server marker, the human's req.Labels, and the explicit
+	// req.SendToUzi boolean. The agent-authored suggestions stored on finding.Labels are NOT read
 	// here, so they never auto-attach — they are surfaced only as an editable seed in the M4
 	// draft (GetFindingIssueDraft), and attach solely when the repo owner explicitly keeps them
 	// in the body. A user-chosen run-eligible label is therefore the owner's own deliberate
 	// action, not an agent-injected one.
 	marker, _ := h.settings.FindingLabel(ctx)
-	filedLabels := assembleFindingLabels(marker, req.Labels)
+	filedLabels, requiredLabels := h.findingFilingLabels(ctx, marker, req.Labels, req.SendToUzi)
 
 	// (5) Claim-first (D4): a guarded open→filing UPDATE. 0 rows affected means the coordinate
 	// is already filed or being filed (the single row is not `open`), so exactly one of two
@@ -156,10 +157,10 @@ func (h *Handler) FileFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// EnsureLabels the marker BEFORE CreateIssue (D5/R5): Forgejo resolves label names to ids
-	// and errors on an unknown one, so the marker must pre-exist. A failure here reverts the
+	// EnsureLabels the marker and opted-in run labels BEFORE CreateIssue (D5/R5): Forgejo
+	// resolves label names to ids and errors on an unknown one, so required labels must pre-exist. A failure here reverts the
 	// claim and is a 502 (an upstream forge problem), not a duplicate issue.
-	if err := f.EnsureLabels(ctx, repo.ForgeProjectID, []forge.Label{{Name: marker}}); err != nil {
+	if err := f.EnsureLabels(ctx, repo.ForgeProjectID, requiredLabels); err != nil {
 		h.revertFindingClaim(ctx, finding)
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
@@ -292,6 +293,41 @@ func assembleFindingLabels(marker string, userLabels []string) []string {
 		out = append(out, clean)
 	}
 	return out
+}
+
+// findingFilingLabels preserves assembleFindingLabels' explicit-label budget, then appends
+// the requested run labels without displacing accepted user labels. Required forge labels
+// are built independently so an explicit-label collision never skips ensuring a run label.
+func (h *Handler) findingFilingLabels(ctx context.Context, marker string, userLabels []string, sendToUzi bool) ([]string, []forge.Label) {
+	filed := assembleFindingLabels(marker, userLabels)
+	required := []forge.Label{{Name: marker}}
+	if !sendToUzi {
+		return filed, required
+	}
+	eligibility, _ := h.settings.UziLabel(ctx)
+	if eligibility == "" {
+		eligibility = settings.DefaultUziLabel
+	}
+	autopilot, _ := h.settings.AutopilotLabel(ctx)
+	if autopilot == "" {
+		autopilot = settings.DefaultAutopilotLabel
+	}
+	filedSeen := make(map[string]bool, len(filed)+2)
+	for _, name := range filed {
+		filedSeen[name] = true
+	}
+	requiredSeen := map[string]bool{marker: true}
+	for _, name := range []string{eligibility, autopilot} {
+		if !filedSeen[name] {
+			filed = append(filed, name)
+			filedSeen[name] = true
+		}
+		if !requiredSeen[name] {
+			required = append(required, forge.Label{Name: name})
+			requiredSeen[name] = true
+		}
+	}
+	return filed, required
 }
 
 func containsComma(s string) bool {

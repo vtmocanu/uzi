@@ -307,7 +307,7 @@ services:
       # UZI_E2E_DROP_ON_SENTINEL above; the api-outage-outbox phase (52) exports it for its Run B
       # cases and unsets it at restore. Read by agent/src/executor.ts.
       UZI_STUB_OUTBOX_TICKS: ${UZI_STUB_OUTBOX_TICKS:-}
-      # Phase 52 only: fast retry spacing for stale inventory recapture. The worker
+      # Phases 52/70: scoped fast retry spacing for inventory recapture/receipt waits. The worker
       # ignores this outside executor=stub; production timers and the cap are unchanged.
       UZI_E2E_RECOVERY_FAST_REDRIVE: ${UZI_E2E_RECOVERY_FAST_REDRIVE:-}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the

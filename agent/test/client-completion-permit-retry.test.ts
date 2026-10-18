@@ -69,7 +69,16 @@ function client(url: string, sleeps: number[], budgetMs?: number): WorkerClient 
   });
 }
 
-const GRANTED = { status: 200, body: { granted: true } };
+const GRANTED = {
+  status: 200,
+  body: {
+    granted: true,
+    permit: {
+      id: "permit-test", contract_revision: 2, branch: "agent/issue-1", head: "head-sha",
+      issued_at: "2026-10-17T00:00:00Z", finding_ids: [], completion_scope: {},
+    },
+  },
+};
 
 describe("requestCompletionPermit waits out an api outage (e2e phase 52 regression)", () => {
   it("a transport failure (fetch failed) is retried until the api answers, then the permit is granted", async () => {

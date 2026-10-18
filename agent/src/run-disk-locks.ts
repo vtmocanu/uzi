@@ -16,6 +16,8 @@
  * run as executing and skips it, or the runner waits for the reclaim's deletion to finish
  * and recreates what it needs afterwards.
  */
+import { MaintenanceBudget } from "./maintenance-budget.js";
+
 export class RunDiskLocks {
   /** runId -> the promise the NEXT acquirer waits on (the current holder's release). */
   private readonly tails = new Map<string, Promise<void>>();
@@ -26,6 +28,9 @@ export class RunDiskLocks {
    * admitting any late action; subsequent waiters retain their FIFO order.
    */
   async acquire(runId: string, signal?: AbortSignal): Promise<() => void> {
+    MaintenanceBudget.current()?.check();
+    const pending = MaintenanceBudget.signal();
+    signal = pending ? (signal ? AbortSignal.any([signal, pending]) : pending) : signal;
     signal?.throwIfAborted();
     const previous = this.tails.get(runId) ?? Promise.resolve();
     let release!: () => void;

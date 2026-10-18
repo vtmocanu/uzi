@@ -65,6 +65,7 @@ describe("IssueDraftCard — repo Select mode (judge/run page)", () => {
     expect(select.value).toBe("repo1");
     expect(screen.getByText(/Source:/)).toBeTruthy();
     expect(screen.getByText(/from vlad's worker/)).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "Send to uzi" })).toBeNull();
     // Labels render.
     expect(screen.getByText("uzi")).toBeTruthy();
     expect(screen.getByText("judge")).toBeTruthy();
@@ -200,5 +201,49 @@ describe("IssueDraftCard — recovery paths", () => {
       />,
     );
     expect(await screen.findByText(/Filed for an earlier version/)).toBeTruthy();
+  });
+});
+
+describe("IssueDraftCard send to uzi opt-in", () => {
+  it("defaults off, omits unchecked, preserves checked edits after failure and resets on a fresh draft", async () => {
+    const loadDraft = vi.fn().mockResolvedValue(seedFixture());
+    const onCreate = vi.fn().mockRejectedValue(new ApiError(502, "forge unavailable"));
+    const props = { loadDraft, onCreate, onCancel: vi.fn(), allowSendToUzi: true };
+    const view = render(<IssueDraftCard {...props} key="first" />);
+    const check = await screen.findByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement;
+    expect(check.checked).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+    await screen.findByText("forge unavailable");
+    expect(onCreate.mock.calls[0][0]).not.toHaveProperty("send_to_uzi");
+    fireEvent.click(check);
+    expect(screen.queryByText(/No autopilot label/)).toBeNull();
+    fireEvent.change(screen.getByDisplayValue(seedFixture().title), { target: { value: "My edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Create issue" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(onCreate.mock.calls[1][0]).toMatchObject({ title: "My edit", send_to_uzi: true });
+    expect(check.checked).toBe(true);
+    expect(screen.getByDisplayValue("My edit")).toBeTruthy();
+    fireEvent.click(check);
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Create issue" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(onCreate.mock.calls[2][0]).not.toHaveProperty("send_to_uzi");
+    fireEvent.click(check);
+    view.rerender(<IssueDraftCard {...props} key="fresh" />);
+    expect((await screen.findByRole("checkbox", { name: "Send to uzi" }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("omits a previously checked choice when the opt-in becomes unavailable", async () => {
+    const onCreate = vi.fn().mockResolvedValue(undefined);
+    const props = { loadDraft: async () => seedFixture(), onCreate, onCancel: vi.fn() };
+    const view = render(<IssueDraftCard {...props} allowSendToUzi />);
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Send to uzi" }));
+    view.rerender(<IssueDraftCard {...props} />);
+    expect(screen.queryByRole("checkbox", { name: "Send to uzi" })).toBeNull();
+    expect(screen.getByText(/No autopilot label/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
+    expect(onCreate.mock.calls[0][0]).not.toHaveProperty("send_to_uzi");
   });
 });

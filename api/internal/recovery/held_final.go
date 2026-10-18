@@ -13,11 +13,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -40,7 +41,7 @@ const (
 	// HeldReleaseRefMismatch: the held ref is at a tip other than the declared one (definitive).
 	HeldReleaseRefMismatch = "held_publication_ref_mismatch"
 	// HeldReleaseNotEligible: the hold, run or publication is not in a state a held release may
-	// end (cancelled or excluded run, stale generation, hold not open, publication not created), or
+	// end (excluded run, ineligible generation, hold not open, publication not created), or
 	// the run's repo or forge connection is gone so no listing can ever be brokered (definitive).
 	HeldReleaseNotEligible = "held_publication_not_eligible"
 )
@@ -136,7 +137,7 @@ func heldReceiptMatches(h store.RecoveryCustodyHold, publication uuid.UUID, f *a
 // heldSupported reports whether step B may release for a worker with the given capabilities.
 func (s *Service) heldSupported(caps []string) bool {
 	return s.heldEnabled && slices.Contains(caps, capability.RecoveryInventoryV1) &&
-		slices.Contains(caps, capability.RecoveryHeldPublicationV1)
+		(slices.Contains(caps, capability.RecoveryHeldPublicationV1) || slices.Contains(caps, capability.RecoveryHeldPublicationV2))
 }
 
 // releaseHeldPublication answers a held FINAL. Order is binding:
@@ -221,13 +222,21 @@ type heldForgeProof struct {
 
 // heldStateEligible is the mutable-state predicate shared by the unlocked pre-check and the
 // locked re-check.
-func heldStateEligible(status string, claimGen int64, runWorker pgtype.UUID, failOrigin pgtype.Text,
-	hold store.RecoveryCustodyHold, wkrID uuid.UUID, havePub bool, pub store.RunHeldPublication,
+func heldStateEligible(run store.Run, wkr store.Worker,
+	hold store.RecoveryCustodyHold, havePub bool, pub store.RunHeldPublication,
 	generation int64, publication uuid.UUID, f *apitypes.RecoveryFinalDisposition) bool {
-	return status == "failed" && (!failOrigin.Valid || (failOrigin.String != "push_secret_blocked" && failOrigin.String != "worker_residue_blocked")) &&
-		claimGen == generation && runWorker.Valid && uuid.UUID(runWorker.Bytes) == hold.OriginalWorkerID &&
-		hold.LiveWorkerID.Valid && uuid.UUID(hold.LiveWorkerID.Bytes) == wkrID &&
+	v2 := slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryHeldPublicationV2)
+	terminal := run.Status == "failed" || (v2 && (run.Status == "cancelled" || run.Status == "completed"))
+	return terminal && (!run.FailOrigin.Valid || (run.FailOrigin.String != "push_secret_blocked" && run.FailOrigin.String != "worker_residue_blocked")) &&
+		generation > 0 && generation <= run.ClaimGeneration && (v2 || (generation == run.ClaimGeneration && run.WorkerID == pgconv.UUID(wkr.ID))) &&
+		slices.Contains([]string{runkind.Issue, runkind.CIFix, runkind.SelfImprove, runkind.Prompt, runkind.Task, runkind.MRRework}, run.Kind) &&
+		run.EgressProfileID.Valid == wkr.IsolatedLane && run.UserID == wkr.UserID &&
+		hold.State == "open" && hold.InventoryGuarded && hold.RunID == run.ID && hold.UserID == wkr.UserID &&
+		hold.RepoID.Valid && hold.RepoID == run.RepoID && hold.Generation == generation &&
+		hold.OriginalWorkerID == wkr.ID && hold.LiveWorkerID == pgconv.UUID(wkr.ID) && hold.LiveRunID == pgconv.UUID(run.ID) &&
 		havePub && pub.ID == publication && pub.HoldID == hold.ID && pub.State == "created" &&
+		pub.RunID == run.ID && pub.UserID == wkr.UserID && pub.WorkerID == wkr.ID && pub.RepoID == uuid.UUID(hold.RepoID.Bytes) &&
+		pub.LiveRunID == pgconv.UUID(run.ID) && pub.Generation == generation && pub.Ref == pushbroker.HeldRef(run.ID, generation) &&
 		pub.Tip == f.SourceSha && pub.CoverageDigest == f.CoverageDigest
 }
 
@@ -235,14 +244,8 @@ func heldStateEligible(status string, claimGen int64, runWorker pgtype.UUID, fai
 // seen now (the locked transaction re-decides).
 func (s *Service) heldPrecheck(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64,
 	hold store.RecoveryCustodyHold, publication uuid.UUID, f *apitypes.RecoveryFinalDisposition) (bool, error) {
-	var (
-		status     string
-		claimGen   int64
-		runWorker  pgtype.UUID
-		failOrigin pgtype.Text
-	)
-	if err := s.pool.QueryRow(ctx, "SELECT status, claim_generation, worker_id, fail_origin FROM runs WHERE id=$1 AND user_id=$2",
-		runID, wkr.UserID).Scan(&status, &claimGen, &runWorker, &failOrigin); err != nil {
+	run, err := store.New(s.pool).GetRunByIDForUser(ctx, store.GetRunByIDForUserParams{ID: runID, UserID: wkr.UserID})
+	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
@@ -252,7 +255,7 @@ func (s *Service) heldPrecheck(ctx context.Context, wkr store.Worker, runID uuid
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return false, err
 	}
-	return heldStateEligible(status, claimGen, runWorker, failOrigin, hold, wkr.ID, err == nil, pub, generation, publication, f), nil
+	return heldStateEligible(run, wkr, hold, err == nil, pub, generation, publication, f), nil
 }
 
 // heldRefDefect lists the held ref once and returns "" when it is at tip, or the definitive
@@ -299,26 +302,25 @@ func (s *Service) releaseHeldLocked(ctx context.Context, wkr store.Worker, runID
 
 	var id uuid.UUID
 	var caps []string
-	if err := tx.QueryRow(ctx, "SELECT id, protocol_capabilities FROM workers WHERE id=$1 AND user_id=$2 FOR UPDATE", wkr.ID, wkr.UserID).Scan(&id, &caps); err != nil {
+	var isolated bool
+	if err := tx.QueryRow(ctx, "SELECT id, protocol_capabilities, isolated_lane FROM workers WHERE id=$1 AND user_id=$2 FOR UPDATE", wkr.ID, wkr.UserID).Scan(&id, &caps, &isolated); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 		}
 		return apitypes.RecoveryReleaseResponse{}, err
 	}
-	var (
-		status     string
-		claimGen   int64
-		runWorker  pgtype.UUID
-		failOrigin pgtype.Text
-	)
-	if err := tx.QueryRow(ctx, "SELECT status, claim_generation, worker_id, fail_origin FROM runs WHERE id=$1 AND user_id=$2 FOR UPDATE",
-		runID, wkr.UserID).Scan(&status, &claimGen, &runWorker, &failOrigin); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
-		}
-		return apitypes.RecoveryReleaseResponse{}, err
-	}
+	wkr.ProtocolCapabilities, wkr.IsolatedLane = caps, isolated
 	qt := store.New(tx)
+	run, err := qt.GetRunByIDForUpdate(ctx, runID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
+		}
+		return apitypes.RecoveryReleaseResponse{}, err
+	}
+	if run.UserID != wkr.UserID {
+		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
+	}
 	hold, err := qt.GetFinalInventoryHold(ctx, store.GetFinalInventoryHoldParams{
 		RunID: runID, UserID: wkr.UserID, WorkerID: wkr.ID, Generation: generation,
 	})
@@ -352,7 +354,7 @@ func (s *Service) releaseHeldLocked(ctx context.Context, wkr store.Worker, runID
 	if !s.heldSupported(caps) || s.limits.ReadyRetention < time.Second {
 		return retained(HeldReleaseUnsupported)
 	}
-	if !heldStateEligible(status, claimGen, runWorker, failOrigin, hold, wkr.ID, havePub, pub, generation, publication, f) {
+	if !heldStateEligible(run, wkr, hold, havePub, pub, generation, publication, f) {
 		return retained(HeldReleaseNotEligible)
 	}
 	if fp.gone {

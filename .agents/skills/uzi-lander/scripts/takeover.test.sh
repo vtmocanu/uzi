@@ -13,9 +13,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
-# Not connected to uzi: the run/rework lookups are skipped, which is not under test here.
-if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
-if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo '[]'; exit 0; fi
+# Default to disconnected; ownership cases supply explicit repo and run fixtures.
+if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
 echo "unexpected uzi call: $*" >&2; exit 1
 STUB
 cat > "$WORK/bin/gh" <<'STUB'
@@ -354,7 +354,7 @@ rc=0; bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/pr-view-down.out" 2
 has pr-view-down 'gh pr view 42 failed'
 unset GH_ALWAYS_FAIL
 grep -qvx 0 "$SLEEP_LOG" && fail "non-zero backoff recorded: $(sort -u "$SLEEP_LOG" | tr '\n' ' ')"
-# No uzi on PATH: the absent-uzi path (have_uzi=0) is unchanged, no function stands in for it.
+# No uzi on PATH: ownership is unknown, not a fabricated empty writer list.
 mkdir -p "$WORK/nouzi"
 for t in bash python3 env git jq awk sed tr head cat rm mktemp grep date dirname basename uname sort cut tail wc mkdir sleep xargs find cmp od; do
   p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$WORK/nouzi/$t"
@@ -368,8 +368,47 @@ hasnt nouzi 'MR_REWORK=repo-not-on-uzi'
 has nouzi 'MR_REWORK_ACTIVE=0'
 # A stand-in uzi() would make the CLI look present but unreadable.
 hasnt nouzi 'UZI_REPO_LIST=unreadable'
-hasnt nouzi 'NEXT=unknown'
+has nouzi 'NEXT=unknown'
+has_line nouzi 'CI_FIX_ACTIVE=unknown'
+has_line nouzi 'CI_FIX_RECENT=unknown'
 snap head_clean with-uzi
 has with-uzi 'MR_REWORK=repo-not-on-uzi'
+
+# CI-fix ownership is keyed to repo + exact branch, not mr_iid. A ci_fix must
+# never become the main PR-producing run in the by-PR resolver.
+export UZI_REPO_JSON='[{"id":"r1","path_with_namespace":"test/repo"}]'
+export UZI_RUNS_JSON='[{"id":"fix-active","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","mr_iid":42,"status":"running","created_at":"2026-01-01T00:00:00Z"}]'
+snap head_clean ci-active
+has_line ci-active 'CI_FIX_ACTIVE=fix-active running'
+has_line ci-active 'CI_FIX_RECENT=none'
+has_line ci-active 'NEXT=ci_fix_active'
+hasnt ci-active 'RUN_ID=fix-active'
+MERGEABLE=CONFLICTING; export MERGEABLE
+snap head_clean ci-active-conflict
+has_line ci-active-conflict 'NEXT=ci_fix_active'
+unset MERGEABLE
+at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UZI_RUNS_JSON=$(jq -nc --arg at "$at" '[{id:"fix-recent",kind:"ci_fix",repo_id:"r1",pipeline_ref:"agent/issue-1",mr_iid:42,status:"completed",finished_at:$at}]'); export UZI_RUNS_JSON
+snap head_clean ci-recent
+has_line ci-recent 'CI_FIX_ACTIVE=none'
+has_line ci-recent "CI_FIX_RECENT=fix-recent completed $at"
+has ci-recent 'NEXT=ready'
+export UZI_RUNS_JSON='[{"id":"other","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-10","status":"running"}]'
+snap head_clean ci-none
+has_line ci-none 'CI_FIX_ACTIVE=none'; has_line ci-none 'CI_FIX_RECENT=none'
+has ci-none 'NEXT=ready'
+for failure in repo runs malformed; do
+  case "$failure" in
+    repo) export UZI_REPO_FAIL=1 ;;
+    runs) export UZI_RUN_LIST_FAIL=1 ;;
+    malformed) export UZI_RUNS_JSON='[{"id":"bad","kind":"ci_fix","repo_id":"r1","pipeline_ref":"agent/issue-1","status":null}]' ;;
+  esac
+  snap head_clean "ci-unknown-$failure"
+  has_line "ci-unknown-$failure" 'CI_FIX_ACTIVE=unknown'
+  has_line "ci-unknown-$failure" 'CI_FIX_RECENT=unknown'
+  has "ci-unknown-$failure" 'NEXT=unknown'
+  unset UZI_REPO_FAIL UZI_RUN_LIST_FAIL
+done
+unset UZI_REPO_JSON UZI_RUNS_JSON
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"

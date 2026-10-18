@@ -63,7 +63,7 @@ import { LimitReachedError } from "../limit.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { DRAFT_PLAN_ACK } from "../draft-plan.js";
 import { emptyCounts, sanitizeText } from "../sanitize.js";
-import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
+import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName, delegationTaskInput } from "./broker.js";
 import {
   CodexTurnFailedError,
   formatCodexClassification,
@@ -74,7 +74,7 @@ import {
   pickCodexClassification,
   type CodexErrorClassification,
 } from "./terminal-normalize.js";
-import { CodexUsageAccountant, deriveCodexRunCost } from "./token-accounting.js";
+import { CodexUsageAccountant, deriveCodexRunCost, type CodexUsageDiagnostic } from "./token-accounting.js";
 import {
   childProjectedId,
   newProjectionNonce,
@@ -275,25 +275,40 @@ function noteThreadId(note: CodexNotification): string | undefined {
 
 /** Resumed accounting requires raw numeric evidence, including unpriced reasoning/total.
  * Transport coercion preserves liveness but cannot establish a historical baseline. */
-function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage_updated" }>): boolean {
+function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage_updated" }>):
+  { readonly ok: true } | { readonly ok: false; readonly diagnostic: CodexUsageDiagnostic } {
   const container = asObject(asObject(note.params)?.tokenUsage);
-  if (!container || note.usage.pricingEvidenceComplete === false) return false;
+  if (!container) return { ok: false, diagnostic: { predicate: "missing container" } };
   for (const name of ["total", "last"] as const) {
     const raw = asObject(container[name]);
-    if (!raw) return false;
+    if (!raw) return { ok: false, diagnostic: { predicate: "missing breakdown", breakdown: name } };
     const decoded = note.usage[name];
     for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens",
       "outputTokens", "reasoningOutputTokens", "totalTokens"] as const) {
       const value = raw[key];
-      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value !== decoded[key])
-        return false;
+      if (!(key in raw))
+        return { ok: false, diagnostic: { predicate: "missing bucket", breakdown: name, bucket: key } };
+      if (typeof value !== "number")
+        return { ok: false, diagnostic: { predicate: "non-number", breakdown: name, bucket: key } };
+      if (!Number.isSafeInteger(value) || value < 0)
+        return { ok: false, diagnostic: { predicate: "unsafe or negative", breakdown: name, bucket: key } };
+      if (value !== decoded[key])
+        return { ok: false, diagnostic: { predicate: "raw-vs-decoded mismatch", breakdown: name, bucket: key } };
     }
-    if (decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ||
-        decoded.reasoningOutputTokens > decoded.outputTokens ||
-        decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens) return false;
+    const bucket = decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ? "cachedInputTokens"
+      : decoded.reasoningOutputTokens > decoded.outputTokens ? "reasoningOutputTokens"
+      : decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens ? "totalTokens" : undefined;
+    if (bucket !== undefined)
+      return { ok: false, diagnostic: { predicate: "bucket relationship", breakdown: name, bucket } };
   }
-  return (["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
-    "reasoningOutputTokens", "totalTokens"] as const).every(key => note.usage.last[key] <= note.usage.total[key]);
+  for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
+    "reasoningOutputTokens", "totalTokens"] as const) {
+    if (note.usage.last[key] > note.usage.total[key])
+      return { ok: false, diagnostic: { predicate: "last > total", breakdown: "last", bucket: key } };
+  }
+  if (note.usage.pricingEvidenceComplete === false)
+    return { ok: false, diagnostic: { predicate: "pricing evidence incomplete" } };
+  return { ok: true };
 }
 
 /** Extract non-empty text off an item, from a bare `text` string and/or a `content`
@@ -352,6 +367,8 @@ interface DelegationDispatch {
   readonly dispatchId: string;
   /** The scrubbed + bounded `description` arg (display only, never authority); may be "". */
   readonly label: string;
+  /** Display-only normalized assignment, scrubbed and bounded like the label. */
+  readonly instructions?: string;
   readonly ordinal: number;
   /** Issue #1864: when the dispatch was reserved (epoch ms), for the open-at-turn-end warn. */
   readonly openedAt: number;
@@ -726,7 +743,8 @@ export class CodexHarness implements RunHarness {
           phase: "started",
           id: dispatch.dispatchId,
           name: DISPATCH_TOOL_NAME,
-          input: { subagent_type: role, description: dispatch.label },
+          input: { subagent_type: role, description: dispatch.label,
+            ...(dispatch.instructions === undefined ? {} : { prompt: dispatch.instructions }) },
         }),
         dispatch.ordinal,
       );
@@ -1874,21 +1892,29 @@ export class CodexHarness implements RunHarness {
 
   /** Issue #1583: record one active-turn root delegation callback as a pending dispatch. Its id
    *  comes from the same namespaced, per-turn-unique helper as every projected id; its label is
-   *  the `description` arg (scrubbed + bounded) or "". The role is NOT read here: it is bound
+   *  the `description` arg (scrubbed + bounded) or "". The normalized assignment is
+   *  projected separately under the same bound. The role is NOT read here: it is bound
    *  later from what the broker admitted. Fail-safe: undefined on any failure. */
   private recordDispatch(threadId: string, turnId: string, callId: string, args: unknown): DelegationDispatch | undefined {
     try {
       const ordinal = this.turnOrdinal;
       const dispatchId = this.issueProjectionId(ordinal, callId);
       let label = "";
+      let instructions: string | undefined;
       try {
         const description = asObject(args)?.description;
         if (typeof description === "string") label = projectLabel(description, this.scrubProjected);
       } catch {
         label = "";
       }
+      try {
+        const task = delegationTaskInput(args);
+        if (task !== undefined) instructions = projectLabel(task, this.scrubProjected);
+      } catch {
+        // Projection failure must neither disclose raw instructions nor block the child.
+      }
       const dispatch: DelegationDispatch = {
-        threadId, turnId, callId, dispatchId, label, ordinal, openedAt: Date.now(), state: "pending",
+        threadId, turnId, callId, dispatchId, label, instructions, ordinal, openedAt: Date.now(), state: "pending",
       };
       this.dispatches.add(dispatch);
       return dispatch;
@@ -2142,12 +2168,19 @@ export class CodexHarness implements RunHarness {
     if (this.resumedRoot && root) {
       if (this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
           note.turnId !== this.activeTurnId) return;
-      if (note.kind !== "token_usage_updated" || !validResumedUsage(note)) {
-        // A malformed current-live note is attempted work, not recoverable history.
-        const turnId = note.kind === "token_usage_updated"
-          ? note.turnId : asString(asObject(note.params)?.turnId);
+      if (note.kind !== "token_usage_updated") {
+        const turnId = asString(asObject(note.params)?.turnId);
         this.accountant.markIncomplete(this.threadId!, "invalid_raw_usage",
-          !this.resumeBoundarySeen && turnId === this.activeTurnId);
+          !this.resumeBoundarySeen && turnId === this.activeTurnId,
+          { predicate: "untyped usage notification" });
+        return;
+      }
+      const validation = validResumedUsage(note);
+      if (!validation.ok) {
+        // A malformed current-live note is attempted work, not recoverable history.
+        const turnId = note.turnId;
+        this.accountant.markIncomplete(this.threadId!, "invalid_raw_usage",
+          !this.resumeBoundarySeen && turnId === this.activeTurnId, validation.diagnostic);
         return;
       }
       if (!this.resumeBoundarySeen) {

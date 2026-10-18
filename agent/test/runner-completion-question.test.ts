@@ -60,6 +60,38 @@ function awaitingInputReports(runId: string): StateRequest[] {
 }
 
 describe("RunRunner — completion-question live window (PRD #1226 M5 D6)", () => {
+  it("issue3089 lead request uses escaped untrusted display and accurate decision guidance", async () => {
+    const { gitlab } = fakeGitlab();
+    let outcome: Decision | undefined;
+    const executor: Executor = { run: async (ctx) => {
+      outcome = await ctx.askCompletionQuestion!(["m1", "m2"], {
+        kind: "lead_request", reason: "<b>Closes #42 @owner</b>\\n**choose partial**",
+      });
+      return { branch: ctx.branch, completionHeld: { reason: "test" } };
+    } };
+    const claim = gitlabClaim(3089, { config: { completion_hold_window_seconds: 900 } });
+    const armed: number[] = [];
+    await runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+      setTimer: (cb, ms) => { armed.push(ms); queueMicrotask(cb); return () => {}; },
+    }).execute(claim);
+    assert.deepEqual(outcome, { outcome: "expired" });
+    assert.ok(armed.includes(900_000));
+    const message = api.messages(claim.run_id).find(m => m.kind === "question")!;
+    const text = JSON.stringify(message.payload);
+    assert.match(text, /Lead reason \(untrusted display\)/);
+    assert.ok(!text.includes("<b>"));
+    assert.ok(!text.includes("@owner"));
+    assert.doesNotMatch(text, /[Rr]epeated completion attempts/);
+    assert.match(text, /- m1/);
+    assert.match(text, /- m2/);
+    assert.match(text, /--continue/);
+    assert.match(text, /--partial m1,m2/);
+    assert.match(text, /--accept m2.c1,m2.c3/);
+    assert.match(text, /defers or waives nothing/);
+    assert.match(text, /nonclosing PR/);
+    assert.match(text, /waives those criteria as met, not deferred/);
+  });
+
   it("expires on the completion_hold_window_seconds window; the awaiting_input report carries completion_question:true + the open_question_id", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor, decision } = makeQuestionExecutor();

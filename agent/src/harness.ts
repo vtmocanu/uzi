@@ -326,6 +326,8 @@ export interface RunTurnRequest {
   policyHoldResume?: boolean;
   /** Server-derived permission for this exact claim only (M2 owner action). */
   policyHoldFreshSession?: boolean;
+  /** Worker-derived eligibility for owner-decision requests, never a model declaration. */
+  ownerDecisionRequested?: boolean;
   /** Worker-derived park admission; never supplied by the model. */
   parkRunSupported?: boolean;
   nonInteractiveIssue?: boolean;
@@ -536,6 +538,7 @@ export interface CodexExecutionSafety {
 // This facade is owned by uzi, so the adapter does not gain git/workflow policy.
 
 export interface TurnSignals {
+  ownerDecisionRequested?: { reason: string };
   draftPlans?: string[];
   plan?: string;
   done: boolean;

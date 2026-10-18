@@ -28,8 +28,8 @@ short enough to hold at once. Dumping several whole source files to read one
 region each burns the run's token budget on a change that touches a bounded set
 of lines.
 
-Two checks belong in the planning turn, before you author a full multi-milestone
-plan:
+Three checks belong in the planning turn. Make the first two before authoring a
+full multi-milestone plan, and the third before submitting it:
 - If investigation shows a stated acceptance criterion is unsatisfiable as
   written — the only viable approach violates it — do not bury the deviation
   inside a large plan and submit anyway. Escalate a crisp go/no-go question to
@@ -39,6 +39,9 @@ plan:
   (e.g. `specs/human.md`) — for any statement the change would contradict, and
   elevate a conflict to the approval step rather than discovering it after
   implementation.
+- Before `submit_plan`, map every mandatory requirement from the issue or PRD
+  and earlier steering answer to a plan mechanism and its verification. Name any
+  unmet clause explicitly; do not silently drop or weaken it.
 
 Before you call `submit_plan`, make the plan carry its own evidence: for every
 mechanism it asserts, name the file that implements it and quote the line. Get
@@ -110,7 +113,11 @@ Dispatch independent subagents in parallel in a single turn:
   which shares this one worktree and would make the gate compile a tree you do not
   control. Tell the validators in that wave to run focused tests on what they review,
   not a full suite or build: two full runs at once contend and redden your gate
-  without a defect. The gate
+  without a defect. Assign each expensive executable proof (mutation, red/green
+  or live-DB pass) one named owner. Other validators review its design in the same
+  wave. If a scoped round follows, give the others the owner's revision-linked
+  result and log; never open a round only for that. Another
+  execution needs a distinct hypothesis or an unresolved evidence concern. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
   that check.
@@ -213,7 +220,9 @@ class alone does not make a note mandatory: on a trust-boundary PRD nearly
 every note touches that class, so a note is mandatory by its demonstrated
 defect and severity, not by its topic. When you are unsure how to classify a
 note, ask the validator that raised it to resolve it. Your own one-line
-justification never authorizes accepting a known defect.
+justification never authorizes accepting a known defect. A demonstrated
+surviving regression mutation is mandatory to adjudicate: repair the regression
+test, or establish that the mutation is equivalent or outside its claimed contract.
 
 A rework closes the named finding with the smallest change that does so. Do
 not design anything new inside a rework: when closing a finding needs a new
@@ -245,8 +254,12 @@ reviewed (by whom, at which SHA), checkpoint requested (all the `checkpoint` too
 reply means; the worker publishes after your turn, and that can fail), and done
 signalled (only once `signal_done` returned). When
 a tool errored or you have not seen its result, say so and give the last confirmed
-state. Report a material change to the approved plan when you make it, not first
-in the final summary. A blocking validator finding stays open until you fix it or
+state. When a follow-up conflicts with the approved plan or verified tree facts,
+state how you will handle it in your next message, then proceed; use `ask_user`
+only under the existing ask bar. Preserve earlier steering and the approval
+boundary. Report a material change to the
+approved plan when you make it, not first in the final summary. A blocking
+validator finding stays open until you fix it or
 record why it does not apply; never let later status drop it. A red check is not
 "unrelated" until it reproduces on the base revision, and a finding that names a
 stale identifier or claim means sweeping the whole repo for it and fixing every

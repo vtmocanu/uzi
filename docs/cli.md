@@ -147,7 +147,7 @@ uzi review undo <id> <rec> | stats [--json]
 uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
 uzi findings draft <finding-id> [<finding-id>...] [--json]
-uzi findings file <finding-id> [<finding-id>...]
+uzi findings file <finding-id> [<finding-id>...] [--send-to-uzi]
 uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
@@ -287,6 +287,13 @@ A few worth knowing:
   (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
   revision limit, and an exhausted limit — or a run that has already finished —
   is a 409 (exit 5).
+- **When plan-revision provider retries expire**, the original plan stays at
+  the gate and feedback remains pending. Use ordinary `run revise` bound with
+  `--expected-gate-revision` for a new, normally charged revision if the cap
+  permits. At the cap, use `run cancel` or source-bound `run reject`, then
+  dispatch a new run for further changes. Approval and follow-up cannot resume
+  the expired wait. See [plan-revision recovery](./run-recovery.md#when-plan-revision-retries-expire)
+  for retry and reclaim limits.
 - **`run approve|reject|revise` bind to a plan-gate revision.** Every plan
   presented at the gate has a revision number, exposed as `gate_revision`
   (readable with `uzi run get <id> --field gate_revision`). Pass
@@ -344,7 +351,7 @@ A few worth knowing:
   missing witness. An ordinary `awaiting_input` question is not a
   completion-decision state; see `run answer` and `run decide` below.
 
-  Deploy the API and migration `00339` before upgraded workers. The API
+  Deploy the API and migration `00340` before upgraded workers. The API
   advertises `milestone_reconciliation_v1`; upgraded workers attempt the gate
   checkpoint when that feature is advertised and the milestone list changes.
   An older worker cannot supply the required witness. After reset, claiming
@@ -1304,13 +1311,17 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
-### Fetching and expiring a failed run's held ref: `uzi run held`
+### Fetching and expiring terminal held refs: `uzi run held`
 
-When a run ends `failed`, uzi first tries to publish its held work to your forge as
-`refs/uzi-held/<run-id>/<generation>` and release the worker's custody against that ref;
-the recovery archive above is the fallback. See
-[Publishing a failed run's held work](./run-recovery.md#publishing-a-failed-runs-held-work)
-for what is eligible, what is published, and when it falls back. Both commands are
+Eligible failed and cancelled runs try to publish held work to your forge as
+`refs/uzi-held/<run-id>/<generation>` before archive fallback. With mutually
+negotiated V2, a completed run without an applicable receipt stays archive-first;
+only a prerequisite-bearing thin archive or structured oversize/quota refusal
+permits the held alternative on the same frozen record. Exact earlier-generation
+holds may qualify on their original custodian even when the run's current worker
+differs. V1 remains failed-current-generation only. See
+[Publishing terminal held work](./run-recovery.md#publishing-terminal-held-work)
+for eligibility, deadlines and accepted late-writer risk. Both commands are
 owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
 
 ```
@@ -1325,8 +1336,8 @@ uzi run held <run-id> [--json]
   still be on the forge (`acknowledged`, `created` or `delete_unknown`), it also prints
   ``fetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire <run-id>` ``.
 - **No publication.** Prints `run <run-id> has no held publications` (nothing under
-  `--quiet`). That is also the answer for a run that was cancelled, parked, or failed on
-  an excluded origin, or whose work fell back to the archive before anything was sent to the forge. A refused
+  `--quiet`). A parked run, an excluded failure origin or work handled by the archive
+  can have no publication; cancellation alone no longer implies that result under V2. A refused
   create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
 - **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
   `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
@@ -1362,7 +1373,10 @@ uzi run held expire <run-id> [--yes]
 
 Held-ref cleanup does not depend on `UZI_HELD_PUBLICATION`: with the feature switched off,
 refs already published are still deleted at their expiry, and `uzi run held expire` still
-works.
+works. The switch also keeps exact-hold reconciliation and immutable FINAL replay
+available; observing a receipt alone is not the ACK required for cleanup. Reuse or
+replay does not renew the persisted expiry. Ref visibility follows the repository;
+copies fetched from a public repository cannot be revoked by deleting its ref.
 
 While a held ref may still exist, removing its repo or its forge connection is refused with a
 409. The error text (`connection` in place of `repo` for a connection removal) reads:
@@ -2229,6 +2243,8 @@ uzi findings draft <finding-id>                               # preview one issu
 uzi findings draft <finding-id> <finding-id> ...              # preview one grouped issue
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
+uzi findings file <finding-id> --send-to-uzi                 # file and request run labels
+uzi findings file <finding-id> <finding-id> ... --send-to-uzi # same for a group
 uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
@@ -2263,6 +2279,34 @@ a UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
 group draft includes assembled labels, including the mandatory marker label,
 but unedited CLI filing sends only the explicit ids and the server applies its
 mandatory marker label. Use explicit ids with `file`; there is no `--run` shortcut.
+
+`file --send-to-uzi` requests the configured run-eligibility label
+(`UziLabel`, default `uzi`) and autopilot label (`AutopilotLabel`, default
+`autopilot`) for either a single or grouped filing. The server appends them,
+deduplicated, after the mandatory finding marker and sanitized, capped explicit
+labels, without displacing accepted explicit labels. Omitting the flag keeps
+filing unchanged. Stored agent suggestions do not automatically attach; manual
+label selection in the web draft remains available.
+
+In human output, a confirmed issue filed with the flag also prints
+"Queued for uzi: starts on the next sync if autopilot is on", followed by
+"Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
+An uncertain group result without a confirmed issue prints no queued confirmation;
+the pending-operation and release guidance below still applies. JSON output keeps
+the existing result DTO.
+
+This is a label request evaluated on the next normal repo sync, not a guaranteed
+run or an autopilot opt-in. The repo owner's connection PAT supplies the forge
+issue author and label-event actor, which need not match the browser user.
+The owner must already have autopilot enabled and a nonempty `human_username`
+matching the event adder or, as fallback, the issue author; repo ownership and
+opt-in alone do not suffice if both mismatch. A consent refusal records the
+event and attempts one explanatory comment, leaving manual **Start run**
+available. Enabling autopilot after a handled refusal requires removing and
+re-adding its label. A missing current label-add event waits without a run or
+comment. Existing credential, harness, active-run, open-PR and description-size
+checks remain in force. See [sending a finding to uzi](./findings.md#sending-the-filed-issue-to-uzi)
+and [Autopilot](./autopilot.md).
 
 `file` turns one coordinate into a real forge issue on **your own** connection. The
 title, description and labels are assembled server-side from the stored, sanitised

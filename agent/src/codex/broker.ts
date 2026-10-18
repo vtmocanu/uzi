@@ -356,6 +356,7 @@ export interface ScreenPolicy {
  *  for the life of the turn; the broker consults THESE, never the callback args, to
  *  decide authority. */
 export interface RunGrants {
+  readonly ownerDecisionRequested?: boolean;
   readonly role: string;
   readonly phase: "plan" | "implement";
   /** Canonical tool names (after alias mapping) this role may invoke. */
@@ -1047,7 +1048,7 @@ export class CodexCallbackBroker {
           },
         ],
       },
-    });
+    }, { ownerDecisionRequested: this.grants.ownerDecisionRequested });
     if (scanned.signalDiagnostic !== undefined) {
       return deny("invalid_signal", scanned.signalDiagnostic);
     }

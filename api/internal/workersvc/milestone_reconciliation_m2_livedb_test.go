@@ -53,6 +53,12 @@ func TestMilestoneReconciliationReviseInvalidatesWitnessLiveDB(t *testing.T) {
 	if _, err := f.svc.SubmitInput(f.ctx, f.userID, id, "revise_plan", "change the replacement", nil); err != nil {
 		t.Fatal(err)
 	}
+	// Refresh consent only; retain the immutable witness invalidated by revise.
+	opts.ExpectedResetStateDigest, _ = ResetStateDigest(reconciliationRow(t, f, id))
+	approvalGuardRefused(t, f, id, nil, opts)
+	// Settle the request to isolate stale-witness validation from the pending-revision
+	// approval guard. Settlement alone cannot restore the invalidated witness.
+	f.exec("UPDATE run_user_inputs SET applied_at=now() WHERE run_id=$1 AND kind='revise_plan'", id)
 	// Even fresh consent cannot make the immutable old witness ready again.
 	run := reconciliationRow(t, f, id)
 	opts.ExpectedResetStateDigest, _ = ResetStateDigest(run)

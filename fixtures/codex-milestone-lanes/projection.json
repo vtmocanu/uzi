@@ -31,7 +31,8 @@
         "name": "Agent",
         "input": {
           "subagent_type": "coder",
-          "description": "[m1] Wire the limiter"
+          "description": "[m1] Wire the limiter",
+          "prompt": "wire it"
         }
       },
       "created_at": "2026-09-25T11:59:00Z",

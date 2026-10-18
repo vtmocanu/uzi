@@ -15,18 +15,18 @@ import (
 // recovery_cause_data_volume_full (unconditional), PRD #1809 M6's run_checkpoint_durability
 // (unconditional), issue #2085's repo_agent_folder (unconditional), and #1390 M2a's active_run_snapshot when the feature is enabled — in slice
 // order (append order = declaration order). terminal_fence sits AFTER claim_generation_fence,
-// then recovery_cause_vault_locked, then gate_revision_v1, then milestone_reconciliation_v1,
+// then recovery_cause_vault_locked, then gate_revision_v1, then milestone_reconciliation_v1, then plan_revision_retry_v1 (#3001),
 // then recovery_cause_data_volume_full,
 // then run_checkpoint_durability, then repo_agent_folder, then terminal_rejection_report
 // (independent of the snapshot kill switch), then active_run_snapshot and provider_policy_hold
 // (the latter also requires a positive pending lease), and issue #2545's
-// recovery_held_publication_v1 (own group, gated on UZI_HELD_PUBLICATION) is last. A drift here is a
+// recovery_held_publication_v1 followed by recovery_held_publication_v2 (gated on UZI_HELD_PUBLICATION) are last. A drift here is a
 // wire-contract change a worker negotiates on. Issue #2507 adds
 // recovery_completed_publication_v1 beside the recovery inventory feature, and issue #2625 adds
 // recovery_archive_redundancy_v1 right after it (the api accepts the archive redundancy claim).
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1"}
+	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true, true) = %v, want exactly %v", got, want)
 	}
@@ -42,7 +42,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // feature while the other landed tokens stay exactly as they were.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "recovery_held_publication_v1"}
+	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false, true) = %v, want exactly %v", got, want)
 	}
@@ -57,13 +57,13 @@ func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 func TestProtocolFeaturesHeldPublicationSwitch(t *testing.T) {
 	for _, snapshot := range []bool{true, false} {
 		on, off := protocolFeatures(snapshot, true, time.Hour), protocolFeatures(snapshot, false, time.Hour)
-		if !slices.Contains(on, "recovery_held_publication_v1") || on[len(on)-1] != "recovery_held_publication_v1" {
-			t.Fatalf("snapshot=%t: switch on = %v, want recovery_held_publication_v1 last", snapshot, on)
+		if !slices.Contains(on, "recovery_held_publication_v1") || !slices.Equal(on[len(on)-2:], []string{"recovery_held_publication_v1", "recovery_held_publication_v2"}) {
+			t.Fatalf("snapshot=%t: switch on = %v, want V1 then V2 last", snapshot, on)
 		}
-		if slices.Contains(off, "recovery_held_publication_v1") {
+		if slices.Contains(off, "recovery_held_publication_v1") || slices.Contains(off, "recovery_held_publication_v2") {
 			t.Fatalf("snapshot=%t: switch off still advertises recovery_held_publication_v1: %v", snapshot, off)
 		}
-		if !slices.Equal(on[:len(on)-1], off) {
+		if !slices.Equal(on[:len(on)-2], off) {
 			t.Fatalf("snapshot=%t: the switch changed more than its own token: on=%v off=%v", snapshot, on, off)
 		}
 	}

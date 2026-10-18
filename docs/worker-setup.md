@@ -569,6 +569,31 @@ paired with an older api may show an MR cancellation reason implying the
 candidate was not applied; that older wording does not establish whether an
 earlier push applied.
 
+## Plan-revision retry rollout
+
+Upgrade the API before workers. The API advertises `plan_revision_retry_v1`;
+new workers use its source-gate write fence and atomic revision receipts when
+negotiated and the source evidence is available. Missing evidence or older
+peers keep their existing compatibility fallback; this does not repair
+mixed-version flights. No migration, command, setting or status is added.
+
+Each accepted human revision gets at most three automatic provider-turn
+re-drives in a live flight, across continuation stages, after bounded inner
+retries. Backoff is 5/10/20 seconds plus 0–20% jitter, capped at 30 seconds.
+On expiry, the old plan and pending feedback remain at a live, busy gate.
+The poller and active snapshot stay live: a provider-spending cap does not
+guarantee drain completion or unblock an image roll. Existing drain/shutdown
+policy is unchanged. See [owner recovery steps](./run-recovery.md#when-plan-revision-retries-expire).
+
+Reclaim does not restore the allowance, expired wait or predecessor chain.
+Claude retains existing FIFO replay of unapplied inputs; Codex shows a fresh
+plan and asks the owner to re-send feedback. A new flight may get a fresh
+allowance. Initial claims and existing episode, credential and transient
+redispatch paths prevent an unconditional lifetime bound. Custody protections
+and missing-snapshot reconciliation retain their existing boundaries.
+
+CI critical-path impact: **UNMEASURED**. Local check duration is not a CI estimate.
+
 ## Concurrent runs
 
 By default a worker executes one run-lane run at a time, alongside its separate

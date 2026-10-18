@@ -595,7 +595,9 @@ are excluded. Required leads and `cross_check` children need a worker with
 A Claude or Codex lead submits bounded, normalized candidates in explicit rounds with
 an immutable base commit and scanned planning diff. The first candidate
 snapshots automatic-round enablement and `PLAN_CROSS_CHECK_MAX_REVISIONS`
-(default 2, range 0–4); later rounds copy that snapshot. The server counts at
+(default 4, range 0–4, at most five checked candidates by default); later rounds
+copy that snapshot. Explicit settings remain authoritative; configuration changes
+affect new checks only. The server counts at
 most limit + 1 candidates globally across generations, including supersession.
 Automatic leads and later-round children require `cross_check_rounds_v1`;
 claimability/provisioning enforce the durable protocol capability independently
@@ -635,7 +637,20 @@ The SDK and stub executors keep automatic-round feed identity separate from
 human counters; human input cannot forge automatic provenance. A stage-neutral
 prompt builder nonce-fences checker advice and prior-plan context separately,
 requires verification against code/issue/uzi rules and declining conflicts,
-and preserves the separate human-revision builder. Exhaustion, BLOCK, timeout
+and preserves the separate human-revision builder. The shared static scratch
+placement fact and actual-effect review cover inherited child processes;
+permitted scratch relocation alone is not a validation bypass or proof of
+harmlessness. Complete automatic revisions include `Cross-check dispositions`
+for every immediately preceding delivered item, with addressed location/method
+or declined rationale and inspectable evidence. The checker considers supported
+declines; round 2+ omissions mean REVISE, never BLOCK solely for omission.
+Uninspectable instruction claims remain explicitly unverified and cannot alone
+establish an exception to inspectable requirements; precedence is unchanged.
+This prompt contract adds no parser, fields, transport, history or authority:
+dispositions are untrusted content within the exact candidate digest. See
+[Cross-check](docs/cross-check.md#automatic-plan-revision-contract) and the dated
+[#3091 amendment](adr/2149-cross-check.md#default-and-plan-prompt-amendment-2026-10-17-3091).
+Exhaustion, BLOCK, timeout
 and other failures keep their fallbacks. A Codex lead consumes automatic
 rounds without spending its human revision budget and implements exactly the
 acknowledged checked plan; its submit requires its worker to advertise
@@ -1093,9 +1108,11 @@ chain in the diagram above, with no intervening `running`.
   (a versioned, frozen structural completion contract stamped before its first
   claim) that signals done with a frozen milestone still undeclared is checkpointed
   and returned to the **same lead session** first — no forge call happens while
-  anything is unmet. Only after repeated no-progress does the worker capture a
-  verified same-worker restore point and call the dedicated `SetRunCompletionHold`
-  transition (a sibling of `SetRunPaused`, not a widening of it) requiring a
+  anything is unmet. The completion question opens on a lead's
+  `owner_decision_requested` after an authoritative unmet result, or after three
+  unchanged no-progress attempts without that request. If its live window expires,
+  the worker captures a verified same-worker restore point and calls the dedicated
+  `SetRunCompletionHold` transition (a sibling of `SetRunPaused`, not a widening of it) requiring a
   positive `paused` acknowledgement before releasing anything. Only a worker that
   self-reports the `completion_interlock_v1` protocol capability can claim an
   interlocked run at all — a **non-bypassable** `ClaimRun` clause deliberately
@@ -1542,7 +1559,23 @@ chain in the diagram above, with no intervening `running`.
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
   count slot freed). See the [ADR-2417 amendment](adr/2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625).
-  A `failed` run's held work is instead published to a run-scoped forge ref, `refs/uzi-held/<run-id>/<generation>`, by the API with the owner's stored connection before custody is released, with the archive as fallback (#2545); see [docs/run-recovery.md](docs/run-recovery.md#publishing-a-failed-runs-held-work).
+  Terminal held publication (#2545/#3030) uses the API's stored forge connection
+  to create `refs/uzi-held/<run-id>/<generation>` before exact custody release.
+  Mutually negotiated `recovery_held_publication_v2` widens V1's scope (failed
+  runs at the current generation) to failed/cancelled/completed runs and ended earlier
+  generations on their original live custodian; the run's current worker may
+  differ. Failed/cancelled runs try held first; completed runs without an applicable
+  receipt stay archive-first, with the held alternative limited to thin archives
+  with prerequisites or structured oversize/quota refusal on the same record.
+  A completing receipt covers its generation, not predecessors. Exact-hold reads
+  reconcile closed evidence without replacing FINAL ACK; immutable FINAL replay
+  precedes mutable checks. Cancellation shares one monotonic 600,000 ms attempt
+  budget; expiry retains protection. Create-marker admission serializes with
+  settlement, while already admitted forge mutations may finish later.
+  See [ADR-2545](adr/2545-failed-run-held-publication.md) for enforcement and the
+  accepted terminal late-writer residual, and
+  [terminal held publication](docs/run-recovery.md#publishing-terminal-held-work)
+  for recovery, retention and visibility limits.
   The planned automatic-settlement programme, its approved policy changes, child issue order and remaining acceptance are recorded in [PRD #2746](prds/2746-automatic-hold-settlement.md). This is a programme record, not a claim that its pending children have shipped.
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free

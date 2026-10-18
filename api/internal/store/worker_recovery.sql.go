@@ -478,7 +478,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = $2
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $3
   AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
@@ -487,6 +487,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($1::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -607,7 +609,7 @@ WITH candidates AS MATERIALIZED (
                   AND runs.claim_released_at IS NULL
                   AND (runs.worker_id = $2
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $3
   AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
@@ -616,6 +618,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($1::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -643,7 +647,7 @@ UPDATE runs SET status = 'queued', status_since = $1::timestamptz, requeue_count
     updated_at = now()
 WHERE runs.worker_id = $2
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
   AND (runs.requeue_count - runs.requeue_episode_baseline) < $4
@@ -652,6 +656,8 @@ WHERE runs.worker_id = $2
     AND runs.started_at < ($1::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($1::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($1::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -728,7 +734,7 @@ type FrozenRequeueRunsMissingFromSnapshotRow struct {
 // PRD #1390 M2b (SC2, under cap): the requeue twin of FailRunsMissingFromSnapshot — a `running`
 // run-lane run this worker OWNS but no longer lists, past the fence and within budget, is REQUEUED
 // through the existing requeue path. Its SET list mirrors RequeueRunsOfStaleWorkers (health reset,
-// park-time bank for approval/input — a no-op here since only status='running' is targeted, codex
+// park-time bank for approval/input (followup keeps its existing accounting), codex
 // cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
 // never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
 func (q *Queries) FrozenRequeueRunsMissingFromSnapshot(ctx context.Context, arg FrozenRequeueRunsMissingFromSnapshotParams) ([]FrozenRequeueRunsMissingFromSnapshotRow, error) {
@@ -1212,7 +1218,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = $1
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $2
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $3
@@ -1221,6 +1227,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($4::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($4::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -1286,7 +1294,7 @@ WITH candidates AS MATERIALIZED (
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = $1
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $2
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $3
@@ -1295,6 +1303,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($4::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($4::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -1347,7 +1357,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = ANY(locks.ids)
       AND runs.worker_id = $1
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $2
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $3
@@ -1356,6 +1366,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($4::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($4::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($4::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -1434,7 +1446,7 @@ type LockFrozenFailRunsMissingFromSnapshotParams struct {
 // evidence or unresolved custody is recorded, else FAILED worker_lost (fail-first with the requeue
 // twin below). The failure path SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
 // the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
-// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+// restore). Active approval/input/followup holds are targets too. Chat is a target restriction
 // (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 // window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
 func (q *Queries) LockFrozenFailRunsMissingFromSnapshot(ctx context.Context, arg LockFrozenFailRunsMissingFromSnapshotParams) ([]uuid.UUID, error) {
@@ -2130,7 +2142,7 @@ WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
     WHERE runs.worker_id = $4
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $5
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
@@ -2139,6 +2151,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($2::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -2204,7 +2218,7 @@ WITH candidates AS MATERIALIZED (
       AND (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
       AND runs.worker_id = $4
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $5
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
@@ -2213,6 +2227,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($2::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -2265,7 +2281,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = ANY(locks.ids)
       AND runs.worker_id = $4
   AND runs.kind <> 'chat'
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL
   AND runs.status_since < $5
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
@@ -2274,6 +2290,8 @@ WITH candidates AS MATERIALIZED (
     AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($2::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -2358,7 +2376,7 @@ UPDATE runs SET plan_cross_check_gate_reason = NULL,
     updated_at = now()
 WHERE runs.worker_id = $4
   AND runs.kind <> 'chat'                                   -- D10 (run-lane only; chat has its own sweeps)
-  AND runs.status = 'running'
+  AND runs.status IN ('running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $5                   -- fence: stale window + one heartbeat interval, D4
   AND (runs.requeue_count - runs.requeue_episode_baseline) >= $6
@@ -2367,6 +2385,8 @@ WHERE runs.worker_id = $4
     AND runs.started_at < ($2::timestamptz
       - make_interval(secs => COALESCE(runs.budget_wall_seconds, $7::int)
                             + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
+                                   THEN GREATEST(0, EXTRACT(EPOCH FROM ($2::timestamptz - runs.status_since))::int) ELSE 0 END
                             + runs.budget_finalize_seconds
                             + COALESCE((SELECT SUM(GREATEST(0, CEIL(EXTRACT(EPOCH FROM
                                 (LEAST($2::timestamptz, cc.deadline_at) - cc.created_at)))::int))::int
@@ -2436,7 +2456,7 @@ type frozenFailRunsMissingFromSnapshotLockedRow struct {
 // evidence or unresolved custody is recorded, else FAILED worker_lost (fail-first with the requeue
 // twin below). The failure path SET list mirrors FailRunsOfStaleWorkersOverCap (fail_origin='worker_lost',
 // the pause/switch/milestone clears, health reset, move_pending_since for the reconcile origin
-// restore). Held states are never targeted (status = 'running' only). Chat is a target restriction
+// restore). Active approval/input/followup holds are targets too. Chat is a target restriction
 // (kind <> 'chat', D10) — these writers only ever touch run-lane runs. @missing_cutoff is the stale
 // window plus one heartbeat interval (D4); @max_requeues is RUN_MAX_REQUEUES.
 func (q *Queries) frozenFailRunsMissingFromSnapshotLocked(ctx context.Context, arg frozenFailRunsMissingFromSnapshotLockedParams) ([]frozenFailRunsMissingFromSnapshotLockedRow, error) {

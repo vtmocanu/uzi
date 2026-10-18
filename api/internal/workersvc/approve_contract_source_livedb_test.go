@@ -19,7 +19,7 @@ import (
 // and CreateApprovePlanInput freezes the source as it is at write time; a candidate republished
 // between the two used to freeze list B beside a contract built from list A.
 //
-// The race is interleaved through the REAL service and queries: publicationStore wraps
+// The source retry is interleaved through the internal service helper and real queries: publicationStore wraps
 // *store.Queries and, after a scripted pre-write GetRunMilestoneFreezeSnapshot read, runs a raw
 // UPDATE that publishes a new candidate. No production hook. The post-write (#260) read finds the
 // script empty, so it never triggers a publication.
@@ -162,7 +162,17 @@ func jsonEqual(t *testing.T, got []byte, want string) bool {
 }
 
 func (f *approveSrcFix) approve(opts SubmitInputOptions) error {
-	_, err := f.svc.SubmitInputWithOptions(f.e.ctx, f.e.userID, f.runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}, opts)
+	// Scripted publication exercises source retry below admission. Public admission
+	// serializes publication behind the run lock (TestApprovalGuardSerializationLiveDB).
+	if len(f.wrap.script) == 0 {
+		_, err := f.svc.SubmitInputWithOptions(f.e.ctx, f.e.userID, f.runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}, opts)
+		return err
+	}
+	run, err := f.svc.GetRun(f.e.ctx, f.e.userID, f.runID)
+	if err != nil {
+		return err
+	}
+	_, err = f.svc.submitInputForRun(f.e.ctx, f.e.userID, f.runID, run, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}, opts)
 	return err
 }
 

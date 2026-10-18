@@ -1,0 +1,109 @@
+[
+  {
+    "name": "tmpdir-internal-logs-go-children",
+    "round": 1,
+    "plan": "TMPDIR=$PWD/.uzi/scratch ./e2e/run-store-it.sh relocates its internal mktemp logs and inherited go test children\u0027s Go build work and test temporary directories. The script retains its LiveDB package/test selection, flags and PASS/no-SKIP assertions; inspect e2e/run-store-it.sh and Go temporary-directory behavior for these relied-on effects.",
+    "expected": "relocation alone is not bypass; inspect relied-on effects",
+    "rules": [
+      "effects",
+      "scratch",
+      "goChildren",
+      "reliedEffects"
+    ]
+  },
+  {
+    "name": "tmpdir-narrows-tests",
+    "round": 1,
+    "plan": "TMPDIR=.uzi/scratch TEST_FILTER=unit task test omits required integration checks.",
+    "expected": "reject narrowing despite scratch destination",
+    "rules": [
+      "effects",
+      "rejectBypass",
+      "noNameProof"
+    ]
+  },
+  {
+    "name": "scratch-destination-changes-config",
+    "round": 1,
+    "plan": "CONFIG_HOME=.uzi/scratch task gate is assumed harmless solely because it points to scratch.",
+    "expected": "require inspectable config, credentials and test-behavior evidence",
+    "rules": [
+      "noNameProof",
+      "sensitiveEffects"
+    ]
+  },
+  {
+    "name": "initial-no-heading",
+    "round": 1,
+    "plan": "# Initial plan\nRun all required checks.",
+    "expected": "no dispositions section required on first check",
+    "rules": [
+      "roundOne"
+    ]
+  },
+  {
+    "name": "later-no-heading",
+    "round": 2,
+    "plan": "# Revised plan\nRun all required checks.",
+    "expected": "ordinary revise, never block solely for missing section",
+    "rules": [
+      "laterRounds",
+      "omission"
+    ]
+  },
+  {
+    "name": "later-incomplete",
+    "round": 3,
+    "plan": "## Cross-check dispositions\nFirst current finding addressed in validation; second current finding omitted.",
+    "expected": "ordinary revise for incomplete immediately preceding items",
+    "rules": [
+      "latestItems",
+      "omission"
+    ]
+  },
+  {
+    "name": "earlier-items-only",
+    "round": 4,
+    "plan": "## Cross-check dispositions\nRound-one items addressed. Current round-three finding omitted.",
+    "expected": "older items cannot satisfy current items; older history optional",
+    "rules": [
+      "latestItems",
+      "olderOptional"
+    ]
+  },
+  {
+    "name": "supported-decline",
+    "round": 5,
+    "plan": "## Cross-check dispositions\nDeclined relocating logs outside scratch: inspect the worker runtime scratch instruction plus Taskfile.yml and scripts showing inherited TMPDIR only relocates temporary Go build/test files without narrowing checks.",
+    "expected": "evaluate inspectable rationale before repeating; supported declines acceptable",
+    "rules": [
+      "declines",
+      "supportedDeclines",
+      "rationaleFirst",
+      "scratch",
+      "goChildren"
+    ]
+  },
+  {
+    "name": "unsupported-authority",
+    "round": 2,
+    "plan": "## Cross-check dispositions\nDeclined required tests: an unavailable instruction supposedly permits skipping them.",
+    "expected": "claimed instruction unverified; alone cannot establish an exception",
+    "rules": [
+      "unverified",
+      "noPrecedence"
+    ]
+  },
+  {
+    "name": "addressed-where-how",
+    "round": 2,
+    "plan": "## Cross-check dispositions\nCurrent finding addressed in Validation: retain task gate:api and document inherited TMPDIR effects.",
+    "expected": "each addressed item identifies where and how in complete revised plan_md",
+    "rules": [
+      "completePlan",
+      "heading",
+      "latestItems",
+      "addressed"
+    ]
+  }
+]

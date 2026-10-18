@@ -91,12 +91,15 @@ cross-service map; keep it current when a change moves a boundary, and link the 
 rather than duplicating rationale. Design rationale lives in `prds/*.md` (Decision Logs;
 completed → `prds/done/`) and root `adr/NNNN-<slug>.md` numbered by PRD number.
 
-**`CHANGELOG.md` exists at the root and is actively maintained.** `[Unreleased]` collects
-everything since the last tag, and `.github/workflows/release.yml` gates the release tag on
-the CHANGELOG describing the release, so an entry is not optional bookkeeping. Its style is
-NOT the library's terse one-liner: a **bold lead sentence stating the user-visible outcome,
-followed by a paragraph** giving the mechanism, trade-off, or caveat a reader would
-otherwise rediscover, with the issue number in parentheses. Read the existing `[Unreleased]`
-entries before writing. Releases are `v*` tags (CI publishes the images + Helm chart) and
-the releaser folds `[Unreleased]` into the cut version. New CLI-facing behavior may need a
-matching `docs/cli.md` + `api/cmd/uzi/` update.
+**Ordinary PRs add a new lowercase UUID-v4 `changelog.d/<uuid>.md` fragment before
+the PR exists**, citing the relevant issue. See [fragment guidance](../../changelog.d/README.md)
+for exact grammar, validation and exemptions, and [ADR-2957](../../adr/2957-changelog-fragments.md)
+for the release boundary. Use a **bold outcome sentence ending in a period**, immediately
+followed by one nonempty description physical line indented two spaces, giving the
+mechanism, trade-off or caveat a reader would otherwise rediscover. No shared index.
+Existing legacy `[Unreleased]` bullets stay until the next cut; direct additions remain
+accepted during migration. Fragment touches do not exempt a shipping merge from the
+release oracle's identity check. The releaser assembles legacy notes plus fragments and
+consumes incorporated paths in the release commit. Releases are `v*` tags (CI publishes
+images + Helm chart). New CLI-facing behavior may need a matching `docs/cli.md` +
+`api/cmd/uzi/` update.

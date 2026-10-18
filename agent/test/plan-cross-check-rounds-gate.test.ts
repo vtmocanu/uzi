@@ -84,6 +84,20 @@ test("round two polls its own identity and releases the decided proof after usag
   assert.equal("fields" in result, false);
 });
 
+for (const round of [1, 2, 3, 4, 5]) {
+  test(`portable approval at candidate ${round} releases that exact candidate proof`, async () => {
+    const decided = snapshot({ round, verdict: "approve", reason_class: "approve", findings: null });
+    const h = harness(decided);
+    const result = await h.run({ round });
+    assert.equal(result.kind, "approve");
+    if (result.kind !== "approve") return;
+    assert.deepEqual(result.response, decided);
+    assert.equal(h.submits[0]![4], round);
+    assert.deepEqual(h.proofs, [decided]);
+    assert.deepEqual(h.events.slice(-3), ["prepare", "usage", "release"]);
+  });
+}
+
 test("decided revise received after deadline retains its server decision", async () => {
   const decided = snapshot({ deadline_at: new Date(Date.now() - 1_000).toISOString() });
   const h = harness(decided, { submitError: new Error("lost ACK"), polls: [decided] });

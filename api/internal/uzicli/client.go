@@ -578,12 +578,12 @@ type Client interface {
 	// is an EMPTY list (no existence oracle), never a 404.
 	ListFindings(ctx context.Context, bucket, repo, run string) (apitypes.IncidentalFindingBacklogDTO, error)
 	// FileFinding files a forge issue from one finding coordinate (PRD #333 M6): POST
-	// /api/findings/{id}/issue with an empty body, so the server files with the STORED,
+	// /api/findings/{id}/issue with {} unless sendToUzi adds send_to_uzi:true. The server uses the STORED,
 	// already-sanitised template and the server-mandated marker label (the CLI is not the rich
 	// editor — the web is, D4/D5). Returns the created forge issue (iid/web_url) and any
 	// created-with-warning note. An unknown/foreign id is a 404 (exit 4); an already-filed or
 	// mid-filing coordinate is a 409 (exit 5) — both come straight from statusError.
-	FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error)
+	FileFinding(ctx context.Context, id string, sendToUzi bool) (apitypes.IncidentalFindingFileResultDTO, error)
 	// FindingIssueDraft reads the issue draft for one finding (GET /api/findings/{id}/issue-draft,
 	// keyed on the EVIDENCE id). The CLI uses it only for DispositionID, which resolves any
 	// (possibly older) evidence id to its coordinate's disposition so a group file can dedupe.
@@ -592,11 +592,12 @@ type Client interface {
 	// GetFindingGroupIssueDraft previews one issue for multiple disposition IDs.
 	GetFindingGroupIssueDraft(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupDraftDTO, error)
 	// FileFindingGroup files ONE forge issue from several coordinates (issue #1724): POST
-	// /api/findings/issue {ids} keyed on DISPOSITION ids, with the server's default text. The bool
+	// /api/findings/issue {ids} keyed on DISPOSITION ids, optionally adding send_to_uzi:true,
+	// with the server's default text. The returned bool
 	// is true on a 202 (the filing has not settled: pre_call/in_flight/returned_uncertain, no
 	// Issue), false on a 201. A 409 (a coordinate is not fileable) is exit 5, 400 exit 2, 404
 	// exit 4, all straight from statusError.
-	FileFindingGroup(ctx context.Context, dispositionIDs []string) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
+	FileFindingGroup(ctx context.Context, dispositionIDs []string, sendToUzi bool) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
 	// ReleaseFindingGroup releases a stuck group filing operation after the owner confirmed no
 	// issue exists (POST /api/findings/filing-operations/{op}/release {confirmed_absent:true}).
 	// A 409 (cannot be released) is exit 5, an unknown operation exit 4.
@@ -650,7 +651,7 @@ type Client interface {
 	GetReviewIssueDraft(ctx context.Context, runID, recID string) (apitypes.IssueDraftDTO, error)
 	// FileReviewIssue files a forge issue from one judge recommendation (PRD #365 M2): POST
 	// /api/runs/{runID}/review/recommendations/{recID}/issue with {repo_id,title,description}
-	// (all three required — unlike FileFinding's empty body, the CLI sends the draft defaults
+	// (all three required — unlike FileFinding's default empty body, the CLI sends the draft defaults
 	// it just fetched). Owner-or-admin to READ the recommendation, caller-owns-repo to WRITE.
 	// Returns the created forge issue (iid/web_url/title) and any created-with-warning note.
 	// A foreign/unknown run or rec is a 404 (exit 4); an already-filed or mid-filing

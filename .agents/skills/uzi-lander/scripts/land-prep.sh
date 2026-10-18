@@ -123,6 +123,8 @@ fi
 
 log() { printf '%s [land-prep #%s] %s\n' "$(date +%H:%M:%S)" "$PR" "$*"; }
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 3
+# shellcheck source=lib/ci-fix.sh
+. "$HERE/lib/ci-fix.sh"
 # shellcheck source=lib/net-retry.sh
 . "$HERE/lib/net-retry.sh"
 net_retry_install
@@ -169,10 +171,9 @@ mrw_check() {
     || { log "could not parse uzi run list; cannot rule out an active mr_rework"; return 4; }
   if [ "${n:-0}" -gt 0 ]; then log "an mr_rework run is ACTIVE on #$PR — defer (scripts/wait-mrrework.sh)"; return 4; fi
   # ci_fix shares the worker-owned branch; match pipeline_ref rather than the PR number.
-  n=$(printf '%s' "$runs" | jq -r --arg repo "$repo_id" --arg br "$BRANCH" \
-    '[.[]|select(.kind=="ci_fix" and .repo_id==$repo and .pipeline_ref==$br and ((.status|test("completed|failed|cancelled"))|not))|.id]|join(" ")') \
+  n=$(ci_fix_active_ids "$runs" "$repo_id" "$BRANCH" 2>/dev/null) \
     || { log "could not parse uzi run list; cannot rule out an active ci_fix"; return 4; }
-  if [ -n "$n" ]; then log "a ci_fix run is ACTIVE on $BRANCH ($n) — let it finish, or cancel it (uzi run cancel <id>) before pushing a local fix"; return 4; fi
+  if [ -n "$n" ]; then log "a ci_fix run is ACTIVE on $BRANCH ($n); decide wait/cancel with the buddy and confirm terminal state before local branch work"; return 4; fi
   return 0
 }
 mrw_check || exit 4
@@ -250,8 +251,8 @@ rebase_in_progress() {
 delta_paths() {
   printf '%s\n' "$1" | sed -e '/^$/d' -e 's|^api/internal/store/migrations/.*|api/internal/store/migrations/|' | LC_ALL=C sort -u
 }
-# union_continue: a rebase has stopped. Nearly every PR adds a CHANGELOG.md bullet under
-# the same heading, so while CHANGELOG.md is the ONLY conflicted path, resolve it as a union
+# union_continue: a rebase has stopped. Legacy direct CHANGELOG.md additions can share
+# a heading, so while CHANGELOG.md is the ONLY conflicted path, resolve it as a union
 # (changelog-union.sh), stage it and continue; a later commit may stop again, hence the loop.
 # Returns 0 once the rebase completes, 1 on any other stop (the rebase is left in progress).
 union_continue() {

@@ -21,10 +21,10 @@ func TestLoadPlanCrossCheckMaxRevisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := Load()
-	if err != nil || cfg.PlanCrossCheckMaxRevisions != DefaultPlanCrossCheckMaxRevisions {
+	if err != nil || cfg.PlanCrossCheckMaxRevisions != 4 {
 		t.Fatalf("unset: %d %v", cfg.PlanCrossCheckMaxRevisions, err)
 	}
-	for n := int32(0); n <= MaxPlanCrossCheckMaxRevisions; n++ {
+	for n := int32(0); n <= 4; n++ {
 		t.Run(strconv.Itoa(int(n)), func(t *testing.T) {
 			t.Setenv("PLAN_CROSS_CHECK_MAX_REVISIONS", strconv.Itoa(int(n)))
 			cfg, err := Load()

@@ -67,6 +67,8 @@ import type {
   ProductTokenScope,
   CreatedIssue,
   FindingGroupDraft,
+  FileFindingRequest,
+  FindingGroupFileRequest,
   FindingGroupFileResult,
   EgressProfile,
   EgressProfileProblem,
@@ -1748,7 +1750,7 @@ const realApi = {
   // user EDITS re-run through the write-boundary sanitisers. A stale card acting on an
   // already-filed coordinate gets a 409 (the guarded claim), which the caller renders as a
   // friendly "already filed" state — the backlog is the source of truth.
-  fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
+  fileFinding: (id: string, body?: FileFindingRequest) =>
     request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
   // findingGroupIssueDraft reads the deterministic, human-editable draft for filing several
   // findings as ONE issue (issue #1724). Keyed on DISPOSITION ids, sent as one comma-separated
@@ -1761,7 +1763,7 @@ const realApi = {
   // created issue; 202 returns the same shape WITHOUT `issue` (uncertain or stopped: `warning` says
   // to inspect the forge), which request() decodes like any 2xx. 409 = a member was already filed
   // or is being filed; 502 = the forge rejected the create.
-  fileFindingGroup: (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) =>
+  fileFindingGroup: (body: FindingGroupFileRequest) =>
     request<FindingGroupFileResult>("POST", "/findings/issue", body),
   // dismissFinding triages one coordinate to `dismissed` with a required reason from the
   // closed enum (M5). A LOCAL write — no forge call, no token spend. Keys on the evidence

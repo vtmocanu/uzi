@@ -354,6 +354,75 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
     assert.equal(client.postCalls.length, 0, "no server write (no tombstones, no rebind)");
   });
 
+  it("a stale_revision_source 409 retires an obsolete reject locally without successful settlement", async t => {
+    const { outbox } = await mkOutbox();
+    const api = new FakeApi("terminal-source-fixture");
+    const url = await api.listen();
+    api.planRevisionRetries = true;
+    api.seedGate("r1", { revision: 2, presentationId: "current", payload: { plan_md: "# current" } });
+    const client = new WorkerClient(url, "terminal-source-fixture", "test", nullLogger());
+    client.protocolFeatures = ["claim_generation_fence", "plan_revision_retry_v1"];
+    const deps = makeTerminalOutboxDeps(outbox, client, {
+      gapFillMax: 10_000, terminalMaxBytes: 1 << 20, log: nullLogger(),
+    })!;
+    const settled = t.mock.method(outbox, "markTerminalServerSettled");
+    const acks: StateAck[] = [];
+    try {
+      await journalAndResolveTerminal(deps, {
+        runId: "r1", claimGeneration: GEN, phase: "awaiting_approval", messagesThroughSeq: 0,
+        body: { status: "failed", fail_origin: "plan_rejected", expected_gate_revision: 1, claim_generation: GEN },
+        send: async body => {
+          const ack = await client.reportState("r1", body);
+          acks.push(ack);
+          return ack;
+        },
+      });
+      assert.equal(acks.length, 1);
+      assert.equal(acks[0]?.staleRevisionSource, true, "real HTTP 409 is classified by WorkerClient");
+      assert.equal(acks[0]?.applied, false);
+      assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0);
+      assert.equal(outbox.depthFor("r1")?.staleRetired, 1);
+      assert.equal(settled.mock.callCount(), 0, "local retirement does not mark server settlement");
+      assert.equal(api.states.length, 0, "obsolete reject never changes server state");
+      assert.equal(api.gateRefusals.length, 0, "source refusal never increments presentation refusal counters");
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: body => client.reportState("r1", body) });
+      assert.equal(api.stateAttempts, 1, "retired journal is not resent");
+    } finally {
+      await api.close();
+    }
+  });
+
+  it("a source-fenced rejection journal stays pending without negotiated support", async t => {
+    const { outbox } = await mkOutbox();
+    const api = new FakeApi("source-rollback-fixture");
+    const url = await api.listen();
+    api.planRevisionRetries = true;
+    api.seedGate("r1", { revision: 2, presentationId: "current", payload: { plan_md: "# current" } });
+    const client = new WorkerClient(url, "source-rollback-fixture", "test", nullLogger());
+    const deps = makeTerminalOutboxDeps(outbox, client, {
+      gapFillMax: 10_000, terminalMaxBytes: 1 << 20, log: nullLogger(),
+    })!;
+    const settled = t.mock.method(outbox, "markTerminalServerSettled");
+    try {
+      await journalAndResolveTerminal(deps, {
+        runId: "r1", claimGeneration: GEN, phase: "awaiting_approval", messagesThroughSeq: 0,
+        body: { status: "failed", expected_gate_revision: 1, claim_generation: GEN },
+        send: body => client.reportState("r1", body),
+      });
+      assert.equal(api.stateAttempts, 0, "no unfenced terminal POST");
+      assert.equal(outbox.hasPendingTerminal("r1", GEN), true);
+      assert.equal((await outbox.readTerminalJournal("r1", GEN))?.body.expected_gate_revision, 1);
+      assert.equal(settled.mock.callCount(), 0);
+      client.protocolFeatures = ["claim_generation_fence", "plan_revision_retry_v1"];
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: body => client.reportState("r1", body) });
+      assert.equal(api.stateAttempts, 1);
+      assert.equal(outbox.hasPendingTerminal("r1", GEN), false);
+      assert.equal(outbox.depthFor("r1")?.staleRetired, 1);
+      assert.equal(settled.mock.callCount(), 0, "source-stale disposal is not successful terminal settlement");
+      assert.equal(api.states.length, 0);
+    } finally { await api.close(); }
+  });
+
   it("messages_pending triggers the GAP-FILL loop: missing seqs get per-seq tombstones (carrying the gen), then the terminal applies", async () => {
     const { outbox } = await mkOutbox();
     const client = new FakeClient();

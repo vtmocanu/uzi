@@ -8,7 +8,7 @@
 #      branch's rules require having reported;
 #   2. a reviewer bot (CodeRabbit and/or Greptile, per --reviewer) has reviewed that exact
 #      head and left no live (unresolved) inline findings;
-#   3. no in-flight uzi `mr_rework` run is reworking this MR (which would race a local
+#   3. no in-flight uzi `ci_fix` on this branch or `mr_rework` on this MR (which would race a local
 #      fix or a merge — see references/mr-rework.md);
 #   4. no every-author blocker (lib/pr-comments.sh), whatever --reviewer says: ANY
 #      unresolved, non-outdated review thread from any author, bots included (`threads=`),
@@ -51,7 +51,7 @@
 #
 # Exit codes (callers branch on these; keep them stable):
 #   0  merge-ready — CI green on head, the required reviewer(s) reviewed this head with
-#      0 live findings, no active mr_rework.
+#      0 live findings, no active mr_rework or ci_fix.
 #   1  red — a required CI check failed on the head.
 #   2  timeout — readiness not reached within max_polls, or the head never resolved.
 #      NOTE: exit 0 is trustworthy; exit 2 means "inspect manually", never "merge".
@@ -77,6 +77,9 @@
 #      mergeable=UNKNOWN (GitHub still computing) is not a conflict; it keeps polling.
 #   9  unknown — --max-unknown consecutive polls could not read a lookup; RESULT names them
 #      (RESULT=unknown_persistent lookups=a,b). Fix or inspect that lookup; never merge on it.
+#  10  ci_fix ownership — active on this branch (even with green CI), or recent while CI is red.
+#      CI_FIX_ACTIVE/RECENT name the runs; decide wait/cancel/review before local work.
+# Branch-writer resolution precedes conflicts: unreadable uzi plus CONFLICTING is exit 9, not 8.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
 # zero-actionable incremental review can post NO new review object AND re-anchor no
@@ -107,6 +110,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/pr-comments.sh"
 # shellcheck source=lib/net-retry.sh
 . "$HERE/lib/net-retry.sh"
+# shellcheck source=lib/ci-fix.sh
+. "$HERE/lib/ci-fix.sh"
 net_retry_install
 
 usage() { echo "usage: watch-pr.sh OWNER/REPO PR [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
@@ -190,7 +195,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
   fi
 
-  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName,mergeable,mergeStateStatus 2>/dev/null || true)
+  pv=$(gh pr view "$PR" --repo "$REPO" --json headRefOid,state,baseRefName,mergeable,mergeStateStatus,headRefName 2>/dev/null || true)
   head=$(printf '%s' "$pv" | jq -r '.headRefOid // empty' 2>/dev/null || true)
   req_base=$(printf '%s' "$pv" | jq -r '.baseRefName // empty' 2>/dev/null || true)
   pstate=$(printf '%s' "$pv" | jq -r '.state // empty' 2>/dev/null || true)
@@ -202,6 +207,27 @@ while [ "$i" -lt "$MAX" ]; do
     continue
   fi
   if [ "$pstate" != "OPEN" ]; then echo "RESULT=pr_not_open state=$pstate"; exit 2; fi
+  # Resolve branch writers before conflict/rebase routing. Known-not-connected is
+  # distinct from an unreadable listing; failed ownership lookups never mean none.
+  mrw_active=0
+  CI_FIX_ACTIVE=unknown; CI_FIX_RECENT=unknown; CI_FIX_ACTIVE_COUNT=0
+  if [ "$repo_known" -eq 0 ]; then
+    unk uzi_repo_list
+  elif [ -z "$repo_id" ]; then
+    CI_FIX_ACTIVE=none; CI_FIX_RECENT=none
+  elif rl2=$(uzi run list --json 2>/dev/null) && is_array "$rl2"; then
+    mrw_active=$(printf '%s' "$rl2" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
+      '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
+                   and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unk mr_rework
+    if ! ci_fix_snapshot "$rl2" "$repo_id" "$(printf '%s' "$pv" | jq -r '.headRefName // empty')" 2>/dev/null; then unk ci_fix; fi
+  else
+    unk mr_rework
+    unk ci_fix
+  fi
+  echo "CI_FIX_ACTIVE=$CI_FIX_ACTIVE"
+  echo "CI_FIX_RECENT=$CI_FIX_RECENT"
+  if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi
+  if [ "$CI_FIX_ACTIVE_COUNT" -gt 0 ]; then echo "RESULT=ci_fix_active"; exit 10; fi
   mergeable=$(printf '%s' "$pv" | jq -r '.mergeable // empty' 2>/dev/null || true)
   if [ "$mergeable" = "CONFLICTING" ]; then
     echo "try $i: head=${head:0:8} mergeable=CONFLICTING merge_state=$(printf '%s' "$pv" | jq -r '.mergeStateStatus // empty' 2>/dev/null || true)"
@@ -248,21 +274,6 @@ while [ "$i" -lt "$MAX" ]; do
     ci_wait=$(( $(date +%s) - seen_ts )); pend=1
   else
     unk ci_checks
-  fi
-
-  # mr_rework: an active (non-terminal) run on this (repo_id, mr_iid). Only skip the check on
-  # a KNOWN-not-connected repo; an unresolved repo_id or a failed run-list is unknown.
-  mrw_active=0
-  if [ "$repo_known" -eq 0 ]; then
-    unk uzi_repo_list
-  elif [ -n "$repo_id" ]; then
-    if rl2=$(uzi run list --json 2>/dev/null) && is_array "$rl2"; then
-      mrw_active=$(printf '%s' "$rl2" | jq -r --arg repo "$repo_id" --argjson pr "$PR" \
-        '[.[]|select(.kind=="mr_rework" and .repo_id==$repo and .mr_iid==$pr
-                     and ((.status|test("completed|failed|cancelled"))|not))]|length' 2>/dev/null) || unk mr_rework
-    else
-      unk mr_rework
-    fi
   fi
 
   # CodeRabbit's commit STATUS on the head (context "CodeRabbit"): its description is the
@@ -669,6 +680,7 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi
   unk_streak=0
 
+  if [ "$fail" -gt 0 ] && [ "$CI_FIX_RECENT" != none ]; then echo "RESULT=ci_fix_recent"; exit 10; fi
   if [ "$fail" -gt 0 ]; then echo "RESULT=red"; exit 1; fi
   if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
   if [ "$pend" -eq 0 ] && [ "$cancel" -eq 0 ]; then

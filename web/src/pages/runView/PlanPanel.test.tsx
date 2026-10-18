@@ -148,6 +148,94 @@ describe("derivePlanRevision — human and automatic feedback", () => {
     return { seq, kind, payload, agent: "lead", agent_instance: null, agent_label: null, created_at: "2026-01-01T00:00:00Z" };
   }
 
+  it.each([
+    ["numeric", { plan_md: 42 }],
+    ["object", { plan_md: { text: "not a plan" } }],
+    ["array", { plan_md: ["not a plan"] }],
+    ["null", { plan_md: null }],
+    ["missing value", { plan_md: undefined }],
+    ["whitespace-only", { plan_md: " \n\t " }],
+    ["empty body", { plan_md: "" }],
+    ["absent field", {}],
+    ["null payload", null],
+  ])("omits %s superseded text while preserving revision state and input order", (_name, payload) => {
+    const messages = [
+      message(30, "plan", { plan_md: "  first in input\n\n" }),
+      message(10, "plan", { plan_md: "\nsecond in input  " }),
+      message(35, "plan", payload),
+      message(40, "plan", { plan_md: "current" }),
+      message(48, "plan_feedback", { feedback: "latest human" }),
+      message(45, "plan_feedback", { feedback: "earlier human" }),
+      message(49, "plan_feedback", { feedback: "automatic advice", automatic: true }),
+      message(50, "plan_revising", {}),
+    ];
+    expect(derivePlanRevision(messages)).toEqual({
+      versions: 4,
+      rounds: 2,
+      latestFeedback: "latest human",
+      revising: true,
+      priorPlans: ["  first in input\n\n", "\nsecond in input  "],
+    });
+    expect(derivePlanRevision([...messages, message(60, "plan", { plan_md: "regated" })])).toEqual({
+      versions: 5,
+      rounds: 2,
+      latestFeedback: "latest human",
+      revising: false,
+      priorPlans: ["  first in input\n\n", "\nsecond in input  ", "current"],
+    });
+  });
+
+  it("excludes the malformed final submission without dropping an earlier valid plan", () => {
+    expect(derivePlanRevision([
+      message(1, "plan", { plan_md: "  earlier valid\n" }),
+      message(2, "plan", { plan_md: 42 }),
+      message(3, "plan", { plan_md: { malformed: true } }),
+    ])).toEqual({
+      versions: 3,
+      rounds: 0,
+      latestFeedback: null,
+      revising: false,
+      priorPlans: ["  earlier valid\n"],
+    });
+  });
+
+  it("renders valid history and approves the current gate despite numeric superseded text", async () => {
+    const onApprove = vi.fn();
+    render(<PlanPanel
+      run={run({ harness: "codex", plan_md: "Current valid plan", gate_revision: 4 })}
+      messages={[
+        message(30, "plan", { plan_md: "First accepted prior" }),
+        message(10, "plan", { plan_md: "Second accepted prior" }),
+        message(35, "plan", { plan_md: 42 }),
+        message(40, "plan", { plan_md: "Current valid plan" }),
+      ]}
+      busy={false}
+      canSteer
+      onApprove={onApprove}
+      onReject={vi.fn()}
+    />);
+    expect(screen.getByText("Current valid plan")).toBeTruthy();
+    const summary = screen.getByText("2 superseded plan versions");
+    const accordion = summary.closest("details")!;
+    expect(accordion.open).toBe(false);
+    fireEvent.click(summary);
+    const history = within(accordion);
+    expect(history.getByText("First accepted prior")).toBeTruthy();
+    expect(history.getByText("Second accepted prior")).toBeTruthy();
+    expect(history.getAllByText(/^Plan v[12]$/)).toHaveLength(2);
+    expect(history.getAllByText(/accepted prior/).map((item) => item.textContent)).toEqual([
+      "First accepted prior", "Second accepted prior",
+    ]);
+    expect(history.queryByText("Current valid plan")).toBeNull();
+    expect(history.queryByText("42")).toBeNull();
+    const approve = screen.getByRole("button", { name: /Approve plan/ }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
+    fireEvent.click(approve);
+    await waitFor(() => expect(onApprove).toHaveBeenCalledTimes(1));
+    expect(onApprove).toHaveBeenCalledWith({ source: "own", exclusions: [] }, undefined, 4);
+    expect(mockApi.setRunCredential).not.toHaveBeenCalled();
+  });
+
   const automatic = [
     message(1, "plan", { plan_md: "v1" }),
     message(2, "plan_feedback", { feedback: "auto first", automatic: true, cross_check_round: 1 }),

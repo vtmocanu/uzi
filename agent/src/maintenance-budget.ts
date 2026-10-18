@@ -1,0 +1,174 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { performance } from "node:perf_hooks";
+
+interface AttemptContext {
+  identity?: string;
+  budget?: MaintenanceBudget;
+  factory?: () => MaintenanceBudget;
+  activating?: boolean;
+  pendingAbort?: AbortController;
+}
+
+const scope = new AsyncLocalStorage<AttemptContext>();
+
+/** One attempt owns this object from its first cancellation observation through cleanup. */
+export class MaintenanceBudget {
+  readonly deadline: number;
+  readonly signal: AbortSignal;
+  private readonly controller = new AbortController();
+  private timer: ReturnType<typeof setTimeout> | undefined;
+
+  constructor(
+    durationMs = 600_000,
+    private readonly now: () => number = () => performance.now(),
+  ) {
+    if (!Number.isFinite(durationMs) || durationMs < 0) throw new Error("invalid maintenance budget");
+    this.deadline = now() + durationMs;
+    this.signal = this.controller.signal;
+    this.timer = setTimeout(() => this.controller.abort(new Error("maintenance deadline exhausted")), durationMs);
+    this.timer.unref();
+  }
+
+  remainingMs(): number { return Math.max(0, this.deadline - this.now()); }
+
+  /** A shorter operation consumes this attempt's clock without renewing either bound. */
+  cap(maxMs: number): () => number {
+    if (!Number.isFinite(maxMs) && maxMs !== Infinity) return () => 0;
+    const start = this.remainingMs();
+    const floor = start - Math.min(Math.max(0, maxMs), start);
+    return () => this.signal.aborted ? 0 : Math.max(0, this.remainingMs() - floor);
+  }
+
+  check(): void {
+    if (this.remainingMs() <= 0 && !this.signal.aborted) {
+      this.controller.abort(new Error("maintenance deadline exhausted"));
+    }
+    this.signal.throwIfAborted();
+  }
+
+  /** Nested scopes retain the attempt object; separate async chains remain isolated. */
+  static run<T>(budget: MaintenanceBudget, action: () => T): T {
+    const context = scope.getStore();
+    const current = context?.budget ?? budget;
+    current.check();
+    if (context?.identity !== undefined) {
+      this.attachBudget(context, current);
+      return scope.run(context, action);
+    }
+    return scope.run({ budget: current }, action);
+  }
+
+  /** Attach the flight's observation before synchronous abort listeners continue. */
+  static attachObserved(identity: string, budget: MaintenanceBudget): void {
+    const context = scope.getStore();
+    if (context?.identity === identity && !context.budget) this.attachBudget(context, budget);
+  }
+
+  /** Status transport is independent of preservation; never use this for FINAL or cleanup. */
+  static withoutAttempt<T>(action: () => T): T { return scope.exit(action); }
+
+  static isAttempt(identity: string): boolean {
+    const context = scope.getStore();
+    return context?.identity === identity || (!!context?.budget && context.identity === undefined);
+  }
+
+  /** Install before any await: late observations update every continuation in this attempt. */
+  static runAttempt<T>(identity: string, factory: () => MaintenanceBudget, action: () => T): T {
+    const parent = scope.getStore();
+    if (parent?.identity === identity || (parent?.budget && parent.identity === undefined)) {
+      parent.budget?.check();
+      return action();
+    }
+    return scope.run({ identity, factory, pendingAbort: new AbortController() }, action);
+  }
+
+  /** Observation constrains time only; it grants no custody authority. */
+  static observeCancellation(): MaintenanceBudget | undefined {
+    const context = scope.getStore();
+    if (!context) return undefined;
+    if (!context.budget && context.factory && !context.activating) {
+      context.activating = true;
+      try { this.attachBudget(context, context.factory()); }
+      finally { context.activating = false; }
+    }
+    context.budget?.check();
+    return context.budget;
+  }
+
+  private static attachBudget(context: AttemptContext, budget: MaintenanceBudget): void {
+    if (context.budget === budget) return;
+    context.budget = budget;
+    const relay = context.pendingAbort;
+    if (!relay) return;
+    const abort = () => relay.abort(budget.signal.reason);
+    if (budget.signal.aborted) abort();
+    else budget.signal.addEventListener("abort", abort, { once: true });
+  }
+
+  /** Stable from attempt entry; obtaining it never starts the cancellation clock. */
+  static signal(): AbortSignal | undefined {
+    const context = scope.getStore();
+    return context?.pendingAbort?.signal ?? context?.budget?.signal;
+  }
+
+  /** Only inert queue waits: callers must preserve their slot behind earlier holders. */
+  static async waitFor<T>(pending: Promise<T>): Promise<T> {
+    this.current()?.check();
+    const signal = this.signal();
+    if (!signal) return pending;
+    signal.throwIfAborted();
+    let onAbort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      const value = await Promise.race([pending, cancelled]);
+      this.current()?.check();
+      signal.throwIfAborted();
+      return value;
+    } finally { signal.removeEventListener("abort", onAbort); }
+  }
+
+  static current(): MaintenanceBudget | undefined { return scope.getStore()?.budget; }
+
+  /** Timer cleanup never renews the absolute deadline. */
+  dispose(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+
+  /**
+   * Only for inert RPC awaits, never owned subprocesses, filesystem work or maintenance.
+   * One late-result cleanup attempt is detached and best effort; it cannot block siblings.
+   * The caller must supply a bounded/nonblocking cleanup (for example body.cancel()).
+   */
+  async raceIO<T>(action: (signal: AbortSignal) => Promise<T>, cancelLate?: (value: T) => void | Promise<void>, operationSignal?: AbortSignal): Promise<T> {
+    this.check();
+    const signal = operationSignal ? AbortSignal.any([this.signal, operationSignal]) : this.signal;
+    signal.throwIfAborted();
+    let aborted = false;
+    let cleaned = false;
+    const cleanup = (value: T): void => {
+      if (cleaned || !cancelLate) return;
+      cleaned = true;
+      void Promise.resolve().then(() => cancelLate(value)).catch(() => undefined);
+    };
+    let onAbort!: () => void;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      onAbort = () => { aborted = true; reject(signal.reason); };
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    const pending = Promise.resolve().then(() => { this.check(); signal.throwIfAborted(); return action(signal); });
+    void pending.then(value => {
+      if (aborted) cleanup(value);
+    }, () => undefined);
+    try {
+      const value = await Promise.race([pending, stopped]);
+      try { this.check(); signal.throwIfAborted(); } catch (error) { cleanup(value); throw error; }
+      return value;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
+}

@@ -52,6 +52,42 @@ labels you pick. Click **Edit & file** first if you want to change the title,
 description, or labels before it's created. Either way, a filed finding links
 back to the issue it became.
 
+### Sending the filed issue to uzi
+
+In the single-finding **Edit & file** draft or the **File as one issue**
+draft, check **Send to uzi** to request automatic work on the filed issue.
+It starts unchecked. Leaving it unchecked keeps filing unchanged, including
+any labels you deliberately select; stored agent label suggestions do not
+automatically attach.
+
+With the checkbox checked, the server keeps the mandatory finding marker and
+your sanitized, capped explicit label selection, then appends the configured
+run-eligibility label (`UziLabel`, default `uzi`) and autopilot label
+(`AutopilotLabel`, default `autopilot`), deduplicated without displacing
+accepted explicit labels. You can still select run labels manually.
+
+The help text reads: "Starts automatically when autopilot is enabled in Settings and the forge identity matches; otherwise this only labels the issue for uzi."
+
+After a confirmed filing with this option, the result reads:
+"Queued for uzi: starts on the next sync if autopilot is on".
+This confirms a label request, not a run: the next normal repo sync evaluates
+[Autopilot](./autopilot.md). Filing does not directly start a run or enable
+autopilot.
+
+The issue is filed through the repo owner's forge connection PAT. The forge
+issue author and autopilot-label event actor therefore need not be the person
+using the browser. The connection's owner must already have autopilot enabled
+and a nonempty `human_username` matching the label-event adder, or the issue
+author as fallback. Owning the repo with autopilot enabled is insufficient
+when both forge identities mismatch.
+
+A consent refusal records the handled label-add event and attempts one
+explanatory comment; the issue stays eligible for a manual **Start run**.
+Enabling autopilot after that handled refusal requires removing and re-adding
+the autopilot label to retry. If no current label-add event is available, the
+poller waits without starting a run or commenting. Existing credential,
+harness, active-run, open-PR and description-size checks still apply.
+
 ### Filing several findings as one issue
 
 When several findings share a root cause, tick their rows and click **File as
@@ -68,7 +104,9 @@ the whole group instead of leaving it half filed. The issue carries a hidden
 marker that lets uzi recognize it later.
 
 If uzi cannot confirm whether the forge created the issue, the page shows the
-operation id and tells you to check the forge. uzi's repo sync settles the group
+operation id and tells you to check the forge. An uncertain result with no
+confirmed issue does not show the queued confirmation, even if **Send to uzi**
+was checked. uzi's repo sync settles the group
 by itself once it finds the marked issue. If you find no issue on the forge
 after the operation's deadline, release the findings with
 [`uzi findings release`](./cli.md#incidental-findings-uzi-findings) and file
@@ -170,6 +208,8 @@ uzi findings draft <finding-id>                          # preview without filin
 uzi findings draft <finding-id> <finding-id> ...         # preview a grouped issue
 uzi findings file <finding-id>                           # file it
 uzi findings file <finding-id> <finding-id> ...          # file several as one issue
+uzi findings file <finding-id> --send-to-uzi             # file and request run labels
+uzi findings file <finding-id> <finding-id> ... --send-to-uzi  # same for a group
 uzi findings release <operation-id> --confirm-no-issue   # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
 uzi findings resolve <finding-id>                        # mark it done yourself
@@ -190,7 +230,10 @@ a blank line and body; `--json` returns the exact server draft DTO. A group
 preview omits the filing-time operation marker; filing may trim evidence at a
 UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
 group includes assembled labels with the mandatory marker label, while unedited
-CLI filing sends only explicit ids and the server applies that label. Preview
+CLI filing sends only explicit ids and the server applies that label.
+Adding `--send-to-uzi` to single or grouped `file` requests the two configured
+run labels described [above](#sending-the-filed-issue-to-uzi); omitting the flag
+keeps the default filing behavior. It does not copy stored suggestions. Preview
 is read-only; pass explicit ids to `file` too, with no `--run` shortcut.
 
 Give `file` several ids of one repo to file one issue for all of them (see
