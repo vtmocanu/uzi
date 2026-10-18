@@ -1009,9 +1009,8 @@ export interface PriorWork {
   commits: number;
 }
 
-/** The paragraph that tells the lead it is standing on work it cannot remember doing.
- *  Deliberately plain and outside every untrusted fence: it is uzi's own statement of
- *  fact about the branch, not repo- or user-supplied text. */
+/** Worker-authored snapshot framing, or legacy positive-count continuation wording.
+ *  Plain text outside untrusted fences: neither branch interpolates historical model text. */
 function priorWorkNote(prior: PriorWork | undefined, snapshot?: InterruptedSnapshot): string {
   if (snapshot) return interruptedSnapshotNote(snapshot);
   if (!prior || prior.commits <= 0) return "";
