@@ -278,6 +278,7 @@ function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage
   { readonly ok: true } | { readonly ok: false; readonly diagnostic: CodexUsageDiagnostic } {
   const container = asObject(asObject(note.params)?.tokenUsage);
   if (!container) return { ok: false, diagnostic: { predicate: "missing container" } };
+  let lastIsContextEstimate = false;
   for (const name of ["total", "last"] as const) {
     const raw = asObject(container[name]);
     if (!raw) return { ok: false, diagnostic: { predicate: "missing breakdown", breakdown: name } };
@@ -294,14 +295,25 @@ function validResumedUsage(note: Extract<CodexNotification, { kind: "token_usage
       if (value !== decoded[key])
         return { ok: false, diagnostic: { predicate: "raw-vs-decoded mismatch", breakdown: name, bucket: key } };
     }
+    // Codex rust-v0.160.1 (d27764b8), core/src/session/mod.rs::recompute_token_usage,
+    // preserves cumulative usage but replaces last with a context-size estimate.
+    // Only this zero-detail last may violate the totalTokens relationships; all
+    // raw validation above still applies. In particular, protocol.rs::fill_to_context_window
+    // also resets TOTAL details, which must remain rejected by the normal total check.
+    if (name === "last") {
+      lastIsContextEstimate = decoded.totalTokens > 0 && decoded.inputTokens === 0 &&
+        decoded.cachedInputTokens === 0 && decoded.cacheWriteInputTokens === 0 &&
+        decoded.outputTokens === 0 && decoded.reasoningOutputTokens === 0;
+    }
     const bucket = decoded.cachedInputTokens + decoded.cacheWriteInputTokens > decoded.inputTokens ? "cachedInputTokens"
       : decoded.reasoningOutputTokens > decoded.outputTokens ? "reasoningOutputTokens"
-      : decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens ? "totalTokens" : undefined;
+      : !lastIsContextEstimate && decoded.totalTokens !== decoded.inputTokens + decoded.outputTokens ? "totalTokens" : undefined;
     if (bucket !== undefined)
       return { ok: false, diagnostic: { predicate: "bucket relationship", breakdown: name, bucket } };
   }
   for (const key of ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens",
     "reasoningOutputTokens", "totalTokens"] as const) {
+    if (key === "totalTokens" && lastIsContextEstimate) continue;
     if (note.usage.last[key] > note.usage.total[key])
       return { ok: false, diagnostic: { predicate: "last > total", breakdown: "last", bucket: key } };
   }
