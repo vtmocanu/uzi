@@ -9548,6 +9548,7 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
       completionSource?: { expectedHead: string; canDelete: () => boolean } },
@@ -9565,11 +9566,16 @@ export class GitCache {
     branch: string,
     ownerRunId: string,
     opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      onRetirementUnproven?: () => void;
       verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
         acknowledged: () => Promise<boolean> };
       completionSource?: { expectedHead: string; canDelete: () => boolean } },
     bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
+    // Deny-only observation: no cleanup authority, and observer errors cannot change retirement.
+    const unproven = (): void => {
+      try { opts.onRetirementUnproven?.(); } catch { /* preserve retirement behavior */ }
+    };
     let stage: OrphanRetireStage = "journal_read";
     const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
@@ -9800,12 +9806,14 @@ export class GitCache {
       // disposal of the holding copy.
       if (opts.attemptId !== undefined && !opts.completionSource) {
         await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
-          (err: unknown) =>
+          (err: unknown) => {
+            unproven();
             this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
               clone: clonePath,
               attempt_id: opts.attemptId,
               error: gitErrorMessage(err),
-            }),
+            });
+          },
         );
       }
       return { holding, scratch, renamed, disposition: holding ? "quarantined" : "source-already-absent" };
@@ -9825,6 +9833,7 @@ export class GitCache {
       (opts.completionSource !== undefined && !opts.completionSource.canDelete());
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
     if (!opts.completionSource && residueQuarantine() !== undefined) {
+      unproven();
       if (holding || scratch) {
         this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
           run_id: ownerRunId,
@@ -9927,20 +9936,22 @@ export class GitCache {
       }
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     };
+    if (!result.renamed || (holding && !opts.discard) || ((holding || scratch) && protectedNow)) unproven();
     if (holding && opts.discard && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
+      await fs.rm(holding, { recursive: true, force: true }).catch((e) => {
+        unproven();
         this.log.warn("retireRunnerClone: holding dispose failed", {
           path: holding,
           error: gitErrorMessage(e),
-        }),
-      );
+        });
+      });
     }
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      await fs.rm(scratch, { recursive: true, force: true }).catch(() => { unproven(); });
     }
     return result.disposition;
   }

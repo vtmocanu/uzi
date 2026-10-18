@@ -5,7 +5,7 @@ import path from "node:path";
 import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
 import {
-  api, client, deferred, fakeGitlab, git, gitlabClaim, homeDir, installHarness, runnerWith,
+  api, client, deferred, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
 } from "./runner-harness.js";
 
 installHarness();
@@ -14,7 +14,7 @@ installHarness();
 // An observation names one fresh source; it never proves source-family completeness.
 type TailView = { executionTails: ReadonlyMap<string, Promise<unknown>> };
 
-for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
+for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
   it(`#3031 owner pause ${mode}: exact fresh source is observed only after cleanup`, async (t) => {
     const claim = gitlabClaim(3033, { claim_generation: 1 });
     const started = deferred(), finish = deferred(), cleaning = deferred(), finishCleanup = deferred();
@@ -39,6 +39,51 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
     }
     if (mode === "failed-owed") t.mock.method(git, "retainCurrentOwedCandidate", async () => ({ kind: "not_updated" as const, reason: "preservation_failed" as const }));
     if (mode === "failed-retire") t.mock.method(git, "retireRunnerClone", async () => { throw new Error("retire failed"); });
+    let internalFaults = 0;
+    const warnings: string[] = [];
+    const runLogger = nullLogger();
+    if (mode === "failed-retired-append" || mode === "failed-holding-dispose" || mode === "failed-scratch-dispose") {
+      const logger = (git as unknown as { log: ReturnType<typeof nullLogger> }).log;
+      t.mock.method(logger, "warn", (message: string) => { warnings.push(message); });
+      t.mock.method(runLogger, "warn", (message: string) => { warnings.push(message); });
+      if (mode === "failed-retired-append") {
+        // Fail only the retired append; seeding and all physical cleanup stay real.
+        const ledger = git as unknown as {
+          appendAttemptLedger(bare: string, branch: string, entry: { state: string }): Promise<void>;
+        };
+        const append = ledger.appendAttemptLedger.bind(ledger);
+        t.mock.method(ledger, "appendAttemptLedger", async (...args: Parameters<typeof append>) => {
+          if (args[2].state === "retired") {
+            internalFaults++;
+            throw new Error("injected retired ledger append failure");
+          }
+          return append(...args);
+        });
+      } else {
+        const holdingRoot = path.join(fx.dataDir, "runner-quarantine");
+        if (mode === "failed-scratch-dispose") {
+          // Model the cross-device holding move, retaining the actual intra-device rename.
+          const rename = fs.rename.bind(fs);
+          t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+            if (String(args[1]).startsWith(holdingRoot + path.sep))
+              throw Object.assign(new Error("cross-device holding move"), { code: "EXDEV" });
+            return rename(...args);
+          });
+        }
+        const rm = fs.rm.bind(fs);
+        t.mock.method(fs, "rm", async (...args: Parameters<typeof rm>) => {
+          const target = String(args[0]);
+          const disposal = mode === "failed-holding-dispose"
+            ? target.startsWith(holdingRoot + path.sep)
+            : path.dirname(target) === path.join(fx.dataDir, "runner") && path.basename(target).startsWith(".retire-");
+          if (disposal) {
+            internalFaults++;
+            throw new Error("injected retirement disposal failure");
+          }
+          return rm(...args);
+        });
+      }
+    }
     const ackStarted = deferred(), releaseAck = deferred();
     if (mode === "late-fence") {
       const ack = client.ackInputs.bind(client);
@@ -100,7 +145,7 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
           return { complete: mode !== "failed-reap", killed: [], left: [] };
         },
       },
-    }), fakeGitlab().gitlab, undefined, nullLogger(), {
+    }), fakeGitlab().gitlab, undefined, runLogger, {
       ...(mode === "canonical" ? {} : { dockerHost: "http://unused.invalid" }),
       ...(mode === "failed-skills" ? { teardownTestDeps: { removeTreePinned: async () => { throw new Error("skills cleanup failed"); } } } : {}),
       quiesceRun: async () => ({
@@ -126,6 +171,19 @@ for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "
         assert.ok(expected, "real attempt onSeeded ran");
         assert.deepEqual(await tail, expected);
       } else assert.equal(await tail, undefined);
+      if (mode === "failed-retired-append" || mode === "failed-holding-dispose" || mode === "failed-scratch-dispose") {
+        assert.equal(internalFaults, 1, "actual retirement reached the injected internal failure once");
+        if (mode === "failed-retired-append") {
+          assert.ok(warnings.includes("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later"));
+          assert.deepEqual(await fs.readdir(path.join(fx.dataDir, "runner-quarantine")), [], "ledger failure still disposes holding");
+        } else if (mode === "failed-holding-dispose") {
+          assert.ok(warnings.includes("retireRunnerClone: holding dispose failed"));
+          assert.equal((await fs.readdir(path.join(fx.dataDir, "runner-quarantine"))).length, 1);
+        } else {
+          assert.equal((await fs.readdir(path.join(fx.dataDir, "runner"))).filter(name => name.startsWith(".retire-")).length, 1);
+        }
+        assert.ok(!warnings.includes("runner clone cleanup failed"), "helper still resolves after its internal failure");
+      }
       assert.equal(tails.has(claim.run_id), false, "no completed registry");
     } finally {
       finish.resolve();
@@ -205,7 +263,7 @@ for (const mode of ["fresh", "canonical", "failed-stop", "late-shutdown", "faile
       assert.equal(await secondTail, undefined, "unknown predecessors cannot be laundered");
       assert.equal(tails.has(claim.run_id), false, "no completed provenance registry");
       assert.equal(runner.isExecuting(claim.run_id), false);
-      assert.equal(paths[0]!.includes(".attempt-"), mode !== "canonical");
+      assert.equal(path.basename(paths[0]!).includes(".attempt-"), mode !== "canonical");
       if (mode !== "late-shutdown") assert.equal(executions, 2, "ordinary queued execution still proceeds");
     } finally {
       finish.resolve();

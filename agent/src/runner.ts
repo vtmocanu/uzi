@@ -4427,7 +4427,8 @@ export class RunRunner {
               flight.worktreePath!,
               flight.branch!,
               runId,
-              { discard: true, attemptId: flight.runnerClone?.attemptId },
+              { discard: true, attemptId: flight.runnerClone?.attemptId,
+                onRetirementUnproven: () => { flight.sourceJoinFailed = true; } },
             ));
             ownAttemptRetired = flight.runnerClone?.attemptId !== undefined;
           } else {
