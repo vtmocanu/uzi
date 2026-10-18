@@ -51,6 +51,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -82,6 +83,13 @@ type Store interface {
 	ListLinkedCodexAccountsForUser(ctx context.Context, userID uuid.UUID) ([]store.ListLinkedCodexAccountsForUserRow, error)
 	UpsertCodexAccountRateLimits(ctx context.Context, arg store.UpsertCodexAccountRateLimitsParams) (int64, error)
 	RecordCodexAccountPollFailure(ctx context.Context, arg store.RecordCodexAccountPollFailureParams) (int64, error)
+	GetCodexEarlyResetBaseline(ctx context.Context, arg store.GetCodexEarlyResetBaselineParams) (store.GetCodexEarlyResetBaselineRow, error)
+}
+
+// EarlyResetNotifier is the account-fenced Codex early-reset notification seam.
+// *notifysvc.Service satisfies it; the engine does not invoke it yet.
+type EarlyResetNotifier interface {
+	NotifyCodexEarlyReset(ctx context.Context, fence notifysvc.CodexAccountFence, expected, observed time.Time) (store.Notification, error)
 }
 
 // UsageCollector reads one account's usage and returns a token-free reading or a typed
@@ -111,6 +119,7 @@ type Engine struct {
 	store      Store
 	collector  UsageCollector
 	reconciler Reconciler
+	notifier   EarlyResetNotifier
 	interval   time.Duration
 	maxConc    int
 	now        func() time.Time
@@ -129,6 +138,10 @@ type Engine struct {
 	// saved is reconciled + polled out-of-band so their meters appear in seconds.
 	poke chan uuid.UUID
 }
+
+// SetNotifier sets the optional early-reset collaborator before the engine runs.
+// The collaborator is reserved for future detection and is currently unused.
+func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
 
 // New builds an Engine. interval is the poll cadence; the caller starts the engine only when
 // interval > 0 (0 disables it). logger may be nil.

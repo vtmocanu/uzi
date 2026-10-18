@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -56,6 +57,9 @@ func (s *fakeStore) ListLinkedCodexAccountsToPoll(context.Context) ([]store.List
 }
 func (s *fakeStore) ListLinkedCodexAccountsForUser(_ context.Context, u uuid.UUID) ([]store.ListLinkedCodexAccountsForUserRow, error) {
 	return s.forUser[u], nil
+}
+func (s *fakeStore) GetCodexEarlyResetBaseline(context.Context, store.GetCodexEarlyResetBaselineParams) (store.GetCodexEarlyResetBaselineRow, error) {
+	return store.GetCodexEarlyResetBaselineRow{}, pgx.ErrNoRows
 }
 func (s *fakeStore) UpsertCodexAccountRateLimits(_ context.Context, arg store.UpsertCodexAccountRateLimitsParams) (int64, error) {
 	s.mu.Lock()
