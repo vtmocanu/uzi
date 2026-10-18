@@ -411,6 +411,8 @@ export async function exerciseCIEvidenceHarness(o: CIEvidenceHarnessOptions): Pr
     metadataFence: true, outsideClone: true, noInputCloneWrites: true, modelTurns };
 }
 
+let cliStage: "configuration" | "claim" | "adapter" | "state" = "configuration";
+
 async function cli() {
   const configPath = process.argv[2] ?? process.env.UZI_CI_ARTIFACTS_CONFIG;
   const config = configPath ? JSON.parse(await fs.readFile(configPath, "utf8")) : {};
@@ -429,17 +431,29 @@ async function cli() {
     assert.equal(previous.expectedreadercontent, expected.text);
   }
   const client = new WorkerClient(url, token, "ci-artifacts-proof", nullLogger());
+  cliStage = "claim";
   const claim = await client.claimRun();
   assert.ok(claim, "real API returned no claim");
   if (previous) assert.equal(claim.run_id, previous.run_id);
+  cliStage = "adapter";
   const report = await exerciseCIEvidenceHarness({ harness, mode, home, clone, expected, claim, client,
     previousGeneration: previous?.generation ?? config.previousGeneration });
   if (previous) { assert.equal(report.sha256, previous.sha256); assert.equal(report.size, previous.size); }
+  cliStage = "state";
   if (statePath) await fs.writeFile(statePath, JSON.stringify(report) + "\n", { mode: 0o600 });
   process.stdout.write(JSON.stringify(report) + "\n");
 }
 
 // Importing the fixture is inert. Explicit CLI invocations fail closed on missing config.
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  cli().catch(() => { process.stderr.write("CI artifacts fixture failed (configuration, claim, or adapter proof)\n"); process.exitCode = 1; });
+  cli().catch((error: unknown) => {
+    // Report only fixed stages and source coordinates: assertion values, HTTP
+    // bodies and config may contain private fixture credentials or evidence.
+    const location = error instanceof Error
+      ? /ci-artifacts-repair-e2e\.ts:(\d+):(\d+)/.exec(error.stack ?? "")
+      : null;
+    const source = location ? ` fixture:${location[1]}:${location[2]}` : "";
+    process.stderr.write(`CI artifacts fixture failed stage=${cliStage}${source}\n`);
+    process.exitCode = 1;
+  });
 }
