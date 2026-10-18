@@ -10524,6 +10524,53 @@ export class GitCache {
   }
 
   /**
+   * Worker-private raw input evidence only. The caller still owns family, custody,
+   * quiescence, output and permit checks; this grants no producer authority and
+   * does not bound Git/filter input. No discovery or unsupervised fallback.
+   */
+  // @ts-expect-error TS6133: read-only precursor intentionally has no production caller yet.
+  private async maintenanceWipInput(
+    cwd: string,
+    limits: { sourceBytes?: number; sourceEntries?: number; metadataBytes?: number } = {},
+  ): Promise<{ digest: string; entries: number; bytes: number }> {
+    const sourceBytes = limits.sourceBytes ?? 64 * 1024 ** 2;
+    const sourceEntries = limits.sourceEntries ?? 16384;
+    const metadataBytes = limits.metadataBytes ?? 32 * 1024 ** 2;
+    if (!Number.isSafeInteger(sourceBytes) || sourceBytes <= 0 || sourceBytes > 64 * 1024 ** 2 ||
+        !Number.isSafeInteger(sourceEntries) || sourceEntries <= 0 || sourceEntries > 16384 ||
+        !Number.isSafeInteger(metadataBytes) || metadataBytes <= 0 || metadataBytes > 32 * 1024 ** 2)
+      throw new Error("maintenance_wip_input_refused");
+    MaintenanceResources.check();
+    const boundary = this.boundaryProcesses.getStore();
+    if (!boundary || MaintenanceResources.discoveryActive()) throw new Error("maintenance_wip_input_refused");
+    boundary.signal.throwIfAborted();
+    // Reserve the entire child envelope before dispatch; failure/EOF never refunds.
+    MaintenanceResources.consume("sourceBytes", sourceBytes);
+    MaintenanceResources.consume("sourceEntries", sourceEntries);
+    MaintenanceResources.consume("metadataBytes", metadataBytes);
+    MaintenanceResources.consume("adminEntries", 256);
+    try {
+      const result = await this.execScoped(process.execPath,
+        ["-e", MAINTENANCE_WIP_INPUT_HELPER, cwd, String(sourceBytes), String(sourceEntries), String(metadataBytes)], {
+          cwd: "/", env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
+          timeout: 30000, maxBuffer: 256,
+        }, "command");
+      MaintenanceResources.check();
+      boundary.signal.throwIfAborted();
+      if (!/^[a-f0-9]{64} [0-9]+ [0-9]+\n$/.test(result.stdout) || result.stderr)
+        throw new Error("maintenance_wip_input_refused");
+      const [digest, entriesText, bytesText] = result.stdout.trim().split(" ");
+      const entries = Number(entriesText), bytes = Number(bytesText);
+      if (!Number.isSafeInteger(entries) || entries < 1 || entries > sourceEntries ||
+          !Number.isSafeInteger(bytes) || bytes < 0 || bytes > sourceBytes)
+        throw new Error("maintenance_wip_input_refused");
+      return { digest: digest!, entries, bytes };
+    } catch {
+      throw new Error("maintenance_wip_input_refused");
+    }
+  }
+
+  /**
    * Issue #281 / CodeRabbit #655: the porcelain read for the no-progress detector's
    * worktree fingerprint. Identical git invocation and runner-uid rationale as
    * planChangedFiles, but returns `null` on a failed read instead of `[]`, so an
@@ -14467,6 +14514,186 @@ export class GitCache {
     return result;
   }
 }
+
+// A single read-only Linux child. Attempts, raw directory rows (including EOF),
+// names, link capacity and file read requests debit the reserved envelope BEFORE
+// IO/allocation. One refusal aborts the whole walk; depth, entries, bytes and the
+// existing 28s/30s helper/owner deadlines bound all loops.
+const MAINTENANCE_WIP_INPUT_HELPER = String.raw`
+const fs = require("node:fs");
+const { createHash } = require("node:crypto");
+const { isUtf8 } = require("node:buffer");
+const C = fs.constants, O_PATH = 0x200000;
+const [root, byteText, entryText, metadataText] = process.argv.slice(1);
+const byteLimit = Number(byteText), entryLimit = Number(entryText), metadataLimit = Number(metadataText);
+const deadline = Date.now() + 28000, fds = new Set(), ancestors = [], records = [];
+let bytes = 0, entries = 0, metadata = 0, admin = 0, administrative = true;
+const frames = [];
+function refuse() { throw Error("refused"); }
+function check() { if (Date.now() >= deadline) refuse(); }
+function debit(n) { check(); if (n > byteLimit - bytes) refuse(); bytes += n; }
+function row() { check(); if (entries >= entryLimit) refuse(); entries++; }
+// Capacities include retained records, UTF-16 strings and JSON escaping.
+// No refunds on EOF or failure. All source revisits share row().
+function meta(n) { check(); if (n > metadataLimit - metadata) refuse(); metadata += n; }
+function visit() {
+  if (!administrative) return row();
+  check(); if (admin >= 256) refuse(); admin++;
+}
+function childPath(parent, leaf) {
+  meta(8448); // Reserve worst-case path capacity BEFORE constructing the string.
+  const p = fp(parent) + "/" + leaf;
+  if (Buffer.byteLength(p) > 4096) refuse();
+  return p;
+}
+function fstat(fd) { visit(); meta(2048); return fs.fstatSync(fd, { bigint: true }); }
+function fp(fd) { meta(256); return "/proc/" + process.pid + "/fd/" + fd; }
+function open(p, flags) { visit(); meta(256); const fd = fs.openSync(p, flags); fds.add(fd); return fd; }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function stat(p) { visit(); meta(2048); return fs.lstatSync(p, { bigint: true }); }
+function same(a, b) {
+  if (["dev", "ino", "size", "mode", "mtimeNs", "ctimeNs"].some(k => a[k] !== b[k])) refuse();
+}
+function sameIdentity(a, b) {
+  if (["dev", "ino", "mode"].some(k => a[k] !== b[k])) refuse();
+}
+function name(raw) {
+  if (raw.length > 255 || !isUtf8(raw)) refuse();
+  meta(1024);
+  const s = raw.toString("utf8");
+  if (!s || s === "." || s === ".." || /[/\\\x00-\x1f\x7f]/.test(s)) refuse();
+  return s;
+}
+function frame(...parts) {
+  meta(1024 + 24 * parts.reduce((n, p) => n + (typeof p === "string" ? p.length : 32), 0));
+  frames.push(JSON.stringify(parts) + "\n");
+}
+function directory(parent, leaf, lookupOnly = false) {
+  const p = childPath(parent, leaf), before = stat(p);
+  // Ancestors require lookup authority only; read authority is checked in the source walk.
+  const fd = open(p, lookupOnly ? O_PATH | C.O_NOFOLLOW : C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW | C.O_NONBLOCK);
+  const opened = fstat(fd);
+  if (!opened.isDirectory()) refuse();
+  (lookupOnly ? sameIdentity : same)(before, opened);
+  return fd;
+}
+function walk(fd, relative, depth) {
+  check(); if (depth > 64) refuse();
+  const before = fstat(fd);
+  if (!before.isDirectory()) refuse();
+  visit(); meta(4096); // Directory handle and initial raw-name capacity.
+  const stream = fs.opendirSync(fp(fd), { encoding: "buffer", bufferSize: 1 });
+  const children = [];
+  try {
+    while (true) {
+      row(); // Raw read, including ignored entries, root .git and EOF.
+      // Linux dirent names are at most 255 bytes; reserve even the EOF probe.
+      debit(255); meta(1536);
+      const ent = stream.readSync();
+      if (!ent) break;
+      const raw = ent.name;
+      meta(8448); // Relative path and retained row capacity before concatenation.
+      const leaf = name(raw), rel = relative ? relative + "/" + leaf : leaf;
+      if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64) refuse();
+      const p = childPath(fd, leaf), beforeLeaf = stat(p);
+      if (leaf.toLowerCase() === ".git") {
+        if (relative || leaf !== ".git" || (!beforeLeaf.isFile() && !beforeLeaf.isDirectory())) refuse();
+        children.push([leaf, beforeLeaf]);
+        frame(rel, "metadata"); // Count but never traverse/read root metadata.
+        continue;
+      }
+      records.push([rel, beforeLeaf]);
+      children.push([leaf, beforeLeaf]);
+      if (beforeLeaf.isDirectory()) {
+        frame(rel, "directory", String(beforeLeaf.mode));
+        const child = directory(fd, leaf);
+        try { walk(child, rel, depth + 1); } finally { close(child); }
+      } else if (beforeLeaf.isSymbolicLink()) {
+        // Linux readlink capacity, charged before its internal buffer allocation.
+        debit(4096);
+        const target = fs.readlinkSync(p, { encoding: "buffer" });
+        if (target.length > 4096 || BigInt(target.length) !== beforeLeaf.size) refuse();
+        same(beforeLeaf, stat(p));
+        meta(16384); // Hex conversion capacity before allocation.
+        frame(rel, "symlink", target.toString("hex"));
+      } else if (beforeLeaf.isFile()) {
+        const file = open(p, C.O_RDONLY | C.O_NOFOLLOW | C.O_NONBLOCK);
+        try {
+          const opened = fstat(file);
+          same(beforeLeaf, opened);
+          if (!opened.isFile() || opened.size > BigInt(byteLimit - bytes)) refuse();
+          const content = createHash("sha256");
+          let n = 0;
+          const size = Number(opened.size);
+          while (true) {
+            const request = Math.min(65536, size + 1 - n);
+            debit(request); // Includes short reads and the EOF/growth sentinel.
+            const buf = Buffer.alloc(request);
+            const got = fs.readSync(file, buf, 0, request, null);
+            n += got;
+            if (n > size) refuse();
+            if (!got) break;
+            content.update(buf.subarray(0, got));
+          }
+          if (n !== size) refuse();
+          same(opened, fstat(file));
+          same(opened, stat(p));
+          frame(rel, "file", String(opened.mode), size, content.digest("hex"));
+        } finally { close(file); }
+      } else refuse();
+    }
+  } finally { stream.closeSync(); }
+  if (["HEAD", "objects", "refs"].every(n => children.some(([leaf]) => leaf === n))) refuse();
+  for (const [leaf, observed] of children) same(observed, stat(childPath(fd, leaf)));
+  same(before, fstat(fd));
+}
+try {
+  if (process.platform !== "linux" || !root.startsWith("/") || Buffer.byteLength(root) > 4096 ||
+      !Number.isSafeInteger(byteLimit) || byteLimit <= 0 || byteLimit > 67108864 ||
+      !Number.isSafeInteger(entryLimit) || entryLimit <= 0 || entryLimit > 16384 ||
+      !Number.isSafeInteger(metadataLimit) || metadataLimit <= 0 || metadataLimit > 33554432) refuse();
+  meta(32768); // Root split, component buffers and ancestor storage capacity.
+  const components = root.slice(1).split("/");
+  if (components.length > 64) refuse();
+  let fd = open("/", O_PATH | C.O_NOFOLLOW);
+  for (const component of components) {
+    name(Buffer.from(component));
+    const next = directory(fd, component, true);
+    ancestors.push([fd, component, fstat(next)]);
+    fd = next;
+  }
+  const rootBefore = fstat(fd);
+  administrative = false;
+  walk(fd, "", 0);
+  // Revalidation spends the same cumulative source-entry and metadata budgets.
+  // One refusal aborts; only one path's descriptors are live at a time.
+  for (const [rel, observed] of records) {
+    meta(32768);
+    const parts = rel.split("/");
+    let parent = fd;
+    const owned = [];
+    try {
+      for (const part of parts.slice(0, -1)) {
+        parent = directory(parent, part); owned.push(parent);
+      }
+      same(observed, stat(childPath(parent, parts.at(-1))));
+    } finally { for (const child of owned.reverse()) close(child); }
+  }
+  same(rootBefore, fstat(fd));
+  administrative = true;
+  // Sibling changes above the source do not alter its named mapping. Source namespace
+  // and content retain the full before/after checks above.
+  for (const [parent, leaf, observed] of ancestors) sameIdentity(observed, stat(childPath(parent, leaf)));
+  check();
+  const hash = createHash("sha256");
+  for (const frame of frames.sort()) { check(); hash.update(frame); }
+  process.stdout.write(hash.digest("hex") + " " + entries + " " + bytes + "\n");
+} catch {
+  process.exitCode = 1; // Fixed diagnostic only; never echo an OS error or path.
+} finally {
+  for (const fd of fds) { try { fs.closeSync(fd); } catch { process.exitCode = 1; } }
+}
+`;
 
 // Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
 // bytes; no target traversal, Git, config, filters or writes. One failed path aborts
