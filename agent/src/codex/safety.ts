@@ -1,4 +1,4 @@
-import { checkCheckpointStop, CheckpointUnsafeCleanupError, waitCheckpointAdmission } from "../checkpoint-stop.js";
+import { checkCheckpointStop, CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, waitCheckpointAdmission } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 1, first unit): the `CodexExecutionSafety` facade and
 // the trusted boundary-action lane.
 //
@@ -341,11 +341,26 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     let release!: () => void;
     const held = new Promise<void>((res) => { release = res; });
     this.queueTail = prior.then(() => held);
+    let admissionExpired = false;
     try {
       try {
-        await MaintenanceBudget.waitFor(waitCheckpointAdmission(prior, request.checkpointStop));
+        if (this.reconcileBeforeBoundary && request.checkpointStop) {
+          // A cancelled queue slot cannot certify source cleanup. Keep credential
+          // reconciliation behind its predecessor, bounded by the original deadline.
+          let cancel = () => {};
+          try {
+            await MaintenanceBudget.waitFor(Promise.race([prior, new Promise<never>((_resolve, reject) => {
+              cancel = (this.seams.armDeadline ?? defaultArmDeadline)(request, remainingMs(deadlineAt), () => {
+                admissionExpired = true;
+                reject(new Error("codex source admission deadline expired"));
+              });
+            })]));
+          } finally { cancel(); }
+        } else {
+          await MaintenanceBudget.waitFor(waitCheckpointAdmission(prior, request.checkpointStop));
+        }
       } catch (error) {
-        if (this.registry.isPoisoned() || Date.now() >= deadlineAt || request.gracefulShutdownCheckpoint?.stopSignal.aborted) {
+        if (this.registry.isPoisoned() || admissionExpired || Date.now() >= deadlineAt || request.gracefulShutdownCheckpoint?.stopSignal.aborted) {
           const errors: readonly HarnessError[] = this.registry.isPoisoned() ? this.registry.poisonErrors()
             : request.gracefulShutdownCheckpoint?.stopSignal.aborted
               ? [{ category: "authorization", message: "codex shutdown checkpoint authority revoked" }]
@@ -433,7 +448,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       if (!stopSignal?.aborted) return;
       const errors: readonly HarnessError[] = [{ category: "authorization", message: "codex shutdown checkpoint authority revoked" }];
       this.registry.poison(errors);
-      throw new CodexBoundaryError(stage, errors, undefined, undefined, { boundary: request.boundary });
+      throw new CodexBoundaryError(stage, errors, undefined, undefined, {
+        boundary: request.boundary, sink: request.sink, step: readStep(request),
+      });
     };
     // Issue #1864: every boundary failure names the boundary and sink it happened at.
     const where = { boundary: request.boundary, ...(request.sink !== undefined ? { sink: request.sink } : {}) };
@@ -466,6 +483,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(errors);
       throw new CodexBoundaryError(stage, errors, undefined, undefined, where);
     };
+    let stage: "reconcile" | "quiesce" | "reap" | "action" = "reconcile";
     try {
     // (1.5) PRD #1171 m4: per-sink auth-mode reconciliation, AFTER the serialization queue
     // (in withBoundary) and BEFORE quiesce/reap/mint. A subscription run refreshes + durably
@@ -488,6 +506,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       checkCheckpointStop(request.checkpointStop);
     }
 
+    stage = "quiesce";
     // (2) Quiesce child admission. Must be fully quiescent or the sink is uncalled.
     requireRemaining("quiesce");
     checkCheckpointStop(request.checkpointStop);
@@ -505,6 +524,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
 
     // (3) Reap every registered root. Must be observed-empty AND carry the SAME
     // epoch we just quiesced at; a mismatch means a stale/foreign permit domain.
+    stage = "reap";
     const r = await this.seams.reap({ ...request, deadlineMs: remainingMs(deadlineAt) }, epoch);
     if (r.kind !== "observed_empty" || r.epoch !== epoch) {
       const errors: readonly HarnessError[] =
@@ -526,6 +546,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // holding it. The permit/closed epoch is held through the full async action and
     // every boundary-action child; release only after actual settlement. The action
     // consumes permit.signal rather than being raced and abandoned at the deadline.
+    stage = "action";
     const permit = mintPermit(epoch, request.boundary, boundarySignal);
     this.heldPermit = permit;
     this.currentDeadlineAt = deadlineAt;
@@ -580,12 +601,29 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         this.registry.poisonErrors(),
         outcome.ok ? undefined : outcome.error,
         undefined,
-        firedStep !== undefined ? { ...where, step: firedStep } : where,
+        { ...where, step: firedStep ?? readStep(request) },
       );
     }
     if (!outcome.ok) throw outcome.error;
     checkCheckpointStop(request.checkpointStop);
     return outcome.value;
+    } catch (error) {
+      if (error instanceof CheckpointSoftDeadlineError) {
+        // Soft is a clean-stop certificate, never a way around source poison,
+        // hard expiry or revoked authority. Preserve the primary and cleanup evidence.
+        let revoked = stopSignal?.aborted === true;
+        try { checkCheckpointStop(request.checkpointStop); }
+        catch (stopError) { if (!(stopError instanceof CheckpointSoftDeadlineError)) revoked = true; }
+        const expired = boundarySignal.aborted || remainingMs(deadlineAt) <= 0 ||
+          (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
+        if (this.registry.isPoisoned() || revoked || expired) {
+          if (revoked) this.registry.poison({ category: "authorization", message: "codex shutdown checkpoint authority revoked" });
+          else if (expired) this.registry.poison({ category: "timeout", message: "codex boundary deadline expired during soft stop" });
+          throw new CodexBoundaryError(stage, this.registry.poisonErrors(), error, undefined,
+            { ...where, step: firedStep ?? readStep(request) });
+        }
+      }
+      throw error;
     } finally {
       cancelDeadline();
     }

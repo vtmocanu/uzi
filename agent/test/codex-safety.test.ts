@@ -2,7 +2,7 @@ import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import * as codexLauncher from "../src/codex/launcher.js";
-import { WorkerClient, CodexRequestFailure } from "../src/client.js";
+import { WorkerClient, CodexRequestFailure, RequestError } from "../src/client.js";
 import { GitCache, CheckpointSoftDeadlineError } from "../src/git.js";
 import { createRunLaneInstallerReconcile, buildRunLaneReconcile } from "../src/codex/codex-executor.js";
 import { nullLogger } from "./helpers.js";
@@ -1702,6 +1702,43 @@ describe("m1 cooperative safety admission", () => {
       return true;
     });
   });
+  it("uses the injected hard clock while source certification waits behind its predecessor", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3140));
+    const entered = defer<void>(), release = defer<void>();
+    let fireQueue: (() => void) | undefined;
+    let reconciles = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam,
+      async () => { reconciles++; return { kind: "ready" }; },
+      undefined, undefined,
+      (request, _ms, fire) => {
+        if (request.checkpointStop) fireQueue = fire;
+        return () => {};
+      });
+    const active = safety.withBoundary(req("checkpoint"), async () => {
+      entered.resolve(); await release.promise;
+    });
+    const activeChecked = assert.rejects(active, CodexBoundaryError);
+    await entered.promise;
+    const stop = new AbortController(); stop.abort();
+    const queued = safety.withBoundary({ boundary: "checkpoint", sink: "done_checkpoint",
+      deadlineMs: 30_000, activeStep: () => "checkpoint_lock_wait",
+      checkpointStop: { signal: stop.signal } }, async () => assert.fail("queued action ran"));
+    const checked = assert.rejects(queued, (error: unknown) => {
+      assert.ok(error instanceof CodexBoundaryError);
+      assert.equal(error.stage, "reconcile");
+      assert.equal(error.errors[0]?.category, "timeout");
+      assert.equal(error.sink, "done_checkpoint");
+      assert.equal(error.step, "checkpoint_lock_wait");
+      return true;
+    });
+    assert.ok(fireQueue, "queue acquisition must use the injected hard clock");
+    fireQueue();
+    await checked;
+    assert.equal(reconciles, 1, "queued source checks cannot overtake the active predecessor");
+    assert.equal(reg.isPoisoned(), true);
+    release.resolve(); await activeChecked;
+  });
+
   it("forfeits a queued boundary while retaining the active predecessor in the tail", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(3123));
     const safety = createCodexExecutionSafety(reg, spawnCounter().seam);
@@ -1869,9 +1906,153 @@ it("m1 cancellation during natural-exit reap closes streams only after the singl
   assert.equal(reaps, 1); assert.equal(disposals, 1); assert.equal(reg.isPoisoned(), false);
 });
 
+for (const outcome of ["settled", "unsafe", "vault", "hard"] as const) {
+  it("m1 actual boundary certifies stopped installer admission: " + outcome, async () => {
+    const lifecycle = new AbortController(), stop = new AbortController();
+    const selected = selectCodexBinding({ codex: { auth_mode: "api_key", access_token: "fixture-token", capability: "fixture-cap" } });
+    if (selected.kind !== "codex") assert.fail("binding");
+    const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+      runId: "run-1", binding: selected.binding,
+      client: { releaseCodex: async () => assert.fail("no release"), refreshCodex: async () => assert.fail("no refresh") },
+      registerToken: () => assert.fail("no token"), isVaultLocked: () => outcome === "vault",
+    });
+    const settlement = defer<{ results: []; truncated: boolean }>();
+    let rejectInstall!: (error: Error) => void;
+    installer.promise = Promise.race([settlement.promise, new Promise<never>((_resolve, reject) => { rejectInstall = reject; })]);
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3127));
+    let fire!: () => void;
+    const safety = new CodexExecutionSafetyImpl(reg, {
+      quiesce: async () => assert.fail("no quiesce"), reap: async () => assert.fail("no reap"),
+      dispose: async () => ({ kind: "disposed" }), spawnRoot: spawnCounter().seam,
+      armDeadline: (_request, _ms, callback) => { fire = callback; return () => {}; },
+    }, installer.reconcile);
+    stop.abort();
+    let returned = false;
+    const result = safety.withBoundary({ ...req("checkpoint"), sink: "done_checkpoint",
+      checkpointStop: { signal: stop.signal } }, async () => assert.fail("no action")).finally(() => { returned = true; });
+    const checked = assert.rejects(result, (error: unknown) => {
+      if (outcome === "settled") assert.ok(error instanceof CheckpointSoftDeadlineError);
+      else {
+        assert.ok(error instanceof CodexBoundaryError);
+        assert.equal(error.stage, "reconcile");
+        assert.equal(error.sink, "done_checkpoint");
+        if (outcome === "vault") assert.equal(error.deferral, "vault_locked");
+      }
+      return true;
+    });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(installer.abort.signal.aborted, true);
+    assert.equal(returned, false);
+    if (outcome === "unsafe") rejectInstall(new Error("installer cleanup unverified"));
+    else if (outcome === "hard") fire();
+    else settlement.resolve({ results: [], truncated: false });
+    await checked;
+    if (outcome === "hard") { settlement.resolve({ results: [], truncated: false }); await installer.promise; }
+    assert.equal(reg.isPoisoned(), outcome !== "settled");
+  });
+}
+
+it("m1 genuine stopped source stays behind its credential predecessor and ahead of its successor", async () => {
+  const lifecycle = new AbortController(), stop = new AbortController();
+  const selected = selectCodexBinding({ codex: { auth_mode: "api_key", access_token: "fixture-token", capability: "fixture-cap" } });
+  if (selected.kind !== "codex") assert.fail("binding");
+  const entered = defer<void>(), release = defer<void>();
+  let calls = 0, live = 0, reconciles = 0;
+  const installer = createRunLaneInstallerReconcile(lifecycle.signal, {
+    runId: "run-1", binding: selected.binding,
+    client: { releaseCodex: async () => {
+      calls++; live++;
+      assert.equal(live, 1);
+      if (calls === 1) { entered.resolve(); await release.promise; }
+      live--;
+      return { auth_mode: "api_key", access_token: "fixture-token" };
+    }, refreshCodex: async () => assert.fail("no refresh") },
+    registerToken: () => {},
+  });
+  const reg = new ExecutionRegistry(newLocalExecutionEpoch(3129));
+  const safety = createCodexExecutionSafety(reg, spawnCounter().seam, async (...args) => {
+    reconciles++; return installer.reconcile(...args);
+  });
+  const first = safety.withBoundary(req("checkpoint"), async () => {});
+  await entered.promise;
+  const stopped = safety.withBoundary({ ...req("checkpoint"), checkpointStop: { signal: stop.signal } },
+    async () => assert.fail("no stopped action"));
+  const checked = assert.rejects(stopped, CheckpointSoftDeadlineError);
+  const last = safety.withBoundary(req("checkpoint"), async () => {});
+  stop.abort();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(reconciles, 1, "source checks cannot overlap credential work");
+  assert.equal(calls, 1);
+  release.resolve();
+  await Promise.all([first, checked, last]);
+  assert.equal(reconciles, 3);
+  assert.equal(calls, 2, "stopped source never sends credentials");
+  assert.equal(reg.isPoisoned(), false);
+});
+
+for (const stage of ["reconcile", "quiesce", "reap", "action"] as const) {
+  for (const refusal of ["poison", "hard", "lifecycle", "authority"] as const) {
+    it("m1 soft escape is guarded at " + stage + " against " + refusal, async () => {
+      const reg = new ExecutionRegistry(newLocalExecutionEpoch(3130));
+      const stop = new AbortController(), lifecycle = new AbortController(), authority = new AbortController();
+      let fire!: () => void;
+      const primary = new CheckpointSoftDeadlineError();
+      const fail = () => {
+        if (refusal === "poison") reg.poison({ category: "protocol", message: "source cleanup failed" });
+        if (refusal === "hard") fire();
+        if (refusal === "lifecycle") lifecycle.abort();
+        if (refusal === "authority") authority.abort();
+        stop.abort();
+        throw primary;
+      };
+      const safety = new CodexExecutionSafetyImpl(reg, {
+        armDeadline: (_request, _ms, callback) => { fire = callback; return () => {}; },
+        quiesce: async () => { if (stage === "quiesce") fail(); return { kind: "quiescent", epoch: 3130 }; },
+        reap: async () => { if (stage === "reap") fail(); return { kind: "observed_empty", evidence: "supervisor_echild", epoch: 3130 }; },
+        dispose: async () => ({ kind: "disposed" }), spawnRoot: spawnCounter().seam,
+      }, async () => { if (stage === "reconcile") fail(); return { kind: "ready" }; });
+      const common = { deadlineMs: 1000, sink: "done_checkpoint" as const,
+        activeStep: () => "checkpoint_lock_wait" as const, checkpointStop: { signal: stop.signal, lifecycleSignal: lifecycle.signal } };
+      const request: BoundaryRequest = refusal === "authority"
+        ? { ...common, boundary: "shutdown", gracefulShutdownCheckpoint: { stopSignal: authority.signal, deadlineAt: Date.now() + 1000 } }
+        : { ...common, boundary: "checkpoint" };
+      await assert.rejects(safety.withBoundary(request, async () => { assert.equal(stage, "action"); fail(); }), (error: unknown) => {
+        assert.ok(error instanceof CodexBoundaryError);
+        assert.equal(error.stage, stage);
+        assert.equal(error.actionError, primary);
+        assert.equal(error.sink, "done_checkpoint");
+        assert.equal(error.step, "checkpoint_lock_wait");
+        assert.equal(reg.isPoisoned(), true);
+        return true;
+      });
+    });
+  }
+}
+
+it("m1 reconcile soft escape preserves poison evidence and primary error", async () => {
+  const reg = new ExecutionRegistry(newLocalExecutionEpoch(3128));
+  const stop = new AbortController();
+  const primary = new CheckpointSoftDeadlineError();
+  const evidence = { category: "protocol" as const, message: "source refused" };
+  const safety = createCodexExecutionSafety(reg, spawnCounter().seam, async () => {
+    reg.poison(evidence); stop.abort(); throw primary;
+  });
+  await assert.rejects(safety.withBoundary({ ...req("checkpoint"), sink: "done_checkpoint",
+    activeStep: () => "checkpoint_lock_wait", checkpointStop: { signal: stop.signal } },
+  async () => assert.fail("no action")), (error: unknown) => {
+    assert.ok(error instanceof CodexBoundaryError);
+    assert.equal(error.stage, "reconcile");
+    assert.equal(error.sink, "done_checkpoint");
+    assert.equal(error.step, "checkpoint_lock_wait");
+    assert.equal(error.actionError, primary);
+    assert.deepEqual(error.errors, [evidence]);
+    return true;
+  });
+});
+
 for (const refusal of ["vault", "account", "response", "lifecycle", "stale"] as const) {
   it("m1 soft admission preserves " + refusal + " refusal", async () => {
-    const subscription = refusal === "stale";
+    const subscription = refusal === "stale" || refusal === "account";
     const selected = selectCodexBinding({ codex: subscription
       ? { auth_mode: "subscription", access_token: "fixture-token", capability: "fixture-cap", generation: 3,
         chatgpt_account_id: "fixture-account", chatgpt_plan_type: null }
@@ -1881,11 +2062,20 @@ for (const refusal of ["vault", "account", "response", "lifecycle", "stale"] as 
     if (["vault", "lifecycle", "stale"].includes(refusal)) stop.abort();
     if (refusal === "lifecycle") lifecycle.abort();
     const client = new WorkerClient("http://fixture.invalid", "fixture-token", "test", nullLogger());
-    client.releaseCodex = async () => { stop.abort(); throw new CodexRequestFailure("response"); };
+    client.releaseCodex = async () => {
+      stop.abort();
+      throw new CodexRequestFailure("response");
+    };
+    client.refreshCodex = async () => {
+      stop.abort();
+      throw new RequestError("POST", "/fixture", 409, JSON.stringify({ reason: "codex_account_unavailable" }));
+    };
     const reconcile = buildRunLaneReconcile("run-1", client, selected.binding, () => assert.fail("no token"),
-      { value: subscription ? 2 : undefined }, () => refusal === "vault", lifecycle.signal);
+      { value: refusal === "stale" ? 2 : subscription ? 3 : undefined }, () => refusal === "vault", lifecycle.signal);
     // A shutdown label alone never exempts the ordinary lifecycle fence.
     const request = { ...req(refusal === "lifecycle" ? "shutdown" : "checkpoint"), checkpointStop: { signal: stop.signal } };
-    assert.equal((await reconcile(request, new AbortController().signal)).kind, "blocked");
+    const outcome = await reconcile(request, new AbortController().signal);
+    assert.equal(outcome.kind, "blocked");
+    if (refusal === "account" && outcome.kind === "blocked") assert.equal(outcome.deferral, "account_unavailable");
   });
 }

@@ -219,6 +219,48 @@ it("m1 snapshot metadata and ref creation settle and release their fence before 
   } finally { f.fx.cleanup(); }
 });
 
+for (const mode of ["done", "milestone", "bridge"] as const) {
+  it("m1 " + mode + " preserves CAS refusal and pending anchors after soft stop", async () => {
+    const f = await fixture();
+    try {
+      const first = f.commit("first"); await f.fetch();
+      const incoming = f.commit("CAS refusal");
+      if (mode === "bridge") git(f.bare, "-c", "protocol.file.allow=always",
+        "fetch", "--no-tags", f.clone, "refs/heads/" + branch);
+      const stop = new AbortController();
+      let failed = false, laterGit = 0;
+      const spawnReal = realSpawner();
+      const spawner: BoundaryProcessSpawner = async request => {
+        if (failed) laterGit++;
+        if (request.argv.includes("update-ref") && request.argv.includes("refs/uzi-runner/" + branch)) {
+          assert.equal(JSON.parse(fs.readFileSync(f.receipt, "utf8")).phase, "pending");
+          failed = true; stop.abort();
+          // Force a real Git CAS failure without changing the tracking ref.
+          const argv = [...request.argv]; argv[argv.length - 1] = "0".repeat(40);
+          return spawnReal({ ...request, argv });
+        }
+        return spawnReal(request);
+      };
+      const result = await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+        () => mode === "bridge" ? f.cache.updateTrackingRef(f.bare, branch, incoming, f.options)
+          : f.cache.fetchAgentBranch(f.bare, f.clone, branch, run,
+            { ...f.options, checkpointImportMode: mode }), { softSignal: stop.signal });
+      assert.deepEqual(result, { kind: "not_updated", reason: "tracking_update_failed" });
+      assert.equal(failed, true);
+      assert.equal(laterGit, 0, "no optional Git work on a refused, stopped import");
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
+      assert.equal(JSON.parse(fs.readFileSync(f.receipt, "utf8")).phase, "pending");
+      for (const sha of [first, incoming]) {
+        assert.equal(git(f.bare, "rev-parse", "refs/uzi-owed/" + run + "/" + sha), sha);
+      }
+      // Pending is still refused by the real ownership reader, with no repair.
+      const pending = fs.readFileSync(f.receipt, "utf8");
+      assert.deepEqual(await f.fetch(), { kind: "not_updated", reason: "ownership_unknown" });
+      assert.equal(fs.readFileSync(f.receipt, "utf8"), pending);
+    } finally { f.fx.cleanup(); }
+  });
+}
+
 it("m1 pending ownership remains refused after a stopped unknown-owner preservation", async () => {
   const f = await fixture();
   try {
@@ -227,9 +269,10 @@ it("m1 pending ownership remains refused after a stopped unknown-owner preservat
     fs.writeFileSync(f.receipt, JSON.stringify({ ...receipt, phase: "pending" }));
     const next = f.commit("pending incoming");
     const stop = new AbortController();
-    await assert.rejects(f.cache.withBoundaryProcessSpawner(realSpawner(args => {
+    const result = await f.cache.withBoundaryProcessSpawner(realSpawner(args => {
       if (args.includes("update-ref") && args.some(a => a.startsWith("refs/uzi-owed/"))) stop.abort();
-    }), new AbortController().signal, () => f.fetch(), { softSignal: stop.signal }), CheckpointSoftDeadlineError);
+    }), new AbortController().signal, () => f.fetch(), { softSignal: stop.signal });
+    assert.deepEqual(result, { kind: "not_updated", reason: "ownership_unknown" });
     assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
     assert.equal(JSON.parse(fs.readFileSync(f.receipt, "utf8")).phase, "pending");
     assert.ok((await f.cache.enumerateOwedCandidates(f.bare, run)).some(c => c.sha === next));

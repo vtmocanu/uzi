@@ -4374,6 +4374,7 @@ export class GitCache {
     opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
     if (!opts) throw new Error("fetchAgentBranch requires trusted claim context");
     opts = this.snapshotOwedOptions(opts);
+    const checkpointScope = this.boundaryProcesses.getStore();
     const prepare = async (): Promise<void> => {
       this.checkCheckpointCooperation();
       this.validateConfirmedSha(opts.expectedCandidateSha);
@@ -4422,6 +4423,11 @@ export class GitCache {
         }
         // Ownership has settled. A stop now retains the private stage rather than
         // moving a stall into optional anchor lookup or staging cleanup.
+        if (result.kind === "not_updated") {
+          await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+          if (checkpointScope?.softSignal?.aborted ||
+              (checkpointScope?.softDeadlineAt ?? Infinity) <= Date.now()) return result;
+        }
         this.checkCheckpointCooperation();
         {
           // A refusal can leave stage as the sole anchor if metadata/pinning failed.
@@ -4438,13 +4444,18 @@ export class GitCache {
               await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
             }
           } catch (cause) {
+            if (result.kind === "not_updated" && cause instanceof CheckpointSoftDeadlineError) {
+              await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+              return result;
+            }
             const abort = this.boundaryAbortError(cause);
             if (abort) throw abort;
             if (result.kind === "updated") throw cause;
             // One cleanup attempt; a harmless stage must not erase the refusal reason.
           }
         }
-        this.checkCheckpointCooperation();
+        if (result.kind === "not_updated") await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        else this.checkCheckpointCooperation();
         return result;
       };
       return opts.checkpointImportMode === "milestone"
@@ -4576,6 +4587,10 @@ export class GitCache {
       if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
       this.checkCheckpointCooperation();
       const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      if (result.kind === "not_updated") {
+        await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        return result;
+      }
       this.checkCheckpointCooperation();
       return result;
     });
@@ -12285,9 +12300,13 @@ export class GitCache {
       { ...scope, softSignal: undefined, softDeadlineAt: undefined }, action) : action();
   }
 
-  private async withCheckpointHardOnly<T>(action: () => Promise<T>, checkBefore = true): Promise<T> {
+  private async withCheckpointHardOnly(action: () => Promise<TrackingUpdateResult>, checkBefore = true): Promise<TrackingUpdateResult> {
     if (checkBefore) this.checkCheckpointCooperation();
     const result = await this.maskCheckpointCooperation(action);
+    if (result.kind === "not_updated") {
+      await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+      return result;
+    }
     this.checkCheckpointCooperation();
     return result;
   }
@@ -12322,18 +12341,23 @@ export class GitCache {
     let child: BoundaryProcessHandle | undefined;
     let stopped = false;
     let cancellation: Promise<void> | undefined;
+    let admittingCancellation = true;
+    const cancel = (): void => {
+      if (!admittingCancellation || !child) return;
+      cancellation ??= Promise.resolve().then(() => child!.cancel());
+      void cancellation.catch(() => undefined);
+    };
     const stop = (): void => {
+      if (!admittingCancellation) return;
       stopped = true;
-      if (child) {
-        cancellation ??= Promise.resolve().then(() => child!.cancel());
-        void cancellation.catch(() => undefined);
-      }
+      cancel();
     };
     boundary.softSignal?.addEventListener("abort", stop, { once: true });
     if (boundary.softSignal?.aborted) stop();
     try {
       child = await boundary.spawn(request);
     } catch (error) {
+      admittingCancellation = false;
       boundary.softSignal?.removeEventListener("abort", stop);
       if (stopped && !(error instanceof CheckpointChildStartupTimeoutError || error instanceof CheckpointSoftDeadlineError)) {
         throw new CheckpointUnsafeCleanupError("checkpoint child startup cleanup unverified", error);
@@ -12344,6 +12368,10 @@ export class GitCache {
     const process = child;
     const completed = (async () => {
       const terminal = await Promise.allSettled([process.completed]);
+      // Close both listener and caller admission before capturing the final owner.
+      // No await may separate this closure from the cancellation snapshot.
+      admittingCancellation = false;
+      boundary.softSignal?.removeEventListener("abort", stop);
       const cancelled = await Promise.allSettled([cancellation]);
       if (cancelled[0]!.status === "rejected") {
         throw new CheckpointUnsafeCleanupError("checkpoint child cancellation cleanup unverified", cancelled[0]!.reason);
@@ -12353,10 +12381,13 @@ export class GitCache {
         throw terminal[0]!.reason;
       }
       return stopped ? { code: -1, softTimedOut: true as const } : terminal[0]!.value;
-    })().finally(() => boundary.softSignal?.removeEventListener("abort", stop));
+    })();
     void completed.catch(() => undefined);
     return { ...process, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr,
-      cancel: () => process.cancel(), completed };
+      cancel: async () => {
+        cancel();
+        await cancellation;
+      }, completed };
   }
 
   private async execScoped(
