@@ -26,7 +26,7 @@ a new declared pre-push refusal still fails rather than holding. Existing
 executor and post-push hold behavior is unchanged and can lose declaration
 intent.
 
-Deploy the additive `00342_completion_non_closing.sql` migration before the
+Deploy the additive `00343_completion_non_closing.sql` migration before the
 new API. It adds one nullable column with no backfill, default or index;
 the ALTER TABLE still takes a table lock. Retain the column on application
 rollback rather than running its destructive Down migration.

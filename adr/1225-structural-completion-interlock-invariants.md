@@ -207,7 +207,7 @@ authority and does not claim remote durability.
 
 ### Stored intent and mixed versions
 
-Migration `00342_completion_non_closing.sql` adds one nullable
+Migration `00343_completion_non_closing.sql` adds one nullable
 `runs.completion_non_closing_reason`. A completion attempt accepts
 `non_closing: {reason}`; the server strips NUL, trims, and validates 1–500
 Unicode code points, refusing invalid input rather than truncating it.
