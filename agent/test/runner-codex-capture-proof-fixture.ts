@@ -119,7 +119,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean } = {}) {
   };
   const observations = () => ({entries, returns, source, holds, pubs, acks, authDeltas, spawns:rig.processSpawns()-start});
   return {
-    rig, capture, arm, observations,
+    rig, capture, arm, observations, isActive: () => active,
     execute: async (operation: Promise<void>) => { await operation.then(() => { done = true; }, error => { done = true; throw error; }); },
     restore: () => {git.commitWipMarker=wip; git.worktreeStatus=status; client.publishCheckpoint=publish; client.reportState=report;},
     assertProof: (publication: boolean, ack = false) => {
