@@ -2191,6 +2191,8 @@ export class CodexExecutor implements Executor {
    *  cancel proves every outstanding registry even when the current safety is healthy. */
   private readonly unverifiedEpochRegistries = new Set<ExecutionRegistry>();
   private readonly ownedSummaryRegistries = new WeakSet<ExecutionRegistry>();
+  // Completed teardown selects capture-only construction; it grants no capture or normal authority.
+  private readonly verifiedDisposedCaptureFacades = new WeakMap<CodexExecutionSafetyImpl, () => boolean>();
   private captureOwners = 0;
   private unstartedLegClosed = false;
   private executionStarted = false;
@@ -2348,6 +2350,9 @@ export class CodexExecutor implements Executor {
         }
         return { kind: "incomplete", errors: drainErrors };
       }
+      // Keep the public Codex refusal marker. Only this owned acquisition may replace
+      // an exactly verified retired facade, after every outstanding registry was checked.
+      if (safety instanceof CodexExecutionSafetyImpl && this.verifiedDisposedCaptureFacades.get(safety)?.()) safety = undefined;
       if (safety === undefined) {
         if (remaining() <= 0) return incomplete("codex capture deadline expired");
         // Use precisely the production boundary adapter, with no reconcile/provider/cache lane.
@@ -4873,6 +4878,13 @@ export class CodexExecutor implements Executor {
     // Closing transports can add poison too. Disposal alone never launders it.
     registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
     if (disposeRegistry && registryClean) {
+      // Preserve the public Codex refusal marker: absence would select legacy sinks.
+      // Only a later owned capture can use this exact completed teardown to select a
+      // fresh capture-only facade; it still needs its own settlement and deadline.
+      const retiredFacade = this.epochSafeties.get(registry);
+      if (captureClean() && retiredFacade && retiredFacade === this.safety) {
+        this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
+      }
       this.unverifiedEpochRegistries.delete(registry);
       this.epochSafeties.delete(registry);
     }

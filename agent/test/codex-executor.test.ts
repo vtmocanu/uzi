@@ -20164,6 +20164,129 @@ describe("A capture lifecycle public run", () => {
       cleanup: () => fs.rm(dir, { recursive: true, force: true }) };
   }
 
+  it("A lifecycle missing facade control selects the runner's legacy action", async () => {
+    const boundaryHost = { git: { withBoundaryProcessSpawner: async (
+      _spawn: unknown, _signal: AbortSignal, action: () => Promise<void>,
+    ) => action() } } as unknown as RunRunner;
+    let actions = 0;
+    const legacy: Executor = { run: async ctx => ({ branch: ctx.branch }) };
+    await RunRunner.prototype["withCodexBoundaryOnly"].call(boundaryHost, legacy,
+      { boundary: "finalize", deadlineMs: 1000 }, async () => { actions++; });
+    assert.equal(actions, 1, "retired-facade refusal regression observes the actual legacy branch");
+  });
+
+  for (const trigger of ["pause", "human", "automatic"] as const) for (const lateCleanupFault of [false, true]) {
+    it(`A lifecycle server vault lock after drained ${trigger} capture, late cleanup fault=${lateCleanupFault}`, async () => {
+      const ready = installerBarrier();
+      const fx = await fixture([trigger === "pause"
+        ? epochResponder(thread, "tn-wait", () => ready.resolve()) : plan(1), done()]);
+      let locked = false, attempts = 0, refreshes = 0, captures = 0;
+      let generation = "", content = "";
+      let retiredRegistry: ExecutionRegistry | undefined;
+      let mode: "now" | null = null;
+      let interrupt: (() => void) | undefined;
+      const release = fx.rig.client.releaseCodex.bind(fx.rig.client);
+      fx.rig.client.releaseCodex = async (id, request) => {
+        attempts++;
+        if (locked) throw vaultLocked409("release");
+        return release(id, request);
+      };
+      fx.rig.client.refreshCodex = async () => {
+        refreshes++;
+        throw new Error("unexpected refresh after drain");
+      };
+      const capture = async () => {
+        const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          retiredRegistry = [...fx.exec["epochSafeties"]].find(([, facade]) => facade === fx.exec.safety)?.[0];
+          assert.ok(retiredRegistry, "the capture belongs to the exact live epoch");
+          generation = await fx.generation();
+          content = await fx.saved();
+          assert.match(content, /epoch-1/);
+          await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+          locked = true;
+        });
+        assert.equal(result.kind, "observed_empty");
+        mode = null;
+      };
+      const controller = new AbortController();
+      const { ctx } = makeCtx({ signal: controller.signal,
+        planApproved: trigger === "pause", approvedPlan: trigger === "pause" ? "# Approved" : undefined,
+        pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+        parkForPause: async () => { await capture(); return false; },
+        gatePlan: async () => {
+          await capture();
+          return trigger === "automatic"
+            ? { kind: "revise", feedback: "replace milestones", automatic: true, round: 1, items: [] }
+            : { kind: "revise", feedback: "replace milestones", inputId: 1 };
+        },
+      });
+      const run = fx.exec.run(ctx);
+      try {
+        if (trigger === "pause") {
+          await withTimeout(ready.promise, 3000, "turn before vault lock");
+          mode = "now"; interrupt!();
+        }
+        await assert.rejects(withTimeout(run, 5000, "vault deferred recreation"), (error: unknown) => {
+          assert.ok(error instanceof CodexCredentialDeferredError);
+          assert.equal(error.deferral, "vault_locked");
+          assert.equal(error.name, "CodexCredentialDeferredError");
+          return true;
+        });
+        assert.equal(captures, 1);
+        assert.equal(attempts, 2, "one server-discovered failing release is allowed");
+        assert.equal(fx.rig.client.releaseCalls.length, 1, "only pre-lock credentials succeeded");
+        assert.equal(fx.rig.providerLaunches(), 1);
+        assert.deepEqual(fx.rig.epochs.map(e => e.transport.turnStartCount), [1, 0]);
+        assert.deepEqual(fx.persists, fx.homes);
+        assert.deepEqual(fx.missing, []);
+        assert.equal(await fx.generation(), generation);
+        assert.equal(await fx.saved(), content);
+        let ordinaryActions = 0;
+        const boundaryHost = { git: { withBoundaryProcessSpawner: async (
+          _spawn: unknown, _signal: AbortSignal, action: () => Promise<void>,
+        ) => action() } } as unknown as RunRunner;
+        const ordinary = () => RunRunner.prototype["withCodexBoundaryOnly"].call(boundaryHost, fx.exec,
+          { boundary: "finalize", deadlineMs: 1000 }, async () => { ordinaryActions++; });
+        const refused = (error: unknown) => error instanceof CodexBoundaryError || error instanceof TrustedExecutionRefusal;
+        await assert.rejects(ordinary(), refused, "retired Codex safety must never fall through the legacy publication path");
+        assert.equal(ordinaryActions, 0);
+        assert.equal(attempts, 2);
+        assert.equal(refreshes, 0, "normal refusal cannot reconcile credentials on a retired epoch");
+        const retiredSafety = fx.exec.safety;
+        if (lateCleanupFault) retiredRegistry!.poison({ category: "tool", message: "late cleanup fault" });
+        let local = 0;
+        const captured = await fx.exec.withCredentialFreeCapture(1000, async () => {
+          local++;
+          assert.equal(await fx.saved(), content);
+          return "local-only";
+        });
+        if (lateCleanupFault) {
+          assert.equal(captured.kind, "incomplete");
+          assert.equal(local, 0, "a later poison cannot be erased by the teardown selector");
+          assert.equal(fx.exec.safety, retiredSafety);
+          assert.equal((await fx.exec.withCredentialFreeCapture(1000, async () => { local++; })).kind, "incomplete");
+          assert.equal(local, 0, "repeated refusal cannot turn old teardown into fresh proof");
+        } else {
+          assert.deepEqual(captured, { kind: "observed_empty", value: "local-only" });
+          assert.equal(local, 1);
+          assert.notEqual(fx.exec.safety, retiredSafety, "fresh capture-only facade owns capture admission");
+        }
+        await assert.rejects(ordinary(), refused, "capture-only replacement grants no normal boundary");
+        assert.equal(ordinaryActions, 0);
+        assert.equal(attempts, 2);
+        assert.equal(refreshes, 0);
+        assert.equal(fx.rig.providerLaunches(), 1);
+        assert.equal(await fx.generation(), generation);
+        assert.deepEqual(fx.missing, []);
+      } finally {
+        controller.abort(new Error("fixture cleanup"));
+        await withTimeout(run.catch(() => undefined), 5000, "vault cleanup");
+        await fx.cleanup();
+      }
+    });
+  }
+
   for (const mode of ["wall", "now"] as const) {
     it(`A lifecycle two successive ${mode} refusals capture fresh epochs`, async () => {
       const turns = [installerBarrier(), installerBarrier()];

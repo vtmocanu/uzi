@@ -518,6 +518,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // propagates it through finalize/recovery forge + worker HTTP, retry backoff and
     // message drain, while permit-owned processes consume the shrinking budget.
     requireAuthority("reconcile");
+    // This runs after the queue wait. An unusable epoch cannot reconcile credentials;
+    // refusal itself must not change poison revision or completed teardown evidence.
+    const state = this.registry.state();
+    if (state === "poisoned" || state === "disposed") {
+      throw new CodexBoundaryError("quiesce", [{ category: "protocol", message: "codex boundary refused: registry admission unavailable" }],
+        undefined, undefined, where);
+    }
     const atEntry = Math.min(remainingMs(deadlineAt),
       cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity);
     if (atEntry <= 0) {

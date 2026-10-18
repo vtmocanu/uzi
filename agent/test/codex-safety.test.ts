@@ -1720,3 +1720,56 @@ describe("M2 first-send deadline safety propagation", () => {
     assert.equal(reg.state(), "poisoned");
   });
 });
+
+describe("A normal boundaries refuse unusable registries before credentials", () => {
+  for (const state of ["poisoned", "disposed"] as const) {
+    it(`refuses ${state} before reconcile or action`, async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+      let reconciles = 0, actions = 0, quiesces = 0, reaps = 0;
+      const quiesce = registry.quiesceChildren.bind(registry);
+      const reap = registry.reapProcesses.bind(registry);
+      registry.quiesceChildren = (...args) => { quiesces++; return quiesce(...args); };
+      registry.reapProcesses = (...args) => { reaps++; return reap(...args); };
+      const spawn = spawnCounter();
+      const safety = createCodexExecutionSafety(registry, spawn.seam, async () => {
+        reconciles++;
+        return { kind: "ready" };
+      });
+      if (state === "poisoned") registry.poison({ category: "protocol", message: "prior proof refused" });
+      else assert.equal((await safety.dispose(req("terminal"))).kind, "disposed");
+      const priorErrors = registry.poisonErrors();
+      const priorQuiesces = quiesces, priorReaps = reaps;
+      await assert.rejects(safety.withBoundary(req("finalize"), async () => { actions++; }), CodexBoundaryError);
+      assert.equal(reconciles, 0, "an unusable epoch cannot release or refresh credentials");
+      assert.equal(actions, 0);
+      assert.equal(spawn.state.calls, 0);
+      assert.equal(quiesces, priorQuiesces);
+      assert.equal(reaps, priorReaps);
+      assert.equal(registry.state(), state);
+      assert.deepEqual(registry.poisonErrors(), priorErrors, "refusal does not mint fresh cleanup evidence");
+    });
+  }
+
+  it("rechecks registry state after waiting for the safety queue", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let reconciles = 0, secondActions = 0;
+    const entered = defer<void>(), release = defer<void>();
+    const safety = createCodexExecutionSafety(registry, spawnCounter().seam, async () => {
+      reconciles++;
+      return { kind: "ready" };
+    });
+    const first = safety.withBoundary(req("checkpoint"), async () => {
+      entered.resolve(undefined);
+      await release.promise;
+    });
+    await entered.promise;
+    const second = safety.withBoundary(req("finalize"), async () => { secondActions++; });
+    const outcomes = Promise.allSettled([first, second]);
+    registry.poison({ category: "protocol", message: "proof changed while queued" });
+    release.resolve(undefined);
+    const results = await outcomes;
+    assert.equal(results[1]!.status, "rejected");
+    assert.equal(reconciles, 1, "only the first usable acquisition reconciled");
+    assert.equal(secondActions, 0);
+  });
+});
