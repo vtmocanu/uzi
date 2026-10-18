@@ -3198,11 +3198,11 @@ describe("M1 composed policy guidance delivery", () => {
 
   for (const session of ["usable", "missing", "exact fresh retry"] as const)
   for (const recovered of [true, false])
-    it(`M2 unapproved frozen Stop session=${session} recovered=${recovered}`, async () => {
+    it(`M2 numeric-ceiling/no-owner-Stop negative control session=${session} recovered=${recovered}`, async () => {
       const f = await preservingFixture(true);
       try {
-        // The server retains the execution contract when an unapproved replacement is gated.
-        // Leave the gate's candidate absent so it cannot stand in for the frozen definitions.
+        // A numeric ceiling alone is not an accepted owner Stop or a feedback resolution.
+        // Keep the unapproved candidate and pending revision; no Stop input is supplied.
         Object.assign(f.claim, {
           policy_hold_fresh_session: session === "exact fresh retry",
           session_id: session === "exact fresh retry" ? null : f.thread,
@@ -3223,31 +3223,43 @@ describe("M1 composed policy guidance delivery", () => {
         }
         const { rig, running } = f.start(session === "exact fresh retry" ? 3 : 2);
         await waitFor(() => rig.transport.turnStartCount > 0 || f.api.policyHoldRequests.length > 0 ||
-          f.api.states.some(row => row.body.status === "awaiting_approval"), "Stop gate, hold, or forbidden revision", 15000);
+          f.api.states.some(row => ["awaiting_approval", "completed", "failed"].includes(String(row.body.status))),
+          "revision turn, resume rejection, or forbidden old gate/terminal state", 15000);
         // Capture observations before cancellation; cancellation legitimately closes the gate.
         const turns = rig.transport.turnStartCount;
+        const threadStarts = rig.transport.threadStartCount;
+        const resumes = rig.transport.requests.filter(row => row.method === "thread/resume");
         const revisionPrompt = JSON.stringify(rig.transport.requests.find(row => row.method === "turn/start")?.params);
         const gates = f.api.states.filter(row => row.body.status === "awaiting_approval");
         const feedbackApplied = f.api.isApplied(f.claim.run_id, 13);
         const approved = f.api.humanPlanApproved(f.claim.run_id);
         const holds = f.api.policyHoldRequests.map(row => row.body.detail);
-        if (holds.length) await withTimeout(running, 5000, "unavailable Stop source re-parks");
-        else await f.cancel(running);
-        if (turns > 0) assert.ok(revisionPrompt.includes("pending revision feedback"),
-          "the forbidden turn is revision work, rather than a new initial plan");
-        assert.equal(turns, 0, "reached frozen Stop must suppress revision startTurn before approval");
-        assert.equal(approved, false, "Stop must never infer plan approval");
-        assert.equal(feedbackApplied, false, "unexecuted revision feedback stays pending");
+        const executable = recovered && session !== "missing";
+        assert.equal(turns, executable ? 1 : 0, "numeric ceiling cannot supersede pending revision or authorize missing source/session");
+        assert.equal(approved, false, "numeric ceiling must never infer plan approval");
+        assert.equal(feedbackApplied, false, "feedback stays pending before any revised plan persistence ACK");
+        assert.equal(f.api.inputReceiptCalls.some(row => row.ids.includes(13) && row.kind !== "ack"), false,
+          "no owner Stop exists to settle or discard pending revision feedback");
         assert.equal(f.api.states.some(row => row.body.seeded_from_default), false);
         assert.equal(f.api.states.some(row => ["completed", "failed"].includes(String(row.body.status))), false);
-        if (recovered) {
-          assert.deepEqual(holds, [], "a missing session cannot block a model-free Stop gate");
-          assert.equal(gates.length, 1, "unapproved candidate must await its normal gate");
-          assert.equal(gates[0]!.body.plan_md, "persisted original plan");
+        assert.equal(gates.length, 0, "old candidate gate must not supersede pending revision");
+        if (executable) {
+          assert.ok(revisionPrompt.includes("pending revision feedback"), "revision turn must carry the matching feedback");
+          assert.deepEqual(holds, []);
+          assert.equal(threadStarts, session === "exact fresh retry" ? 1 : 0, "only exact fresh consent permits a new conversation");
+          assert.equal(resumes.length, session === "usable" ? 1 : 0);
+          if (session === "usable") assert.ok(JSON.stringify(resumes[0]!.params).includes(f.thread),
+            "revision preserves the usable conversation");
         } else {
-          assert.deepEqual(holds, ["resume_rejected"], "a session never substitutes for delivery source");
-          assert.equal(gates.length, 0);
+          assert.deepEqual(holds, ["resume_rejected"], recovered
+            ? "missing preserving session cannot use a numeric ceiling as a Stop bypass"
+            : "session availability and fresh consent never substitute for delivery source");
+          assert.equal(threadStarts, 0, "rejection cannot fall back to a fresh thread");
+          assert.equal(resumes.length, 0);
+          assert.equal(rig.providerLaunches(), 0);
         }
+        if (holds.length) await withTimeout(running, 5000, "unavailable source or session re-parks");
+        else await f.cancel(running);
       } finally { await f.cleanup(); }
     });
 
