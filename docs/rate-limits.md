@@ -187,6 +187,16 @@ same Codex account under two saved aliases, they share a single meter —
 the quota is a property of the account, not of how many times you saved its
 login.
 
+The existing default-on **Settings → Usage limits** option, *"Alert me when my
+7-day limit resets early"*, also covers Codex subscription accounts, independently
+of waiting on limits. It compares the main bucket's weekly window (604800
+seconds), once per account across saved aliases; extra buckets and other window
+lengths do not trigger it. A linked, confirmed Slack account with notifications
+enabled is required for the DM. See [Codex early-reset alerts](run-limit-wait.md#codex-subscription-accounts)
+for the strict timing and percentage thresholds, silent missing-evidence cases,
+and best-effort delivery limits. The alert only notifies; it does not resume runs
+or switch accounts.
+
 **An OpenAI API key has no subscription windows and is not metered.** Only a
 linked Codex subscription login produces a meter; an API-key-only default
 shows nothing here, and Settings says so next to the credential itself.
