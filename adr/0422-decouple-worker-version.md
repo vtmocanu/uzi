@@ -91,6 +91,16 @@ establish hosted acceptance or CI validation. The receipt baseline is clean HEAD
 | Disposable full store integration harness (`./e2e/run-store-it.sh`, scratch-backed TMPDIR) | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; 2,984 top-level tests passed, plus 5,121 subtest passes; 0 skips across 7 packages. |
 | `task test:e2e-lib && task test:forge-fake` | `e308096d64ec9905afbb7f28dd10fbfde8ae7d54` | Exit 0; forge fake reported 10 passed, 0 skipped. |
 
+The ordinary API gate unsets `UZI_TEST_DATABASE_URL` per
+[the Go rules](../.claude/rules/go.md#live-db-tests-livedb) to prevent package
+binaries racing a shared database; that gate does not establish LiveDB proof.
+The full `./e2e/run-store-it.sh` harness owns a throwaway database, sets
+`UZI_TEST_DATABASE_URL` itself and runs the listed packages serially with
+`-race -p 1 -run 'LiveDB$'` and a skip guard; named PASS evidence and zero skips
+are recorded below and in the table. `TMPDIR="$PWD/.uzi/scratch"` locates harness
+logs and inherited Go temporary files within the permitted worktree. Database
+setup, test selection and skip checks remain controlled by the harness.
+
 The gates ran serially, with no source changes during them. The implementation
 lead verified that the new blocker query and its generated code were unchanged
 since the store-harness revision. E2E sources
@@ -122,5 +132,5 @@ idle-upgrade acceptance. No expressly isolated disposable hosted worker was
 supplied; shared workers, runs and volumes were not mutated. PRD #1470 hosted
 acceptance remains unchecked; #3103 is delivered without closure pending that
 acceptance. This evidence gives no
-lost-source or shutdown-preservation guarantee. Subsequent receipt-only
-documentation does not alter tested product trees; no API embedded docs changed.
+lost-source or shutdown-preservation guarantee. The original receipt-only
+documentation commits did not alter tested product trees or API embedded docs.
