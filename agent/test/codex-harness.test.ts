@@ -5552,11 +5552,14 @@ describe("CodexHarness: error precedence + lifecycle", () => {
   it("aborts the launch and tears the root down when registry admission fails (finding 6)", async () => {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     let disposed = 0;
+    let reaps = 0;
+    let releaseReap!: (value: { ok: true }) => void;
+    const reaping = new Promise<{ ok: true }>(resolve => { releaseReap = resolve; });
     // A root whose declared kind MISMATCHES the reserved "provider" kind: the REAL registry
     // poisons and registerRoot returns { ok: false }, so ensureRoot must not proceed on it.
     const mismatchedRoot: RegisteredRoot = {
       kind: "command",
-      reap: async () => ({ ok: true }),
+      reap: () => { reaps++; return reaping; },
       dispose: async () => {
         disposed += 1;
       },
@@ -5572,12 +5575,26 @@ describe("CodexHarness: error precedence + lifecycle", () => {
       launchRoot: async () => ({ root: mismatchedRoot, transport, supervisorPid: 1 }),
     });
 
-    await assert.rejects(collect(harness.startTurn(makeRequest()).events), (err: unknown) => {
+    let finished = false;
+    const turn = collect(harness.startTurn(makeRequest()).events);
+    const rejection = assert.rejects(turn, (err: unknown) => {
       assert.ok(err instanceof CodexHarnessError);
       assert.equal(err.failure.category, "protocol");
       assert.match(err.message, /failed registry admission/);
       return true;
     });
+    void turn.then(() => { finished = true; }, () => { finished = true; });
+    try {
+      await tick();
+      assert.equal(registry.rootCount(), 1, "rejected registration retains the launched root");
+      assert.equal(registry.pendingLaunchCount(), 0, "retained root settles its reservation");
+      assert.equal(reaps, 1, "startup joins the launched root's reap");
+      assert.equal(finished, false, "startup cannot reject before owned reaping settles");
+    } finally {
+      releaseReap({ ok: true });
+      await rejection;
+    }
+    assert.equal((await registry.settleForCapture(1000)).kind, "incomplete");
     // The registry poisoned on the kind mismatch, and the just-launched root was torn down:
     // its transport was closed and it was disposed rather than left to a (dead) reap.
     assert.equal(registry.isPoisoned(), true, "the admission failure poisoned the epoch");

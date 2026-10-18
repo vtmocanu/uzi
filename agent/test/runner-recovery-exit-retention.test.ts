@@ -232,7 +232,7 @@ function credRig(iid: number, o: { generation?: number; extra?: Record<string, u
     facts = writeWorkerState(ctx.worktreePath);
     api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation as number);
     return { branch: ctx.branch };
-  }, rig.settle);
+  }, undefined, rig.capture);
   const { logger, lines } = recordingLogger();
   const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, { recoveryRetryMs: 5, ...o.extra });
   return { claim, runner, lines, worked: () => facts!, clone: () => clone, ran: () => facts !== undefined, seedHead: () => seedHead };

@@ -80,7 +80,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
     }
     factory = (runId) => {
       runHome = path.join(homeRoot, runId);
-      return { homeDir: runHome, executor: new FakeCodexExecutor(rig.safety, behavior, rig.settle) };
+      return { homeDir: runHome, executor: new FakeCodexExecutor(rig.safety, behavior, undefined, rig.capture) };
     };
   } else {
     factory = (runId) => {
