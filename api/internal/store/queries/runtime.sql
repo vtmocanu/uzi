@@ -7731,6 +7731,7 @@ SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
        COALESCE(source.generation, 0)::bigint AS source_generation,
        s.seq, s.kind,
        COALESCE(CASE WHEN char_length(s.agent) <= 128 THEN s.agent END, '')::text AS agent,
+       COALESCE(char_length(s.agent) > 128, false)::boolean AS agent_omitted,
        (s.agent IS NOT DISTINCT FROM 'lead')::boolean AS explicit_lead,
        (s.agent_instance IS NULL)::boolean AS null_lane,
        COALESCE(CASE WHEN char_length(s.agent_instance) < 128

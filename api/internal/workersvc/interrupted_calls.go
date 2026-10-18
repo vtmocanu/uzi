@@ -99,7 +99,7 @@ func interruptedCallsJSON(run, worker uuid.UUID, nonce string, generation int64,
 			groups[k] = g
 		}
 		// Attribution may reject a persisted key, but never changes its identity.
-		g.ambiguous = g.ambiguous || g.agent != r.Agent
+		g.ambiguous = g.ambiguous || r.AgentOmitted || g.agent != r.Agent
 		if r.Kind.String == "tool_use" {
 			g.uses = append(g.uses, r)
 		} else {

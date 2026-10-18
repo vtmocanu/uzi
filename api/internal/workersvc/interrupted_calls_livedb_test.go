@@ -227,6 +227,14 @@ func TestInterruptedCallsWindowLiveDB(t *testing.T) {
 		add(1, "tool_use", use("a", strings.Repeat("x", 2048)), "lead", nil, 3)
 		read(1, 3)
 	})
+	t.Run("oversized distinct attribution never settles through projection", func(t *testing.T) {
+		clear()
+		add(1, "tool_use", use("same", "echo candidate"), strings.Repeat("a", 129), "dispatch", 3)
+		add(2, "tool_result", result("same"), strings.Repeat("b", 129), "dispatch", 3)
+		if out := read(0, 3); !out.Unavailable {
+			t.Fatal(out)
+		}
+	})
 	t.Run("oversized label omitted with metadata", func(t *testing.T) {
 		clear()
 		add(1, "tool_use", use("a", "echo accepted"), "lead", nil, 3)

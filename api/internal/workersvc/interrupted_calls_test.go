@@ -188,6 +188,21 @@ func TestInterruptedCallsRoleAttribution(t *testing.T) {
 	})
 }
 
+func TestInterruptedCallsProjectedAgentOmission(t *testing.T) {
+	use := interruptedRow(1, "call")
+	use.NullLane = false
+	use.AgentInstance = "dispatch"
+	use.Agent = ""
+	use.AgentOmitted = true
+	result := use
+	result.Kind.String = "tool_result"
+	result.Seq.Int32 = 2
+	out := interruptedRead(t, use, result)
+	if len(out.Entries) != 0 || !out.Unavailable {
+		t.Fatal(out)
+	}
+}
+
 func TestInterruptedCallsProjectedLabelOmission(t *testing.T) {
 	r := interruptedRow(1, "call")
 	// SQL omits the complete oversized label and projects only this boolean.

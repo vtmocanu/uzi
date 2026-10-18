@@ -7951,6 +7951,7 @@ SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
        COALESCE(source.generation, 0)::bigint AS source_generation,
        s.seq, s.kind,
        COALESCE(CASE WHEN char_length(s.agent) <= 128 THEN s.agent END, '')::text AS agent,
+       COALESCE(char_length(s.agent) > 128, false)::boolean AS agent_omitted,
        (s.agent IS NOT DISTINCT FROM 'lead')::boolean AS explicit_lead,
        (s.agent_instance IS NULL)::boolean AS null_lane,
        COALESCE(CASE WHEN char_length(s.agent_instance) < 128
@@ -7987,6 +7988,7 @@ type InterruptedCallsWindowRow struct {
 	Seq               pgtype.Int4 `json:"seq"`
 	Kind              pgtype.Text `json:"kind"`
 	Agent             string      `json:"agent"`
+	AgentOmitted      bool        `json:"agent_omitted"`
 	ExplicitLead      bool        `json:"explicit_lead"`
 	NullLane          bool        `json:"null_lane"`
 	AgentInstance     string      `json:"agent_instance"`
@@ -8021,6 +8023,7 @@ func (q *Queries) InterruptedCallsWindow(ctx context.Context, arg InterruptedCal
 			&i.Seq,
 			&i.Kind,
 			&i.Agent,
+			&i.AgentOmitted,
 			&i.ExplicitLead,
 			&i.NullLane,
 			&i.AgentInstance,
