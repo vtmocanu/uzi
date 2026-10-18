@@ -1209,7 +1209,10 @@ describe("M1 read-only canonical retention through the public seed path", () => 
       assert.ok(opened);
       await assert.rejects(opened.read(), { code: "ERR_DIR_CLOSED" });
       assert.ok(paths.every(p => fs.readFileSync(path.join(p, "kept.txt"), "utf8") === "residue"));
-      for (const l of rec.lines.filter(l => (l as { msg?: string }).msg === warning))
+      const warnings = rec.lines.filter(l => (l as { msg?: string }).msg === warning);
+      if (kind === "recognized" || kind === "unrecognized")
+        assert.equal(warnings.length, 1, "overflow must emit one partial lower-bound warning");
+      for (const l of warnings)
         assert.equal((l as { residue: { complete: boolean } }).residue.complete, false);
       if (kind === "read failure") assert.equal(rec.lines.filter(l => (l as { msg?: string }).msg === warning).length, 0, "unknown alone never warns");
     });
