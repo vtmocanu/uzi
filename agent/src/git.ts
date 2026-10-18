@@ -2798,7 +2798,7 @@ export class GitCache {
       const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
       if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
-      await this.diagnoseRetainedArtifacts(barePath, clonePath, undefined, reseed).catch((err: unknown) => {
+      await this.diagnoseRetainedArtifacts(barePath, clonePath, undefined, reseed, warningScope).catch((err: unknown) => {
         if (reseed.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
       });
@@ -3115,6 +3115,7 @@ export class GitCache {
     canonical: string,
     seeding: string | undefined,
     predicates: Pick<AttemptSeedOptions, "isLive" | "isInterruption">,
+    warningScope?: RecoveryPhysicalWarningScope,
   ): Promise<void> {
     const attempts = { count: 0, complete: true };
     const residue = { count: 0, complete: true };
@@ -3152,7 +3153,7 @@ export class GitCache {
         if (!entry) identitiesComplete = false;
         else ledgers.set(entry.attemptId, entry);
       }
-      journaled = [...await this.journaledClonePaths(barePath)];
+      journaled = [...await this.journaledClonePaths(barePath, warningScope)];
     } catch (err) {
       interrupted(err);
       identitiesComplete = false;

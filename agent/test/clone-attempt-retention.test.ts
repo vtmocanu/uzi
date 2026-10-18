@@ -221,7 +221,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.equal(fs.existsSync(unknown), true);
   });
 
-  it("keeps at most 5 .uzi-residue-<key>.residue-<uuid> per key, oldest mtime first, only its own key's, only the pinned grammar", async () => {
+  it("retains all residue entries beyond the diagnostic threshold, including other keys and legacy names", async () => {
     const s = await keyFixture();
     const t0 = Date.UTC(2026, 0, 1) / 1000;
     const residue = [0, 1, 2, 3, 4, 5, 6].map((i) => {
@@ -246,7 +246,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.deepEqual(opts.quiescentCalls, [], "no retention proofs");
   });
 
-  it("residue: a journaled, live or not-quiescent residue is kept, and so is one the delete cannot remove (logged)", async () => {
+  it("retains journaled, live, busy and read-only residues while diagnosing excess", async () => {
     const s = await keyFixture();
     const t0 = Date.UTC(2026, 0, 1) / 1000;
     const residue = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => {
@@ -380,8 +380,8 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
 
 // ─── review round (N1–N5) ──────────────────────────────────────────────────────────────────
 
-describe("issue #1783 M2 review: retention deletions are re-validated and run as the runner uid", () => {
-  it("under the uid split every deletion is the setpriv-wrapped /bin/rm -rf -- <target>, never an in-process rm", async () => {
+describe("issue #1858: automatic retention preserves artifacts under uid split", () => {
+  it("under the uid split automatic retention requests no deletion and preserves all artifacts", async () => {
     const calls: Array<{ command: string; args: string[] }> = [];
     const rec = recordingLogger();
     git = new GitCache(
@@ -413,7 +413,7 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("refuses a symlinked attempt; unlinks a symlinked or plain-file residue entry without following it (targets untouched)", async () => {
+  it("retains symlinked attempts, symlinked residues and plain-file residues with targets untouched", async () => {
     const s = await keyFixture();
     const victim = path.join(fx.dataDir, "victim");
     fs.mkdirSync(victim);
@@ -442,7 +442,7 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
   });
 });
 
-describe("issue #1783 final: a timed-out retention rm is waited out, and an unsettled one stops the sweep", () => {
+describe("issue #1858: automatic retention never starts rm", () => {
   /** A stand-in rm child: the first spawn never exits on its own (the busybox rm still walking);
    *  later ones delete their target and exit 0. */
   function fakeRm(events: string[], onKill: (child: ChildProcess) => boolean) {
@@ -491,92 +491,7 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), retentionDelete }));
   }
 
-  it("the group kill fails and 'close' never arrives: the sweep stops, no further delete starts, the artifact is kept", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    for (let round = 0; round < 2; round++) {
-      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
-      for (const p of planted) {
-        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
-        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
-      }
-      assert.ok(residue.every(p => fs.existsSync(p)));
-      assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    }
-  });
-
-  it("N2: the group kill fails but 'close' arrives within the wait: the sweep goes on", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    for (let round = 0; round < 2; round++) {
-      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
-      for (const p of planted) {
-        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
-        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
-      }
-      assert.ok(residue.every(p => fs.existsSync(p)));
-      assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    }
-  });
-
-  it("the kill lands but 'close' never arrives: the sweep stops, no further delete starts", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    for (let round = 0; round < 2; round++) {
-      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
-      for (const p of planted) {
-        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
-        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
-      }
-      assert.ok(residue.every(p => fs.existsSync(p)));
-      assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    }
-  });
-
-  it("'close' arrives after the kill: the next delete starts only after it, and the timed-out artifact is kept", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    for (let round = 0; round < 2; round++) {
-      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
-      for (const p of planted) {
-        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
-        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
-      }
-      assert.ok(residue.every(p => fs.existsSync(p)));
-      assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    }
-  });
-
-  it("NB-2: a later sweep never starts a second rm on a path an unsettled rm may still walk; it keeps and logs it", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    for (let round = 0; round < 2; round++) {
-      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
-      for (const p of planted) {
-        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
-        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
-      }
-      assert.ok(residue.every(p => fs.existsSync(p)));
-      assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    }
-  });
-
-  it("NB-3: the worker log records a path entering the unsettled record and leaving it on 'close'", async () => {
+  it("repeated automatic seeds never start or signal rm and preserve attempts, skills and residues", async () => {
     const events: string[] = [];
     const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
     withRm(rm);
@@ -594,8 +509,8 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
   });
 });
 
-describe("issue #1783 final: a directory swapped in for a residue link fails the unlink (EISDIR on Linux, EPERM on macOS) and is kept", () => {
-  it("the re-validation lstat reports a symlink while the entry is a real directory: the directory and its contents survive", async () => {
+describe("issue #1858: automatic retention preserves residue directories without unlink validation", () => {
+  it("automatic retention never requests delete validation; the residue directory and contents survive", async () => {
     const s = await keyFixture();
     const swapped = path.join(s.parent, formatResidueName(s.key, randomUUID()));
     fs.mkdirSync(path.join(swapped, "inner"), { recursive: true });
@@ -827,7 +742,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     );
   }
 
-  it("a failed skills delete keeps the attempt dir (the skills dir is never left without it)", async () => {
+  it("retains attempts and paired skills with a skills-delete failure hook configured", async () => {
     failingOn((t) => path.basename(t).startsWith(".uzi-skills-"));
     const s = await keyFixture();
     const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
@@ -837,7 +752,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("a failed attempt delete after a successful skills delete orphans nothing, and the next seed retries it", async () => {
+  it("repeated seeds retain attempts and skills with an attempt-delete failure hook enabled or disabled", async () => {
     let failAttempt = true;
     failingOn((t) => failAttempt && !path.basename(t).startsWith("."));
     const s = await keyFixture();
@@ -854,7 +769,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("sweeps an existing orphan skills dir (attempt gone, entry absent/abandoned/retired), never a reclaimed/live one's, a journaled one or another key's", async () => {
+  it("retains orphan skills for absent, abandoned and retired entries alongside protected and other-key skills", async () => {
     const s = await keyFixture();
     const key = `uzi-attempts.${s.branch}.entry`;
     const skillsOf = (i: number, k = s.key): string => {
@@ -952,7 +867,7 @@ describe("issue #1783 M2 final review (NB4): deleteRetainedArtifact's re-validat
 });
 
 describe("issue #1783 M2 review: crash-window orphans (N5)", () => {
-  it("a live entry that is not live here, unjournaled and without custody is disposable under the cap; the others are not", async () => {
+  it("retains crash-window live orphans alongside journaled, custody-held and worker-live attempts", async () => {
     const s = await keyFixture();
     const orphans = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "live"));
     const journaledLive = plantAttempt(s, idAt(4), "run-4", "live");

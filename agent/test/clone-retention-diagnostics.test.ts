@@ -168,18 +168,24 @@ describe("#1858 retention diagnostic observations", () => {
   it("bounds diagnostic LRU at 128 full canonical keys, touching a key preserves it while eviction may warn", async () => {
     const { git, warnings } = cache();
     const b = await git.ensureClone(fx.originPath);
+    const diagnose = (key: string) => (git as unknown as {
+      diagnoseRetainedArtifacts: (bare: string, canonical: string, seeding: undefined, predicates: { isLive: (p: string) => boolean }) => Promise<void>;
+    }).diagnoseRetainedArtifacts(b, git.runnerClonePath(b, key), undefined, noProofReseed);
     for (let n = 0; n < 129; n++) {
       const key = `retention-${n}`;
       const canonical = git.runnerClonePath(b, key);
       fs.mkdirSync(path.dirname(canonical), { recursive: true });
       for (let r = 0; r < 6; r++) residue(canonical, r);
-      await git.runnerCloneForBranch(b, "agent/retention", key, noProofReseed);
-      if (n === 127) await git.runnerCloneForBranch(b, "agent/retention", "retention-0", noProofReseed);
+      if (n === 0) {
+        await git.runnerCloneForBranch(b, "agent/retention", key, noProofReseed);
+        assert.equal(warnings().length, 1, "real public seed produces the first diagnostic");
+      } else await diagnose(key);
+      if (n === 127) await diagnose("retention-0");
     }
     assert.equal(warnings().length, 129);
-    await git.runnerCloneForBranch(b, "agent/retention", "retention-0", noProofReseed);
+    await diagnose("retention-0");
     assert.equal(warnings().length, 129, "touched key remains cached");
-    await git.runnerCloneForBranch(b, "agent/retention", "retention-1", noProofReseed);
+    await diagnose("retention-1");
     assert.equal(warnings().length, 130, "evicted key may warn again");
   });
 
