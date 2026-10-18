@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
-	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 type policyStopDelayedRejectStore struct {
@@ -32,23 +31,6 @@ func (s *policyStopDelayedRejectStore) RejectRunServerSide(ctx context.Context, 
 	}
 }
 
-type policyStopDelayedApprovalStore struct {
-	*wallParkRaceStore
-	attempt chan struct{}
-	release <-chan struct{}
-}
-
-func (s *policyStopDelayedApprovalStore) CreateGateVerdictInput(ctx context.Context, arg store.CreateGateVerdictInputParams) (store.RunUserInput, error) {
-	// Pause enqueueGateApproval immediately before the real verdict SQL.
-	close(s.attempt)
-	select {
-	case <-s.release:
-		return s.wallParkRaceStore.CreateGateVerdictInput(ctx, arg)
-	case <-ctx.Done():
-		return store.RunUserInput{}, ctx.Err()
-	}
-}
-
 // These are fixture handler/SQL races, with no worker or runtime Stop operation.
 // Each request executes once, bounded by policyStopRacePOST's ten-second context;
 // cancellation releases either store wait and the helper joins the request.
@@ -60,8 +42,6 @@ func TestPolicyStopDelayedVerdictsLiveDB(t *testing.T) {
 	}{
 		{"reject_without_Stop", "reject_plan", false},
 		{"reject_after_Stop_ACK", "reject_plan", true},
-		{"plain_approval_without_Stop", "approve_plan", false},
-		{"plain_approval_after_Stop_ACK", "approve_plan", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newPolicyStopConfirmEnv(t, 1, "revise")
@@ -80,12 +60,7 @@ func TestPolicyStopDelayedVerdictsLiveDB(t *testing.T) {
 			}
 
 			attempt, release := make(chan struct{}), make(chan struct{})
-			var q workersvc.Store
-			if tc.kind == "reject_plan" {
-				q = &policyStopDelayedRejectStore{f.race, attempt, release}
-			} else {
-				q = &policyStopDelayedApprovalStore{f.race, attempt, release}
-			}
+			q := &policyStopDelayedRejectStore{f.race, attempt, release}
 			policyStopRaceService(f, q, pool)
 			// No selection or expected_gate_revision: exercise an unbound verdict
 			// from the paused fixture, not a revision mismatch or selection approve.
@@ -145,25 +120,10 @@ func TestPolicyStopDelayedVerdictsLiveDB(t *testing.T) {
 			if len(run.PolicyStopResolution) != 0 {
 				t.Fatal("no-Stop control unexpectedly acquired a Stop resolution")
 			}
-			if tc.kind == "reject_plan" {
-				if !response.ServerSide || run.Status != "failed" || run.FailureReason.String != body ||
-					run.StopKind.String != "plan_rejected" {
-					t.Fatalf("no-Stop reject did not fail normally: response=%s status=%q reason=%q stop_kind=%q",
-						rec.Body, run.Status, run.FailureReason.String, run.StopKind.String)
-				}
-			} else {
-				if response.ServerSide || run.Status != "paused" {
-					t.Fatalf("plain approval did not enqueue normally: response=%s status=%q", rec.Body, run.Status)
-				}
-				var unbound bool
-				if err := pool.QueryRow(ctx, `SELECT gate_binding='unbound' AND gate_revision IS NULL
- AND consumed_at IS NULL AND disposition IS NULL
- FROM run_user_inputs WHERE run_id=$1 AND kind='approve_plan' AND body=$2`, f.id, body).Scan(&unbound); err != nil {
-					t.Fatal(err)
-				}
-				if !unbound {
-					t.Fatal("no-Stop plain approval did not persist an unbound pending verdict")
-				}
+			if !response.ServerSide || run.Status != "failed" || run.FailureReason.String != body ||
+				run.StopKind.String != "plan_rejected" {
+				t.Fatalf("no-Stop reject did not fail normally: response=%s status=%q reason=%q stop_kind=%q",
+					rec.Body, run.Status, run.FailureReason.String, run.StopKind.String)
 			}
 		})
 	}

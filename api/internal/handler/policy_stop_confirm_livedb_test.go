@@ -34,6 +34,18 @@ type policyStopConfirmEnv struct {
 
 func newPolicyStopConfirmEnv(t *testing.T, completed int, verdict string) *policyStopConfirmEnv {
 	t.Helper()
+	return newPolicyStopConfirmFixture(t, completed, verdict, true)
+}
+
+// No feedback is inserted in this variant. The source is a seeded V1 fixture,
+// not evidence of runtime source authority.
+func newPolicyStopConfirmNoFeedbackEnv(t *testing.T) *policyStopConfirmEnv {
+	t.Helper()
+	return newPolicyStopConfirmFixture(t, 1, "", false)
+}
+
+func newPolicyStopConfirmFixture(t *testing.T, completed int, verdict string, feedback bool) *policyStopConfirmEnv {
+	t.Helper()
 	e := newWallParkExtendHTTPEnv(t, 57600)
 	ctx := context.Background()
 	pool, err := store.OpenPool(ctx, os.Getenv("UZI_TEST_DATABASE_URL"))
@@ -60,27 +72,33 @@ func newPolicyStopConfirmEnv(t *testing.T, completed int, verdict string) *polic
  plan_md=E'exact candidate\n',milestones_candidate=milestones_frozen,size_class='s',
  started_at=status_since-interval '1 minute',budget_wall_seconds=57600 WHERE id=$1`,
 		f.id, uuid.New(), presentation, payload, digest[:], "pr-"+strings.Repeat("a", 32)+"-1")
-	if err := e.query(`INSERT INTO run_user_inputs(run_id,kind,body,gate_binding,gate_revision,consumed_at,consumed_claim_generation,consumed_worker_id)
+	if feedback {
+		if err := e.query(`INSERT INTO run_user_inputs(run_id,kind,body,gate_binding,gate_revision,consumed_at,consumed_claim_generation,consumed_worker_id)
  VALUES($1,'revise_plan',$2,'bound',3,now(),1,$3) RETURNING id`, f.id, "  exact human body\n\n", f.worker).Scan(&f.humanID); err != nil {
-		t.Fatal(err)
-	}
-	source := fmt.Sprintf(`{"version":1,"gate":{"revision":"3","presentation_id":"%s","payload_digest":"%s"},"primary_revision":{"source":"run_user_input","input_id":"%d"},"associated_cross_checks":[{"source":"plan_cross_check","cross_check_id":"%s"}]}`,
-		presentation, hex.EncodeToString(digest[:]), f.humanID, f.ccID)
-	e.exec("UPDATE runs SET policy_revision_source=$2::jsonb WHERE id=$1", f.id, source)
-	frozen := json.RawMessage(`[{"id":"m1","title":"m1"},{"id":"m2","title":"m2"},{"id":"m3","title":"m3"}]`)
-	candidate := workersvc.PlanCrossCheckCandidate{PlanMd: "exact candidate\n", Milestones: frozen,
-		RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s",
-		BaseCommit: strings.Repeat("a", 40), PlanningDiff: "exact diff\n"}
-	ccDigest, err := candidate.Digest()
-	if err != nil {
-		t.Fatal(err)
-	}
-	e.exec(`INSERT INTO cross_checks(id,lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,
+			t.Fatal(err)
+		}
+		source := fmt.Sprintf(`{"version":1,"gate":{"revision":"3","presentation_id":"%s","payload_digest":"%s"},"primary_revision":{"source":"run_user_input","input_id":"%d"},"associated_cross_checks":[{"source":"plan_cross_check","cross_check_id":"%s"}]}`,
+			presentation, hex.EncodeToString(digest[:]), f.humanID, f.ccID)
+		e.exec("UPDATE runs SET policy_revision_source=$2::jsonb WHERE id=$1", f.id, source)
+		frozen := json.RawMessage(`[{"id":"m1","title":"m1"},{"id":"m2","title":"m2"},{"id":"m3","title":"m3"}]`)
+		candidate := workersvc.PlanCrossCheckCandidate{PlanMd: "exact candidate\n", Milestones: frozen,
+			RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s",
+			BaseCommit: strings.Repeat("a", 40), PlanningDiff: "exact diff\n"}
+		ccDigest, err := candidate.Digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.exec(`INSERT INTO cross_checks(id,lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,
  required_capabilities,required_tools,size_class,base_commit,planning_diff,candidate_digest,verdict,findings,
  created_at,decided_at,deadline_at,checker_harness,checker_model,checker_effort,automatic_rounds_enabled,automatic_revision_limit)
  VALUES($1,$2,'plan',1,1,$3,$4::jsonb,'{}','{}','s',$5,$6,$7,$8,
  '[{"body":"exact finding\n"}]',now(),now(),now()+interval '1 hour','claude','checker-model','high',true,2)`,
-		f.ccID, f.id, candidate.PlanMd, string(frozen), candidate.BaseCommit, candidate.PlanningDiff, ccDigest, verdict)
+			f.ccID, f.id, candidate.PlanMd, string(frozen), candidate.BaseCommit, candidate.PlanningDiff, ccDigest, verdict)
+	} else {
+		source := fmt.Sprintf(`{"version":1,"gate":{"revision":"3","presentation_id":"%s","payload_digest":"%s"},"primary_revision":null,"associated_cross_checks":[]}`,
+			presentation, hex.EncodeToString(digest[:]))
+		e.exec("UPDATE runs SET policy_revision_source=$2::jsonb WHERE id=$1", f.id, source)
+	}
 	r, err := e.race.GetRunByID(ctx, f.id)
 	if err != nil {
 		t.Fatal(err)
