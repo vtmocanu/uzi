@@ -536,6 +536,8 @@ function canonicalRecoveryInterruption(value: unknown): boolean {
 interface ExecutionRejection {
   rejected: boolean;
   value?: unknown;
+  /** Private source observation only; leaves the existing deferral classification intact. */
+  executorRejected?: true;
 }
 
 /** PRD #1733: the `hold_reason` of a run held after repeated provider outages. */
@@ -1835,6 +1837,14 @@ interface RunFlight {
   sourceJoinFailed?: boolean;
   sourceNormalPark?: boolean;
   sourceExitDenied?: boolean;
+  /** Unsupported catch selection, separate from irrevocable retainStoppedSource denial. */
+  sourceDispatchDenied?: boolean;
+  sourceNormalFailure?: {
+    kind: "executor_failed";
+    providerReaped?: true;
+    snapshotTransferred?: true;
+    acknowledged?: true;
+  };
   sourceCleanupJoined?: boolean;
   workerMemory?: MemoryFlight;
   cancellationBudget?: MaintenanceBudget;
@@ -3301,10 +3311,15 @@ export class RunRunner {
     // HOME/cache/lifecycle cleanup. Catch selection and steering.stop alone are too early.
     const flight = observedFlight;
     const blocked = flight?.sourceNormalBlocked === true && flight.sourceFamilyMatched === true;
-    if (!flight || (!blocked && (!flight.sourceGenesis || !flight.sourceNormalPark || !flight.parked || flight.terminalResolved ||
+    const failed = flight?.sourceNormalFailure;
+    const normalFailed = failed?.kind === "executor_failed" && failed.providerReaped === true &&
+      failed.snapshotTransferred === true && failed.acknowledged === true &&
+      !flight?.parked && !flight?.preserveSession && !flight?.keepGuardedInventoryOpen;
+    if (!flight || (!blocked && (!flight.sourceGenesis ||
+        (!normalFailed && (!flight.sourceNormalPark || !flight.parked || flight.terminalResolved)) ||
         flight.retainedEpisode || flight.retainedLocalCustody || flight.retainedEpisodeCustody ||
         flight.completedRetainedSuccessor || flight.predecessorCapture)) || !flight.sourceCleanupJoined ||
-        flight.sourceJoinFailed || flight.sourceExitDenied || flight.workerMemory ||
+        flight.sourceJoinFailed || flight.sourceExitDenied || flight.sourceDispatchDenied || flight.workerMemory ||
         flight.cancellationBudget || this.cancellationExpired(flight) ||
         flight.batcher.isTripped() || flight.batcher.isSpilled() || flight.batcher.bufferedCount() !== 0 ||
         flight.providerParkUnproven || flight.uncertainWallPark || flight.completionHoldOutcome !== "none" ||
@@ -3323,7 +3338,7 @@ export class RunRunner {
       ? await this.git.matchMaintenanceSourceFamily(flight.barePath, flight.branch, this.cloneCoordinates(claim).key,
         flight.runId, originals, { signal: this.retainedLifecycleSignal(flight) }) : undefined;
     // The metadata read awaited: repeat final lifecycle checks before delivery.
-    if (flight.sourceJoinFailed || flight.sourceExitDenied || flight.steering.isCancelled() ||
+    if (flight.sourceJoinFailed || flight.sourceExitDenied || flight.sourceDispatchDenied || flight.steering.isCancelled() ||
         flight.steering.terminalLifecycleSignal().aborted || flight.steering.claimFence() !== undefined ||
         (flight.cancel.signal.aborted && !(flight.cancel.signal.reason instanceof PauseNowSignal)) ||
         (flight.steering.lifecycleSignal().aborted && !(flight.steering.lifecycleSignal().reason instanceof PauseNowSignal)) ||
@@ -3432,9 +3447,10 @@ export class RunRunner {
     }
     const executionRejection: ExecutionRejection = { rejected: false };
     const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
-      // Catch selection denies every unsupported exit, regardless of parked flags.
-      const priorSourceExitDenied = flight.sourceExitDenied;
-      flight.sourceExitDenied = true;
+      // Catch selection is not a stopped-source denial. Only supported routes below
+      // can discharge this default; retainStoppedSource's denial is never cleared.
+      const priorSourceExitDenied = flight.sourceExitDenied || flight.sourceDispatchDenied;
+      flight.sourceDispatchDenied = true;
       if (flight.completionHoldOutcome === "unresolved") {
         await batcher.close().catch(() => undefined);
         runLog.warn("completion hold unresolved; retaining artifacts without terminal dispatch");
@@ -3905,7 +3921,7 @@ export class RunRunner {
         // pause_failed and left the run running), preserve the session and leave it for the
         // sweeper to requeue rather than failing a run the owner asked to pause.
         // Only a first, supported owner-pause exit may qualify below.
-        if (!priorSourceExitDenied && !flight.sourceNormalPark) flight.sourceExitDenied = false;
+        if (!priorSourceExitDenied && !flight.sourceNormalPark) flight.sourceDispatchDenied = false;
         flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 });
         // Issue #1742 retirement site (c): the api accepted the owner pause park for this generation.
         if (flight.parked) await this.retireFinalizeRecord(flight, "pause_park_accepted");
@@ -4040,7 +4056,7 @@ export class RunRunner {
       } else if (err instanceof RetainedRecoveryStop) {
         // Only the positively tracked normal recovery exit can undo this
         // dispatcher's deny. Earlier stops and ambiguous custody remain denied.
-        if (flight.sourceNormalBlocked && !priorSourceExitDenied) flight.sourceExitDenied = false;
+        if (flight.sourceNormalBlocked && !priorSourceExitDenied) flight.sourceDispatchDenied = false;
         // Discovery can stop before the source record reaches this flight. Preserve
         // its existing HOME and custody as well as any subsequently discovered clone.
         flight.preserveRecoveryClone = true;
@@ -4138,6 +4154,26 @@ export class RunRunner {
             await dispatchFailure(interruption);
             return;
           }
+        }
+        // Private provenance for this exact executor rejection, after its owned
+        // execution joins and disk-deferral selection. No terminal custody authority.
+        if (!priorSourceExitDenied && executionRejection.executorRejected === true &&
+            executionRejection.rejected && Object.is(executionRejection.value, err) &&
+            flight.sourceGenesis && !flight.sourceNormalFailure && !flight.sourceJoinFailed &&
+            !flight.sourceExitDenied && !flight.terminalResolved && !flight.completionSendAttempted &&
+            !this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration) &&
+            !isInputReceiptError(err) && !flight.parked && !flight.preserveSession &&
+            !flight.stoppedSourceKept && !flight.workerMemory && !flight.keepGuardedInventoryOpen &&
+            !flight.retainedEpisode && !flight.retainedLocalCustody && !flight.retainedEpisodeCustody &&
+            !flight.completedRetainedSuccessor && !flight.predecessorCapture &&
+            !flight.providerParkUnproven && !flight.uncertainWallPark && flight.completionHoldOutcome === "none" &&
+            !flight.cancellationBudget && !flight.cancel.signal.aborted &&
+            !flight.steering.lifecycleSignal().aborted && !flight.steering.terminalLifecycleSignal().aborted &&
+            !flight.steering.isCancelled() && flight.steering.claimFence() === undefined &&
+            !flight.active?.shuttingDown && !this.shuttingDownGlobal && residueQuarantine() === undefined &&
+            !batcher.isTripped() && !batcher.isSpilled()) {
+          flight.sourceNormalFailure = { kind: "executor_failed" };
+          flight.sourceDispatchDenied = false;
         }
         if (isInputReceiptError(err)) {
           // Receipt give-up must fail server-visibly without discarding unfinished source.
@@ -4538,9 +4574,12 @@ export class RunRunner {
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
       // removed with it even on a park; a retained predecessor keeps its pair until the retention
       // sweep deletes both.
+      let sourceSkillsRemoved = false;
+      let sourceHomeRemoved = false;
       const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (!this.cancellationExpired(flight) && flight.worktreePath && removeSkills) {
         await this.runCancellationMaintenance(flight, () => rmTeardownTree(skillsPluginDir(flight.worktreePath!), this.teardownTestDeps))
+          .then(() => { sourceSkillsRemoved = true; })
           .catch((e) => {
             flight.sourceJoinFailed = true;
             runLog.warn("skills plugin cleanup failed", { error: errMessage(e) });
@@ -4554,10 +4593,12 @@ export class RunRunner {
       // Reaping this run does not stop sibling writers swapping intermediate directories.
       // Refusal warns and retains the tree; cleanup must never change the run's outcome.
       if (!this.cancellationExpired(flight) && runHome && !preserveResumeArtifacts) {
-        await this.runCancellationMaintenance(flight, () => rmTeardownTree(runHome, this.teardownTestDeps)).catch((e) => {
-          flight.sourceJoinFailed = true;
-          runLog.warn("run HOME cleanup failed", { error: errMessage(e) });
-        });
+        await this.runCancellationMaintenance(flight, () => rmTeardownTree(runHome, this.teardownTestDeps))
+          .then(() => { sourceHomeRemoved = true; })
+          .catch((e) => {
+            flight.sourceJoinFailed = true;
+            runLog.warn("run HOME cleanup failed", { error: errMessage(e) });
+          });
       }
       // PRD #1809 D2: a park that ended the run's process keeps its HOME for the resume but
       // drops the rebuildable caches in it (RUN_CACHE_SUBTREES only; the transcript and every
@@ -4627,9 +4668,12 @@ export class RunRunner {
       // reclaim and its "fresh sample" wait start from the dropped HOME. A no-op when unwatched.
       this.diskGovernor?.unregister(runId);
       flight.cancellationBudget?.dispose();
-      // Observable joins cover a fresh owner pause and an inherited family blocked before execution.
+      // Record successful normal disposal explicitly; skipped cleanup proves nothing.
+      // Preserved park/block joins retain their existing requirements.
       flight.sourceCleanupJoined = !executor.safety &&
-        (!runHome || (preserveResumeArtifacts && (flight.parked || flight.sourceNormalBlocked) && !flight.providerParkUnproven)) &&
+        (flight.sourceNormalFailure
+          ? sourceSkillsRemoved && (!runHome || sourceHomeRemoved)
+          : (!runHome || (preserveResumeArtifacts && (flight.parked || flight.sourceNormalBlocked) && !flight.providerParkUnproven))) &&
         sourceOwedJoined &&
         !!flight.barePath && !!flight.branch && !retireBlocked &&
         (ownAttemptRetired || flight.preserveRecoveryClone);
@@ -5338,6 +5382,8 @@ export class RunRunner {
         : flight.permanentFailureReap !== undefined
           ? this.permanentFailureReapValid(flight)
           : await this.reapRecoveryProviderForSettle(claim, flight, runLog, "terminal");
+    if (flight.sourceNormalFailure && reaped && !opts.keepCustody)
+      flight.sourceNormalFailure.providerReaped = true;
     if (reaped && (!opts.keepCustody || flight.completedRetainedSuccessor)) {
       // Issue #2545: the failed terminal sent below is known here, so a held-eligible failure can
       // defer its archive capture. A quarantine-stopped run never reports a held-eligible origin.
@@ -5377,6 +5423,8 @@ export class RunRunner {
       },
       async (b, sig) => {
         const ack = await flight.reportState(b, sig);
+        if (flight.sourceNormalFailure && ack.applied && ack.status === "failed" && !ack.staleClaim && !ack.staleRevisionSource)
+          flight.sourceNormalFailure.acknowledged = true;
         if (flight.sourceBlockingNormal && ack.applied && ack.status === "failed" && !ack.staleClaim && !ack.staleRevisionSource)
           flight.sourceBlockedReport = true;
         if (ack.staleRevisionSource) staleRevisionRejection = true;
@@ -9020,6 +9068,8 @@ export class RunRunner {
             if (head) await this.pinRecoveryGeneration(claim, flight, head);
             return;
           }
+          if (flight.sourceNormalFailure && q.outcome.process?.state === "quiescent")
+            flight.sourceNormalFailure.snapshotTransferred = true;
           // Issue #2545: a held-eligible failure freezes here, at the same strength, and leaves its
           // archive capture for the post-send held step (or its archive fallback) on this same record.
           await this.settleGuardedInventory(claim, flight, source ?? undefined, undefined, undefined, true,
@@ -12182,7 +12232,11 @@ export class RunRunner {
       this.diskGovernor?.enterRun(flight.runId);
       nowSummary?.start();
       try {
-        result = await executor.run(ctx);
+        try { result = await executor.run(ctx); }
+        catch (value) {
+          executionRejection.executorRejected = true;
+          throw value;
+        }
         if (flight.workerMemory?.hold) {
           await this.reconcileWorkerMemory(flight);
           throw new RetainedRecoveryStop();
@@ -12568,6 +12622,9 @@ export class RunRunner {
       }
       MaintenanceBudget.current()?.check();
       outcome = fold(outcome);
+      // Ordinary callers allow an absent process result. Private FAILED observation
+      // requires explicit process proof, including the transfer's post-Git re-proof.
+      if (flight.sourceNormalFailure && outcome.process?.state !== "quiescent") flight.sourceJoinFailed = true;
       // issue #2213: detection only. An `unreadable_unattributed` entry latches the worker (single-uid
       // Linux); whether this verdict blocks its caller is unchanged.
       latchOnUnattributedUnreadable(outcome.process, { runId: flight.runId, site: opts.site, log: flight.runLog });
@@ -18263,7 +18320,7 @@ export class RunRunner {
       // Classification depends on the actual normal iteration, joined
       // quiescence and persisted blocker, never the catch type or custody flags.
       flight.sourceBlockingNormal = flight.sourceFamilyMatched === true && sourceQuiescenceJoined &&
-        blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied;
+        blocker === "decoded_history_limit" && persistence === "" && !flight.sourceExitDenied && !flight.sourceDispatchDenied;
       await this.reportGenericFailure(claim, flight,
         blocker === "quiescence_failed" ? new RunResidueBlockedError(reason) : new Error(reason),
         { keepCustody: true });
