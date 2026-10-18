@@ -3323,7 +3323,7 @@ export class RecoveryCoordinator {
         check();
         if (!current(chargedHold.token)) return refused("exact_hold_refused");
         stage = "history_refused";
-        const admitted = await ledger.admit(admission, { signal });
+        const admitted = await ledger.admit(admission, { signal, newOrigin: true });
         if (!admitted.ok) return refused(admitted.reason);
         const slot = admitted.value;
         try {

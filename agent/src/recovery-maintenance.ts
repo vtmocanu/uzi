@@ -16,7 +16,9 @@ const digest = z.string().regex(/^[a-f0-9]{64}(?![\s\S])/);
 const integer = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
 const identitySchema = z.object({
   run: safe, generation: integer.min(1), hold: safe, repo: safe, custodian: safe,
-  bareBasename: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,255}(?![\s\S])/), origin: digest, originalSource: digest, sourceConfig: digest,
+  bareBasename: z.string().refine(value => value.length > 0 && value !== "." && value !== ".." &&
+    !/[/\\\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\uD800-\uDFFF]/u.test(value) &&
+    Buffer.byteLength(value, "utf8") <= 255), origin: digest, originalSource: digest, sourceConfig: digest,
 }).strict();
 export type MaintenanceIdentity = z.infer<typeof identitySchema>;
 const configSchema = z.object({
@@ -362,7 +364,7 @@ export class RecoveryMaintenance {
     if (now >= cycle.originalCycleExpiry) refuse("maintenance_cycle_expired");
     cycle.lastObserved = now;
   }
-  async admit(input: MaintenanceAdmission, options: { deadline?: number; signal?: AbortSignal } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
+  async admit(input: MaintenanceAdmission, options: { deadline?: number; signal?: AbortSignal; newOrigin?: true } = {}): Promise<MaintenanceResult<MaintenanceSlot>> {
     // Metadata discovery cannot initialize storage, precharge work or mint a permit.
     if (discovery.getStore()) return deny("maintenance_discovery_only");
     return this.transaction(async (root, table) => {
@@ -422,6 +424,10 @@ export class RecoveryMaintenance {
       if (input.source !== cycle.identity.originalSource && !table.cycles.some(c => hash(c.identity) === id && c.outputs.includes(input.source)))
         return deny("maintenance_lineage_invalid");
       if (cycle.exhausted || cycle.slots.length >= 3) return deny("maintenance_cycle_exhausted");
+      // Initial publication cannot replace an indexed origin whose journal is missing.
+      // Continuations use authenticated output continuity through the existing API.
+      if (options.newOrigin && lineage.some(c => c.outputs.length > 0))
+        return deny("maintenance_lineage_invalid");
       const priorLive = active.get(root)?.get(id);
       if (priorLive) priorLive.lastObserved = Math.max(priorLive.lastObserved, now);
       if (priorLive && (now >= priorLive.deadline || priorLive.signal?.aborted)) {

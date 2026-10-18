@@ -37,11 +37,6 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
   t.mock.method(client, "listRecoveryHolds", async () => ({ run_id: claim.run_id, holds: [{ hold_id: "fixture-hold", generation: 1, inventory_guarded: true, has_available_capture: false }] }));
   if (originMode) {
     claim.repo.id = "00000000-0000-4000-8000-000000000033";
-    // Existing hashed cache names fit the immutable ledger identity schema.
-    // Ordinary '+' cache basenames currently fail closed in that schema.
-    const longOrigin = path.join(path.dirname(claim.repo.clone_url), "origin-" + "x".repeat(180));
-    await fs.symlink(claim.repo.clone_url, longOrigin, "dir");
-    claim.repo.clone_url = longOrigin;
     const workerId = "00000000-0000-4000-8000-000000000034";
     const holdId = "00000000-0000-4000-8000-000000000032";
     // The production strict client validates the complete unique inventory and exact

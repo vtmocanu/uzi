@@ -236,12 +236,35 @@ export interface ProcTable {
 
 const PROC_ROOT = path.join("/", "proc");
 const meteredProcTables = new WeakSet<ProcTable>();
+const HELPER_WORK_LIMITS = { adminEntries: 512, metadataBytes: 32 * 1024 * 1024 };
+type HelperWorkLimits = typeof HELPER_WORK_LIMITS;
+type HelperScanRequest = ScanRequest & { workLimits?: HelperWorkLimits };
+
+/** One sticky allowance for all raw proc work in one child invocation, including rescans.
+ * Failed reservations consume no more work; earlier reservations are never refunded. */
+class HelperWork {
+  private readonly left: HelperWorkLimits;
+  failed = false;
+  constructor(limits: HelperWorkLimits) { this.left = { ...limits }; }
+  check(): void { if (this.failed) throw new Error("helper work exhausted"); }
+  consume(resource: keyof HelperWorkLimits, amount: number): void {
+    this.check();
+    if (amount > this.left[resource]) {
+      this.failed = true;
+      this.check();
+    }
+    this.left[resource] -= amount;
+  }
+}
+const helperWork = new AsyncLocalStorage<HelperWork>();
 
 /** A procfs-shaped table rooted at `root`: `<root>/<pid>/{status,environ,cwd,stat}`. */
 export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; deadline: number }): ProcTable {
-  if (budget || MaintenanceResources.active()) {
+  const work = helperWork.getStore();
+  if (budget || MaintenanceResources.active() || work) {
     let total = 0;
     const check = () => {
+      work?.check();
       MaintenanceResources.checkIfActive();
       budget?.signal?.throwIfAborted();
       if (budget && Date.now() >= budget.deadline) throw new Error("process proof deadline");
@@ -251,6 +274,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       const fd = fs.openSync(path.join(root, String(pid), name), fs.constants.O_RDONLY |
         fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       try {
+        work?.consume("metadataBytes", cap + 1);
         MaintenanceResources.consumeIfActive("metadataBytes", cap + 1);
         const buf = Buffer.alloc(cap + 1);
         let length = 0;
@@ -275,6 +299,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
         try {
           for (;;) {
             check();
+            work?.consume("adminEntries", 1);
             MaintenanceResources.consumeIfActive("adminEntries", 1);
             const entry = directory.readSync();
             if (!entry) break;
@@ -290,6 +315,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       readEnviron: pid => read(pid, "environ", 256 * 1024, "latin1"),
       readCwd: pid => {
         check();
+        work?.consume("metadataBytes", 64 * 1024);
         MaintenanceResources.consumeIfActive("metadataBytes", 64 * 1024);
         const cwd = fs.readlinkSync(path.join(root, String(pid), "cwd"));
         if (Buffer.byteLength(cwd) > 64 * 1024) throw new Error("process cwd budget");
@@ -390,7 +416,10 @@ function pidsInFile(file: string): number[] {
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, "r");
-    const buf = Buffer.alloc(VIEW_PIDFILE_MAX_BYTES);
+    const work = helperWork.getStore();
+    const cap = VIEW_PIDFILE_MAX_BYTES + (work ? 1 : 0);
+    work?.consume("metadataBytes", cap);
+    const buf = Buffer.alloc(cap);
     let len = 0;
     for (;;) {
       const n = fs.readSync(fd, buf, len, buf.length - len, null);
@@ -398,9 +427,10 @@ function pidsInFile(file: string): number[] {
       len += n;
       if (len === buf.length) break;
     }
-    let text = buf.toString("utf8", 0, len);
+    work?.check();
+    let text = buf.toString("utf8", 0, Math.min(len, VIEW_PIDFILE_MAX_BYTES));
     // A file cut at the cap drops its last, possibly truncated, line (a cut "12345" is not "123").
-    if (len === buf.length) text = text.slice(0, text.lastIndexOf("\n") + 1);
+    if (len >= VIEW_PIDFILE_MAX_BYTES) text = text.slice(0, text.lastIndexOf("\n") + 1);
     return text
       .split("\n")
       .filter((l) => /^\d+$/.test(l.trim()))
@@ -419,14 +449,15 @@ function pidsInFile(file: string): number[] {
 /** The real procfs listing only `root`'s descendants (by the world-readable ppid), `extraPids` and
  *  the pids in `extraPidFiles` (re-read at every listing). */
 function descendantsTable(root: number, extraPids: readonly number[], extraPidFiles: readonly string[]): ProcTable {
+  const raw = helperWork.getStore() ? procfsTableAt(PROC_ROOT) : procfsTable;
   return {
-    ...procfsTable,
+    ...raw,
     listPids: () => {
-      const pids = procfsTable.listPids();
+      const pids = raw.listPids();
       const extra = new Set([...extraPids, ...extraPidFiles.flatMap(pidsInFile)]);
       const parentOf = new Map<number, number>();
       for (const pid of pids) {
-        const r = tryRead(() => procfsTable.readStat(pid));
+        const r = tryRead(() => raw.readStat(pid));
         const facts = r.ok ? parseStat(r.value) : undefined;
         if (facts) parentOf.set(pid, facts.ppid);
       }
@@ -438,6 +469,7 @@ function descendantsTable(root: number, extraPids: readonly number[], extraPidFi
         }
         return false;
       };
+      helperWork.getStore()?.check();
       return pids.filter((pid) => extra.has(pid) || under(pid));
     },
   };
@@ -835,7 +867,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     } : undefined) : { deadline: req.reportDeadline });
   const baseTable = deps.table ?? (reportBudget && testView && "procRoot" in testView
     ? procfsTableAt(testView.procRoot, reportBudget) : view?.table) ??
-    (reportBudget ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
+    (reportBudget || helperWork.getStore() ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
   let tableFailure: unknown;
   let bytes = 0;
   const bounded = <T>(read: () => T, cap?: number): T => {
@@ -887,8 +919,8 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     }
     MaintenanceResources.checkIfActive();
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError || tableFailure || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
-      return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? "process proof deadline") };
+    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
+      return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? (helperWork.getStore()?.failed ? "helper work exhausted" : "process proof deadline")) };
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
@@ -1242,7 +1274,7 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  * spawn timeout. Any failure to start, finish or answer is `unverified`.
  */
 async function reapProcessesViaHelper(
-  req: ScanRequest,
+  req: HelperScanRequest,
   opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
   const ambient = MaintenanceBudget.current();
@@ -1250,8 +1282,8 @@ async function reapProcessesViaHelper(
   const resourceSignal = MaintenanceResources.signalIfActive();
   const within = AsyncLocalStorage.snapshot();
   const remaining = ambient?.cap(opts.timeoutMs ?? HELPER_TIMEOUT_MS);
-  if (scoped) req = { ...req, reportDeadline: Math.min(req.reportDeadline ?? Infinity,
-    Date.now() + MaintenanceResources.remainingMsIfActive()) };
+  if (scoped) req = { ...req, reportDeadline: Math.floor(Math.min(req.reportDeadline ?? Infinity,
+    Date.now() + MaintenanceResources.remainingMsIfActive())) };
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
   try {
@@ -1332,6 +1364,12 @@ async function reapProcessesViaHelper(
     try {
       ambient?.check();
       if (remaining && Math.floor(remaining()) <= 0) throw new Error("maintenance helper operation expired");
+      if (scoped) {
+        // Reserve the whole child envelope before dispatch, without refunds even on partial failure.
+        MaintenanceResources.consume("adminEntries", HELPER_WORK_LIMITS.adminEntries);
+        MaintenanceResources.consume("metadataBytes", HELPER_WORK_LIMITS.metadataBytes);
+        req = { ...req, workLimits: { ...HELPER_WORK_LIMITS } };
+      }
       MaintenanceResources.consumeIfActive("launches", 1);
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
@@ -1790,7 +1828,15 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
 
 // ─── Helper entry ──────────────────────────────────────────────────────────────────────────
 
-function isScanRequest(v: unknown): v is ScanRequest {
+function isHelperWorkLimits(v: unknown): v is HelperWorkLimits {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  return Object.keys(o).length === 2 && (Object.keys(HELPER_WORK_LIMITS) as (keyof HelperWorkLimits)[])
+    .every(key => Number.isSafeInteger(o[key]) && (o[key] as number) >= 0 &&
+      (o[key] as number) <= HELPER_WORK_LIMITS[key]);
+}
+
+function isScanRequest(v: unknown): v is HelperScanRequest {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
   const strings = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === "string");
@@ -1815,6 +1861,7 @@ function isScanRequest(v: unknown): v is ScanRequest {
     ) &&
     typeof o.workerNonce === "string" &&
     (o.reportDeadline === undefined || (Number.isSafeInteger(o.reportDeadline) && (o.reportDeadline as number) > 0)) &&
+    (o.workLimits === undefined || isHelperWorkLimits(o.workLimits)) &&
     (o.view === undefined || isQuiescenceView(o.view))
   );
 }
@@ -1840,8 +1887,11 @@ async function helperMain(): Promise<ProcessQuiescence> {
     return { state: "unverified", processes: [], killed: [], detail: "helper request unparsable" };
   }
   if (!isScanRequest(req)) return { state: "unverified", processes: [], killed: [], detail: "helper request invalid" };
-  const view = req.view === undefined ? {} : viewReapDeps(req.view);
-  return reapProcesses(req, { ...view, excludeAllDescendants: true });
+  const reap = () => {
+    const view = req.view === undefined ? {} : viewReapDeps(req.view);
+    return reapProcesses(req, { ...view, excludeAllDescendants: true });
+  };
+  return req.workLimits === undefined ? reap() : helperWork.run(new HelperWork(req.workLimits), reap);
 }
 
 if (process.argv[2] === HELPER_FLAG && process.argv[1] && path.resolve(process.argv[1]) === HELPER_FILE) {

@@ -63,7 +63,7 @@ async function fixture(t: test.TestContext) {
     matchMaintenanceSourceFamily: async () => {
       if (!MaintenanceResources.discoveryActive()) {
         events.push("paid-scan");
-        assert.ok((await table()).cycles[0].slots.length === 1, "proof follows durable charge");
+        assert.ok((await table()).cycles[0].slots.length >= 1, "proof follows durable charge");
         if (afterCharge) { const action = afterCharge; afterCharge = undefined; await action(); }
       }
       return stopped ? undefined : { sources: observation.family!.originals, metadata };
@@ -208,6 +208,63 @@ for (const mode of ["stopped", "registration", "closed", "active", "shutdown", "
     await f.unchanged();
   });
 }
+
+test("terminal origin missing indexed artifact cannot charge or mint after changed HEAD", async t => {
+  const f = await fixture(t);
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
+  await f.run();
+  const published = await f.prefixes();
+  assert.equal(published.length, 1, "ordinary first admission publishes an origin");
+  assert.ok(published[0]);
+  assert.equal((await f.coordinator.inspect(runId)).length, 1);
+  const before = (await f.table()).cycles[0];
+  assert.deepEqual(before.outputs, [digest(path.basename(published[0], ".json"))]);
+  assert.equal(before.slots.length, 1);
+  await fs.unlink(path.join(f.dir, published[0]));
+  f.headChanged();
+  t.mock.timers.setTime(before.slots[0].start + 180_001);
+  await f.run(f.make(), structuredClone(f.observation));
+  assert.equal(await f.chargeCount(), 1, "missing indexed origin must not charge a second slot");
+  assert.deepEqual(await f.prefixes(), [], "missing indexed origin must not mint another ID");
+  const after = (await f.table()).cycles[0];
+  assert.deepEqual(after.outputs, before.outputs);
+  assert.equal(after.originalCycleExpiry, before.originalCycleExpiry);
+  assert.equal(after.fenced, before.fenced);
+});
+
+test("terminal origin syncs published run directory before authenticated readback", async t => {
+  const f = await fixture(t);
+  const open = fs.open.bind(fs), rename = fs.rename.bind(fs);
+  let published = false, synced = false, readback = false, parentSyncs = 0, fileSyncs = 0;
+  t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+    await rename(...args);
+    if (String(args[1]).startsWith(f.dir + path.sep)) published = true;
+  });
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    const name = String(args[0]), sync = file.sync.bind(file);
+    file.sync = async () => {
+      await sync();
+      if (name === f.dir && published) synced = true;
+      else if (name === f.dir) parentSyncs++;
+      else if (name.startsWith(f.dir + path.sep) && name.endsWith(".tmp")) fileSyncs++;
+    };
+    if (published && name.startsWith(f.dir + path.sep) && name.endsWith(".json")) {
+      readback = true;
+      if (!synced) await file.close();
+      assert.equal(synced, true, "published run directory must sync before authenticated readback");
+    }
+    return file;
+  });
+  await f.run();
+  assert.equal(published, true);
+  assert.ok(parentSyncs > 0, "new run directory was synced before publication");
+  assert.equal(fileSyncs, 1, "temporary file fsync is separate");
+  assert.equal(synced, true, "post-rename run directory sync must occur");
+  assert.equal(readback, true);
+  assert.equal((await f.coordinator.inspect(runId)).length, 1);
+  await f.unchanged();
+});
 
 for (const mode of ["fsync", "rename", "readback"] as const) {
   test("terminal origin durable publication fault preserves charge/evidence, cannot renew: " + mode, async t => {

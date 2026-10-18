@@ -378,6 +378,53 @@ test("output lookup works at full capacity and exhausted/expired cycles without 
   refused(await ledger.admit(fresh), "maintenance_table_capacity");
 });
 
+test("new origin admission protects indexed history without changing continuation or expiry priority", async t => {
+  const f = await fixture(t), input = eligible(), ledger = f.make(), output = sha("initial-origin");
+  const first = take(await ledger.admit(input, { newOrigin: true }));
+  take(await ledger.revalidate(first, input));
+  take(await ledger.beforeMutation(first, [output]));
+  take(await ledger.finish(first, "nonmutating"));
+  f.time(first.start + 180_001);
+  refused(await f.make().admit(input, { newOrigin: true }), "maintenance_lineage_invalid");
+  const raised = { ...input, config: { ...input.config, decodedCap: input.config.decodedCap + 1 } };
+  refused(await f.make().admit(raised, { newOrigin: true }), "maintenance_lineage_invalid");
+  let stored = await table(f.root);
+  assert.equal(stored.cycles.length, 1, "cap changes cannot persist a new cycle");
+  assert.equal(stored.cycles[0].slots.length, 1);
+  assert.deepEqual(stored.cycles[0].outputs, [output]);
+  const continuation = { ...input, source: output };
+  const second = take(await f.make().admit(continuation));
+  take(await ledger.revalidate(second, continuation));
+  take(await ledger.finish(second, "nonmutating"));
+  f.time(second.start + 180_001);
+  const third = take(await ledger.admit(continuation));
+  take(await ledger.revalidate(third, continuation));
+  take(await ledger.finish(third, "nonmutating"));
+  refused(await ledger.admit(input, { newOrigin: true }), "maintenance_cycle_exhausted");
+  f.time(first.originalCycleExpiry);
+  refused(await f.make().admit(input, { newOrigin: true }), "maintenance_cycle_expired");
+  f.time(first.originalCycleExpiry - 1);
+  refused(await f.make().admit(input, { newOrigin: true }), "maintenance_clock_invalid");
+  stored = await table(f.root);
+  assert.equal(stored.cycles.length, 1);
+  assert.equal(stored.cycles[0].slots.length, 3);
+  assert.equal(stored.cycles[0].originalCycleExpiry, first.originalCycleExpiry);
+});
+
+test("new origin pre-index crash retains spaced eligibility and its mutation fence", async t => {
+  const f = await fixture(t), input = eligible(), ledger = f.make();
+  const first = take(await ledger.admit(input, { newOrigin: true }));
+  take(await ledger.finish(first, "transient"));
+  f.time(first.start + 180_001);
+  const second = take(await f.make().admit(input, { newOrigin: true }));
+  assert.equal(second.ordinal, 2);
+  assert.equal(second.originalCycleExpiry, first.originalCycleExpiry);
+  const stored = (await table(f.root)).cycles[0];
+  assert.deepEqual(stored.outputs, []);
+  assert.equal(stored.fenced, true);
+  take(await ledger.finish(second, "transient"));
+});
+
 test("durable slots survive interruption, reserve full totals, retain expiry and stop after three", async t => {
   const f = await fixture(t), input = eligible(), ledger = f.make();
   const first = take(await ledger.admit(input));
@@ -902,6 +949,46 @@ test("identity fields and digest sources reject final newlines while foo.git rem
   refused(await ledger.beforeMutation(token, [sha("out") + "\n"]), "maintenance_lineage_invalid");
   take(await ledger.revalidate(token, input));
   take(await ledger.finish(token, "nonmutating"));
+});
+
+test("bare basename roundtrips canonical literal spelling and UTF-8 byte boundaries", async t => {
+  for (const name of ["repo.git", "github.com+org+repo.git", "forge.example%3A8443+org+repo.git",
+    "é".repeat(125) + "a.git", "a".repeat(255), "e\u0301+Repo.git"]) {
+    const f = await fixture(t), input = eligible();
+    input.identity.bareBasename = name;
+    const token = take(await f.make().admit(input));
+    take(await f.make().revalidate(token, input));
+    take(await f.make().finish(token, "nonmutating"));
+    const before = await Promise.all(["complete.json", "initialized.json"].map(n => fs.readFile(path.join(f.root, n), "utf8")));
+    assert.equal((await table(f.root)).cycles[0].identity.bareBasename, name);
+    refused(await f.make().admit(input), "maintenance_slot_spacing");
+    assert.deepEqual(await Promise.all(["complete.json", "initialized.json"].map(n => fs.readFile(path.join(f.root, n), "utf8"))), before);
+  }
+});
+
+test("bare basename rejects unsafe components and malformed Unicode without admitting history", async t => {
+  const f = await fixture(t);
+  for (const name of ["", ".", "..", "a/b", "a\\b", "a".repeat(256), "é".repeat(126) + ".git",
+    "\uD800", "\uDC00", "a\uD800b", ...Array.from({ length: 32 }, (_, n) => "a" + String.fromCharCode(n)),
+    "a\u007f", "a\u0085", ...[0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e,
+      0x2066, 0x2067, 0x2068, 0x2069].map(n => "a" + String.fromCharCode(n))]) {
+    const input = eligible(); input.identity.bareBasename = name;
+    refused(await f.make().admit(input), "maintenance_identity_invalid");
+  }
+  assert.deepEqual((await table(f.root)).cycles, []);
+});
+
+test("bare basename malformed 256-byte authenticated history remains protected", async t => {
+  const f = await fixture(t), input = eligible();
+  const token = take(await f.make().admit(input));
+  take(await f.make().revalidate(token, input));
+  take(await f.make().finish(token, "nonmutating"));
+  const value = await table(f.root);
+  value.cycles[0].identity.bareBasename = "a".repeat(256);
+  await reseal(f.root, value);
+  const before = await storageSnapshot(f.root);
+  refused(await f.make().admit(input), "maintenance_state_invalid");
+  assert.deepEqual(await storageSnapshot(f.root), before);
 });
 
 test("optional instrumentation is inert outside scope and exhaustion latches until joined finish", async t => {

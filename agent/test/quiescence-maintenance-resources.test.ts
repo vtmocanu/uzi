@@ -17,6 +17,7 @@ const request: ScanRequest = {
 };
 const verdict = JSON.stringify({ state: "quiescent", processes: [], killed: [], detail: "" }) + "\n";
 const byteCap = 256 * 1024 ** 2;
+const childBytes = 32 * 1024 ** 2;
 function child() {
   return Object.assign(new EventEmitter(), {
     pid: undefined, stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(),
@@ -96,7 +97,7 @@ for (const stream of ["stdout", "stderr"] as const) {
     f.run(() => {
       // A zero-byte source is serialized with the existing reportDeadline; count the actual write once.
       const inputBytes = c.stdin.readableLength;
-      MaintenanceResources.consume("metadataBytes", byteCap - inputBytes - 3);
+      MaintenanceResources.consume("metadataBytes", byteCap - childBytes - inputBytes - 3);
     });
     const read = c[stream].read.bind(c[stream]);
     t.mock.method(c[stream], "read", (n?: number) => {
@@ -125,7 +126,7 @@ test("exact remaining raw bytes can be read once; buffered extra data cannot rev
     spawnHelper: () => c as unknown as ChildProcess,
   }));
   await turn();
-  f.run(() => MaintenanceResources.consume("metadataBytes", byteCap - c.stdin.readableLength - 3));
+  f.run(() => MaintenanceResources.consume("metadataBytes", byteCap - childBytes - c.stdin.readableLength - 3));
   const read = c.stdout.read.bind(c.stdout);
   t.mock.method(c.stdout, "read", (n?: number) => {
     if (n && n > 0) bytesRead += n;
@@ -142,11 +143,11 @@ test("exact remaining raw bytes can be read once; buffered extra data cannot rev
   assert.equal((await pending).state, "unverified");
 });
 
-test("request quota is reserved before stdin delivery and cancellation still joins close", async t => {
+test("request row refusal before stdin delivery still joins owned close", async t => {
   const f = await fixture(t), c = child();
   let settled = false;
   const pending = f.run(() => {
-    MaintenanceResources.consume("metadataBytes", byteCap);
+    MaintenanceResources.consume("adminEntries", 4096 - 512);
     return reapRunProcesses(request, { viaHelper: true,
       helperTmp: { make: () => "/private-base", remove: () => {} },
       spawnHelper: () => c as unknown as ChildProcess,
@@ -164,7 +165,7 @@ for (const field of ["processes", "killed"] as const) {
   test("decoded helper " + field + " rows are charged before validation and sanitization", async t => {
     const f = await fixture(t), c = child();
     const pending = f.run(() => {
-      MaintenanceResources.consume("adminEntries", 4096 - request.targetPaths.length);
+      MaintenanceResources.consume("adminEntries", 4096 - 512 - request.targetPaths.length);
       return reapRunProcesses(request, { viaHelper: true,
         helperTmp: { make: () => "/private-base", remove: () => {} },
         spawnHelper: () => c as unknown as ChildProcess,
@@ -196,6 +197,162 @@ test("native TMP raw quota refusal does not settle on error before owned close",
   assert.equal(settled, false);
   c.emit("close", 0, null);
   assert.equal(await pending, "rejected");
+});
+
+for (const resource of ["adminEntries", "metadataBytes"] as const) {
+  test("parent refuses insufficient child " + resource + " reservation before real scanner dispatch", async t => {
+    const f = await fixture(t);
+    let launches = 0;
+    const result = await f.run(() => {
+      MaintenanceResources.consume(resource, resource === "adminEntries" ? 4096 - 511 : byteCap - childBytes + 1);
+      return reapRunProcesses(request, { viaHelper: true,
+        helperTmp: { make: () => f.dir, remove: () => {} },
+        spawnHelper: (_command, args, opts) => {
+          launches++;
+          return childProcess.spawn(process.execPath, args.slice(args.indexOf("--import")), {
+            ...opts, stdio: ["pipe", "pipe", "pipe"],
+          });
+        },
+      });
+    });
+    assert.equal(result.state, "unverified");
+    assert.equal(launches, 0);
+  });
+}
+
+/** Exercise the actual stdin validator and child scanner against only a fake proc root. */
+async function realHelper(root: string, workLimits?: unknown, options: { preload?: string; view?: object } = {}) {
+  const c = childProcess.spawn(process.execPath, [
+    "--import", import.meta.resolve("tsx"), ...(options.preload ? ["--import", options.preload] : []),
+    path.resolve("src/run-quiescence.ts"), "--uzi-quiesce-helper",
+  ], { env: { PATH: process.env.PATH, TSX_DISABLE_CACHE: "1" }, stdio: ["pipe", "pipe", "pipe"], timeout: 5000 });
+  let stdout = "", stderr = "";
+  c.stdout.setEncoding("utf8").on("data", chunk => { stdout += chunk; });
+  c.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+  const closed = new Promise<void>((resolve, reject) => {
+    c.on("error", reject);
+    c.on("close", (code, signal) => {
+      if (code !== 0) reject(new Error("helper exit " + (code ?? signal) + ": " + stderr));
+      else resolve();
+    });
+  });
+  c.stdin.end(JSON.stringify({ ...request, view: options.view ?? { procRoot: root, deadlineMs: 100, intervalMs: 1 }, workLimits }));
+  await closed;
+  return JSON.parse(stdout) as { state: string; detail: string };
+}
+
+test("real helper charges ignored entries and EOF with an exact cumulative allowance", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc");
+  await fs.promises.mkdir(root);
+  await fs.promises.writeFile(path.join(root, "ignored"), "");
+  await fs.promises.writeFile(path.join(root, "also-ignored"), "");
+  assert.equal((await realHelper(root, { adminEntries: 2, metadataBytes: 0 })).state, "unverified");
+  assert.equal((await realHelper(root, { adminEntries: 3, metadataBytes: 0 })).state, "quiescent");
+  assert.equal((await realHelper(root)).state, "quiescent", "ordinary helper needs no allowance");
+});
+
+test("real helper shares read reservations across PIDs and sticky exhaustion survives vanished reads", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc");
+  for (const pid of ["17777", "17778"]) {
+    await fs.promises.mkdir(path.join(root, pid), { recursive: true });
+    await fs.promises.writeFile(path.join(root, pid, "stat"), "");
+    await fs.promises.writeFile(path.join(root, pid, "status"), "Name: fixture\nUid: 54321\n");
+  }
+  // Two stat and two status reads each reserve cap+1 even for these tiny files.
+  assert.equal((await realHelper(root, { adminEntries: 3, metadataBytes: 3 * 65537 })).state, "unverified");
+  assert.equal((await realHelper(root, { adminEntries: 3, metadataBytes: 4 * 65537 })).state, "quiescent");
+});
+
+test("real helper rescans share the same listing and metadata counters", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc");
+  await fs.promises.mkdir(path.join(root, "17777"), { recursive: true });
+  await fs.promises.writeFile(path.join(root, "17777", "stat"), "");
+  await fs.promises.writeFile(path.join(root, "17777", "status"), "malformed");
+  for (const workLimits of [
+    { adminEntries: 2, metadataBytes: childBytes },
+    { adminEntries: 512, metadataBytes: 2 * 65537 },
+  ]) {
+    const result = await realHelper(root, workLimits);
+    assert.equal(result.state, "unverified");
+    assert.match(result.detail, /helper work exhausted/, "a later rescan must retain exhaustion");
+  }
+});
+
+test("real helper reserves cwd readlink bytes cumulatively with file reads", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc"), pid = path.join(root, "17777");
+  await fs.promises.mkdir(pid, { recursive: true });
+  await fs.promises.writeFile(path.join(pid, "stat"), "");
+  await fs.promises.writeFile(path.join(pid, "status"), "Name: fixture\nUid: 12345\n");
+  await fs.promises.writeFile(path.join(pid, "environ"), "");
+  await fs.promises.symlink("/outside-test", path.join(pid, "cwd"));
+  const bytes = 2 * 65537 + 262145 + 65536;
+  assert.equal((await realHelper(root, { adminEntries: 2, metadataBytes: bytes - 1 })).state, "unverified");
+  assert.equal((await realHelper(root, { adminEntries: 2, metadataBytes: bytes })).state, "quiescent");
+});
+
+test("real helper descendant filtering and swallowed pidfiles retain shared exhaustion", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc"), preload = path.join(f.dir, "fake-proc.mjs");
+  await fs.promises.mkdir(root);
+  // Remap every procfs operation before the actual helper module loads; no host proc access.
+  await fs.promises.writeFile(preload, `
+import fs from "node:fs";
+const root = ${JSON.stringify(root)};
+const remap = value => typeof value === "string" && (value === "/proc" || value.startsWith("/proc/"))
+  ? root + value.slice(5) : value;
+for (const name of ["openSync", "opendirSync", "readlinkSync"]) {
+  const original = fs[name];
+  fs[name] = (file, ...args) => original(remap(file), ...args);
+}
+`);
+  const view = { descendantsOf: 99999, deadlineMs: 100, intervalMs: 1 };
+  for (const pid of ["17777", "17778"]) {
+    await fs.promises.mkdir(path.join(root, pid));
+    await fs.promises.writeFile(path.join(root, pid, "stat"), "");
+  }
+  assert.equal((await realHelper(root, { adminEntries: 3, metadataBytes: 65537 }, { preload, view })).state, "unverified",
+    "filtered-out stat failures must not turn into an empty proof");
+  await fs.promises.rm(root, { recursive: true });
+  await fs.promises.mkdir(root);
+  const pidfile = path.join(f.dir, "pids");
+  await fs.promises.writeFile(pidfile, "");
+  const pidView = { ...view, extraPidFiles: [pidfile, pidfile] };
+  assert.equal((await realHelper(root, { adminEntries: 1, metadataBytes: 65537 },
+    { preload, view: pidView })).state, "unverified");
+  assert.equal((await realHelper(root, { adminEntries: 1, metadataBytes: 2 * 65537 },
+    { preload, view: pidView })).state, "quiescent");
+});
+
+test("parent reserves the fixed envelope and real helper proves an empty fake root", async t => {
+  const f = await fixture(t);
+  let input: { workLimits?: object } | undefined;
+  const result = await f.run(() => reapRunProcesses(request, { viaHelper: true,
+    helperTmp: { make: () => f.dir, remove: () => {} },
+    spawnHelper: (_command, args, opts) => {
+      const c = childProcess.spawn(process.execPath, args.slice(args.indexOf("--import")), {
+        ...opts, stdio: ["pipe", "pipe", "pipe"],
+      });
+      const end = c.stdin.end.bind(c.stdin);
+      t.mock.method(c.stdin, "end", (chunk: string) => { input = JSON.parse(chunk); return end(chunk); });
+      return c;
+    },
+  }));
+  assert.equal(result.state, "quiescent", result.detail);
+  assert.deepEqual(input?.workLimits, { adminEntries: 512, metadataBytes: childBytes });
+  f.run(() => {
+    // Request rows also consume one entry; only 3583 remain after the fixed reservation.
+    MaintenanceResources.consume("adminEntries", 3583);
+    assert.throws(() => MaintenanceResources.consume("adminEntries", 1), /maintenance_resource_exhausted/);
+  });
+});
+
+test("real helper refuses unsafe or expanded private allowances", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc");
+  await fs.promises.mkdir(root);
+  for (const workLimits of [
+    { adminEntries: 513, metadataBytes: 0 }, { adminEntries: 1, metadataBytes: childBytes + 1 },
+    { adminEntries: 1.5, metadataBytes: 0 }, { adminEntries: 1, metadataBytes: -1 },
+    { adminEntries: 1, metadataBytes: Number.MAX_SAFE_INTEGER + 1 },
+  ]) assert.match((await realHelper(root, workLimits)).detail, /request invalid/);
 });
 
 test("native empty proc table charges its single EOF visit exactly once", async t => {
