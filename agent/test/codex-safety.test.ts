@@ -1731,12 +1731,18 @@ describe("m1 cooperative safety admission", () => {
       assert.equal(error.step, "checkpoint_lock_wait");
       return true;
     });
-    assert.ok(fireQueue, "queue acquisition must use the injected hard clock");
-    fireQueue();
-    await checked;
-    assert.equal(reconciles, 1, "queued source checks cannot overtake the active predecessor");
-    assert.equal(reg.isPoisoned(), true);
-    release.resolve(); await activeChecked;
+    try {
+      assert.ok(fireQueue, "queue acquisition must use the injected hard clock");
+      fireQueue();
+      await checked;
+      assert.equal(reconciles, 1, "queued source checks cannot overtake the active predecessor");
+      assert.equal(reg.isPoisoned(), true);
+    } finally {
+      // Also settle the fixture when this assertion is used as a regression probe.
+      reg.poison({ category: "protocol", message: "queue fixture teardown" });
+      release.resolve();
+      await Promise.allSettled([activeChecked, checked]);
+    }
   });
 
   it("forfeits a queued boundary while retaining the active predecessor in the tail", async () => {
