@@ -859,7 +859,7 @@ Mock at `prds/mockups/1167-lights-on-themes-mock.html`.
 
 ## Decision #3090 — Non-closing publication and pending acceptance
 
-Approved M5 prose, 2026-10-18. Mechanism and residual boundaries are recorded
+Approved M5 prose. (AI-synced 2026-10-18). Mechanism and residual boundaries are recorded
 in [ADR-1225](../adr/1225-structural-completion-interlock-invariants.md#addendum--non-closing-publication-and-pending-acceptance-2026-10-18-3090).
 
 - Plans isolate external acceptance in a final milestone; implementation,
