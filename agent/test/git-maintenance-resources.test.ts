@@ -130,7 +130,9 @@ for (const kind of ["stdout quota", "stderr quota", "object mode", "encoded", "c
     const beforeReap = settled;
     if (stdout instanceof PassThrough) stdout.end();
     stderr.end(); stdin.end();
-    reap();
+    await tick();
+    const afterDrains = settled;
+    if (kind !== "clean EOF") reap();
     const value = await pending;
     assert.equal(before, false, "owned completion cannot outrun open or rejected output");
     assert.equal(beforeReap, false, "output refusal must join owned cancellation");
@@ -141,7 +143,8 @@ for (const kind of ["stdout quota", "stderr quota", "object mode", "encoded", "c
       assert.notEqual(value.code, 0);
       assert.ok(cancelled > 0);
     }
-    assert.equal(reaped, true);
+    assert.equal(afterDrains, kind === "clean EOF", "finished drains must still join owned cancellation until owner release");
+    assert.equal(reaped, kind !== "clean EOF");
     assert.equal(reads, 0, "refused output must never reach a positive raw read");
   });
 }
