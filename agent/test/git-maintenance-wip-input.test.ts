@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { describe } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -39,10 +39,10 @@ async function fixture(t: test.TestContext) {
 // Initialize runtime stdio before counting helper-owned filesystem operations.
 void process.stdin; void process.stdout; void process.stderr;
 const meterFs = require("node:fs");
-const metrics = { reads: 0, allocated: 0, stats: 0, opens: 0, rows: 0, frames: 0 };
+const metrics = { reads: 0, readBytes: 0, allocated: 0, stats: 0, opens: 0, rows: 0, frames: 0 };
 for (const [key, metric] of [["readSync", "reads"], ["lstatSync", "stats"], ["fstatSync", "stats"], ["openSync", "opens"]]) {
   const original = meterFs[key];
-  meterFs[key] = function(...args) { metrics[metric]++; return original.apply(this, args); };
+  meterFs[key] = function(...args) { metrics[metric]++; const result = original.apply(this, args); if (key === "readSync") metrics.readBytes += result; return result; };
 }
 const originalAlloc = Buffer.alloc;
 Buffer.alloc = function(...args) { metrics.allocated += args[0]; return originalAlloc.apply(this, args); };
@@ -73,8 +73,10 @@ process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metrics)}, origi
       () => git["maintenanceWipInput"](source, limits)));
   return { root, dir, git, run, proof, owner, launches: () => launches, joined: () => joined,
     metrics: async () => JSON.parse(await fs.readFile(metrics, "utf8")) as
-      { reads: number; allocated: number; stats: number; opens: number; rows: number; frames: number } };
+      { reads: number; readBytes: number; allocated: number; stats: number; opens: number; rows: number; frames: number } };
 }
+
+describe("raw maintenance WIP input", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
 
 test("raw proof includes unchanged, ignored and binary bytes; root metadata is count-only", async t => {
   const f = await fixture(t);
@@ -89,15 +91,31 @@ test("raw proof includes unchanged, ignored and binary bytes; root metadata is c
   assert.deepEqual(await proof(), first);
   await fs.writeFile(path.join(f.root, ".git", "not-source"), "different");
   assert.deepEqual(await proof(), first);
-  for (const leaf of ["unchanged", "ignored", "binary"]) {
-    await fs.appendFile(path.join(f.root, leaf), "x");
+  // Raw reads include every source byte, including ignored/binary content, but no root .git bytes.
+  const rawBytes = 8 + 7 + 7 + 3;
+  assert.equal((await f.metrics()).readBytes, rawBytes);
+  let previous = first;
+  for (const [leaf, replacement] of [
+    ["unchanged", Buffer.from("changed")],
+    ["ignored", Buffer.from("IGNORED")],
+    ["binary", Buffer.from([0, 254, 0])],
+  ] as const) {
+    await fs.writeFile(path.join(f.root, leaf), replacement);
     const next = await proof();
-    assert.notEqual(next.digest, first.digest);
-    assert.equal(next.entries, first.entries);
-    assert.ok(next.bytes > first.bytes);
+    assert.notEqual(next.digest, previous.digest, `${leaf} same-size content must change digest`);
+    assert.equal(next.entries, previous.entries);
+    assert.equal(next.bytes, previous.bytes, `${leaf} same-size content preserves byte allowance`);
+    assert.equal((await f.metrics()).readBytes, rawBytes);
+    previous = next;
   }
+  await fs.appendFile(path.join(f.root, "binary"), "x");
+  const grown = await proof();
+  assert.notEqual(grown.digest, previous.digest);
+  assert.equal(grown.entries, previous.entries);
+  assert.equal(grown.bytes, previous.bytes + 1);
+  assert.equal((await f.metrics()).readBytes, rawBytes + 1);
   await fs.writeFile(path.join(f.root, "new"), "");
-  assert.ok((await proof()).entries > first.entries);
+  assert.ok((await proof()).entries > grown.entries);
   assert.equal(f.launches(), f.joined());
 });
 
@@ -294,4 +312,6 @@ mutationFs.readSync = function(...args) {
 `;
   await assert.rejects(f.proof({}, hook), /maintenance_/);
   assert.equal(f.joined(), 1);
+});
+
 });

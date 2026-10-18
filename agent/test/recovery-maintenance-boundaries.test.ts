@@ -8,7 +8,7 @@ import { PassThrough, Readable, Writable } from "node:stream";
 import { RecoveryMaintenance, MaintenanceResources, type MaintenanceEligibility } from "../src/recovery-maintenance.js";
 import { verifyClosureFrames } from "../src/recovery-closure.js";
 import { GitCache } from "../src/git.js";
-import { WorkerClient } from "../src/client.js";
+import { WorkerClient, RequestError } from "../src/client.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { nullLogger } from "./helpers.js";
 import type { BoundaryProcessSpawner } from "../src/git.js";
@@ -334,16 +334,59 @@ test("RPC attempts are charged once per transport and oversized error chunks bef
   });
 });
 
-test("oversized error body consumes the full returned chunk", async t => {
-  const f = await fixture(t);
-  const client = new WorkerClient("http://boundary.test", "token", "test", nullLogger(), { fetch: async () =>
-    new Response("x".repeat(8192), { status: 503 }) });
-  await MaintenanceResources.run(f.token, async () => {
-    MaintenanceResources.consume("metadataBytes", metadataCap - 4096);
-    await assert.rejects(client.releaseRecoveryCustody("run"));
-    assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+// A real byte stream exposes the requested BYOB view before delivering any bytes.
+function byteResponse(status: number) {
+  const views: number[] = [];
+  let delivered = 0, cancelled = 0;
+  const response = new Response(new ReadableStream({
+    type: "bytes",
+    pull(controller) {
+      const request = controller.byobRequest;
+      assert.ok(request, "maintenance error reads require a BYOB view");
+      const view = request.view!;
+      views.push(view.byteLength);
+      const size = Math.min(view.byteLength, 8192 - delivered);
+      new Uint8Array(view.buffer, view.byteOffset, size).fill(120);
+      delivered += size;
+      request.respond(size);
+    },
+    cancel() { cancelled++; },
+  }, { highWaterMark: 0 }), { status });
+  return { response, views, delivered: () => delivered, cancelled: () => cancelled };
+}
+
+for (const remaining of [4096, 4095]) {
+  test(`oversized HTTP error precharges a 4096-byte BYOB view with ${remaining} remaining`, async t => {
+    const f = await fixture(t);
+    const source = byteResponse(503);
+    const reads = t.mock.method(ReadableStreamBYOBReader.prototype, "read");
+    let calls = 0;
+    const client = new WorkerClient("http://boundary.test", "token", "test", nullLogger(), { fetch: async () => {
+      calls++;
+      return source.response;
+    } });
+    await MaintenanceResources.run(f.token, async () => {
+      MaintenanceResources.consume("metadataBytes", metadataCap - remaining);
+      await assert.rejects(client.releaseRecoveryCustody("run"), error => {
+        assert.ok(error instanceof RequestError);
+        assert.equal(error.constructor, RequestError, "HTTP 503 retains untyped classification");
+        assert.equal(error.status, 503);
+        assert.equal(error.body, remaining === 4096 ? "x".repeat(4096) : "");
+        return true;
+      });
+      assert.equal(calls, 1);
+      assert.equal(reads.mock.callCount(), remaining === 4096 ? 1 : 0);
+      assert.deepEqual(source.views, remaining === 4096 ? [4096] : []);
+      assert.equal(source.delivered(), remaining === 4096 ? 4096 : 0);
+      assert.equal(source.cancelled(), 1, "unread response remainder is cancelled");
+      if (remaining === 4096) {
+        assert.equal(MaintenanceResources.signalIfActive()?.aborted, false);
+        assert.throws(() => MaintenanceResources.consume("metadataBytes", 1), /maintenance_resource_exhausted/);
+      }
+      assert.equal(MaintenanceResources.signalIfActive()?.aborted, true);
+    });
   });
-});
+}
 
 for (const status of [400, 403, 404, 409, 503]) {
   test(`global archive-upload transport counts every request and retains HTTP ${status}`, async t => {
