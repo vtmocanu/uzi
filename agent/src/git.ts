@@ -1571,6 +1571,8 @@ export interface AttemptSeedOptions {
    *  written, so the caller can register the attempt live before any other seed of the key can
    *  run its sweep. */
   onSeeded?: (clonePath: string) => void;
+  /** Deny-only observation of a failed or refused seed-time retention operation. */
+  onRetentionUnproven?: () => void;
   /** The retention sweep's quiescence predicate: true when the scoped process scan over `paths`
    *  finds nothing in scope. False, absent/unverified proof or a generic throw keeps the entry;
    *  classified control/recovery interruptions escape best-effort retention. */
@@ -3079,6 +3081,7 @@ export class GitCache {
       }
       attempt.onSeeded?.(clonePath);
       await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
+        attempt.onRetentionUnproven?.();
         if (attempt.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
@@ -3174,6 +3177,7 @@ export class GitCache {
       try {
         return await attempt.quiescent(paths, canonical);
       } catch (err) {
+        attempt.onRetentionUnproven?.();
         if (attempt.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         return false;
@@ -3206,10 +3210,16 @@ export class GitCache {
       // losing it costs nothing, while an attempt dir deleted before a failed skills delete would
       // leave the skills dir orphaned. A failed attempt delete after this keeps the attempt (still
       // `abandoned`, retried at the next seed) and orphans nothing.
-      if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) continue;
-      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
+      if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) {
+        attempt.onRetentionUnproven?.();
+        continue;
+      }
+      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) {
+        attempt.onRetentionUnproven?.();
+        continue;
+      }
       const { branch: entryBranch, ...entry } = a.entry;
-      await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => undefined);
+      await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => { attempt.onRetentionUnproven?.(); });
       this.log.info("runner clone retention: deleted a retained attempt", { path: a.p, state: a.entry.state });
     }
 
@@ -3232,7 +3242,7 @@ export class GitCache {
       if (!(await quiescent([p]))) continue;
       if (await this.deleteRetainedArtifact(parent, p, (n) => n === name)) {
         this.log.info("runner clone retention: deleted an orphaned skills sibling", { path: p });
-      }
+      } else attempt.onRetentionUnproven?.();
     }
 
     await this.sweepResidue(barePath, canonical, attempt, warningScope);
@@ -3262,7 +3272,7 @@ export class GitCache {
   private async sweepResidue(
     barePath: string,
     canonical: string,
-    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption">,
+    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption" | "onRetentionUnproven">,
     warningScope: RecoveryPhysicalWarningScope,
   ): Promise<void> {
     const parent = path.dirname(canonical);
@@ -3320,6 +3330,7 @@ export class GitCache {
         this.residueSweepCursors.delete(this.residueSweepCursors.keys().next().value!);
       }
       const refuse = (reason: string): false => {
+        predicates.onRetentionUnproven?.();
         this.log.warn("runner clone retention: refusing residue deletion; keeping it", {
           path: r.p, reason: sanitizeForLog(reason, 157),
         });
@@ -3354,7 +3365,7 @@ export class GitCache {
         unlinkNonDirectory: true, beforeDelete: validate, canDelete: open, strictValidation: true,
       })) {
         this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
-      }
+      } else predicates.onRetentionUnproven?.();
     }
   }
 
