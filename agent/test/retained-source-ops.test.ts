@@ -197,17 +197,25 @@ describe("retainStoppedAttempt", () => {
     assert.equal(JSON.parse(journalRaw(next.branch)).clonePath, next.path, "the successor's own journal");
   });
 
-  it("a sweep, compactAttemptLedger and the abandoned cap keep a reclaimed stopped attempt", async () => {
+  it("disabled automatic sweep and compactAttemptLedger keep reclaimed and abandoned attempts past the diagnostic cap", async () => {
+    const rec = recordingLogger();
+    git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions());
     const a = await seedAttempt("run-a", 1);
     fs.writeFileSync(path.join(a.path, "dirty.txt"), "unpreserved\n");
     assert.equal(await git.retainStoppedAttempt(bare, a.branch, a), "retained");
-    // Five older abandoned attempts push the key past the cap of three; the oldest are swept.
-    const swept = [10, 11, 12, 13, 14].map((i) => plantAttempt(a.branch, a.key, attemptIdAt(i), `old-${i}`, "abandoned"));
+    // Five abandoned attempts exceed the diagnostic threshold of three without authorizing deletion.
+    const retained = [10, 11, 12, 13, 14].map((i) => plantAttempt(a.branch, a.key, attemptIdAt(i), `old-${i}`, "abandoned"));
     // Duplicate ledger values force a real compaction on the next seed.
     gitIn(bare, ["config", "--local", "--add", `uzi-attempts.${a.branch}.entry`,
       JSON.stringify({ attemptId: a.attemptId, runId: a.runId, clonePath: a.path, state: "reclaimed" })]);
     await seedAttempt("run-b", 20, { gen: 2 });
-    assert.equal(fs.existsSync(swept[0]!.dir), false, "the cap pass really ran and swept the oldest abandoned attempt");
+    for (const [i, artifact] of retained.entries()) {
+      assert.equal(fs.readFileSync(path.join(artifact.dir, "WORK.txt"), "utf8"), attemptIdAt(10 + i));
+      assert.equal(fs.readFileSync(path.join(artifact.skills, "plugin.json"), "utf8"), "{}");
+      assert.equal(ledgerState(a.branch, attemptIdAt(10 + i)), "abandoned");
+    }
+    assert.ok(rec.lines.some((line) => (line as { msg?: string }).msg === "runner clone retention: automatic reclaim disabled"),
+      "over-threshold inventory is diagnostic only");
     assert.equal(fs.readFileSync(path.join(a.path, "dirty.txt"), "utf8"), "unpreserved\n");
     assert.equal(ledgerState(a.branch, a.attemptId), "reclaimed");
     assert.equal(cfgAll(`uzi-attempts.${a.branch}.entry`).filter((v) => v.includes(a.attemptId)).length, 1, "compaction ran and kept it");

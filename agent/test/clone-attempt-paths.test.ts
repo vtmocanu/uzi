@@ -1040,9 +1040,8 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
     terminalOwner(owner, iid);
     await restartedWorker(transientFactory().factory).runner.execute(gitlabClaim(iid));
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed");
-    // Three NEWER abandoned attempts of the same key, then another seed: were the reclaimed
-    // attempt counted as abandoned it would be the oldest of four and deleted (the probe printed
-    // OWNER_DIR_EXISTS=false STATE=retired).
+    // Three newer abandoned attempts of the same key, then another seed. Reclaimed identity
+    // and original bytes survive alongside the abandoned inventory; automatic reclaim is disabled.
     for (let i = 1; i <= 3; i++) await plantAbandoned(iid, formatAttemptId(new Date(Date.now() + i * 60_000), 1, `00000000000000${i}${i}`));
     const next = transientFactory();
     await wired(next.factory).execute(gitlabClaim(iid));
@@ -1425,7 +1424,7 @@ describe("issue #1783 M2 review (N6): seed availability under an unattributable 
         : { process: { state: "quiescent", processes: [], killed: [], detail: "scripted" }, docker: { state: "not_wired", removed: [], detail: "" } };
   }
 
-  it("seed: seeds the fresh path, logs, and vetoes every retention deletion of that seed", async () => {
+  it("seed: seeds the fresh path, logs unreadable scope, and retains every predecessor", async () => {
     const iid = 2101;
     const planted: string[] = [];
     for (const i of [1, 2, 3, 4, 5]) planted.push(await plantAbandoned(iid, formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, i)), 1, `000000000000000${i}`)));
@@ -1434,7 +1433,7 @@ describe("issue #1783 M2 review (N6): seed availability under an unattributable 
     await wired(factory, { quiesceRun: scriptedAt("attempt_seed", [unreadable]) }, logger).execute(gitlabClaim(iid));
     assert.equal(started(), 1, "the fresh seed is not blocked");
     assert.ok(lines.some((l) => ((l as { msg?: string }).msg ?? "").includes("unattributable unreadable")), "logged");
-    for (const p of planted) assert.equal(fs.existsSync(p), true, `retention deletion vetoed: ${p}`);
+    for (const p of planted) assert.equal(fs.existsSync(p), true, `automatic retention keeps predecessor: ${p}`);
   });
 
   it("seed: a positively in-scope survivor alongside it still blocks", async () => {

@@ -28,8 +28,8 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 
-// issue #1783 M2 — the git-layer half of per-attempt clone paths: the retention sweep that bounds
-// what retained attempts cost, the attempt ledger / recovery journal contract the watcher's backup
+// issue #1783 M2 / #1858 — the git-layer half of per-attempt clone paths: retained attempts
+// and bounded retention diagnostics, the attempt ledger / recovery journal contract the watcher's backup
 // script reads, the owner-path predicate (d′), and that an attempt path is an ordinary working
 // tree to every consumer that screens or runs in it.
 
