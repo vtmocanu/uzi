@@ -14,7 +14,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { CodexSessionStore } from "../src/codex/session-state.js";
-import { fakeGitlab } from "./runner-harness.js";
+import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
 
 const HAS_PROCFS = process.platform === "linux";
@@ -79,6 +79,8 @@ import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
+import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
+import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { closingDirectiveFor as m2ClosingDirective } from "../src/pr-description.js";
 import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
@@ -18952,4 +18954,165 @@ describe("M2 replacement Codex fresh context", () => {
     assert.equal(result.scopeCapped, undefined);
     assert.deepEqual(result.milestonesCompleted, ["M1"]);
   });
+});
+
+// The executor is real; only provider transport, effect supervision and installer IO are
+// injected using the same seams as the terminal-run scenarios above.
+it("#3101 actual CodexExecutor completed installer preserves C through shutdown and unobserved remote cancel", async () => {
+  const api = new FakeApi("3101-worker");
+  const url = await api.listen();
+  const fx = makeFixture();
+  const diagnostics = recordingLog();
+  const client = new WorkerClient(url, "3101-worker", "test", diagnostics.log,
+    { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+  client.protocolFeatures = ["run_checkpoint_durability"];
+  const iid = 310101;
+  const claim = makeClaim({
+    issue_iid: iid, claim_generation: 1,
+    repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
+      forge_type: "github", default_branch: "main" },
+    plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+    secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+  });
+  const proof = shutdownContentProof(fx, client, iid);
+  let turnEntered!: () => void;
+  const ready = new Promise<void>(resolve => { turnEntered = resolve; });
+  let installed = false;
+  const rig = makeRig({ responder: c => {
+    if (c.method === "thread/start") return { thread: { id: "th-1" } };
+    if (c.method === "turn/start") {
+      assert.equal(installed, true, "installer IO completed before shutdown readiness");
+      turnEntered();
+      return { turn: { id: "tn-1" } };
+    }
+    return {};
+  } });
+  const effect = rig.deps.launchEffectRoot!;
+  const launchProvider = rig.deps.launchProviderRoot!;
+  let epochs = 0;
+  rig.deps = { ...rig.deps, deferRegistryTeardown: true, boundaryDeadlineMs: 60_000,
+    launchProviderRoot: async (spec, mode) => { epochs++; return launchProvider(spec, mode); },
+    installDeps: async () => {
+      installed = true;
+      return { results: [{ dir: ".", manager: "npm", ok: true, detail: "fixture installed" }], truncated: false };
+    },
+    launchEffectRoot: async (spec, deadline) => {
+      const handle = await effect(spec, deadline);
+      const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+        ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+      if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+      if (context?.signal?.aborted && !remoteCancelled) {
+        assert.equal(api.codexRequests.filter(r => r.operation === "refresh").length, 1,
+          "remote cancel lands after shutdown reconcile and before its first Git child");
+        getsAtCancel = api.inputGets.get(claim.run_id) ?? 0;
+        receiptsAtCancel = api.inputReceiptCalls.length;
+        // Remote-only owner cancel under the SAME still-bound claim. The stopped
+        // steering loop consumes no GET/ACK/APPLIED and delivers no local stop.
+        api.parkRunOwnership = { status: "cancelled", claim_generation: claim.claim_generation!,
+          hold_reason: null, claim_released: false };
+        api.appendInputs(claim.run_id, [{ id: 3101, kind: "cancel" }]);
+        remoteCancelled = true;
+      }
+      const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+      const timer = setTimeout(() => child.kill(), deadline);
+      const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+        child.once("error", error => { clearTimeout(timer); reject(error); });
+        child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+      });
+      return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+        waitChild: async () => exited,
+        dispose: async ms => { await exited; return handle.dispose(ms); } };
+    },
+  };
+  const summaryCalls: string[] = [];
+  let summaryStarted!: () => void;
+  const summaryReady = new Promise<void>(resolve => { summaryStarted = resolve; });
+  let finishSummary: ((value: string) => void) | undefined;
+  let summarySignal: AbortSignal | undefined;
+  let summaryPosts = 0;
+  client.postIntentSummary = async () => { summaryPosts++; };
+  client.postPlanSummary = async () => { summaryPosts++; };
+  const executor = makeExecutor({ ...rig, client: client as never }, bindingOf(SUBSCRIPTION),
+    diagnostics.log, undefined, provider, { summaryRunner: {
+      generateIntentSummary: async input => {
+        summaryCalls.push("intent");
+        summarySignal = input.signal;
+        const pending = new Promise<string>(resolve => { finishSummary = resolve; });
+        summaryStarted();
+        return pending;
+      },
+      generatePlanSummary: async () => { summaryCalls.push("plan"); return null; },
+    } });
+  const closeSummary = executor.closeAndSettlePlanSummary.bind(executor);
+  let summaryCloses = 0;
+  executor.closeAndSettlePlanSummary = async deadline => {
+    summaryCloses++;
+    const settled = closeSummary(deadline);
+    // The real seam closes admission and aborts in-flight advice before yielding.
+    if (summarySignal) assert.equal(summarySignal.aborted, true);
+    finishSummary?.("late summary after shutdown");
+    await settled;
+  };
+  const originalRun = executor.run.bind(executor);
+  let context: RunContext | undefined;
+  executor.run = async ctx => {
+    context = ctx;
+    await proof.prepare(ctx);
+    // Forward the ORIGINAL context, including both spent execution signals and the
+    // Runner callbacks. A synthetic makeCtx would bypass the regression.
+    return originalRun(ctx);
+  };
+  const git = new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+  const { gitlab } = fakeGitlab();
+  const { github } = fakeGitHub();
+  const runner = new RunRunner(client, git,
+    () => ({ executor, homeDir: path.join(fx.dataDir, "3101-home") }), diagnostics.log, 20, undefined, {
+      pollMs: 5, checkpointIntervalMs: 1, checkpointTickIntervalMs: 0,
+      codexBoundaryDeadlineMs: 60_000, shutdownPublishTimeoutMs: 60_000, gitlab, github,
+    });
+  let remoteCancelled = false;
+  let getsAtCancel = 0;
+  let receiptsAtCancel = 0;
+  proof.onShutdownReceipt((signal, generation) => {
+    assert.equal(signal.aborted, false);
+    assert.equal(generation, 1, "publication forwards the original still-bound claim generation");
+    assert.ok(executor.safety);
+    assert.equal(context!.signal!.aborted, true);
+    assert.equal(context!.terminalLifecycleSignal!.aborted, true);
+    assert.equal(remoteCancelled, true, "broker receipt remains eligible after remote-only cancel");
+    assert.equal(api.parkRunOwnership!.status, "cancelled");
+    assert.equal(api.parkRunOwnership!.claim_generation, claim.claim_generation);
+    assert.equal(api.inputGets.get(claim.run_id) ?? 0, getsAtCancel);
+    assert.equal(api.inputReceiptCalls.length, receiptsAtCancel);
+  });
+  const execution = runner.execute(claim);
+  try {
+    await withTimeout(Promise.race([ready, execution.then(() => {
+      throw new Error("actual executor ended before readiness: " + diagnostics.lines.join("\n"));
+    })]), 30_000, "actual executor turn admission");
+    await withTimeout(summaryReady, 5_000, "live summary admission");
+    assert.deepEqual(summaryCalls, ["intent"], "a live summary was admitted before shutdown");
+    const closesBeforeShutdown = summaryCloses;
+    runner.shutdown();
+    runner.shutdown();
+    await withTimeout(execution, 60_000, "actual executor shutdown");
+    await proof.verify(git);
+    assert.equal(remoteCancelled, true, diagnostics.lines.join("\n"));
+    assert.equal(api.inputGets.get(claim.run_id) ?? 0, getsAtCancel);
+    assert.equal(api.inputReceiptCalls.length, receiptsAtCancel);
+    assert.equal(api.inputReceiptCalls.some(r => r.ids.includes(3101)), false);
+    assert.equal(api.parkRunOwnership!.claim_generation, claim.claim_generation);
+    assert.equal(rig.transport.turnStartCount, 1, "shutdown never resumes provider execution");
+    assert.equal(epochs, 1, "shutdown never creates another execution epoch");
+    assert.ok(summaryCloses > closesBeforeShutdown, "actual shutdown closes and settles summary admission");
+    assert.deepEqual(summaryCalls, ["intent"], "shutdown admits no replacement intent or plan summary");
+    assert.equal(summarySignal?.aborted, true);
+    assert.equal(summaryPosts, 0, "late advice cannot publish after shutdown");
+    assert.ok(rig.reaped() > 0);
+    assert.ok(rig.disposed() > 0);
+  } finally {
+    runner.shutdown();
+    try { await withTimeout(execution, 60_000, "actual executor cleanup"); }
+    finally { proof.cleanup(); await api.close(); fx.cleanup(); }
+  }
 });

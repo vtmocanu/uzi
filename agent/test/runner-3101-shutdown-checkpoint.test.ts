@@ -1,118 +1,151 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
-import type { Readable } from "node:stream";
 import type { Executor, RunContext } from "../src/executor.js";
+import type { GracefulShutdownCheckpoint } from "../src/harness.js";
+import { RunDiskLocks } from "../src/run-disk-locks.js";
+import type { SteeringChannel } from "../src/steering.js";
 import {
-  client, deferred, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith,
+  client, deferred, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith,
 } from "./runner-harness.js";
-import {
-  codexRig, commitInTree, GIT_ENV, trackedFile, type CodexRig,
-} from "./runner-codex-sinks-fixture.js";
+import { codexRig, type CodexRig } from "./runner-codex-sinks-fixture.js";
+import { shutdownContentProof } from "./shutdown-3101-content-fixture.js";
 
 installHarness();
 
-// Shutdown cancels execution while the bounded checkpoint retains separate authority.
-// The fake provider leaves its real registry/safety alive through terminal disposal,
-// matching CodexExecutor's deferRegistryTeardown: true runner ownership.
-for (const installer of ["completed", "absent-promise"] as const) {
-  it(`#3101 shutdown checkpoint preserves exact committed and dirty content; installer=${installer}`, async () => {
-    const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
-    fs.mkdirSync(scratch, { recursive: true });
-    const dir = fs.mkdtempSync(path.join(scratch, "3101-checkpoint-"));
-    const receiver = path.join(dir, "receiver.git");
-    const committed = "committed work before shutdown\n";
-    const dirty = "uncommitted work before shutdown\n";
-    const iid = installer === "completed" ? 310101 : 310102;
-    const started = deferred();
-    let rig: CodexRig | undefined;
-    let context: RunContext | undefined;
-    const publications: Array<{ tip: string; bytes: Buffer }> = [];
-    const originalPublish = client.publishCheckpoint;
-    client.publishCheckpoint = async (_runId, tip, pack: Readable) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of pack) chunks.push(Buffer.from(chunk));
-      publications.push({ tip, bytes: Buffer.concat(chunks) });
-      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/test/3101" } };
-    };
-    try {
-      // Only the default branch is available here. No alternates, runner clone,
-      // or worker tracking-ref objects can satisfy the assertions after import.
-      execFileSync("git", ["clone", "--bare", "--no-local", fx.originPath, receiver],
-        { env: GIT_ENV, stdio: "pipe" });
-      const executor: Executor = {
-        run: async (ctx) => {
-          context = ctx;
-          assert.ok(ctx.signal, "Runner supplies its genuine run signal");
-          assert.ok(ctx.terminalLifecycleSignal, "Runner supplies its terminal lifecycle signal");
-          rig = codexRig({
-            lifecycleSignal: AbortSignal.any([ctx.signal, ctx.terminalLifecycleSignal]),
-          });
-          executor.safety = rig.safety;
-          if (installer === "completed") {
-            rig.installer.promise = Promise.resolve({ results: [], truncated: false })
-              .then((result) => { rig!.installer.result = result; return result; });
-            await rig.installer.promise;
-            assert.ok(rig.installer.result, "actual shared installer state has completed");
-          } else {
-            assert.equal(rig.installer.promise, undefined, "absent promise, not a no-lockfile install");
-          }
-          commitInTree(ctx.worktreePath, "COMMITTED-3101.txt", committed);
-          fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY-3101.txt"), dirty);
-          started.resolve();
-          try {
-            await new Promise<void>((resolve) => {
-              if (ctx.signal!.aborted) resolve();
-              else ctx.signal!.addEventListener("abort", () => resolve(), { once: true });
-            });
-            throw new Error("runner shutdown interrupted provider");
-          } finally {
-            // Production's terminal install join does not drop the settled promise.
-            await rig.installer.settle();
-          }
-        },
-      };
-      const { gitlab } = fakeGitlab();
-      const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
-        codexBoundaryDeadlineMs: 60_000,
-        shutdownPublishTimeoutMs: 60_000,
-      });
-      const execution = runner.execute(gitlabClaim(iid));
-      await Promise.race([
-        started.promise,
-        execution.then(() => { throw new Error("run ended before shutdown regression reached readiness"); }),
-      ]);
-      runner.shutdown();
-      await execution;
-      assert.equal(context!.signal!.aborted, true);
-      assert.equal(context!.terminalLifecycleSignal!.aborted, true);
-      assert.ok(rig!.boundaries.includes("shutdown"), "real safety reconciles the shutdown sink");
-
-      // Consume ONLY the emitted pack plus the independent default-branch seed.
-      // Both exact file contents must survive capture,
-      // fetch-back, pack production, and import.
-      const content = publications.map(({ tip, bytes }) => {
-        execFileSync("git", ["-C", receiver, "index-pack", "--stdin"],
-          { env: GIT_ENV, input: bytes, stdio: ["pipe", "pipe", "pipe"] });
-        const show = (file: string): string => execFileSync(
-          "git", ["-C", receiver, "show", `${tip}:${file}`],
-          { env: GIT_ENV, encoding: "utf8", stdio: "pipe" },
-        );
-        return { committed: show("COMMITTED-3101.txt"), dirty: show("DIRTY-3101.txt") };
-      });
-      assert.deepEqual(content, [{ committed, dirty }],
-        "#3101 emitted independent checkpoint pack must contain exact committed and dirty work");
-      assert.equal(trackedFile(iid, "COMMITTED-3101.txt"), committed, "real fetch-back imports committed work");
-      assert.equal(trackedFile(iid, "DIRTY-3101.txt"), dirty, "real capture and fetch-back import dirty work");
-      assert.equal(execFileSync("git", ["-C", git.barePathFor(fx.originPath), "rev-parse",
-        `refs/uzi-runner/agent/issue-${iid}`],
-      { env: GIT_ENV, encoding: "utf8" }).trim(), publications[0]!.tip);
-      assert.deepEqual(rig!.disposeBoundaries, ["terminal"]);
-    } finally {
-      client.publishCheckpoint = originalPublish;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+it("#3101 actual Runner late admission inherits the original deadline across repeated shutdown", async t => {
+  const start = Date.now();
+  let now = start;
+  t.mock.method(Date, "now", () => now);
+  const locks = new RunDiskLocks();
+  const first = gitlabClaim(310103);
+  const second = gitlabClaim(310104);
+  const releaseFirst = await locks.acquire(first.run_id);
+  const releaseSecond = await locks.acquire(second.run_id);
+  const { gitlab } = fakeGitlab();
+  let factories = 0;
+  let models = 0;
+  let clones = 0;
+  const runner = runnerWith(() => {
+    factories++;
+    return { executor: { run: async () => { models++; throw new Error("no late model admission"); } } };
+  }, gitlab, undefined, undefined, {
+    diskLocks: locks, codexBoundaryDeadlineMs: 1_000, shutdownPublishTimeoutMs: 2_000,
   });
-}
+  const deadlines: number[] = [];
+  const report = client.reportState.bind(client);
+  client.reportState = async (runId, body, signal) => {
+    if (body.status === "running") {
+      // Observe phaseClone's actual registration at the existing first-running ACK seam.
+      const active = (runner as unknown as { activeRuns: Map<string, {
+        gracefulShutdownCheckpoint?: GracefulShutdownCheckpoint;
+        steering: SteeringChannel;
+        cancel: AbortController;
+      }> }).activeRuns.get(runId);
+      assert.ok(active);
+      const cause = active.gracefulShutdownCheckpoint;
+      assert.ok(cause, "late registration receives shutdown checkpoint authority");
+      deadlines.push(cause.deadlineAt);
+      assert.equal(cause.deadlineAt, start + 1_000, "elapsed admission time never renews the original grace");
+      assert.equal(active.cancel.signal.aborted, true);
+      assert.equal(active.steering.lifecycleSignal().aborted, true);
+      assert.equal(active.steering.terminalLifecycleSignal().aborted, true);
+      assert.equal(cause.stopSignal.aborted, false, "shutdown retains only bounded checkpoint authority");
+      assert.equal(Object.isFrozen(cause), true);
+    }
+    return report(runId, body, signal);
+  };
+  git.ensureClone = async () => { clones++; throw new Error("shutdown must stop before clone admission"); };
+  const firstExecution = runner.execute(first);
+  let secondExecution: Promise<void> | undefined;
+  try {
+    assert.equal(runner.isExecuting(first.run_id), true);
+    assert.equal(factories, 0, "real disk lock holds the claim before attempt registration");
+    runner.shutdown();
+    now += 100;
+    runner.shutdown();
+    secondExecution = runner.execute(second);
+    assert.equal(factories, 0);
+    releaseFirst();
+    await firstExecution;
+    now += 200;
+    runner.shutdown();
+    releaseSecond();
+    await secondExecution;
+    assert.deepEqual(deadlines, [start + 1_000, start + 1_000]);
+    assert.equal(factories, 2);
+    assert.equal(models, 0);
+    assert.equal(clones, 0);
+  } finally {
+    releaseFirst();
+    releaseSecond();
+    runner.shutdown();
+    await Promise.all([firstExecution, secondExecution]);
+  }
+});
+
+it("#3101 shutdown checkpoint preserves newer C and dirty work with a genuinely absent installer promise", async () => {
+  client.protocolFeatures = ["run_checkpoint_durability"];
+  const iid = 310102;
+  const proof = shutdownContentProof(fx, client, iid);
+  const started = deferred();
+  let rig: CodexRig | undefined;
+  let context: RunContext | undefined;
+  const executor: Executor = {
+    run: async (ctx) => {
+      context = ctx;
+      assert.ok(ctx.signal, "Runner supplies its genuine run signal");
+      assert.ok(ctx.terminalLifecycleSignal, "Runner supplies its terminal lifecycle signal");
+      // The provider alone is fake; registry, lifecycle, safety and installer reconcile
+      // are real. No promise/result is populated on this shared production factory.
+      rig = codexRig({
+        lifecycleSignal: AbortSignal.any([ctx.signal, ctx.terminalLifecycleSignal]),
+      });
+      executor.safety = rig.safety;
+      assert.equal(rig.installer.promise, undefined);
+      await proof.prepare(ctx);
+      started.resolve();
+      try {
+        await new Promise<void>((resolve) => {
+          if (ctx.signal!.aborted) resolve();
+          else ctx.signal!.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new Error("runner shutdown interrupted provider");
+      } finally {
+        await rig.installer.settle();
+        assert.equal(rig.installer.promise, undefined);
+      }
+    },
+  };
+  const { gitlab } = fakeGitlab();
+  const { github } = fakeGitHub();
+  const runner = runnerWith(() => ({ executor }), gitlab, undefined, undefined, {
+    github,
+    checkpointIntervalMs: 1,
+    checkpointTickIntervalMs: 0,
+    codexBoundaryDeadlineMs: 60_000,
+    shutdownPublishTimeoutMs: 60_000,
+  });
+  const execution = runner.execute(gitlabClaim(iid, {
+    repo: {
+      id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath,
+      forge_type: "github", default_branch: "main",
+    },
+  }));
+  try {
+    await Promise.race([
+      started.promise,
+      execution.then(() => { throw new Error("run ended before shutdown readiness"); }),
+    ]);
+    runner.shutdown();
+    await execution;
+    assert.equal(context!.signal!.aborted, true);
+    assert.equal(context!.terminalLifecycleSignal!.aborted, true);
+    assert.ok(rig!.boundaries.includes("shutdown"));
+    await proof.verify(git);
+    assert.deepEqual(rig!.disposeBoundaries, ["terminal"]);
+  } finally {
+    runner.shutdown();
+    await execution;
+    proof.cleanup();
+  }
+});
