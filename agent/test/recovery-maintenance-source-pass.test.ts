@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { createHash, createHmac } from "node:crypto";
 import { RecoveryCoordinator, canonicalJson, type ClosedSourceObservation, type RecoveryRecord, type RecoveryArchiveClient } from "../src/recovery.js";
@@ -98,8 +99,9 @@ async function fixture(t: test.TestContext) {
   const log = nullLogger();
   log.warn = (message, fields) => warnings.push({ message, fields });
   let executing = false;
+  let executionCheck: (() => boolean) | undefined;
   const make = () => new RecoveryCoordinator({
-    isExecuting: () => executing,
+    isExecuting: () => executionCheck?.() ?? executing,
     recoveryRoot, workerToken: token, client, git: git as never, log, now: () => 1000,
     withInventorySourceBoundary: async (_ctx, action) => { await action(async () => true); return "passed"; },
   });
@@ -146,6 +148,7 @@ async function fixture(t: test.TestContext) {
     partial, frozen, seal, bundled, capture, operate, freeze, pin, file,
     cancel: () => { status = "cancelled"; }, refuseFinal: () => { fallback = true; },
     executing: (value: boolean) => { executing = value; },
+    onExecutionCheck: (check: () => boolean) => { executionCheck = check; },
     settle: (exact: RecoveryExactHold) => { settled = exact; } };
 }
 
@@ -166,6 +169,352 @@ function request(f: Awaited<ReturnType<typeof fixture>>, source = observation())
   tail.resolve(source);
   return pass;
 }
+
+// Count bytes returned by the real filesystem before journal parsing/authentication.
+// Each entry represents one open/readFile, including repeated reads on its handle.
+async function observeJournalReads(t: test.TestContext, filename: string,
+  beforeOpen: (ordinal: number) => Promise<void>,
+  afterStat?: (ordinal: number) => Promise<void>,
+  afterRead?: (ordinal: number) => Promise<void>) {
+  const reads: Array<{ bytes: number }> = [];
+  const begin = async () => {
+    const entry = { bytes: 0 };
+    reads.push(entry);
+    const ordinal = reads.length;
+    await beforeOpen(ordinal);
+    return { entry, ordinal };
+  };
+  const readFile = fs.readFile.bind(fs);
+  t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    const observed = args[0] === filename ? await begin() : undefined;
+    const result = await readFile(...args);
+    if (observed) observed.entry.bytes += Buffer.byteLength(result);
+    return result;
+  });
+  const open = fs.open.bind(fs);
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const observed = args[0] === filename ? await begin() : undefined;
+    const file = await open(...args);
+    if (!observed) return file;
+    const read = file.read.bind(file), readFile = file.readFile.bind(file), stat = file.stat.bind(file);
+    t.mock.method(file, "read", async (...args: unknown[]) => {
+      const result = await Reflect.apply(read, file, args);
+      observed.entry.bytes += result.bytesRead;
+      await afterRead?.(observed.ordinal);
+      return result;
+    });
+    t.mock.method(file, "readFile", async (...args: Parameters<typeof file.readFile>) => {
+      const result = await readFile(...args);
+      observed.entry.bytes += Buffer.byteLength(result);
+      return result;
+    });
+    let firstStat = true;
+    t.mock.method(file, "stat", async (...args: Parameters<typeof file.stat>) => {
+      const result = await stat(...args);
+      if (firstStat) { firstStat = false; await afterStat?.(observed.ordinal); }
+      return result;
+    });
+    return file;
+  });
+  return reads;
+}
+
+// Observe real directory IO, without manufacturing an entry or a returned name array.
+function observeJournalDirectory(t: test.TestContext, dir: string) {
+  const listings: number[] = [];
+  const wholeNames: number[] = [];
+  const readdir = fs.readdir.bind(fs), opendir = fs.opendir.bind(fs);
+  t.mock.method(fs, "readdir", async (...args: Parameters<typeof fs.readdir>) => {
+    const actual = await readdir(...args);
+    if (args[0] === dir) wholeNames.push(actual.length);
+    return actual;
+  });
+  t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+    const directory = await opendir(...args);
+    if (args[0] !== dir) return directory;
+    const index = listings.push(0) - 1;
+    const read = directory.read.bind(directory);
+    t.mock.method(directory, "read", async () => {
+      const actual = await read();
+      if (actual) listings[index] = listings[index]! + 1;
+      return actual;
+    });
+    return directory;
+  });
+  return { listings, wholeListings: () => wholeNames.length, wholeNames };
+}
+
+function seedRawNames(dir: string, count = 10_000) {
+  for (let i = 0; i < count; i++) writeFileSync(path.join(dir, "non-json-" + i), "");
+}
+
+test("real late raw names cannot turn an incomplete cycleKey listing into an unguarded replay", async t => {
+  const f = await fixture(t);
+  const record = await f.seal(await f.bundled(f.partial(ordinary)));
+  const filename = f.file(ordinary), dir = path.dirname(filename);
+  const original = await fs.readFile(filename), body = await fs.readFile(record.bundlePath!);
+  const io = observeJournalDirectory(t, dir);
+  let seeded = false;
+  f.onExecutionCheck(() => {
+    if (!seeded) { seeded = true; seedRawNames(dir); }
+    return false;
+  });
+  await request(f);
+  assert.equal(seeded, true, "the callback runs after initial discovery");
+  assert.deepEqual(io.wholeNames, [], "lock selection must never buffer the whole directory");
+  assert.equal(io.listings[0], 2, "discovery sees only the original journal and bundle");
+  assert.ok(io.listings.length >= 2, "fresh lock selection reopens the real directory");
+  assert.ok(io.listings[1]! > 4000);
+  assert.ok(io.listings.reduce((a, b) => a + b, 0) <= 4096, "raw names share the discovery counter");
+  assert.equal(f.calls.upload, 0);
+  assert.equal(f.calls.final, 0);
+  assert.equal(f.calls.reserve, 0, "an incomplete lock key cannot dispatch");
+  assert.equal(f.calls.produce, 0);
+  t.mock.restoreAll();
+  assert.deepEqual(await fs.readFile(filename), original);
+  assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+  for (let i = 0; i < 10_000; i++) await fs.unlink(path.join(dir, "non-json-" + i));
+  await f.coordinator.resumePending();
+  assert.equal(f.calls.upload, 1);
+  assert.deepEqual(f.uploaded, [body]);
+});
+
+for (const kind of ["archive", "held_publication"] as const) {
+  test(`real late raw names stop fresh guarded ${kind} FINAL completeness proof`, async t => {
+    const f = await fixture(t);
+    const record = { ...await f.bundled(f.frozen(ordinary)), state: "uploaded" as const,
+      serverCaptureId: "server-capture" };
+    const disposition: RecoveryFinalDisposition = kind === "archive"
+      ? { kind, capture_id: "server-capture", source_sha: aggregate, coverage_digest: digest }
+      : { kind, publication_id: publicationId, source_sha: aggregate, coverage_digest: digest };
+    const finalRecord: RecoveryRecord = { ...record, finalRequest: { disposition } };
+    if (kind === "held_publication") {
+      const exact = (await f.client.getExactRecoveryHold!(record.runId, 7, record.exactHoldBinding!))!;
+      const closed: RecoveryExactHold = { ...exact, state: "released", final_receipt: disposition,
+        release_evidence: "held_publication" };
+      delete closed.live_run_id; delete closed.live_worker_id;
+      finalRecord.holdSettlement = closed;
+      f.settle(closed);
+    }
+    await f.seal(finalRecord);
+    const filename = f.file(ordinary), dir = path.dirname(filename);
+    const original = await fs.readFile(filename), body = await fs.readFile(record.bundlePath!);
+    const io = observeJournalDirectory(t, dir);
+    const enumerate = f.git.enumerateOwedCandidates;
+    let seeded = false;
+    t.mock.method(f.git, "enumerateOwedCandidates", async () => {
+      const result = await enumerate();
+      assert.equal(MaintenanceResources.active(), false, "fresh proof is outside the discovery timer");
+      if (!seeded) { seeded = true; seedRawNames(dir); }
+      return result;
+    });
+    await request(f);
+    assert.equal(seeded, true, "the mutation occurs during fresh FINAL proof");
+    assert.deepEqual(io.wholeNames, [], "omitted strict budget must still stream");
+    assert.ok(io.listings.some(count => count > 4000), "strict proof visits actual late raw names");
+    assert.ok(io.listings.reduce((a, b) => a + b, 0) <= 4096);
+    assert.equal(f.calls.final, 0);
+    assert.equal(f.calls.upload, 0);
+    assert.equal(f.calls.publish, 0);
+    assert.equal(f.calls.produce, 0);
+    t.mock.restoreAll();
+    assert.deepEqual(await fs.readFile(filename), original, "FINAL journal and original roots are retained");
+    assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+  });
+}
+
+test("nested repeated advisory listings share discovery raw-name accounting without resetting", async t => {
+  const f = await fixture(t);
+  const record = await f.seal(await f.bundled(f.partial(ordinary)));
+  const dir = path.dirname(f.file(ordinary)), body = await fs.readFile(record.bundlePath!);
+  seedRawNames(dir, 600);
+  const io = observeJournalDirectory(t, dir);
+  let completed = 0;
+  f.client.reserveRecoveryCapture = async () => {
+    for (let i = 0; i < 12; i++) {
+      assert.equal((await f.coordinator.inspect(record.runId)).length, 1);
+      completed++;
+    }
+    return { capture_id: "server-capture", state: "preparing" };
+  };
+  await request(f);
+  assert.equal(io.wholeListings(), 0);
+  assert.ok(completed > 0 && completed < 12, "per-call reset would allow every complete listing");
+  assert.ok(io.listings.length > 3);
+  const total = io.listings.reduce((a, b) => a + b, 0);
+  assert.ok(total > 4000 && total <= 4096, "raw non-JSON visits share the reserved read ceiling");
+  assert.equal(f.calls.upload, 0);
+  assert.equal(f.calls.final, 0);
+  t.mock.restoreAll();
+  assert.ok(await fs.stat(f.file(ordinary)));
+  assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+});
+
+test("retained bundle payload above metadata quota still uploads its original bytes", async t => {
+  const f = await fixture(t);
+  const record = await f.bundled(f.partial(ordinary));
+  // The journal binds these opaque archive bytes; the worker never decodes them here.
+  const body = Buffer.concat([await fs.readFile(record.bundlePath!), Buffer.alloc(33 * 1024 ** 2)]);
+  await fs.writeFile(record.bundlePath!, body);
+  await f.seal({ ...record, byteSize: body.length,
+    checksum: createHash("sha256").update(body).digest("hex"),
+    chunkCount: Math.ceil(body.length / (1024 * 1024)) });
+  const reads = await observeJournalReads(t, f.file(ordinary), async () => {});
+  await request(f);
+  assert.equal(f.calls.upload, 1);
+  assert.deepEqual(f.uploaded, [body]);
+  assert.ok(reads.reduce((sum, read) => sum + read.bytes, 0) < 1024 * 1024);
+  assert.equal(f.calls.produce, 0);
+});
+
+test("nested valid sub-MiB journals exhaust actual aggregate metadata before another body read", async t => {
+  const f = await fixture(t);
+  const record = await f.seal(await f.bundled(f.partial(ordinary)));
+  const filename = f.file(ordinary), body = await fs.readFile(record.bundlePath!);
+  const original = await fs.readFile(filename);
+  // JSON whitespace keeps the original ARC and its MAC valid.
+  await fs.appendFile(filename, " ".repeat(900_000 - original.length));
+  const reads = await observeJournalReads(t, filename, async () => {});
+  let completed = 0;
+  f.client.reserveRecoveryCapture = async () => {
+    for (let i = 0; i < 45; i++) {
+      assert.equal((await f.coordinator.inspect(record.runId)).length, 1);
+      completed++;
+    }
+    return { capture_id: "server-capture", state: "preparing" };
+  };
+  await request(f);
+  assert.ok(completed > 0 && completed < 45);
+  assert.ok(reads.reduce((sum, read) => sum + read.bytes, 0) <= 32 * 1024 ** 2 + 1);
+  assert.equal(reads.at(-1)!.bytes, 0, "known body exceeds remaining quota: no body read");
+  assert.equal(f.calls.upload, 0);
+  assert.equal(f.calls.final, 0);
+  t.mock.restoreAll();
+  assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+});
+
+for (const id of [ordinary, producer]) {
+  for (const ordinal of [2, 4]) {
+    for (const mode of ["whitespace", "invalid", "growth", "symlink"] as const) {
+      test(`saved journal reopen ${ordinal} ${mode} refuses bounded bytes for ${id}`, async t => {
+        const f = await fixture(t);
+        const record = await f.seal(await f.bundled(f.partial(id)));
+        const filename = f.file(id);
+        const original = await fs.readFile(filename);
+        const body = await fs.readFile(record.bundlePath!);
+        const target = path.join(f.root, "valid-record");
+        await fs.writeFile(target, original);
+        const oversized = mode === "invalid" ? "{" + "x".repeat(33 * 1024 ** 2)
+          : "{}" + " ".repeat(33 * 1024 ** 2);
+        const replace = async () => {
+          if (mode === "symlink") { await fs.unlink(filename); await fs.symlink(target, filename); }
+          else await fs.writeFile(filename, oversized);
+        };
+        const reads = await observeJournalReads(t, filename,
+          async n => { if (n === ordinal && mode !== "growth") await replace(); },
+          async n => { if (n === ordinal && mode === "growth") await replace(); });
+        await request(f);
+        assert.ok(reads.length >= ordinal, "the selected nested reopen must execute");
+        const replay = reads.slice(ordinal - 1);
+        assert.ok(replay[0]);
+        if (mode === "growth") assert.equal(replay[0].bytes, 1024 * 1024 + 1, "growth stops at the overflow byte");
+        else assert.equal(replay[0].bytes, 0, "oversize stat or no-follow rejects before reading bytes");
+        assert.ok(replay.every(r => r.bytes <= 1024 * 1024 + 1));
+        assert.equal(f.calls.upload, 0);
+        assert.equal(f.calls.final, 0);
+        assert.equal(f.calls.produce, 0);
+        assert.equal(f.calls.publish, 0);
+        // Restore instrumentation before inspecting retained evidence.
+        t.mock.restoreAll();
+        assert.ok(await fs.lstat(filename));
+        assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+        assert.ok(f.warnings.every(w => w.fields === undefined), "refusal diagnostics contain no file content or identity");
+      });
+    }
+  }
+}
+
+for (const kind of ["archive", "held_publication"] as const) {
+  for (const mode of ["whitespace", "growth", "symlink"] as const) {
+    test(`saved ${kind} FINAL journal proof refuses late ${mode} replacement`, async t => {
+      const f = await fixture(t);
+      let record: RecoveryRecord = await f.bundled(f.frozen(ordinary));
+      record = { ...record, state: "uploaded", serverCaptureId: "server-capture" };
+      const disposition: RecoveryFinalDisposition = kind === "archive"
+        ? { kind, capture_id: "server-capture", source_sha: aggregate, coverage_digest: digest }
+        : { kind, publication_id: publicationId, source_sha: aggregate, coverage_digest: digest };
+      record.finalRequest = { disposition };
+      if (kind === "held_publication") {
+        const exact = (await f.client.getExactRecoveryHold!(record.runId, 7, record.exactHoldBinding!))!;
+        const closed: RecoveryExactHold = { ...exact, state: "released", final_receipt: disposition,
+          release_evidence: "held_publication" };
+        delete closed.live_run_id; delete closed.live_worker_id;
+        record.holdSettlement = closed;
+        f.settle(closed);
+      }
+      await f.seal(record);
+      const filename = f.file(ordinary), target = path.join(f.root, "valid-final");
+      await fs.copyFile(filename, target);
+      const body = await fs.readFile(record.bundlePath!);
+      let armed = false, replacedAt = 0;
+      const coverage = f.git.buildRecoveryCoverage;
+      t.mock.method(f.git, "buildRecoveryCoverage", async () => {
+        const result = await coverage();
+        armed = true;
+        return result;
+      });
+      const replace = async () => {
+        if (mode === "symlink") { await fs.unlink(filename); await fs.symlink(target, filename); }
+        else await fs.writeFile(filename, "{}" + " ".repeat(33 * 1024 ** 2));
+      };
+      const reads = await observeJournalReads(t, filename, async n => {
+        if (!armed || replacedAt) return;
+        replacedAt = n;
+        if (mode !== "growth") await replace();
+      }, async n => { if (mode === "growth" && n === replacedAt) await replace(); });
+      await request(f);
+      assert.ok(replacedAt > 4, "replacement occurs during fresh FINAL proofs after initial nested reads");
+      const replay = reads.slice(replacedAt - 1);
+      assert.ok(replay[0]);
+      assert.equal(replay[0].bytes, mode === "growth" ? 1024 * 1024 + 1 : 0);
+      assert.ok(replay.every(r => r.bytes <= 1024 * 1024 + 1));
+      assert.equal(f.calls.final, 0);
+      assert.equal(f.calls.upload, 0);
+      assert.equal(f.calls.produce, 0);
+      assert.equal(f.calls.publish, 0);
+      t.mock.restoreAll();
+      assert.ok(await fs.lstat(filename));
+      assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+    });
+  }
+}
+
+test("saved journal delayed read settlement remains joined by shutdown", async t => {
+  const f = await fixture(t);
+  const record = await f.seal(await f.bundled(f.partial(ordinary)));
+  const entered = deferred<void>(), release = deferred<void>();
+  let delayed = false;
+  await observeJournalReads(t, f.file(ordinary), async () => {}, undefined, async n => {
+    if (n !== 2 || delayed) return;
+    delayed = true;
+    entered.resolve();
+    await release.promise;
+  });
+  const pass = request(f);
+  await entered.promise;
+  let stopped = false;
+  const shutdown = f.coordinator.shutdown().then(() => { stopped = true; });
+  await turn();
+  assert.equal(stopped, false, "shutdown joins actual filesystem settlement after abort");
+  release.resolve();
+  await Promise.all([pass, shutdown]);
+  assert.equal(f.calls.upload, 0);
+  assert.equal(f.calls.final, 0);
+  assert.equal(f.calls.produce, 0);
+  t.mock.restoreAll();
+  assert.ok(await fs.stat(f.file(ordinary)));
+  assert.ok(await fs.stat(record.bundlePath!));
+});
 
 for (const id of [ordinary, producer, "maintenance"]) {
   test(`terminal saved original ${id} uploads exact bytes despite malformed sibling`, async t => {
@@ -309,6 +658,8 @@ for (const kind of ["archive", "held_publication"] as const) {
       f.settle(closed);
     }
     await f.seal(record);
+    await fs.appendFile(f.file(ordinary), " ".repeat(128 * 1024));
+    assert.ok((await fs.stat(f.file(ordinary))).size < 1024 * 1024);
     await request(f);
     assert.equal(f.calls.final, 1);
     assert.ok(f.calls.coverage > 0);
@@ -362,9 +713,12 @@ test("saved-only public reentrant pin and freeze refuse even an empty inventory"
     sourceSha: source, kind: "issue", branch: "work" }));
 });
 
-test("raw-name discovery exhaustion retains earlier saved candidates outside discovery scope", async t => {
+for (const route of ["boot", "live", "foreground"] as const) {
+test(`raw-name discovery exhaustion denies additional replay; ${route} retries independently`, async t => {
   const f = await fixture(t);
-  await f.seal(await f.bundled(f.partial(ordinary)));
+  const record = await f.seal(await f.bundled(f.partial(ordinary)));
+  const original = await fs.readFile(f.file(ordinary));
+  const body = await fs.readFile(record.bundlePath!);
   const open = fs.opendir.bind(fs);
   let rawNames = 0;
   t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
@@ -384,11 +738,22 @@ test("raw-name discovery exhaustion retains earlier saved candidates outside dis
     return upload(...args);
   };
   await request(f);
-  assert.ok(rawNames > 4000 && rawNames <= 4097, "raw non-JSON entries exhaust the admin budget");
-  assert.equal(f.calls.upload, 1);
+  assert.ok(rawNames > 4000 && rawNames <= 4096, "raw non-JSON entries exhaust the admin budget");
+  assert.equal(f.calls.upload, 0);
+  assert.equal(f.calls.final, 0);
   assert.equal(f.calls.produce, 0);
   assert.ok(f.warnings.some(w => w.message === "recovery: terminal saved evidence discovery incomplete"));
+  t.mock.restoreAll();
+  assert.deepEqual(await fs.readFile(f.file(ordinary)), original);
+  assert.deepEqual(await fs.readFile(record.bundlePath!), body);
+  if (route === "boot") await f.coordinator.resumePending();
+  else if (route === "live") await f.coordinator.resumeLive({ isExecuting: () => false, authenticatedAtMs: 1000 });
+  else await f.capture(record);
+  // Ordinary live recovery also discovers the fixture's independent owed inventory.
+  assert.ok(f.uploaded.some(bytes => bytes.equals(body)), "independent retry uploads the exact original bytes");
+  if (route !== "live") assert.equal(f.calls.upload, 1);
 });
+}
 
 test("ordinary held FINAL definitive fallback cannot clear evidence or produce new bytes in saved pass", async t => {
   const f = await fixture(t);
