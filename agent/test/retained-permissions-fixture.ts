@@ -75,9 +75,10 @@ const SNAPSHOT = `
 const fs = require("node:fs"), crypto = require("node:crypto");
 const result = process.argv.slice(1).map(file => {
   const s = fs.lstatSync(file);
-  if (!s.isFile() || s.isSymbolicLink()) throw Error("not a regular object");
+  if ((!s.isFile() && !s.isDirectory()) || s.isSymbolicLink()) throw Error("not an object or directory");
   return { uid:s.uid, gid:s.gid, mode:s.mode & 4095, dev:s.dev, ino:s.ino, nlink:s.nlink,
-    hash:crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") };
+    hash:crypto.createHash("sha256").update(s.isDirectory()
+      ? JSON.stringify(fs.readdirSync(file).sort()) : fs.readFileSync(file)).digest("hex") };
 });
 console.log(JSON.stringify(result));
 `;
@@ -241,6 +242,9 @@ const fs=require("node:fs"); fs.chmodSync(process.argv[1],0o440); fs.linkSync(pr
       'require("node:fs").linkSync(process.argv[1],process.argv[2])', ...candidateNames);
   }
   if (options.corrupt) {
+    // Keep real runner status from re-reading the damaged blob while refreshing index stat data.
+    // The committed worktree is clean; real pack transport must still read and reject this blob.
+    await commandGit(clone.path, "update-index", "--assume-unchanged", "retained.txt");
     await commandNode(clone.path, `
 const fs=require("node:fs"); fs.chmodSync(process.argv[1],0o600);
 fs.writeFileSync(process.argv[1],"deliberately corrupt retained loose object");
@@ -296,6 +300,9 @@ catch(e) { if(e.code!=="EACCES") throw e; }
   const privateFiles = privateEntries.filter(e => !e.dir).map(e => e.path);
   const privateBefore: Identity[] = JSON.parse(await commandNode(clone.path, SNAPSHOT, ...privateFiles));
   assert.equal(privateBefore.length, privateFiles.length);
+  const privateDirs = privateEntries.filter(e => e.dir).map(e => e.path);
+  const privateDirsBefore: Identity[] = JSON.parse(await commandNode(clone.path, SNAPSHOT, ...privateDirs));
+  assert.equal(privateDirsBefore.length, privateDirs.length);
   const sourceRefsBefore = await commandGit(clone.path, "for-each-ref", "--format=%(refname) %(objectname)");
   if (!options.corrupt) assert.equal(await commandGit(clone.path, "cat-file", "blob", blob), CONTENT.trim());
   else assert.notEqual((await commandExec(clone.path, "/usr/bin/git", gitArgs(clone.path, ["cat-file", "blob", blob]))).code, 0);
@@ -310,6 +317,37 @@ catch(e) { if(e.code!=="EACCES") throw e; }
   const refsBefore = workerGit(bare, "for-each-ref", "--format=%(refname) %(objectname)").split("\n");
   let releases = 0, models = 0, settlements = 0, adoptionCalls = 0;
   let successor: Awaited<ReturnType<typeof git.prepareRecoverySuccessor>> | undefined;
+  // Observe originals only. Assertions live after execute(), outside recovery callbacks whose
+  // exceptions may be caught and converted into an ordinary blocked episode.
+  const integrityTrace: string[] = [];
+  const fetchFaults: Array<{ trace: string[]; diagnostic: string }> = [];
+  if (options.corrupt) {
+    const normalize = git.normalizeRetainedSourceObjects.bind(git);
+    git.normalizeRetainedSourceObjects = async (...args) => {
+      integrityTrace.push("readiness-start");
+      const result = await normalize(...args);
+      if (args[0] === bare && args[3].clonePath === clone.path) integrityTrace.push("readiness-ok");
+      return result;
+    };
+    const status = git.worktreeStatus.bind(git);
+    git.worktreeStatus = async (...args) => {
+      const result = await status(...args);
+      if (args[0] === clone.path) integrityTrace.push(result?.length === 0 ? "status-clean" : "status-unreadable-or-dirty");
+      return result;
+    };
+    const fetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = async (...args) => {
+      const trace = [...integrityTrace];
+      try {
+        return await fetch(...args);
+      } catch (error) {
+        if (args[0] === bare && args[1] === clone.path && args[2] === clone.branch) {
+          fetchFaults.push({ trace, diagnostic: error instanceof Error ? error.message : String(error) });
+        }
+        throw error;
+      }
+    };
+  }
   const resumedReads: boolean[] = [];
   const verified = git.verifiedRecoveryRestorePoint.bind(git);
   git.verifiedRecoveryRestorePoint = async (...args) => {
@@ -361,12 +399,38 @@ catch(e) { if(e.code!=="EACCES") throw e; }
     for (const ref of refsBefore) assert.ok(refsAfter.includes(ref), "existing source refs and journal pins survive");
     assert.equal(workerGit(clone.path, "rev-parse", "HEAD"), tip);
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), CONTENT);
+    assert.equal(await commandGit(clone.path, "for-each-ref", "--format=%(refname) %(objectname)"), sourceRefsBefore,
+      "negative recovery preserves every predecessor ref exactly");
+    // A refused pass may have repaired a prefix. Every original object still has its exact
+    // identity and bytes; its only permitted mode transition is the complete group-read addition.
+    for (const [names, before, addition] of [
+      [privateFiles, privateBefore, 0o040], [privateDirs, privateDirsBefore, 0o050],
+    ] as const) {
+      const after: Identity[] = JSON.parse(await commandNode(clone.path, SNAPSHOT, ...names));
+      assert.equal(after.length, before.length);
+      for (const [index, original] of before.entries()) {
+        const observed = after[index]!;
+        assert.ok(observed.mode === original.mode || observed.mode === (original.mode | addition),
+          "negative recovery permits only unchanged mode or exact readiness addition: " + names[index]);
+        assert.deepEqual(observed, { ...original, mode: observed.mode },
+          "negative recovery preserves original object bytes, directory entries and identity: " + names[index]);
+      }
+    }
     if (options.linked) {
       assert.match(JSON.stringify(log.lines), /hardlinked_mutation/,
         "the command-owned hardlink mutation guard itself was reached; generic capture failure is not proof");
       assert.deepEqual(JSON.parse(await commandNode(clone.path, SNAPSHOT, ...candidateNames)), candidateBefore,
         "multiply linked command mutation candidate refused before fchmod on either name");
     } else {
+      assert.ok(fetchFaults.length > 0,
+        "corrupt source must reach real fetch integrity refusal; " + JSON.stringify({ integrityTrace, logs: log.lines }));
+      for (const fault of fetchFaults) {
+        assert.deepEqual(fault.trace.slice(-3), ["readiness-start", "readiness-ok", "status-clean"],
+          "real readiness and clean runner status precede each actual corrupt-source fetch");
+        assert.match(fault.diagnostic, new RegExp(`(?:loose object ${blob} [^\\n]*corrupt|unable to unpack ${blob} header)`),
+          "real fetch rejected the deliberately corrupt blob, not a generic capture or permission fault");
+        assert.doesNotMatch(fault.diagnostic, /Permission denied|EACCES|timed out|deadline|quiescen/i);
+      }
       assert.equal(await commandNode(clone.path, 'console.log(require("node:fs").readFileSync(process.argv[1],"utf8"))', target),
         "deliberately corrupt retained loose object");
     }

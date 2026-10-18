@@ -184,3 +184,60 @@ leaves passed without skips, failures or errors, plus all existing required
 worker/command leaves. Image identity matched the original ID above.
 Worker proof: 172 seconds; command proof: 19 seconds. These are local source-tree
 timings, not measured CI critical-path results.
+
+The full agent-gate repeat on `a1b58d6f` passed, log
+`.uzi/scratch/gate-log.lC0dFB`, exit 0: 16,157 unit tests passed,
+15 skipped, zero failed/cancelled (4,935 seconds), followed by all 183 M4 tests
+passing without skips (105 seconds). The required claude/U, codex/U, codex/P
+matrix was satisfied. Reviewer, auditor and read-only tester reviewed both the
+run-only cleanup repair and its fixture integration repair without remaining
+findings. M2 was checkpointed at that revision.
+
+## M3: negative-source preservation and integrity proof corrections
+
+The test-only correction range starts at `a1b58d6f` and ends at the commit
+containing this section. Both negative branches previously returned before
+checking the saved source refs and every private object snapshot. They now
+compare all original private objects and directories, preserving hashes,
+device/inode identity, ownership, links and directory entries. Each mode must
+be unchanged or have exactly the specified file group-read / directory
+group-read-and-traverse addition. Both names of the multiply-linked mutation
+candidate still require exact unchanged snapshots. Existing HEAD, worktree,
+bare-ref, outside-content, custody and positive-recovery assertions remain.
+
+The corrupt case now observes the real normalization, status and fetch methods,
+calling their originals. It requires successful readiness and clean status
+before each actual fetch error and a diagnostic identifying the deliberately
+corrupt blob. An index assume-unchanged hint on the committed corrupt-case file
+lets this scenario reach fetch integrity instead of a status re-read. This is
+post-fix negative coverage, not permission-specific baseline-red evidence.
+
+The unmutated corrected fixture passed the same-image UID lane, log
+`.uzi/scratch/gate-log.EpQpGs`, exit 0: all nine retained leaves and all
+47 worker / two command required leaves passed; worker proof 180 seconds,
+command proof 18 seconds. Report: `.uzi/scratch/worker-uid.kSIKLw/results.xml`.
+Static/lane type checks passed in `.uzi/scratch/gate-log.ea49jA`.
+
+Sensitivity probes ran against disposable exports of unchanged production
+`a1b58d6f`, comparing its old fixture with the corrected fixture. Image ID was
+the original ID above in every invocation. No production file was mutated.
+
+| Probe | Old assertions | Corrected assertions |
+|---|---|---|
+| Add a source tag after linked refusal; append bytes to an unrelated private tree object after corrupt refusal | exit 0, all nine retained leaves pass (`gate-log.EVE06i`) | exit 1, exactly the two targeted leaves fail: exact source-ref preservation and original private-object hash (`gate-log.juV61L`) |
+| Substitute a generic fetch refusal, with a positively reached fault counter | exit 0, all nine retained leaves pass (`gate-log.CGTYJN`) | exit 1, only corrupt-source leaf fails: missing actual fetch-integrity evidence (`gate-log.Mz91Lx`) |
+
+The generic-refusal comparison gives the old fixture the same index hint so
+both variants positively reach the substituted fetch. It does not claim an
+integrity failure. All comparisons had zero skipped or startup-error leaves;
+the corrected unmutated fixture remained green. Probe code and reports live
+under `.uzi/scratch/snap-m3-negative-*`; the four gate logs above are in
+`.uzi/scratch/`. Initial probe attempts without a dependency link failed
+inventory startup (MODULE_NOT_FOUND) and are retained but excluded from proof:
+`gate-log.jvTJDl`, `gate-log.260P6e`, `gate-log.w4hGVE`,
+`gate-log.wDuYdy`. Linking provisioned dependencies required no installation.
+
+The original permission-specific same-image red evidence and all earlier
+failed gates remain recorded above. No production, quarantine-policy,
+workflow, assertion/deadline relaxation, or source cleanup was part of this
+test correction.
