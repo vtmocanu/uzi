@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -39,7 +41,11 @@ func presentSemanticGate(t *testing.T, f *coverageLiveFixture, req StateRequest)
 	if err != nil || !applied || revision < 1 {
 		t.Fatalf("gate report: applied=%v revision=%d err=%v", applied, revision, err)
 	}
-	out, err := f.svc.SemanticGateForOwner(f.e.ctx, f.e.userID, f.run)
+	run, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.svc.SemanticGateForOwner(f.e.ctx, f.e.userID, run)
 	if err != nil || out == nil {
 		t.Fatalf("owner presentation: %v", err)
 	}
@@ -212,30 +218,122 @@ func TestSemanticGateMutationAndReportGenerationLiveDB(t *testing.T) {
 }
 
 func TestSemanticGateConcurrentRevisionApprovalLiveDB(t *testing.T) {
-	f := newSemanticGateLive(t)
-	gate := presentSemanticGate(t, f, gateReportRequest(t, f))
-	var wg sync.WaitGroup
-	wg.Add(2)
-	errs := make([]error, 2)
-	go func() { defer wg.Done(); _, errs[0] = semanticGateApprove(f, f.e.userID, gate, nil) }()
-	go func() {
-		defer wg.Done()
-		_, errs[1] = f.svc.SubmitInputWithOptions(f.e.ctx, f.e.userID, f.run, "revise_plan", "more detail", nil, SubmitInputOptions{ExpectedGateRevision: &gate.Approval.PresentationRevision})
-	}()
-	wg.Wait()
-	if errs[0] != nil && !errors.Is(errs[0], ErrPlanRevisionPending) {
-		t.Fatal(errs[0])
-	}
-	// A pending revision must prevent any subsequent approval, even if the
-	// first approve won the lock before the revision was enqueued.
-	if errs[1] == nil {
-		before := semanticGateState(t, f)
-		if _, err := semanticGateApprove(f, f.e.userID, gate, nil); !errors.Is(err, ErrPlanRevisionPending) {
-			t.Fatalf("pending revision: %v", err)
+	for _, approveFirst := range []bool{true, false} {
+		name := "revise_before_approve"
+		if approveFirst {
+			name = "approve_before_revise"
 		}
-		if !bytes.Equal(before, semanticGateState(t, f)) {
-			t.Fatal("revision race wrote")
-		}
+		t.Run(name, func(t *testing.T) {
+			f := newSemanticRevisionLive(t)
+			ctx, cancel := context.WithTimeout(f.e.ctx, 20*time.Second)
+			defer cancel()
+			f.e.ctx = ctx
+			gate := presentSemanticGate(t, f, gateReportRequest(t, f))
+			first, err := f.e.pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.Release()
+			second, err := f.e.pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer second.Release()
+			a := reconciliationRaceService(f.svc, store.New(first))
+			b := reconciliationRaceService(f.svc, store.New(second))
+			barrier := &reconciliationRaceBeginner{conn: first.Conn(), ready: make(chan struct{}), release: make(chan struct{})}
+			a.SetTxBeginner(barrier)
+			b.SetTxBeginner(second)
+			var once sync.Once
+			release := func() { once.Do(func() { close(barrier.release) }) }
+			var wg sync.WaitGroup
+			defer func() { release(); wg.Wait() }()
+			approve := func(s *Service) error {
+				_, err := s.SubmitInputWithOptions(ctx, f.e.userID, f.run, "approve_plan", "", nil, SubmitInputOptions{ExpectedGateRevision: &gate.Approval.PresentationRevision, SemanticApproval: &gate.Approval})
+				return err
+			}
+			revise := func(s *Service) error {
+				_, err := s.SubmitInputWithOptions(ctx, f.e.userID, f.run, "revise_plan", "more detail", nil, SubmitInputOptions{ExpectedGateRevision: &gate.Approval.PresentationRevision})
+				return err
+			}
+			firstDone, secondDone := make(chan error, 1), make(chan error, 1)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if approveFirst {
+					firstDone <- approve(a)
+					return
+				}
+				// Revision is normally autocommit. Enclose the real service
+				// operation so its write holds the row lock at the commit barrier.
+				var tx pgx.Tx
+				tx, err := barrier.Begin(ctx)
+				if err == nil {
+					defer func() { _ = tx.Rollback(ctx) }()
+					writer := reconciliationRaceService(f.svc, store.New(tx))
+					err = revise(writer)
+					if err == nil {
+						err = tx.Commit(ctx)
+					}
+				}
+				firstDone <- err
+			}()
+			reconciliationRaceWait(t, ctx, barrier.ready)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if approveFirst {
+					secondDone <- revise(b)
+				} else {
+					secondDone <- approve(b)
+				}
+			}()
+			reconciliationRaceBlocked(t, &gateFix{ctx: ctx, pool: f.e.pool}, second.Conn().PgConn().PID())
+			release()
+			wg.Wait()
+			if err := <-firstDone; err != nil {
+				t.Fatalf("first operation: %v", err)
+			}
+			secondErr := <-secondDone
+			if approveFirst {
+				if secondErr != nil {
+					t.Fatalf("revision must succeed: %v", secondErr)
+				}
+			} else if !errors.Is(secondErr, ErrPlanRevisionPending) {
+				t.Fatalf("approval = %v, want ErrPlanRevisionPending", secondErr)
+			}
+			var approvals, revisions, bound int
+			if err := f.e.pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE kind='approve_plan'),count(*) FILTER(WHERE kind='revise_plan'),count(*) FILTER(WHERE gate_binding='bound' AND gate_revision=$2) FROM run_user_inputs WHERE run_id=$1`, f.run, gate.Approval.PresentationRevision).Scan(&approvals, &revisions, &bound); err != nil {
+				t.Fatal(err)
+			}
+			wantApprovals := 0
+			if approveFirst {
+				wantApprovals = 1
+			}
+			if approvals != wantApprovals || revisions != 1 || bound != approvals+revisions {
+				t.Fatalf("approvals=%d revisions=%d bound=%d", approvals, revisions, bound)
+			}
+			run, err := f.e.q.GetRunByID(ctx, f.run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if run.GateRevision != gate.Approval.PresentationRevision || run.ReviseCount != 1 || run.Status != "awaiting_approval" || (len(run.CompletionContract) > 0) != approveFirst || (len(run.MilestonesFrozen) > 0) != approveFirst {
+				t.Fatalf("unexpected revision/freeze state: revision=%d count=%d status=%s contract=%s frozen=%s", run.GateRevision, run.ReviseCount, run.Status, run.CompletionContract, run.MilestonesFrozen)
+			}
+			if approveFirst {
+				contract, err := parseCompletionContract(run.CompletionContract)
+				if err != nil || !sameSemanticJSON(contract.SemanticApproval, &gate.Approval) || !sameSemanticJSON(contract.SemanticPresentation, &gate.Presentation) {
+					t.Fatalf("approval lost atomic semantic freeze: %v", err)
+				}
+			}
+			before := semanticRevisionSnapshot(t, f)
+			if _, err := semanticGateApprove(f, f.e.userID, gate, nil); !errors.Is(err, ErrPlanRevisionPending) {
+				t.Fatalf("subsequent pending approval: %v", err)
+			}
+			if !bytes.Equal(before, semanticRevisionSnapshot(t, f)) {
+				t.Fatal("pending approval wrote")
+			}
+		})
 	}
 }
 

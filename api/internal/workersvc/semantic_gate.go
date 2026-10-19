@@ -147,7 +147,10 @@ func semanticGateReport(ctx context.Context, q *store.Queries, run store.Run, re
 
 // SemanticGateForOwner serves bytes from the stored presentation's immutable
 // blob references, including after the live candidate changed.
-func (s *Service) SemanticGateForOwner(ctx context.Context, owner, runID uuid.UUID) (*apitypes.SemanticGateDTO, error) {
+func (s *Service) SemanticGateForOwner(ctx context.Context, owner uuid.UUID, run store.Run) (*apitypes.SemanticGateDTO, error) {
+	if run.UserID != owner {
+		return nil, ErrRunNotFound
+	}
 	if s.txBeginner == nil {
 		return nil, errors.New("semantic presentation requires transaction")
 	}
@@ -157,27 +160,20 @@ func (s *Service) SemanticGateForOwner(ctx context.Context, owner, runID uuid.UU
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	run, err := q.GetRunByIDForUpdate(ctx, runID)
-	if err != nil {
-		return nil, err
-	}
-	if run.UserID != owner {
-		return nil, ErrRunNotFound
-	}
 	snapshot, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload)
 	if err != nil || !ok || snapshot.Semantic == nil {
 		return nil, err
 	}
 	p := snapshot.Semantic
 	c := &semanticCoverageTx{q: q, candidate: p.Candidate}
-	blobs, err := c.payload(ctx, runID)
+	blobs, err := c.payload(ctx, run.ID)
 	if err != nil {
 		return nil, err
 	}
 	return &apitypes.SemanticGateDTO{Presentation: *p, Approval: semanticApprovalFor(run, *p), Sources: blobs.Sources, Plan: blobs.Plan}, nil
 }
 
-func validateSemanticApproval(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
+func validateSemanticApprovalIdentity(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
 	if opts.SemanticApproval == nil || opts.ExpectedGateRevision == nil || *opts.ExpectedGateRevision != run.GateRevision || run.Status != "awaiting_approval" || run.ClaimReleasedAt.Valid || run.GateRevision < 1 {
 		return ErrSemanticGateMismatch
 	}
@@ -188,6 +184,17 @@ func validateSemanticApproval(run store.Run, opts SubmitInputOptions, p *apitype
 	_, digest, err := snapshot.digest()
 	if err != nil || !bytes.Equal(digest, run.GatePayloadDigest) || snapshot.PlanMd == nil || !run.PlanMd.Valid || *snapshot.PlanMd != run.PlanMd.String || semanticHash([]byte(run.PlanMd.String)) != p.Candidate.PlanHash {
 		return ErrSemanticGateMismatch
+	}
+	return nil
+}
+
+func validateSemanticApproval(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
+	if err := validateSemanticApprovalIdentity(run, opts, p); err != nil {
+		return err
+	}
+	snapshot, _, err := decodeGatePresentedPayload(run.GatePresentedPayload)
+	if err != nil {
+		return err
 	}
 	live := gatePayloadFromRow(run)
 	a, ae := canonicalRawJSON(live.Milestones)
@@ -213,10 +220,29 @@ func semanticGateContract(p *apitypes.SemanticGatePresentation, approval *apityp
 }
 
 func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run store.Run, body string, sel *AgentSelection, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation, c *semanticCoverageTx) (SubmitInputResult, error) {
-	if err := validateSemanticApproval(run, opts, p); err != nil {
+	if err := validateSemanticApprovalIdentity(run, opts, p); err != nil {
 		return SubmitInputResult{}, err
 	}
 	if _, err := c.payload(ctx, run.ID); err != nil {
+		return SubmitInputResult{}, err
+	}
+	// Replay authorizes the stored decision and returns its original receipt.
+	// Body, selection and override are not stored as request identity and have
+	// no effects here. Live admission checks apply only to the first freeze.
+	if len(run.CompletionContract) > 0 {
+		var frozen completionContract
+		if json.Unmarshal(run.CompletionContract, &frozen) != nil || !sameSemanticJSON(frozen.SemanticApproval, opts.SemanticApproval) || !sameSemanticJSON(frozen.SemanticPresentation, p) {
+			return SubmitInputResult{}, ErrSemanticGateMismatch
+		}
+		var id int64
+		var created time.Time
+		err := tx.QueryRow(ctx, "SELECT id,created_at FROM run_user_inputs WHERE run_id=$1 AND kind='approve_plan' AND gate_binding='bound' AND gate_revision=$2 ORDER BY id LIMIT 1", run.ID, run.GateRevision).Scan(&id, &created)
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{ID: id, CreatedAt: created}, nil
+	}
+	if err := validateSemanticApproval(run, opts, p); err != nil {
 		return SubmitInputResult{}, err
 	}
 	if changedMilestoneContract(run) {
@@ -250,19 +276,6 @@ func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run sto
 	contract, err := semanticGateContract(p, opts.SemanticApproval)
 	if err != nil {
 		return SubmitInputResult{}, err
-	}
-	if len(run.CompletionContract) > 0 {
-		var frozen completionContract
-		if json.Unmarshal(run.CompletionContract, &frozen) != nil || !sameSemanticJSON(frozen.SemanticApproval, opts.SemanticApproval) {
-			return SubmitInputResult{}, ErrSemanticGateMismatch
-		}
-		var id int64
-		var created time.Time
-		err = tx.QueryRow(ctx, "SELECT id,created_at FROM run_user_inputs WHERE run_id=$1 AND kind='approve_plan' AND gate_binding='bound' AND gate_revision=$2 ORDER BY id LIMIT 1", run.ID, run.GateRevision).Scan(&id, &created)
-		if err != nil {
-			return SubmitInputResult{}, err
-		}
-		return SubmitInputResult{ID: id, CreatedAt: created}, nil
 	}
 	if len(run.MilestonesCandidate) == 0 {
 		return SubmitInputResult{}, ErrSemanticGateMismatch

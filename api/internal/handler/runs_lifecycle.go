@@ -456,7 +456,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
 	if user.ID == run.UserID {
 		if presentation, _ := workersvc.SemanticGateBindingFromRun(run); presentation != nil {
-			dto.SemanticGate, err = h.wsvc.SemanticGateForOwner(r.Context(), user.ID, run.ID)
+			dto.SemanticGate, err = h.wsvc.SemanticGateForOwner(r.Context(), user.ID, run)
 			if err != nil {
 				httpx.Error(w, http.StatusInternalServerError, "semantic presentation unavailable")
 				return
