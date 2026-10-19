@@ -6370,6 +6370,14 @@ export class GitCache {
   }
 
   async verifyRecoveryClosure(barePath: string, tip: string): Promise<boolean> {
+    return this.verifyRecoveryClosureBound(barePath, tip);
+  }
+
+  private async verifyRecoveryClosureBound(barePath: string, tip: string, binding?: {
+    read: (args: string[], input?: string) => Promise<string>;
+    spawn: (args: string[], input: string) => ReturnType<GitCache["spawnGit"]>;
+    identity: () => Promise<string>;
+  }): Promise<boolean> {
     MaintenanceResources.consumeIfActive("decoded", 0);
     const operation = this.recoveryOperations.getStore();
     operation?.signal.throwIfAborted();
@@ -6378,14 +6386,14 @@ export class GitCache {
     const cache = operation?.closureCache ?? { identities: new Map<string, Map<string, ClosureObject>>(), entries: 0 };
     // Operation-wide bound, including every bare identity. At capacity misses still hash/charge.
     const maxEntries = Math.floor(GIT_MAX_BUFFER / 41);
-    const identity = async (): Promise<string> => {
+    const identity = binding?.identity ?? (async (): Promise<string> => {
       const bare = await fs.lstat(barePath, { bigint: true });
       const objects = await fs.lstat(path.join(barePath, "objects"), { bigint: true });
       if (!bare.isDirectory() || bare.isSymbolicLink() || !objects.isDirectory() || objects.isSymbolicLink()) {
         throw new Error("unsafe recovery object directory");
       }
       return JSON.stringify([barePath, `${bare.dev}:${bare.ino}`, `${objects.dev}:${objects.ino}`]);
-    };
+    });
     // Reuse assumes immutable worker-owned object storage and disabled bare repack/prune.
     // User decision 2026-10-14 (#2979) accepts that corruption, loose/pack replacement
     // or added alternates within this operation can escape re-hashing when directory
@@ -6393,9 +6401,9 @@ export class GitCache {
     // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
     const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
       GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
-    const read = async (args: string[], input?: string): Promise<string> =>
+    const read = binding?.read ?? (async (args: string[], input?: string): Promise<string> =>
       (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
-        { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+        { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout);
     let producer: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
     try {
       const beforeIdentity = await identity();
@@ -6433,9 +6441,10 @@ export class GitCache {
       }
       operation?.signal.throwIfAborted();
       if (objects.length > 0) {
-        producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"],
-          objects.map(object => object.oid).join("\n") + "\n",
-          { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true, stdoutCategory: "closure" });
+        const input = objects.map(object => object.oid).join("\n") + "\n";
+        producer = binding ? await binding.spawn(["cat-file", "--batch"], input) :
+          await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input,
+            { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true, stdoutCategory: "closure" });
         await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
         if (await producer.exited !== 0) return false;
       }
@@ -11666,6 +11675,230 @@ try {
   }
 
   /**
+   * Private callback lifetime only. Caller still owes the held bare lock, quiescence,
+   * fresh exact custody, non-stopped family and original charged output history.
+   * This seam grants neither publication nor preservation/release authority.
+   */
+  // @ts-expect-error TS6133: dormant until the fresh integration binding is implemented.
+  private async withVerifiedMaintenancePack(
+    source: { clonePath: string; identity: string },
+    tip: string,
+    outDir: string,
+    beforeEffect: () => Promise<void>,
+    consume: (result: { pack: { path: string; byteSize: number; objectCount: number };
+      index: { path: string; byteSize: number; objectCount: number }; sourceSha: string }) => Promise<void>,
+    knownBase?: { barePath: string; identity: string },
+  ): Promise<void> {
+    MaintenanceResources.check();
+    if (!this.boundaryProcesses.getStore() || !this.recoveryOperations.getStore() ||
+        !SHA40_RE.test(tip) || typeof beforeEffect !== "function" || typeof consume !== "function") {
+      throw new Error("maintenance_private_verification_refused");
+    }
+    type Stat = import("node:fs").BigIntStats;
+    const root = path.resolve(this.recoveryRoot);
+    const refused = () => new Error("maintenance_private_verification_refused");
+    const check = () => { MaintenanceResources.check(); this.checkRecoveryInterruption(); };
+    const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
+    const safe = (p: string, s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
+      (s.uid === BigInt(process.getuid!()) || (s.uid === 0n && p !== root && isWithinPath(root, p))) &&
+      (s.mode & 2n) === 0n && ((s.mode & 16n) === 0n ||
+        (p !== root && isWithinPath(root, p) && uidSplitActive() &&
+          process.getuid!() === WORKER_UID && process.getgid!() === WORKER_UID && s.gid === BigInt(WORKER_UID)));
+    const valid = (p: string) => {
+      if (typeof p !== "string" || !path.isAbsolute(p) || path.resolve(p) !== p ||
+          Buffer.byteLength(p) > 4096 || p === root || !isWithinPath(p, root)) throw refused();
+      MaintenanceResources.consume("metadataBytes", 32768);
+      const parts = p.split("/").filter(Boolean);
+      if (parts.length > 128 || parts.some(part => Buffer.byteLength(part) > 255 ||
+          [...part].some(character => { const code = character.charCodeAt(0); return code < 32 || code === 127 || code === 92; }))) throw refused();
+    };
+    valid(outDir);
+    const ancestors: Array<{ path: string; stat: Stat }> = [];
+    const owned = new Map<string, { stat: Stat; directory: boolean }>();
+    const stat = async (p: string) => {
+      check(); MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume("metadataBytes", 2048 + Buffer.byteLength(p));
+      const s = await fs.lstat(p, { bigint: true }); check(); return s;
+    };
+    const validate = async (target = outDir) => {
+      for (const a of ancestors) {
+        const now = await stat(a.path);
+        if (!same(a.stat, now) || !safe(a.path, now)) throw refused();
+      }
+      for (const [p, entry] of owned) {
+        if (!entry.directory || !isWithinPath(target, p)) continue;
+        const now = await stat(p);
+        if (!same(entry.stat, now) || !safe(p, now)) throw refused();
+      }
+    };
+    const admit = async () => { check(); await beforeEffect(); check(); };
+    const effect = async (target = outDir) => { await admit(); await validate(target); check(); };
+    // Reserve every later cleanup lookup/removal before admitting its creation.
+    // One attempt per recorded name; an uncertain parent/name is retained, siblings continue.
+    const own = (p: string, directory: boolean) => {
+      valid(p);
+      const depth = p.split("/").length;
+      MaintenanceResources.consume("adminEntries", depth + 2);
+      MaintenanceResources.consume("metadataBytes", (depth + 2) * (4096 + 2048));
+      return (s: Stat) => { owned.set(p, { stat: s, directory }); };
+    };
+    const mkdir = async (p: string) => {
+      const record = own(p, true);
+      await effect(p); MaintenanceResources.consume("adminEntries", 1);
+      await fs.mkdir(p, { mode: 0o700 });
+      const created = await fs.lstat(p, { bigint: true }); record(created);
+      if (!safe(p, created) || created.uid !== BigInt(process.getuid!()) ||
+          (created.mode & 0o5777n) !== 0o700n) throw refused();
+      check();
+    };
+    const write = async (p: string, value: string) => {
+      const record = own(p, false);
+      MaintenanceResources.consume("adminEntries", 3);
+      MaintenanceResources.consume("artifactBytes", Buffer.byteLength(value));
+      await effect(p);
+      const file = await fs.open(p, fsConstants.O_CREAT | fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW | fsConstants.O_WRONLY, 0o600);
+      try {
+        record(await file.stat({ bigint: true }));
+        const bytes = Buffer.from(value);
+        for (let offset = 0; offset < bytes.length;) {
+          await effect(p);
+          const result = await file.write(bytes, offset, bytes.length - offset);
+          if (result.bytesWritten <= 0) throw refused();
+          offset += result.bytesWritten;
+        }
+      } finally { await file.close(); }
+    };
+    const view = async (p: string) => {
+      await mkdir(p); await mkdir(path.join(p, "objects")); await mkdir(path.join(p, "refs"));
+      await write(path.join(p, "HEAD"), "ref: refs/heads/private\n");
+      await write(path.join(p, "config"), "[core]\nrepositoryformatversion = 0\nbare = true\n");
+    };
+    const environment = (repo: string, objects: string, base?: string): NodeJS.ProcessEnv => ({
+      PATH: "/usr/bin:/bin", HOME: outDir, TMPDIR: outDir, LANG: "C", LC_ALL: "C",
+      GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0", GIT_DIR: repo, GIT_OBJECT_DIRECTORY: objects,
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: base ? JSON.stringify(base) : "",
+      GIT_NO_REPLACE_OBJECTS: "1", GIT_REPLACE_REF_BASE: "refs/disabled/",
+      GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1",
+      GIT_ALLOW_PROTOCOL: "none",
+    });
+    const launch = async (repo: string, env: NodeJS.ProcessEnv, args: string[], input?: string,
+      category: SpawnGitOptions["stdoutCategory"] = "metadataBytes") => {
+      // Logical helper input and retained control capacity, before stdin delivery.
+      MaintenanceResources.consume("metadataBytes", Buffer.byteLength(input ?? "") * 2 + 4096);
+      return this.spawnGit(repo, ["--no-replace-objects", ...args], input, { env,
+        trustedExecutable: true, beforeSpawn: async () => { await effect(repo); await validate(env.GIT_OBJECT_DIRECTORY); },
+        joinStderr: true, cancelOnAbandon: true,
+        stderrMaxBytes: 4096, timeoutMs: GIT_TIMEOUT_MS, stdoutCategory: category });
+    };
+    const read = async (repo: string, env: NodeJS.ProcessEnv, args: string[], input?: string) => {
+      const child = await launch(repo, env, args, input);
+      try {
+        const chunks: Buffer[] = []; let size = 0;
+        for await (const raw of child.stdout) {
+          const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+          if (bytes.length > GIT_MAX_BUFFER - size) throw refused();
+          MaintenanceResources.consume("metadataBytes", bytes.length * 2);
+          chunks.push(bytes); size += bytes.length;
+        }
+        if (await child.exited !== 0) throw refused();
+        return Buffer.concat(chunks).toString("utf8");
+      } catch (error) {
+        child.cancel(); child.stdout.destroy(); await child.exited; throw error;
+      }
+    };
+    const cleanup = async () => {
+      // All admitted child and serial I/O work above has joined. Unknown entries
+      // (including partial helper outputs without an observed identity) are retained.
+      for (const [p, entry] of [...owned].reverse()) {
+        try {
+          await beforeEffect();
+          for (let parent = path.dirname(p);; parent = path.dirname(parent)) {
+            const expected = owned.get(parent)?.stat ?? ancestors.find(a => a.path === parent)?.stat;
+            if (!expected) throw refused();
+            const now = await fs.lstat(parent, { bigint: true });
+            if (!same(expected, now) || !safe(parent, now)) throw refused();
+            if (path.dirname(parent) === parent) break;
+          }
+          const now = await fs.lstat(p, { bigint: true });
+          if (!same(entry.stat, now)) continue;
+          if (entry.directory) await fs.rmdir(p); else await fs.unlink(p);
+        } catch { /* One bounded attempt; preserve uncertainty and continue siblings. */ }
+      }
+    };
+    try {
+      const hierarchy: string[] = [];
+      for (let p = path.dirname(outDir);; p = path.dirname(p)) {
+        if (hierarchy.length >= 128) throw refused();
+        hierarchy.push(p); if (path.dirname(p) === p) break;
+      }
+      for (const p of hierarchy.reverse()) {
+        const s = await stat(p); if (!safe(p, s)) throw refused();
+        ancestors.push({ path: p, stat: s });
+      }
+      await mkdir(outDir);
+      const snapshot = await this.snapshotMaintenanceObjects(source, path.join(outDir, "source"),
+        admit, knownBase, own);
+      const first = path.join(outDir, "read"), second = path.join(outDir, "proof");
+      await view(first); await view(second);
+      const env = environment(first, snapshot.path, snapshot.base?.path);
+      const listing = await read(first, env, ["rev-list", "--objects", "--no-object-names", "--missing=error", tip]);
+      let count = 0;
+      for (const character of listing) if (character === "\n") count++;
+      MaintenanceResources.consume("closureEntries", count);
+      MaintenanceResources.consume("metadataBytes", listing.length * 4 + count * 128);
+      if (!listing.endsWith("\n") || count === 0 || count > 65536) throw refused();
+      const oids = listing.slice(0, -1).split("\n");
+      if (oids.some(oid => !SHA40_RE.test(oid)) || new Set(oids).size !== count || !oids.includes(tip)) throw refused();
+      const packDir = path.join(second, "objects", "pack");
+      await mkdir(packDir);
+      const packPath = path.join(packDir, "stage.pack"), indexPath = path.join(packDir, "stage.idx");
+      const packRecord = own(packPath, false), indexRecord = own(indexPath, false);
+      const producer = await launch(first, env, ["pack-objects", "--stdout", "--no-reuse-object",
+        "--no-reuse-delta", "--window=0", "--depth=0", "--threads=1"], listing, "artifactBytes");
+      // No stdout reads/listeners between spawn and the existing staging consumer.
+      const pack = await this.stageMaintenancePack({ stdout: producer.stdout,
+        exited: producer.exited.then(code => ({ code, stderr: "" })), abort: producer.cancel },
+      packPath, 256 * 1024 ** 2, admit, beforeEffect);
+      packRecord(await stat(packPath));
+      const index = await this.indexMaintenancePack(pack, indexPath, oids, admit, beforeEffect);
+      indexRecord(await stat(indexPath));
+      MaintenanceResources.consume("adminEntries", 3);
+      MaintenanceResources.consume("sourceBytes", 20);
+      const file = await fs.open(packPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      let checksum: string;
+      try {
+        const bytes = Buffer.alloc(20);
+        if ((await file.read(bytes, 0, 20, pack.byteSize - 20)).bytesRead !== 20) throw refused();
+        checksum = bytes.toString("hex");
+      } finally { await file.close(); }
+      const rename = async (from: string, to: string) => {
+        const record = own(to, false);
+        await effect(to); MaintenanceResources.consume("adminEntries", 1);
+        await fs.rename(from, to);
+        record(owned.get(from)!.stat); owned.delete(from);
+      };
+      pack.path = path.join(packDir, "pack-" + checksum + ".pack");
+      index.path = path.join(packDir, "pack-" + checksum + ".idx");
+      await rename(packPath, pack.path); await rename(indexPath, index.path);
+      const proofEnv = environment(second, path.join(second, "objects"));
+      if (!await this.verifyRecoveryClosureBound(second, tip, {
+        read: (args, input) => read(second, proofEnv, args, input),
+        spawn: (args, input) => launch(second, proofEnv, args, input, "closure"),
+        identity: async () => {
+          await validate(path.join(second, "objects"));
+          const bare = await stat(second), objects = await stat(path.join(second, "objects"));
+          return JSON.stringify([second, String(bare.dev) + ":" + bare.ino, String(objects.dev) + ":" + objects.ino]);
+        },
+      })) throw refused();
+      await effect();
+      await consume({ pack, index, sourceSha: tip });
+      check();
+    } finally { await cleanup(); }
+  }
+
+  /**
    * Dormant detached encoded bytes, NOT authentication or a durable journal.
    * Caller owes positive non-stopped family/custody/origin/output-index proof,
    * quiescence, held bare lock, live execution reservation and worker-exclusive
@@ -11673,12 +11906,12 @@ try {
    * A caller-selected canonical base supplies encoded prerequisites, never repository
    * authentication. Both complete private copies still owe the later C verification.
    */
-  // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
   private async snapshotMaintenanceObjects(
     source: { clonePath: string; identity: string },
     outDir: string,
     beforeEffect: () => Promise<void>,
     knownBase?: { barePath: string; identity: string },
+    own?: (absolute: string, directory: boolean) => (stat: import("node:fs").BigIntStats) => void,
   ): Promise<{ path: string; byteSize: number; fileCount: number;
     base?: { path: string; byteSize: number; fileCount: number } }> {
     type Stat = import("node:fs").BigIntStats;
@@ -11849,11 +12082,13 @@ try {
     const createDirectory = async (parent: Pin, name: string, absolute: string) => {
       const p = child(parent, name);
       await absent(p, true); reserveCleanup(true, parent); visit(true); meta(2048);
+      const record = own?.(absolute, true);
       await effect(); visit(true);
       await fs.mkdir(p, { mode: 0o700 });
       // Recover identity without dispatching other effects, even if now revoked.
       const created = await fs.lstat(p, { bigint: true });
       outputs.push({ parent, name, stat: created, directory: true, size: 0 });
+      record?.(created);
       check(); await validatePins();
       // mkdir(0700) can inherit SGID. It grants no group access; never heal
       // an existing directory or permit setuid/sticky/group/other permission bits.
@@ -11919,11 +12154,13 @@ try {
           const before = await fstat(input, false);
           if (!unchanged(observed, before) || !before.isFile() || before.nlink !== 1n) throw refused();
           await absent(to, true); reserveCleanup(true, dst); visit(true); meta(2048);
+          const record = own?.(absoluteChild(dst, name), false);
           await effect();
           output = await open(to, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
             fsConstants.O_RDWR, true, 0o600, true);
           const created = await output.stat({ bigint: true });
           outputs.push({ parent: dst, name, stat: created, directory: false, size: Number(before.size) });
+          record?.(created);
           check(); await validatePins();
           let n = 0;
           while (true) {
@@ -12042,6 +12279,7 @@ try {
       for (let i = outputs.length - 1; i >= 0; i--) {
         const r = outputs[i]!;
         try {
+          if (own) await beforeEffect();
           for (const p of pins) {
             if (!p.output || !isWithinPath(r.parent.absolute, p.absolute)) continue;
             const named = await fs.lstat(p.named, { bigint: true });
@@ -12077,12 +12315,12 @@ try {
    * The parent hierarchy must remain worker-exclusive against hostile replacement;
    * identity checks and O_NOFOLLOW alone cannot supply that exclusion.
    */
-  // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
   private async stageMaintenancePack(
     producer: { stdout: Readable; exited: Promise<{ code: number; stderr: string }>; abort: () => void },
     outPath: string,
     maxBytes: number,
     beforeEffect: () => Promise<void>,
+    beforeCleanup?: () => Promise<void>,
   ): Promise<{ path: string; byteSize: number; objectCount: number }> {
     const refused = () => new Error("maintenance_pack_staging_refused");
     const scope = AsyncLocalStorage.snapshot();
@@ -12257,6 +12495,7 @@ try {
       // Check-then-unlink relies on the caller's worker-exclusive hierarchy.
       if (created) {
         try {
+          await beforeCleanup?.();
           for (const parent of parents) {
             const now = await fs.lstat(parent.path);
             if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
@@ -12285,12 +12524,12 @@ try {
    * in scratch/index-envelope-20261019/findings.md support this restricted contract;
    * they are not a universal theorem about Git or an internal decompression cap.
    */
-  // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
   private async indexMaintenancePack(
     staged: { path: string; byteSize: number; objectCount: number },
     outPath: string,
     expectedOids: readonly string[],
     beforeEffect: () => Promise<void>,
+    beforeCleanup?: () => Promise<void>,
   ): Promise<{ path: string; byteSize: number; objectCount: number }> {
     const refused = () => new Error("maintenance_pack_index_refused");
     const check = () => { MaintenanceResources.check(); this.checkRecoveryInterruption(); };
@@ -12563,6 +12802,7 @@ try {
       // checks preserve foreign names. Parent exclusion is a caller prerequisite.
       if (launched) {
         try {
+          await beforeCleanup?.();
           for (const parent of parents) {
             const now = await fs.lstat(parent.path);
             if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
@@ -13982,7 +14222,7 @@ try {
     stdin?: string,
     opts: SpawnGitOptions = {},
   ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
-    const env = { ...gitEnv(), ...opts.env };
+    const env = opts.trustedExecutable ? { ...opts.env } : { ...gitEnv(), ...opts.env };
     const metered = MaintenanceResources.active();
     const producerScope = AsyncLocalStorage.snapshot();
     const completionError = (): Error | undefined => producerScope(() => {
