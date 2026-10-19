@@ -15,7 +15,11 @@ const workerToken = "origin-admission-fixture";
 const sha = "a".repeat(40), origin = "b".repeat(64);
 const digest = (value: unknown) => createHash("sha256").update(canonicalJson(value)).digest("hex");
 
-async function fixture(t: test.TestContext, mode: string) {
+async function fixture(t: test.TestContext, mode: string, options: {
+  status?: string;
+  observeStatus?: (call: number) => string;
+  currentGeneration?: number;
+} = {}) {
   const root = await fs.mkdtemp(path.resolve("../.uzi/scratch/terminal-origin-"));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const recoveryRoot = path.join(root, "recovery");
@@ -57,7 +61,8 @@ async function fixture(t: test.TestContext, mode: string) {
       return { ok: true, token: holdCalls === 1 ? token : chargedToken, hold: { run_id: runId, generation: 1, hold_id: holdId, repo_id: repo,
         original_worker_id: workerId, original_worker_identity: "human-label",
         live_worker_id: workerId, live_run_id: runId, inventory_guarded: true, state: "open",
-        run_status: "failed", current_claim_generation: 1, claim_released: true } };
+        run_status: options.observeStatus?.(holdCalls) ?? options.status ?? "failed",
+        current_claim_generation: options.currentGeneration ?? 1, claim_released: true } };
     },
     isCurrentTerminalMaintenanceHold: candidate => registration &&
       (candidate === token || (candidate === chargedToken && chargedRegistration)),
@@ -168,6 +173,110 @@ async function fixture(t: test.TestContext, mode: string) {
     counts: () => ({ quiesceCalls, holdCalls, headCalls, chargedRpc, discoveryRpc }),
     tokenState: () => [client.isCurrentTerminalMaintenanceHold!(token),
       client.isCurrentTerminalMaintenanceHold!(chargedToken)] };
+}
+
+const terminalStatuses = ["failed", "cancelled", "completed"] as const;
+
+for (const status of terminalStatuses) {
+  for (const earlierGeneration of [false, true]) {
+    test("terminal WIP exact status: " + status + (earlierGeneration ? " earlier generation" : ""), async t => {
+      const f = await fixture(t, "committed", { status, currentGeneration: earlierGeneration ? 9 : 1 });
+      const observation: ClosedSourceObservation = earlierGeneration ? {
+        ...f.observation, terminal: "normal_blocked",
+        family: { ...f.observation.family!, observedExecution: { runId, generation: 9 } },
+      } : f.observation;
+      await f.run(f.coordinator, observation);
+      assert.equal(await f.chargeCount(), 1);
+      const cycle = (await f.table()).cycles[0];
+      assert.equal(cycle.identity.generation, 1, "custody and charge stay bound to the original generation");
+      assert.equal(cycle.identity.hold, holdId);
+      assert.equal(cycle.fenced, true);
+      const records = await f.coordinator.inspect(runId);
+      assert.equal(records.length, 1);
+      const record = records[0]!;
+      assert.match(record.captureId, /^maintenance-v1-/);
+      assert.deepEqual(await f.prefixes(), [record.captureId + ".json"]);
+      assert.equal(record.generation, 1);
+      assert.equal(record.sourceSha, sha);
+      assert.equal(record.state, "pinned");
+      assert.deepEqual(record.exactHoldBinding, { holdId, repoId });
+      assert.equal(record.heldPolicy, undefined);
+      assert.equal(record.attemptedHeadSha, undefined);
+      assert.deepEqual(cycle.outputs, [digest(record.captureId),
+        digest(["maintenance-wip-v1", cycle.identity, "e".repeat(40)])]);
+      assert.deepEqual(f.events.filter(event => event.startsWith("git-")), ["git-status", "git-add", "git-commit"]);
+      assert.ok(f.events.indexOf("authenticated-before-raw") < f.events.indexOf("git-status"));
+      await f.unchanged();
+      await f.run(f.make(), observation);
+      assert.equal(await f.chargeCount(), 1);
+      assert.deepEqual((await f.table()).cycles[0].outputs, cycle.outputs);
+    });
+  }
+}
+
+for (const status of ["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup",
+  "limit_wait", "pool_wait", "paused", "recovery_wait", "parked", "stopped", "unknown", ""]) {
+  test("terminal WIP rejects initial exact status: " + JSON.stringify(status), async t => {
+    const f = await fixture(t, "committed", { status });
+    await f.run();
+    assert.equal(f.counts().holdCalls, 1);
+    assert.equal(await f.chargeCount(), 0);
+    assert.deepEqual(await f.prefixes(), []);
+    assert.deepEqual(await f.coordinator.inspect(runId), []);
+    assert.deepEqual(f.events, []);
+    await f.unchanged();
+  });
+}
+
+// With both journal directories present the observations are: discovery, before
+// charge, pre-publication, before temporary open, before rename, add, commit,
+// and result. Each independent fixture stops at its selected observation.
+const observationBoundaries = [
+  { call: 2, name: "before charge", origins: 0, outputs: 0, git: [] },
+  { call: 3, name: "pre-publication", origins: 0, outputs: 0, git: [] },
+  { call: 4, name: "before temporary open", origins: 0, outputs: 1, git: [] },
+  { call: 5, name: "before rename", origins: 0, outputs: 1, git: [] },
+  { call: 6, name: "before add", origins: 1, outputs: 1, git: ["git-status"] },
+  { call: 7, name: "before commit", origins: 1, outputs: 1, git: ["git-status", "git-add"] },
+  { call: 8, name: "result", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
+];
+for (const [index, status] of terminalStatuses.entries()) {
+  const nonterminal = ["running", "parked", "unknown"][index]!;
+  for (const boundary of observationBoundaries) {
+    test("terminal WIP exact status transition: " + status + " to " + nonterminal + " " + boundary.name, async t => {
+      const f = await fixture(t, "committed", {
+        observeStatus: call => call < boundary.call ? status : nonterminal,
+      });
+      await fs.mkdir(f.dir, { recursive: true });
+      await f.run();
+      assert.equal(f.counts().holdCalls, boundary.call);
+      assert.equal(await f.chargeCount(), boundary.call === 2 ? 0 : 1);
+      assert.equal((await f.prefixes()).length, boundary.origins);
+      const records = await f.coordinator.inspect(runId);
+      assert.equal(records.length, boundary.origins);
+      if (records.length) {
+        assert.equal(records[0]!.state, "pinned");
+        assert.equal(records[0]!.sourceSha, sha);
+        assert.equal(records[0]!.heldPolicy, undefined);
+        assert.deepEqual(records[0]!.exactHoldBinding, { holdId, repoId });
+      }
+      assert.deepEqual(f.events.filter(event => event.startsWith("git-")), boundary.git);
+      if (boundary.call !== 2) {
+        const cycle = (await f.table()).cycles[0];
+        assert.equal(cycle.fenced, true, "refusal does not refund a charged slot");
+        assert.equal(cycle.slots.length, 1);
+        assert.equal(cycle.outputs.length, boundary.outputs);
+        if (records.length) assert.deepEqual(cycle.outputs, [digest(records[0]!.captureId)]);
+        const events = [...f.events];
+        await f.run(f.make());
+        assert.equal(await f.chargeCount(), 1);
+        assert.deepEqual((await f.table()).cycles[0].outputs, cycle.outputs, "indexed evidence is retained");
+        assert.deepEqual(f.events, events, "retry adds no WIP work");
+        assert.deepEqual(await f.coordinator.inspect(runId), records);
+      }
+      await f.unchanged();
+    });
+  }
 }
 
 for (const mode of ["committed", "missing-bridge", "initial-stop", "before-add-stop", "before-commit-stop", "post-commit-stop",

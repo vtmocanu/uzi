@@ -3273,7 +3273,7 @@ export class RecoveryCoordinator {
         if (!origin) return refused(stage);
         stage = "exact_hold_refused";
         const held = await observe(genesis.runId, genesis.generation, undefined, signal);
-        if (!held.ok || held.hold.run_status !== "failed" || !current(held.token)) return refused(stage);
+        if (!held.ok || !["failed", "cancelled", "completed"].includes(held.hold.run_status ?? "") || !current(held.token)) return refused(stage);
         if (held.hold.repo_id !== original.repoId) return refused("local_binding_mismatch");
         knownHold = safeId(held.hold.hold_id);
         if (!localBindingsMatch(existing, { holdId: held.hold.hold_id, repoId: held.hold.repo_id }))
@@ -3314,7 +3314,8 @@ export class RecoveryCoordinator {
           if (!await freshFamily()) return refused("source_protected_or_ambiguous");
           const exact = await observe(genesis.runId, genesis.generation, binding, signal);
           check();
-          if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token)) return refused("exact_hold_refused");
+          if (!exact.ok || !["failed", "cancelled", "completed"].includes(exact.hold.run_status ?? "") ||
+              !current(exact.token)) return refused("exact_hold_refused");
           stage = "metadata_incomplete";
           const beforeCharge = await records();
           if (!localBindingsMatch(beforeCharge, binding)) return refused("local_binding_mismatch");
@@ -3351,7 +3352,7 @@ export class RecoveryCoordinator {
               await localFresh(expectedHead);
               const exact = await observe(genesis.runId, genesis.generation, binding, signal);
               check();
-              if (!exact.ok || exact.hold.run_status !== "failed" || !current(exact.token) ||
+              if (!exact.ok || !["failed", "cancelled", "completed"].includes(exact.hold.run_status ?? "") || !current(exact.token) ||
                   exact.hold.original_worker_id !== admission.identity.custodian ||
                   !current(chargedHold.token)) refused("exact_hold_refused");
             };
