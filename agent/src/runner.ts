@@ -9081,7 +9081,7 @@ export class RunRunner {
         // Session/roster/progress senders are separate from feed/usage transport. Hold new
         // informational running reports until the checker sequence barrier has reconciled.
         if (!checked && body.status === "running" && flight.checkedStateBarrier)
-          await flight.checkedStateBarrier;
+          await (signal ? MaintenanceBudget.waitFor(flight.checkedStateBarrier, signal) : flight.checkedStateBarrier);
         // Issue #1673: a routed input can trigger this report while its applied reply is
         // uncertain. Keep the report behind that receipt so the server's resume guards see it;
         // the wait throws once the receipt is given up, so neither a resume nor a completion goes
@@ -10491,7 +10491,26 @@ export class RunRunner {
     // reach the api in the order they were made. The chain itself NEVER rejects (each link
     // is isolated below) so one failed report cannot break the ordering of later ones.
     let runningReportChain: Promise<unknown> = Promise.resolve();
-    const enqueueRunningReport = <T>(task: () => Promise<T>): Promise<T> => {
+    const enqueueRunningReport = <T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
+      if (signal) {
+        const prior = runningReportChain;
+        let releaseSlot!: () => void;
+        const slot = new Promise<void>(resolve => { releaseSlot = resolve; });
+        // A forfeited slot still follows its predecessor; later reports cannot overtake it.
+        runningReportChain = prior.then(() => slot, () => slot).catch(() => undefined);
+        return (async () => {
+          try { await MaintenanceBudget.waitFor(prior, signal); }
+          catch (error) {
+            void prior.then(releaseSlot, releaseSlot);
+            throw error;
+          }
+          try {
+            signal.throwIfAborted();
+            // Once admitted, retain the slot until the transport's own cleanup settles.
+            return await task();
+          } finally { releaseSlot(); }
+        })();
+      }
       // Run `task` after the current tail settles, regardless of its outcome (pass the same
       // handler to both arms — the tail never rejects, but this is belt-and-braces). The
       // returned promise carries THIS task's result (and rejection) for a caller that awaits
@@ -11045,7 +11064,6 @@ export class RunRunner {
         } catch (err) {
           checkpointFailed = !(err instanceof RunResidueBlockedError || err instanceof CheckpointSoftDeadlineError);
           if (err instanceof CheckpointSoftDeadlineError) {
-            if (opts.doneAttempt) throw err;
             bodyOutcome = "soft_deadline";
             this.reportPublishOutcome(flight, "soft_deadline", "checkpoint publish skipped: soft deadline", {
               step: checkpointSteps?.current(),
@@ -11053,14 +11071,36 @@ export class RunRunner {
             if (opts.progress) {
               // The local milestone completed even though its remote checkpoint did
               // not. Preserve the progress report without claiming publication.
-              await enqueueRunningReport(() => reportState({
-                status: "running",
-                milestones_completed: opts.progress!.completed,
-                milestones_in_progress: opts.progress!.in_progress,
-                ...(opts.progress!.milestones_agents
-                  ? { milestones_agents: opts.progress!.milestones_agents }
-                  : {}),
-              })).catch((e) => runLog.warn("could not report checkpoint progress", { error: errMessage(e) }));
+              const progressSignal = opts.doneAttempt && opts.donePermit
+                ? AbortSignal.any([opts.donePermit.signal, opts.doneAttempt.stop.lifecycleSignal ?? steering.lifecycleSignal()]) : undefined;
+              if (!progressSignal?.aborted) {
+                checkpointSteps?.enter("checkpoint_report");
+                await enqueueRunningReport(() => reportState({
+                  status: "running",
+                  milestones_completed: opts.progress!.completed,
+                  milestones_in_progress: opts.progress!.in_progress,
+                  ...(opts.progress!.milestones_agents
+                    ? { milestones_agents: opts.progress!.milestones_agents }
+                    : {}),
+                }, progressSignal), progressSignal).catch((e) => {
+                  if (opts.doneAttempt) {
+                    if (opts.donePermit?.signal.aborted) checkpointFailed = true;
+                    opts.donePermit?.signal.throwIfAborted();
+                    if (e instanceof StaleClaimError || e instanceof CredentialSwitchSignal ||
+                        e instanceof ServerWallParkedError || isCheckpointBoundaryFailure(e)) {
+                      checkpointFailed = true;
+                      throw e;
+                    }
+                  }
+                  runLog.warn("could not report checkpoint progress", { error: errMessage(e) });
+                });
+              }
+            }
+            // DONE must retain its soft outcome and clear the snapshot before any continuation.
+            if (opts.doneAttempt) {
+              if (opts.donePermit?.signal.aborted) checkpointFailed = true;
+              opts.donePermit?.signal.throwIfAborted();
+              throw err;
             }
           } else if (!(err instanceof RunResidueBlockedError)) {
             throw err;
