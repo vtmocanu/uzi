@@ -3028,6 +3028,7 @@ export class RunRunner {
       quiesce: (paths: string[]) => Promise<boolean>;
       isLivePath: (clonePath: string) => boolean;
       captureWip: GitCache["captureMaintenanceWip"];
+      withMaintenanceTransfer: <V>(action: (check: () => void) => Promise<V>) => Promise<V>;
     }) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<{ entered: false } | { entered: true; value: T }> {
@@ -3066,11 +3067,11 @@ export class RunRunner {
     const scope = new AbortController();
     let spawner: TickSpawner | undefined;
     const refused = () => new Error("maintenance_wip_boundary_refused");
-    const settleOwned = async () => {
-      if (!spawner) return;
+    const settleOwned = async (owner: TickSpawner | undefined) => {
+      if (!owner) return;
       try {
-        await spawner.settled();
-        if (spawner.survivors().length) throw refused();
+        await owner.settled();
+        if (owner.survivors().length) throw refused();
       } catch {
         settlementUncertain = true;
         // The unresolved execution tail denies ordinary cleanup/recovery too.
@@ -3078,6 +3079,112 @@ export class RunRunner {
         this.log.warn("maintenance WIP source retained", { diagnostic: "maintenance_wip_settlement_unconfirmed" });
         throw new Error("maintenance_wip_settlement_unconfirmed");
       }
+    };
+    const familyProof = (clonePath: string, check: () => void, ownerSignal: AbortSignal) => {
+      const familyKey = cloneKeyOf(clonePath).cloneKey;
+      return async () => {
+        check();
+        ownerSignal.throwIfAborted();
+        if (process.platform !== "linux" || !open()) return false;
+        // A retained family has one stable clone key across attempts and skills roots.
+        // Scan all paths together: one helper envelope per pass, never one per member.
+        for (const p of clonePaths) {
+          const base = pathBasename(p);
+          const source = base.startsWith(".uzi-skills-") ? join(pathDirname(p), base.slice(".uzi-skills-".length)) : p;
+          if (cloneKeyOf(source).cloneKey !== familyKey) return false;
+        }
+        const outcome = await this.quiesceImpl({
+          mode: "capture", attempt: undefined, cloneKey: familyKey, targetPaths: [...clonePaths],
+          processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
+          otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+          site: "retained_ops",
+        });
+        return outcome.process?.state === "quiescent" && open() &&
+          (!this.dockerHost || outcome.docker.state === "docker_unconfirmed");
+      };
+    };
+    let capturedSource: string | undefined;
+    let capturedSignal: AbortSignal | undefined;
+    let captureCompleted = false;
+    let transferClaimed = false;
+    let transferTask: Promise<unknown> | undefined;
+    let transferScope: AbortController | undefined;
+    // This grants only local continuation under the existing owner. The caller still owes
+    // stopped/custody proofs and fresh per-effect revalidation; quiet and a token prove neither.
+    const withMaintenanceTransfer = <V>(action: (check: () => void) => Promise<V>): Promise<V> => {
+      // Never wait for capture here: a capture callback could otherwise wait on itself.
+      if (!captureCompleted || transferClaimed || !capturedSource || !capturedSignal) return Promise.reject(refused());
+      transferClaimed = true;
+      const source = capturedSource;
+      const chargedSignal = capturedSignal;
+      const phaseScope = new AbortController();
+      transferScope = phaseScope;
+      let phaseActive = true;
+      let callbackActive = false;
+      const ambientSignal = MaintenanceBudget.current()?.signal;
+      const continuationSignal = AbortSignal.any([chargedSignal, this.shutdownSignal.signal,
+        ...(ambientSignal ? [ambientSignal] : []), ...(signal ? [signal] : [])]);
+      const ownerSignal = AbortSignal.any([phaseScope.signal, continuationSignal]);
+      const checkLocal = () => {
+        try {
+          if (!phaseActive || !open() || !clonePaths.includes(source) ||
+              this.dataVolume?.preflight() === "data_volume_full") throw refused();
+          MaintenanceBudget.current()?.check();
+          MaintenanceResources.check();
+          if (MaintenanceResources.signalIfActive() !== chargedSignal) throw refused();
+          continuationSignal.throwIfAborted();
+        } catch { throw refused(); }
+      };
+      const check = () => {
+        if (!callbackActive) throw refused();
+        checkLocal();
+        ownerSignal.throwIfAborted();
+      };
+      const task = (async () => {
+        let owner: TickSpawner | undefined;
+        let started = false;
+        const proveAfterTransfer = async () => {
+          try {
+            if (started && !await familyProof(source, checkLocal, continuationSignal)()) throw refused();
+            checkLocal();
+          } catch { throw refused(); }
+        };
+        try {
+          checkLocal();
+          owner = new TickSpawner({ signal: ownerSignal, log: this.log,
+            ...(this.checkpointTestHooks?.tickSpawn ? { hooks: this.checkpointTestHooks.tickSpawn } : {}),
+            ...(this.checkpointTestHooks?.tickKillGraceMs !== undefined
+              ? { killGraceMs: this.checkpointTestHooks.tickKillGraceMs } : {}),
+          });
+          const supervisor = owner;
+          const familyQuiet = familyProof(source, checkLocal, ownerSignal);
+          return await this.git.withBoundaryProcessSpawner(request => {
+            check();
+            return supervisor.spawn(request);
+          }, ownerSignal, async () => {
+            if (!await familyQuiet()) throw refused();
+            checkLocal();
+            started = true;
+            callbackActive = true;
+            // Await the callback itself, including pending filesystem work, before settlement.
+            try { return await action(check); }
+            finally { callbackActive = false; }
+          });
+        } catch {
+          throw refused();
+        } finally {
+          callbackActive = false;
+          phaseScope.abort();
+          try {
+            await settleOwned(owner);
+            // A single post-transfer family pass follows the actual child join, also on failure.
+            await proveAfterTransfer();
+          } finally { phaseActive = false; }
+        }
+      })();
+      transferTask = task;
+      void task.catch(() => {});
+      return task;
     };
     const captureWip: GitCache["captureMaintenanceWip"] = (clonePath, oldHead, callbacks) => {
       // One capture per reservation bounds the extra family scans to initial + three Git steps.
@@ -3098,6 +3205,8 @@ export class RunRunner {
               typeof oldHead !== "string" || oldHead.length !== 40 || !/^[a-f0-9]{40}$/.test(oldHead)) throw refused();
           const chargedSignal = MaintenanceResources.signalIfActive();
           if (!chargedSignal) throw refused();
+          capturedSignal = chargedSignal;
+          capturedSource = clonePath;
           const ambientSignal = MaintenanceBudget.current()?.signal;
           const ownerSignal = AbortSignal.any([scope.signal, chargedSignal, this.shutdownSignal.signal,
             ...(ambientSignal ? [ambientSignal] : []), ...(signal ? [signal] : [])]);
@@ -3108,27 +3217,7 @@ export class RunRunner {
               ? { killGraceMs: this.checkpointTestHooks.tickKillGraceMs } : {}),
           });
           const owner = spawner;
-          const familyKey = cloneKeyOf(clonePath).cloneKey;
-          const familyQuiet = async () => {
-            check();
-            ownerSignal.throwIfAborted();
-            if (process.platform !== "linux" || !open()) return false;
-            // A retained family has one stable clone key across attempts and skills roots.
-            // Scan all paths together: one helper envelope per pass, never one per member.
-            for (const p of clonePaths) {
-              const base = pathBasename(p);
-              const source = base.startsWith(".uzi-skills-") ? join(pathDirname(p), base.slice(".uzi-skills-".length)) : p;
-              if (cloneKeyOf(source).cloneKey !== familyKey) return false;
-            }
-            const outcome = await this.quiesceImpl({
-              mode: "capture", attempt: undefined, cloneKey: familyKey, targetPaths: [...clonePaths],
-              processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
-              otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
-              site: "retained_ops",
-            });
-            return outcome.process?.state === "quiescent" && open() &&
-              (!this.dockerHost || outcome.docker.state === "docker_unconfirmed");
-          };
+          const familyQuiet = familyProof(clonePath, check, ownerSignal);
           return await this.git.withBoundaryProcessSpawner(request => {
             check();
             ownerSignal.throwIfAborted();
@@ -3156,21 +3245,24 @@ export class RunRunner {
           throw refused();
         } finally {
           scope.abort();
-          await settleOwned();
+          await settleOwned(spawner);
         }
       })();
+      captureTask = captureTask.then(value => { captureCompleted = true; return value; });
       // A caller may neglect to await; the reservation's finally still joins and refuses.
       void captureTask.catch(() => {});
       return captureTask;
     };
     try {
       if (!open()) return { entered: false };
-      return { entered: true, value: await action({ open, quiesce, captureWip, isLivePath: (p) => this.liveAttempts.isLivePath(p) }) };
+      return { entered: true, value: await action({ open, quiesce, captureWip, withMaintenanceTransfer, isLivePath: (p) => this.liveAttempts.isLivePath(p) }) };
     } finally {
       boundaryActive = false;
       scope.abort();
+      transferScope?.abort();
       try {
-        if (captureTask) await captureTask;
+        try { if (captureTask) await captureTask; }
+        finally { if (transferTask) await transferTask; }
       } finally {
         this.inventoryReservations.delete(runId);
         if (!settlementUncertain) {

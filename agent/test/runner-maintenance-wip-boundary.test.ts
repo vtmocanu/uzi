@@ -406,4 +406,380 @@ test("production wrapper exposes owned capture and refreshes pressure", async t 
   assert.deepEqual(await f.view.recovery.withTerminalSourceBoundary("run", [f.root], async () => assert.fail()), { entered: false });
 });
 
+
+test("transfer after real dirty WIP uses a fresh child owner under the same tail and charged slot", async t => {
+  const f = await fixture(t);
+  await f.dirty();
+  const owners: TickSpawner[] = [];
+  const settled = TickSpawner.prototype.settled;
+  t.mock.method(TickSpawner.prototype, "settled", async function (this: TickSpawner) {
+    owners.push(this);
+    return settled.call(this);
+  });
+  let lateCheck!: () => void, escaped!: Context;
+  await f.run(() => f.boundary(async ctx => {
+    escaped = ctx;
+    const tail = f.view.executionTails.get("run");
+    const slot = MaintenanceResources.signalIfActive();
+    const wip = await ctx.captureWip(f.root, f.old, callbacks);
+    assert.equal(wip.kind, "committed");
+    assert.equal(owners.length, 1, "capture has actually settled before transfer");
+    const count = f.pids.length;
+    assert.equal(await ctx.withMaintenanceTransfer(async check => {
+      lateCheck = check;
+      check();
+      assert.equal(f.view.executionTails.get("run"), tail);
+      assert.equal(f.view.inventoryReservations.has("run"), true);
+      assert.equal(MaintenanceResources.signalIfActive(), slot);
+      await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+      assert.equal(await git.worktreeHead(f.root), wip.head, "existing Git spawner launches the real transfer child");
+      assert.equal(f.pids.length, count + 1);
+      check();
+      return "transferred";
+    }), "transferred");
+    assert.throws(lateCheck, refused, "callback check expires when the phase returns");
+    await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+    assert.equal(ctx.open(), true, "transfer disposal does not dispose the outer reservation");
+  }));
+  assert.equal(owners.length, 2);
+  assert.notEqual(owners[0], owners[1]);
+  assert.equal(f.families.length, 6, "four dirty WIP passes plus two whole-family transfer passes");
+  await assert.rejects(f.run(() => escaped.withMaintenanceTransfer(async () => assert.fail())), refused);
+  assert.throws(lateCheck, refused);
+  assert.equal(f.runner.isExecuting("run"), false);
+});
+
+for (const mode of ["before", "during", "failed", "settling"] as const)
+test("transfer never waits for or bypasses incomplete capture: " + mode, async t => {
+  const f = await fixture(t);
+  const invoke = () => f.run(() => f.boundary(async ctx => {
+    if (mode === "before") {
+      await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+      return;
+    }
+    if (mode === "settling") {
+      const settled = TickSpawner.prototype.settled;
+      t.mock.method(TickSpawner.prototype, "settled", async function (this: TickSpawner) {
+        await settled.call(this);
+        await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+      });
+    }
+    const capture = ctx.captureWip(f.root, f.old, { ...callbacks, beforeStep: async () => {
+      await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+      if (mode === "failed") throw new Error("capture failed");
+    } });
+    if (mode === "failed") {
+      await assert.rejects(capture, refused);
+      await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+    } else await capture;
+  }));
+  if (mode === "failed") await assert.rejects(invoke(), refused);
+  else await invoke();
+  assert.ok(f.families.length <= 2);
+});
+
+for (const mode of ["no-charge", "discovery"] as const)
+test("a completed capture cannot lend its charge to a transfer: " + mode, async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.boundary(async ctx => {
+    await f.run(() => ctx.captureWip(f.root, f.old, callbacks));
+    const count = f.pids.length;
+    const invoke = () => ctx.withMaintenanceTransfer(async () => assert.fail());
+    await assert.rejects(mode === "discovery" ? MaintenanceResources.runDiscovery(invoke) : invoke(), /maintenance_/);
+    assert.equal(f.pids.length, count);
+  }), /maintenance_/);
+});
+
+test("a different valid slot cannot continue an earlier capture", async t => {
+  const f = await fixture(t);
+  const otherDir = path.join(path.dirname(f.root), "other-charge");
+  await fs.mkdir(otherDir);
+  const ledger = new RecoveryMaintenance({ root: path.join(otherDir, "recovery-maintenance"), workerToken: "fixture" });
+  const admitted = await ledger.admit({
+    identity: { run: "other-run", generation: 1, hold: "other-hold", repo: "repo", custodian: "worker",
+      bareBasename: "repo.git", origin: "a".repeat(64), originalSource: "b".repeat(64), sourceConfig: "c".repeat(64) },
+    config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: "b".repeat(64),
+  });
+  assert.ok(admitted.ok);
+  try {
+    await assert.rejects(f.boundary(async ctx => {
+      await f.run(() => ctx.captureWip(f.root, f.old, callbacks));
+      const count = f.pids.length;
+      await assert.rejects(MaintenanceResources.run(admitted.value,
+        () => ctx.withMaintenanceTransfer(async () => assert.fail("foreign slot callback"))), refused);
+      assert.equal(f.pids.length, count);
+    }), refused);
+    MaintenanceResources.run(admitted.value, () => MaintenanceResources.check());
+  } finally { await ledger.finish(admitted.value, "transient"); }
+});
+
+for (const mode of ["expiry", "pressure", "shutdown", "slot-abort", "caller-abort", "ambient", "live", "closed", "unquiet", "exhausted"] as const)
+for (const at of ["entry", "spawn"] as const)
+test("transfer checks local authority at " + at + ": " + mode, async t => {
+  const f = await fixture(t);
+  const caller = new AbortController();
+  let now = 0;
+  const budget = new MaintenanceBudget(120_000, () => now);
+  t.after(() => budget.dispose());
+  const revoke = () => {
+    if (mode === "expiry") f.expire();
+    if (mode === "pressure") f.pressure();
+    if (mode === "shutdown") f.runner.shutdown();
+    if (mode === "slot-abort") f.slotAbort.abort();
+    if (mode === "caller-abort") caller.abort();
+    if (mode === "ambient") now = 120_000;
+    if (mode === "live") t.mock.method(f.view.liveAttempts, "isLivePath", () => true);
+    if (mode === "closed") f.view.executionTails.delete("run");
+    if (mode === "unquiet") f.quiet(false);
+    if (mode === "exhausted") assert.throws(() => MaintenanceResources.consume("launches", 513));
+  };
+  await assert.rejects(MaintenanceBudget.run(budget, () => f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    const count = f.pids.length;
+    if (at === "entry") revoke();
+    await assert.rejects(ctx.withMaintenanceTransfer(async check => {
+      if (at === "entry") assert.fail("refused before callback");
+      revoke();
+      if (mode === "unquiet") { check(); return; } // Positive post-transfer proof is separately required.
+      assert.throws(check);
+      assert.equal(await git.worktreeHead(f.root), null, "late Git launch is denied by the supervisor");
+    }), /maintenance_|abort/i);
+    assert.equal(f.pids.length, count);
+  }, [f.root], caller.signal))), /maintenance_|abort/i);
+});
+
+test("transfer quiescence reentry is denied synchronously and uses one family envelope", async t => {
+  const f = await fixture(t);
+  const skills = path.join(path.dirname(f.root), ".uzi-skills-source");
+  let reentry: Promise<unknown> | undefined;
+  await f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    f.onQuiet(() => { reentry = assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused); });
+    await ctx.withMaintenanceTransfer(async check => { check(); });
+    await reentry;
+  }, [f.root, skills]));
+  assert.deepEqual(f.families, Array.from({ length: 4 }, () => [f.root, skills]));
+});
+
+test("unawaited transfer joins delayed filesystem callback before releasing its reservation", async t => {
+  const f = await fixture(t);
+  const ioEntered = deferred(), releaseIO = deferred();
+  const target = path.join(f.root, "transfer-output");
+  const write = fs.writeFile.bind(fs);
+  t.mock.method(fs, "writeFile", async (...args: Parameters<typeof fs.writeFile>) => {
+    if (args[0] === target) { ioEntered.resolve(); await releaseIO.promise; }
+    return write(...args);
+  });
+  let completed = false, lateCheck!: () => void;
+  const pending = f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    void ctx.withMaintenanceTransfer(async check => {
+      lateCheck = check;
+      await fs.writeFile(target, "joined");
+    });
+    await ioEntered.promise;
+  })).finally(() => { completed = true; });
+  const rejected = assert.rejects(pending, refused);
+  try {
+    await ioEntered.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(completed, false);
+    assert.equal(f.view.inventoryReservations.has("run"), true);
+    assert.equal(f.runner.isExecuting("run"), true);
+    assert.throws(lateCheck, refused);
+    assert.deepEqual(await f.boundary(async () => assert.fail()), { entered: false });
+  } finally { releaseIO.resolve(); }
+  await rejected;
+  assert.equal(await fs.readFile(target, "utf8"), "joined");
+  assert.equal(f.runner.isExecuting("run"), false);
+});
+
+for (const mode of ["abort", "throw", "settlement-failure"] as const)
+test("transfer callback and real owned child join before release: " + mode, async t => {
+  const f = await fixture(t);
+  const callbackEntered = deferred(), releaseCallback = deferred(), cleanupEntered = deferred(), releaseCleanup = deferred();
+  const caller = new AbortController();
+  let completed = false;
+  const pending = f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    const settled = TickSpawner.prototype.settled;
+    t.mock.method(TickSpawner.prototype, "settled", async function (this: TickSpawner) {
+      await settled.call(this);
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
+      if (mode === "settlement-failure") throw new Error("private join failure");
+    });
+    await ctx.withMaintenanceTransfer(async check => {
+      check();
+      assert.equal(await git.worktreeHead(f.root), f.old);
+      callbackEntered.resolve();
+      await releaseCallback.promise;
+      if (mode === "throw") throw new Error("private callback failure");
+    });
+  }, [f.root], caller.signal)).finally(() => { completed = true; });
+  const rejected = assert.rejects(pending, mode === "settlement-failure" ? /maintenance_wip_settlement_unconfirmed/ : refused);
+  try {
+    await callbackEntered.promise;
+    if (mode === "abort") caller.abort();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(completed, false);
+    assert.equal(f.view.inventoryReservations.has("run"), true);
+    releaseCallback.resolve();
+    await cleanupEntered.promise;
+    assert.equal(completed, false);
+    assert.equal(f.runner.isExecuting("run"), true);
+    assert.equal(f.view.inventoryReservations.has("run"), true);
+  } finally { releaseCallback.resolve(); releaseCleanup.resolve(); }
+  await rejected;
+  assert.equal(f.runner.isExecuting("run"), mode === "settlement-failure");
+  if (mode === "settlement-failure") {
+    assert.equal(f.view.recovery.isExecuting("run"), true);
+    assert.equal(f.view.inventoryReservations.has("run"), false);
+  }
+});
+
+test("escaped asynchronous Git callback cannot launch after transfer return", async t => {
+  const f = await fixture(t);
+  const release = deferred();
+  let late!: Promise<string | null>, check!: () => void;
+  await f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    const count = f.pids.length;
+    await ctx.withMaintenanceTransfer(async current => {
+      check = current;
+      late = (async () => { await release.promise; return git.worktreeHead(f.root); })();
+    });
+    release.resolve();
+    assert.equal(await late, null);
+    assert.throws(check, refused);
+    assert.equal(f.pids.length, count);
+  }));
+});
+
+
+for (const mode of ["caller", "slot", "ambient"] as const)
+test("transfer signal aborts and joins an active real Git-spawned child: " + mode, async t => {
+  let armed = false, now = 0;
+  const spawned = deferred(), callbackIO = deferred(), releaseIO = deferred();
+  const caller = new AbortController();
+  const budget = new MaintenanceBudget(120_000, () => now);
+  t.after(() => budget.dispose());
+  const signals: string[] = [];
+  const f = await fixture(t, { checkpointTestHooks: { tickSpawn: {
+    rewrite: request => armed ? { ...request, argv: [process.execPath, "-e", "setInterval(() => {}, 1000)"] } : request,
+    onSpawn: () => { if (armed) spawned.resolve(); },
+    signalGroup: (_pid, sig) => { if (armed) signals.push(sig); return undefined; },
+  } } });
+  let completed = false;
+  const pending = MaintenanceBudget.run(budget, () => f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    armed = true;
+    await ctx.withMaintenanceTransfer(async check => {
+      check();
+      assert.equal(await git.worktreeHead(f.root), null, "aborted child cannot provide a Git answer");
+      callbackIO.resolve();
+      await releaseIO.promise;
+    });
+  }, [f.root], caller.signal))).finally(() => { completed = true; });
+  const rejected = assert.rejects(pending, refused);
+  try {
+    await spawned.promise;
+    if (mode === "caller") caller.abort();
+    if (mode === "slot") f.slotAbort.abort();
+    if (mode === "ambient") { now = 120_000; assert.throws(() => budget.check()); }
+    await callbackIO.promise;
+    assert.ok(signals.includes("SIGTERM"));
+    assert.equal(completed, false);
+    assert.equal(f.view.inventoryReservations.has("run"), true);
+    assert.equal(f.runner.isExecuting("run"), true);
+  } finally { caller.abort(); releaseIO.resolve(); }
+  await rejected;
+  for (const pid of f.pids) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal(f.runner.isExecuting("run"), false);
+});
+
+for (const mode of ["unknown-probe", "survivor"] as const)
+test("transfer uncertainty retains the original unresolved tail: " + mode, async t => {
+  let armed = false, clock = 0;
+  const f = await fixture(t, { checkpointTestHooks: { tickSpawn: {
+    groupAlive: () => {
+      if (!armed) return undefined;
+      if (mode === "unknown-probe") throw new Error("private transfer probe");
+      clock += 3_000;
+      return true;
+    },
+    signalGroup: () => armed ? false : undefined,
+  } } });
+  if (mode === "survivor") t.mock.method(Date, "now", () => clock);
+  let tail: Promise<unknown> | undefined;
+  await assert.rejects(f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    tail = f.view.executionTails.get("run");
+    armed = true;
+    await ctx.withMaintenanceTransfer(async check => { check(); await git.worktreeHead(f.root); });
+  })), /maintenance_wip_settlement_unconfirmed/);
+  assert.equal(f.view.executionTails.get("run"), tail);
+  let released = false;
+  void tail!.then(() => { released = true; });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(released, false);
+  assert.equal(f.view.recovery.isExecuting("run"), true);
+  assert.equal(f.view.inventoryReservations.has("run"), false);
+  assert.deepEqual(await f.boundary(async () => assert.fail()), { entered: false });
+});
+
+
+for (const mode of ["return", "throw"] as const)
+test("transfer joins a real unawaited child after callback " + mode, async t => {
+  let armed = false;
+  const spawned = deferred(), cleanupEntered = deferred(), releaseCleanup = deferred();
+  const f = await fixture(t, { checkpointTestHooks: { tickSpawn: {
+    rewrite: request => armed ? { ...request, argv: [process.execPath, "-e", "setInterval(() => {}, 1000)"] } : request,
+    onSpawn: () => { if (armed) spawned.resolve(); },
+  } } });
+  let completed = false, lateCheck!: () => void, child!: Promise<string | null>;
+  const pending = f.run(() => f.boundary(async ctx => {
+    await ctx.captureWip(f.root, f.old, callbacks);
+    armed = true;
+    const settled = TickSpawner.prototype.settled;
+    t.mock.method(TickSpawner.prototype, "settled", async function (this: TickSpawner) {
+      await settled.call(this);
+      for (const pid of this.pids()) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+      cleanupEntered.resolve();
+      await releaseCleanup.promise;
+    });
+    await ctx.withMaintenanceTransfer(async check => {
+      lateCheck = check;
+      child = git.worktreeHead(f.root);
+      await spawned.promise;
+      if (mode === "throw") throw new Error("private callback failure");
+    });
+  })).finally(() => { completed = true; });
+  const outcome = mode === "throw" ? assert.rejects(pending, refused) : pending;
+  try {
+    await cleanupEntered.promise;
+    assert.equal(completed, false);
+    assert.equal(f.runner.isExecuting("run"), true);
+    assert.equal(f.view.inventoryReservations.has("run"), true);
+    assert.throws(lateCheck, refused, "callback scope closes before child settlement completes");
+    assert.equal(await child, null);
+  } finally { releaseCleanup.resolve(); }
+  await outcome;
+  assert.equal(f.runner.isExecuting("run"), false);
+});
+
+test("failed capture settlement never permits a transfer", async t => {
+  const f = await fixture(t);
+  const settled = TickSpawner.prototype.settled;
+  t.mock.method(TickSpawner.prototype, "settled", async function (this: TickSpawner) {
+    await settled.call(this);
+    throw new Error("private capture settlement");
+  });
+  await assert.rejects(f.run(() => f.boundary(async ctx => {
+    await assert.rejects(ctx.captureWip(f.root, f.old, callbacks), /maintenance_wip_settlement_unconfirmed/);
+    await assert.rejects(ctx.withMaintenanceTransfer(async () => assert.fail()), refused);
+  })), /maintenance_wip_settlement_unconfirmed/);
+  assert.equal(f.runner.isExecuting("run"), true);
+});
+
 });
