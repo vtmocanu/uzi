@@ -19,6 +19,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { fakeGitHub, fakeGitlab } from "./runner-harness.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { newRunAttempt } from "../src/run-quiescence.js";
 
 const HAS_PROCFS = process.platform === "linux";
 
@@ -21557,4 +21558,48 @@ it("#2852 fileop unknown failed start retains registry proof through terminal te
   assert.equal((await exec.withCredentialFreeCapture(1000, async () => { body++; })).kind, "incomplete");
   assert.equal(body, 0);
   assert.equal(rig.providerLaunches(), 0);
+});
+
+
+it("A normal run binding refuses foreign capture and restores omitted fallback after throw and abort", async () => {
+  const home = await fs.mkdtemp(path.resolve("../.uzi/scratch/normal-binding-"));
+  const rig = makeRig({ responder: epochResponder("th-1", "tn-1", t => {
+    t.push(signalDone()).push(turnCompleted());
+  }) });
+  rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+  const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, home);
+  const normal = newRunAttempt("run-1", 1, WORKSPACE, () => []);
+  const foreign = newRunAttempt("run-1", 1, WORKSPACE, () => []);
+  const tuple = ({ marker, cloneKey, clonePath }: typeof normal) => ({ marker, cloneKey, clonePath });
+  const { ctx } = makeCtx({ runAttempt: tuple(normal) });
+  let actions = 0;
+  const refuseForeign = async () => {
+    const result = await exec.withCredentialFreeCapture(1000, async () => { actions++; }, "capture", undefined, tuple(foreign));
+    assert.equal(result.kind, "incomplete");
+    assert.equal(actions, 0, "valid foreign tuple must never enter callback");
+  };
+  try {
+    await withTimeout(exec.run(ctx), 5000, "normal binding public run");
+    await refuseForeign();
+    const exact = await exec.withCredentialFreeCapture(1000, async () => "exact normal tuple", "capture", undefined, tuple(normal));
+    assert.deepEqual(exact, { kind: "observed_empty", value: "exact normal tuple" });
+    const thrown = new Error("normal capture callback sentinel");
+    await assert.rejects(exec.withCredentialFreeCapture(1000, async () => { throw thrown; }, "capture", undefined, tuple(normal)), error => error === thrown);
+    assert.deepEqual(await exec.withCredentialFreeCapture(1000, async () => "fallback after throw"),
+      { kind: "observed_empty", value: "fallback after throw" });
+    await refuseForeign();
+    const controller = new AbortController();
+    await assert.rejects(exec.withCredentialFreeCapture(1000, async () => {
+      controller.abort(new Error("scoped action abort"));
+      return "aborted body entered";
+    }, "capture", controller.signal, tuple(normal)), error =>
+      error instanceof CodexBoundaryError && error.errors.some(e => e.category === "timeout"));
+    assert.equal(controller.signal.aborted, true);
+    assert.deepEqual(await exec.withCredentialFreeCapture(1000, async () => "fallback after abort"),
+      { kind: "observed_empty", value: "fallback after abort" });
+    await refuseForeign();
+  } finally {
+    await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    await fs.rm(home, { recursive: true, force: true });
+  }
 });

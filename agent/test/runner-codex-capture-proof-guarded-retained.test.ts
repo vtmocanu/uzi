@@ -8,8 +8,9 @@ import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { observe } from "./runner-codex-capture-proof-fixture.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import type { Executor } from "../src/executor.js";
-import { LiveAttemptRegistry, newRunAttempt, quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
-import { noProofReseed, nullLogger } from "./helpers.js";
+import { LiveAttemptRegistry, mintAttemptId, newRunAttempt, quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
+import { PendingRecoveryCaptureError } from "../src/git.js";
+import { noProofReseed, recordingLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 installHarness();
 import { heldServer, JOIN_TOKEN } from "./runner-held-publication-fixture.js";
@@ -24,8 +25,10 @@ async function seed(iid = 2512) {
   const bare = await git.ensureClone(fx.originPath);
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
-  const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
-  await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+  const attemptId = mintAttemptId(1);
+  const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id, false, undefined,
+    { attemptId, isLive: () => false, beforeSeed: async () => {} });
+  await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id, attemptId);
   fs.writeFileSync(path.join(clone.path, "retained.txt"), "only local dirty work\n");
   api.setOwnershipStatus(claim.run_id, "running", 2);
   return { claim, bare, clone };
@@ -39,9 +42,29 @@ afterEach(() => {
   callbackFailures = [];
   assert.deepEqual(failures, [], "runner must not swallow model callback assertions");
 });
-for (const stage of ["newcapture", "captured", "adopting", "missing-capability"] as string[]) {
+for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "missing-capability"] as string[]) {
   it(`A guarded retained public scope proof: ${stage}`, async t => {
     const { claim, bare, clone } = await seed();
+    const newCapture = stage === "newcapture" || stage === "pending-entry";
+    let discoveries = 0, pendingThrows = 0;
+    if (stage === "pending-entry") {
+      // A recovered attempt-mode worker must choose the real per-attempt seed path.
+      command(bare, "config", "--local", "uzi-attemptmode.issue-2512.enabled", "true");
+      assert.equal(await git.recoveryAttemptMode(fx.originPath, "issue-2512"), true);
+      const discover = git.discoverRetainedRecovery.bind(git);
+      t.mock.method(git, "discoverRetainedRecovery", async (...args: Parameters<typeof discover>) => {
+        if (++discoveries === 1) return undefined;
+        return discover(...args);
+      });
+      const create = git.createOrAttachRunnerClone.bind(git);
+      t.mock.method(git, "createOrAttachRunnerClone", async (...args: Parameters<typeof create>) => {
+        try { return await create(...args); }
+        catch (error) {
+          if (error instanceof PendingRecoveryCaptureError) pendingThrows++;
+          throw error;
+        }
+      });
+    }
     claim.inventory_guarded = true;
     claim.repo.id = "00000000-0000-4000-8000-000000000072";
     const features = ["recovery_inventory_v1", "claim_generation_fence", "recovery_held_publication_v2"];
@@ -60,7 +83,7 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
     assert.equal(exact?.hold_id, holdId);
     if (stage === "captured" || stage === "adopting") {
       const key = "issue-2512";
-      const source = { runId: claim.run_id, clonePath: clone.path };
+      const source = { runId: claim.run_id, clonePath: clone.path, attemptId: readJournal(bare, clone.branch).attemptId as string };
       const reservation = await git.reserveRecoveryIteration(bare, clone.branch, key, source, 2);
       await git.commitWipMarker(clone.path);
       await fixtureFetchTracking(git, bare, clone.path, clone.branch, claim.run_id, 2);
@@ -76,6 +99,9 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
     }
     const observer = observe({ sourcePath: clone.path });
     const before = readJournal(bare, clone.branch);
+    assert.equal(typeof before.attemptId, "string");
+    assert.ok(before.attemptId.length > 0, "source journal has an actual attempt identity");
+    const sourceMarker = `${claim.run_id}:${before.attemptId}`;
     const live = new LiveAttemptRegistry();
     const otherOwner = newRunAttempt("other-live-run", 1, path.join(homeDir, "other-live"), () => []);
     live.add(otherOwner);
@@ -90,10 +116,11 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
     let supplied: Parameters<NonNullable<Executor["withCredentialFreeCapture"]>>[4];
     const proofCalls: QuiesceRunRequest[] = [];
     const prestartCapture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal, metadata) => {
-      if (stage === "newcapture") {
+      if (newCapture) {
         assert.ok(metadata);
         assert.equal(metadata.clonePath, clone.path);
         assert.notEqual(metadata.marker.split(":").at(-1), before.attemptId);
+        assert.notEqual(metadata.marker, sourceMarker, "probe differs from real prior source marker");
         assert.equal(Object.isFrozen(metadata), true);
         supplied = metadata;
       }
@@ -138,15 +165,20 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
             assert.equal(ordinal, 2);
             assert.equal(oldDisposed, true);
             assert.notEqual(ctx.worktreePath, clone.path);
+            assert.ok(ctx.runAttempt, "successor has a real normal attempt");
+            assert.notEqual(ctx.runAttempt.marker, sourceMarker);
+            if (newCapture) assert.notEqual(ctx.runAttempt.marker, supplied!.marker);
+            assert.equal(readJournal(bare, clone.branch).attemptId, ctx.runAttempt.marker.split(":").at(-1), "successor journal carries actual new ID");
             assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
           } catch (error) { callbackFailures.push(error); }
           throw new Error("fixture model interruption");
         },
       } };
     };
-    const r = runnerWith(make, fakeGitlab().gitlab, JOIN_TOKEN, nullLogger(), { recoveryRetryMs: 1, liveAttempts: live,
+    const diagnostics = recordingLogger();
+    const r = runnerWith(make, fakeGitlab().gitlab, JOIN_TOKEN, diagnostics.logger, { recoveryRetryMs: 1, liveAttempts: live,
       quiesceRun: async req => {
-        if (stage === "newcapture" && req.targetPaths.includes(clone.path)) {
+        if (newCapture && req.targetPaths.includes(clone.path)) {
           proofCalls.push(req);
           if (observer.isActive()) {
             assert.ok(req.attempt);
@@ -179,6 +211,7 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
     observer.arm();
     try {
       await observer.execute(r.execute(claim));
+      if (stage === "pending-entry") console.log("PENDING_ENTRY", JSON.stringify({ discoveries, pendingThrows, lines: diagnostics.lines }));
       console.log("GUARDED_SPANS", JSON.stringify(spans));
       console.log("GUARDED_SERVER", JSON.stringify({reserves:server.archiveReserves(),uploads:server.archiveUploads(),finals:server.finals}));
       if (stage !== "missing-capability") {
@@ -210,14 +243,15 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
       } else {
         assert.equal(models, 1);
         assert.equal(created, 2);
-        assert.equal(verifiedCalls, stage === "newcapture" ? 0 : 1);
-        assert.equal(verifiedTrue, stage === "newcapture" ? 0 : 1, "real seeded restore point verified");
-        assert.ok(readJournal(bare, clone.branch).retainedSources.some((s:any) => s.clonePath === clone.path),
+        assert.equal(verifiedCalls, newCapture ? 0 : 1);
+        assert.equal(verifiedTrue, newCapture ? 0 : 1, "real seeded restore point verified");
+        assert.ok(readJournal(bare, clone.branch).retainedSources.some((s:any) =>
+          s.clonePath === clone.path && s.runId === before.runId && s.attemptId === before.attemptId),
           "predecessor journal custody retained");
         assert.equal(facts, 1);
         assert.deepEqual(factScopes, [true], "capture held through actual journal capture fact");
         observer.assertProof(true);
-        if (stage === "newcapture") {
+        if (newCapture) {
           assert.ok(proofCalls[0]);
           assert.equal(proofCalls[0].attempt, undefined, "outside predecessor guard has no normal attempt");
           const inside = proofCalls.filter(req => req.attempt?.marker === supplied?.marker);
@@ -228,6 +262,10 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
           assert.ok(!registryWrites.includes(supplied!.marker), "probe never added or removed");
           assert.notEqual(supplied!.marker, otherOwner.marker);
           assert.ok(registryWrites.some(marker => marker !== supplied!.marker), "successor normal registration still runs");
+          if (stage === "pending-entry") {
+            assert.ok(discoveries >= 2, "second real discovery reached");
+            assert.equal(pendingThrows, 1, "real clone acquisition threw PendingRecoveryCaptureError");
+          }
           console.log("PRESTART_BINDING_OBSERVER", JSON.stringify({ insideProofs: inside.length, sourceFacts: facts, models, registryWrites }));
         }
       }
