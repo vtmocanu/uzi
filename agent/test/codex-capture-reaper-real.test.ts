@@ -47,6 +47,7 @@ async function proof(hold: boolean, mode: "capture" | "own" = "capture", report 
   const plants: Array<Awaited<ReturnType<typeof plant>>> = [];
   const reaped = latch(), release = latch(), late = latch();
   const operations: string[] = [], cleanRoots: string[] = [];
+  let scanReportDeadline: { present: boolean; value: unknown } | undefined;
   const adapter = boundaryProcessSpawnerForTest("required", async () => {
     throw new Error("EffectLaunch is unreachable for a closed reaper");
   });
@@ -62,8 +63,7 @@ async function proof(hold: boolean, mode: "capture" | "own" = "capture", report 
         const scan = JSON.parse(input);
         assert.equal(scan.targetUid, RUNNER_UID);
         assert.equal(scan.mode, mode);
-        assert.equal(Object.hasOwn(scan, "reportDeadline"), report, "only genuine reportBudget changes legacy JSON");
-        if (report) assert.ok(Number.isSafeInteger(scan.reportDeadline));
+        scanReportDeadline = { present: Object.hasOwn(scan, "reportDeadline"), value: scan.reportDeadline };
         assert.equal(scan.ownMarker, attempt.marker);
         assert.deepEqual(scan.targetPaths, [attempt.clonePath]);
         assert.ok(scan.liveMarkers.includes(foreign.marker));
@@ -133,6 +133,9 @@ async function proof(hold: boolean, mode: "capture" | "own" = "capture", report 
     assert.equal(identity(otherUid.pid), otherUid.startTime, "foreign UID survives with same identity");
     assert.deepEqual(operations, ["/bin/mktemp", process.execPath, "/bin/rm"]);
     assert.deepEqual(cleanRoots, operations, "each real root cleanup precedes the capture verdict");
+    assert.ok(scanReportDeadline);
+    assert.equal(scanReportDeadline.present, report, "only genuine reportBudget changes legacy JSON");
+    if (report) assert.ok(Number.isSafeInteger(scanReportDeadline.value));
   } finally {
     release.resolve(); late.resolve();
     for (const p of plants) {
