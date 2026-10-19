@@ -20167,7 +20167,7 @@ describe("A capture lifecycle public run", () => {
       .push(turnCompleted("completed", th, tn)));
 
   // Exercise the production store and actual epoch HOME removal, not a simulated generation counter.
-  async function fixture(responders: Responder[], configure?: (rig: MultiRig) => void) {
+  async function fixture(responders: Responder[], configure?: (rig: MultiRig) => void, client?: WorkerClient) {
     const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/a-lifecycle-"));
     const rig = makeMultiEpochRig(responders);
     const homes: string[] = [], persists: string[] = [], adopted: string[] = [], missing: string[] = [];
@@ -20198,25 +20198,281 @@ describe("A capture lifecycle public run", () => {
         await fs.writeFile(path.join(home, "sessions", rolloutName),
           JSON.stringify({ type: "session_meta", payload: { id: thread, cwd: spec.cwd } }) + "\n"
           + JSON.stringify({ type: "event_msg", payload: { message: `epoch-${homes.length}` } }) + "\n");
-        return { ...result, root: { ...result.root,
-          reap: async ms => {
-            const resultReap = await result.root.reap(ms);
+        const reap = result.root.reap.bind(result.root), dispose = result.root.dispose.bind(result.root);
+        result.root.reap = async ms => {
+            const resultReap = await reap(ms);
             if (resultReap.ok) await fs.rm(spec.ownedDataRoot, { recursive: true, force: true });
             return resultReap;
-          },
-          dispose: async ms => {
-            await result.root.dispose(ms);
+          };
+        result.root.dispose = async ms => {
+            await dispose(ms);
             await fs.rm(spec.ownedDataRoot, { recursive: true, force: true });
-          },
-        } };
+          };
+        return result;
       },
     };
     configure?.(rig);
-    const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, homeRoot);
+    const exec = makeExecutor(client ? { ...rig, client: client as never } : rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, homeRoot);
     const generation = () => fs.readFile(path.join(store, "current"), "utf8");
     const saved = async () => fs.readFile(path.join(store, "generations", (await generation()).trim(), "sessions", rolloutName), "utf8");
     return { rig, exec, homeRoot, homes, persists, adopted, missing, generation, saved,
       cleanup: () => fs.rm(dir, { recursive: true, force: true }) };
+  }
+
+
+  // SF1: original executor -> original RunRunner context callbacks, never a capture substitute.
+  for (const route of ["seed-now", "seed-milestone", "immediate", "milestone", "pre-turn"] as const) {
+    for (const outcome of (route.startsWith("seed-") ? ["accepted"] : ["accepted", "declined", "withdrawn"]) as readonly ("accepted" | "declined" | "withdrawn")[]) {
+      it(`SF1 real public pause ${route} ${outcome}`, async t => {
+        const diagnostics = recordingLog();
+        const tmp = mock.method(os, "tmpdir", () => path.resolve("../.uzi/scratch"));
+        let repo: ReturnType<typeof makeFixture>;
+        try { repo = makeFixture({}, { testName: `SF1 ${route} ${outcome}` }); }
+        finally { tmp.mock.restore(); }
+        const api = new FakeApi("sf1-worker");
+        const url = await api.listen();
+        const client = new WorkerClient(url, "sf1-worker", "test", diagnostics.log,
+          { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
+        client.protocolFeatures = ["run_checkpoint_durability"];
+        const entered = installerBarrier(), rootEntered = installerBarrier(), rootRelease = installerBarrier();
+        const packEntered = installerBarrier(), packRelease = installerBarrier(), successor = installerBarrier();
+        const withdrawalApplied = installerBarrier(), pauseApplied = installerBarrier();
+        const sourceEntered = installerBarrier(), sourceRelease = installerBarrier();
+        let rootClean = false, savedGeneration = "", savedContent = "";
+        let context: RunContext | undefined, worktree = "", region = false, parks = 0;
+        let authAtEntry = 0, launchesAtEntry = 0, regionClosed = false, accepted = false;
+        const roots = new Map<RegisteredRoot, boolean>();
+        const register = ExecutionRegistry.prototype.registerRoot;
+        const reap = ExecutionRegistry.prototype.reapRoot;
+        const registerProbe = mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+          this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+        ) {
+          const result = register.apply(this, args);
+          if (result.ok && region && args[1].kind === "boundary_action") roots.set(args[1], false);
+          return result;
+        });
+        const reapProbe = mock.method(ExecutionRegistry.prototype, "reapRoot", async function (
+          this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["reapRoot"]>
+        ) {
+          const result = await reap.apply(this, args);
+          if (result.ok && roots.has(args[0])) roots.set(args[0], true);
+          return result;
+        });
+        const sourceSamples: { roots: RegisteredRoot[]; reaped: boolean }[] = [];
+        const packs: { tip: string; bytes: number }[] = [];
+        const fx = await fixture([
+          epochResponder(thread, "sf1-first", (t, th, tn) => {
+            entered.resolve();
+            if (route === "milestone" || route === "pre-turn") {
+              t.push(toolCall(9110, "report_progress", { completed: ["m1"], in_progress: [] }, th, tn, "sf1-progress"))
+                .push(toolCall(9111, "checkpoint", {}, th, tn, "sf1-checkpoint"))
+                .push(turnCompleted("completed", th, tn));
+            }
+          }),
+          resumedEpochResponder(thread, "sf1-successor", () => successor.resolve()),
+        ], rig => {
+          const root = rig.epochs[0]!.root, originalReap = root.reap.bind(root);
+          root.reap = async ms => {
+            savedGeneration = await fx.generation();
+            savedContent = await fx.saved();
+            rootEntered.resolve();
+            await rootRelease.promise;
+            const result = await originalReap(ms);
+            if (result.ok) rootClean = true;
+            return result;
+          };
+          const launch = rig.deps.launchEffectRoot!;
+          rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+            const handle = await launch(spec, deadline);
+            const argv = spec.command.endsWith("/uzi-codex-command-sandbox")
+              ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+            if (argv[0] !== "/usr/bin/git" && argv[0] !== "/usr/local/bin/gitleaks") return handle;
+            const child = spawn(argv[0], argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+            const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+              child.once("error", reject);
+              child.once("close", code => resolve({ event: "child_exit", code: code ?? 1 }));
+            });
+            return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+              waitChild: async () => exited,
+              dispose: async ms => { await exited; return handle.dispose(ms); } };
+          } };
+        }, client);
+        const git = new GitCache(repo.dataDir, diagnostics.log, undefined, testGitCacheOptions());
+        const claim = makeClaim({ claim_generation: 1,
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repo.originPath },
+          plan_approved: true, plan_source: "seeded", plan_md: "approved SF1 plan",
+          milestones: [{ id: "m1", title: "first" }, { id: "m2", title: "second" }],
+          ...(route.startsWith("seed-") ? { pause_pending: true, pause_mode: route === "seed-now" ? "now" as const : "milestone" as const } : {}),
+          secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+        });
+        api.codexAuthModes.set(claim.run_id, "subscription");
+        // A cooperative checkpoint advances the real subscription generation via refresh.
+        // Subsequent releases must not replay FakeApi's default generation 3.
+        api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 8 }, (_, i) => ({
+          status: 200, body: { auth_mode: "subscription", access_token: "subscription-access",
+            generation: 3 + i, chatgpt_account_id: "verified-account", chatgpt_plan_type: null },
+        })));
+        api.setOwnershipStatus(claim.run_id, "running", 1);
+        if (outcome !== "accepted") api.failStateWhen(claim.run_id, b => b.status === "paused",
+          outcome === "withdrawn" ? { httpStatus: 409, runStatus: "running" } : { httpStatus: 400 });
+        let milestoneAck = false;
+        api.stateAckWire = (body, run) => {
+          if (route !== "milestone" || milestoneAck || body.iteration_count !== 2) return undefined;
+          milestoneAck = true;
+          return { status: 200, body: { run: { ...run, pause_requested: true, milestones_completed: ["m1"] } } };
+        };
+        const apply = client.applyInputs.bind(client);
+        client.applyInputs = async (...args) => {
+          const result = await apply(...args);
+          if (args[1].includes(9101)) pauseApplied.resolve();
+          if (args[1].includes(9102)) withdrawalApplied.resolve();
+          return result;
+        };
+        const checkRegion = () => {
+          assert.equal(api.codexRequests.length, authAtEntry, "actual caller region has zero release/refresh delta");
+          assert.equal(fx.rig.providerLaunches(), launchesAtEntry, "actual caller region admits no provider");
+        };
+        const wip = git.commitWipMarker.bind(git);
+        git.commitWipMarker = async (...args) => {
+          if (!region) return wip(...args);
+          checkRegion();
+          if (!route.startsWith("seed-")) {
+            assert.equal(rootClean, true, "original provider full-root reap precedes source Git");
+            await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+            assert.equal(await fx.generation(), savedGeneration);
+            assert.equal(await fx.saved(), savedContent);
+          }
+          const before = new Set(roots.keys());
+          const result = await wip(...args);
+          const added = [...roots.keys()].filter(r => !before.has(r));
+          sourceSamples.push({ roots: added, reaped: added.every(r => roots.get(r)) });
+          sourceEntered.resolve();
+          await sourceRelease.promise;
+          checkRegion();
+          return result;
+        };
+        client.publishCheckpoint = async (_id, tip, pack) => {
+          let bytes = 0;
+          for await (const chunk of pack) bytes += Buffer.byteLength(chunk);
+          packs.push({ tip, bytes });
+          if (region) checkRegion();
+            for (const [file, expected] of [["SF1-COMMITTED.txt", "SF1 committed bytes\n"],
+              ["SF1-DIRTY.txt", "SF1 dirty bytes\n"]] as const) {
+              const read = spawnSync("/usr/bin/git", ["-C", worktree, "show", `${tip}:${file}`],
+                { encoding: "utf8", env: gitEnv() });
+              assert.equal(read.status, 0, read.stderr);
+              assert.equal(read.stdout, expected, "actual packed tip preserves source bytes");
+            }
+          if (region) {
+            packEntered.resolve();
+            await packRelease.promise;
+            checkRegion();
+          }
+          return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/sf1" } };
+        };
+        const run = fx.exec.run.bind(fx.exec);
+        fx.exec.run = async ctx => {
+          context = ctx; worktree = ctx.worktreePath;
+          if (route === "pre-turn") {
+            const report = ctx.reportIteration!.bind(ctx);
+            ctx.reportIteration = async (...args) => {
+              const result = await report(...args);
+              if (args[0] === 2) {
+                api.appendInputs(claim.run_id, [{ id: 9101, kind: "pause", body: "now" }]);
+                await pauseApplied.promise;
+                assert.equal(ctx.pauseModeRequested!(), "now");
+              }
+              return result || undefined;
+            };
+          }
+          commitInTree(worktree, "SF1-COMMITTED.txt", "SF1 committed bytes\n");
+          await fs.writeFile(path.join(worktree, "SF1-DIRTY.txt"), "SF1 dirty bytes\n");
+          return run(ctx);
+        };
+        const runner = new RunRunner(client, git, () => ({ executor: fx.exec, homeDir: fx.homeRoot }),
+          diagnostics.log, 20, undefined, { pollMs: 5,
+            checkpointTestHooks: { retryBackoffMs: [0, 0] },
+            quiesceRun: async () => ({
+              process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+              docker: { state: "not_wired", removed: [], detail: "not wired" },
+            }),
+          });
+        const park = runner["handlePausePark"].bind(runner);
+        runner["handlePausePark"] = async (...args) => {
+          assert.equal(args[1].executor, fx.exec);
+          assert.ok(context);
+          parks++; region = true;
+          authAtEntry = api.codexRequests.length; launchesAtEntry = fx.rig.providerLaunches();
+          try { accepted = await park(...args); return accepted; }
+          finally {
+            checkRegion();
+            if (savedGeneration) {
+              assert.equal(await fx.generation(), savedGeneration, "last caller tail preserves saved generation");
+              assert.equal(await fx.saved(), savedContent, "last caller tail preserves exact saved bytes");
+            }
+            region = false; regionClosed = true;
+          }
+        };
+        const execution = runner.execute(claim);
+        void execution.catch(() => undefined);
+        const beforeEnd = <T,>(event: Promise<T>) => Promise.race([event, execution.then(() => {
+          throw new Error("SF1 execution settled before event: " + diagnostics.lines.filter(l => !l.includes('"level":"debug"')).join("\n"));
+        })]);
+        try {
+          if (route === "immediate") {
+            await beforeEnd(entered.promise);
+            api.appendInputs(claim.run_id, [{ id: 9101, kind: "pause", body: "now" }]);
+            await beforeEnd(rootEntered.promise);
+            assert.equal(sourceSamples.length, 0, "held original root excludes source operations");
+          }
+          rootRelease.resolve();
+          await beforeEnd(sourceEntered.promise);
+          if (outcome === "withdrawn") {
+            api.appendInputs(claim.run_id, [{ id: 9102, kind: "pause_cancel" }]);
+            await beforeEnd(withdrawalApplied.promise);
+            assert.equal(context!.pauseModeRequested!(), null, "actual steering consumed withdrawal after drain");
+          }
+          sourceRelease.resolve(); packRelease.resolve();
+          if (outcome === "accepted") {
+            await execution;
+            assert.equal(api.states.at(-1)?.body.status, "paused", "actual runner receives accepted paused ACK");
+          } else {
+            await beforeEnd(successor.promise);
+            assert.equal(regionClosed, true);
+            assert.equal(accepted, false);
+            assert.equal(fx.rig.providerLaunches(), 2, "decline after drain creates a fresh provider epoch");
+            assert.equal(api.codexRequests.length, authAtEntry + 1, "fresh successor legitimately releases a credential after caller return");
+            assert.notEqual(fx.homes[0], fx.homes[1]);
+            assert.equal(fx.adopted[0], savedContent, "fresh epoch adopts exact persisted rollout bytes");
+            const resume = fx.rig.epochs[1]!.transport.requests.find(r => r.method === "thread/resume");
+            assert.equal(rec(resume!.params).threadId, thread);
+            assert.equal(await fx.generation(), savedGeneration);
+          }
+          await t.test("ACK + exact source/session bytes compatibility", () => {
+          assert.equal(parks, 1);
+          assert.ok(packs.length > 0 && packs.every(p => p.bytes > 0), "original pack streams were drained");
+          assert.deepEqual(fx.missing, [], "no persistence reads the removed HOME");
+          if (route.startsWith("seed-")) {
+            assert.equal(fx.rig.providerLaunches(), 0, JSON.stringify({ launchesAtEntry, authAtEntry, auth: api.codexRequests.length, turns: fx.rig.epochs[0]!.transport.turnStartCount }));
+            assert.equal(fx.rig.epochs[0]!.transport.turnStartCount, 0);
+            assert.equal(api.codexRequests.length, authAtEntry, "seeded capture adds no credentials to eager setup release");
+          }
+          assert.ok(sourceSamples.length > 0, "original source Git completed successfully");
+          });
+          await t.test("original source root supervision", () => {
+          // Shared paired assertion: old native dispatch completes Git but has no supervised roots.
+          assert.ok(sourceSamples.every(s => s.roots.length > 0 && s.reaped)
+            && roots.size > 0 && [...roots.values()].every(Boolean),
+            "successful source Git must register nonempty original boundary_action roots and reap all before return");
+          });
+        } finally {
+          rootRelease.resolve(); sourceRelease.resolve(); packRelease.resolve(); runner.shutdown();
+          await execution.catch(() => undefined);
+          registerProbe.mock.restore(); reapProbe.mock.restore();
+          await api.close(); repo.cleanup(); await fx.cleanup();
+        }
+      });
+    }
   }
 
   // Real executor caller + capture primitive proof; runner publication/ACK is proved separately.
