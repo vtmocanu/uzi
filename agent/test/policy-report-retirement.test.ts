@@ -72,31 +72,45 @@ for (const obstruction of ["expired deadline", "cancelled proof", "custody refus
     const timer = f.captureTimers(ms => ms > f.headroom.proofMs - 5_000 && ms <= f.headroom.proofMs);
     const real = client.withPolicyReportRetirementCustody.bind(client);
     let callbacks = 0;
+    let callbackFailure: unknown;
+    let obstructionApplied = false;
     let restoreClock = () => {};
     t.mock.method(client, "withPolicyReportRetirementCustody", (...args: Parameters<typeof real>) => {
       const [runId, current, generations, budget, action, guarded] = args;
       return real(runId, current, generations, budget, async eligible => {
         callbacks++;
-        assert.deepEqual(f.policyCustody.generations, [2], "actual custody HTTP completed before invalidation");
-        assert.equal(eligible(), true, "custody was initially eligible");
-        assert.ok(MaintenanceBudget.current(), "the cancellation attempt still owns its maintenance budget");
-        MaintenanceBudget.current()!.check();
-        if (obstruction === "expired deadline") {
-          const clock = t.mock.method(Date, "now", () => budget.deadline);
-          restoreClock = () => clock.mock.restore();
-        } else if (obstruction === "cancelled proof") {
-          assert.equal(budget.signal.aborted, false);
-          assert.equal(timer.count(), 1, "one real proof timer is armed");
-          timer.fire();
-          assert.equal(budget.signal.aborted, true);
+        try {
+          assert.deepEqual(f.policyCustody.generations, [2], "actual custody HTTP completed before invalidation");
+          assert.equal(eligible(), true, "custody was initially eligible");
+          assert.ok(MaintenanceBudget.current(), "the cancellation attempt still owns its maintenance budget");
+          MaintenanceBudget.current()!.check();
+          if (obstruction === "expired deadline") {
+            const clock = t.mock.method(Date, "now", () => budget.deadline);
+            restoreClock = () => clock.mock.restore();
+          } else if (obstruction === "cancelled proof") {
+            assert.equal(budget.signal.aborted, false);
+            // The runner arms its deadline before any observation or custody RPC.
+            // Later matching timers belong to nested proof and HTTP operations.
+            assert.equal(timer.fireFirst(), true, "the policy runner deadline timer was captured");
+            assert.equal(budget.signal.aborted, true);
+            assert.ok(budget.signal.reason instanceof Error);
+            assert.equal(budget.signal.reason.message, "policy report proof deadline");
+          }
+          obstructionApplied = true;
+        } catch (error) {
+          callbackFailure = error;
+          throw error;
         }
         await action(obstruction === "custody refusal" ? () => false : eligible);
       }, guarded);
     });
     try {
-      assert.equal(await f.r.retirePolicyReport(f.claim.run_id, 2, context), false);
-      assert.equal(callbacks, 1, "the real custody callback boundary was reached once");
+      const retired = await f.r.retirePolicyReport(f.claim.run_id, 2, context);
       restoreClock();
+      assert.ifError(callbackFailure);
+      assert.equal(callbacks, 1, "the real custody callback boundary was reached once");
+      assert.equal(obstructionApplied, true, "the intended obstruction was applied after valid preconditions");
+      assert.equal(retired, false);
       assert.equal(f.outbox.listPendingPolicies(f.claim.run_id).length, 1);
       await f.assertPending();
     } finally { restoreClock(); timer.restore(); restore(); }

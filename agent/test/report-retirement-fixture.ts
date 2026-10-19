@@ -503,6 +503,12 @@ export async function reportRetirementFixture(t: TestContext, options: {
     }) as unknown as typeof setTimeout);
     return {
       count: () => captured.length,
+      fireFirst: () => {
+        const callback = captured.shift();
+        if (!callback) return false;
+        callback();
+        return true;
+      },
       fire: () => { for (const callback of captured.splice(0)) callback(); },
       restore: () => mock.mock.restore(),
     };
