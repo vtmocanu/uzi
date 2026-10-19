@@ -85,6 +85,15 @@ executor-owned summary cleanup stay joined even after authority or summary deliv
 expires; unconfirmed cleanup blocks capture and credential continuation. Local
 capture moves capturable work from the ephemeral clone into the durable worker
 bare; it does not prove that latest work is archived or authorize source deletion.
+A bounded observation can return while memory capture or its cleanup remains
+unfinished. The worker keeps that run reserved and its local source held until
+the original capture and cleanup actually settle. A same-run duplicate on that
+runner waits, and local maintenance refuses entry while the reservation remains.
+If cleanup never settles, the reservation can remain indefinitely, reducing
+available capacity; occurrence rates and capacity cost are unknown. Command
+authority still expires at the original deadline. An uncertain acknowledgment
+does not start another capture, establish success or release custody; late
+acknowledgments retain the existing isolation from a successor attempt.
 Retained-source capture ends at its durable capture record; creating a fresh
 successor from that bare pin follows outside the held capture, without reading
 old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened

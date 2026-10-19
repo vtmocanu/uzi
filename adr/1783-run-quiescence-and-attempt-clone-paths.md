@@ -293,6 +293,25 @@ removes the tree.
   other advice factories are unchanged. Authority expires at its original absolute
   deadline, but owned cleanup stays joined under the fence without a new budget.
 
+  GitCache's capture request issuer is module-private and applies its full canonical
+  policy. A recipient holding only the capture context cannot choose a validator or
+  obtain a generic spawner. Shared pure policy validation cannot register requests;
+  the complete policy is checked synchronously again at actual launch.
+
+  For pending Codex memory capture, the same `executionTails` promise is installed
+  synchronously before factory work and owns the original preservation operation
+  through capture callback completion and cleanup. The public observer can return
+  after its configured bounded wait while that tail still reserves the run. Only after actual settlement may identity-checked deletion release it;
+  an old owner cannot delete a queued successor's replacement tail. Same-run local
+  duplicates and maintenance respect this ordinary execution reservation, with no
+  `inventoryReservations` exemption. An indefinitely pending callback or cleanup
+  can retain the reservation indefinitely; capacity cost and occurrence rates are
+  unknown. The original deadline still expires command authority. ACK uncertainty
+  grants neither recapture nor success; original receipt, custody and late-ACK
+  successor-isolation rules remain unchanged. Flightless maintenance outside an
+  executing flight is unchanged. Finalization classifies Codex using the same safety
+  markers as free capture.
+
   Save credential-free session state before capture may drain the epoch. After
   failed or withdrawn pause, and before human or automatic changed-milestone gate
   revision continues the model, recreate a possibly drained provider through the
