@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -350,6 +351,68 @@ func TestSemanticCoverageRawPlanRevisionsLiveDB(t *testing.T) {
 			t.Fatal("identical raw retry changed persisted mapping")
 		}
 		previous = current
+	}
+}
+
+func TestSemanticCoverageAtomicityOutcomesLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sourceOutcome string
+		atomic        bool
+		outcome       string
+	}{
+		{"complete_atomic", "complete", true, "complete"},
+		{"complete_non_atomic", "complete", false, "incomplete"},
+		{"unknown_atomic", "unknown", true, "uncertain"},
+		{"unknown_non_atomic", "unknown", false, "uncertain"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCoverageLiveFixture(t)
+			if tc.sourceOutcome == "complete" {
+				f.sources = f.sources[:1]
+				f.submit(t)
+			}
+			if f.candidate.SourceOutcome != tc.sourceOutcome {
+				t.Fatalf("candidate source outcome=%s, want %s", f.candidate.SourceOutcome, tc.sourceOutcome)
+			}
+			reservation := f.reserve(t, "")
+			if reservation.Outcome != "reserved" || reservation.Candidate == nil ||
+				!reflect.DeepEqual(*reservation.Candidate, f.candidate) ||
+				reservation.SemanticCoverageBinding != SemanticCoverageBinding(f.candidate) {
+				t.Fatalf("reservation changed chosen candidate: %+v", reservation)
+			}
+			used := 15
+			f.settle(t, reservation, "success", &used)
+			explanation := "one independently verifiable behavior"
+			if !tc.atomic {
+				explanation = "bundled independently verifiable behaviors"
+			}
+			report := apitypes.SemanticCoverageReport{
+				SemanticCoverageBinding: SemanticCoverageBinding(f.candidate),
+				Requirements: []apitypes.SemanticCoverageResult{{
+					RequirementID: "r1", Status: "represented", Explanation: "behavior represented",
+					Citations: f.candidate.Criteria[0].Citations, CriterionIDs: []string{f.candidate.Criteria[0].ID},
+				}},
+				Criteria: []apitypes.SemanticCoverageAtomicity{{
+					CriterionID: f.candidate.Criteria[0].ID, Atomic: tc.atomic, Explanation: explanation,
+				}},
+			}
+			raw := semanticJSON(t, apitypes.SemanticCoveragePublishRequest{
+				ReviewID: reservation.ReviewID, InvocationID: reservation.InvocationID, Report: report,
+			})
+			if err := f.svc.PublishSemanticCoverage(f.e.ctx, f.worker, f.run, 7, raw); err != nil {
+				t.Fatal(err)
+			}
+			got := f.status(t)
+			if got.Outcome != tc.outcome || got.Report == nil || !reflect.DeepEqual(*got.Report, report) ||
+				got.SemanticCoverageBinding != report.SemanticCoverageBinding ||
+				got.Reviews != 1 || got.Invocations != 1 || got.ChargedTokens != 15 {
+				t.Fatalf("coverage=%+v, want outcome=%s with retained report and usage", got, tc.outcome)
+			}
+			if (!tc.atomic || tc.sourceOutcome != "complete") && got.Outcome == "complete" {
+				t.Fatal("non-atomic criterion or unknown source reported complete")
+			}
+		})
 	}
 }
 

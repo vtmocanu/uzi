@@ -151,6 +151,10 @@ func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &compiled) != nil {
 		t.Fatalf("candidate: %d %s", rec.Code, rec.Body.String())
 	}
+	if compiled.Candidate.SourceOutcome != "unknown" || len(compiled.Candidate.Sources) != 2 ||
+		compiled.Candidate.Sources[1].ID != unknown.ID || compiled.Candidate.Sources[1].Completeness != "unknown" {
+		t.Fatal("missing PRD uncertainty lost")
+	}
 	if compiled.Candidate.Sources[0].Provenance != "server:run-issue" || compiled.Candidate.Sources[0].Completeness != "complete" {
 		t.Fatal("worker issue provenance survived")
 	}
@@ -192,6 +196,10 @@ func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &reservation) != nil || reservation.Outcome != "reserved" || string(reservation.Sources[0].Bytes) != issue {
 		t.Fatalf("reserve: %d %s", rec.Code, rec.Body.String())
 	}
+	if reservation.Candidate == nil || !reflect.DeepEqual(*reservation.Candidate, compiled.Candidate) ||
+		!reflect.DeepEqual(reservation.Sources, compiled.Sources) {
+		t.Fatal("reservation changed candidate or unknown source")
+	}
 	rec = call(http.MethodPost, "/coverage/settle", map[string]any{"claim_generation": 7, "review_id": reservation.ReviewID, "invocation_id": reservation.InvocationID, "status": "success", "tokens": 15})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("settle: %d %s", rec.Code, rec.Body.String())
@@ -206,7 +214,10 @@ func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 	}
 	var status apitypes.SemanticCoverageStatus
 	rec = call(http.MethodGet, "/coverage?claim_generation=7", nil)
-	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &status) != nil || status.Outcome != "incomplete" || status.Report == nil || status.Report.Criteria[0].Atomic || status.ChargedTokens != 15 {
+	// Unknown source coverage remains uncertain even with a non-atomic finding.
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &status) != nil || status.Outcome != "uncertain" ||
+		status.Report == nil || !reflect.DeepEqual(*status.Report, report) || status.SemanticCoverageBinding != compiled.Binding ||
+		status.Reviews != 1 || status.Invocations != 1 || status.ChargedTokens != 15 {
 		t.Fatalf("status: %d %s", rec.Code, rec.Body.String())
 	}
 	// Seed a checker attempt with semantic history identity. No model credential
