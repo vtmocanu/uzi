@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { setImmediate as tick } from "node:timers/promises";
 import { codexRig, drain } from "./runner-codex-sinks-fixture.js";
 import { git, client } from "./runner-harness.js";
@@ -33,14 +34,26 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
       const [bin, ...args] = request.argv;
       if (!bin) throw new Error("test fixture empty Git argv");
       const child = spawn(bin, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+      // Preserve bytes during the launch hold without bypassing stream backpressure.
+      const stdout = new PassThrough({ highWaterMark: 64 * 1024 });
+      const stderr = new PassThrough({ highWaterMark: 64 * 1024 });
+      // Keep early errors handled; consumers still observe each stream's error state.
+      stdout.on("error", () => {});
+      stderr.on("error", () => {});
+      child.stdout.on("error", error => stdout.destroy(error));
+      child.stderr.on("error", error => stderr.destroy(error));
+      child.stdout.pipe(stdout);
+      child.stderr.pipe(stderr);
       const terminal = new Promise<{code:number}>((resolve, reject) => {
         child.once("error", reject);
         child.once("close", code => resolve({code: code ?? 1}));
       });
+      // The launch hold may outlast a spawn failure; retain rejection for the awaiters.
+      void terminal.catch(() => undefined);
       // Only the external execute controller can release protocol progress.
       await hold("launch");
       return {
-        stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
+        stdin: child.stdin, stdout, stderr,
         waitChild: async () => {
           const result = await terminal;
           await hold("primary-held");
@@ -55,6 +68,13 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
           },
           dispose: async () => {
             for (const release of releases) release();
+            child.stdout.unpipe(stdout);
+            child.stderr.unpipe(stderr);
+            stdout.destroy();
+            stderr.destroy();
+            // Startup abort may leave the buffers unread; drain pipes before joining close.
+            child.stdout.resume();
+            child.stderr.resume();
             if (child.exitCode === null) child.kill("SIGKILL");
             await terminal.catch(() => undefined);
           }
