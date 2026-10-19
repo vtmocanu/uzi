@@ -195,8 +195,36 @@ func TestCIArtifactsOneConnectionPoolLiveDB(t *testing.T) {
 	svc.SetJobFiles(NewJobFiles(pool, f.env.box, JobFileLimits{}, nil))
 	ctx, cancel := context.WithTimeout(f.env.ctx, 10*time.Second)
 	defer cancel()
-	if _, err := svc.CreateCIRepairRun(ctx, artifactParams(t, f, []byte("one connection"))); err != nil {
+	content := []byte("one connection")
+	run, err := svc.CreateCIRepairRun(ctx, artifactParams(t, f, content))
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Admission must actually store the artifact through the single connection, not merely
+	// return without error: a kept manifest entry, one sealed file, nothing left reserved.
+	m := artifactManifest(t, run)
+	if len(m.Entries) == 0 || m.Entries[0].Status != "kept" || m.Entries[0].ManifestID == "" {
+		t.Fatalf("manifest %+v", m)
+	}
+	if !strings.Contains(run.IssueDescription, "kept: file=") {
+		t.Fatal(run.IssueDescription)
+	}
+	files, _, reserved := artifactCounts(t, f)
+	if files != 1 || reserved != 0 {
+		t.Fatalf("files/reserved %d/%d", files, reserved)
+	}
+	w := f.guardWorker(t, 1, capability.CIConfigGuardV1, capability.CIArtifactsV1)
+	claim := f.acceptClaim(t, w, run.ID, "repair-capable worker")
+	if claim.CIRepair == nil || len(claim.CIRepair.InputFiles) != 1 {
+		t.Fatalf("claim contract %+v", claim.CIRepair)
+	}
+	_, r, err := svc.OpenJobInputFile(ctx, w, run.ID, uuid.MustParse(claim.CIRepair.InputFiles[0].ManifestID), claim.ClaimGeneration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("read back %q %v", got, err)
 	}
 }
 
