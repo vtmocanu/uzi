@@ -2,15 +2,15 @@
 
 **Issue:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
 **Status:** Epic, not directly runnable. Implementation is split into eight ordered child PRDs.
-**Priority:** High.
+**Priority:** Normal (current issue taxonomy).
 **Origin:** Review of [PR #1220](https://github.com/vtmocanu/uzi/pull/1220) and run `b0ffd0ea` on 2026-09-09.
-**Execution:** Keep only the `PRD` label on this epic. Exactly one child carries `uzi` at a time; #1226 is first. Reviewers: existing `@help1` and `@brainstorm` Claude sessions.
+**Execution:** Epic is not runnable; retain current taxonomy and do not add `uzi`. Serialize implementation children at dispatch after checking real dependencies and green main CI. #1226/#1227 and structural rollout #1626/#1627 already shipped. This refresh dispatches nothing; #1230/#1231 remain held on their explicit integration prerequisites.
 
 No implementation or validation under this epic may create or modify `.github/workflows/**`. Child migrations are numbered above the live head when each child lands. The children run sequentially to avoid shared `runner.ts`, completion-state and migration-constraint collisions.
 
 ## Problem and intended outcome
 
-Uzi asks a lead to declare only milestones it actually completed, but trusts that declaration. `SetRunCompleted` accepts any subset; the worker opens the PR before reporting terminal completion; the normal issue body includes `Closes #N`.
+The original pre-#1226 failure trusted the lead's subset declaration: a worker could open a closing PR before reporting terminal completion. The shipped structural interlock now contains that whole-milestone omission; semantic omission inside a milestone remains the planned #1230/#1231 problem.
 
 PR #1220 proved the failure: its run froze `m1..m5`, declared `m1..m4`, used only 8 of 25 iterations, had no scope cap, contradicted its own PRD on M3/M5, and still opened a closing PR. This is a lifecycle bug, not a prompt-quality problem.
 
@@ -26,12 +26,14 @@ The final product rejects an incomplete completion attempt without failing the r
 | 2 | [#1227 Owner completion decisions and scope-reduced delivery](done/1227-completion-owner-decisions.md) | Continue/partial/accept authority, real contract revisions and truthful closing behavior | #1226 |
 | 3 | [#1228 Shared encrypted provider-context generations](1228-shared-context-generations.md) | One dark storage/codec primitive for run holds and #1214 PR sessions | #1227 by queue policy; no technical dependency |
 | 4 | [#1229 Durable run-hold capture and cross-worker resume](1229-durable-run-holds.md) | Verified provider context plus Git before park; restore before inspect on another worker | Not planned (closed 2026-10-15, #2746) |
-| 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Source-backed criteria, independent plan coverage and autopilot fallback | #1226 |
-| 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Exact-head full audit (tool-less, two-pass cap, fixed token/wall budget), captured gate evidence, semantic permit, per-repo semantic opt-in and bounded recovery | #1226 + #1230 |
+| 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Dormant source-backed criteria, approval-point coverage and exact human-authorized maintainer acceptance | Shipped #1226/#1227; complete M4 also needs merged #3089 and corrected #3090 |
+| 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Bounded exact-head audit, evidence capture and default-on semantic enrollment with instance-admin controls | Completed #1230 and its actual authority/publication seams |
 | 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
 | 8 | [#1232 Completion interlock integration, rollout and epic close-out](1232-completion-interlock-integration.md) | End-to-end/race proof, default enablement, consolidated docs and epic close | #1226-#1228, #1230, #1231 + #1233 (#1229 not planned) |
 
 Queue policy: remove `uzi` from the current child after its PR merges and main CI is green, then add `uzi` to the next child. The scheduled sweep's `max_issues=3` is not a serialization guarantee; the single eligibility label is.
+
+Refresh (AI-synced 2026-10-18): table order is not a technical dependency on #1228 for semantic work. Provider-context storage remains separate; #1229 is not planned. #3089 (PR #3098) and #3090 (PR #3117) are merged; #1230 may dispatch only under its own Execution conditions. No issue is made eligible by this document edit.
 
 ## Binding cross-child contracts
 
@@ -52,7 +54,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 
 ## Issue relationships and queue order
 
-#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The preferred completion-first order is #1226, #1227, #1228, #1230, #1231, #1233, #1232, then #1214. A maintainer may choose #1214 after #1228, but it and #1231/#1233 share runner/resume seams and must still execute one at a time.
+#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The historical completion-first queue preference is #1226, #1227, #1228, #1230, #1231, #1233, #1232, then #1214 (a queue preference, not a semantic technical dependency; see the Refresh note). A maintainer may choose #1214 after #1228, but it and #1231/#1233 share runner/resume seams and must still execute one at a time.
 
 #1088 provider-outage recovery is related but not a prerequisite. #1202 already provides on-demand post-PR rework. #1171 may later supply a verified Codex codec; an unmerged/provisional branch is not production support.
 
@@ -62,10 +64,10 @@ These seams are fixed here so each merged child extends rather than replaces its
 - [x] #1227 merged: only the owner/admin can continue, reduce exact scope or accept exact criteria with a reason.
 - [ ] #1228 merged: one encrypted, bounded provider-context primitive exists for both consumer lifecycles.
 - #1229 not planned (closed 2026-10-15, #2746): completion holds preserve Git; provider context stays `same_worker_only`.
-- [ ] #1230 merged: the per-repo semantic setting has default-off storage and a read seam with no write path or runtime effect, and the dormant compiler/reviewer produce independently reviewed source-backed semantic contracts under test.
-- [ ] #1231 merged: on repos with the semantic setting on, a bounded full exact-head audit gates completion on capable workers.
+- [ ] #1230 merged: dormant compiler/reviewer produce source-backed criteria under test, with coverage at exact approval decision points and exact human authority over maintainer exceptions; no repo setting or production calls.
+- [ ] #1231 merged: new eligible issue runs use semantic enrollment by default, frozen instance-admin controls and hard capability routing; pending authorized acceptance remains truthful/non-closing.
 - [ ] #1233 merged: structured blocker policy gates completion and governed automatic/manual MR rework.
-- [ ] #1232 merged: integrated recovery/compatibility/mutation proof passes and new issue runs use the structural interlock by default; the semantic profile stays a per-repo opt-in.
+- [ ] #1232 merged: integrated recovery/compatibility/mutation and semantic default-on rollout/rollback proof passes. Structural default-on already shipped in #1626/#1627; no duplicate default flip or kill-switch removal.
 - [ ] #1214 is amended to consume #1228 and is queued only after the shared seams are stable.
 
 ## Maintainer-operated post-merge validation
@@ -84,7 +86,7 @@ Record sanitized commands/outcomes, commit/image versions and dates. Never mark 
 
 - Structural containment lands before semantic judgment and states that limitation.
 - Provider context is same-worker only (durable cross-worker recovery, #1229, is not planned) and is exposed as degraded, not hidden.
-- Independent plan/final audits add bounded owner-token cost, and the bound is concrete: the coverage review is at most two invocations per verdict-bearing review sharing 5 min and 40k tokens, capped at three reviews and 15 min / 120k tokens per run and the completion audit at most two tool-less passes (5 min each, 10 min aggregate, 100k tokens) over a worker-built packet with captured gate evidence, so review time scales with the diff, not with implementation time. Deterministic checks run first. Both run only on repos that opt into the semantic profile; the structural interlock costs no tokens and is the default.
+- Independent coverage/audits consume bounded owner-token usage: coverage at most two invocations/5 minutes/40k tokens per approval-point review, capped at three reviews/15 minutes/120k per run; audit at most two verdict-bearing passes/10 aggregate model minutes/100k tokens. Intermediate checker REVISE rounds spend no coverage calls. These are separate frozen maxima, not expected bills. #1231 defaults new eligible issue runs to semantic with instance-admin controls; an explicit disable selects structural, which adds no model calls. Existing run enrollment never changes.
 - A PAT-holding compromised worker remains outside scope; the hard claim clause addresses normal version skew.
 - Finalize-time base-align conflicts, non-fast-forward rejection and push-secret blocking retain their existing typed preserved-work behavior; this epic changes incomplete-completion handling, not every terminal finalization error.
 - A provider without a verified codec cannot be called cross-worker durable.
@@ -96,6 +98,8 @@ ADR 1225 is created by #1226 and amended by later children. It records contract 
 No `docs/ROADMAP.md` exists in the inspected checkout.
 
 ## Review record
+
+- 2026-10-17 (AI-synced, planned refresh): #1230/#1231 replace repo opt-in with default-on semantic enrollment and instance-admin controls, coverage only at exact approval points, and human-authorized pending maintainer acceptance. #3089/#3090 are unmerged integration gates, not shipped support. #1228 is no semantic technical prerequisite and #1229 stays not planned. Structural default-on already shipped; #1232 owns compatibility evidence, not another default flip. Historical opt-in decisions below are superseded in this planned design, not erased. No dispatch/live change; peer/independent review pending.
 
 - 2026-09-09: Initial combined PRD drafted after a three-round design discussion between the lead Codex session and `@brainstorm`.
 - 2026-09-09: `@help1` found five blocking defects: bypassable capability gating, unreachable pause transition, failing no-progress path, non-worker k8s acceptance and excessive scope.

@@ -946,6 +946,16 @@ describe("CodexHarness: closed usage diagnostics", () => {
     } }) });
   cases.push({ label: "pricing fallback", detail: "pricing evidence incomplete",
     mutate: n => ({ ...n, usage: { ...n.usage, pricingEvidenceComplete: false } }) });
+  cases.push({ label: "estimate last raw-vs-decoded mismatch", detail: "raw-vs-decoded mismatch (last.totalTokens)",
+    mutate: n => {
+      const estimate = tokenUsage(total, { totalTokens: 50 }, n.threadId, n.turnId);
+      rec(raw(estimate).last).totalTokens = 51;
+      return estimate;
+    } });
+  for (const value of [-5, 1.5]) {
+    cases.push({ label: `estimate last unsafe ${value}`, detail: "unsafe or negative (last.totalTokens)", real: true,
+      mutate: n => tokenUsage(total, { totalTokens: value }, n.threadId, n.turnId) });
+  }
   cases.push({ label: "untyped", detail: "untyped usage notification",
     mutate: n => ({ kind: "activity", method: n.method,
       params: { ...rec(n.params), tokenUsage: { "provider-key-sentinel": "provider-value-sentinel" },
@@ -1048,6 +1058,101 @@ describe("CodexHarness: resumed usage evidence", () => {
     return event.terminal;
   };
   for (const authMode of ["api_key", "subscription"] as const) {
+    for (const scenario of ["live estimate", "live oversized estimate", "historical estimate",
+      "unobserved response", "full-context reset", "full-context replay", "nonzero last mismatch"] as const) {
+      it(`${authMode}: compaction usage ${scenario} through real transport`, async () => {
+        const accountant = new CodexUsageAccountant();
+        const notices: string[] = [];
+        const inbound = new PassThrough();
+        const outbound = new PassThrough();
+        const transport = createCodexTransport({ inbound, outbound });
+        const { harness } = makeHarness({ authMode, accountant,
+          onTokenUsageIncomplete: text => { notices.push(text); },
+          launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
+        });
+        // Pinned Codex 0.160.1, core/src/session/mod.rs::recompute_token_usage:
+        // cumulative billing usage is unchanged; last is a context estimate with
+        // all five detail buckets zero. The estimate need not fit the cumulative.
+        const estimate = bd({ totalTokens: scenario === "live estimate" ? 50 : 5000 });
+        const finalTotal = { inputTokens: 900, cachedInputTokens: 180, outputTokens: 270,
+          reasoningOutputTokens: 90, totalTokens: 1170 };
+        const sequence = [
+          scenario === "full-context replay"
+            ? tokenUsage({ totalTokens: 5000 }, estimate, "resumed-1", "historical")
+            : scenario === "historical estimate"
+            ? tokenUsage(historical, estimate, "resumed-1", "historical") : replay(),
+          turnStarted("resumed-1"),
+          ...(scenario === "unobserved response" ? [] : [tokenUsage(next, response, "resumed-1")]),
+          scenario === "full-context reset"
+            ? tokenUsage({ totalTokens: 5000 }, estimate, "resumed-1")
+            : tokenUsage(next, scenario === "nonzero last mismatch"
+              ? { inputTokens: 1, totalTokens: 5000 } : estimate, "resumed-1"),
+          tokenUsage(next, estimate, "resumed-1"), // duplicate estimate is never a response
+          tokenUsage(finalTotal, response, "resumed-1"),
+          turnCompleted("completed", undefined, "resumed-1"),
+        ];
+        let buffered = "";
+        outbound.setEncoding("utf8");
+        outbound.on("data", (chunk: string) => {
+          buffered += chunk;
+          let end: number;
+          while ((end = buffered.indexOf("\n")) !== -1) {
+            const frame = rec(JSON.parse(buffered.slice(0, end)));
+            buffered = buffered.slice(end + 1);
+            if (typeof frame.method !== "string" || frame.id === undefined) continue;
+            inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+            if (frame.method === "turn/start") {
+              for (const note of sequence)
+                inbound.write(JSON.stringify({ method: note.method, params: note.params }) + "\n");
+            }
+          }
+        });
+        try {
+          const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+          assert.equal(terminal(events).outcome, "success");
+          assert.equal(accountant.hasBaseline("resumed-1"), scenario !== "full-context replay");
+          const model = accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") })?.["gpt-6-astra"];
+          assert.ok(model);
+          const { costUSD, costStatus, ...tokens } = model;
+          assert.deepEqual(tokens, scenario === "full-context replay"
+            ? { inputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+              outputTokens: 0, reasoningOutputTokens: 0 }
+            : { inputTokens: 480, cacheReadInputTokens: 120, cacheCreationInputTokens: 0,
+              outputTokens: 180, reasoningOutputTokens: 60 });
+          const healthy = scenario.endsWith("estimate");
+          assert.equal(costStatus, healthy ? "metered" : "unreported");
+          if (healthy) {
+            assert.equal(costUSD, 0.01392);
+            assert.deepEqual(notices, []);
+            const records = events.filter(e => e.kind === "usage_record");
+            assert.equal(records.length, 2, "only the two new responses are recorded, never replay or estimates");
+            for (const record of records)
+              assert.deepEqual(record.usage, { input_tokens: 240, cache_read_input_tokens: 60,
+                cache_creation_input_tokens: 0, output_tokens: 90 });
+          } else {
+            assert.equal(costUSD, undefined, "unexplained/malformed billing usage must stay unpriced");
+            if (scenario === "unobserved response") {
+              const records = events.filter(e => e.kind === "usage_record");
+              assert.equal(records.length, 2);
+              assert.deepEqual(records[0]!.usage, { input_tokens: 0, cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0, output_tokens: 0 }, "an unexplained advance cannot invent response spend");
+              assert.deepEqual(notices, []);
+            } else {
+              assert.equal(notices.length, 1);
+              assert.match(notices[0]!, scenario.startsWith("full-context")
+                ? /bucket relationship \(total.totalTokens\)/ : /bucket relationship \(last.totalTokens\)/);
+              if (scenario === "full-context replay")
+                assert.equal(events.filter(e => e.kind === "usage_record").length, 0,
+                  "a synthetic cumulative reset cannot establish a billing baseline");
+            }
+          }
+        } finally {
+          await harness.close();
+          inbound.destroy(); outbound.destroy();
+        }
+      });
+    }
+
     it(`${authMode}: delayed replay after outbound turn/start is historical; child/stale boundaries cannot close replay`, async () => {
       const accountant = new CodexUsageAccountant();
       let notices = 0;
