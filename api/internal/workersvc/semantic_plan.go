@@ -325,7 +325,11 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 		Criteria   []apitypes.ProposedSemanticCriterion
 	}{hex.EncodeToString(structuralDigest), semanticHash([]byte(structural.PlanMd)), refs, proposal.Criteria})
 	fingerprint := semanticHash(append([]byte("uzi:semantic_v1:proposal\x00"), canonical...))
-	out = apitypes.SemanticCandidate{CandidateIdentityVersion: semanticIdentityVersion, Sources: refs, PlanHash: semanticHash([]byte(structural.PlanMd)), SourceOutcome: sourceOutcome, Criteria: make([]apitypes.SemanticCriterion, len(proposal.Criteria))}
+	fieldsDigest, err := semanticPlanFieldsDigest(structural.PlanMd, canonicalStructural.Milestones, canonicalStructural.RequiredCapabilities, canonicalStructural.RequiredTools, canonicalStructural.SizeClass)
+	if err != nil {
+		return out, "", err
+	}
+	out = apitypes.SemanticCandidate{PlanFieldsDigest: fieldsDigest, CandidateIdentityVersion: semanticIdentityVersion, Sources: refs, PlanHash: semanticHash([]byte(structural.PlanMd)), SourceOutcome: sourceOutcome, Criteria: make([]apitypes.SemanticCriterion, len(proposal.Criteria))}
 	for i, c := range proposal.Criteria {
 		out.Criteria[i] = apitypes.SemanticCriterion{ProposedSemanticCriterion: c}
 	}

@@ -133,6 +133,7 @@ type SemanticCandidate struct {
 	Revision                 int64                  `json:"revision"`
 	Digest                   string                 `json:"digest"`
 	Sources                  []SemanticSourceRef    `json:"sources"`
+	PlanFieldsDigest         string                 `json:"plan_fields_digest,omitempty"`
 	PlanHash                 string                 `json:"plan_hash"`
 	SourceOutcome            string                 `json:"source_outcome"`
 	Criteria                 []SemanticCriterion    `json:"criteria"`

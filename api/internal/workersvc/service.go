@@ -12,6 +12,7 @@ package workersvc
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -4400,6 +4401,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
 	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
 	// always names the id it adopts with, and a revision is positive.
+	if s.txBeginner == nil && (req.State == "running" || req.State == "awaiting_approval") {
+		if txq, ok := s.q.(*store.Queries); ok {
+			if semantic, err := semanticEnrollmentPresent(ctx, txq, runID); err != nil || semantic {
+				if err != nil {
+					return owned, false, err
+				}
+				return owned, false, ErrSemanticGateMismatch
+			}
+		}
+	}
 	gateTracked := req.State == "awaiting_approval" && gateRevisionKind(owned.Kind)
 	if gateTracked && (req.PresentationID != nil || req.AdoptGateRevision != nil) {
 		if req.ClaimGeneration == nil {
@@ -4567,6 +4578,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// 'declined' otherwise.
 	var settleScopeDisposition string
 	// providerHeld marks a typed provider park that parkProviderOutage turned into the paused hold (PRD #1733).
+	var semanticRunningContract []byte
+	var semanticRunning bool
+	if req.State == "running" {
+		if txq, ok := q.(*store.Queries); ok {
+			semanticRunningContract, semanticRunning, err = semanticAutoContract(ctx, txq, owned, req)
+			if semanticRunning && fenceTx == nil {
+				return owned, false, ErrSemanticGateMismatch
+			}
+			if err != nil {
+				return owned, false, err
+			}
+		}
+	}
 	var providerHeld bool
 	switch req.State {
 	case "running":
@@ -4608,6 +4632,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			var planRows int64
 			planParams := store.SetRunAutopilotPlanParams{
 				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+			}
+			if semanticRunning {
+				planParams.CandidateDigest, err = hex.DecodeString(req.CandidateDigest)
+				if err != nil {
+					return owned, false, ErrSemanticGateMismatch
+				}
 			}
 			if owned.PlanCrossCheckRequired {
 				if err := bindPlanCrossCheckWrite(&planParams, owned, &req); err != nil {
@@ -4651,6 +4681,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		runningParams, err = s.runningStateParams(ctx, owned, req)
 		if err != nil {
 			return store.Run{}, false, err
+		}
+		if semanticRunning {
+			runningParams.CompletionContract = semanticRunningContract
 		}
 		runningParams.IterationCount = req.IterationCount
 		runningParams.SessionID = sessionID
@@ -4746,6 +4779,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// PRD #1795 M1: classify the report under the run-row lock BEFORE any write (see
 		// gate_revision.go). The effective presented payload is computed in Go, so a conflict
 		// needs no trial write.
+		var semanticPresentation *apitypes.SemanticGatePresentation
+		if txq, ok := q.(*store.Queries); ok {
+			semanticPresentation, err = semanticGateReport(ctx, txq, owned, req)
+			if err != nil {
+				return owned, false, err
+			}
+		}
 		decision := gateDecision{class: gateClassUntracked}
 		if gateTracked && fenceTx != nil {
 			var witnessWorker *uuid.UUID
@@ -4757,6 +4797,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				witnessWorker = &id
 			}
 			decision, err = classifyGateReport(ctx, q, owned, req, gateReportFields{
+				semantic:          semanticPresentation,
 				checkpointWitness: req.GateCheckpointWitness,
 				witnessWorkerID:   witnessWorker,
 				witnessClaimGeneration: func() *int64 {

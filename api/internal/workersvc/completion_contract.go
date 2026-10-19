@@ -39,9 +39,11 @@ const (
 // across revisions — an owner decision never rewrites a criterion, it only defers a milestone
 // (scope.out) or accepts a criterion id (accepted).
 type completionContract struct {
-	Profile  string                `json:"profile"`
-	Revision int                   `json:"revision"`
-	Criteria []completionCriterion `json:"criteria"`
+	SemanticApproval     *apitypes.SemanticGateApproval     `json:"semantic_approval,omitempty"`
+	SemanticPresentation *apitypes.SemanticGatePresentation `json:"semantic_presentation,omitempty"`
+	Profile              string                             `json:"profile"`
+	Revision             int                                `json:"revision"`
+	Criteria             []completionCriterion              `json:"criteria"`
 	// Scope is the owner-reduced scope on a #1227 `partial` revision: the milestone ids still
 	// in scope (`in`) and the owner-deferred ones (`out`). nil on a revision-1 contract.
 	Scope *scopeBlock `json:"scope,omitempty"`

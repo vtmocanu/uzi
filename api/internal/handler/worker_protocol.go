@@ -1503,6 +1503,10 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// returned inside the report's transaction and threaded back from SetStateReport, never
 		// re-read after commit. The worker confirms THIS revision for bound-verdict matching.
 		ack["gate_revision"] = gateRevision
+		if presentation, approval := workersvc.SemanticGateBindingFromRun(run); presentation != nil {
+			ack["semantic_presentation"] = presentation
+			ack["semantic_approval"] = approval
+		}
 	}
 	if result.Reconciliation != nil {
 		var supersededIDs *[]int64

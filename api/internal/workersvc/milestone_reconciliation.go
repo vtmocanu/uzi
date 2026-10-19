@@ -327,6 +327,12 @@ func (s *Service) reconcileMilestoneApproval(ctx context.Context, owner uuid.UUI
 	if run.UserID != owner {
 		return SubmitInputResult{}, ErrRunNotFound
 	}
+	if semantic, err := semanticEnrollmentPresent(ctx, q, run.ID); err != nil || semantic {
+		if err != nil {
+			return SubmitInputResult{}, err
+		}
+		return SubmitInputResult{}, ErrSemanticResetUnsupported
+	}
 	var priorConsent []byte
 	var inputID int64
 	var created time.Time

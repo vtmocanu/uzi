@@ -205,6 +205,7 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
+	SemanticGate                                   *SemanticGateDTO   `json:"semantic_gate,omitempty"`
 	ResetStateDigest                               string             `json:"reset_state_digest,omitempty"`
 	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
 	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
@@ -2242,6 +2243,7 @@ type RunInputRequest struct {
 	// untyped "run has already finished" 409. A revise_plan at the revision cap whose revision
 	// still matches keeps the cap's own answer. Omitted when absent, so a newer client stays
 	// compatible with an older strict-decoding api.
+	SemanticApproval         *SemanticGateApproval    `json:"semantic_approval,omitempty"`
 	ExpectedGateRevision     *int64                   `json:"expected_gate_revision,omitempty"`
 	Reconciliation           *MilestoneReconciliation `json:"reconciliation,omitempty"`
 	ExpectedResetStateDigest string                   `json:"expected_reset_state_digest,omitempty"`

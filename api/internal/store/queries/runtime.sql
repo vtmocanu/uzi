@@ -2081,6 +2081,21 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Semantic freeze has no structural fallback when cross-check is disabled.
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR (COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)->>'profile' = 'semantic'
+           AND COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)
+               ->'semantic_presentation'->'candidate' =
+               (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id))
+       OR (runs.completion_contract IS NULL AND runs.plan_md IS NULL
+           AND runs.milestones_frozen IS NULL AND runs.milestones_candidate IS NULL
+           AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR runs.status <> 'awaiting_approval'
+       OR EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+           AND i.kind = 'approve_plan' AND i.gate_binding = 'bound'
+           AND i.gate_revision = runs.gate_revision AND i.applied_at IS NOT NULL
+           AND i.disposition IS DISTINCT FROM 'superseded'))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -2619,6 +2634,9 @@ UPDATE runs SET
     plan_source = 'agent',
     updated_at  = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id
+           AND sp.candidate->>'digest' = encode(sqlc.arg('candidate_digest')::bytea, 'hex')))
   AND runs.status IN ('claimed', 'running')
   AND runs.auto_approve = true
   AND runs.plan_source = 'agent'
@@ -8619,6 +8637,16 @@ WITH selected AS (
         updated_at       = now()
     WHERE runs.id = @run_id
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
+      AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+           OR (runs.status = 'awaiting_approval'
+               AND sqlc.narg('expected_gate_revision')::bigint = runs.gate_revision
+               AND sqlc.narg('completion_contract')::jsonb->>'profile' = 'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation' =
+                   runs.gate_presented_payload->'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation'->'candidate' =
+                   (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id)
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_approval'->>'presentation_digest' =
+                   encode(runs.gate_payload_digest, 'hex')))
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL

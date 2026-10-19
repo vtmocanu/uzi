@@ -109,6 +109,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
 	}
+	rows = append(rows, semanticGateRows(r)...)
 	rows = append(rows, planCrossCheckRows(r)...)
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)

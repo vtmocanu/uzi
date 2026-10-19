@@ -1,0 +1,119 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
+)
+
+type semanticSwitchClient struct{ *uzicli.FakeClient }
+
+func (c semanticSwitchClient) SetRunCredential(ctx context.Context, id string, o uzicli.SetRunCredentialOverride) (apitypes.RunDTO, string, error) {
+	result, warning, err := c.FakeClient.SetRunCredential(ctx, id, o)
+	run := c.RunByID[id]
+	run.GateRevision = 9
+	run.SemanticGate.Approval.PresentationRevision = 9
+	run.SemanticGate.Approval.ReportDigest = "unseen"
+	c.RunByID[id] = run
+	return result, warning, err
+}
+
+func semanticCLIGate() *apitypes.SemanticGateDTO {
+	return &apitypes.SemanticGateDTO{
+		Approval:     apitypes.SemanticGateApproval{PresentationRevision: 2, PresentationDigest: "displayed", SemanticCoverageBinding: apitypes.SemanticCoverageBinding{CandidateDigest: "candidate"}, ReportDigest: "reviewed"},
+		Sources:      []apitypes.SemanticSourceCapture{{Bytes: []byte("untrusted source\x1b[31m")}},
+		Presentation: apitypes.SemanticGatePresentation{Coverage: apitypes.SemanticCoverageStatus{Outcome: "uncertain"}},
+	}
+}
+
+func TestSemanticApprovalNormalBindsBeforeCredentialAwait(t *testing.T) {
+	for _, token := range []bool{false, true} {
+		fc := gateFake("awaiting_approval", 2)
+		run := fc.RunByID["r1"]
+		run.SemanticGate = semanticCLIGate()
+		fc.RunByID["r1"] = run
+		expected := run.SemanticGate.Approval
+		args := []string{"run", "approve", "r1", "--agent-source", "own"}
+		if token {
+			args = append(args, "--token", "inherit")
+		}
+		_, stderr, code := runCLI(t, fakeEnv(semanticSwitchClient{fc}), args...)
+		if code != 0 {
+			t.Fatalf("exit=%d: %s", code, stderr)
+		}
+		if !reflect.DeepEqual(fc.LastInputOptions.SemanticApproval, &expected) || fc.LastInputExpectedGateRevision == nil || *fc.LastInputExpectedGateRevision != 2 || fc.LastInputSelection == nil {
+			t.Fatalf("lost reviewed binding/options: %+v", fc.LastInputOptions)
+		}
+		want := []string{"get_run", "submit_run_input"}
+		if token {
+			want = []string{"get_run", "set_run_credential", "submit_run_input"}
+		}
+		if !reflect.DeepEqual(fc.RunVerbCalls, want) {
+			t.Fatal(fc.RunVerbCalls)
+		}
+		if !strings.Contains(stderr, "SEMANTIC_COVERAGE: uncertain") || !strings.Contains(stderr, "untrusted source") || strings.ContainsRune(stderr, '\x1b') {
+			t.Fatalf("unsafe/incomplete displayed source: %q", stderr)
+		}
+	}
+}
+
+func TestSemanticGateDisplaySourceCriteriaAndReview(t *testing.T) {
+	fc := gateFake("awaiting_approval", 2)
+	gate := semanticCLIGate()
+	gate.Presentation.Candidate.Criteria = []apitypes.SemanticCriterion{{ID: "criterion-stable", ProposedSemanticCriterion: apitypes.ProposedSemanticCriterion{Kind: "maintainer", Text: "owner-only rollout", Maintainer: &apitypes.SemanticMaintainer{Conditions: []string{"cluster available"}, VerificationSteps: []string{"observe rollout"}}}}}
+	gate.Presentation.Coverage.Report = &apitypes.SemanticCoverageReport{Requirements: []apitypes.SemanticCoverageResult{{RequirementID: "requirement-stable", Status: "missing", Explanation: "untrusted review\x1b[31m", Citations: []apitypes.SemanticCitation{{SourceID: "issue-source", Start: 1, End: 7}}}}}
+	run := fc.RunByID["r1"]
+	run.SemanticGate = gate
+	fc.RunByID["r1"] = run
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 {
+		t.Fatalf("exit=%d: %s", code, stderr)
+	}
+	for _, want := range []string{"untrusted source", "criterion-stable", "owner-only rollout", "cluster available", "observe rollout", "requirement-stable", "missing", "issue-source", "untrusted review", "SEMANTIC_APPROVAL"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("display omitted %q: %s", want, out)
+		}
+	}
+	if strings.ContainsRune(out, '\x1b') {
+		t.Fatalf("source or review emitted terminal controls: %q", out)
+	}
+}
+
+func TestSemanticApprovalManualAndInvalidOptions(t *testing.T) {
+	raw, err := json.Marshal(semanticCLIGate().Approval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		valid bool
+	}{
+		{"exact", []string{"--semantic-approval", string(raw)}, true},
+		{"malformed", []string{"--semantic-approval", "{", "--token", "inherit"}, false},
+		{"unknown", []string{"--semantic-approval", strings.TrimSuffix(string(raw), "}") + ",\"unknown\":true}", "--token", "inherit"}, false},
+		{"revision", []string{"--semantic-approval", string(raw), "--expected-gate-revision", "3", "--token", "inherit"}, false},
+		{"reset", []string{"--semantic-approval", string(raw), "--reset-milestones"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := gateFake("awaiting_approval", 2)
+			args := append([]string{"run", "approve", "r1"}, tc.args...)
+			_, stderr, code := runCLI(t, fakeEnv(fc), args...)
+			if tc.valid {
+				if code != 0 || fc.LastInputOptions.SemanticApproval == nil {
+					t.Fatalf("exit=%d: %s", code, stderr)
+				}
+				if !reflect.DeepEqual(fc.RunVerbCalls, []string{"submit_run_input"}) {
+					t.Fatal(fc.RunVerbCalls)
+				}
+			} else if code != uzicli.ExitUsage || len(fc.RunVerbCalls) != 0 {
+				t.Fatalf("invalid approval had effects: exit=%d calls=%v: %s", code, fc.RunVerbCalls, stderr)
+			}
+		})
+	}
+}

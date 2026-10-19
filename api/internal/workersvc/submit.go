@@ -69,6 +69,7 @@ type SubmitInputOptions struct {
 	// selection, milestone freeze, revise_count, stop_kind, capability clear, server-side reject)
 	// and returns a *GateRevisionMismatchError naming the current revision.
 	// nil keeps the pre-#1795 behaviour.
+	SemanticApproval         *apitypes.SemanticGateApproval
 	ExpectedGateRevision     *int64
 	Reconciliation           *apitypes.MilestoneReconciliation
 	ExpectedResetStateDigest string
