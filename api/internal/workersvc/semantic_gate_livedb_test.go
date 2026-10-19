@@ -262,6 +262,176 @@ func TestSemanticGateResetRefusesLiveDB(t *testing.T) {
 	}
 }
 
+func freezeSemanticGateNoChecker(t *testing.T) *coverageLiveFixture {
+	t.Helper()
+	f := newSemanticGateLive(t)
+	f.sources = f.sources[:1]
+	f.structural.RequiredCapabilities = []string{"docker"}
+	f.structural.RequiredTools = []string{"go", "node"}
+	f.structural.SizeClass = "m"
+	f.submit(t)
+	publishGateCoverage(t, f)
+	f.e.exec(t, "UPDATE runs SET auto_approve=true,plan_cross_check_required=false WHERE id=$1", f.run)
+	req := gateReportRequest(t, f)
+	req.State, req.PresentationID = "running", nil
+	req.RequiredCapabilities, req.RequiredTools, req.SizeClass = &f.structural.RequiredCapabilities, &f.structural.RequiredTools, &f.structural.SizeClass
+	_, applied, _, err := f.svc.SetStateReport(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, req)
+	if err != nil || !applied {
+		t.Fatalf("freeze: applied=%v err=%v", applied, err)
+	}
+	run, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := parseCompletionContract(run.CompletionContract)
+	if err != nil || contract.Profile != "semantic" || run.PlanCrossCheckRequired ||
+		!sameSemanticJSON(sortedSet(run.RequiredCapabilities), []string{"docker"}) ||
+		!sameSemanticJSON(sortedSet(run.RequiredTools), []string{"go", "node"}) ||
+		run.SizeClass != "m" || len(run.MilestonesFrozen) == 0 {
+		t.Fatalf("fixture did not freeze semantic execution fields: %v", err)
+	}
+	return f
+}
+
+func TestSemanticGateFrozenNoCheckerReportsLiveDB(t *testing.T) {
+	for _, scenario := range []string{"tools", "size", "caps", "plan", "milestones", "absent", "identical_metadata", "identical_plan", "filtered_noop", "progress"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := freezeSemanticGateNoChecker(t)
+			req := StateRequest{State: "running", ClaimGeneration: i64(7), IterationCount: 2}
+			reject := true
+			switch scenario {
+			case "tools":
+				tools := []string{"python"}
+				req.RequiredTools = &tools
+			case "size":
+				size := "l"
+				req.SizeClass = &size
+			case "caps":
+				caps := []string{"jvm"}
+				req.RequiredCapabilities = &caps
+			case "plan":
+				req = gateReportRequest(t, f)
+				req.State, req.PresentationID = "running", nil
+				plan := f.structural.PlanMd + " changed"
+				req.PlanMd = &plan
+			case "milestones":
+				req = gateReportRequest(t, f)
+				req.State, req.PresentationID = "running", nil
+				(*req.Milestones)[0].Title = "Changed definition"
+			case "absent":
+				reject = false
+			case "identical_metadata", "identical_plan":
+				reject = false
+				if scenario == "identical_plan" {
+					req = gateReportRequest(t, f)
+					req.State, req.PresentationID = "running", nil
+				}
+				// Effective identity is set-based and uses the shared sanitiser.
+				tools, caps, size := []string{"node", "go", "node", "unknown"}, []string{"docker", "docker"}, "m"
+				req.RequiredTools, req.RequiredCapabilities, req.SizeClass = &tools, &caps, &size
+			case "filtered_noop":
+				reject = false
+				tools, caps, size := []string{"unknown"}, []string{"unknown"}, "unknown"
+				req.RequiredTools, req.RequiredCapabilities, req.SizeClass = &tools, &caps, &size
+			case "progress":
+				reject = false
+				completed := []string{"m1"}
+				req.MilestonesCompleted = &completed
+			}
+			before := semanticGateState(t, f)
+			frozen, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, applied, _, err := f.svc.SetStateReport(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, req)
+			if reject {
+				if !errors.Is(err, ErrSemanticGateMismatch) || applied {
+					t.Fatalf("changed %s: applied=%v err=%v", scenario, applied, err)
+				}
+				if !bytes.Equal(before, semanticGateState(t, f)) {
+					t.Fatal("rejected report mutated run or inputs")
+				}
+				return
+			}
+			if err != nil || !applied {
+				t.Fatalf("allowed %s: applied=%v err=%v", scenario, applied, err)
+			}
+			after, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameSemanticJSON(sortedSet(after.RequiredCapabilities), sortedSet(frozen.RequiredCapabilities)) ||
+				!sameSemanticJSON(sortedSet(after.RequiredTools), sortedSet(frozen.RequiredTools)) ||
+				after.SizeClass != frozen.SizeClass || after.PlanMd != frozen.PlanMd ||
+				!bytes.Equal(after.MilestonesFrozen, frozen.MilestonesFrozen) ||
+				!bytes.Equal(after.CompletionContract, frozen.CompletionContract) {
+				t.Fatal("allowed report changed frozen execution fields")
+			}
+			if scenario == "progress" && !sameSemanticJSON(json.RawMessage(after.MilestonesCompleted), json.RawMessage(`["m1"]`)) {
+				t.Fatalf("progress not persisted: %s", after.MilestonesCompleted)
+			}
+		})
+	}
+}
+
+func TestSemanticGateFrozenOwnerCapabilityOverrideLiveDB(t *testing.T) {
+	f := newSemanticGateLive(t)
+	f.structural.RequiredCapabilities = []string{"docker"}
+	f.structural.RequiredTools = []string{"go"}
+	f.structural.SizeClass = "m"
+	f.submit(t)
+	req := gateReportRequest(t, f)
+	req.RequiredCapabilities, req.RequiredTools, req.SizeClass = &f.structural.RequiredCapabilities, &f.structural.RequiredTools, &f.structural.SizeClass
+	gate := presentSemanticGate(t, f, req)
+	_, err := f.svc.SubmitInputWithOptions(f.e.ctx, f.e.userID, f.run, "approve_plan", "", nil, SubmitInputOptions{
+		ExpectedGateRevision: &gate.Approval.PresentationRevision, SemanticApproval: &gate.Approval, OverrideCapabilities: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wkr := store.Worker{ID: f.worker, UserID: f.e.userID}
+	if _, err := f.svc.ConsumeInputs(f.e.ctx, wkr, f.run, i64(7)); err != nil {
+		t.Fatal(err)
+	}
+	run, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+	if err != nil || len(run.RequiredCapabilities) != 0 || len(run.CompletionContract) == 0 || run.PlanCrossCheckRequired {
+		t.Fatalf("owner override not frozen: %v", err)
+	}
+	snapshot, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload)
+	if err != nil || !ok || !sameSemanticJSON(snapshot.RequiredCapabilities, []string{"docker"}) {
+		t.Fatalf("override fixture lost source display capabilities: %v", err)
+	}
+	// The immutable source display still names docker. The owner authorized an
+	// empty execution requirement set, which absent/identical reports must keep.
+	for _, scenario := range []string{"absent", "identical", "restore_source_caps"} {
+		t.Run(scenario, func(t *testing.T) {
+			req := StateRequest{State: "running", ClaimGeneration: i64(7)}
+			if scenario == "identical" {
+				caps := []string{}
+				req.RequiredCapabilities, req.RequiredTools, req.SizeClass = &caps, &f.structural.RequiredTools, &f.structural.SizeClass
+			}
+			if scenario == "restore_source_caps" {
+				req.RequiredCapabilities = &f.structural.RequiredCapabilities
+			}
+			before := semanticGateState(t, f)
+			_, applied, _, err := f.svc.SetStateReport(f.e.ctx, wkr, f.run, req)
+			if scenario == "restore_source_caps" {
+				if !errors.Is(err, ErrSemanticGateMismatch) || applied || !bytes.Equal(before, semanticGateState(t, f)) {
+					t.Fatalf("restored source capabilities: applied=%v err=%v", applied, err)
+				}
+				return
+			}
+			if err != nil || !applied {
+				t.Fatalf("authorized %s: applied=%v err=%v", scenario, applied, err)
+			}
+			run, err := f.e.q.GetRunByID(f.e.ctx, f.run)
+			if err != nil || len(run.RequiredCapabilities) != 0 {
+				t.Fatalf("override lost: %v", err)
+			}
+		})
+	}
+}
+
 func TestSemanticGateNoCheckerAutoFenceLiveDB(t *testing.T) {
 	for _, scenario := range []string{"complete", "missing_report", "maintainer", "delayed", "reclaimed", "cancelled"} {
 		t.Run(scenario, func(t *testing.T) {

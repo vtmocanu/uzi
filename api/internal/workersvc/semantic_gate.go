@@ -131,7 +131,12 @@ func semanticGateReport(ctx context.Context, q *store.Queries, run store.Run, re
 	}
 	fields := gateReportFields{planMd: stripNULParam(req.PlanMd), milestones: reportPlanMilestonesParam(run, req), milestonesReported: req.Milestones != nil}
 	fields.caps, fields.tools, fields.sizeClass = inferredRequirementParams(req)
-	if err = validateSemanticGateFields(effectiveGatePayload(gatePayloadFromRow(run), fields), p); err != nil {
+	if len(run.CompletionContract) > 0 {
+		err = validateFrozenSemanticReport(run, req)
+	} else {
+		err = validateSemanticGateFields(effectiveGatePayload(gatePayloadFromRow(run), fields), p)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if _, err = c.payload(ctx, run.ID); err != nil {
@@ -282,6 +287,28 @@ func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run sto
 	return SubmitInputResult{ID: row.ID, CreatedAt: row.CreatedAt.Time}, nil
 }
 
+// validateFrozenSemanticReport compares against the locked run's authorized execution
+// fields. A capability override may have cleared capabilities from the original
+// semantic presentation; a worker report must not restore them.
+func validateFrozenSemanticReport(run store.Run, req StateRequest) error {
+	base := gatePayloadFromRow(run)
+	base.Milestones = run.MilestonesFrozen
+	fields := gateReportFields{planMd: run.PlanMd, milestones: reportPlanMilestonesParam(run, req), milestonesReported: req.Milestones != nil}
+	if req.PlanMd != nil {
+		fields.planMd = stripNULParam(req.PlanMd)
+	}
+	fields.caps, fields.tools, fields.sizeClass = inferredRequirementParams(req)
+	_, before, err := base.digest()
+	if err != nil {
+		return ErrSemanticGateMismatch
+	}
+	_, after, err := effectiveGatePayload(base, fields).digest()
+	if err != nil || !bytes.Equal(before, after) {
+		return ErrSemanticGateMismatch
+	}
+	return nil
+}
+
 // semanticAutoContract fences the dormant automatic freeze even when Plan
 // cross-check is disabled. M4 owns the actual park and notifications.
 func semanticAutoContract(ctx context.Context, q *store.Queries, run store.Run, req StateRequest) ([]byte, bool, error) {
@@ -293,7 +320,7 @@ func semanticAutoContract(ctx context.Context, q *store.Queries, run store.Run, 
 		return nil, true, err
 	}
 	if len(run.CompletionContract) > 0 && req.PlanMd == nil && req.Milestones == nil {
-		return nil, true, nil
+		return nil, true, validateFrozenSemanticReport(run, req)
 	}
 	// A claim heartbeat carries no plan or milestones and grants no authority.
 	if req.PlanMd == nil && req.Milestones == nil && len(run.MilestonesFrozen) == 0 && len(run.MilestonesCandidate) == 0 {
