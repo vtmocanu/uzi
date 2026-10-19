@@ -11660,6 +11660,208 @@ try {
   }
 
   /**
+   * Dormant transport prerequisite, never an object-verification result.
+   * The internal caller must spawn the artifact-metered producer and hand it off
+   * exactly once in the SAME original charged continuation, with no prior stdout
+   * consumption or competing reader. Handles cannot authenticate that ownership.
+   * SHA-1 is caller-pinned: the PACK header cannot identify the hash algorithm.
+   * The parent hierarchy must remain worker-exclusive against hostile replacement;
+   * identity checks and O_NOFOLLOW alone cannot supply that exclusion.
+   */
+  // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
+  private async stageMaintenancePack(
+    producer: { stdout: Readable; exited: Promise<{ code: number; stderr: string }>; abort: () => void },
+    outPath: string,
+    maxBytes: number,
+    beforeEffect: () => Promise<void>,
+  ): Promise<{ path: string; byteSize: number; objectCount: number }> {
+    const refused = () => new Error("maintenance_pack_staging_refused");
+    const scope = AsyncLocalStorage.snapshot();
+    let failed = false;
+    const cancel = () => {
+      failed = true;
+      try { scope(() => producer.abort()); } catch { /* Still destroy and join. */ }
+      producer.stdout.destroy();
+    };
+    // Observe failures immediately, including a producer that fails with its pipe
+    // still open. This promise joins the actual owner, never a timeout race.
+    const exited = producer.exited.then(result => {
+      if (result.code !== 0) cancel();
+      return result.code === 0;
+    }, () => { cancel(); return false; });
+    const signal = MaintenanceResources.signalIfActive();
+    signal?.addEventListener("abort", cancel, { once: true });
+    let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let created: Stats | undefined;
+    const parents: Array<{ path: string; stat: Stats }> = [];
+    const check = () => {
+      MaintenanceResources.check();
+      this.checkRecoveryInterruption();
+      if (failed || signal?.aborted) throw refused();
+    };
+    const admit = async () => {
+      await beforeEffect();
+      check();
+    };
+    const chargeStat = (p: string) => {
+      MaintenanceResources.consume("adminEntries", 1);
+      MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
+    };
+    const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
+    const safeDirectory = (p: string, s: Stats) => s.isDirectory() && !s.isSymbolicLink() &&
+      (s.uid === process.getuid!() || (s.uid === 0 &&
+        !isWithinPath(p, path.resolve(this.recoveryRoot)))) && (s.mode & 0o022) === 0;
+    const parentCheck = async () => {
+      for (const parent of parents) {
+        await admit();
+        chargeStat(parent.path);
+        const now = await fs.lstat(parent.path);
+        check();
+        if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
+      }
+    };
+    const effect = async () => { await admit(); await parentCheck(); check(); };
+    let byteSize = 0, objectCount = 0, prefixSize = 0;
+    const prefix = Buffer.alloc(12);
+    try {
+      check();
+      if (typeof beforeEffect !== "function" || !Number.isSafeInteger(maxBytes) ||
+          maxBytes < 32 || maxBytes > 256 * 1024 ** 2 ||
+          typeof outPath !== "string" || Buffer.byteLength(outPath) > 4096 ||
+          !path.isAbsolute(outPath) || path.resolve(outPath) !== outPath ||
+          !isWithinPath(outPath, path.resolve(this.recoveryRoot)) || outPath === path.resolve(this.recoveryRoot) ||
+          producer.stdout.readableDidRead || producer.stdout.readableEnded || producer.stdout.destroyed ||
+          producer.stdout.readableFlowing || producer.stdout.listenerCount("data") !== 0) throw refused();
+      const hierarchy: string[] = [];
+      for (let p = path.dirname(outPath);; p = path.dirname(p)) {
+        if (hierarchy.length >= 128) throw refused();
+        hierarchy.push(p);
+        if (path.dirname(p) === p) break;
+      }
+      // Reserve cleanup metadata before creation: refusal must never block safe
+      // cleanup after revocation. Each reserved read is bounded like a normal stat.
+      for (const p of [...hierarchy, outPath, outPath]) chargeStat(p);
+      MaintenanceResources.consume("adminEntries", 1); // Potential cleanup unlink.
+      for (const p of hierarchy.reverse()) {
+        await admit();
+        chargeStat(p);
+        const stat = await fs.lstat(p);
+        check();
+        if (!safeDirectory(p, stat)) throw refused();
+        parents.push({ path: p, stat });
+      }
+      await effect();
+      MaintenanceResources.consume("adminEntries", 1);
+      file = await fs.open(outPath, fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
+        fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
+      // On refusal after open, cleanup recovers identity from this owned fd.
+      await effect();
+      chargeStat(outPath);
+      created = await file.stat();
+      check();
+      const write = async (bytes: Buffer) => {
+        if (bytes.length > maxBytes - byteSize) throw refused();
+        await effect();
+        MaintenanceResources.consume("artifactBytes", bytes.length);
+        for (let offset = 0; offset < bytes.length;) {
+          await effect();
+          const { bytesWritten } = await file!.write(bytes, offset, bytes.length - offset, byteSize + offset);
+          check();
+          if (bytesWritten <= 0 || bytesWritten > bytes.length - offset) throw refused();
+          offset += bytesWritten;
+        }
+        byteSize += bytes.length;
+      };
+      // Serial I/O, no queued writes: a failure joins every admitted write before
+      // cleanup. Per delivered chunk slices are at most 64 KiB; no charge refunds.
+      for await (const raw of producer.stdout) {
+        check();
+        if (!Buffer.isBuffer(raw) && !(raw instanceof Uint8Array)) throw refused();
+        const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength);
+        let offset = 0;
+        if (prefixSize < 12) {
+          const length = Math.min(12 - prefixSize, bytes.length);
+          bytes.copy(prefix, prefixSize, 0, length);
+          prefixSize += length;
+          offset += length;
+          if (prefixSize === 12) {
+            const version = prefix.readUInt32BE(4);
+            if (prefix.readUInt32BE(0) !== 0x5041434b || (version !== 2 && version !== 3)) throw refused();
+            objectCount = prefix.readUInt32BE(8);
+            MaintenanceResources.consume("closureEntries", objectCount);
+            await write(prefix);
+          }
+        }
+        while (offset < bytes.length) {
+          const end = Math.min(bytes.length, offset + 64 * 1024);
+          await write(bytes.subarray(offset, end));
+          offset = end;
+        }
+      }
+      if (!(await exited)) throw refused();
+      check();
+      if (prefixSize !== 12 || byteSize < 32) throw refused();
+      await effect();
+      await file.sync();
+      await effect();
+      chargeStat(outPath);
+      const fdStat = await file.stat();
+      check();
+      await effect();
+      chargeStat(outPath);
+      const pathStat = await fs.lstat(outPath);
+      check();
+      if (!same(created, fdStat) || !same(fdStat, pathStat) || !fdStat.isFile() ||
+          fdStat.size !== byteSize || (fdStat.mode & 0o7777) !== 0o600 ||
+          fdStat.uid !== process.getuid!() || fdStat.nlink !== 1) throw refused();
+      await effect();
+      MaintenanceResources.consume("metadataBytes", 12);
+      const readback = Buffer.alloc(12);
+      const { bytesRead } = await file.read(readback, 0, 12, 0);
+      check();
+      if (bytesRead !== 12 || !readback.equals(prefix)) throw refused();
+      await effect();
+      chargeStat(outPath);
+      const finalPath = await fs.lstat(outPath);
+      check();
+      if (!same(fdStat, finalPath) || finalPath.size !== byteSize || finalPath.nlink !== 1 ||
+          (finalPath.mode & 0o7777) !== 0o600 || finalPath.uid !== process.getuid!()) throw refused();
+      await effect();
+      await file.close();
+      file = undefined;
+      check();
+      return { path: outPath, byteSize, objectCount };
+    } catch (error) {
+      cancel();
+      await exited;
+      if (file) {
+        // If the first fstat failed, recover identity from our still-owned fd.
+        if (!created) { try { created = await file.stat(); } catch { /* No unlink without identity. */ } }
+        try { await file.close(); } catch { /* Cleanup still checks identity. */ }
+        file = undefined;
+      }
+      // Bounded best effort, no retries; one failed check prevents unlink.
+      // Check-then-unlink relies on the caller's worker-exclusive hierarchy.
+      if (created) {
+        try {
+          for (const parent of parents) {
+            const now = await fs.lstat(parent.path);
+            if (!safeDirectory(parent.path, now) || !same(now, parent.stat)) throw refused();
+          }
+          const now = await fs.lstat(outPath);
+          if (same(created, now)) await fs.unlink(outPath);
+        } catch { /* Preserve foreign paths and ambiguous cleanup evidence. */ }
+      }
+      const reason = error instanceof Error && [
+        "maintenance_resource_exhausted", "maintenance_token_invalid", "maintenance_clock_invalid",
+      ].includes(error.message) ? error.message : "maintenance_pack_staging_refused";
+      throw new Error(reason);
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+    }
+  }
+
+  /**
    * issue #1742 — run `git bundle create - ...` (bundle on stdout) and write it to `outPath`
    * through a byte counter that is a HARD bound on the bytes written: the moment the count passes
    * `maxBytes` the git child is killed, the partial file is removed and
