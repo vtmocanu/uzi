@@ -81,7 +81,7 @@ async function fixture(t: test.TestContext, profile: number | {
     const open = fs.open.bind(fs);
     t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
       const file = await open(...args);
-      if (args[0] !== out) return file;
+      if (typeof args[0] !== "string" || !args[0].startsWith(git.recoveryRoot + path.sep)) return file;
       const stat = file.stat.bind(file);
       t.mock.method(file, "stat", async () => Object.assign(await stat(), { uid: workerUid }));
       return file;
