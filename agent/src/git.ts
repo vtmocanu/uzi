@@ -18,6 +18,7 @@ import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
 import type { CredentialFreeCaptureContext } from "./harness.js";
+import type { CommandSandboxMode } from "./config.js";
 import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
@@ -116,7 +117,7 @@ export function isCaptureRequest(request: BoundaryProcessRequest): boolean {
 }
 
 /** The executor binds its trusted identity/sandbox transformation before launch. */
-export function bindCaptureLaunch(request: BoundaryProcessRequest, spec: Launch): void {
+export function bindCaptureLaunch(request: BoundaryProcessRequest, spec: Launch, mode: CommandSandboxMode): void {
   const held = requests.get(request);
   if (!held) return;
   held.validate();
@@ -130,7 +131,9 @@ export function bindCaptureLaunch(request: BoundaryProcessRequest, spec: Launch)
           spec.args[0] !== "--root" || spec.args[1] !== request.cwd ||
           spec.args[2] !== "--tmp" || spec.args[3] !== tmp ||
           spec.args[4] !== "--cwd" || spec.args[5] !== request.cwd ||
-          spec.args[6] !== "--mode" || spec.args[8] !== "--") refuseCapture();
+          spec.args[6] !== "--mode" || spec.args[7] !== mode ||
+          (mode !== "required" && mode !== "best-effort" && mode !== "off") ||
+          spec.args[8] !== "--") refuseCapture();
       argv = spec.args.slice(9);
     } else argv = [spec.command, ...spec.args];
     if (argv.length !== request.argv.length || argv.some((arg, i) => arg !== request.argv[i])) refuseCapture();

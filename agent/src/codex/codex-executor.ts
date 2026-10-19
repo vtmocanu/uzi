@@ -6481,7 +6481,7 @@ function makeBoundaryProcessSpawner(
           env: request.env,
           supervisorBin: SUPERVISOR_BIN,
         };
-    bindCaptureLaunch(request, spec);
+    bindCaptureLaunch(request, spec, mode);
     const handle = await withCache.launch(spec, deadlineMs, startupCleanup);
     // stderr is consumed by GitCache for all boundary processes. The provider
     // adapter below drains its otherwise-unused stderr independently.

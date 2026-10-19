@@ -28,7 +28,7 @@ export function validateCaptureGitRequest(
   const env = request.env;
   const trusted = environments.some(candidate =>
     Object.keys(env).length === Object.keys(candidate).length &&
-    Object.entries(env).every(([key, value]) => candidate[key] === value));
+    Object.entries(env).every(([key, value]) => Object.hasOwn(candidate, key) && candidate[key] === value));
   if (!trusted || carriesForgeCredential(env)) refuse();
   for (const [key, value] of Object.entries(env)) {
     if (/^(?:GIT_CONFIG_PARAMETERS|GIT_ASKPASS|SSH_ASKPASS|GIT_CREDENTIAL_.*|GCM_.*)$/i.test(key) ||

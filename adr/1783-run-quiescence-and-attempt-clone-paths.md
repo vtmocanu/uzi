@@ -120,10 +120,12 @@ removes the tree.
     deletion is disabled for disposable-kind attempts too.
 11. The recovery journal carries the attempt id, so a journal entry and a ledger
     entry can be cross-checked for the same attempt.
-12. Journal cases are classified by identity (C'/B'/A'), and a C' capture proves
-    predecessor-scoped quiescence before releasing the predecessor's path in
-    place — the predecessor is never removed out from under a proof that has not
-    run.
+12. Journal cases are classified by identity (C'/B'/A'). Historically, C' capture
+    established predecessor-scoped quiescence before in-place path release — the
+    predecessor was never removed out from under a proof that had not run.
+    Current stopped/parked predecessor policy keeps the exact source after
+    successful recapture; recapture grants no deletion authority
+    ([ADR-1786](1786-stopped-source-retention.md)) (AI-synced 2026-10-18).
 13. **Automatic retention reclaim is disabled on every worker (Refs #1858).**
     Disposable-kind attempts (abandoned and crash-window live orphans), shared
     own-key residue from canonical and attempt entries, and orphaned skills are
@@ -268,7 +270,7 @@ removes the tree.
   park, actual graceful-shutdown durability, milestone checkpoint, pre-settle
   reap and finalize.
 
-  **Slice A contract, Refs #2852 (2026-10-18):**
+  **Slice A contract, Refs #2852 (AI-synced 2026-10-18):**
   A separate credential-free GitCache capture callback covers owner pause and
   credential-free recovery, memory-pressure and retained-source captures. It
   holds safety serialization, the epoch fence and closed admission through source
@@ -653,7 +655,7 @@ The original follow-ups are recorded below with their later disposition where kn
   complete after the process proof and clean listings. #2852's terminal/Docker
   writer-exclusion remainder is not fixed. Currently unwired status is not durable
   proof that a path was never exposed to a daemon.
-- **Follow-up 4 — #2852 remains partial under the slice A contract.** A holds owner
+- **Follow-up 4 — #2852 remains partial under the slice A contract (AI-synced 2026-10-18).** A holds owner
   pause and credential-free recovery, memory-pressure and retained-source capture
   through supervised-child settlement, including the narrow lane of an intentionally
   poisoned, successfully settled registry. It restores neither normal admission

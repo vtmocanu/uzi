@@ -1,4 +1,4 @@
-# ADR-1786: A stopped generation's source is kept until preservation is proven or an operator disposes it
+# ADR-1786: A stopped generation's source is kept until explicit operator disposal
 
 **Status**: Accepted
 **Date**: 2026-10-12
@@ -22,9 +22,9 @@ A stopped generation's exact local source is kept until an operator explicitly d
 stopped-source exits the coverage check is diagnostic only and never authorizes release. Park
 release paths also keep the exact clone and existing journal even when covered. Terminal exits
 retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
-limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852).
+limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852) (AI-synced 2026-10-18).
 
-**Slice A contract, Refs #2852 (2026-10-18):** A holds
+**Slice A contract, Refs #2852 (AI-synced 2026-10-18):** A holds
 credential-free GitCache capture and its supervised children, including retained-source
 capture, under closed admission and an epoch fence. This preservation boundary grants
 no disposal authority: stopped and parked sources remain retained under this ADR.

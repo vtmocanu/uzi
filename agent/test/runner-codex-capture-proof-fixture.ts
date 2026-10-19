@@ -9,6 +9,21 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   let fullReap = false, done = false, injected = false;
   const authDeltas: unknown[] = [];
   const source: unknown[] = [], holds: unknown[] = [], pubs: unknown[] = [], acks: unknown[] = [];
+  type HeldEvent = { phase: string; release: () => void };
+  const events: HeldEvent[] = [];
+  const releases = new Set<() => void>();
+  let closed = false;
+  let wake: (() => void) | undefined;
+  const hold = async (phase: string) => {
+    if (closed) return;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    releases.add(release);
+    events.push({ phase, release });
+    wake?.();
+    await held;
+    releases.delete(release);
+  };
   const rig = codexRig({
     vaultLocked: () => !!opts.vault,
     boundaryProcess: async request => {
@@ -22,36 +37,24 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
         child.once("error", reject);
         child.once("exit", code => resolve({code: code ?? 1}));
       });
-      let releasePrimary!: () => void;
-      const primaryGate = new Promise<void>(resolve => { releasePrimary = resolve; });
-      let releaseRoot!: () => void;
-      const rootGate = new Promise<void>(resolve => { releaseRoot = resolve; });
-      // The controller releases each independent latch only after observing the awaiting caller.
-      void terminal.then(async () => {
-        await tick();
-        holds.push({ phase: "primary-held", active, pending: !done, captureReturned: returns > 0 });
-        releasePrimary();
-      });
+      // Only the external execute controller can release protocol progress.
+      await hold("launch");
       return {
         stdin: child.stdin, stdout: child.stdout, stderr: child.stderr,
         waitChild: async () => {
           const result = await terminal;
-          await primaryGate;
+          await hold("primary-held");
           return result;
         },
         root: {
           kind: "boundary_action",
           reap: async () => {
             await terminal;
-            void tick().then(() => {
-              holds.push({ phase: "full-root-held", active, pending: !done, captureReturned: returns > 0 });
-              releaseRoot();
-            });
-            await rootGate;
+            await hold("full-root-held");
             return {ok:true};
           },
           dispose: async () => {
-            releasePrimary(); releaseRoot();
+            for (const release of releases) release();
             if (child.exitCode === null) child.kill("SIGKILL");
             await terminal.catch(() => undefined);
           }
@@ -97,13 +100,13 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   const publish = client.publishCheckpoint.bind(client);
   client.publishCheckpoint = async (_id, _oid, pack) => {
     await drain(pack);
-    if (armed) { await tick(); pubs.push({active, pending:!done}); }
+    if (armed) { await hold("upload"); pubs.push({active, pending:!done}); }
     return {ok:true, body:{published:true, ref:"refs/uzi-checkpoints/agent/issue-x"}};
   };
   const report = client.reportState.bind(client);
   client.reportState = async (id, body, signal) => {
     if (armed && ["paused", "recovery_wait"].includes(body.status)) {
-      await tick(); acks.push({active, pending:!done});
+      await hold("ACK"); acks.push({active, pending:!done});
     }
     return report(id, body, signal);
   };
@@ -112,7 +115,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
       return await rig.capture(ms, async held => {
         entries++; active = true;
         const refresh = rig.refreshCalls(), release = rig.releaseCalls();
-        try { return await action(held); }
+        try { const value = await action(held); await hold("action-tail"); return value; }
         finally { authDeltas.push({refresh:rig.refreshCalls()-refresh,release:rig.releaseCalls()-release}); }
       }, purpose, signal);
     } finally { active = false; returns++; }
@@ -120,8 +123,41 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   const observations = () => ({entries, returns, source, holds, pubs, acks, authDeltas, spawns:rig.processSpawns()-start});
   return {
     rig, capture, arm, recordSource, observations, isActive: () => active,
-    execute: async (operation: Promise<void>) => { await operation.then(() => { done = true; }, error => { done = true; throw error; }); },
-    restore: () => {git.commitWipMarker=wip; git.worktreeStatus=status; client.publishCheckpoint=publish; client.reportState=report;},
+    execute: async (operation: Promise<void>) => {
+      // The test controller owns releases; the instrument never releases itself.
+      const settled = operation.then(() => { done = true; }, error => { done = true; throw error; });
+      try {
+        while (!done) {
+          if (!events.length) await Promise.race([settled, new Promise<void>(resolve => { wake = resolve; })]);
+          wake = undefined;
+          const event = events.shift();
+          if (!event) continue;
+          try {
+            await tick();
+            assert.equal(done, false, event.phase + " cannot be accepted while externally held");
+            // Recovery reports its park after capture; pause ACKs stay inside it.
+            // assertProof's ack argument checks the latter caller contract.
+            if (event.phase !== "ACK" || active) {
+              assert.equal(active, true, event.phase + " retains capture custody");
+              assert.equal(rig.registry.state(), "poisoned", event.phase + " keeps successor admission closed");
+            }
+            if (event.phase === "primary-held" || event.phase === "full-root-held")
+              holds.push({ phase: event.phase, active, pending: !done, captureReturned: returns > 0 });
+          } finally { event.release(); }
+        }
+        await settled;
+      } finally {
+        // A failed assertion cannot strand a later latch or abandon the operation.
+        closed = true;
+        for (const release of releases) release();
+        await settled.catch(() => undefined);
+      }
+    },
+    restore: () => {
+      closed = true;
+      for (const release of releases) release();
+      git.commitWipMarker=wip; git.worktreeStatus=status; client.publishCheckpoint=publish; client.reportState=report;
+    },
     assertProof: (publication: boolean, ack = false) => {
       const o = observations();
       console.log("PUBLIC_PROOF", JSON.stringify(o));

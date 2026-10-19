@@ -29,7 +29,7 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
-import { registeredRoot, makeProductionLaunchAdviceRoot, CODEX_PRODUCTION_PROVIDER } from "../src/codex/codex-executor.js";
+import { registeredRoot, makeProductionLaunchAdviceRoot, CODEX_PRODUCTION_PROVIDER, commandSandboxArgv } from "../src/codex/codex-executor.js";
 import { recordingLogger } from "./helpers.js";
 import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
 import { assertGone } from "./runner-teardown-fixtures.js";
@@ -43,7 +43,7 @@ import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
-import { GitCache, gitEnv, createCaptureContext, assertCaptureRequest } from "../src/git.js";
+import { GitCache, gitEnv, createCaptureContext, assertCaptureRequest, bindCaptureLaunch } from "../src/git.js";
 import * as gitApi from "../src/git.js";
 import * as captureApi from "../src/credential-free-capture.js";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
@@ -2195,6 +2195,76 @@ describe("C2 private capture issuer regression", () => {
   });
 });
 
+describe("C2 exact worker-selected sandbox mode at real launch", () => {
+  for (const mode of ["required", "best-effort", "off"] as const) {
+    for (const substituted of [mode, ...["required", "best-effort", "off"].filter(value => value !== mode),
+      "", mode + "\n", "--mode=off", "unknown"]) {
+      it(mode + " MODE actual launch " + JSON.stringify(substituted), async () => {
+        const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+        let issued = false;
+        let launchError: unknown;
+        let reachedLauncher = false;
+        const safety = createCodexExecutionSafety(registry, async () => { throw new Error("generic spawn forbidden"); },
+          undefined, undefined, async request => {
+            issued = true;
+            assert.equal(request.identity, "command");
+            const tmp = "/tmp/uzi-codex-command-12345678-1234-4234-8234-123456789abc";
+            const args = commandSandboxArgv(request.cwd, request.cwd, request.argv[0]!,
+              request.argv.slice(1), tmp, mode);
+            assert.equal(args[7], mode, "production builder emits worker-selected mode");
+            args[7] = substituted; // Data only: the sole spawn implementation is inert.
+            const spec: CodexEffectLaunchSpec = {
+              identity: request.identity, cwd: request.cwd,
+              command: "/usr/local/bin/uzi-codex-command-sandbox", args,
+              env: { ...request.env, HOME: tmp, TMPDIR: tmp }, supervisorBin: SUPERVISOR_BIN,
+            };
+            const fake = newFake({ uid: COMMAND_UID });
+            try {
+              bindCaptureLaunch(request, spec, mode);
+              reachedLauncher = true;
+              const handle = await launchCodexEffectRoot(spec, baseDeps(fake, {
+                resolveCommandUid: () => COMMAND_UID,
+                spawnSupervisor: (command, argv, options) => {
+                  spawnCalls.push({ command, args: argv, options });
+                  fake.emitChildExit(0);
+                  return fake as unknown as SupervisorProcess;
+                },
+              }));
+              assert.equal((await handle.dispose()).clean, true);
+            } catch (error) { launchError = error; }
+            return {
+              root: { kind: "boundary_action", reap: async () => ({ ok: true }), dispose: async () => {} },
+              stdin: new PassThrough(), stdout: new PassThrough().end(), stderr: new PassThrough().end(),
+              waitChild: async () => ({ code: 0 }),
+            };
+          });
+        const git = new GitCache(process.env.TMPDIR!, nullLogger());
+        // GitCache's private issuer creates the request under the safety-owned acquisition.
+        const exec = git as unknown as {
+          execScoped(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv },
+            identity: "command"): Promise<{ stdout: string; stderr: string }>;
+        };
+        const result = await safety.withCredentialFreeCapture(10_000, context =>
+          git.withCredentialFreeCapture(context, () => exec.execScoped("/usr/bin/git",
+            ["status", "--porcelain"], { cwd: "/capture/runner", env: gitEnv() }, "command")));
+        assert.equal(result.kind, "observed_empty");
+        assert.equal(issued, true, "real GitCache-issued request reached capture adapter");
+        assert.equal(spawnCalls.length, substituted === mode ? 1 : 0,
+          "only the exact worker-selected mode may reach the actual supervisor");
+        if (substituted === mode) {
+          assert.equal(reachedLauncher, true);
+          assert.equal(launchError, undefined);
+          assert.ok(spawnCalls[0]!.args.includes(mode));
+        } else {
+          assert.equal(reachedLauncher, false, "binding refusal stops the composed real-launch path");
+          assert.ok(launchError instanceof TrustedExecutionRefusal);
+          assert.match(String(launchError), /credential-free capture launch refused/);
+        }
+      });
+    }
+  }
+});
+
 // Every candidate below is data. Only the injected supervisor sees launch strings.
 describe("C2 real effect launcher capture policy", () => {
   type Alter = (r: BoundaryProcessRequest) => BoundaryProcessRequest;
@@ -2253,12 +2323,14 @@ describe("C2 real effect launcher capture policy", () => {
       return { ...r, env }; }],
   );
   for (const identity of ["worker_pat", "command"] as const) {
-    function fixture(options: { revoke?: boolean; invalidateCanonical?: boolean; alterRequest?: Alter; mutate?: (spec: CodexEffectLaunchSpec) => void } = {}) {
+    function fixture(options: { revoke?: boolean; expire?: boolean; abort?: boolean; invalidateCanonical?: boolean; alterRequest?: Alter; mutate?: (spec: CodexEffectLaunchSpec) => void } = {}) {
       let live = true;
       let checks = 0;
       let prepared = false;
       let actual = false;
       let boundRequest: BoundaryProcessRequest;
+      const controller = new AbortController();
+      const deadlineAt = Date.now() + 10_000;
       const git = new GitCache(process.env.TMPDIR!, nullLogger());
       const internal = git as unknown as {
         captureSynthesisEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
@@ -2283,9 +2355,14 @@ describe("C2 real effect launcher capture policy", () => {
           if (altered.argv !== boundRequest.argv) (boundRequest.argv as string[]).splice(0, boundRequest.argv.length, ...altered.argv);
         }
         options.mutate?.(spec);
-        return launchCodexEffectRoot(spec, baseDeps(fake, {
-          resolveCommandUid: () => COMMAND_UID,
-          resolveWorkerUid: () => WORKER_UID,
+        const realNow = Date.now;
+        const beforeIdentity = () => {
+          if (options.expire) Date.now = () => deadlineAt;
+          if (options.abort) controller.abort();
+        };
+        try { return await launchCodexEffectRoot(spec, baseDeps(fake, {
+          resolveCommandUid: () => { beforeIdentity(); return COMMAND_UID; },
+          resolveWorkerUid: () => { beforeIdentity(); return WORKER_UID; },
           spawnSupervisor: (command, args, opts) => {
             actual = true;
             spawnCalls.push({ command, args, options: opts });
@@ -2296,9 +2373,9 @@ describe("C2 real effect launcher capture policy", () => {
           ...(options.revoke ? identity === "command"
             ? { resolveCommandUid: () => { live = false; return COMMAND_UID; } }
             : { resolveWorkerUid: () => { live = false; return WORKER_UID; } } : {}),
-        }));
+        })); } finally { Date.now = realNow; }
       });
-      const context = createCaptureContext(new AbortController().signal, Date.now() + 10_000,
+      const context = createCaptureContext(controller.signal, deadlineAt,
         async r => {
           boundRequest = r;
           const child = await adapter(r, 10_000);
@@ -2340,9 +2417,13 @@ describe("C2 real effect launcher capture policy", () => {
       const env = r.request.env;
       const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
         [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
-      for (const key of ["credential.helper", "core.askpass"]) {
-        assert.deepEqual(pairs.filter(([k]) => k === key), [[key, ""]]);
-      }
+      assert.equal(env.GIT_CONFIG_COUNT, "11");
+      assert.deepEqual(pairs, [
+        ["safe.directory", "*"], ["core.hooksPath", "/usr/share/uzi-git-nohooks"],
+        ["maintenance.auto", "false"], ["gc.auto", "0"], ["core.fsmonitor", "false"],
+        ["diff.external", "true"], ["core.pager", "cat"], ["core.sshCommand", "ssh"],
+        ["credential.helper", ""], ["core.askpass", ""], ["core.alternateRefsCommand", ""],
+      ], "independent literal oracle for the complete ordered canonical block");
       const output = await r.spawn(r.request);
       assert.equal(r.state().actual, true);
       assert.equal(r.state().checks, 3, "complete validator did not repeat at actual spawn");
@@ -2392,6 +2473,47 @@ describe("C2 real effect launcher capture policy", () => {
       assert.equal(r.state().checks, 2, "revoked acquisition must fail before calling the validator again");
       assert.equal(r.state().actual, false);
       assert.equal(spawnCalls.length, 0);
+    });
+
+    for (const option of ["expire", "abort"] as const) {
+      it(identity + " ACTUAL refuses " + option + " after binding at real launcher", async () => {
+        const r = fixture({ [option]: true });
+        const refusal = await r.spawn(r.request).then(() => undefined, error => error as unknown);
+        assert.equal(spawnCalls.length, 0, "expired or aborted binding must not reach the actual supervisor");
+        await assert.rejects(Promise.reject(refusal), error => {
+          // GitCache preserves the launcher refusal as the cause of its abort wrapper.
+          assert.ok(error instanceof Error);
+          const launchError = option === "abort" ? error.cause : error;
+          if (option === "abort") {
+            assert.equal(error.name, "AbortError");
+            assert.equal(error.message, "permit-held git operation aborted");
+          }
+          assert.ok(launchError instanceof CodexLaunchError);
+          assert.match(String(launchError.cause), /credential-free capture launch refused/);
+          return true;
+        });
+        assert.equal(r.state().prepared, true);
+        assert.equal(r.state().actual, false);
+        assert.equal(spawnCalls.length, 0);
+      });
+    }
+
+    it(identity + " refuses canonical own-key undefined substitution", async () => {
+      const savedHome = process.env.HOME;
+      delete process.env.HOME;
+      try {
+        const r = fixture();
+        const env = { ...r.request.env };
+        assert.equal(Object.hasOwn(env, "HOME"), true);
+        assert.equal(env.HOME, undefined);
+        delete env.HOME;
+        env.CAPTURE_UNKNOWN_UNDEFINED = undefined;
+        await assert.rejects(r.spawn({ ...r.request, env }), /credential-free capture launch refused/);
+        assert.equal(r.state().prepared, false, "own-key substitution refused before launch admission");
+        assert.equal(spawnCalls.length, 0);
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+      }
     });
 
     it(identity + " refuses forged provenance and stale acquisition before preparation", async () => {

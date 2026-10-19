@@ -472,7 +472,7 @@ for that frozen epoch. The
 holds the matching-epoch permit through the runner action and its owned work,
 preserving primary-error independence and the unchanged Claude branch.
 
-**Slice A contract, Refs #2852 (2026-10-18):**
+**Slice A contract, Refs #2852 (AI-synced 2026-10-18):**
 A separate credential-free GitCache capture callback holds safety serialization,
 the epoch fence and closed admission through source reads, WIP commit, fetch-back,
 verification, authorized publication and full supervised-child settlement. An
@@ -486,7 +486,10 @@ mints neither a credentialed nor a completion permit. See the
 GitCache binds the restricted launch policy: the canonical environment includes
 exactly one empty `credential.helper` and one empty `core.askpass`, with no
 credential-bearing override. The strict GitCache builder policy matches the complete
-canonical environment, including exact indexed config order (reordering is refused).
+canonical environment's own keys and values, including exact indexed config order
+(reordering is refused). The command-identity launch binds the sandbox mode to the
+executor-selected `required`, `best-effort` or `off` mode, alongside the fixed
+wrapper, cwd, argv and environment transformation.
 Only the builder supplies the empty helper/askpass pins; duplicate entries and caller
 helper/askpass argv overrides, even empty ones, are refused. The synchronous launch-request check
 scans credential/askpass, includes, config-env, `GIT_CONFIG_PARAMETERS`, Authorization

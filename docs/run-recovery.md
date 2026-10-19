@@ -78,7 +78,7 @@ otherwise `source_only`, before available unguarded archives or capture progress
 Other custody attention decisions retain their existing ordering.
 
 The worker attempts preservation using its existing recovery path. Under the
-**slice A contract (Refs #2852)**, Codex credential-free capture keeps
+**slice A contract (Refs #2852) (AI-synced 2026-10-18)**, Codex credential-free capture keeps
 execution closed through capture and settlement of the supervised capture processes,
 including credential-free recovery and retained-source capture. Setup, auth and
 executor-owned summary cleanup stay joined even after authority or summary delivery
@@ -641,7 +641,7 @@ worker, including abandoned attempts and crash-window live orphans, shared
 own-key residue from canonical and attempt entries, and orphaned skills.
 There is no automatic reclaim escape from that accumulation.
 
-**Slice A contract (Refs #2852):** credential-free capture, including owner pause,
+**Slice A contract (Refs #2852) (AI-synced 2026-10-18):** credential-free capture, including owner pause,
 keeps execution closed without changing these retention rules. If a failed or withdrawn
 pause may have drained Codex execution, the saved session is loaded into a recreated
 provider epoch before work continues. Human or automatic gate revision after changed
