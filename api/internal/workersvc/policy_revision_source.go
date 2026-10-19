@@ -106,6 +106,57 @@ func policyRevisionSourceGateMatches(r store.Run, source apitypes.PolicyRevision
 		(len(r.GatePresentedPayload) == 0 || bytes.Equal(bytes.TrimSpace(r.GatePresentedPayload), []byte("null")))
 }
 
+// The locked row is the pre-selection snapshot; created is the row returned by
+// InsertPlanCrossCheck in the same transaction. Creation adds inventory, never
+// takes a revision. Historical candidates need not project to the current gate.
+func policyRevisionSourceWithCreatedCrossCheck(ctx context.Context, q *store.Queries, r store.Run, created store.CrossCheck) ([]byte, error) {
+	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
+	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
+		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
+		return nil, nil
+	}
+	refs := append([]apitypes.PolicyRevisionRef{}, source.AssociatedCrossChecks...)
+	if source.PrimaryRevision != nil && source.PrimaryRevision.CrossCheckID != nil {
+		refs = append(refs, *source.PrimaryRevision)
+	}
+	// Visit only the finite stored identities, once each, without retries.
+	// A missing/foreign witness invalidates all coverage; DB errors abort creation.
+	for _, ref := range refs {
+		id, err := uuid.Parse(*ref.CrossCheckID)
+		if err != nil {
+			return nil, nil
+		}
+		cc, err := q.GetPolicyStopCrossCheck(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 {
+			return nil, nil
+		}
+		candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
+		digest, err := candidate.Digest()
+		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
+			return nil, nil
+		}
+		if id == created.ID {
+			return nil, fmt.Errorf("new cross-check already in pre-creation inventory")
+		}
+	}
+	id := created.ID.String()
+	source.AssociatedCrossChecks = append(source.AssociatedCrossChecks, apitypes.PolicyRevisionRef{Source: "plan_cross_check", CrossCheckID: &id})
+	raw, err := json.Marshal(source)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := apitypes.ParsePolicyRevisionSourceV1(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func policyRevisionUpdatedSource(ctx context.Context, tx pgx.Tx, r store.Run, w store.Worker, wire policyRevisionWire) ([]byte, error) {
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
 	if err != nil || !wire.valid || !policyRevisionSourceGateMatches(r, source) ||

@@ -258,6 +258,13 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
+		var source []byte
+		if policyEligible(locked) && !locked.TargetRunID.Valid {
+			source, e = policyRevisionSourceWithCreatedCrossCheck(ctx, txq, locked, existing)
+			if e != nil {
+				return store.Run{}, e
+			}
+		}
 		n, e := txq.SetPolicyCandidateCrossCheckAssociation(ctx, store.SetPolicyCandidateCrossCheckAssociationParams{
 			CrossCheckID: existing.ID, LeadRunID: leadID, WorkerID: worker.ID, ClaimGeneration: generation,
 		})
@@ -266,6 +273,17 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		if n != 1 {
 			return store.Run{}, ErrCrossCheckRefused
+		}
+		if policyEligible(locked) && !locked.TargetRunID.Valid {
+			n, e := txq.SetPolicyRevisionSource(ctx, store.SetPolicyRevisionSourceParams{
+				Source: source, RunID: leadID, WorkerID: worker.ID, ClaimGeneration: generation,
+			})
+			if e != nil {
+				return store.Run{}, e
+			}
+			if n != 1 {
+				return store.Run{}, fmt.Errorf("policy revision source fence: affected %d rows", n)
+			}
 		}
 		return child, nil
 	})
