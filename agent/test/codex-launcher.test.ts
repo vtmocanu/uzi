@@ -2359,7 +2359,9 @@ describe("C2 real effect launcher capture policy", () => {
     }
   }
   for (const key of ["GIT_ASKPASS", "SSH_ASKPASS", "GIT_CREDENTIAL_HELPER", "GIT_CREDENTIAL_USEHTTPPATH",
-    "GCM_INTERACTIVE", "GCM_CREDENTIAL_STORE", "GIT_CONFIG_PARAMETERS"]) {
+    "GCM_INTERACTIVE", "GCM_CREDENTIAL_STORE", "GIT_CONFIG_PARAMETERS", "ANTHROPIC_API_KEY",
+    "GIT_CREDENTIAL_ARBITRARY", "gIt_CrEdEnTiAl_ArBiTrArY", "gCm_ArBiTrArY", "gIt_AsKpAsS",
+    "sSh_AsKpAsS", "gIt_CoNfIg_PaRaMeTeRs"]) {
     for (const value of ["", "sentinel"]) cells.push([`${key} presence ${JSON.stringify(value)}`,
       r => ({ ...r, env: { ...r.env, [key]: value } })]);
   }
@@ -2380,6 +2382,36 @@ describe("C2 real effect launcher capture policy", () => {
       [env.GIT_CONFIG_VALUE_0, env.GIT_CONFIG_VALUE_1] = [env.GIT_CONFIG_VALUE_1, env.GIT_CONFIG_VALUE_0];
       return { ...r, env }; }],
   );
+  // Remove a whole pin and reindex: a missing pin is distinct from a sparse block.
+  for (const key of ["credential.helper", "core.askpass", "core.alternateRefsCommand"]) {
+    for (const change of ["missing", "nonempty"] as const) cells.push([
+      key + " " + change, r => {
+        const env = { ...r.env };
+        const pairs = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+          [env[`GIT_CONFIG_KEY_${i}`]!, env[`GIT_CONFIG_VALUE_${i}`]!]);
+        const at = pairs.findIndex(pair => pair[0] === key);
+        assert.ok(at >= 0, "fixture contains the pin under test");
+        if (change === "nonempty") pairs[at]![1] = "sentinel";
+        else {
+          pairs.splice(at, 1);
+          delete env[`GIT_CONFIG_KEY_${pairs.length}`];
+          delete env[`GIT_CONFIG_VALUE_${pairs.length}`];
+        }
+        env.GIT_CONFIG_COUNT = String(pairs.length);
+        pairs.forEach(([k, v], i) => { env[`GIT_CONFIG_KEY_${i}`] = k; env[`GIT_CONFIG_VALUE_${i}`] = v; });
+        return { ...r, env };
+      },
+    ]);
+  }
+  cells.push(["local file pin widened", r => ({ ...r, argv: [...r.argv, "-c", "protocol.file.allow=always"] })]);
+
+  // Immutable issuance prevents native mutation cells from reaching final policy.
+  // Independent scratch proof: count validateCaptureGitRequest calls, bypass only
+  // calls 1/2, and alter request DATA before issuance. Require call 3, prepared=true,
+  // policy refusal (never TypeError), and no supervisor. In a separate fresh export,
+  // omit only launcher.ts's final assertCaptureLaunch call: the same cells must
+  // reach the fake supervisor and fail refusal assertions. Keep this instrumentation
+  // out of production; capability/deadline/abort tests below use native final seams.
   for (const identity of ["worker_pat", "command"] as const) {
     function fixture(options: { revoke?: boolean; expire?: boolean; abort?: boolean; invalidateCanonical?: boolean; alterRequest?: Alter; mutate?: (spec: CodexEffectLaunchSpec) => void } = {}) {
       let live = true;
@@ -2484,7 +2516,7 @@ describe("C2 real effect launcher capture policy", () => {
       ], "independent literal oracle for the complete ordered canonical block");
       const output = await r.spawn(r.request);
       assert.equal(r.state().actual, true);
-      assert.equal(r.state().checks, 3, "complete validator did not repeat at actual spawn");
+      assert.equal(r.state().checks, 1, "synthesis candidates are constructed once at issuance");
       assert.equal(spawnCalls.length, 1);
       assert.deepEqual(output, { stdout: "", stderr: "" }, "real execScoped joined successful exit and root cleanup");
     });
@@ -2499,7 +2531,7 @@ describe("C2 real effect launcher capture policy", () => {
     }
 
     for (const [name, alter] of cells) {
-      it(identity + " ACTUAL preparation frozen request refuses " + name, async () => {
+      it(identity + " FREEZE preparation frozen request refuses " + name, async () => {
         const r = fixture({ alterRequest: alter });
         await assert.rejects(r.spawn(r.request), TypeError);
         assert.equal(r.state().prepared, true);
@@ -2508,16 +2540,13 @@ describe("C2 real effect launcher capture policy", () => {
       });
     }
 
-    it(identity + " ACTUAL repeats complete validator after async preparation", async () => {
+    it(identity + " ACTUAL retains canonical snapshot after synthesis callback changes", async () => {
       const r = fixture({ invalidateCanonical: true });
-      await assert.rejects(r.spawn(r.request), error => {
-        assert.ok(error instanceof CodexLaunchError);
-        assert.match(String(error.cause), /credential-free capture launch refused/);
-        return true;
-      });
-      assert.equal(r.state().checks, 3);
+      assert.deepEqual(await r.spawn(r.request), { stdout: "", stderr: "" });
+      assert.equal(r.state().checks, 1, "later callback changes cannot rebuild canonical candidates");
       assert.equal(r.state().prepared, true);
-      assert.equal(spawnCalls.length, 0);
+      assert.equal(r.state().actual, true);
+      assert.equal(spawnCalls.length, 1);
     });
 
     it(identity + " ACTUAL repeats capability check after async preparation", async () => {
@@ -2528,7 +2557,7 @@ describe("C2 real effect launcher capture policy", () => {
         return true;
       });
       assert.equal(r.state().prepared, true);
-      assert.equal(r.state().checks, 2, "revoked acquisition must fail before calling the validator again");
+      assert.equal(r.state().checks, 1, "revocation must not rebuild canonical candidates");
       assert.equal(r.state().actual, false);
       assert.equal(spawnCalls.length, 0);
     });

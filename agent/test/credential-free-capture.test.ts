@@ -630,6 +630,92 @@ describe("credential-free fixed helper deadline binding", () => {
     } finally { release.resolve(); resume.resolve(); await late?.catch(() => undefined); }
   });
 
+  // These are separate private-issuance and immutable-setup negatives, not proof
+  // of helper predicates at the final guard. For independent scratch isolation,
+  // use the real producer unchanged and count validateCaptureGitRequest entries.
+  // On entry 3 only, replace its local request argument with altered DATA while
+  // retaining the original canonical candidates/helper constants and validator
+  // body. Require prepared setup, policy refusal, no TypeError, and no fake spawn.
+  // Repeat from a fresh export omitting only the launcher's final
+  // assertCaptureLaunch: require fake spawn and a failing refusal assertion for
+  // every cell. This preserves private issuance/freeze/trusted builders and
+  // isolates final policy without adding production hooks or helper authority.
+  for (const cell of ["script", "executable", "argv", "environment",
+    "missing helper pin", "nonempty helper pin", "missing askpass pin", "nonempty askpass pin"] as const) {
+    for (const boundary of ["private issuance", "frozen setup"] as const)
+      it("refuses fixed helper " + cell + " at " + boundary, async () => {
+        let attempted = false;
+        let freezeFailure: unknown;
+        let issuanceFailure: unknown;
+        const alterEnv = (env: NodeJS.ProcessEnv) => {
+          if (cell === "environment") env.NODE_OPTIONS = "--substituted";
+          else {
+            const key = cell.includes("helper pin") ? "credential.helper" : "core.askpass";
+            const index = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => i)
+              .find(i => env[`GIT_CONFIG_KEY_${i}`] === key);
+            assert.notEqual(index, undefined);
+            if (cell.startsWith("missing")) delete env[`GIT_CONFIG_VALUE_${index}`];
+            else env[`GIT_CONFIG_VALUE_${index}`] = "sentinel";
+          }
+        };
+        const r = rig({ output, setup: async spec => {
+          if (boundary !== "frozen setup" || !isHelper(spec)) return;
+          await setImmediate();
+          attempted = true;
+          assert.equal(Object.isFrozen(spec), true);
+          assert.equal(Object.isFrozen(spec.args), true);
+          assert.equal(Object.isFrozen(spec.env), true);
+          const executable = spec.args.indexOf(process.execPath);
+          assert.ok(executable >= 0);
+          try {
+            if (cell === "script") (spec.args as string[])[executable + 2] += "\n// substituted";
+            else if (cell === "executable") (spec.args as string[])[executable] = "/capture/substituted-node";
+            else if (cell === "argv") (spec.args as string[]).push("substituted");
+            else alterEnv(spec.env);
+          } catch (error) {
+            freezeFailure = error;
+            throw error; // Freeze refusal precedes the final policy predicate.
+          }
+        } });
+        const internal = r.git as any, original = internal.execScoped.bind(r.git);
+        internal.execScoped = async (command: string, args: string[], opts: any, identity: any) => {
+          if (boundary !== "private issuance" || command !== process.execPath)
+            return original(command, args, opts, identity);
+          attempted = true;
+          const argv = [command, ...args], env = { ...opts.env };
+          if (cell === "script") argv[2] += "\n// substituted";
+          else if (cell === "executable") argv[0] = "/capture/substituted-node";
+          else if (cell === "argv") argv.push("substituted");
+          else alterEnv(env);
+          const before = r.specs.length;
+          try {
+            await internal.boundaryProcesses.getStore().spawn({ argv, env, cwd: opts.cwd, identity });
+          } catch (error) {
+            issuanceFailure = error;
+          }
+          assert.equal(r.specs.length, before, "early refusal precedes launcher setup");
+          throw new Error("private helper substitution refused");
+        };
+        const pending = r.safety.withCredentialFreeCapture(10_000, context =>
+          r.git.withCredentialFreeCapture(context, () => produce(r)));
+        if (boundary === "frozen setup") {
+          await assert.rejects(pending, /codex boundary failed at action/);
+          assert.ok(freezeFailure instanceof TypeError, "immutable setup refuses the actual mutation");
+        } else {
+          const result = await pending;
+          assert.equal(result.kind, "observed_empty");
+          if (result.kind === "observed_empty") assert.equal(result.value, null);
+          // The producer intentionally catches helper errors. Assert outside it
+          // so a swallowed assertion cannot turn missing enforcement green.
+          assert.ok(issuanceFailure instanceof Error);
+          assert.equal(issuanceFailure instanceof TypeError, false);
+          assert.match(issuanceFailure.message, /credential-free capture launch refused/);
+        }
+        assert.equal(attempted, true, "real private helper producer reached the tested seam");
+        assert.equal(r.specs.some(isHelper), false, "substituted helper never spawned");
+      });
+  }
+
   for (const value of ["different future integer", "9", "9".repeat(400), "9007199254740992",
     "Infinity", "NaN", "1.5", "01", "+9", "1e13", ""] as const)
     it("rejects private helper deadline substitution " + (value.length > 30 ? "huge decimal" : JSON.stringify(value)), async () => {
