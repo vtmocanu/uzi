@@ -145,14 +145,24 @@ async function enrolled(commands: WorkerMemoryCommands, count: number): Promise<
 }
 const ready = (rig: Rig, name: string) => until(() => fs.existsSync(path.join(rig.dir, name)), `marker ${name}`);
 
-/** A fresh complete observation of one enrolled command (a single observe may be in flight: retry). */
+/**
+ * A fresh complete observation of one enrolled command, taken once the tree has settled: two
+ * consecutive complete observations list the same pids, so a short-lived startup process (the
+ * `touch` of a readiness marker, a forking wrapper) is not in the returned rows to be asserted
+ * alive later. A single observe may also be in flight or stale: retry.
+ */
 async function observeFresh(entry: Entry): Promise<Observation> {
-  for (let attempt = 0; attempt < 40; attempt++) {
+  let previous: string | undefined;
+  for (let attempt = 0; attempt < 60; attempt++) {
     const observation = await entry.observe({ remainingMs: 5000, signal: new AbortController().signal });
-    if (observation.available && observation.complete && observation.rows.length > 0) return observation;
+    if (observation.available && observation.complete && observation.rows.length > 0) {
+      const key = observation.rows.map((row) => `${String(row.pid)}:${row.startTime}`).sort().join(",");
+      if (key === previous) return observation;
+      previous = key;
+    } else previous = undefined;
     await sleep(100);
   }
-  return assert.fail("no complete observation of the enrolled command");
+  return assert.fail("no settled complete observation of the enrolled command");
 }
 const treePids = (observation: Observation) => observation.rows.map((row) => row.pid);
 const WINDOW_MS = 5000;

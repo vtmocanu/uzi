@@ -225,3 +225,30 @@ test("guardStopped is false until the guard's own cancel or drain reaches dispos
   await assert.rejects(stale.entry.cancel({ remainingMs: 1000, signal: AbortSignal.abort(), authorized: () => true }), /stale/);
   assert.equal(stale.guardStopped(), false, "a refused cancel stopped nothing");
 });
+
+test("a stale initial observation from the wrapper's startup is re-sampled and enrolls", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  const stable = await root.handle.observe(500);
+  let calls = 0;
+  const handle: CodexRootHandle = { ...root.handle, observe: async () => {
+    calls++;
+    return calls <= 2 ? { event: "observe", id: calls, state: "unavailable", reason: "stale" } : stable;
+  } };
+  const enrolled = await enrollClaudeCommand(c, mint(c), handle, 1000);
+  assert.ok(enrolled, "a transient stale sample does not leave the command unenrolled");
+  assert.equal(calls, 3);
+  assert.equal(c.commands.eligibleEntries()?.length, 1);
+});
+
+test("a persistently stale initial observation stays unenrolled within the observe budget", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  root.change({ event: "observe", id: 1, state: "unavailable", reason: "stale" });
+  const started = performance.now();
+  const enrolled = await enrollClaudeCommand(c, mint(c), root.handle, 200);
+  assert.equal(enrolled, undefined);
+  assert.ok(performance.now() - started < 1000, "the retry never outlives the observe budget");
+  assert.ok(root.observations() > 1, "the stale sample was retried");
+  assert.equal(root.disposes(), 0, "uncertainty never disposes");
+});

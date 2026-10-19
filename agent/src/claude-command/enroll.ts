@@ -93,6 +93,30 @@ async function observeUnlessAborted<T>(observed: Promise<T>, timeoutMs: number, 
   }
 }
 
+/** Pause between initial observations that raced the wrapper's own startup. */
+const STALE_RETRY_MS = 20;
+
+/**
+ * The initial supervisor observation. The supervisor rejects a sample as `stale` when a process
+ * in the tree appears, exits or changes parent between its two passes. While the wrapper is still
+ * forking (process substitution, `tee`) that is a transient condition, not an uncertain tree, so
+ * it is re-sampled until a sample is stable. Every other outcome is returned as is. The retries
+ * stay inside `deadlineMs`, and `stop` aborts the loop and its pause timer.
+ */
+async function initialObservation(handle: CodexRootHandle, deadlineMs: number, stop: AbortSignal) {
+  const end = performance.now() + deadlineMs;
+  for (;;) {
+    const sample = await handle.observe(Math.max(1, end - performance.now()));
+    const transient = sample.state === "unavailable" && sample.reason === "stale";
+    if (!transient || stop.aborted || performance.now() + STALE_RETRY_MS >= end) return sample;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, STALE_RETRY_MS);
+      stop.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    });
+    if (stop.aborted) return sample;
+  }
+}
+
 export interface ClaudeCommandEnrollment {
   readonly entry: Entry;
   /** Resolves when the guard resolves a pressure outcome for this entry (watch only). */
@@ -126,7 +150,10 @@ export async function enrollClaudeCommand(
   const startedAtMs = performance.now();
   // The initial observe honours the abort: an aborted command goes straight to disposal instead of
   // waiting out the observe budget (the disposal join budget in lane.ts counts on this).
-  const initial = await observeUnlessAborted(handle.observe(deadlineMs), deadlineMs, signal);
+  const stopInitial = new AbortController();
+  let initial: Awaited<ReturnType<typeof initialObservation>> | undefined;
+  try { initial = await observeUnlessAborted(initialObservation(handle, deadlineMs, stopInitial.signal), deadlineMs, signal); }
+  finally { stopInitial.abort(); }
   if (!initial || !current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
   // Read-only uncertainty prevents memory intervention, not ordinary execution.
   if (initial.state !== "complete") return undefined;
