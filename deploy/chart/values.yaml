@@ -1408,7 +1408,7 @@ workers:
       # by a live pull (issue #285):
       #   ghcr.io                              -> manifest + anonymous pull token
       #   pkg-containers.githubusercontent.com -> 307 target for the blob layers
-      #                                           (config + the cluster-0.6.1.tgz)
+      #                                           (config + the cluster-<version>.tgz)
       # BOTH are needed — a manifest-only reachability check against ghcr.io alone passes
       # while the actual layer pull still fails at the blob host.
       #
@@ -1698,8 +1698,8 @@ database:
 #
 # Postgres image: the per-cluster values pin a specific tag from a private registry
 # mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
-# + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
-# operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
+# + confirmed mirrored); do NOT copy example-app's PG18 image here. (The fleet's CNPG
+# operator 1.30.1 supports newer majors, so 16.x is a fleet-convention choice, not an
 # operator-imposed ceiling.)
 postgres:
   enabled: false

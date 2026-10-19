@@ -110,14 +110,14 @@ jobs:
         with:
           version: v4.3.0
 
-      # Public CNPG operator, the SAME minor dev-cluster runs, pinned to a fixed
+      # Public CNPG operator, the SAME version the fleet runs, pinned to a fixed
       # release-asset URL (not a moving branch). Wait for the controller before the
       # chart creates the Cluster CR.
       - name: Install CNPG operator
         run: |
           set -euo pipefail
           kubectl apply --server-side -f \
-            "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.23.5/cnpg-1.23.5.yaml"
+            "https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml"
           kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager --timeout=180s
           # rollout status only proves the operator POD is Ready per its probe; the
           # mutating webhook (mcluster.cnpg.io) can still refuse connections until
@@ -153,19 +153,10 @@ jobs:
           set -euo pipefail
           # Vendor the CNPG subchart (gitignored; Chart.lock pins it) before install.
           helm dependency build deploy/chart
-          # --server-side=false: Helm 4 defaults `install` to server-side apply, which
-          # strictly validates every field against the target CRD schema. The pinned
-          # CNPG `cluster` subchart (0.6.1) unconditionally renders
-          # `.spec.monitoring.tls.enabled` on the Cluster CR, but the fleet-pinned CNPG
-          # operator (1.23.5) ships a CRD that does not declare that field yet, so SSA
-          # rejects the install ("field not declared in schema"). Helm 3 and the real
-          # deploy path (ArgoCD) both use client-side apply, where the apiserver prunes
-          # the unknown field -- harmless. Forcing client-side here makes the smoke
-          # match production apply semantics instead of testing a stricter path nothing
-          # ships. Bumping the CNPG operator+subchart pair (so the CRD gains the field)
-          # is the alternative, but that is a fleet-wide change; tracked separately.
-          helm install uzi deploy/chart -n uzi -f deploy/values/kind-smoke.yaml \
-            --server-side=false
+          # Helm 4's default server-side apply validates every field against the CRD
+          # schema, so this also proves the subchart renders nothing the operator's
+          # Cluster CRD lacks (#448).
+          helm install uzi deploy/chart -n uzi -f deploy/values/kind-smoke.yaml
 
       - name: Wait for workloads
         run: |
