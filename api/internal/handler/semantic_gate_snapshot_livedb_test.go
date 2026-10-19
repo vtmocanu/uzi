@@ -37,7 +37,7 @@ func (s *semanticSnapshotStore) GetRunByIDForUser(ctx context.Context, arg store
 }
 
 func TestGetRunSemanticSnapshotLiveDB(t *testing.T) {
-	for _, scenario := range []string{"captured_N", "foreign", "admin_observer", "structural", "missing_source", "corrupt_source", "missing_plan", "corrupt_plan"} {
+	for _, scenario := range []string{"captured_N", "foreign", "admin_observer", "admin_user_scope", "structural", "missing_source", "corrupt_source", "missing_plan", "corrupt_plan"} {
 		t.Run(scenario, func(t *testing.T) {
 			h, router, pool := cliLiveDB(t)
 			ctx := t.Context()
@@ -57,10 +57,14 @@ func TestGetRunSemanticSnapshotLiveDB(t *testing.T) {
 			if scenario == "foreign" {
 				viewer = cliSeedUser(t, pool, false)
 			}
-			if scenario == "admin_observer" {
+			if scenario == "admin_observer" || scenario == "admin_user_scope" {
 				viewer = cliSeedUser(t, pool, true)
 			}
-			token := cliMintToken(t, pool, viewer, clitoken.ScopeUser)
+			scope := clitoken.ScopeUser
+			if scenario == "admin_observer" {
+				scope = clitoken.ScopeAdminRO
+			}
+			token := cliMintToken(t, pool, viewer, scope)
 			route := "/api/runs/" + id.String()
 			if scenario == "structural" {
 				rec := bearerReq(router, http.MethodGet, route, token)
@@ -164,7 +168,7 @@ func TestGetRunSemanticSnapshotLiveDB(t *testing.T) {
 				cliMustExec(t, pool, "UPDATE semantic_snapshots SET raw=$3 WHERE run_id=$1 AND hash=$2", id, target, []byte("corrupt"))
 			}
 			rec := bearerReq(router, http.MethodGet, route, token)
-			if scenario == "foreign" {
+			if scenario == "foreign" || scenario == "admin_user_scope" {
 				if rec.Code != http.StatusNotFound || bytes.Contains(rec.Body.Bytes(), issue) {
 					t.Fatalf("foreign response: %d %s", rec.Code, rec.Body.String())
 				}
