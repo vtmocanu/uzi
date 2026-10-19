@@ -1758,8 +1758,10 @@ describe("m1 cooperative safety admission", () => {
     const rejected = assert.rejects(cancelled, CheckpointSoftDeadlineError);
     const later = safety.withBoundary(req("checkpoint"), async () => { events.push("later"); });
     stop.abort(); await rejected;
-    assert.deepEqual(events, []);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const beforePredecessorSettled = [...events];
     release.resolve(); await Promise.all([active, later]);
+    assert.deepEqual(beforePredecessorSettled, [], "successor must remain queued until predecessor settles");
     assert.deepEqual(events, ["active", "later"]);
     assert.equal(reg.isPoisoned(), false);
   });

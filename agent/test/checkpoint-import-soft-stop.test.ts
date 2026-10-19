@@ -81,6 +81,7 @@ for (const operation of ["fetch", "bridge"] as const) {
           .map(name => [name, fs.readFileSync(path.join(f.bare, "uzi-owed", name), "utf8")]);
         const stop = new AbortController();
         let fired = false;
+        let latePins = 0;
         // Inject the stop after the real safe read, retaining the lock and snapshot.
         const internal = f.cache as unknown as {
           ancestry(...args: unknown[]): Promise<unknown>;
@@ -93,11 +94,14 @@ for (const operation of ["fetch", "bridge"] as const) {
           fired = true; stop.abort();
           return value;
         };
-        await assert.rejects(f.cache.withBoundaryProcessSpawner(realSpawner(), new AbortController().signal,
+        await assert.rejects(f.cache.withBoundaryProcessSpawner(realSpawner(args => {
+          if (fired && args.includes("update-ref") && args.some(a => a.startsWith("refs/uzi-owed/"))) latePins++;
+        }), new AbortController().signal,
           () => operation === "fetch" ? f.fetch()
             : f.cache.updateTrackingRef(f.bare, branch, incoming, f.options),
           { softSignal: stop.signal }), CheckpointSoftDeadlineError);
         assert.equal(fired, true);
+        assert.equal(latePins, 0, "no ownership pin command may run after pre-mutation stop");
         assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
         assert.equal(fs.readFileSync(f.receipt, "utf8"), receipt);
         assert.deepEqual(fs.readdirSync(path.join(f.bare, "uzi-owed")).sort()

@@ -119,6 +119,8 @@ for (const failure of ["soft import", "ordinary import", "capture", "unread head
     const softBudgets: number[] = [];
     let active = false, imports = 0, original = "", verified = false, unread = false;
     const fetch = git.fetchAgentBranch.bind(git), pin = git.pinCodeSnapshot.bind(git), tip = git.branchTip.bind(git);
+    const submitted: unknown[] = [];
+    const candidates: Array<string | undefined> = [];
     let failCapture = failure === "capture";
     let contextStopped = false;
     const originTip = git.originBranchTip.bind(git);
@@ -135,7 +137,7 @@ for (const failure of ["soft import", "ordinary import", "capture", "unread head
         assert.equal(args[4].checkpointImportMode, "done");
         if (imports === 1 && failure === "soft import") throw new CheckpointSoftDeadlineError();
         if (imports === 1 && failure === "ordinary import") throw new Error("local import unavailable");
-        assert.equal(args[4].expectedCandidateSha, original);
+        candidates.push(args[4].expectedCandidateSha);
       }
       return fetch(...args);
     });
@@ -150,6 +152,7 @@ for (const failure of ["soft import", "ordinary import", "capture", "unread head
     t.mock.method(client, "recordCompletionAttempt", async () => ({ unmet: [], attemptCount: 1 }));
     t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row", repo_instructions_enabled: false }));
     const submit = t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _generation: number, snapshot: Parameters<typeof client.submitCodeCrossCheck>[2]) => {
+      submitted.push(snapshot);
       assert.ok("head_commit" in snapshot);
       assert.equal(snapshot.head_commit, original);
       return { stage: "code" as const, round: 1 as const, candidate_generation: 1,
@@ -184,6 +187,9 @@ for (const failure of ["soft import", "ordinary import", "capture", "unread head
       checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: (fire, ms) => { softBudgets.push(ms); return clock.arm(fire, ms); } },
     }).execute(gitlabClaim(312303, { code_cross_check_required: true, claim_generation: 1 }));
     assert.equal(verified, true); assert.equal(submit.mock.callCount(), 1);
+    assert.ok(candidates.length > 0);
+    assert.equal(candidates.at(-1), original, "fresh import must retain original candidate");
+    assert.deepEqual((submitted[0] as { head_commit?: string }).head_commit, original, "submitted snapshot must carry original head");
     assert.deepEqual(softBudgets, [60_000, 60_000]);
     assert.ok(clock.budgets.some(b => b.sink === "done_checkpoint"), "the fresh hard deadline was armed");
     assert.ok(clock.budgets.filter(b => b.sink === "done_checkpoint").every(b => b.ms === 90_000));
