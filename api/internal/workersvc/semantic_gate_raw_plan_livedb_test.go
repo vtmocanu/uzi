@@ -84,6 +84,12 @@ func TestSemanticGateRawPlanDisplayLiveDB(t *testing.T) {
 	req.ExpectedGateRevision = &next.Approval.PresentationRevision
 	final := presentSemanticGate(t, f, req)
 	assertRaw(final, f.structural.PlanMd)
+	if f.candidate.PlanHash != rawCandidate.PlanHash || f.candidate.Digest == rawCandidate.Digest || f.candidate.Criteria[0].ID == rawCandidate.Criteria[0].ID {
+		t.Fatal("restored raw plan resurrected historical candidate identity")
+	}
+	if _, err := semanticGateApprove(f, f.e.userID, gate, nil); err == nil {
+		t.Fatal("restored raw plan resurrected original approval")
+	}
 	first, err := semanticGateApprove(f, f.e.userID, final, nil)
 	if err != nil {
 		t.Fatal(err)
