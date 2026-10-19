@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import { it } from "node:test";
 import type { Executor } from "../src/executor.js";
 import type { CodeCrossCheckRecord, CodeCrossCheckStatus } from "../src/code-cross-check-contract.js";
@@ -18,18 +19,20 @@ const scenarios = [
   "changed clone", "both soft stops", "cross-check off",
   "null head normal H1", "unreadable head normal H1",
   "null head normal null", "unreadable head normal null",
-  "cold context",
+  "cold context", "contract-enabled both soft stops",
 ] as const;
 
 // Every real import and ownership read below uses the harness GitCache. Only the named
 // initial/fresh soft stops and initial head read are injected; finalize is never stubbed.
 for (const scenario of scenarios) {
-  it(`m3 snapshot retry: ${scenario}`, async t => {
+  it(`m3 snapshot retry (${scenario === "contract-enabled both soft stops" ? "contract finalize" : "ordinary finalize"}): ${scenario}`, async t => {
+    const contractEnabled = scenario === "contract-enabled both soft stops";
+    const bothSoftStops = scenario === "both soft stops" || contractEnabled;
     const clock = virtualBoundaryClock();
     const enabled = scenario !== "cross-check off";
     const missingHead = scenario.startsWith("null head") || scenario.startsWith("unreadable head");
     const nullCompletion = scenario.endsWith("normal null");
-    const expectedFailure = scenario === "changed clone" || scenario === "both soft stops" || nullCompletion;
+    const expectedFailure = scenario === "changed clone" || bothSoftStops || nullCompletion;
     const fetch = git.fetchAgentBranch.bind(git);
     const tip = git.branchTip.bind(git);
     const originTip = git.originBranchTip.bind(git);
@@ -74,7 +77,7 @@ for (const scenario of scenarios) {
       };
       imports.push(observed);
       events.push(`${phase} import`);
-      if (phase === "initial" || phase === "fresh" && scenario === "both soft stops") {
+      if (phase === "initial" || phase === "fresh" && bothSoftStops) {
         throw new CheckpointSoftDeadlineError();
       }
       observed.result = await fetch(...args);
@@ -85,10 +88,11 @@ for (const scenario of scenarios) {
       }
       return observed.result;
     });
+    const recordAttempt = client.recordCompletionAttempt.bind(client);
     t.mock.method(client, "recordCompletionAttempt", async (_id: string, body: Parameters<typeof client.recordCompletionAttempt>[1]) => {
       events.push("normal completion recorded");
       attempts.push(structuredClone(body));
-      return { unmet: [], attemptCount: 1 };
+      return contractEnabled ? recordAttempt(_id, body) : { unmet: [], attemptCount: 1 };
     });
     const statusReads: CodeCrossCheckStatus[] = [];
     t.mock.method(client, "codeCrossCheckStatus", async () => {
@@ -155,10 +159,22 @@ for (const scenario of scenarios) {
       },
     };
     const forge = fakeGitlab();
+    const claim = gitlabClaim(312310, {
+      code_cross_check_required: enabled, claim_generation: 7,
+      ...(contractEnabled ? { config: { completion_contract_version: 1, contract_revision: 1 } } : {}),
+    });
+    let pushedHead: (() => string) | undefined;
+    if (contractEnabled) {
+      api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
+      await client.register("m3-snapshot-retry");
+      api.setPublicationState(claim.run_id, [], 1);
+      pushedHead = followSuccessfulPush(git, forge.pr);
+    }
+    const permitRequests = api.completionPermitRequests;
     await runnerWith(() => ({ executor }), forge.gitlab, undefined, undefined, {
       checkpointIntervalMs: 0,
       checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
-    }).execute(gitlabClaim(312310, { code_cross_check_required: enabled, claim_generation: 7 }));
+    }).execute(claim);
 
     // Runner advisory catches must not turn a swallowed assertion into a green test.
     assert.equal(modelTurns, 1);
@@ -194,7 +210,7 @@ for (const scenario of scenarios) {
 
     const fresh = imports.filter(i => i.phase === "fresh");
     const finalized = imports.filter(i => i.phase === "finalize");
-    assert.ok(finalized.length > 0, "ordinary finalize independently imports");
+    assert.ok(finalized.length > 0, "finalize independently imports");
     const finalImport = finalized[0]!;
     const finalHead = scenario === "changed clone" ? h2 : h1;
     assert.equal(finalImport.result?.kind, "updated", "finalize is a positive real Git import");
@@ -202,7 +218,7 @@ for (const scenario of scenarios) {
     assert.equal(finalImport.tracking, finalHead);
     assert.deepEqual(finalImport.owned, { kind: "owned", sha: finalHead, context: finalImport.context });
     assert.ok(finalImport.owed?.some(c => c.sha === finalHead && c.pinRef === `refs/uzi-owed/${runId}/${finalHead}`));
-    assert.equal(await tip(fx.originPath, branch), finalHead, "real guarded finalize publishes its candidate");
+    assert.equal(await tip(fx.originPath, branch), finalHead, "real finalize publishes its candidate");
     assert.equal(forge.calls.filter(c => c.method === "POST").length, 1, "actual MR creation is observed outside callbacks");
     assert.ok(api.states.some(s => s.body.status === "completed"), "run reaches completed");
     if (scenario === "changed clone") {
@@ -210,7 +226,7 @@ for (const scenario of scenarios) {
       assert.notEqual(h2, h1);
       assert.equal(fresh.length, 0, "clone comparison refuses H2 before a fresh import");
       assert.equal(imports[0]?.expected, h1);
-    } else if (scenario === "both soft stops") {
+    } else if (bothSoftStops) {
       assert.equal(fresh.length, 1);
       assert.equal(fresh[0]!.expected, h1);
       assert.equal(fresh[0]!.result, undefined);
@@ -225,6 +241,29 @@ for (const scenario of scenarios) {
       assert.match(forge.pr.description, /Code cross-check incomplete: snapshot failed/);
       assert.doesNotMatch(forge.pr.description, /Code cross-check \(checked|Code cross-check[^\n]*pass/i);
       assert.ok(JSON.stringify(forge.calls).includes("Code cross-check incomplete: snapshot failed"));
+    }
+    if (contractEnabled) {
+      assert.equal(imports.filter(i => i.phase === "initial").length, 1);
+      assert.equal(api.completionAttemptRequests.length, 1, "one normal server completion attempt");
+      assert.equal(permitRequests.length, 1, "exactly one authoritative finalize permit request");
+      assert.equal(permitRequests[0]!.runId, runId);
+      assert.deepEqual(permitRequests[0]!.body, {
+        contract_revision: 1, branch, head: h1, claim_generation: 7,
+      });
+      assert.equal(pushedHead?.(), h1, "permit candidate was really pushed");
+      assert.equal(forge.pr.head, h1, "forge follows the actual push candidate");
+      const completed = api.states.filter(s => s.runId === runId && s.body.status === "completed");
+      assert.equal(completed.length, 1);
+      assert.equal(completed[0]!.body.head, h1, "completed report binds permitted and verified H1");
+      assert.equal(completed[0]!.body.branch, branch);
+      assert.equal(completed[0]!.body.mr_iid, 42);
+      assert.equal(completed[0]!.body.claim_generation, 7);
+      assert.equal(api.completionHoldRequests.length, 0);
+      assert.ok(forge.all.some(c => c.method === "GET"), "authoritative finalize reads the PR head");
+      assert.match(forge.pr.description, /Code cross-check incomplete: snapshot failed/);
+      assert.match(forge.pr.description, /Closes #312310/, "advisory acquisition failure does not revoke verified completion");
+    } else {
+      assert.deepEqual(permitRequests, [], "ordinary finalize requests no completion permit");
     }
     if (scenario === "cold context") {
       assert.equal(contextStopped, true);
