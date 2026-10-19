@@ -663,11 +663,88 @@ for (const fail of [false, true]) {
   });
 }
 
-test("M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor", async () => {
+for (const primaryError of [new Error("exact owner failure"), undefined]) {
+  test(`execution owner forwards exact primary rejection with pending completion error=${primaryError !== undefined}`, async () => {
+    const claim = gitlabClaim(2396);
+    const runner = runnerWith(() => ({ executor: { run: async () => {
+      throw new Error("owner-only executor must not run");
+    } } }), fakeGitlab().gitlab);
+    const owner = runner as unknown as {
+      executeClaim: (claim: ClaimResponse, own: (operation: Promise<void>) => void) => Promise<void>;
+      executionTails: Map<string, Promise<void>>;
+    };
+    const cleanup = releaseGate();
+    owner.executeClaim = async (_claim, own) => {
+      own(cleanup.promise);
+      throw primaryError;
+    };
+    const observation = runner.execute(claim);
+    const tail = owner.executionTails.get(claim.run_id)!;
+    assert.ok(tail, "pending completion is strongly owned by existing map");
+    try {
+      await observation.then(() => assert.fail("expected exact rejection"), error => {
+        assert.equal(error, primaryError);
+        assert.equal(runner.isExecuting(claim.run_id), true);
+        assert.equal(owner.executionTails.get(claim.run_id), tail);
+      });
+      assert.equal(runner.isExecuting(claim.run_id), true);
+    } finally {
+      cleanup.resolve();
+      await tail;
+    }
+    assert.equal(runner.isExecuting(claim.run_id), false);
+  });
+}
+
+test("execution owner ordinary observation follows tail deletion", async () => {
+  const claim = gitlabClaim(2396);
+  const runner = runnerWith(() => ({ executor: { run: async () => {
+    throw new Error("owner-only executor must not run");
+  } } }), fakeGitlab().gitlab);
+  const owner = runner as unknown as {
+    executeClaim: () => Promise<void>;
+    executionTails: Map<string, Promise<void>>;
+  };
+  owner.executeClaim = async () => {};
+  const observation = runner.execute(claim);
+  const tail = owner.executionTails.get(claim.run_id)!;
+  assert.ok(tail);
+  await observation.then(() => {
+    assert.equal(owner.executionTails.has(claim.run_id), false);
+    assert.equal(runner.isExecuting(claim.run_id), false);
+  });
+  await tail;
+});
+
+for (const claimCredential of [true, false]) {
+test(`M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor credential=${claimCredential}`, async () => {
   const f = await setup(1);
+  const successorCredential = f.claim.secrets.codex;
   const monitoring = f.memory.run();
   const release = releaseGate();
   const successorRelease = releaseGate();
+  const cleanupRelease = releaseGate();
+  const duplicateRelease = releaseGate();
+  const captureReturnedGate = releaseGate();
+  const duplicateEnteredGate = releaseGate();
+  const rig = codexRig();
+  let fullReapCompleted = false;
+  const provider = rig.registry.reserveLaunch("provider");
+  assert.equal(provider.kind, "reserved");
+  if (provider.kind !== "reserved") throw new Error("provider reservation refused");
+  rig.registry.registerRoot(provider.reservation, {
+    kind: "provider",
+    reap: async () => {
+      fullReapCompleted = false;
+      await Promise.resolve();
+      fullReapCompleted = true;
+      return { ok: true };
+    },
+    dispose: async () => {},
+  });
+  let captureContext: Parameters<Parameters<typeof rig.capture>[1]>[0] | undefined;
+  let captureReturned = false, protectedScope: boolean | undefined, duplicateEntered = false;
+  let queuedWork: Promise<void> | undefined;
   let original: MemoryFlightProof | undefined;
   let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
   let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined;
@@ -688,13 +765,30 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     return ack;
   };
   fs.writeFileSync(homeDir + "/session-proof", "original session");
-  git.worktreeStatus = async () => ["M fixture"];
+  git.worktreeStatus = async () => {
+    protectedScope ??= captureContext !== undefined && !captureContext.signal.aborted &&
+      rig.registry.state() === "poisoned" && rig.registry.pendingLaunchCount() === 0 &&
+      rig.registry.inFlightCallbackCount() === 0 && fullReapCompleted;
+    return ["M fixture"];
+  };
   git.commitWipMarker = async () => false;
   const executor: Executor = {
-    withCredentialFreeCapture: realCapture(),
+    withCredentialFreeCapture: async (deadline, action, purpose, signal) => {
+      try {
+        return await rig.capture(deadline, async context => {
+          captureContext = context;
+          return action(context);
+        }, purpose, signal);
+      } finally {
+        captureReturned = true;
+        captureReturnedGate.resolve();
+        await cleanupRelease.promise;
+      }
+    },
     run: async ctx => {
       const command = enroll(ctx);
       original = command.captured.flight as MemoryFlightProof;
+      if (!claimCredential) delete f.claim.secrets.codex;
       started = performance.now();
       f.pressure(950);
       const result = await command.captured.commands.watchOutcome(command.entry);
@@ -711,9 +805,12 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await work;
     assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
+    assert.equal(protectedScope, true, "fake protected source runs inside real drained capture scope");
+    assert.equal(captureReturned, false, "ACK still holds actual capture callback");
     const operation = original!.workerMemory!.operation!;
     assert.ok(operation, "original preservation promise remains on its flight");
     assert.notEqual(original!.workerMemory!.settled, true, "original work has not settled");
+    assert.equal(runner.isExecuting(f.claim.run_id), true, "execution tail owns the pending original capture");
     assert.equal(parkSignal!.aborted, true);
     assert.notEqual(original!.parked, true, "native acceptance alone cannot mark an expired flight parked");
     assert.equal(original!.retainedLocalCustody, true);
@@ -722,11 +819,25 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.equal(api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure").length, 1);
     assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
 
+    assert.deepEqual(await runner.withRetainedSourceBoundary(f.claim.run_id, [], async () => {
+      return "unexpected maintenance entry";
+    }), { entered: false }, "maintenance refuses before lock/capture acquisition");
+    const duplicateGate = runner as unknown as { gateQueuedDuplicate: () => Promise<boolean> };
+    duplicateGate.gateQueuedDuplicate = async () => {
+      duplicateEntered = true;
+      duplicateEnteredGate.resolve();
+      await duplicateRelease.promise;
+      return false;
+    };
+    queuedWork = runner.execute(f.claim);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(duplicateEntered, false, "same-run duplicate cannot reach its gate while ACK is pending");
     f.pressure(100);
     git.worktreeStatus = async () => [];
     api.memoryRegisterNonce = "successor-memory-registration";
     await client.register("memory-fixture", "base");
-    const next = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
+    const next = { ...f.claim, secrets: { ...f.claim.secrets, codex: successorCredential },
+      claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
     api.setOwnershipStatus(next.run_id, "running", 8);
     const nextExecutor: Executor = { withCredentialFreeCapture: realCapture(), run: async ctx => {
       successor = ctx.capturedMemory!();
@@ -755,7 +866,19 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     assert.notEqual(original!.workerMemory!.settled, true, "controlled release, not rescue, settles old park");
     const nextParked = nextFlight.parked;
     release.resolve();
+    await captureReturnedGate.promise;
+    assert.equal(captureReturned, true, "actual capture has returned before wrapper cleanup");
+    assert.equal(captureContext!.signal.aborted, true);
+    assert.notEqual(original!.workerMemory!.settled, true, "ACK return is not full wrapper cleanup");
+    assert.equal(duplicateEntered, false, "tail also owns delayed scope wrapper cleanup");
+    assert.equal(runner.isExecuting(f.claim.run_id), true);
+    cleanupRelease.resolve();
     await operation;
+    await duplicateEnteredGate.promise;
+    assert.equal(runner.isExecuting(f.claim.run_id), true, "old owner cannot delete replacement tail");
+    duplicateRelease.resolve();
+    await queuedWork;
+    assert.equal(runner.isExecuting(f.claim.run_id), false, "replacement releases only after owned join");
     assert.equal(original!.workerMemory!.operation, operation, "late completion settles the same original promise");
     assert.equal(original!.workerMemory!.settled, true);
     assert.notEqual(original!.parked, true);
@@ -766,15 +889,19 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
   } finally {
     clearTimeout(rescue);
     release.resolve();
+    cleanupRelease.resolve();
+    duplicateRelease.resolve();
     successorRelease.resolve();
     await work;
     await original?.workerMemory?.operation;
     await original?.workerMemory?.closing;
     await successorWork;
+    await queuedWork;
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }
 });
+}
 
 for (const interruption of ["registration", "generation", "shutdown", "cancel"] as const) {
   test(`M3 capture interruption ${interruption} keeps original custody and prevents stale mutations`, async () => {

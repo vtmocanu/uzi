@@ -3060,43 +3060,65 @@ export class RunRunner {
     if (!RUN_ID_RE.test(runId))
       throw new Error("refusing to execute a run with an invalid run id");
     const previous = this.executionTails.get(runId);
-    let release!: () => void;
+    let release!: (completion: Promise<void>) => void;
     const tail = new Promise<void>((resolve) => { release = resolve; });
+    let resolveObserver!: () => void;
+    let rejectObserver!: (error: unknown) => void;
+    const observer = new Promise<void>((resolve, reject) => {
+      resolveObserver = resolve;
+      rejectObserver = reject;
+    });
+    let ownedMemory: Promise<void> | undefined;
+    let failed = false;
+    let primaryError: unknown;
+    const deliver = () => { if (failed) rejectObserver(primaryError); else resolveObserver(); };
     // Install synchronously before factory work. A third claim must queue behind
     // the second even while the second is waiting for the first's cleanup.
     this.executionTails.set(runId, tail);
-    try {
-      // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
-      // its executor or touches its HOME. Holding the lock only this long is enough: the
-      // executionTails entry installed above already makes every later reclaim see the run as
-      // executing (isExecuting) and skip it, so the only deletion that can overlap this
-      // execution is one that checked before that entry existed, and that one holds the lock.
-      // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
-      // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
-      // this execution's rebuilt caches.
-      if (this.diskLocks) {
-        const releaseDisk = await this.diskLocks.acquire(runId);
-        this.cachesDropped?.forget(runId);
-        releaseDisk();
-      } else {
-        this.cachesDropped?.forget(runId);
+    release((async () => {
+      try {
+        // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
+        // its executor or touches its HOME. Holding the lock only this long is enough: the
+        // executionTails entry installed above already makes every later reclaim see the run as
+        // executing (isExecuting) and skip it, so the only deletion that can overlap this
+        // execution is one that checked before that entry existed, and that one holds the lock.
+        // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
+        // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
+        // this execution's rebuilt caches.
+        if (this.diskLocks) {
+          const releaseDisk = await this.diskLocks.acquire(runId);
+          this.cachesDropped?.forget(runId);
+          releaseDisk();
+        } else {
+          this.cachesDropped?.forget(runId);
+        }
+        if (previous) {
+          await previous;
+          // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
+          // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
+          // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
+          // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
+          // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
+          // its authoritative status for the api's own reclaim/sweep to resolve.
+          if (!(await this.gateQueuedDuplicate(claim))) return;
+          claim = await this.refreshQueuedClaimCursor(claim);
+        }
+        await this.executeClaim(claim, operation => { ownedMemory = operation; });
+      } catch (error) {
+        failed = true;
+        primaryError = error;
+      } finally {
+        // Public observation stays bounded; the same tail owns capture cleanup.
+        // Joining the original operation grants no fresh capture authority.
+        if (ownedMemory) {
+          deliver();
+          await Promise.allSettled([ownedMemory]);
+        }
+        if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
+        if (!ownedMemory) deliver();
       }
-      if (previous) {
-        await previous;
-        // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
-        // of this run serialised behind the first must NOT blindly re-execute: the first attempt may
-        // have journaled a terminal outcome, or a reclaim may have bumped the generation. Drain this
-        // run's pending terminal synchronously, then probe ownership and decide (proceed only on a
-        // claimed/running row AT this claim's generation). Ending here sends NO report — the run keeps
-        // its authoritative status for the api's own reclaim/sweep to resolve.
-        if (!(await this.gateQueuedDuplicate(claim))) return;
-        claim = await this.refreshQueuedClaimCursor(claim);
-      }
-      await this.executeClaim(claim);
-    } finally {
-      if (this.executionTails.get(runId) === tail) this.executionTails.delete(runId);
-      release();
-    }
+    })());
+    return observer;
   }
 
   /**
@@ -3263,15 +3285,16 @@ export class RunRunner {
     }
   }
 
-  private async executeClaim(claim: ClaimResponse): Promise<void> {
+  private async executeClaim(claim: ClaimResponse, ownMemory: (operation: Promise<void>) => void): Promise<void> {
     let observedFlight: RunFlight | undefined;
     return MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
       return this.observeCancellation(observedFlight);
-    }, () => this.executeClaimInAttempt(claim, flight => { observedFlight = flight; }));
+    }, () => this.executeClaimInAttempt(claim, flight => { observedFlight = flight; }, ownMemory));
   }
 
-  private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void): Promise<void> {
+  private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void,
+    ownMemory: (operation: Promise<void>) => void): Promise<void> {
     const runId = claim.run_id;
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
@@ -4197,6 +4220,10 @@ export class RunRunner {
       if (flight.workerMemory) {
         flight.workerMemory.ended = true;
         flight.workerMemory.unsubscribe?.();
+        if (this.requiresFreeCaptureScope(claim, flight) && flight.workerMemory.operation && !flight.workerMemory.settled) {
+          flight.runLog.warn("codex capture operation pending; source reservation retained");
+          ownMemory(flight.workerMemory.operation);
+        }
       }
       // PRD #1171 m4 (F1): the FINAL Codex registry disposal, after EVERY durability sink has
       // settled. A Codex executor's run() no longer disposes its registry on the normal path —
@@ -13505,6 +13532,11 @@ export class RunRunner {
     });
   }
 
+  private requiresFreeCaptureScope(claim: ClaimResponse, flight: RunFlight): boolean {
+    return !!(flight.executor.withCredentialFreeCapture || flight.executor.safety ||
+      flight.executor.sandboxesCommands || flight.executor.settleForCredentialFreeCapture || claim.secrets.codex);
+  }
+
   /** Sink gate precedes executor admission; GitCache alone binds restricted spawning.
    * One absolute deadline includes queueing and all awaited callback work. */
   private runFreeCapture<T>(
@@ -13513,8 +13545,7 @@ export class RunRunner {
     purpose: "capture" | "cancel" = "capture",
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete" }> {
     return this.runGatedSink(flight, async () => {
-      const requiresScope = !!(flight.executor.withCredentialFreeCapture || flight.executor.safety ||
-        flight.executor.sandboxesCommands || flight.executor.settleForCredentialFreeCapture || claim.secrets.codex);
+      const requiresScope = this.requiresFreeCaptureScope(claim, flight);
       const remaining = () => Math.max(0, deadlineAt - Date.now());
       if ((requiresScope && remaining() === 0) || signal?.aborted) return { kind: "incomplete" };
       let actionEntered = false;
@@ -17812,6 +17843,7 @@ export class RunRunner {
   private startWorkerMemoryPreservation(flight: RunFlight): Promise<void> {
     const memory = flight.workerMemory!;
     if (memory.operation) return memory.operation;
+    if (memory.ended) return Promise.resolve();
     const hold = memory.hold!;
     // Preparation left tool outcome delivery open. This owner operation now stops
     // only the original model execution; its capture signal is independent.
@@ -17836,7 +17868,9 @@ export class RunRunner {
         throw new RetainedRecoveryStop();
     };
     try {
+      identity();
       await this.git.withRecoveryOperation(lifecycle, deadline, async signal => {
+        identity();
         const result = await this.runFreeCapture(memory.claim, flight, deadline, signal, async held => {
           const check = async () => {
             this.assertHeldFreeCapture(flight, held);
