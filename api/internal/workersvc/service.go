@@ -4839,6 +4839,14 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			approvalParams.SizeClass = pgtype.Text{}
 			approvalParams.MilestonesCandidate = retainedMilestonesCandidate(decision.retained)
 		}
+		rebindSource := decision.class == gateClassPublish && fenceTx != nil &&
+			policyEligible(owned) && !owned.TargetRunID.Valid && len(owned.PolicyStopResolution) == 0 &&
+			owned.ClaimGeneration > 0 && owned.WorkerID.Valid && uuid.UUID(owned.WorkerID.Bytes) == wkr.ID &&
+			!owned.ClaimReleasedAt.Valid
+		var publicationSource *apitypes.PolicyRevisionSourceV1
+		if rebindSource {
+			publicationSource = policyRevisionSourceBeforePublication(owned)
+		}
 		rows, err = q.SetRunAwaitingApproval(ctx, approvalParams)
 		if err == nil && rows > 0 {
 			// Allocation only when the report was actually applied, in the same transaction.
@@ -4849,6 +4857,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			case gateClassRetain:
 				rev = owned.GateRevision
 				err = q.ResetRunGateRefusals(ctx, runID)
+			}
+			if err == nil && rebindSource {
+				err = rebindPolicyRevisionSource(ctx, q.(*store.Queries), owned, publicationSource, rev)
 			}
 			if err == nil && req.RevisionInputID != nil {
 				err = settleRevisionTargets(ctx, q.(*store.Queries), owned, wkr.ID, req)

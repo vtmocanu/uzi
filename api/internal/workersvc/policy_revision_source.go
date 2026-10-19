@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,58 @@ func (s *Service) writePolicyRevisionSource(ctx context.Context, tx pgx.Tx, w st
 	}
 	if rows != 1 {
 		return fmt.Errorf("policy revision source fence: affected %d rows", rows)
+	}
+	return nil
+}
+
+// Capture coverage from the locked pre-publication row. Publication must not
+// make an old mismatched source appear valid by replacing the gate first.
+func policyRevisionSourceBeforePublication(r store.Run) *apitypes.PolicyRevisionSourceV1 {
+	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
+	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
+		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
+		return nil
+	}
+	return &source
+}
+
+// The caller has applied a publish decision in the same claim transaction.
+// Only the gate changes: primary and historical associations remain evidence,
+// never an approval or an acceptance of the new candidate.
+func rebindPolicyRevisionSource(ctx context.Context, q *store.Queries, owned store.Run, source *apitypes.PolicyRevisionSourceV1, revision int64) error {
+	var raw []byte
+	if source != nil {
+		published, err := q.GetRunByID(ctx, owned.ID)
+		if err != nil {
+			return err
+		}
+		source.Gate = &apitypes.PolicyStopGateContext{
+			Revision:       stopDecimal(published.GateRevision),
+			PresentationID: uuid.UUID(published.GatePresentationID.Bytes).String(),
+			PayloadDigest:  hex.EncodeToString(published.GatePayloadDigest),
+		}
+		// ID-less publications cannot represent a V1 gate. Authenticate the
+		// persisted snapshot as well as the revision actually allocated.
+		if published.GateRevision == revision && published.GatePresentationID.Valid &&
+			uuid.UUID(published.GatePresentationID.Bytes) != uuid.Nil &&
+			policyRevisionGateMatches(published, *source) {
+			raw, err = json.Marshal(source)
+			if err != nil {
+				return err
+			}
+			if _, err := apitypes.ParsePolicyRevisionSourceV1(raw); err != nil {
+				raw = nil
+			}
+		}
+	}
+	rows, err := q.SetPolicyRevisionSource(ctx, store.SetPolicyRevisionSourceParams{
+		Source: raw, RunID: owned.ID, WorkerID: uuid.UUID(owned.WorkerID.Bytes), ClaimGeneration: owned.ClaimGeneration,
+	})
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("policy gate source fence: affected %d rows", rows)
 	}
 	return nil
 }
