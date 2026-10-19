@@ -15,6 +15,15 @@ WHERE run_id = $1 AND kind = 'revise_plan'
   AND disposition IS DISTINCT FROM 'superseded_by_stop'
 ORDER BY id;
 
+-- name: HasPolicyRevisionHistory :one
+-- The caller holds the parent run lock. Recorded revision history prevents an
+-- unknown source from regaining legacy approval after a plan frame or reclaim.
+-- This is negative evidence only; source acceptance remains an explicit writer.
+SELECT (EXISTS (
+ SELECT 1 FROM run_messages
+ WHERE run_id = sqlc.arg(run_id)::uuid AND kind = 'plan_revising'
+))::boolean AS has_revision;
+
 -- name: HasPolicyCurrentGateApproval :one
 -- The caller authenticates the current source, presentation and candidate, and
 -- proves absence of applicable pending revision before using this receipt.

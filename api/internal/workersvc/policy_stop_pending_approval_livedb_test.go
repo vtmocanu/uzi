@@ -48,8 +48,10 @@ func policyStopPendingApprovalFixture(t *testing.T) (usageTailEnv, int64) {
 
 func policyStopPendingApprovalAccept(t *testing.T, e usageTailEnv) {
 	t.Helper()
-	// Awaiting-approval refusal requires the real revision-frame admission seam.
-	// The closed source witness remains explicitly seeded by the fixture.
+	// This frame simulates awaiting-approval revision admission, not a taken
+	// source. Its missing carrier must invalidate coverage. The receipt/Stop
+	// component proof restores its explicitly seeded V1 precondition below;
+	// this is not a source-writer-to-Stop composition proof.
 	if err := e.svc.AppendMessagesForClaim(e.ctx, e.wkr, e.runID, []IncomingMessage{{Seq: 1, Kind: "plan_revising", Payload: []byte("{}")}}, i64p(1)); err != nil {
 		t.Fatal(err)
 	}
@@ -59,6 +61,10 @@ func policyStopPendingApprovalAccept(t *testing.T, e usageTailEnv) {
 	if err != nil || disposition != PolicyHoldApplied || held.Status != "paused" {
 		t.Fatalf("real policy hold: status=%s disposition=%s err=%v", held.Status, disposition, err)
 	}
+	if len(held.PolicyRevisionSource) != 0 {
+		t.Fatal("metadata-only revision admission certified source coverage")
+	}
+	seedPolicyOwnerStopSource(t, e.codexTestEnv, e.runID)
 	// Closed full V1 plus no cross-check and NULL selection must still allow Stop.
 	review := policyOwnerStopReview(t, e)
 	result, err := e.svc.SubmitInputWithOptions(e.ctx, e.userID, e.runID, "stop", "finish completed work", nil,

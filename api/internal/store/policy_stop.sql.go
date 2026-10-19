@@ -316,6 +316,23 @@ func (q *Queries) HasPolicyCurrentGateApproval(ctx context.Context, arg HasPolic
 	return approved, err
 }
 
+const hasPolicyRevisionHistory = `-- name: HasPolicyRevisionHistory :one
+SELECT (EXISTS (
+ SELECT 1 FROM run_messages
+ WHERE run_id = $1::uuid AND kind = 'plan_revising'
+))::boolean AS has_revision
+`
+
+// The caller holds the parent run lock. Recorded revision history prevents an
+// unknown source from regaining legacy approval after a plan frame or reclaim.
+// This is negative evidence only; source acceptance remains an explicit writer.
+func (q *Queries) HasPolicyRevisionHistory(ctx context.Context, runID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasPolicyRevisionHistory, runID)
+	var has_revision bool
+	err := row.Scan(&has_revision)
+	return has_revision, err
+}
+
 const listPolicyStopRevisionInputs = `-- name: ListPolicyStopRevisionInputs :many
 SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'revise_plan'

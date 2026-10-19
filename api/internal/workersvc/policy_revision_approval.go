@@ -19,6 +19,10 @@ type policyRevisionApprovalReader interface {
 	HasPolicyCurrentGateApproval(context.Context, store.HasPolicyCurrentGateApprovalParams) (bool, error)
 }
 
+type policyRevisionLegacyReader interface {
+	HasPolicyRevisionHistory(context.Context, uuid.UUID) (bool, error)
+}
+
 // policyRevisionPlanApproved is read-only and independent of paused eligibility
 // and Stop actions. Future state/ACK/running callers must supply their locked row
 // and transaction-bound reader; claim assembly currently supplies its claim row.
@@ -45,10 +49,20 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 		}
 	}
 
-	// SQL NULL is unknown coverage, never a V1 no-revision witness. Preserve
-	// ordinary legacy implementation approval only when there is no gate/source.
+	// SQL NULL is unknown coverage, never a V1 no-revision witness. Retain the
+	// no-gate legacy implementation fallback only without recorded revision
+	// history. Invalidation must not turn an unverified revision into approval;
+	// later plan frames and generation changes cannot establish acceptance.
 	if len(r.PolicyRevisionSource) == 0 && r.GateRevision == 0 && !r.GatePresentationID.Valid {
-		return legacyApproved
+		if !legacyApproved {
+			return false
+		}
+		q, ok := reader.(policyRevisionLegacyReader)
+		if !ok {
+			return false
+		}
+		hasRevision, err := q.HasPolicyRevisionHistory(ctx, r.ID)
+		return err == nil && !hasRevision
 	}
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
 	if err != nil || !policyRevisionGateMatches(r, source) {
