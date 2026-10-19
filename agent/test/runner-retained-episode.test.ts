@@ -1669,6 +1669,24 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
       }
     }
     const observer = observe({ sourcePath: clone.path });
+    // Host-only registered-process/capture proof: explicitly complete readiness here.
+    // This does not prove the UID permission normalizer; actual UID fixtures are
+    // covered separately in the profile skipped on this host.
+    let readiness = 0;
+    t.mock.method(git, "normalizeRetainedSourceObjects", async (actualBare: string, actualBranch: string, actualKey: string,
+      actualSource: Parameters<GitCache["normalizeRetainedSourceObjects"]>[3]) => {
+      assert.equal(actualBare, bare);
+      assert.equal(actualBranch, clone.branch);
+      assert.equal(actualKey, key);
+      assert.equal(actualSource.runId, source.runId);
+      assert.equal(actualSource.clonePath, source.clonePath);
+      assert.equal(actualSource.attemptId, undefined, "canonical predecessor attribution remains exact");
+      readiness++;
+      assert.equal(observer.isActive(), false, "normalization stays outside both credential-free scopes");
+      const initial = observer.observations();
+      assert.equal(initial.entries, 1, "initial quiescence capture entered before readiness");
+      assert.equal(initial.returns, 1, "initial quiescence capture completed before readiness");
+    });
     const before = readJournal(bare, clone.branch);
     let verifiedCalls = 0, verifiedTrue = 0, facts = 0;
     const factScopes: boolean[] = [];
@@ -1723,11 +1741,13 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
       assert.equal(oldModels, 0);
       assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
       if (stage === "missing-capability") {
+        assert.equal(readiness, 0, "initial scope refusal precedes readiness");
         observer.assertRefusal();
         assert.equal(models, 0);
         assert.equal(facts, 0);
         assert.equal(readJournal(bare, clone.branch).clonePath, before.clonePath);
       } else {
+        assert.equal(readiness, 1, "readiness completed between the two scopes");
         assert.equal(models, 1);
         assert.equal(created, 2);
         if (stage === "captured" || stage === "adopting") {

@@ -1,4 +1,5 @@
 import { after } from "node:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -276,6 +277,7 @@ export function codexRig(
   );
   const reconcile: ReconcileBeforeBoundary = installer.reconcile;
 
+  const captureAttempt = new AsyncLocalStorage<Parameters<Capture>[4]>();
   const inner = createCodexExecutionSafety(
     registry,
     async () => {
@@ -311,6 +313,7 @@ export function codexRig(
       };
     },
     opts.armDeadline,
+    { reaperAttempt: () => captureAttempt.getStore() },
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];
@@ -340,7 +343,12 @@ export function codexRig(
     processSpawns: () => processSpawns,
     processArgv,
     settle: (deadlineMs) => inner.settleForCredentialFreeCapture(deadlineMs),
-    capture: (deadlineMs, action, _purpose, signal) => inner.withCredentialFreeCapture(deadlineMs, action, signal),
+    capture: (deadlineMs, action, _purpose, signal, attempt) => {
+      const snapshot = attempt === undefined ? undefined : Object.freeze({
+        marker: attempt.marker, cloneKey: attempt.cloneKey, clonePath: attempt.clonePath,
+      });
+      return captureAttempt.run(snapshot, () => inner.withCredentialFreeCapture(deadlineMs, action, signal));
+    },
   };
 }
 

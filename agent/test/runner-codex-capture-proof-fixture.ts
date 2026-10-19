@@ -130,14 +130,14 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
     }
     return report(id, body, signal);
   };
-  const capture: typeof rig.capture = async (ms, action, purpose, signal) => {
+  const capture: typeof rig.capture = async (ms, action, purpose, signal, attempt) => {
     try {
       return await rig.capture(ms, async held => {
         entries++; active = true;
         const refresh = rig.refreshCalls(), release = rig.releaseCalls();
         try { const value = await action(held); await hold("action-tail"); return value; }
         finally { authDeltas.push({refresh:rig.refreshCalls()-refresh,release:rig.releaseCalls()-release}); }
-      }, purpose, signal);
+      }, purpose, signal, attempt);
     } finally { active = false; returns++; }
   };
   const observations = () => ({entries, returns, source, holds, pubs, acks, authDeltas, spawns:rig.processSpawns()-start});

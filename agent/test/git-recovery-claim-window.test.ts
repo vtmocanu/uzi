@@ -4,6 +4,7 @@ import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
 import { RequestError } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
+import { SinkGate } from "../src/sink-gate.js";
 import { nullLogger } from "./helpers.js";
 
 // Exercise the production reservation and parser with persistent journal storage in memory.
@@ -125,27 +126,32 @@ for (const binding of ["bound predecessor", "legacy"] as const) {
     const f = fixture(t);
     const first = await f.reserve(binding === "legacy" ? undefined : 1);
     f.advance(300_001);
-    let reports = "", reads = 0;
+    let reports = "", reads = 0, quiescenceCalls = 0;
     // Run the production wrapper and ownership check, stopping at the first quiescence
     // boundary. The Linux runner suite covers capture/adoption and real source IO.
     const runner = Object.assign(Object.create(RunRunner.prototype), {
       git: f.recreate(), recoveryRetryMs: 1000, codexBoundaryDeadlineMs: 1000,
+      freeCaptureFlights: new WeakMap(),
       shutdownSignal: new AbortController(),
       client: { getRunOwnership: async () => { reads++; return { status: "running", claim_generation: 2 }; } },
       cloneCoordinates: () => ({ branch: "branch" }),
       retainedLifecycleGuard: () => {},
       retainedLifecycleSignal: () => new AbortController().signal,
       quiesceRun: async (_flight: unknown, _executor: unknown, opts: unknown) => {
+        quiescenceCalls++;
         assert.deepEqual(opts, { mode: "capture", site: "predecessor_capture",
           targetPaths: [f.source.clonePath], propagateControl: true });
         return { blocked: true };
       },
       reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { reports = error.message; },
     });
-    await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
+    await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId, secrets: {} }, {
       barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2,
+      executor: { run: async () => ({ branch: "branch" }) },
+      sinkGate: new SinkGate(), survivingTickGroups: [],
       runLog: nullLogger(),
     }, "key", f.read()));
+    assert.equal(quiescenceCalls, 1, "the production capture wrapper reached quiescence");
     assert.ok(reads > 0, "positive ownership verification preceded the reservation");
     assert.equal(f.read().recovery?.claimGeneration, 2);
     assert.equal(f.read().recovery?.deadline, first.deadline + 300_001);
