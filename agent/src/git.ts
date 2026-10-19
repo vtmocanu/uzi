@@ -11670,14 +11670,17 @@ try {
    * Caller owes positive non-stopped family/custody/origin/output-index proof,
    * quiescence, held bare lock, live execution reservation and worker-exclusive
    * private parents throughout. The supplied dev:ino is only a consistency check.
-   * Ordinary shared clones remain unsupported until authenticated base integration.
+   * A caller-selected canonical base supplies encoded prerequisites, never repository
+   * authentication. Both complete private copies still owe the later C verification.
    */
   // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
   private async snapshotMaintenanceObjects(
     source: { clonePath: string; identity: string },
     outDir: string,
     beforeEffect: () => Promise<void>,
-  ): Promise<{ path: string; byteSize: number; fileCount: number }> {
+    knownBase?: { barePath: string; identity: string },
+  ): Promise<{ path: string; byteSize: number; fileCount: number;
+    base?: { path: string; byteSize: number; fileCount: number } }> {
     type Stat = import("node:fs").BigIntStats;
     type Handle = Awaited<ReturnType<typeof fs.open>>;
     type Pin = { file: Handle; named: string; stat: Stat; output: boolean; absolute: string; immutable: boolean };
@@ -11695,6 +11698,12 @@ try {
     };
     const pins: Pin[] = [], handles = new Set<Handle>();
     const pinIndex = new Map<string, Pin>();
+    const workerInputs = new Set<Pin>();
+    // Match assertOwedBare's worker-exclusive directory policy without running Git.
+    const workerDirectory = (s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
+      s.uid === BigInt(process.getuid!()) && (s.mode & 2n) === 0n &&
+      ((s.mode & 16n) === 0n || (s.gid === BigInt(process.getgid!()) &&
+        !(uidSplitActive() && s.gid === BigInt(RUNNER_UID))));
     const inputs: Record[] = [], outputs: Record[] = [];
     const root = path.resolve(this.recoveryRoot), runner = path.resolve(this.runnerRoot);
     const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
@@ -11753,7 +11762,8 @@ try {
         const named = await stat(p.named, p.output), fd = await fstat(p.file, p.output);
         if (!(p.immutable ? unchanged(p.stat, named) && unchanged(named, fd) :
           same(p.stat, named) && same(named, fd)) || !fd.isDirectory() ||
-            (p.output && (!safeDirectory(p.absolute, named) || !safeDirectory(p.absolute, fd)))) throw refused();
+            (p.output && (!safeDirectory(p.absolute, named) || !safeDirectory(p.absolute, fd))) ||
+            (workerInputs.has(p) && (!workerDirectory(named) || !workerDirectory(fd)))) throw refused();
       }
     };
     const effect = async () => {
@@ -11811,7 +11821,7 @@ try {
       }
       throw refused();
     };
-    const controlsAbsent = async (objects: Pin) => {
+    const controlsAbsent = async (objects: Pin, omit = false) => {
       const p = child(objects, "info");
       let info: Stat;
       try { info = await stat(p, objects.output); }
@@ -11823,7 +11833,18 @@ try {
       if (!info.isDirectory() || info.isSymbolicLink()) throw refused();
       // Pin even this preliminary control lookup: no symlink-following probe.
       const d = await pin(p, absoluteChild(objects, "info"), objects.output, true, !objects.output);
-      for (const name of ["alternates", "http-alternates"]) await absent(child(d, name), objects.output);
+      for (const name of ["alternates", "http-alternates"]) {
+        const control = child(d, name);
+        if (!omit) { await absent(control, objects.output); continue; }
+        // Non-authoritative metadata only: never open, readlink, read or follow it.
+        try {
+          const s = await stat(control, false);
+          if (!s.isFile() && !s.isSymbolicLink() && !s.isFIFO()) throw refused();
+        } catch (error) {
+          check();
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
     };
     const createDirectory = async (parent: Pin, name: string, absolute: string) => {
       const p = child(parent, name);
@@ -11855,8 +11876,38 @@ try {
       if (String(clone.stat.dev) + ":" + String(clone.stat.ino) !== source.identity) throw refused();
       const gd = await pin(child(clone, ".git"), absoluteChild(clone, ".git"), false, true);
       const objects = await pin(child(gd, "objects"), absoluteChild(gd, "objects"), false, true, true);
-      await controlsAbsent(objects);
+      await controlsAbsent(objects, knownBase !== undefined);
+      let baseObjects: Pin | undefined, baseOut: string | undefined;
+      if (knownBase !== undefined) {
+        validPath(knownBase.barePath);
+        if (typeof knownBase.identity !== "string" || knownBase.identity.length > 128 ||
+            !/^[0-9]+:[0-9]+(?![\s\S])/.test(knownBase.identity) ||
+            path.dirname(knownBase.barePath) !== path.resolve(this.reposRoot) ||
+            !path.basename(knownBase.barePath).endsWith(".git")) throw refused();
+        // Reserve the fixed sibling's capacity BEFORE concatenation; never accept
+        // a caller path for the second output or discover a base via alternates.
+        meta(8448);
+        if (Buffer.byteLength(outDir) + Buffer.byteLength("-base") > 4096) throw refused();
+        baseOut = outDir + "-base";
+        validPath(baseOut);
+        for (const output of [outDir, baseOut]) {
+          for (const input of [source.clonePath, knownBase.barePath]) {
+            if (isWithinPath(output, input) || isWithinPath(input, output)) throw refused();
+          }
+        }
+        MaintenanceResources.consume("sources", 1);
+        const repos = await absoluteDirectory(path.resolve(this.reposRoot), false);
+        const bare = await pin(child(repos, path.basename(knownBase.barePath)), knownBase.barePath, false, true, true);
+        if (String(bare.stat.dev) + ":" + String(bare.stat.ino) !== knownBase.identity) throw refused();
+        baseObjects = await pin(child(bare, "objects"), absoluteChild(bare, "objects"), false, true, true);
+        for (const p of [repos, bare, baseObjects]) {
+          if (!workerDirectory(p.stat)) throw refused();
+          workerInputs.add(p);
+        }
+        await controlsAbsent(baseObjects);
+      }
       const parent = await absoluteDirectory(path.dirname(outDir), true);
+      if (baseOut) await absent(child(parent, path.basename(baseOut)), true);
       const destination = await createDirectory(parent, path.basename(outDir), outDir);
       const copyFile = async (src: Pin, dst: Pin, name: string, observed: Stat) => {
         const from = child(src, name), to = child(dst, name);
@@ -11902,7 +11953,7 @@ try {
           await close(input);
         }
       };
-      const walk = async (src: Pin, dst: Pin, relative: string, depth: number): Promise<void> => {
+      const walk = async (src: Pin, dst: Pin, relative: string, depth: number, omit = false, workerTree = false): Promise<void> => {
         check(); if (depth > 64) throw refused();
         const before = await fstat(src.file, false);
         visit(false); meta(4096);
@@ -11917,23 +11968,41 @@ try {
             if (!Buffer.isBuffer(raw) || raw.length > 255 || !isUtf8(raw)) throw refused();
             meta(1024); const name = raw.toString("utf8"); validName(name);
             meta(16384); const rel = relative ? relative + "/" + name : name;
-            if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64 ||
-                (relative === "info" && (name === "alternates" || name === "http-alternates"))) throw refused();
+            if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64) throw refused();
+            const control = relative === "info" && (name === "alternates" || name === "http-alternates");
+            if (control && !omit) throw refused();
             const sourceAbsolute = absoluteChild(src, name), targetAbsolute = absoluteChild(dst, name);
             const observed = await stat(child(src, name), false);
             visit(false); meta(2048);
             inputs.push({ parent: src, name, stat: observed, directory: observed.isDirectory(), size: 0 });
+            if (control) {
+              if (!observed.isFile() && !observed.isSymbolicLink() && !observed.isFIFO()) throw refused();
+              continue;
+            }
             if (observed.isDirectory()) {
               const sub = await pin(child(src, name), sourceAbsolute, false, true, true);
               if (!unchanged(observed, sub.stat)) throw refused();
+              if (workerTree) {
+                if (!workerDirectory(sub.stat)) throw refused();
+                workerInputs.add(sub);
+              }
               const target = await createDirectory(dst, name, targetAbsolute);
-              await walk(sub, target, rel, depth + 1);
+              await walk(sub, target, rel, depth + 1, omit, workerTree);
             } else await copyFile(src, dst, name, observed);
           }
         } finally { await stream.close(); }
         if (!unchanged(before, await fstat(src.file, false))) throw refused();
       };
-      await walk(objects, destination, "", 0);
+      await walk(objects, destination, "", 0, knownBase !== undefined);
+      const sourceResult = { path: outDir, byteSize, fileCount };
+      let baseResult: { path: string; byteSize: number; fileCount: number } | undefined;
+      let baseDestination: Pin | undefined;
+      if (baseObjects && baseOut) {
+        baseDestination = await createDirectory(parent, path.basename(baseOut), baseOut);
+        const sourceBytes = byteSize, sourceFiles = fileCount;
+        await walk(baseObjects, baseDestination, "", 0, false, true);
+        baseResult = { path: baseOut, byteSize: byteSize - sourceBytes, fileCount: fileCount - sourceFiles };
+      }
       const validateRecords = async () => {
         await validatePins();
         if (!unchanged(objects.stat, await fstat(objects.file, false))) throw refused();
@@ -11954,7 +12023,10 @@ try {
             if (!unchanged(now, fd)) throw refused();
           } finally { await close(f); }
         }
-        await controlsAbsent(objects); await controlsAbsent(destination);
+        await controlsAbsent(objects, knownBase !== undefined); await controlsAbsent(destination);
+        if (baseObjects && baseDestination) {
+          await controlsAbsent(baseObjects); await controlsAbsent(baseDestination);
+        }
         await validatePins();
       };
       await validateRecords();
@@ -11963,7 +12035,7 @@ try {
       for (const f of handles) { await close(f); check(); }
       check();
       if (handles.size !== 0) throw refused();
-      return { path: outDir, byteSize, fileCount };
+      return baseResult ? { ...sourceResult, base: baseResult } : sourceResult;
     } catch (error) {
       // All I/O above is serial and settled before cleanup. No abort races,
       // permission repairs, retries, source writes, child launches or refunds.

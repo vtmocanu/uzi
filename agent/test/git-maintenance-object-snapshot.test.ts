@@ -63,7 +63,8 @@ async function fixture(t: test.TestContext, profile: { split?: boolean; mode?: n
     return match && fdPaths.has(Number(match[1]))
       ? path.join(fdPaths.get(Number(match[1]))!, match[2] ?? "") : p;
   };
-  const owned = (p: string) => ancestors.has(p) || p === git.recoveryRoot ||
+  const owned = (p: string) => p === path.join(dir, "repos") || p.startsWith(path.join(dir, "repos") + "/") ||
+    ancestors.has(p) || p === git.recoveryRoot ||
     p.startsWith(git.recoveryRoot + "/") || p === path.join(dir, "runner") || p.startsWith(path.join(dir, "runner") + "/");
   const project = <T extends Stats | BigIntStats>(p: string, s: T): T => {
     if (!owned(p)) return s;
@@ -94,7 +95,7 @@ async function fixture(t: test.TestContext, profile: { split?: boolean; mode?: n
   });
   t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
     const file = await open(...args), p = physical(args[0]);
-    if (!owned(p)) return file;
+    if (!owned(p)) { await hooks.open?.(file, p, args[1]!); return file; }
     fdPaths.set(file.fd, p);
     const stat = file.stat.bind(file);
     t.mock.method(file, "stat", async (...args: Parameters<typeof file.stat>) => project(p, (await stat(...args))!));
@@ -124,10 +125,18 @@ async function fixture(t: test.TestContext, profile: { split?: boolean; mode?: n
   let launches = 0, callbacks = 0;
   const run = <T>(fn: () => Promise<T>) => MaintenanceResources.run(admitted.value, () =>
     git.withBoundaryProcessSpawner(async () => { launches++; throw Error("unexpected child"); }, controller.signal, fn));
-  const snapshot = (before = async () => {}, input = source, output = out) =>
-    git["snapshotMaintenanceObjects"](input, output, async () => { callbacks++; await before(); });
+  const snapshot = (before = async () => {}, input = source, output = out,
+    base?: { barePath: string; identity: string }) =>
+    git["snapshotMaintenanceObjects"](input, output, async () => { callbacks++; await before(); }, base);
   return { git, dir, clone, objects, out, source, hooks, physical, controller, run, snapshot, charge,
     callbacks: () => callbacks, launches: () => launches };
+}
+async function knownBaseFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  const barePath = path.join(f.dir, "repos", "fixture.git");
+  await fs.mkdir(path.join(barePath, "objects"), { recursive: true });
+  await fs.writeFile(path.join(barePath, "objects", "base-leaf"), "base");
+  const s = await fs.lstat(barePath, { bigint: true });
+  return { barePath, identity: s.dev + ":" + s.ino };
 }
 function longFixturePath(root: string, length: number): string {
   while (length - Buffer.byteLength(root) - 1 > 200) root += "/" + "p".repeat(200);
@@ -216,6 +225,315 @@ test("derived regular destination file paths cannot exceed 4096 bytes", async t 
   } finally {
     await removeLongFixtureOutput(out, [["payload-long", false], ["leaf", false]]);
   }
+});
+
+test("real shared clone descendants traverse offline through completed private source and base", async t => {
+  const f = await fixture(t), base = await knownBaseFixture(f);
+  const seed = path.join(f.dir, "seed"), verify = path.join(f.dir, "clean-view");
+  await fs.rm(base.barePath, { recursive: true });
+  await fs.rm(f.clone, { recursive: true });
+  await exec("/usr/bin/git", ["init", "--quiet", "--template=", seed]);
+  const commit = async (repo: string, message: string) => {
+    await exec("/usr/bin/git", ["-C", repo, "add", "body"]);
+    await exec("/usr/bin/git", ["-C", repo, "-c", "user.name=Fixture", "-c",
+      "user.email=fixture@example.invalid", "commit", "--quiet", "-m", message]);
+    return (await exec("/usr/bin/git", ["-C", repo, "rev-parse", "HEAD"])).stdout.trim();
+  };
+  await fs.writeFile(path.join(seed, "body"), "parent-only\n");
+  const parent = await commit(seed, "parent");
+  await exec("/usr/bin/git", ["clone", "--quiet", "--bare", "--no-hardlinks", "--template=", seed, base.barePath]);
+  await exec("/usr/bin/git", ["clone", "--quiet", "--shared", "--template=", base.barePath, f.clone]);
+  await fs.writeFile(path.join(f.clone, "body"), "runner-only\n");
+  const descendant = await commit(f.clone, "descendant");
+  const sourceStat = await fs.lstat(f.clone, { bigint: true }), baseStat = await fs.lstat(base.barePath, { bigint: true });
+  const source = { clonePath: f.clone, identity: sourceStat.dev + ":" + sourceStat.ino };
+  base.identity = baseStat.dev + ":" + baseStat.ino;
+  const parentLoose = path.join(f.objects, parent.slice(0, 2), parent.slice(2));
+  await assert.rejects(fs.lstat(parentLoose), { code: "ENOENT" });
+  await assert.rejects(fs.lstat(path.join(base.barePath, "objects", descendant.slice(0, 2), descendant.slice(2))), { code: "ENOENT" });
+  const inventory = async (root: string) => {
+    const entries: unknown[] = [];
+    const walk = async (p: string): Promise<void> => {
+      const s = await fs.lstat(p, { bigint: true });
+      entries.push([p, s.dev, s.ino, s.mode, s.size, s.mtimeNs, s.ctimeNs,
+        s.isFile() ? await fs.readFile(p) : null]);
+      if (s.isDirectory()) for (const name of (await fs.readdir(p)).sort()) await walk(path.join(p, name));
+    };
+    await walk(root); return entries;
+  };
+  const beforeSource = await inventory(f.clone), beforeBase = await inventory(base.barePath);
+  const result = await f.run(() => f.snapshot(undefined, source, f.out, base));
+  assert.ok(result.base);
+  assert.deepEqual(await inventory(f.clone), beforeSource);
+  assert.deepEqual(await inventory(base.barePath), beforeBase);
+  await assert.rejects(fs.lstat(path.join(result.path, "info", "alternates")), { code: "ENOENT" });
+  await fs.rename(f.clone, f.clone + "-offline");
+  await fs.rename(base.barePath, base.barePath + "-offline");
+  await fs.rm(seed, { recursive: true });
+  await exec("/usr/bin/git", ["init", "--quiet", "--bare", "--template=", verify]);
+  // Git's alternate environment uses C-style quoted entries for colon paths.
+  // JSON quoting here supplies the same escapes for this controlled fixture path.
+  const privateBase = result.base.path + ":colon";
+  await fs.rename(result.base.path, privateBase);
+  const traverse = (args: string[], useBase: boolean) => {
+    const child = nativeExec("/usr/bin/git", ["-C", verify, ...args], { env: {
+      PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0",
+      GIT_OBJECT_DIRECTORY: result.path,
+      ...(useBase ? { GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(privateBase) } : {}),
+    } });
+    child.child.stdin?.end(); return child;
+  };
+  await assert.rejects(traverse(["rev-list", "--objects", descendant], false));
+  const traversal = (await traverse(["rev-list", "--objects", descendant], true)).stdout;
+  assert.ok(traversal.split("\n").includes(parent));
+  assert.ok(traversal.split("\n").includes(descendant));
+  assert.equal((await traverse(["show", descendant + ":body"], true)).stdout, "runner-only\n");
+  assert.equal((await traverse(["show", parent + ":body"], true)).stdout, "parent-only\n");
+  assert.equal(f.launches(), 0);
+  // Ordinary traversal only; later C/parser verification and repository binding remain owed.
+});
+for (const control of ["alternates", "http-alternates"]) {
+  for (const kind of ["file", "symlink", "FIFO"]) {
+    test("known base omits non-authoritative source " + control + " " + kind + " without opening", async t => {
+      const f = await fixture(t), base = await knownBaseFixture(f);
+      const info = path.join(f.objects, "info"), target = path.join(f.dir, "hostile");
+      await fs.mkdir(info);
+      await fs.mkdir(target);
+      await fs.writeFile(path.join(target, "forbidden-object"), "never imported");
+      const p = path.join(info, control);
+      if (kind === "file") await fs.writeFile(p, target + "\n");
+      if (kind === "symlink") await fs.symlink(target, p);
+      if (kind === "FIFO") await exec("/usr/bin/mkfifo", [p]);
+      const before = await fs.lstat(p, { bigint: true });
+      let controlOpens = 0, targetOpens = 0;
+      f.hooks.open = (_file, named) => {
+        if (named === p) controlOpens++;
+        if (named === target || named.startsWith(target + "/")) targetOpens++;
+      };
+      const result = await f.run(() => f.snapshot(undefined, f.source, f.out, base));
+      assert.deepEqual(result, { path: f.out, byteSize: 3, fileCount: 1,
+        base: { path: f.out + "-base", byteSize: 4, fileCount: 1 } });
+      assert.equal(controlOpens, 0);
+      assert.equal(targetOpens, 0);
+      assert.deepEqual(await fs.readdir(path.join(f.out, "info")), []);
+      assert.deepEqual(await fs.readdir(result.base!.path), ["base-leaf"]);
+      const after = await fs.lstat(p, { bigint: true });
+      assert.equal(after.ino, before.ino);
+      assert.equal(after.ctimeNs, before.ctimeNs);
+      assert.equal(after.mtimeNs, before.mtimeNs);
+    });
+  }
+}
+for (const kind of ["bad identity", "relative", "unnormalized", "outside", "nested", "basename",
+  "repos symlink", "bare symlink", "objects symlink", "unsafe repos", "unsafe bare", "unsafe objects",
+  "alternates", "http-alternates", "control symlink", "control FIFO", "control directory", "ordinary FIFO",
+  "existing sibling", "sibling symlink"]) {
+  test("known base refuses " + kind + " and never hands off a partial source", async t => {
+    const f = await fixture(t), base = await knownBaseFixture(f);
+    const objects = path.join(base.barePath, "objects");
+    if (kind === "bad identity") base.identity = "0:0";
+    if (kind === "relative") base.barePath = "repos/fixture.git";
+    if (kind === "unnormalized") base.barePath += "/../fixture.git";
+    if (kind === "outside") base.barePath = f.clone;
+    if (kind === "nested") base.barePath = path.join(base.barePath, "nested.git");
+    if (kind === "basename") {
+      const p = base.barePath + "-invalid"; await fs.rename(base.barePath, p); base.barePath = p;
+    }
+    if (kind.endsWith("symlink") && !kind.startsWith("control") && !kind.startsWith("sibling")) {
+      const p = kind === "repos symlink" ? path.dirname(base.barePath) : kind === "bare symlink" ? base.barePath : objects;
+      await fs.rename(p, p + "-real"); await fs.symlink(p + "-real", p);
+    }
+    if (kind.startsWith("unsafe")) await fs.chmod(kind === "unsafe repos" ? path.dirname(base.barePath) :
+      kind === "unsafe bare" ? base.barePath : objects, 0o777);
+    if (kind === "alternates" || kind === "http-alternates" || kind.startsWith("control")) {
+      await fs.mkdir(path.join(objects, "info"));
+      const p = path.join(objects, "info", kind === "http-alternates" ? kind : "alternates");
+      if (kind === "control symlink") await fs.symlink(f.objects, p);
+      else if (kind === "control FIFO") await exec("/usr/bin/mkfifo", [p]);
+      else if (kind === "control directory") await fs.mkdir(p);
+      else await fs.writeFile(p, f.objects + "\n");
+    }
+    if (kind === "ordinary FIFO") await exec("/usr/bin/mkfifo", [path.join(objects, "pipe")]);
+    if (kind === "existing sibling") await fs.mkdir(f.out + "-base");
+    if (kind === "sibling symlink") await fs.symlink(f.objects, f.out + "-base");
+    await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)), refused);
+    await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+    assert.equal(await fs.readFile(path.join(f.objects, "leaf"), "utf8"), "abc");
+    assert.equal(f.launches(), 0);
+  });
+}
+for (const store of ["source", "base"]) {
+  for (const kind of ["mutation", "replacement", "root replacement"]) {
+    test("both-store final revalidation: " + store + " " + kind, async t => {
+      const f = await fixture(t), base = await knownBaseFixture(f);
+      let changed = false;
+      f.hooks.open = async (_file, p) => {
+        if (changed || p !== path.join(f.out + "-base", "base-leaf")) return;
+        changed = true;
+        const root = store === "source" ? f.objects : path.join(base.barePath, "objects");
+        const leaf = path.join(root, store === "source" ? "leaf" : "base-leaf");
+        if (kind === "root replacement") {
+          await fs.rename(root, root + "-old"); await fs.mkdir(root);
+        } else {
+          if (kind === "replacement") await fs.rename(leaf, leaf + "-old");
+          await fs.writeFile(leaf, "changed");
+        }
+      };
+      await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)), refused);
+      assert.equal(changed, true);
+      await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+      await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
+    });
+  }
+}
+for (const resource of ["sourceBytes", "sourceEntries", "adminEntries", "metadataBytes", "artifactBytes"] as const) {
+  test("second store cannot renew shared " + resource + " and cleans both copies", async t => {
+    const f = await fixture(t), base = await knownBaseFixture(f);
+    const consume = MaintenanceResources.consume.bind(MaintenanceResources);
+    let used = 0, reached = false, quotaRefused = false;
+    t.mock.method(MaintenanceResources, "consume", (r: MaintenanceResource, n: number) => {
+      try { consume(r, n); }
+      catch (error) {
+        if (r === resource && error instanceof Error && error.message === exhausted.message) quotaRefused = true;
+        throw error;
+      }
+      if (r === resource) used += n;
+    });
+    f.hooks.open = async (_file, p) => {
+      if (p !== path.join(base.barePath, "objects", "base-leaf")) return;
+      reached = true;
+      assert.equal(await fs.readFile(path.join(f.out, "leaf"), "utf8"), "abc");
+      const limit = resource === "sourceEntries" ? 65536 : resource === "adminEntries" ? 4096 : cap;
+      f.charge(resource, limit - used);
+    };
+    // absent() rechecks revocation after its failing target-name stat; that
+    // path reports the revoked token, while the observer proves actual quota refusal.
+    await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)),
+      resource === "adminEntries" ? { message: "maintenance_token_invalid" } : exhausted);
+    assert.equal(reached, true);
+    assert.equal(quotaRefused, true);
+    assert.equal(used, resource === "sourceEntries" ? 65536 : resource === "adminEntries" ? 4096 : cap);
+    assert.throws(() => f.charge(resource, 1), { message: "maintenance_token_invalid" });
+    await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+    await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
+  });
+}
+test("a hostile declared alternate contributes no real Git objects", async t => {
+  const f = await fixture(t), base = await knownBaseFixture(f);
+  const hostile = path.join(f.dir, "hostile"), clean = path.join(f.dir, "clean");
+  await exec("/usr/bin/git", ["init", "--quiet", "--bare", "--template=", hostile]);
+  const body = path.join(f.dir, "hostile-body");
+  await fs.writeFile(body, "hostile object must not become visible\n");
+  const oid = (await exec("/usr/bin/git", ["-C", hostile, "hash-object", "-w", body])).stdout.trim();
+  await exec("/usr/bin/git", ["-C", hostile, "cat-file", "-e", oid]);
+  await fs.mkdir(path.join(f.objects, "info"));
+  const control = path.join(f.objects, "info", "alternates");
+  await fs.writeFile(control, path.join(hostile, "objects") + "\n");
+  let reads = 0, links = 0, opens = 0;
+  const readFile = fs.readFile.bind(fs), readlink = fs.readlink.bind(fs);
+  t.mock.method(fs, "readFile", async (...args: Parameters<typeof fs.readFile>) => {
+    if (f.physical(args[0]) === control) reads++;
+    return readFile(...args);
+  });
+  t.mock.method(fs, "readlink", async (...args: Parameters<typeof fs.readlink>) => {
+    if (f.physical(args[0]) === control) links++;
+    return readlink(...args);
+  });
+  f.hooks.open = (_file, p) => {
+    if (p === control || p === hostile || p.startsWith(hostile + "/")) opens++;
+  };
+  const result = await f.run(() => f.snapshot(undefined, f.source, f.out, base));
+  assert.equal(reads, 0); assert.equal(links, 0); assert.equal(opens, 0);
+  await exec("/usr/bin/git", ["init", "--quiet", "--bare", "--template=", clean]);
+  const probe = nativeExec("/usr/bin/git", ["-C", clean, "cat-file", "-e", oid], { env: {
+    PATH: "/usr/bin:/bin", LANG: "C", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_OBJECT_DIRECTORY: result.path, GIT_ALTERNATE_OBJECT_DIRECTORIES: JSON.stringify(result.base!.path),
+  } });
+  probe.child.stdin?.end();
+  await assert.rejects(probe);
+});
+for (const kind of ["control mutation", "control replacement", "source control directory", "late base control"]) {
+  test("both stores retain alternate metadata consistency: " + kind, async t => {
+    const f = await fixture(t), base = await knownBaseFixture(f);
+    const info = path.join(f.objects, "info"), p = path.join(info, "alternates");
+    await fs.mkdir(info);
+    if (kind === "source control directory") await fs.mkdir(p);
+    else await fs.writeFile(p, "non-authoritative");
+    let changed = false;
+    f.hooks.open = async (_file, named) => {
+      if (changed || named !== path.join(f.out + "-base", "base-leaf")) return;
+      changed = true;
+      if (kind === "late base control") {
+        await fs.mkdir(path.join(base.barePath, "objects", "info"));
+        await fs.writeFile(path.join(base.barePath, "objects", "info", "alternates"), f.objects);
+      } else {
+        if (kind === "control replacement") await fs.rename(p, p + "-old");
+        await fs.writeFile(p, "changed");
+      }
+    };
+    await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)), refused);
+    assert.equal(changed, kind !== "source control directory");
+    await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+    await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
+  });
+}
+for (const direction of ["read", "write"]) {
+  test("second-store pending " + direction + " settles before revocation cleanup", async t => {
+    const f = await fixture(t), base = await knownBaseFixture(f), entered = latch(), release = latch();
+    let pending = false, settled = false, closesWhilePending = 0;
+    f.hooks.open = (file, p) => {
+      if (p !== path.join(direction === "read" ? path.join(base.barePath, "objects") : f.out + "-base", "base-leaf")) return;
+      const close = file.close.bind(file);
+      t.mock.method(file, "close", async () => { if (pending) closesWhilePending++; await close(); });
+      if (direction === "read") {
+        const read = file.read.bind(file);
+        t.mock.method(file, "read", async (b: Buffer, o: number, n: number, at: number) => {
+          pending = true; entered.release(); await release.promise;
+          try { return await read(b, o, n, at); } finally { pending = false; }
+        });
+      } else {
+        const write = file.write.bind(file);
+        t.mock.method(file, "write", async (b: Buffer, o: number, n: number, at: number) => {
+          pending = true; entered.release(); await release.promise;
+          try { return await write(b, o, n, at); } finally { pending = false; }
+        });
+      }
+    };
+    const outcome = f.run(() => f.snapshot(undefined, f.source, f.out, base)).then(
+      value => { settled = true; return value; }, error => { settled = true; return error; });
+    try {
+      await Promise.race([entered.promise, outcome.then(() => { throw Error("missed second-store I/O"); })]);
+      f.controller.abort();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(settled, false);
+      assert.equal(closesWhilePending, 0);
+      assert.equal(await fs.readFile(path.join(f.out, "leaf"), "utf8"), "abc");
+    } finally { release.release(); await outcome; }
+    assert.ok((await outcome) instanceof Error);
+    assert.equal((await outcome).message, "maintenance_token_invalid");
+    assert.equal(closesWhilePending, 0);
+    await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+    await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
+  });
+}
+test("both stores consume the original logical source quota", async t => {
+  const f = await fixture(t), base = await knownBaseFixture(f);
+  f.charge("sources", 127);
+  await assert.rejects(f.run(() => f.snapshot(undefined, f.source, f.out, base)), exhausted);
+  assert.equal(f.callbacks(), 0);
+  await assert.rejects(fs.lstat(f.out), { code: "ENOENT" });
+  await assert.rejects(fs.lstat(f.out + "-base"), { code: "ENOENT" });
+});
+test("derived base sibling is bounded before concatenation", async t => {
+  const f = await fixture(t), base = await knownBaseFixture(f);
+  const parent = longFixturePath(f.git.recoveryRoot, 4076);
+  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  const output = parent + "/snapshot-long-name";
+  assert.ok(Buffer.byteLength(output) <= 4096);
+  assert.ok(Buffer.byteLength(output + "-base") > 4096);
+  await assert.rejects(f.run(() => f.snapshot(undefined, f.source, output, base)), refused);
+  await assert.rejects(fs.lstat(output), { code: "ENOENT" });
 });
 test("detaches actual loose objects, pack/index and nested encoded bytes without source writes or launches", async t => {
   const f = await fixture(t);
