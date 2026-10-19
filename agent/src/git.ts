@@ -11905,6 +11905,10 @@ try {
    * private parents throughout. The supplied dev:ino is only a consistency check.
    * A caller-selected canonical base supplies encoded prerequisites, never repository
    * authentication. Both complete private copies still owe the later C verification.
+   * Optional own reserves cleanup before each creation and registers every observed
+   * output identity. Supplying it delegates ALL removal to the caller, including on
+   * refusal; this helper joins I/O and closes handles before returning or throwing.
+   * Unknown identities must be retained. Without own, local cleanup stays reserved.
    */
   private async snapshotMaintenanceObjects(
     source: { clonePath: string; identity: string },
@@ -11990,8 +11994,12 @@ try {
       handles.add(f); if (!creating) check(); return f;
     };
     const close = async (f: Handle) => { await f.close(); handles.delete(f); };
-    const validatePins = async () => {
+    const validatePins = async (...active: Pin[]) => {
+      // Each selected pin and its named ancestor chain is visited once per call.
+      // Earlier siblings remain covered by the complete final validations.
       for (const p of pins) {
+        if (active.length && !active.some(target => target.output === p.output &&
+            isWithinPath(target.absolute, p.absolute))) continue;
         const named = await stat(p.named, p.output), fd = await fstat(p.file, p.output);
         if (!(p.immutable ? unchanged(p.stat, named) && unchanged(named, fd) :
           same(p.stat, named) && same(named, fd)) || !fd.isDirectory() ||
@@ -11999,13 +12007,14 @@ try {
             (workerInputs.has(p) && (!workerDirectory(named) || !workerDirectory(fd)))) throw refused();
       }
     };
-    const effect = async () => {
-      check(); await beforeEffect(); check(); await validatePins(); check();
+    const effect = async (...active: Pin[]) => {
+      check(); await beforeEffect(); check(); await validatePins(...active); check();
     };
     // Cleanup reads/removals are admitted before creation, then remain available
     // after revocation. One serial attempt per recorded entry, no recursive rm.
     // An ambiguous parent/entry is preserved; sibling cleanup may still proceed.
     const reserveCleanup = (admin: boolean, parent?: Pin) => {
+      if (own) return; // Composition reserves and performs the sole removal traversal.
       visit(admin); meta(12288); MaintenanceResources.consume("adminEntries", 2);
       if (parent) for (const p of pins) {
         if (p.output && isWithinPath(parent.absolute, p.absolute)) {
@@ -12079,17 +12088,17 @@ try {
         }
       }
     };
-    const createDirectory = async (parent: Pin, name: string, absolute: string) => {
+    const createDirectory = async (parent: Pin, name: string, absolute: string, source: Pin) => {
       const p = child(parent, name);
       await absent(p, true); reserveCleanup(true, parent); visit(true); meta(2048);
       const record = own?.(absolute, true);
-      await effect(); visit(true);
+      await effect(source, parent); visit(true);
       await fs.mkdir(p, { mode: 0o700 });
       // Recover identity without dispatching other effects, even if now revoked.
       const created = await fs.lstat(p, { bigint: true });
       outputs.push({ parent, name, stat: created, directory: true, size: 0 });
       record?.(created);
-      check(); await validatePins();
+      check(); await validatePins(source, parent);
       // mkdir(0700) can inherit SGID. It grants no group access; never heal
       // an existing directory or permit setuid/sticky/group/other permission bits.
       if (!created.isDirectory() || created.uid !== BigInt(process.getuid!()) ||
@@ -12143,7 +12152,7 @@ try {
       }
       const parent = await absoluteDirectory(path.dirname(outDir), true);
       if (baseOut) await absent(child(parent, path.basename(baseOut)), true);
-      const destination = await createDirectory(parent, path.basename(outDir), outDir);
+      const destination = await createDirectory(parent, path.basename(outDir), outDir, objects);
       const copyFile = async (src: Pin, dst: Pin, name: string, observed: Stat) => {
         const from = child(src, name), to = child(dst, name);
         if (!observed.isFile() || observed.nlink !== 1n || observed.size < 0n ||
@@ -12155,13 +12164,13 @@ try {
           if (!unchanged(observed, before) || !before.isFile() || before.nlink !== 1n) throw refused();
           await absent(to, true); reserveCleanup(true, dst); visit(true); meta(2048);
           const record = own?.(absoluteChild(dst, name), false);
-          await effect();
+          await effect(src, dst);
           output = await open(to, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
             fsConstants.O_RDWR, true, 0o600, true);
           const created = await output.stat({ bigint: true });
           outputs.push({ parent: dst, name, stat: created, directory: false, size: Number(before.size) });
           record?.(created);
-          check(); await validatePins();
+          check(); await validatePins(src, dst);
           let n = 0;
           while (true) {
             check();
@@ -12174,9 +12183,9 @@ try {
             if (!bytesRead) break;
             MaintenanceResources.consume("artifactBytes", bytesRead);
             for (let offset = 0; offset < bytesRead;) {
-              await effect();
+              await effect(src, dst);
               const { bytesWritten } = await output.write(buf, offset, bytesRead - offset, n + offset);
-              check(); await validatePins();
+              check(); await validatePins(src, dst);
               if (bytesWritten <= 0 || bytesWritten > bytesRead - offset) throw refused();
               offset += bytesWritten;
             }
@@ -12223,7 +12232,7 @@ try {
                 if (!workerDirectory(sub.stat)) throw refused();
                 workerInputs.add(sub);
               }
-              const target = await createDirectory(dst, name, targetAbsolute);
+              const target = await createDirectory(dst, name, targetAbsolute, sub);
               await walk(sub, target, rel, depth + 1, omit, workerTree);
             } else await copyFile(src, dst, name, observed);
           }
@@ -12235,7 +12244,7 @@ try {
       let baseResult: { path: string; byteSize: number; fileCount: number } | undefined;
       let baseDestination: Pin | undefined;
       if (baseObjects && baseOut) {
-        baseDestination = await createDirectory(parent, path.basename(baseOut), baseOut);
+        baseDestination = await createDirectory(parent, path.basename(baseOut), baseOut, baseObjects);
         const sourceBytes = byteSize, sourceFiles = fileCount;
         await walk(baseObjects, baseDestination, "", 0, false, true);
         baseResult = { path: baseOut, byteSize: byteSize - sourceBytes, fileCount: fileCount - sourceFiles };
@@ -12276,10 +12285,9 @@ try {
     } catch (error) {
       // All I/O above is serial and settled before cleanup. No abort races,
       // permission repairs, retries, source writes, child launches or refunds.
-      for (let i = outputs.length - 1; i >= 0; i--) {
+      for (let i = own ? -1 : outputs.length - 1; i >= 0; i--) {
         const r = outputs[i]!;
         try {
-          if (own) await beforeEffect();
           for (const p of pins) {
             if (!p.output || !isWithinPath(r.parent.absolute, p.absolute)) continue;
             const named = await fs.lstat(p.named, { bigint: true });

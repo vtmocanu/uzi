@@ -22,11 +22,15 @@ const latch = () => {
 };
 async function fixture(t: test.TestContext, decoded?: number | ((total: number) => number)) {
   const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/private-verification-"));
-  const native = async (cwd: string, args: string[]) => (await exec("/usr/bin/git", ["-C", cwd, ...args], {
+  const native = async (cwd: string, args: string[]) => {
+    const result = exec("/usr/bin/git", ["-C", cwd, ...args], {
     env: { PATH: "/usr/bin:/bin", HOME: dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.com",
       GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.com" },
-  })).stdout.trim();
+    });
+    result.child.stdin?.end();
+    return (await result).stdout.trim();
+  };
   const seed = path.join(dir, "seed"), base = path.join(dir, "repos", "repo.git");
   const clone = path.join(dir, "runner", "repo", "attempt");
   await fs.mkdir(seed);
@@ -88,6 +92,16 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     return match && descriptors.has(Number(match[1]))
       ? path.join(descriptors.get(Number(match[1]))!, match[2] ?? "") : p;
   };
+  const hooks: {
+    open?: (file: Awaited<ReturnType<typeof fs.open>>, p: string) => Promise<void> | void;
+    spawn?: (request: BoundaryProcessRequest) => Promise<void>;
+    effect?: () => Promise<void>;
+    completed?: () => Promise<void>;
+    cancel?: () => Promise<void>;
+    holdStderr?: boolean;
+    stderrDestroy?: (error: Error | null, callback: (error?: Error | null) => void) => void;
+    stderr?: PassThrough;
+  } = {};
   const lstat = fs.lstat.bind(fs), open = fs.open.bind(fs);
   t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) =>
     project(physical(args[0]), await lstat(...args)));
@@ -99,6 +113,7 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
       t.mock.method(file, "stat", async (...params: Parameters<typeof file.stat>) =>
         project(p, (await stat(...params))!));
     }
+    await hooks.open?.(file, p);
     return file;
   });
 
@@ -112,15 +127,6 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
   assert.ok(admitted.ok);
   const requests: BoundaryProcessRequest[] = [];
   let joined = 0, cancelled = 0, callbacks = 0, effects = 0;
-  const hooks: {
-    spawn?: (request: BoundaryProcessRequest) => Promise<void>;
-    effect?: () => Promise<void>;
-    completed?: () => Promise<void>;
-    cancel?: () => Promise<void>;
-    holdStderr?: boolean;
-    stderrDestroy?: (error: Error | null, callback: (error?: Error | null) => void) => void;
-    stderr?: PassThrough;
-  } = {};
   const ownedGit = async (request: BoundaryProcessRequest) => {
     requests.push(request);
     if (request.cwd.startsWith(git.recoveryRoot)) assert.ok(effects > 0);
@@ -154,7 +160,7 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     await fs.rm(dir, { recursive: true, force: true });
   });
   return { dir, git, clone, base, seed, source, knownBase, tip, total, oids, poison, controller, requests, hooks,
-    run, seam, charge, fingerprint, original, callbacks: () => callbacks, joined: () => joined, cancelled: () => cancelled };
+    run, seam, charge, fingerprint, original, physical, callbacks: () => callbacks, joined: () => joined, cancelled: () => cancelled };
 }
 
 test("real shared-base private proof survives unavailable originals and ignores poisoned config", async t => {
@@ -252,6 +258,7 @@ test("all pipeline work remains in the original charged reservation", async t =>
   await f.run(() => f.seam());
   for (const resource of ["decoded", "closureEntries", "sourceBytes", "sourceEntries", "artifactBytes",
     "metadataBytes", "adminEntries", "sources", "launches"] as const) assert.ok((used.get(resource) ?? 0) > 0, resource);
+  t.diagnostic("actual private fixture resources " + JSON.stringify(Object.fromEntries(used)));
   assert.equal(used.get("decoded"), f.total);
   assert.equal(used.get("rpcAttempts") ?? 0, 0);
   assert.equal(await f.fingerprint(), f.original);
@@ -352,3 +359,91 @@ test("owned completion and raw stderr disposal both settle before continuation",
   assert.equal(cleanupBeforeClose, false, "cleanup must follow actual raw stderr closure");
   assert.equal(f.callbacks(), 0); assert.ok(f.cancelled() > 0);
 });
+
+for (const failure of ["write failure", "cancel", "callback rejection"]) {
+  test("composed snapshot sole cleanup follows all handle closes: " + failure, async t => {
+    const f = await fixture(t), closing = latch(), release = latch();
+    const removals = new Map<string, number>();
+    let opened = 0, closed = 0, injected = false, outputReady = false, earlyCleanup = false;
+    const unlink = fs.unlink.bind(fs), rmdir = fs.rmdir.bind(fs);
+    const record = (p: unknown) => {
+      const name = f.physical(p);
+      if (!name.startsWith(f.git.recoveryRoot + "/unit")) return;
+      earlyCleanup ||= closed !== opened;
+      removals.set(name, (removals.get(name) ?? 0) + 1);
+    };
+    t.mock.method(fs, "unlink", async (...args: Parameters<typeof fs.unlink>) => { record(args[0]); return unlink(...args); });
+    t.mock.method(fs, "rmdir", async (...args: Parameters<typeof fs.rmdir>) => { record(args[0]); return rmdir(...args); });
+    f.hooks.open = (file, p) => {
+      opened++;
+      const close = file.close.bind(file);
+      t.mock.method(file, "close", async () => {
+        if (p === path.join(f.clone, ".git", "objects")) { closing.release(); await release.promise; }
+        await close(); closed++;
+      });
+      if (p.startsWith(path.join(f.git.recoveryRoot, "unit", "source") + "/")) {
+        const write = file.write.bind(file);
+        t.mock.method(file, "write", async (...args: Parameters<typeof file.write>) => {
+          if (!injected && failure !== "callback rejection") {
+            injected = true;
+            if (failure === "cancel") f.controller.abort(Error("snapshot cancel"));
+            throw Error("snapshot write failure");
+          }
+          return write(...args);
+        });
+        outputReady = true;
+      }
+    };
+    f.hooks.effect = async () => {
+      if (outputReady && !injected && failure === "callback rejection") {
+        injected = true; throw Error("snapshot callback rejection");
+      }
+    };
+    const work = assert.rejects(f.run(() => f.seam()));
+    let heldRemovals = 0;
+    try { await closing.promise; heldRemovals = removals.size; }
+    finally { release.release(); }
+    await work;
+    assert.equal(heldRemovals, 0, "outer cleanup must await held descriptor close");
+    assert.equal(earlyCleanup, false, "every snapshot handle closed before outer cleanup");
+    assert.equal(injected, true);
+    assert.ok(removals.size > 0);
+    assert.ok([...removals.values()].every(count => count === 1), "one removal attempt per owned name");
+    assert.deepEqual(await fs.readdir(f.git.recoveryRoot), []);
+    assert.equal(f.requests.length, 0); assert.equal(f.callbacks(), 0);
+  });
+}
+
+for (const mutation of ["earlier source sibling", "earlier output sibling", "source control", "output control"]) {
+  test("snapshot final proof blocks every Git launch after " + mutation, async t => {
+    const f = await fixture(t);
+    let previous: string | undefined, changed = false;
+    const objects = path.join(f.clone, ".git", "objects");
+    f.hooks.open = (file, p) => {
+      if (!p.startsWith(path.join(f.git.recoveryRoot, "unit", "source") + "/")) return;
+      const write = file.write.bind(file);
+      t.mock.method(file, "write", async (...args: Parameters<typeof file.write>) => {
+        if (!changed && previous && previous !== p) {
+          changed = true;
+          if (mutation === "earlier source sibling") {
+            const source = path.join(objects, path.relative(path.join(f.git.recoveryRoot, "unit", "source"), previous));
+            await fs.appendFile(source, "changed");
+          } else if (mutation === "earlier output sibling") {
+            await fs.appendFile(previous, "changed");
+          } else {
+            const info = mutation === "source control" ? path.join(objects, "info") :
+              path.join(f.git.recoveryRoot, "unit", "source", "info");
+            await fs.mkdir(info, { recursive: true });
+            await fs.writeFile(path.join(info, "alternates"), "");
+          }
+        }
+        previous = p;
+        return write(...args);
+      });
+    };
+    await assert.rejects(f.run(() => f.seam()));
+    assert.equal(changed, true);
+    assert.equal(f.requests.length, 0, "no rev-list, pack producer or verifier launch");
+    assert.equal(f.callbacks(), 0);
+  });
+}

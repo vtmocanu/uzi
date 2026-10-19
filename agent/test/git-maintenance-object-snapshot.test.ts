@@ -740,10 +740,20 @@ test("source request accounting includes raw names, EOF and short read capacity"
 });
 test("partial writes retry only unwritten tail and charge the chunk once", async t => {
   const f = await fixture(t), attempts: Array<[number, number, number]> = [];
+  let admin = 0, source = 0;
+  const consume = MaintenanceResources.consume.bind(MaintenanceResources);
+  t.mock.method(MaintenanceResources, "consume", (resource: MaintenanceResource, amount: number) => {
+    if (resource === "adminEntries") admin += amount;
+    if (resource === "sourceEntries") source += amount;
+    return consume(resource, amount);
+  });
+  let lastAdmin = 0, lastSource = 0;
   f.hooks.open = (file, p) => {
     if (p !== path.join(f.out, "leaf")) return;
     const write = file.write.bind(file);
     t.mock.method(file, "write", async (b: Buffer, o: number, n: number, at: number) => {
+      assert.ok(admin > lastAdmin && source > lastSource, "each attempt charges active chain validation");
+      lastAdmin = admin; lastSource = source;
       attempts.push([o, n, at]); return write(b, o, 1, at);
     });
   };
@@ -882,5 +892,27 @@ for (const message of ["maintenance_resource_exhausted", "maintenance_token_inva
       assert.deepEqual(Object.keys(error), []);
       return true;
     });
+  });
+}
+
+for (const target of ["active source", "active destination", "source ancestor", "destination ancestor"]) {
+  test("short write revalidates " + target + " before retry", async t => {
+    const f = await fixture(t);
+    let writes = 0;
+    f.hooks.open = (file, p) => {
+      if (p !== path.join(f.out, "leaf")) return;
+      const write = file.write.bind(file);
+      t.mock.method(file, "write", async (b: Buffer, o: number, n: number, at: number) => {
+        writes++;
+        const result = await write(b, o, Math.min(1, n), at);
+        const directory = target === "active source" ? f.objects : target === "active destination" ? f.out :
+          target === "source ancestor" ? path.dirname(f.objects) : f.git.recoveryRoot;
+        await fs.chmod(directory, 0o750);
+        return result;
+      });
+    };
+    await assert.rejects(f.run(() => f.snapshot()), refused);
+    assert.equal(writes, 1, "changed active directory refuses the unwritten tail");
+    assert.equal(f.launches(), 0);
   });
 }
