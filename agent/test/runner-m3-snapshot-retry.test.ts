@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { followSuccessfulPush } from "./publication-fixture.js";
 import { it } from "node:test";
 import type { Executor } from "../src/executor.js";
@@ -19,16 +20,25 @@ const scenarios = [
   "changed clone", "both soft stops", "cross-check off",
   "null head normal H1", "unreadable head normal H1",
   "null head normal null", "unreadable head normal null",
-  "cold context", "contract-enabled both soft stops",
+  "cold context", "contract-enabled both soft stops", "independent done allowances",
 ] as const;
 
 // Every real import and ownership read below uses the harness GitCache. Only the named
 // initial/fresh soft stops and initial head read are injected; finalize is never stubbed.
 for (const scenario of scenarios) {
-  it(`m3 snapshot retry (${scenario === "contract-enabled both soft stops" ? "contract finalize" : "ordinary finalize"}): ${scenario}`, async t => {
-    const contractEnabled = scenario === "contract-enabled both soft stops";
+  it(`m3 snapshot retry (${scenario === "contract-enabled both soft stops" || scenario === "independent done allowances" ? "contract finalize" : "ordinary finalize"}): ${scenario}`, async t => {
+    const budgeted = scenario === "independent done allowances";
+    const contractEnabled = scenario === "contract-enabled both soft stops" || budgeted;
     const bothSoftStops = scenario === "both soft stops" || contractEnabled;
     const clock = virtualBoundaryClock();
+    if (budgeted) t.mock.method(Date, "now", clock.now);
+    const startedAt = clock.now();
+    const softArms: number[] = [], maskedChildBudgets: number[][] = [[], []];
+    const mutationJumps: Phase[] = [], stoppedErrors: unknown[] = [];
+    const hardAttempts: number[] = [], permits: unknown[] = [];
+    let maskedAttempt = -1;
+    const stoppedStates: Array<{ tracking: string | null; owned: Awaited<ReturnType<typeof git.committedTrackingOwnership>>;
+      stages: string[]; source: string | null }> = [];
     const enabled = scenario !== "cross-check off";
     const missingHead = scenario.startsWith("null head") || scenario.startsWith("unreadable head");
     const nullCompletion = scenario.endsWith("normal null");
@@ -77,10 +87,27 @@ for (const scenario of scenarios) {
       };
       imports.push(observed);
       events.push(`${phase} import`);
-      if (phase === "initial" || phase === "fresh" && bothSoftStops) {
+      if (!budgeted && (phase === "initial" || phase === "fresh" && bothSoftStops)) {
         throw new CheckpointSoftDeadlineError();
       }
-      observed.result = await fetch(...args);
+      const step = args[4].checkpointStep;
+      const stoppedAttempt = budgeted && phase !== "finalize";
+      try {
+        observed.result = await fetch(args[0], args[1], args[2], args[3], {
+          ...args[4],
+          checkpointStep: name => {
+            step?.(name);
+            if (stoppedAttempt && name === "checkpoint_import_mutation" && !mutationJumps.includes(phase)) {
+              mutationJumps.push(phase);
+              maskedAttempt = phase === "initial" ? 0 : 1;
+              clock.advance(85_000);
+            }
+          },
+        });
+      } catch (error) {
+        if (stoppedAttempt) stoppedErrors.push(error);
+        throw error;
+      } finally { maskedAttempt = -1; }
       observed.tracking = await git.trackingTip(args[0], args[2]);
       if (observed.result.kind === "updated") {
         observed.owned = await git.committedTrackingOwnership(args[0], args[2], args[3], observed.result.candidateSha);
@@ -126,6 +153,17 @@ for (const scenario of scenarios) {
         rig = codexRig({
           lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]),
           armDeadline: clock.armDeadline, now: clock.now,
+          boundaryProcess: (_request, startupMs) => {
+            if (maskedAttempt >= 0) maskedChildBudgets[maskedAttempt]!.push(startupMs);
+            return undefined;
+          },
+        });
+        const boundary = rig.safety.withBoundary.bind(rig.safety);
+        rig.safety.withBoundary = (request, action) => boundary(request, permit => {
+          if (budgeted && request.sink === "done_checkpoint") {
+            hardAttempts.push(request.deadlineMs); permits.push(permit);
+          }
+          return action(permit);
         });
         branch = ctx.branch; runId = ctx.runId; bare = git.barePathFor(fx.originPath);
         base = (await originTip(bare, "main"))!;
@@ -134,6 +172,17 @@ for (const scenario of scenarios) {
         active = true;
         await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
         events.push("initial checkpoint returned");
+        const captureStopped = async () => {
+          // Called after checkpoint/gate returns, outside the stopped import ALS scope.
+          stoppedStates.push({
+            tracking: await git.trackingTip(bare, branch),
+            owned: await git.committedTrackingOwnership(bare, branch, runId, h1),
+            stages: execFileSync("git", ["-C", bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-incoming/"],
+              { encoding: "utf8" }).trim().split("\n").filter(Boolean),
+            source: await tip(ctx.worktreePath, branch),
+          });
+        };
+        if (budgeted) await captureStopped();
         await ctx.recordCompletionAttempt!({ declared: [], head: nullCompletion ? null : h1, worktreeFingerprint: null });
         if (scenario === "changed clone") {
           commitInTree(ctx.worktreePath, "newer.txt", "distinct newer candidate\n");
@@ -142,6 +191,7 @@ for (const scenario of scenarios) {
         phase = "fresh";
         if (enabled) {
           decisions.push(await ctx.codeCrossCheckGate!({ interlocked: true }));
+          if (budgeted) await captureStopped();
           const before = imports.length;
           decisions.push(await ctx.codeCrossCheckGate!({ interlocked: true }));
           importsAtRepeat = [before, imports.length];
@@ -173,9 +223,43 @@ for (const scenario of scenarios) {
     const permitRequests = api.completionPermitRequests;
     await runnerWith(() => ({ executor }), forge.gitlab, undefined, undefined, {
       checkpointIntervalMs: 0,
-      checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: clock.arm },
+      checkpointTestHooks: { absoluteNow: clock.now, armSoftDeadline: (fire, ms) => {
+        softArms.push(ms); return clock.arm(fire, ms);
+      } },
     }).execute(claim);
 
+    if (budgeted) {
+      assert.equal(clock.now() - startedAt, 170_000);
+      assert.deepEqual(softArms, [60_000, 60_000]);
+      assert.deepEqual(hardAttempts, [90_000, 90_000]);
+      assert.equal(permits.length, 2);
+      assert.notStrictEqual(permits[0], permits[1], "fresh retry acquires a distinct permit");
+      // CodexSafety arms admission and held-action timers for each absolute allowance.
+      assert.deepEqual(clock.budgets.filter(b => b.sink === "done_checkpoint").map(b => b.ms),
+        [90_000, 90_000, 90_000, 90_000]);
+      assert.deepEqual(mutationJumps, ["initial", "fresh"]);
+      assert.equal(stoppedErrors.length, 2);
+      assert.ok(stoppedErrors.every(error => error instanceof CheckpointSoftDeadlineError));
+      for (const budgets of maskedChildBudgets) {
+        assert.ok(budgets.length > 0, "real mutation children run after each jump");
+        assert.ok(budgets.every(ms => ms === 5_000), "each child inherits the remaining hard allowance without resetting it");
+      }
+      assert.equal(stoppedStates.length, 2);
+      for (const [index, state] of stoppedStates.entries()) {
+        assert.equal(state.tracking, h1);
+        assert.deepEqual(state.owned, { kind: "owned", sha: h1, context: imports[0]!.context });
+        assert.equal(state.source, h1);
+        assert.equal(state.stages.length, index + 1, "each stopped attempt retains its own private stage");
+        assert.ok(state.stages.every(stage => stage.endsWith(` ${h1}`)));
+      }
+      assert.ok(stoppedStates[1]!.stages.includes(stoppedStates[0]!.stages[0]!), "fresh retry retains the first attempt's exact private stage");
+      assert.equal(imports.length, 3, "initial, one fresh retry, and authoritative finalize only");
+      for (const imported of imports) {
+        if (imported.phase !== "finalize") assert.equal(imported.expected, h1);
+        assert.strictEqual(imported.context, imports[0]!.context);
+      }
+      assert.ok(Object.isFrozen(imports[0]!.context));
+    }
     // Runner advisory catches must not turn a swallowed assertion into a green test.
     assert.equal(modelTurns, 1);
     assert.equal(poisoned, false, "genuine installer reconcile leaves source custody usable");
