@@ -312,8 +312,9 @@ for (const [index, point] of points.entries()) {
     } finally {
       for (const release of releases) release();
       try {
-        await execution;
-        await Promise.all(predecessors);
+        const settled = await Promise.allSettled([execution, ...predecessors]);
+        // Propagate failures only after every owned operation has settled.
+        await Promise.all(settled.map(result => result.status === "fulfilled" ? result.value : Promise.reject(result.reason)));
       } finally { proof.cleanup(); }
     }
   });
