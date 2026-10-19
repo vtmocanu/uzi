@@ -52,6 +52,97 @@ Inspect against the known task/base where available, including the experiment
 context. Recovery grants no execution, rollback, retry, blacklist, park or authority
 changes, and the default branch is not an authorized known-good replacement.
 
+## Local integration record — 2026-10-19
+
+This record covers local executable checks, separately from the hosted acceptance
+below. Base revision: `28534e917aeb23a31ddaa9400d85d1712c99fa25`.
+API LiveDB candidate: `2671e1b27e3243fcf716a61ddd7f5a6b54dce9c5`.
+Wire-contract and affected-agent candidate:
+`8a611802ddb04fb7141550f2c73fb847ecb0ca5d`. The API implementation is unchanged
+between those candidate revisions; the later revision adds independent
+Go/TypeScript checks of the actual marshaled wire fixtures.
+
+The candidate `./e2e/run-store-it.sh` exited 0: 3,035 top-level passes and no skips.
+Named new tests actually ran: `TestInterruptedCallsPlanLiveDB`,
+`TestWorkerInterruptedCallsRouteLiveDB`, `TestInterruptedCallsLockDeadlineLiveDB`,
+`TestInterruptedCallsEligibilityLiveDB` and `TestInterruptedCallsWindowLiveDB`.
+The job-route refusal and route-limiter inventory also passed. Focused proofs
+mutated disposable exports only: generation selection and lane pairing each
+failed their intended assertions under mutation and passed on pristine source.
+A separate snapshot-warning proof passed 100 cases, failed 84 assertions when
+incorrectly gated by positive prior commits, then passed all 100 on restoration.
+These proofs establish those specific regressions, not universal mutation resistance.
+
+On 32,768-row disposable sparse/displaced histories, prepared custom/generic
+query execution was 0.444–0.476 ms, planning 0.044–1.441 ms, with an initial
+256-row tail. Relation-lock cancellation was observed at about 1.001 s with the
+one-second budget and 80.7 ms with an earlier parent deadline. These are local
+fixtures, not production latency guarantees. An optional pool-exhaustion deadline
+test suggested by the DBA remains unimplemented; no extra authority is inferred.
+
+### Timing comparison and limits
+
+Both LiveDB measurements used the existing script, flags and timeouts, a fresh
+throwaway PostgreSQL 17 fixture, sequential packages and the same host. The base
+ran from an immutable export. Package-reported seconds were:
+
+| LiveDB package | Base | Candidate |
+|---|---:|---:|
+| store | 439.020 | 402.192 |
+| handler | 515.481 | 564.823 |
+| forgesvc | 12.178 | 11.127 |
+| schedsvc | 10.766 | 9.261 |
+| workersvc | timed out at 1,200.233 | 1,178.838 |
+| recovery | not reached | 45.653 |
+| poller | not reached | 10.671 |
+
+The candidate serial wall time was approximately 2,563 s (log timestamps,
+including startup/build/cleanup); the base failed after 2,526 s at the existing
+workersvc 20-minute package timeout. The test active then,
+`TestPendingOutcomeHealthRequiresCurrentOwnerGenerationLeaseLiveDB`, passed in
+isolation on both base and candidate with identical race/count/timeout flags,
+four subtests and no skips (5.130 s and 1.589 s package times). Thus the narrowed
+probe does not reproduce the full-run failure; the full base run remains a failed
+check. No complete before/after LiveDB critical-path delta can be calculated.
+The five new named LiveDB tests contributed 8.23 s of observed test time in the
+successful candidate lane; that is not a causal estimate of total added runtime.
+
+The common affected-agent command on each revision was:
+
+```sh
+node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 test/prompt.test.ts test/sdk-executor.test.ts test/codex-executor.test.ts
+```
+
+It exited 0 on both: base 229.229 s, 1,686 passes; candidate 208.193 s, 1,707
+passes. Both skipped the existing opt-in live Anthropic skill-expansion test.
+The observed difference is −21.036 s, not evidence that this feature accelerates
+tests. Feature-only test files are outside this common-file timing comparison.
+The host reported Linux x86_64, eight CPUs, Go 1.27.2 and Node 24.20.0. CPU quotas,
+memory and competing load were not measured. Tool/build caches were shared and
+warmth/source paths differed; JS dependencies were provisioned, never reinstalled.
+These local serial measurements do not measure hosted CI queues, parallelism or
+critical path. Per-command exits, revisions and raw logs were retained in this
+run's private scratch evidence; final required gate outcomes belong in the PR
+validation report, not in the unrun hosted matrix.
+
+### Consumer inventory and unrun product phases
+
+An exhaustive tracked-source search for the new DTO/route/state identifiers and
+touched recovery wording found consumers in API SQL/service/DTO/worker routing,
+the agent client/runner/context and both harnesses, their tests and the new wire
+fixtures. It found none in `e2e/phases/`, the E2E library, forge fake, user CLI or
+web client. The agent fake API already models the optional GET and its default
+404. The Go-marshaled full/empty fixtures now independently pin field names,
+nullability and strict worker decoding. No additional product consumer required
+a change; this worker-authenticated GET adds no user CLI command or route.
+`task test:e2e-lib` and `task test:forge-fake` each exited 0.
+
+All full product E2E phases remain unrun and unchanged, including recovery-related
+`15-happy-path-restart`, `16-usage-limit-park`, `42-api-outage-readoption`,
+`52-api-outage-outbox`, `72-custody-lifecycle` and `74-codex-activation`.
+Library/fake checks and source-level harness delivery tests do not establish
+hosted prompt delivery or edit survival.
+
 ## Prepare an isolated hosted experiment — UNRUN
 
 1. Use a dedicated disposable repository and hosted worker, with disposable test
