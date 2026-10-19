@@ -497,7 +497,8 @@ A few worth knowing:
   it answers, so one written against a question the agent has already moved
   past is rejected rather than applied to the current one, and calling it
   against a run that isn't currently parked fails outright instead of
-  queuing.
+  queuing. Answers sent in one call may total at most 40,000 characters; a
+  larger set is rejected with an error and the question stays open.
   During approved, non-interactive issue implementation, use
   `uzi run answer <id> --message /park` to request a dependency pause.
   After validation and consumption, trimmed non-empty answers must each be
