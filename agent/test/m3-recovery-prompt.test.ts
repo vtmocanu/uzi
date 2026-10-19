@@ -44,7 +44,16 @@ describe("M3 recovery prompts", () => {
             assert.match(prompt, /clean git status or an empty diff against the recovered HEAD/);
             assert.match(prompt, /candidate and experiment context with git log and git diff against the known task\/base/);
             assert.match(prompt, /default branch is not an authorized known-good replacement/);
-            assert.doesNotMatch(prompt, /and build on it|Do not redo|rebuilt at the start/);
+            assert.doesNotMatch(prompt, /and build on it|Do not redo/);
+            // #3124 preserves the #222 reseed and PRD #759 WIP notes beside the snapshot warning.
+            if (name === "implement") {
+              if (wipRecovered) {
+                assert.match(prompt, /recovered from an earlier attempt/);
+                assert.doesNotMatch(prompt, /did not survive that rebuild/);
+              } else {
+                assert.match(prompt, /did not survive that rebuild/);
+              }
+            }
             if (seededFrom === "origin") assert.match(prompt, /origin base has unknown provenance/);
             if (seededFrom === "default") assert.match(prompt, /base was seeded from the default branch/);
             if (wipRecovered) assert.match(prompt, /Separately, recovered uncommitted WIP edits/);

@@ -1948,9 +1948,10 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
   // are mutually exclusive — reseedNote returns "" when wipRecovered is true), telling a cold
   // resumed lead to treat the recovered uncommitted edits as a mid-edit to reconcile, not
   // finished work. First turn only, placed with reseedNote so it reads before baseNote.
-  const wipNote = input.first && !input.interruptedSnapshot ? wipRecoveredNote(input.wipRecovered) : "";
+  // #3124: both stay beside the interrupted-snapshot warning; neither claims validated work.
+  const wipNote = input.first ? wipRecoveredNote(input.wipRecovered) : "";
   if (wipNote) lines.push("", wipNote);
-  const reseed = input.first && !input.interruptedSnapshot ? reseedNote(input.resumed, input.wipRecovered) : "";
+  const reseed = input.first ? reseedNote(input.resumed, input.wipRecovered) : "";
   if (reseed) lines.push("", reseed);
   const dockerResume = input.first ? dockerScratchResumeNote(input.dockerScratchResume) : "";
   if (dockerResume) lines.push("", dockerResume);
