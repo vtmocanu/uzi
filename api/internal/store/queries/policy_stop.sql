@@ -18,6 +18,13 @@ SELECT (EXISTS (
       AND disposition IS DISTINCT FROM 'superseded_by_stop'
 ))::boolean AS approved;
 
+-- name: SetPolicyCandidateCrossCheckAssociation :execrows
+UPDATE runs
+SET policy_candidate_cross_check_id = @cross_check_id::uuid
+WHERE id = @lead_run_id::uuid AND worker_id = @worker_id::uuid
+  AND claim_generation = @claim_generation::bigint
+  AND claim_released_at IS NULL AND policy_stop_resolution IS NULL;
+
 -- name: GetPolicyStopCrossCheck :one
 SELECT * FROM cross_checks WHERE id = $1;
 
