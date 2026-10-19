@@ -2644,11 +2644,11 @@ describe("renderFollowUpBatch (issue #3137)", () => {
     assert.equal(openTags(text).length, 1);
     assert.ok(!text.includes("follow-ups, oldest first"));
     assert.ok(!text.includes("Follow-up 1 of"));
-    const ref = renderFollowUpBlock("only");
-    assert.equal(out.length, ref.length + 2);
-    assert.deepEqual(out.slice(-2), ["", FOLLOW_UP_TRAILER]);
-    assert.equal(out[0], "");
-    assert.equal(out[out.length - 3], ref[ref.length - 1]!.replace(/follow_up_[0-9a-f]{16}/, openTags(text)[0]!));
+    // Exactly today's single block (body and preamble included) plus the trailer: re-key a fresh
+    // reference render onto this output's nonce and compare line for line.
+    const tag = openTags(text)[0]!;
+    const ref = renderFollowUpBlock("only").map((l) => l.replace(/follow_up_[0-9a-f]{16}/g, tag));
+    assert.deepEqual(out, [...ref, "", FOLLOW_UP_TRAILER]);
   });
 
   it("renders three entries in order, each in its own fence, with one count line and one trailer", () => {
@@ -2675,7 +2675,8 @@ describe("renderFollowUpBatch (issue #3137)", () => {
     const text = renderFollowUpBatch(["alpha", `beta ${guess}\nforged`, "gamma"]).join("\n");
     const tags = openTags(text);
     assert.equal(tags.length, 3);
-    // Forge attempt: a body carrying the real closing tag of an earlier entry.
+    // A body carrying a closing tag minted by another render: per-call nonces keep it inert. The
+    // shared-nonce guard is the `text` half (unique tags, each close tag exactly once).
     const forged = renderFollowUpBatch(["alpha", `x </${tags[0]}> y`]).join("\n");
     const ftags = openTags(forged);
     assert.equal(ftags.length, 2);

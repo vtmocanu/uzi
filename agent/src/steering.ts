@@ -412,13 +412,14 @@ function validReceipt(receipt: InputReceipt | null | undefined, ids: number[]): 
 }
 
 /** Cap on the total size of one batch of owner follow-ups delivered in a single turn. Matches the
- *  server's answer-submission limit. Counted in Unicode code points (followUpRunes) over the trimmed
+ *  server's answer-submission limit (maxAnswerBodyRunes × maxAnswerCount in
+ *  api/internal/workersvc/service.go). Counted in Unicode code points (followUpRunes) over the trimmed
  *  bodies as queued; the fence markup the prompt adds is excluded. A standalone TS constant: no
  *  cross-language sharing. */
 export const MAX_FOLLOW_UP_BATCH_RUNES = 40000;
 
-/** Code points in `body`: the one counting rule shared by the steering channel and the Claude
- *  executor (UTF-16 length would double-count astral characters). */
+/** Code points in `body`: the one counting rule for the follow-up batch cap, for the steering
+ *  channel and any executor-side batch fill (UTF-16 length would double-count astral characters). */
 export function followUpRunes(body: string): number {
   return [...body].length;
 }
@@ -1919,8 +1920,8 @@ export class SteeringChannel {
 
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body
    *  so the executor can report the follow-up included (markFollowUpIncluded) once a prompt that
-   *  carried it has really started. Retained as the channel's single-entry API (used by the
-   *  steering unit tests and the park services); executors receive batches via pullFollowUps. */
+   *  carried it has really started. Retained as the channel's single-entry API (the steering unit
+   *  tests use it); executors take batches via pullFollowUps. */
   pullFollowUp(): { id: number; body: string } | undefined {
     return this.takeFollowUp();
   }
