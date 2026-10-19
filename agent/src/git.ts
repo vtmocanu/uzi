@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
 import os from "node:os";
+import { isUtf8 } from "node:buffer";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { finished, pipeline } from "node:stream/promises";
@@ -11662,6 +11663,331 @@ try {
         alreadyPublished: false,
       };
     });
+  }
+
+  /**
+   * Dormant detached encoded bytes, NOT authentication or a durable journal.
+   * Caller owes positive non-stopped family/custody/origin/output-index proof,
+   * quiescence, held bare lock, live execution reservation and worker-exclusive
+   * private parents throughout. The supplied dev:ino is only a consistency check.
+   * Ordinary shared clones remain unsupported until authenticated base integration.
+   */
+  // @ts-expect-error TS6133: intentionally dormant until the import proof is complete.
+  private async snapshotMaintenanceObjects(
+    source: { clonePath: string; identity: string },
+    outDir: string,
+    beforeEffect: () => Promise<void>,
+  ): Promise<{ path: string; byteSize: number; fileCount: number }> {
+    type Stat = import("node:fs").BigIntStats;
+    type Handle = Awaited<ReturnType<typeof fs.open>>;
+    type Pin = { file: Handle; named: string; stat: Stat; output: boolean; absolute: string; immutable: boolean };
+    type Record = { parent: Pin; name: string; stat: Stat; directory: boolean; size: number };
+    const refused = () => new Error("maintenance_object_snapshot_refused");
+    const signal = MaintenanceResources.signalIfActive();
+    const check = () => {
+      MaintenanceResources.check();
+      this.checkRecoveryInterruption();
+      if (signal?.aborted) throw refused();
+    };
+    const meta = (n: number) => { check(); MaintenanceResources.consume("metadataBytes", n); };
+    const visit = (admin: boolean) => {
+      check(); MaintenanceResources.consume(admin ? "adminEntries" : "sourceEntries", 1);
+    };
+    const pins: Pin[] = [], handles = new Set<Handle>();
+    const pinIndex = new Map<string, Pin>();
+    const inputs: Record[] = [], outputs: Record[] = [];
+    const root = path.resolve(this.recoveryRoot), runner = path.resolve(this.runnerRoot);
+    const same = (a: Stat, b: Stat) => a.dev === b.dev && a.ino === b.ino && a.mode === b.mode;
+    const unchanged = (a: Stat, b: Stat) => same(a, b) && a.size === b.size &&
+      a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
+    const strictAncestor = (p: string) => p !== root && isWithinPath(root, p);
+    const safeDirectory = (p: string, s: Stat) => s.isDirectory() && !s.isSymbolicLink() &&
+      (s.uid === BigInt(process.getuid!()) || (s.uid === 0n && strictAncestor(p))) &&
+      (s.mode & 2n) === 0n && ((s.mode & 16n) === 0n ||
+        (strictAncestor(p) && uidSplitActive() && process.getuid!() === WORKER_UID &&
+          process.getgid!() === WORKER_UID && s.gid === BigInt(WORKER_UID)));
+    const validPath = (p: string) => {
+      if (typeof p !== "string" || Buffer.byteLength(p) > 4096 ||
+          !path.isAbsolute(p) || path.resolve(p) !== p) throw refused();
+      meta(32768); // Split/components/retained ancestor capacity before allocation.
+      const parts = p.split("/").filter(Boolean);
+      if (parts.length > 128) throw refused();
+      for (const part of parts) validName(part);
+      return parts;
+    };
+    const validName = (s: string) => {
+      if (!s || s === "." || s === ".." || Buffer.byteLength(s) > 255) throw refused();
+      for (const character of s) {
+        const point = character.codePointAt(0)!;
+        if (character === "/" || character === "\\" || point < 32 || point === 127 ||
+            (point >= 0xd800 && point <= 0xdfff)) throw refused();
+      }
+    };
+    const child = (parent: Pin, name: string) => {
+      meta(8448);
+      const p = "/proc/self/fd/" + parent.file.fd + "/" + name;
+      if (Buffer.byteLength(p) > 4096) throw refused();
+      return p;
+    };
+    const stat = async (p: string, admin: boolean) => {
+      visit(admin); meta(2048);
+      const s = await fs.lstat(p, { bigint: true }); check(); return s;
+    };
+    const fstat = async (f: Handle, admin: boolean) => {
+      visit(admin); meta(2048);
+      const s = await f.stat({ bigint: true }); check(); return s;
+    };
+    const open = async (p: string, flags: number, admin: boolean, mode?: number, creating = false) => {
+      visit(admin); meta(512);
+      const f = await fs.open(p, flags, mode);
+      handles.add(f); if (!creating) check(); return f;
+    };
+    const close = async (f: Handle) => { await f.close(); handles.delete(f); };
+    const validatePins = async () => {
+      for (const p of pins) {
+        const named = await stat(p.named, p.output), fd = await fstat(p.file, p.output);
+        if (!(p.immutable ? unchanged(p.stat, named) && unchanged(named, fd) :
+          same(p.stat, named) && same(named, fd)) || !fd.isDirectory() ||
+            (p.output && (!safeDirectory(p.absolute, named) || !safeDirectory(p.absolute, fd)))) throw refused();
+      }
+    };
+    const effect = async () => {
+      check(); await beforeEffect(); check(); await validatePins(); check();
+    };
+    // Cleanup reads/removals are admitted before creation, then remain available
+    // after revocation. One serial attempt per recorded entry, no recursive rm.
+    // An ambiguous parent/entry is preserved; sibling cleanup may still proceed.
+    const reserveCleanup = (admin: boolean, parent?: Pin) => {
+      visit(admin); meta(12288); MaintenanceResources.consume("adminEntries", 2);
+      if (parent) for (const p of pins) {
+        if (p.output && isWithinPath(parent.absolute, p.absolute)) {
+          MaintenanceResources.consume("adminEntries", 2); meta(4096);
+        }
+      }
+    };
+    const pin = async (named: string, absolute: string, output: boolean, readable: boolean, immutable = false) => {
+      meta(8448); // Bounded lookup key and retained map entry before allocation.
+      const key = (output ? "+" : "-") + absolute;
+      const before = await stat(named, output), existing = pinIndex.get(key);
+      if (existing) {
+        const fd = await fstat(existing.file, output);
+        if (existing.immutable !== immutable || !fd.isDirectory() ||
+            !(immutable ? unchanged(existing.stat, before) && unchanged(before, fd) :
+              same(existing.stat, before) && same(before, fd)) ||
+            (output && (!safeDirectory(absolute, before) || !safeDirectory(absolute, fd)))) throw refused();
+        // Reuse the original pin: repeated control probes cannot grow the set
+        // of cleanup ancestors after an artifact's cleanup work was reserved.
+        return existing;
+      }
+      const f = await open(named, (readable ? fsConstants.O_RDONLY | fsConstants.O_DIRECTORY |
+        fsConstants.O_NONBLOCK : 0x200000) | fsConstants.O_NOFOLLOW, output);
+      const after = await fstat(f, output);
+      if (!after.isDirectory() || !same(before, after) || (output && !safeDirectory(absolute, after))) throw refused();
+      meta(1024); reserveCleanup(output);
+      const p = { file: f, named, stat: after, output, absolute, immutable };
+      pins.push(p); pinIndex.set(key, p); return p;
+    };
+    const absoluteDirectory = async (absolute: string, output: boolean) => {
+      const parts = validPath(absolute);
+      let current = await pin("/", "/", output, parts.length === 0);
+      let full = "";
+      for (let i = 0; i < parts.length; i++) {
+        meta(8448); full += "/" + parts[i];
+        current = await pin(child(current, parts[i]!), full, output, i === parts.length - 1);
+      }
+      return current;
+    };
+    const absent = async (p: string, admin: boolean) => {
+      try { await stat(p, admin); }
+      catch (error) {
+        check();
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      throw refused();
+    };
+    const controlsAbsent = async (objects: Pin) => {
+      const p = child(objects, "info");
+      let info: Stat;
+      try { info = await stat(p, objects.output); }
+      catch (error) {
+        check();
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw error;
+      }
+      if (!info.isDirectory() || info.isSymbolicLink()) throw refused();
+      // Pin even this preliminary control lookup: no symlink-following probe.
+      const d = await pin(p, objects.absolute + "/info", objects.output, true, !objects.output);
+      for (const name of ["alternates", "http-alternates"]) await absent(child(d, name), objects.output);
+    };
+    const createDirectory = async (parent: Pin, name: string, absolute: string) => {
+      const p = child(parent, name);
+      await absent(p, true); reserveCleanup(true, parent); visit(true); meta(2048);
+      await effect(); visit(true);
+      await fs.mkdir(p, { mode: 0o700 });
+      // Recover identity without dispatching other effects, even if now revoked.
+      const created = await fs.lstat(p, { bigint: true });
+      outputs.push({ parent, name, stat: created, directory: true, size: 0 });
+      check(); await validatePins();
+      // mkdir(0700) can inherit SGID. It grants no group access; never heal
+      // an existing directory or permit setuid/sticky/group/other permission bits.
+      if (!created.isDirectory() || created.uid !== BigInt(process.getuid!()) ||
+          (created.mode & 0o5777n) !== 0o700n) throw refused();
+      return pin(p, absolute, true, true);
+    };
+    let byteSize = 0, fileCount = 0;
+    try {
+      check();
+      if (process.platform !== "linux" || typeof beforeEffect !== "function" ||
+          typeof source?.identity !== "string" || source.identity.length > 128 ||
+          !/^[0-9]+:[0-9]+(?![\s\S])/.test(source.identity)) throw refused();
+      validPath(source.clonePath); validPath(outDir);
+      if (source.clonePath === runner || !isWithinPath(source.clonePath, runner) ||
+          outDir === root || !isWithinPath(outDir, root)) throw refused();
+      // sources counts logical inventory, never OS descriptors.
+      MaintenanceResources.consume("sources", 1);
+      const clone = await absoluteDirectory(source.clonePath, false);
+      if (String(clone.stat.dev) + ":" + String(clone.stat.ino) !== source.identity) throw refused();
+      const gd = await pin(child(clone, ".git"), source.clonePath + "/.git", false, true);
+      const objects = await pin(child(gd, "objects"), source.clonePath + "/.git/objects", false, true, true);
+      await controlsAbsent(objects);
+      const parent = await absoluteDirectory(path.dirname(outDir), true);
+      const destination = await createDirectory(parent, path.basename(outDir), outDir);
+      const copyFile = async (src: Pin, dst: Pin, name: string, observed: Stat) => {
+        const from = child(src, name), to = child(dst, name);
+        if (!observed.isFile() || observed.nlink !== 1n || observed.size < 0n ||
+            observed.size > BigInt(Number.MAX_SAFE_INTEGER)) throw refused();
+        const input = await open(from, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, false);
+        let output: Handle | undefined;
+        try {
+          const before = await fstat(input, false);
+          if (!unchanged(observed, before) || !before.isFile() || before.nlink !== 1n) throw refused();
+          await absent(to, true); reserveCleanup(true, dst); visit(true); meta(2048);
+          await effect();
+          output = await open(to, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
+            fsConstants.O_RDWR, true, 0o600, true);
+          const created = await output.stat({ bigint: true });
+          outputs.push({ parent: dst, name, stat: created, directory: false, size: Number(before.size) });
+          check(); await validatePins();
+          let n = 0;
+          while (true) {
+            check();
+            const request = Math.min(65536, Number(before.size) + 1 - n);
+            MaintenanceResources.consume("sourceBytes", request);
+            const buf = Buffer.alloc(request);
+            const { bytesRead } = await input.read(buf, 0, request, n);
+            check();
+            if (bytesRead < 0 || bytesRead > request || n + bytesRead > Number(before.size)) throw refused();
+            if (!bytesRead) break;
+            MaintenanceResources.consume("artifactBytes", bytesRead);
+            for (let offset = 0; offset < bytesRead;) {
+              await effect();
+              const { bytesWritten } = await output.write(buf, offset, bytesRead - offset, n + offset);
+              check(); await validatePins();
+              if (bytesWritten <= 0 || bytesWritten > bytesRead - offset) throw refused();
+              offset += bytesWritten;
+            }
+            n += bytesRead;
+          }
+          if (n !== Number(before.size) || !unchanged(before, await fstat(input, false)) ||
+              !unchanged(before, await stat(from, false))) throw refused();
+          byteSize += n; fileCount++;
+        } finally {
+          if (output) await close(output);
+          await close(input);
+        }
+      };
+      const walk = async (src: Pin, dst: Pin, relative: string, depth: number): Promise<void> => {
+        check(); if (depth > 64) throw refused();
+        const before = await fstat(src.file, false);
+        visit(false); meta(4096);
+        const stream = await fs.opendir("/proc/self/fd/" + src.file.fd, { encoding: "buffer" as BufferEncoding, bufferSize: 1 });
+        try {
+          check();
+          while (true) {
+            visit(false); MaintenanceResources.consume("sourceBytes", 255); meta(1536);
+            const ent = await stream.read(); check();
+            if (!ent) break;
+            const raw = ent.name as unknown as Buffer;
+            if (!Buffer.isBuffer(raw) || raw.length > 255 || !isUtf8(raw)) throw refused();
+            meta(1024); const name = raw.toString("utf8"); validName(name);
+            meta(16384); const rel = relative ? relative + "/" + name : name;
+            if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64 ||
+                (relative === "info" && (name === "alternates" || name === "http-alternates"))) throw refused();
+            const observed = await stat(child(src, name), false);
+            visit(false); meta(2048);
+            inputs.push({ parent: src, name, stat: observed, directory: observed.isDirectory(), size: 0 });
+            if (observed.isDirectory()) {
+              const sub = await pin(child(src, name), src.absolute + "/" + name, false, true, true);
+              if (!unchanged(observed, sub.stat)) throw refused();
+              const target = await createDirectory(dst, name, dst.absolute + "/" + name);
+              await walk(sub, target, rel, depth + 1);
+            } else await copyFile(src, dst, name, observed);
+          }
+        } finally { await stream.close(); }
+        if (!unchanged(before, await fstat(src.file, false))) throw refused();
+      };
+      await walk(objects, destination, "", 0);
+      const validateRecords = async () => {
+        await validatePins();
+        if (!unchanged(objects.stat, await fstat(objects.file, false))) throw refused();
+        // Revisit every earlier leaf after the entire walk, including files in
+        // earlier directories. Quiescence is a caller prerequisite, not an atomic claim.
+        for (const r of inputs) {
+          if (!unchanged(r.stat, await stat(child(r.parent, r.name), false))) throw refused();
+        }
+        for (const r of outputs) {
+          const named = child(r.parent, r.name), now = await stat(named, true);
+          if (!same(r.stat, now) || now.uid !== BigInt(process.getuid!()) ||
+              (now.mode & (r.directory ? 0o5777n : 0o7777n)) !== (r.directory ? 0o700n : 0o600n) ||
+              (!r.directory && (now.nlink !== 1n || now.size !== BigInt(r.size)))) throw refused();
+          const f = await open(named, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
+            fsConstants.O_NONBLOCK | (r.directory ? fsConstants.O_DIRECTORY : 0), true);
+          try {
+            const fd = await fstat(f, true);
+            if (!unchanged(now, fd)) throw refused();
+          } finally { await close(f); }
+        }
+        await controlsAbsent(objects); await controlsAbsent(destination);
+        await validatePins();
+      };
+      await validateRecords();
+      await effect();
+      await validateRecords(); // Callback may itself yield to an insertion/replacement.
+      for (const f of handles) { await close(f); check(); }
+      check();
+      if (handles.size !== 0) throw refused();
+      return { path: outDir, byteSize, fileCount };
+    } catch (error) {
+      // All I/O above is serial and settled before cleanup. No abort races,
+      // permission repairs, retries, source writes, child launches or refunds.
+      for (let i = outputs.length - 1; i >= 0; i--) {
+        const r = outputs[i]!;
+        try {
+          for (const p of pins) {
+            if (!p.output || !isWithinPath(r.parent.absolute, p.absolute)) continue;
+            const named = await fs.lstat(p.named, { bigint: true });
+            const fd = await p.file.stat({ bigint: true });
+            if (!same(p.stat, named) || !same(named, fd) ||
+                (p.output && !safeDirectory(p.absolute, named))) throw refused();
+          }
+          const p = "/proc/self/fd/" + r.parent.file.fd + "/" + r.name;
+          const now = await fs.lstat(p, { bigint: true });
+          if (!same(r.stat, now)) continue;
+          if (r.directory) await fs.rmdir(p); else await fs.unlink(p);
+        } catch { /* Preserve foreign or ambiguous names; continue bounded siblings. */ }
+      }
+      const reason = error instanceof Error && [
+        "maintenance_resource_exhausted", "maintenance_token_invalid", "maintenance_clock_invalid",
+      ].includes(error.message) ? error.message : "maintenance_object_snapshot_refused";
+      throw new Error(reason);
+    } finally {
+      // Success already joined every retained close. On refusal, settle the
+      // remaining admitted handles without masking the fixed refusal or granting work.
+      for (const f of handles) {
+        try { await close(f); } catch { /* Retain uncertainty; no successful handoff. */ }
+      }
+    }
   }
 
   /**
