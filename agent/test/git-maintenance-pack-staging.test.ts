@@ -53,8 +53,10 @@ async function fixture(t: test.TestContext, profile: number | {
         gid: p === path.dirname(dir) ? options.dataGid ?? stat.gid : stat.gid,
         mode: p === path.dirname(dir) && options.dataMode !== undefined
           ? (stat.mode & ~0o7777) | options.dataMode : stat.mode & ~0o022 });
-    if (actualUid !== workerUid && typeof p === "string" && (p === dir || p.startsWith(dir + path.sep)))
-      stat.uid = workerUid;
+    if (typeof p === "string" && (p === dir || p.startsWith(dir + path.sep))) {
+      if (actualUid !== workerUid) stat.uid = workerUid;
+      if (options.gid !== undefined) stat.gid = options.gid;
+    }
     return stat;
   });
   const git = new GitCache(dir, nullLogger());
