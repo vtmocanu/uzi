@@ -11,8 +11,9 @@ import (
 // summaryOmitted is the exact set of RunListItemDTO keys the ?view=summary projection drops
 // (issue #2661). Adding a key here is a deliberate wire decision, never a side effect.
 var summaryOmitted = map[string]bool{
-	"reset_state_digest":                                  true,
-	"milestone_reconciliations":                           true,
+	"semantic_gate":             true, // Owner detail only; no raw snapshots in summaries.
+	"reset_state_digest":        true,
+	"milestone_reconciliations": true,
 	"milestone_reconciliations_next_before_gate_revision": true,
 	"plan_md":           true,
 	"repo_agents":       true,
@@ -50,6 +51,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 	apitypestest.Populate(&full)
 
 	want := full
+	want.SemanticGate = nil
 	want.ResetStateDigest = ""
 	want.MilestoneReconciliations = nil
 	want.MilestoneReconciliationsNextBeforeGateRevision = nil

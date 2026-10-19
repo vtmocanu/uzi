@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { SemanticGateApproval } from "./semanticGate";
 import {
   api,
   ApiError,
@@ -255,6 +256,7 @@ export function useRunStream(runId: string) {
       // submitRunInput. Meaningful only with approve_plan / reject_plan / revise_plan.
       expectedGateRevision?: number,
       reset?: MilestoneResetOptions,
+      semanticApproval?: SemanticGateApproval,
     ) => {
       // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
       // optimistically prepend a temp entry (the queue is newest-first), then adopt
@@ -304,7 +306,8 @@ export function useRunStream(runId: string) {
         discardPendingOutcome,
         expectedGateRevision,
       ] as const;
-      if (reset) await api.submitRunInput(...args, reset);
+      if (semanticApproval !== undefined) await api.submitRunInput(...args, reset, semanticApproval);
+      else if (reset) await api.submitRunInput(...args, reset);
       else await api.submitRunInput(...args);
       void refreshRun();
     },
