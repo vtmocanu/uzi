@@ -2,6 +2,8 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { client, installHarness } from "./runner-harness.js";
 import { reportRetirementFixture } from "./report-retirement-fixture.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import type { RecoveryRecord } from "../src/recovery.js";
 
 installHarness();
 
@@ -32,6 +34,74 @@ it("policy production proof retires exactly the ACKed report with closed custody
     await f.assertPending(); // Ordinary report, MAC journals, source clones and pins all remain.
   } finally { restore(); }
 });
+
+it("policy forwarding includes a closed older source without ordinary settlement", { skip: process.platform !== "linux" }, async t => {
+  const f = await reportRetirementFixture(t, { policyCustody: true, olderSource: true });
+  const context = await policy(f);
+  assert.ok((await f.coordinator.inspect(f.claim.run_id)).some(row => row.generation === 1),
+    "an authenticated older source exists independently of the current policy");
+  assert.deepEqual((await client.listRecoveryHolds(f.claim.run_id)).holds.map(hold => hold.generation), [2],
+    "the older source has no open hold");
+  const recovery = f.recoveryOf(f.r);
+  const ordinary = recovery as unknown as {
+    settledEarlierGenerations(records: RecoveryRecord[], generation: number): Promise<Set<number>>;
+  };
+  const settled = t.mock.method(ordinary, "settledEarlierGenerations");
+  const proof = t.mock.method(recovery, "withPolicyReportRetirementProof");
+  const custody = t.mock.method(client, "withPolicyReportRetirementCustody");
+  const restore = f.useHeadroom();
+  try {
+    assert.equal(await f.r.retirePolicyReport(f.claim.run_id, 2, context), true);
+    assert.equal(proof.mock.callCount(), 1, "the runner entered the public policy proof");
+    assert.equal(custody.mock.callCount(), 1, "the real within-attempt path entered policy custody");
+    const [custodyCall] = custody.mock.calls;
+    assert.ok(custodyCall);
+    assert.deepEqual(custodyCall.arguments.slice(0, 3), [f.claim.run_id, 2, [1, 2]]);
+    assert.deepEqual(f.policyCustody.generations, [1, 2], "closed older custody was checked over typed HTTP");
+    assert.equal(settled.mock.callCount(), 0, "policy proof must never prune ordinary settled generations");
+    assert.equal(f.outbox.listPendingPolicies(f.claim.run_id).length, 0, "the exact ACKed policy was unlinked");
+    await f.assertPending();
+  } finally { restore(); }
+});
+
+for (const obstruction of ["expired deadline", "cancelled proof", "custody refusal"] as const) {
+  it(`policy callback retains evidence after late ${obstruction}`, { skip: process.platform !== "linux" }, async t => {
+    const f = await reportRetirementFixture(t, { policyCustody: true });
+    const context = await policy(f);
+    const restore = f.useHeadroom();
+    const timer = f.captureTimers(ms => ms > f.headroom.proofMs - 5_000 && ms <= f.headroom.proofMs);
+    const real = client.withPolicyReportRetirementCustody.bind(client);
+    let callbacks = 0;
+    let restoreClock = () => {};
+    t.mock.method(client, "withPolicyReportRetirementCustody", (...args: Parameters<typeof real>) => {
+      const [runId, current, generations, budget, action, guarded] = args;
+      return real(runId, current, generations, budget, async eligible => {
+        callbacks++;
+        assert.deepEqual(f.policyCustody.generations, [2], "actual custody HTTP completed before invalidation");
+        assert.equal(eligible(), true, "custody was initially eligible");
+        assert.ok(MaintenanceBudget.current(), "the cancellation attempt still owns its maintenance budget");
+        MaintenanceBudget.current()!.check();
+        if (obstruction === "expired deadline") {
+          const clock = t.mock.method(Date, "now", () => budget.deadline);
+          restoreClock = () => clock.mock.restore();
+        } else if (obstruction === "cancelled proof") {
+          assert.equal(budget.signal.aborted, false);
+          assert.equal(timer.count(), 1, "one real proof timer is armed");
+          timer.fire();
+          assert.equal(budget.signal.aborted, true);
+        }
+        await action(obstruction === "custody refusal" ? () => false : eligible);
+      }, guarded);
+    });
+    try {
+      assert.equal(await f.r.retirePolicyReport(f.claim.run_id, 2, context), false);
+      assert.equal(callbacks, 1, "the real custody callback boundary was reached once");
+      restoreClock();
+      assert.equal(f.outbox.listPendingPolicies(f.claim.run_id).length, 1);
+      await f.assertPending();
+    } finally { restoreClock(); timer.restore(); restore(); }
+  });
+}
 
 it("degraded evidence with no preserved head can retire after a complete later source proof", async t => {
   const f = await reportRetirementFixture(t, { policyCustody: true });

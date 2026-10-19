@@ -40,6 +40,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const captureId = "00000000-0000-4000-8000-000000002652";
   const holdId = "33333333-3333-4333-8333-333333333333";
   let status = "running";
+  // An explicit olderSource can be pinned under a real hold, then closed after capture.
+  let olderHoldOpen = options.olderOpenHold === true || options.olderSource === true;
   let manifest: RecoveryUploadManifest | undefined;
   let uploadedBytes: Buffer | undefined;
   const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0, priorArchiveFinal: 0 };
@@ -94,7 +96,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased || (options.priorPendingArchiveFinal && ownership.generation < generation) ? [] : [{
     hold_id: holdId, generation: archiveGeneration, inventory_guarded: true,
     has_available_capture: !!manifest,
-  }]), ...(options.olderOpenHold ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
+  }]), ...(olderHoldOpen ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
     generation: 1, inventory_guarded: true,
     has_available_capture: options.priorPendingArchiveFinal === true && captures.has("00000000-0000-4000-8000-000000002651") }] : [])] });
   const historyEvents: string[] = [];
@@ -376,7 +378,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     archive = (await coordinator.inspect(claim.run_id)).find(row => row.generation === archiveGeneration && row.state === "uploaded")!;
   } else {
     await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
-    if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
+    if (options.olderSource ?? options.olderOpenHold) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
       inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
     assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
       inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
@@ -385,6 +387,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.equal((await coordinator.captureAndUpload({ record: inventory, barePath: bare, defaultBranch: "main" })).state, "uploaded");
     archive = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === inventory.captureId)!;
   }
+  if (!options.olderOpenHold) olderHoldOpen = false;
   assert.ok(archive, "real uploaded archive exists");
   assert.equal(archive.generation, archiveGeneration);
   assert.equal(archive.finalAcknowledged === true, false);
