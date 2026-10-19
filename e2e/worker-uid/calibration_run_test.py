@@ -441,6 +441,11 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
         self.assertEqual(host.requests, [])
         self.assertEqual(stderr.getvalue().count("node diagnostic "), 6)
+        # The node version is measurement only (no required major): captured in the JSON and the summary.
+        for result in results:
+            self.assertIsInstance(result["nodeVersion"], str)
+            self.assertTrue(result["nodeVersion"])
+        self.assertEqual(stderr.getvalue().count("node=" + results[0]["nodeVersion"]), 6)
         journal = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
         self.assertEqual(len(journal), 6)
 
@@ -481,7 +486,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([c for c in calls if c[:2] == ["docker", "rm"]], [])
         self.assertFalse(any(c[:2] == ["docker", "start"] for c in calls))
 
-    def test_diagnostic_failure_does_not_change_published_reports_but_fails_the_run(self):
+    def test_diagnostic_failure_leaves_reports_unchanged_when_cleanup_succeeds_but_fails_the_run(self):
         events = []
         class FakeHost:
             def __init__(self, manifest, directory, image):
@@ -496,6 +501,22 @@ class RunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "node diagnostic: diagnostic harness broke"):
                 calibration.main()
         self.assertEqual(events, ["run", "measure", "finish", ("publish", None)])
+
+    def test_diagnostic_cleanup_failure_publishes_both_reports_failed(self):
+        events = []
+        class FakeHost:
+            def __init__(self, manifest, directory, image):
+                self.manifest, self.directory = manifest, directory
+            def run(self): events.append("run")
+            def measure_diagnostics(self): events.append("measure"); raise ValueError("diagnostic harness broke")
+            def finish(self): events.append("finish"); raise ValueError("container cleanup failed")
+            def publish(self, error=None): events.append(("publish", str(error)))
+        argv = ["calibration.py", "--image", "x", "--mode", "local", "--run-id", "r", "--attempt", "1"]
+        with patch.object(calibration, "Host", FakeHost), patch.object(calibration, "SCRATCH", self.root / "scratch"), \
+                patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "cleanup: container cleanup failed"):
+                calibration.main()
+        self.assertEqual(events, ["run", "measure", "finish", ("publish", "None; cleanup: container cleanup failed")])
 
 
 if __name__ == "__main__":

@@ -181,9 +181,9 @@ function rig(over: { maxInterventions?: number } = {}) {
   const text = (r: { content: { type: string; text?: string }[] }) => r.content.map((b) => b.text ?? "").join("");
   const grant = (index: number, remaining: number) => reserves[index]!.answer.resolve(ack(reserves[index]!.request, remaining));
   /** A refusal: no allowance left, nothing admitted, nothing authorized. */
-  const deny = (index: number) => {
+  const deny = (index: number, authorizing = false) => {
     const request = reserves[index]!.request;
-    reserves[index]!.answer.resolve({ ...ack(request, 0, { admitted: false, authorizing: false }),
+    reserves[index]!.answer.resolve({ ...ack(request, 0, { admitted: false, authorizing }),
       allowance: { limit: request.policy.max_interventions, used: request.policy.max_interventions, remaining: 0 } });
   };
   return {
@@ -241,6 +241,15 @@ test("reservation fence: an intervention disposes the victim only after the API 
     intervention_id: r.reserves[0]!.request.intervention_id, tree_rss_bytes_approx: 500,
     outcome: "confirmed_drained", cancellation_confirmed: true,
   }));
+  // The feed event for the confirmed victim carries the same exact result, for its own tool use only.
+  await r.monitor.settle();
+  const fed = r.feedback.filter((item) => item.tool_id === "toolu_a");
+  assert.equal(fed.length, 1, "exactly one feed event for the victim's tool use");
+  assert.deepEqual(fed[0], expectedResult(identity, {
+    intervention_id: r.reserves[0]!.request.intervention_id, tree_rss_bytes_approx: 500,
+    outcome: "confirmed_drained", cancellation_confirmed: true,
+  }));
+  assert.deepEqual(r.feedback.filter((item) => item.tool_id !== "toolu_a"), []);
   await r.monitor.stop();
 });
 
@@ -264,6 +273,24 @@ test("a refused reservation cancels nothing: the command keeps running and the m
   const result = await victim.call;
   assert.equal(JSON.parse(r.text(result)).outcome, "no_signal");
   assert.equal(JSON.parse(r.text(result)).cancellation_confirmed, false);
+  await r.monitor.stop();
+});
+
+test("a reservation that is not admitted cancels nothing even when it claims to authorize", { timeout: 15000 }, async () => {
+  const r = rig();
+  const victim = r.start("a", 500);
+  await r.enrolled(1);
+  r.monitor.tick();
+  await until(() => r.reserves.length === 1, "reservation request");
+  r.deny(0, true); // admitted: false, authorizing: true
+  await r.monitor.settle();
+  await sleep(30);
+  assert.equal(r.roots.get("a")!.disposes(), 0, "a not-admitted reservation never disposes the command");
+  assert.equal(victim.outcome.settled, false, "the command is still live");
+  assert.equal(r.lane.liveCount, 1);
+  assert.equal(r.trips.length, 0);
+  await r.lane.quiesce(1000);
+  await victim.call;
   await r.monitor.stop();
 });
 

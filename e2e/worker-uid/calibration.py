@@ -24,7 +24,8 @@ DIAG_BEGIN = "UZI_NODE_DIAGNOSTIC_BEGIN"
 DIAG_END = "UZI_NODE_DIAGNOSTIC_END"
 DIAG_WORKLOADS = ("many-mismatch", "equivalent", "bounded-diagnostic")
 DIAG_SIZES = (1024 ** 3, 2 * 1024 ** 3)
-# Six containers: each start is bounded by DIAG_SECONDS, so the step adds at most ~3 minutes.
+# Six containers, each bounded in turn: create <=10s, inspect <=10s, start/capture <=DIAG_SECONDS+5s (35s),
+# owned cleanup <=29s. Worst case ~84s per container, so the step adds at most ~8.4 minutes.
 DIAG_SECONDS = 30
 DIAG_OUTPUT_BYTES = 64 * 1024
 
@@ -450,7 +451,10 @@ def main():
         try:
             host.measure_diagnostics()
         except Exception as exc:
-            # Harness failure only; kept apart so the two calibration reports publish unchanged.
+            # Harness failure only, kept apart from the calibration reports: when owned cleanup in
+            # host.finish() succeeds, the two reports publish exactly as they would without the
+            # diagnostic. A diagnostic container whose own cleanup fails makes finish() fail, and
+            # both reports are then published FAILED (fail-closed by design).
             diagnostic_error = exc
     except Exception as exc:
         # Ordinary implementation/shape errors still require owned cleanup and

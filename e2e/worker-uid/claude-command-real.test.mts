@@ -7,10 +7,10 @@
 // The model-facing batcher feed event is runner-level and is covered by agent unit tests; here
 // the WorkerMemoryPressureResult fields are asserted against the entry identity instead.
 //
-// Not feasible in this image: a NON-DUMPABLE runner-uid descendant (the Alpine image ships no
-// python3, C compiler or prctl helper, and node has no prctl binding), so the "non-dumpable
-// descendant" scenario is proven with its nearest real equivalent, a SIGSTOPped supervisor
-// (see the last-but-one case).
+// A NON-DUMPABLE runner-uid descendant needs no prctl helper: the kernel marks a process
+// non-dumpable when it execs a file it cannot read. The stopped-supervisor case builds one from
+// a worker-owned, mode 0711 copy of the image's busybox (executable by the runner uid, not
+// readable by it) run by its applet name, and checks the runner uid cannot read its environ.
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -54,7 +54,19 @@ function runnerRun(command: string, args: readonly string[]) {
   const wrapped = runnerCommand(command, args);
   return spawnSync(wrapped.command, wrapped.args, { env: HELPER_ENV, encoding: "utf8", timeout: 10_000 });
 }
-const alive = (pid: number) => runnerRun("kill", ["-0", String(pid)]).status === 0;
+/**
+ * True when `pid` exists, false only on a definite ESRCH. A wrapper that failed or timed out
+ * throws, so a broken probe can never read as "gone" and pass an untilGone vacuously.
+ */
+function alive(pid: number): boolean {
+  const probe = runnerRun("kill", ["-0", String(pid)]);
+  if (probe.error || probe.status === null) {
+    throw new Error(`liveness probe for pid ${String(pid)} did not complete: ${probe.error?.message ?? probe.signal ?? "no exit status"}`);
+  }
+  if (probe.status === 0) return true;
+  if (/No such process/i.test(probe.stderr)) return false;
+  throw new Error(`liveness probe for pid ${String(pid)} failed with status ${String(probe.status)}: ${probe.stderr.trim()}`);
+}
 
 /** Poll until `predicate` holds; at most `ms` (50 ms steps). A failure stops this case only. */
 async function until(predicate: () => boolean, what: string, ms = 15_000) {
@@ -253,7 +265,7 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       const laneA = newLane(rig, capturedA).lane;
       const laneB = newLane(rig, capturedB).lane;
       const callA = startCall(laneA, rig, { command: hog("ready-a"), timeout: 90_000 });
-      const callB = startCall(laneB, rig, { command: "touch ready-b; sleep 8; echo sibling-done", timeout: 90_000 });
+      const callB = startCall(laneB, rig, { command: "mkfifo -m 666 release-b; touch ready-b; read -r _ < release-b; echo sibling-done", timeout: 90_000 });
       await ready(rig, "ready-a");
       await ready(rig, "ready-b");
       const entries = await enrolled(commands, 2);
@@ -274,6 +286,9 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       assert.equal(commands.hasConfirmedStop(entryB), false);
       assert.ok(siblingPids.every((pid) => alive(pid)), "the sibling run's command survived the other run's cancel");
       assert.equal(laneB.liveCount, 1);
+      // The sibling is blocked reading a fifo: it finishes only when released, never on a timer a
+      // loaded host could outrun, and it keeps one stable process for the liveness check above.
+      fs.writeFileSync(path.join(rig.dir, "release-b"), "go\n");
       const resultB = await callB.pending;
       assert.equal(resultB.isError, false);
       assert.match(textOf(resultB), /^Exit code: 0\n/);
@@ -378,10 +393,12 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
   it("never selects a larger unattributed process tree", { timeout: 60_000 }, async () => {
     const rig = newRig();
     try {
-      // A ~200 MiB process started outside the lane, as the worker uid, never enrolled.
-      const big = spawn(process.execPath, ["-e", "const b = Buffer.alloc(200 * 1024 * 1024, 1); setInterval(() => b[0]++, 1000);"], { stdio: "ignore" });
+      // A ~200 MiB process at the RUNNER uid, started outside the lane and any supervisor, never enrolled.
+      const wrapped = runnerCommand(process.execPath, ["-e", "const b = Buffer.alloc(200 * 1024 * 1024, 1); setInterval(() => b[0]++, 1000);"]);
+      const big = spawn(wrapped.command, wrapped.args, { env: HELPER_ENV, stdio: "ignore" });
       rig.children.push(big);
       const bigPid = big.pid!;
+      rig.pids.add(bigPid);
       const residentBytes = () => {
         try { return Number(fs.readFileSync(`/proc/${String(bigPid)}/statm`, "utf8").split(" ")[1]) * 4096; } catch { return 0; }
       };
@@ -394,12 +411,16 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       await ready(rig, "ready");
       const entries = await enrolled(commands, 1);
       assert.equal(entries.length, 1, "only the lane's own command is eligible");
-      const observation = await observeFresh(entries[0]!);
+      // Candidate assembly as the guard does it: every eligible entry, each freshly observed.
+      const candidates: Array<{ entry: Entry; observation: Observation }> = [];
+      for (const entry of commands.eligibleEntries()!) candidates.push({ entry, observation: await observeFresh(entry) });
+      assert.equal(candidates.length, 1);
+      const observation = candidates[0]!.observation;
       for (const pid of treePids(observation)) rig.pids.add(pid);
       assert.ok(!treePids(observation).includes(bigPid), "the unattributed process is not in the enrolled tree");
       const enrolledBytes = observation.rows.reduce((sum, row) => sum + row.rssBytes, 0);
       assert.ok(residentBytes() > enrolledBytes, "the unattributed tree is the larger one");
-      const selection = commands.select([{ entry: entries[0]!, observation }], performance.now(), WINDOW_MS);
+      const selection = commands.select(candidates, performance.now(), WINDOW_MS);
       assert.equal(selection?.entry, entries[0], "the guard selects only the enrolled smaller command");
       assert.equal(selection?.rssBytesApprox, enrolledBytes);
       ac.abort();
@@ -530,9 +551,20 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
   });
 
   it("poisons the lane and kills the exact supervisor when a stopped supervisor cannot confirm disposal", { timeout: 90_000 }, async (t) => {
-    // The nearest real equivalent of a non-dumpable descendant that defeats observation:
-    // the supervisor itself is SIGSTOPped, so its dispose can never be confirmed.
+    // A non-dumpable runner-uid descendant under a SIGSTOPped supervisor: the supervisor's dispose
+    // can never be confirmed, and the owner's own reap must not call the run quiescent while the
+    // descendant (whose environ and cwd the scan cannot read) is alive.
     const rig = newRig();
+    // Worker-owned, executable-but-unreadable copy of busybox: the kernel marks a process
+    // non-dumpable when it execs a file it cannot read, and the runner uid (10002) holds only
+    // the "other" execute bit. Run by its applet name: `<rig>/sleep`.
+    const hidden = path.join(rig.dir, "sleep");
+    fs.copyFileSync("/bin/busybox", hidden);
+    fs.chmodSync(hidden, 0o711);
+    const cloneB = path.join(fs.mkdtempSync(path.join("/tmp", "uzi-claude-real-b-")), "runner", "github.com+o+r", "issue-3");
+    fs.mkdirSync(cloneB, { recursive: true });
+    // The real runner-uid quiescence helper reads the real procfs: clear the hermetic empty view.
+    setQuiescenceViewForTests(undefined);
     try {
       const commands = new WorkerMemoryCommands();
       const killed: Array<{ pid: number | undefined; reaped: boolean }> = [];
@@ -544,12 +576,23 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
         },
       });
       const ac = new AbortController();
-      const { pending } = startCall(lane, rig, { command: "setsid sleep 300 & touch ready; sleep 280", timeout: 90_000 }, ac.signal);
+      const { pending } = startCall(lane, rig, {
+        command: `setsid ${hidden} 300 & echo $! > nd.pid; echo $$ > sh.pid; touch ready; sleep 280`, timeout: 90_000,
+      }, ac.signal);
       await ready(rig, "ready");
       const [entry] = await enrolled(commands, 1);
       const supervisorPid = entry!.root.pid;
+      const ndPid = Number(fs.readFileSync(path.join(rig.dir, "nd.pid"), "utf8"));
+      const shellPid = Number(fs.readFileSync(path.join(rig.dir, "sh.pid"), "utf8"));
+      assert.ok(Number.isInteger(ndPid) && ndPid > 1 && Number.isInteger(shellPid) && shellPid > 1);
+      await until(() => alive(ndPid), "the non-dumpable descendant");
       const tree = treePids(await observeFresh(entry!));
-      for (const pid of [supervisorPid, ...tree]) rig.pids.add(pid);
+      for (const pid of [supervisorPid, ndPid, shellPid, ...tree]) rig.pids.add(pid);
+      assert.ok(tree.includes(ndPid), `the enrolled tree includes the non-dumpable descendant: ${tree.join(",")}`);
+      // Control: the command's own shell is readable by the runner uid; the unreadable-exec
+      // descendant is not (the kernel makes its environ root-owned).
+      assert.equal(runnerRun("cat", [`/proc/${String(shellPid)}/environ`]).status, 0, "the command's own shell is dumpable");
+      assert.notEqual(runnerRun("cat", [`/proc/${String(ndPid)}/environ`]).status, 0, "the unreadable-exec descendant is non-dumpable");
 
       assert.equal(runnerRun("kill", ["-STOP", String(supervisorPid)]).status, 0);
       ac.abort();
@@ -569,12 +612,35 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       assert.equal(later.isError, true);
       assert.match(textOf(later), /Commands are unavailable/);
       await assert.rejects(lane.quiesce(2000), GuardedCommandUnconfirmedError);
-      // The supervisor is the tree's only reaper and has no parent-death signal, so processes it
-      // adopted may outlive a supervisor killed this way. Report it rather than assert it; the
-      // rig kills any survivor by its recorded pid.
+      // The supervisor is the tree's only reaper and has no parent-death signal, so the
+      // non-dumpable descendant must outlive a supervisor killed this way.
       await sleep(500);
+      assert.equal(alive(ndPid), true, "the non-dumpable descendant outlived the supervisor kill");
+
+      // The run's own reap, with a sibling attempt in flight (so an unreadable, unattributed
+      // process is never killed on a guess): it cannot read the descendant, so it must report
+      // `unverified` naming it, never `quiescent`, and must not signal it.
+      const attemptA = newRunAttempt(randomUUID(), 1, rig.dir, () => lane.recordedRoots());
+      const attemptB = newRunAttempt(randomUUID(), 1, cloneB, () => []);
+      const registry = new LiveAttemptRegistry();
+      registry.add(attemptA);
+      registry.add(attemptB);
+      const own = await quiesceRunAttempt({
+        mode: "own", attempt: attemptA, cloneKey: attemptA.cloneKey, targetPaths: [rig.dir],
+        processes: true, dockerHost: undefined, registry, otherClaimInFlight: true,
+      });
+      assert.notEqual(own.process?.state, "quiescent", own.process?.detail);
+      assert.equal(own.process?.state, "unverified", JSON.stringify(own.process));
+      assert.ok(own.process?.processes.some((p) => p.pid === ndPid && p.reason === "unreadable_unattributed"),
+        `the non-dumpable descendant is reported: ${JSON.stringify(own.process?.processes)}`);
+      assert.ok(!own.process?.killed.includes(ndPid), "the unreadable descendant is not signalled on a guess");
+      assert.equal(alive(ndPid), true, "the non-dumpable descendant is still alive after the unverified reap");
       t.diagnostic(`descendants alive after the supervisor kill: ${tree.filter((pid) => pid !== supervisorPid && alive(pid)).join(",") || "none"}`);
-    } finally { await cleanRig(rig); }
+    } finally {
+      restoreHermeticView();
+      await cleanRig(rig);
+      fs.rmSync(path.dirname(path.dirname(path.dirname(cloneB))), { recursive: true, force: true });
+    }
   });
 
   it("keeps native Bash when the guard is off", { timeout: 30_000 }, async () => {
