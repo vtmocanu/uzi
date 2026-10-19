@@ -179,7 +179,7 @@ func TestPolicyRevisionAcceptanceNullableSwitchLiveDB(t *testing.T) {
 }
 
 func TestPolicyRevisionAcceptanceNegativeProofLiveDB(t *testing.T) {
-	for _, mode := range []string{"pending_current", "pending_unbound", "pending_future", "mixed", "other_gate", "unknown", "malformed", "gate", "selection", "old", "unbound", "old_applied_mixed", "missing_primary", "foreign_primary", "future_primary_gate", "future_primary_generation", "linkage", "no_stop"} {
+	for _, mode := range []string{"pending_current", "pending_unbound", "pending_future", "mixed", "other_gate", "unknown", "malformed", "gate", "selection", "old", "unbound", "old_applied_mixed", "missing_primary", "foreign_primary", "future_primary_gate", "future_primary_generation", "linkage", "accepted_stop"} {
 		t.Run(mode, func(t *testing.T) {
 			e, f, run := acceptanceFixture(t)
 			currentGate := int64(1)
@@ -251,23 +251,37 @@ func TestPolicyRevisionAcceptanceNegativeProofLiveDB(t *testing.T) {
 				if mode == "linkage" {
 					e.exec(`UPDATE runs SET gate_presented_payload=gate_presented_payload || '{"revision_retry_receipt":{"source_revision":1,"revision_input_id":1}}'::jsonb WHERE id=$1`, run)
 				}
-			case "no_stop":
-				e.exec("UPDATE runs SET policy_stop_resolution='{}' WHERE id=$1", run)
+			case "accepted_stop":
+				// This is a constraint-valid retained-resolution marker fixture;
+				// actual reviewed Stop composition is exercised separately.
+				acceptanceAck(t, f, run, approval)
+				scope, err := e.q.CreateRunInput(e.ctx, store.CreateRunInputParams{RunID: run, Kind: "scope"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				e.exec("UPDATE runs SET policy_stop_resolution=jsonb_build_object('version',1,'scope_input_id',$2::bigint) WHERE id=$1", run, scope.ID)
 			}
 			// An exact historical APPLIED row must already be owned before its retry.
 			if mode == "old_applied_mixed" {
 				e.exec("UPDATE run_user_inputs SET consumed_at=now(),consumed_worker_id=$2,consumed_claim_generation=1 WHERE id=$1", approval, f.wkr.ID)
 				acceptanceAck(t, f, run, ids[1])
-			} else if mode != "no_stop" {
+			} else if mode != "accepted_stop" {
 				acceptanceAck(t, f, run, ids...)
 			}
 			before := acceptancePair(t, e, run)
 			observer := &acceptanceBeginner{TxBeginner: e.pool}
 			f.svc.SetTxBeginner(observer)
 			_, err := f.svc.ApplyInputs(e.ctx, f.wkr, run, 1, ids)
-			if mode == "no_stop" {
-				if err == nil {
-					t.Fatal("accepted Stop allowed approval")
+			if mode == "accepted_stop" {
+				if !errors.Is(err, ErrInputReceiptConflict) {
+					t.Fatalf("accepted Stop allowed approval or returned another failure: %v", err)
+				}
+				var unapplied bool
+				if readErr := e.pool.QueryRow(e.ctx, "SELECT applied_at IS NULL FROM run_user_inputs WHERE id=$1", approval).Scan(&unapplied); readErr != nil || !unapplied {
+					t.Fatalf("Stop refusal mutated receipt: %v %v", unapplied, readErr)
+				}
+				if observer.hits != 0 || acceptancePair(t, e, run) != before {
+					t.Fatal("Stop refusal changed source or selection")
 				}
 				return
 			}
@@ -297,6 +311,9 @@ func TestPolicyRevisionAcceptanceCrossCheckLiveDB(t *testing.T) {
 			candidate := PlanCrossCheckCandidate{PlanMd: r.PlanMd.String, Milestones: r.MilestonesCandidate,
 				RequiredCapabilities: r.RequiredCapabilities, RequiredTools: r.RequiredTools, SizeClass: r.SizeClass,
 				BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
+			if len(candidate.Milestones) == 0 {
+				candidate.Milestones = []byte("[]")
+			}
 			if mode == "history" || strings.HasPrefix(mode, "historical_pending") {
 				candidate.PlanMd = "historical"
 			}
@@ -501,7 +518,7 @@ func TestPolicyRevisionAcceptanceLateVerdictInterleavingLiveDB(t *testing.T) {
 	f.mustPublish(run, req, 1)
 	// Publication normally settles the exited checker. Explicitly restore a
 	// historical pending witness to exercise the late writer's independent fence.
-	e.exec("UPDATE cross_checks SET verdict='pending',decided_at=NULL WHERE id=$1", cc.ID)
+	e.exec("UPDATE cross_checks SET verdict='pending',reason_class=NULL,findings=NULL,decided_at=NULL WHERE id=$1", cc.ID)
 	e.exec("UPDATE runs SET status='running',worker_id=$2,claim_generation=1,claim_released_at=NULL WHERE id=$1", child, f.wkr.ID)
 	approval := acceptanceInput(t, e, run, "approve_plan", 1)
 	acceptanceAck(t, f, run, approval)
@@ -556,6 +573,9 @@ func TestPolicyRevisionAcceptanceSubmitRecoveryLiveDB(t *testing.T) {
 				if len(accepted.AssociatedCrossChecks) != 0 || mustRun(t, e, run).PolicyCandidateCrossCheckID.Valid {
 					t.Fatal("human approval did not waive real decided feedback")
 				}
+				// Exact recovery retains its original auto-approved running admission.
+				// This state bridge does not claim the complete resumed worker flow.
+				e.exec("UPDATE runs SET status='running',auto_approve=true,plan_cross_check_required=true WHERE id=$1", run)
 				baseline, history = acceptancePair(t, e, run), acceptanceHistory(t, e, run)
 				return nil
 			}

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -108,6 +109,12 @@ func preparePolicyRevisionAcceptance(ctx context.Context, tx pgx.Tx, w store.Wor
 		projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones,
 			RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools),
 			SizeClass: nonEmptyPtr(cc.SizeClass.String)}
+		// The report writer gates execution milestones to issue runs. Tasks,
+		// prompts and self-improvement candidates still carry a non-NULL array
+		// in cross_checks, but their presented gate omits it.
+		if r.Kind != runkind.Issue {
+			projection.Milestones = nil
+		}
 		projected, err := projection.canonicalJSON()
 		current, currentErr := gatePayloadFromRow(r).canonicalJSON()
 		if err != nil || currentErr != nil {
