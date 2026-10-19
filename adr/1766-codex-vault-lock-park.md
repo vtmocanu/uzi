@@ -217,6 +217,12 @@ state and `acceptsCompletedCapture`; later poison, changed root/launch/callback
 facts, unclean cache tracking or open roots retain the cache. This narrow reader
 grants no general clean status, admission, credential-release or capture authority.
 Refs #2852 (AI-synced 2026-10-18).
+Pre-start retained-source capture can bind that existing capture-only facade with
+optional worker-internal marker/key/path metadata. Its acquisition-local binding
+and refusal rules are specified in [ADR-1106](1106-codex-harness.md#process-root-ownership);
+this enables an eligible predecessor proof without a provider start, credential
+reconciliation or changes to the normal run binding. Missing metadata retains
+pre-start scoped-reaper refusal. Refs #2852 (AI-synced 2026-10-18).
 That acquisition still needs its own settlement and deadline. New poison or unknown
 cleanup retains the outstanding registry and refuses capture.
 

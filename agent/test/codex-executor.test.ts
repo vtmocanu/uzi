@@ -842,9 +842,9 @@ describe("M3 actual runner memory Codex delivery", () => {
           assert.ok(captured, "actual RunRunner supplies trusted captured memory before Codex admission");
           return executor.run(ctx);
         },
-        withCredentialFreeCapture: async (ms, action, purpose, signal) => {
+        withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
           assert.ok(ms > 0 && ms <= 5000, "settlement stays inside the finite owner budget");
-          const result = await executor.withCredentialFreeCapture(ms, action, purpose, signal);
+          const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
           settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
           return result;
         },
@@ -2790,10 +2790,10 @@ describe("m1 credential-free owner cancel", () => {
           },
           get safety() { return executor.safety; },
           sandboxesCommands: true,
-          withCredentialFreeCapture: async (ms, action, purpose, signal) => {
+          withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
             settlingCancel = purpose === "cancel";
             try {
-              const result = await executor.withCredentialFreeCapture(ms, action, purpose, signal);
+              const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
               settlementKind = result.kind;
               return result;
             } finally { settlingCancel = false; }

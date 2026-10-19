@@ -34,6 +34,11 @@ old clone bytes. Ordinary seeding trust is unchanged. Refusing every credential-
 capture would strand capturable work in the ephemeral clone rather than the durable
 worker bare and regress verified park/pause preservation; successful local capture
 still proves neither archive availability nor permission to delete the predecessor.
+Pre-start retained-source proof uses a fresh unregistered process marker bound to
+the exact source, as specified in [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+It is not the source attempt identity or a recovery-record capture ID; it changes
+no journal, ledger, live registry, successor or deletion authority. Live-owner
+conflicts and inside clone proof/reproof still apply. Refs #2852 (AI-synced 2026-10-18).
 Exact completed-capture evidence also has a narrow disposed-registry cache
 attestation reader under [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect);
 this grants no source cleanup or general clean status. Refs #2852 (AI-synced 2026-10-18).

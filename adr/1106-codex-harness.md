@@ -483,6 +483,19 @@ Lost supervision or incomplete settlement grants no capture authority. This cont
 mints neither a credentialed nor a completion permit. See the
 [remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 
+Pre-start capture uses the existing capture-only facade. The optional fifth
+`Executor.withCredentialFreeCapture` argument is worker-internal immutable
+`marker`/`cloneKey`/`clonePath` metadata, not a wire field. The executor snapshots
+it before yielding, selects `captureReaperAttempt` under `captureTail` after prior
+ownership, setup/summary joins and session save, before safety acquisition, and
+restores it after owned callback/child settlement. Both facade getters select
+`captureReaperAttempt ?? reaperAttempt`; `run(ctx)` remains the normal binding
+writer. Invalid metadata or a tuple foreign to that normal binding refuses before
+the action. Omission retains normal fallback and pre-start scoped-reaper refusal;
+it does not impose a blanket capture ban. No helper JSON, flags, bootstrap,
+protocol, budget, component, model or credential authority changes.
+Refs #2852 (AI-synced 2026-10-18).
+
 The scoped reaper uses registered supervisor roots for fixed `mktemp`, the existing
 Node/tsx run-quiescence helper flag, and removal of the exact private temporary
 directory. Ordinary scans send legacy JSON without `reportDeadline` and retain

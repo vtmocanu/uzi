@@ -973,6 +973,7 @@ export interface Executor {
     action: (context: CredentialFreeCaptureContext) => Promise<T>,
     purpose?: "capture" | "cancel",
     signal?: AbortSignal,
+    attempt?: Readonly<SdkAttemptEnv>,
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete"; errors: readonly HarnessError[] }>;
 }
 

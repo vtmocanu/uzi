@@ -358,7 +358,7 @@ export class FakeCodexExecutor implements Executor {
   ) {
     this.safety = safety;
     if (settle) this.settleForCredentialFreeCapture = settle;
-    if (capture) this.withCredentialFreeCapture = (ms, action, purpose, signal) => capture(ms, action, purpose, signal);
+    if (capture) this.withCredentialFreeCapture = (ms, action, purpose, signal, attempt) => Reflect.apply(capture, undefined, [ms, action, purpose, signal, attempt]);
   }
   run(ctx: RunContext): Promise<ExecutorResult> {
     return this.behavior(ctx);

@@ -98,6 +98,12 @@ available capacity; occurrence rates and capacity cost are unknown. Command
 authority still expires at the original deadline. An uncertain acknowledgment
 does not start another capture, establish success or release custody; late
 acknowledgments retain the existing isolation from a successor attempt.
+An eligible retained source can be checked before the new model session starts,
+using a temporary worker-internal binding to that exact source. Existing live-owner
+conflicts and clone proof/reproof still apply; missing or invalid binding refuses
+the scoped proof and retains custody. This grants no source deletion authority.
+See [pre-start binding](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
+(Refs #2852) (AI-synced 2026-10-18).
 Retained-source capture ends at its durable capture record; creating a fresh
 successor from that bare pin follows outside the held capture, without reading
 old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened

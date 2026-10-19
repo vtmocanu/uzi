@@ -1972,6 +1972,8 @@ interface RunFlight {
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
+  /** Ephemeral helper owner during runFreeCapture; never a live execution attempt. */
+  activeCaptureAttempt?: RunAttempt;
   /** issue #1783 M2: in attempt-path mode (Docker-wired or recovery-enabled), the id minted BEFORE
    *  its clone is seeded: it names the attempt clone path, the recovery journal entry, the
    *  attempt ledger entry and the attempt marker alike. Undefined for a canonical-path seed. */
@@ -12547,7 +12549,7 @@ export class RunRunner {
         MaintenanceBudget.current()?.check();
         outcome = await this.quiesceImpl({
           mode,
-          attempt: flight.attempt,
+          attempt: flight.activeCaptureAttempt ?? flight.attempt,
           cloneKey,
           targetPaths,
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
@@ -13544,8 +13546,15 @@ export class RunRunner {
       const requiresScope = this.requiresFreeCaptureScope(claim, flight);
       const remaining = () => Math.max(0, deadlineAt - Date.now());
       if ((requiresScope && remaining() === 0) || signal?.aborted) return { kind: "incomplete" };
+      const captureAttempt = flight.executor.withCredentialFreeCapture
+        ? flight.predecessorCapture && flight.worktreePath
+          ? newRunAttempt(flight.runId, flight.claimGeneration, flight.worktreePath, () => [])
+          : flight.attempt
+        : undefined;
       let actionEntered = false;
       const invoke = async (context?: CredentialFreeCaptureContext) => {
+        const previousCaptureAttempt = flight.activeCaptureAttempt;
+        if (context) flight.activeCaptureAttempt = captureAttempt;
         const held: HeldFreeCapture = {
           context, signal: context?.signal ?? signal,
           // Legacy callers retain their existing operation bounds. Only Codex
@@ -13565,6 +13574,7 @@ export class RunRunner {
             : await body();
         } finally {
           this.freeCaptureFlights.delete(held);
+          if (context) flight.activeCaptureAttempt = previousCaptureAttempt;
         }
       };
       if (flight.executor.withCredentialFreeCapture) {
@@ -13572,7 +13582,9 @@ export class RunRunner {
           const result = await flight.executor.withCredentialFreeCapture(remaining(), context => {
             if (!context) throw new TrustedExecutionRefusal("credential-free capture context missing");
             return invoke(context);
-          }, purpose, signal);
+          }, purpose, signal, captureAttempt ? Object.freeze({
+            marker: captureAttempt.marker, cloneKey: captureAttempt.cloneKey, clonePath: captureAttempt.clonePath,
+          }) : undefined);
           return result.kind === "observed_empty" && !actionEntered ? { kind: "incomplete" } : result;
         } catch (error) {
           if (actionEntered) throw error;

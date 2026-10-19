@@ -6,7 +6,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
-import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { CodexExecutor, boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import type { WorkerClient } from "../src/client.js";
+import type { Logger } from "../src/log.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { assertClosedReaperRequest } from "../src/closed-reaper.js";
 import { LiveAttemptRegistry, newRunAttempt, quiesceRunAttempt, setQuiescenceViewForTests } from "../src/run-quiescence.js";
@@ -145,8 +148,129 @@ async function proof(hold: boolean, mode: "capture" | "own" = "capture", report 
   }
 }
 
+async function publicPrestart(report: (message: string) => void) {
+  setQuiescenceViewForTests(undefined); // Use real procfs, just as the existing UID proof does.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "public-prestart-"));
+  const calls: string[] = [];
+  const forbidden = (name: string) => async (): Promise<never> => {
+    calls.push(name); throw new Error("forbidden prestart effect: " + name);
+  };
+  const selection = selectCodexBinding({ codex: {
+    auth_mode: "api_key", access_token: "fixture-access", capability: "fixture-cap",
+  } });
+  assert.equal(selection.kind, "codex");
+  if (selection.kind !== "codex") throw new Error("fixture binding unavailable");
+  const log: Logger = { debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return this; } };
+  const client = new Proxy({} as WorkerClient, {
+    get: (_target, name) => forbidden("client." + String(name)),
+  });
+  const executor = new CodexExecutor(log, path.join(dir, "home"), {
+    binding: selection.binding, client, commandSandbox: "required",
+    provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1",
+      envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+  }, {
+    installDeps: forbidden("install"), provisionRunTools: forbidden("provision"),
+    launchProviderRoot: forbidden("provider"),
+  });
+  const probe = newRunAttempt("public-prestart", 1, dir, () => []);
+  const registry = new LiveAttemptRegistry();
+  const metadata = Object.freeze({ marker: probe.marker, cloneKey: probe.cloneKey, clonePath: probe.clonePath });
+  try {
+    for (const scenario of ["missing", "copied", "matching", "live-conflict"] as const) {
+      const owner = newRunAttempt("live-owner", 1, dir, () => []);
+      let plantOwner: Awaited<ReturnType<typeof plant>> | undefined;
+      if (scenario === "live-conflict") {
+        registry.add(owner);
+        plantOwner = await plant("runner", owner.marker, owner.cloneKey);
+      }
+      try {
+        const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [
+          30000, async () => quiesceRunAttempt({
+            mode: "capture", attempt: scenario === "copied" ? { ...probe } : probe,
+            cloneKey: probe.cloneKey, targetPaths: [probe.clonePath], processes: true,
+            registry, otherClaimInFlight: false, dockerHost: undefined,
+          }), "capture", undefined, scenario === "missing" ? undefined : metadata,
+        ]);
+        assert.equal(result.kind, "observed_empty", scenario + " enters public capture");
+        if (result.kind !== "observed_empty") throw new Error(JSON.stringify(result));
+        const verdict = result.value.process!;
+        if (scenario === "matching") {
+          assert.equal(verdict.state, "quiescent", "public preRun matching metadata: " + JSON.stringify(verdict));
+        } else {
+          assert.equal(verdict.state, scenario === "live-conflict" ? "survivors" : "unverified", scenario + ": " + JSON.stringify(verdict));
+          assert.deepEqual(verdict.killed, [], scenario + " must signal nothing");
+        }
+        if (plantOwner) assert.equal(identity(plantOwner.pid), plantOwner.startTime, "live owner survives");
+        assert.deepEqual(calls, [], "no credential, provider, install or provisioning calls");
+        report("public preRun " + scenario + ": " + verdict.state + "; forbidden calls=0");
+      } finally {
+        registry.remove(owner.marker);
+        if (plantOwner) { plantOwner.child.stdin!.end(); await plantOwner.closed; }
+      }
+    }
+    const scan = (attempt: typeof probe) => quiesceRunAttempt({
+      mode: "capture", attempt, cloneKey: attempt.cloneKey, targetPaths: [attempt.clonePath],
+      processes: true, registry, otherClaimInFlight: false, dockerHost: undefined,
+    });
+    const acquire = <T>(action: () => Promise<T>, tuple: typeof metadata | undefined, signal?: AbortSignal) =>
+      executor.withCredentialFreeCapture(30000, action, "capture", signal, tuple);
+    const expectState = (result: Awaited<ReturnType<typeof scan>>, state: string, name: string) =>
+      assert.equal(result.process?.state, state, name + ": " + JSON.stringify(result));
+    // Keep the first owner active while a different authenticated tuple queues.
+    const second = newRunAttempt("queued-prestart", 2, dir, () => []);
+    const mutable = { marker: second.marker, cloneKey: second.cloneKey, clonePath: second.clonePath };
+    const entered = latch(), release = latch();
+    let queuedActions = 0;
+    const first = acquire(async () => {
+      entered.resolve();
+      await release.promise;
+      expectState(await scan(probe), "quiescent", "queued tuple cannot publish to prior owner");
+    }, metadata);
+    await entered.promise;
+    const queued = acquire(async () => {
+      queuedActions++;
+      expectState(await scan(second), "quiescent", "queued snapshot keeps authenticated request tuple");
+    }, mutable);
+    const abort = new AbortController();
+    let abortedActions = 0;
+    const aborted = acquire(async () => { abortedActions++; }, metadata, abort.signal);
+    mutable.marker = "invalid-after-enqueue";
+    mutable.cloneKey = "invalid-after-enqueue";
+    mutable.clonePath = "relative-after-enqueue";
+    abort.abort();
+    release.resolve();
+    const outcomes = await Promise.allSettled([first, queued, aborted]);
+    for (const result of outcomes) assert.equal(result.status, "fulfilled", JSON.stringify(result));
+    assert.equal(queuedActions, 1);
+    assert.equal(abortedActions, 0, "aborted queued acquisition performs zero callback actions");
+    assert.equal(outcomes[2].status === "fulfilled" && outcomes[2].value.kind, "incomplete");
+    report("queue snapshots/prior-owner isolation/aborted queued acquisition: PASS");
+    const thrown = new Error("owned capture callback throw");
+    await assert.rejects(acquire(async () => { throw thrown; }, metadata), error => error === thrown);
+    const restored = await acquire(() => scan(probe), undefined);
+    assert.equal(restored.kind, "observed_empty");
+    if (restored.kind === "observed_empty")
+      expectState(restored.value, "unverified", "throw restores missing preRun binding");
+    for (const [name, tuple] of [
+      ["marker", { ...metadata, marker: "bad" }],
+      ["key", { ...metadata, cloneKey: "bad" }],
+      ["relative path", { ...metadata, clonePath: "relative" }],
+      ["unnormalized path", { ...metadata, clonePath: dir + "/../" + path.basename(dir) }],
+    ] as const) {
+      let actions = 0;
+      const result = await acquire(async () => { actions++; }, tuple);
+      assert.equal(result.kind, "incomplete", name);
+      assert.equal(actions, 0, name + " refuses callback");
+    }
+    report("callback throw restoration/missing acquisition/invalid marker-key-path: PASS");
+  } finally {
+    assert.deepEqual(calls, []);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe("fixed capture reaper: real worker profile", { skip: GROUP_B_SKIP }, () => {
-  it("fixed capture reaper: real runner procfs and signal compatibility", async () => { await proof(false); });
+  it("fixed capture reaper: real runner procfs and signal compatibility", async t => { await publicPrestart(message => t.diagnostic(message)); await proof(false); });
   it("fixed capture reaper: descendant settlement precedes verdict", async () => { await proof(true); });
   it("fixed capture reaper: own mode kills owned residue before capture proceeds", async () => { await proof(false, "own"); });
   it("fixed capture reaper: genuine report preserves the same owned writer", async () => { await proof(false, "capture", true); });

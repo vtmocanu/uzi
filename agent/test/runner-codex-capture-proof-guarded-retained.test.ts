@@ -7,6 +7,8 @@ import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { observe } from "./runner-codex-capture-proof-fixture.js";
 import type { ExecutorFactory } from "../src/runner.js";
+import type { Executor } from "../src/executor.js";
+import { LiveAttemptRegistry, newRunAttempt, quiesceRunAttempt, type QuiesceRunRequest } from "../src/run-quiescence.js";
 import { noProofReseed, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 installHarness();
@@ -74,6 +76,29 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
     }
     const observer = observe({ sourcePath: clone.path });
     const before = readJournal(bare, clone.branch);
+    const live = new LiveAttemptRegistry();
+    const otherOwner = newRunAttempt("other-live-run", 1, path.join(homeDir, "other-live"), () => []);
+    live.add(otherOwner);
+    const registryWrites: string[] = [];
+    for (const method of ["add", "remove"] as const) {
+      const original = live[method].bind(live);
+      t.mock.method(live, method, ((arg: any) => {
+        registryWrites.push(typeof arg === "string" ? arg : arg.marker);
+        return (original as any)(arg);
+      }) as any);
+    }
+    let supplied: Parameters<NonNullable<Executor["withCredentialFreeCapture"]>>[4];
+    const proofCalls: QuiesceRunRequest[] = [];
+    const prestartCapture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal, metadata) => {
+      if (stage === "newcapture") {
+        assert.ok(metadata);
+        assert.equal(metadata.clonePath, clone.path);
+        assert.notEqual(metadata.marker.split(":").at(-1), before.attemptId);
+        assert.equal(Object.isFrozen(metadata), true);
+        supplied = metadata;
+      }
+      return observer.capture(ms, action, purpose, signal);
+    };
     let verifiedCalls = 0, verifiedTrue = 0, facts = 0;
     const factScopes: boolean[] = [];
     const verify = git.verifiedRecoveryRestorePoint.bind(git);
@@ -104,7 +129,7 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
         } },
         settleForCredentialFreeCapture: rig.settle,
         ...(stage === "missing-capability" ? {} : {
-          withCredentialFreeCapture: ordinal === 1 ? observer.capture : rig.capture,
+          withCredentialFreeCapture: ordinal === 1 ? prestartCapture : rig.capture,
         }),
         run: async ctx => {
           if (ordinal === 1) oldModels++;
@@ -119,7 +144,22 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
         },
       } };
     };
-    const r = runnerWith(make, fakeGitlab().gitlab, JOIN_TOKEN, nullLogger(), { recoveryRetryMs: 1 });
+    const r = runnerWith(make, fakeGitlab().gitlab, JOIN_TOKEN, nullLogger(), { recoveryRetryMs: 1, liveAttempts: live,
+      quiesceRun: async req => {
+        if (stage === "newcapture" && req.targetPaths.includes(clone.path)) {
+          proofCalls.push(req);
+          if (observer.isActive()) {
+            assert.ok(req.attempt);
+            assert.deepEqual({ marker: req.attempt.marker, cloneKey: req.attempt.cloneKey, clonePath: req.attempt.clonePath }, supplied);
+            assert.equal(req.mode, "capture");
+            assert.deepEqual(req.targetPaths, [clone.path]);
+            assert.ok(req.registry.others(req.attempt.marker).includes(otherOwner), "other live owners remain visible");
+            assert.equal(req.registry.others(undefined).includes(req.attempt), false, "probe is unregistered");
+          }
+        }
+        return quiesceRunAttempt(req);
+      },
+    });
     const recovery = (r as any).recovery;
     const spans: {method:string,phase:string,active:boolean,result?:boolean}[] = [];
     let capturedFrozen: any;
@@ -177,6 +217,19 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
         assert.equal(facts, 1);
         assert.deepEqual(factScopes, [true], "capture held through actual journal capture fact");
         observer.assertProof(true);
+        if (stage === "newcapture") {
+          assert.ok(proofCalls[0]);
+          assert.equal(proofCalls[0].attempt, undefined, "outside predecessor guard has no normal attempt");
+          const inside = proofCalls.filter(req => req.attempt?.marker === supplied?.marker);
+          assert.ok(inside.length >= 2, "inside Body and after-Git reproof both reached");
+          const firstInside = inside[0];
+          assert.ok(firstInside);
+          assert.ok(inside.every(req => req.attempt === firstInside.attempt), "same authenticated object through both proofs");
+          assert.ok(!registryWrites.includes(supplied!.marker), "probe never added or removed");
+          assert.notEqual(supplied!.marker, otherOwner.marker);
+          assert.ok(registryWrites.some(marker => marker !== supplied!.marker), "successor normal registration still runs");
+          console.log("PRESTART_BINDING_OBSERVER", JSON.stringify({ insideProofs: inside.length, sourceFacts: facts, models, registryWrites }));
+        }
       }
     } finally { observer.restore(); }
   });

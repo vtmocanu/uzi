@@ -302,6 +302,23 @@ removes the tree.
   synthesis bindings, including exact invocation and dynamic environment ownership,
   are described in [ADR-1106](1106-codex-harness.md#process-root-ownership).
 
+  Pre-start predecessor binding uses one fresh, unregistered `newRunAttempt` per
+  `runFreeCapture` acquisition, with the current run/generation, exact source path
+  and empty recorded roots. It never reuses the source `attemptId`. During the
+  owned callback, Runner sets/restores `activeCaptureAttempt`; `quiesceRun` reads
+  `activeCaptureAttempt ?? flight.attempt`. The same authenticated object supplies
+  the inside clone proof and post-runner-Git reproof; the initial predecessor
+  proof remains outside this binding. Mode `capture`, exact source targets,
+  live-owner conflicts and clone proof/reproof remain required. The executor
+  receives only its immutable marker/key/path tuple through the existing optional
+  fifth capture argument; its acquisition lifetime is specified in
+  [ADR-1106](1106-codex-harness.md#process-root-ownership).
+  This fresh process marker is not a recovery-record capture ID (C5b). It changes
+  no source identity, normal `flight.attempt`/`attemptId`/`runnerClone`, live registry,
+  journal, ledger, successor or deletion authority. C5 remains executing-flight
+  `executionTails` ownership; flightless maintenance is unchanged.
+  Refs #2852 (AI-synced 2026-10-18).
+
   **H/C amendment, Refs #2852 (AI-synced 2026-10-18):** ordinary scoped
   helpers retain legacy JSON without `reportDeadline` and unbounded kill-mode
   procfs reads. Genuine `reportBudget` includes the floored deadline and selects

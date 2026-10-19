@@ -61,6 +61,8 @@ import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
+import { ATTEMPT_ID_RE, cloneKeyOf } from "../attempt-path.js";
+import type { SdkAttemptEnv } from "../sdk-env.js";
 import { randomUUID } from "node:crypto";
 import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
@@ -2223,6 +2225,7 @@ export class CodexExecutor implements Executor {
   private epochAdmission?: () => void;
   private captureLifecycleSignal?: AbortSignal;
   private reaperAttempt?: RunContext["runAttempt"];
+  private captureReaperAttempt?: Readonly<SdkAttemptEnv>;
 
   private assertCaptureAdmission(revision = this.captureRevision): void {
     if (this.unstartedLegClosed || this.captureOwners || revision !== this.captureRevision) {
@@ -2248,7 +2251,12 @@ export class CodexExecutor implements Executor {
     action: (context: CredentialFreeCaptureContext) => Promise<T>,
     purpose: "capture" | "cancel" = "capture",
     signal?: AbortSignal,
+    attempt?: Readonly<SdkAttemptEnv>,
   ): Promise<{ kind: "observed_empty"; value: T } | { kind: "incomplete"; errors: readonly HarnessError[] }> {
+    // Each queued caller owns a value snapshot, never a mutable caller reference.
+    const captureAttempt = attempt === undefined ? undefined : Object.freeze({
+      marker: attempt.marker, cloneKey: attempt.cloneKey, clonePath: attempt.clonePath,
+    });
     // Close construction and publication synchronously, including callers queued behind us.
     // Before the first run there is no leg that can legitimately resume construction.
     // Capturing a completed leg still permits a separately built sequential run.
@@ -2280,10 +2288,12 @@ export class CodexExecutor implements Executor {
     let release!: () => void;
     this.captureTail = new Promise<void>(resolve => { release = resolve; });
     let actionEntered = false;
+    let previousCaptureAttempt: Readonly<SdkAttemptEnv> | undefined;
     try {
       // Expiry closes authority, not ownership: never detach setup, summary delivery,
       // installer cleanup or session save from the executor's admission fence.
       await prior;
+      previousCaptureAttempt = this.captureReaperAttempt;
       const summaryJoins = [...this.planFlights, ...this.retiredIntentFlights].map(flight => flight.done);
       if (this.intentFlight) summaryJoins.push(this.intentFlight.done);
       const setups = [...this.epochSetups];
@@ -2311,6 +2321,18 @@ export class CodexExecutor implements Executor {
       catch {
         drainErrors.push({ category: "protocol", message: "codex capture: session save failed" });
       }
+      if (captureAttempt) {
+        const { marker, cloneKey, clonePath } = captureAttempt;
+        const colon = typeof marker === "string" ? marker.lastIndexOf(":") : -1;
+        if (colon <= 0 || !ATTEMPT_ID_RE.test(marker.slice(colon + 1)) ||
+            typeof clonePath !== "string" || !path.isAbsolute(clonePath) ||
+            path.resolve(clonePath) !== clonePath || cloneKeyOf(clonePath).cloneKey !== cloneKey ||
+            (this.reaperAttempt && (this.reaperAttempt.marker !== marker ||
+              this.reaperAttempt.cloneKey !== cloneKey || this.reaperAttempt.clonePath !== clonePath))) {
+          return incomplete("codex capture: invalid or mismatched attempt binding");
+        }
+      }
+      this.captureReaperAttempt = captureAttempt;
       let safety = this.safety;
       if (safety !== undefined && !(safety instanceof CodexExecutionSafetyImpl)) {
         drainErrors.push({ category: "protocol", message: "codex capture: unsupported safety facade" });
@@ -2366,7 +2388,7 @@ export class CodexExecutor implements Executor {
           undefined,
           makeBoundaryProcessSpawner(this.deps.launchEffectRoot ?? productionEffectLaunch,
             this.opts.commandSandbox ?? "required", this.log), undefined,
-          { reaperAttempt: () => this.reaperAttempt });
+          { reaperAttempt: () => this.captureReaperAttempt ?? this.reaperAttempt });
         this.unverifiedEpochRegistries.add(registry);
         if (!(safety instanceof CodexExecutionSafetyImpl)) return incomplete("codex capture: production safety unavailable");
         this.epochSafeties.set(registry, safety);
@@ -2397,6 +2419,8 @@ export class CodexExecutor implements Executor {
       }
       return incomplete("codex credential-free capture acquisition failed");
     } finally {
+      // Release only after the owned capture call settles, including its child cleanup.
+      this.captureReaperAttempt = previousCaptureAttempt;
       // The safety callback expires its context before resolving; admission stays fenced until then.
       this.captureOwners--;
       if (!this.captureOwners) this.captureCleanupRemaining = undefined;
@@ -4559,7 +4583,7 @@ export class CodexExecutor implements Executor {
       (deadlineAt) => onTerminalDispose(deadlineAt),
       boundaryProcessSpawner,
       undefined,
-      { reaperAttempt: () => this.reaperAttempt },
+      { reaperAttempt: () => this.captureReaperAttempt ?? this.reaperAttempt },
     );
 
     let harness: CodexHarness | undefined;
