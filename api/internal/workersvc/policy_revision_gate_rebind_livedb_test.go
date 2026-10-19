@@ -173,7 +173,7 @@ func (tx *revisionGateTx) Exec(ctx context.Context, sql string, args ...any) (pg
 }
 func (tx *revisionGateTx) Commit(ctx context.Context) error {
 	if tx.owner.point == "commit" {
-		_ = tx.Tx.Rollback(ctx)
+		_ = tx.Rollback(ctx)
 		return errors.New("injected gate commit failure")
 	}
 	return tx.Tx.Commit(ctx)
