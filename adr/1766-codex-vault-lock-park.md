@@ -215,7 +215,13 @@ capture-only facade for that exact retired facade. Ordinary evidence is created
 only by `ProviderEpoch.dispose` replacing an abandoned epoch, with observed
 quiescence and matching-epoch reaping, successful disposal, harness close and
 fileop cleanup for that exact public facade, with the registry still disposed and
-unpoisoned. Terminal run cleanup and partial-build cleanup do not create this
+unpoisoned.
+The exact registry's pre-reap epoch, root count and existing launch/callback
+cursors, with initially zero pending launches and callbacks, must remain unchanged
+through aggregate reaping, registry/harness/fileop cleanup and later eligibility
+checks; a newly admitted root or pending reservation invalidates the clean result
+and retains the old registry as unverified, even if disposal clears its tables.
+Terminal run cleanup and partial-build cleanup do not create this
 ordinary fact from cleared tracking tables. Intentional capture instead requires
 the exact completed scope/epoch/registry proof to revalidate clean teardown and an
 unchanged poison revision. Selection follows the

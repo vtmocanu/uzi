@@ -2379,7 +2379,7 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
 
 describe("ordinary teardown capture eligibility", () => {
   // Unit seam only: real registry and safety, modeled root evidence; no live-kernel claim.
-  for (const mode of ["clean", "already-disposed", "later-poison", "late-root", "root-cleanup",
+  for (const mode of ["late-accepted-root", "late-reservation", "late-reap-root", "clean", "already-disposed", "later-poison", "late-root", "root-cleanup",
     "harness-cleanup", "fileop-cleanup", "foreign-facade", "terminal"] as const) {
     it(`ordinary teardown capture eligibility ${mode}`, async () => {
       const rig = makeRig();
@@ -2389,10 +2389,47 @@ describe("ordinary teardown capture eligibility", () => {
       const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
       const tracked = trackedRoot();
-      const root: RegisteredRoot = { ...tracked.root, dispose: async ms => {
-        await tracked.root.dispose(ms);
-        if (mode === "root-cleanup") throw new Error("root cleanup unconfirmed");
-      } };
+      const lateMode = mode === "late-accepted-root" || mode === "late-reservation" || mode === "late-reap-root";
+      let injected = false;
+      let admissionState: string | undefined;
+      let admission: string | undefined;
+      let registered: boolean | undefined;
+      let lateReaps = 0;
+      let lateDisposals = 0;
+      let lateDisposed = false;
+      const lateRoot: RegisteredRoot = {
+        kind: "boundary_action",
+        reap: async () => {
+          lateReaps++;
+          return { ok: false, error: { category: "tool", message: "not observed empty" } };
+        },
+        dispose: async () => {
+          if (lateDisposed) return;
+          lateDisposed = true;
+          lateDisposals++; // Idempotent transport cleanup supplies no reap evidence.
+        },
+      };
+      const inject = () => {
+        if (injected) return;
+        injected = true;
+        admissionState = registry.state();
+        const late = registry.reserveLaunch("boundary_action");
+        admission = late.kind;
+        if (late.kind === "reserved" && mode !== "late-reservation") {
+          registered = registry.registerRoot(late.reservation, lateRoot).ok;
+        }
+      };
+      const root: RegisteredRoot = { ...tracked.root,
+        reap: async ms => {
+          if (mode === "late-reap-root") inject();
+          return tracked.root.reap(ms);
+        },
+        dispose: async ms => {
+          await tracked.root.dispose(ms);
+          if (mode === "late-accepted-root" || mode === "late-reservation") inject();
+          if (mode === "root-cleanup") throw new Error("root cleanup unconfirmed");
+        },
+      };
       const reservation = registry.reserveLaunch(root.kind);
       assert.equal(reservation.kind, "reserved");
       if (reservation.kind !== "reserved") throw new Error("missing launch reservation");
@@ -2407,7 +2444,8 @@ describe("ordinary teardown capture eligibility", () => {
       const fileop = mode === "fileop-cleanup"
         ? { ...fakeFileopHandle().handle, dispose: async () => { throw new Error("fileop cleanup unconfirmed"); } } : undefined;
       const clean = await exec["tearDownEpoch"](registry, harness, fileop, 1000, true, mode === "terminal" ? undefined : "replacement");
-      assert.equal(clean, !["root-cleanup", "harness-cleanup", "fileop-cleanup"].includes(mode));
+      if (!lateMode) assert.equal(clean, !["root-cleanup", "harness-cleanup", "fileop-cleanup"].includes(mode));
+      const unverifiedAfterTeardown = exec["unverifiedEpochRegistries"].has(registry);
       assert.equal(exec.safety, facade, "teardown preserves the public refusal marker");
       if (mode === "later-poison") registry.poison({ category: "tool", message: "late cleanup fault" });
       if (mode === "late-root") {
@@ -2429,7 +2467,27 @@ describe("ordinary teardown capture eligibility", () => {
         assert.equal(fresh.isPoisoned(), true, "N1: replacement still intentionally poisons before capture");
         return "local-only";
       });
-      if (mode === "clean") {
+      if (lateMode) {
+        const facts = {
+          clean, unverifiedAfterTeardown,
+          unverifiedAfterCapture: exec["unverifiedEpochRegistries"].has(registry),
+          result: result.kind, actions, injected, admissionState, admission, registered,
+          initialReaps: tracked.reaped(), lateReaps, lateDisposals,
+          roots: registry.rootCount(), pending: registry.pendingLaunchCount(),
+          state: registry.state(), poison: registry.isPoisoned(),
+          releases: rig.client.releaseCalls.length, refreshes: rig.client.refreshCalls.length,
+          launches, probes: rig.probeCalls.length,
+        };
+        console.log("ORDINARY_OBSERVATION " + mode + " " + JSON.stringify(facts));
+        assert.deepEqual(facts, {
+          clean: false, unverifiedAfterTeardown: true, unverifiedAfterCapture: true,
+          result: "incomplete", actions: 0, injected: true, admissionState: "closed",
+          admission: "reserved", registered: mode === "late-reservation" ? undefined : true,
+          initialReaps: 1, lateReaps: 0, lateDisposals: mode === "late-reservation" ? 0 : 1,
+          roots: mode === "late-reservation" ? 1 : 2, pending: 0,
+          state: "disposed", poison: false, releases: 0, refreshes: 0, launches: 0, probes: 0,
+        });
+      } else if (mode === "clean") {
         assert.deepEqual(result, { kind: "observed_empty", value: "local-only" });
         assert.equal(actions, 1);
         assert.notEqual(exec.safety, current, "ordinary proof selects a fresh capture-only facade");

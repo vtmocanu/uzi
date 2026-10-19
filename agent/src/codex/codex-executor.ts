@@ -4910,6 +4910,7 @@ export class CodexExecutor implements Executor {
     // outstanding-set removal. Pre-existing faults remain unproven.
     const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
     let ordinaryDrained = false;
+    let ordinaryObservationUnchanged: (() => boolean) | undefined;
     let registryClean = !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
     if (disposeRegistry && registry.state() !== "disposed") {
       // A completed capture already observed every root empty; ordinary quiesce/reap
@@ -4919,8 +4920,19 @@ export class CodexExecutor implements Executor {
         try {
           const q = await registry.quiesceChildren(remaining());
           if (q.kind === "quiescent") {
+            const epoch = registry.epoch();
+            const roots = registry.rootCount();
+            const launches = registry.launchAdmissionCursor();
+            const callbacks = registry.callbackAdmissionCursor();
+            const initiallyEmpty = registry.pendingLaunchCount() === 0 && registry.inFlightCallbackCount() === 0;
+            // disposeTools clears pending tables; their later empty counts cannot rule out
+            // closed-state admissions during reap or handler/transport cleanup.
+            ordinaryObservationUnchanged = () => initiallyEmpty && registry.epoch() === epoch &&
+              registry.rootCount() === roots && registry.launchAdmissionCursor() === launches &&
+              registry.callbackAdmissionCursor() === callbacks;
             const reaped = await registry.reapProcesses(remaining(), q.epoch);
-            drained = reaped.kind === "observed_empty";
+            drained = q.epoch === epoch && reaped.kind === "observed_empty" && reaped.epoch === epoch &&
+              ordinaryObservationUnchanged();
             ordinaryDrained = drained;
           }
         } catch { /* Disposal is still attempted after a failed drain. */ }
@@ -4934,6 +4946,7 @@ export class CodexExecutor implements Executor {
     try { await fileopHandle?.dispose(); } catch { registryClean = false; }
     // Closing transports can add poison too. Disposal alone never launders it.
     registryClean &&= !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
+    registryClean &&= ordinaryObservationUnchanged?.() ?? true;
     if (disposeRegistry && registryClean) {
       // Preserve the public Codex refusal marker: absence would select legacy sinks.
       // Only a later owned capture can use this exact completed teardown to select a
@@ -4946,7 +4959,7 @@ export class CodexExecutor implements Executor {
           // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
           // Later rejected root registration poisons even a disposed registry, invalidating this fact.
           this.verifiedDisposedCaptureFacades.set(retiredFacade,
-            () => registry.state() === "disposed" && !registry.isPoisoned());
+            () => registry.state() === "disposed" && !registry.isPoisoned() && ordinaryObservationUnchanged?.() === true);
         }
       }
       this.unverifiedEpochRegistries.delete(registry);

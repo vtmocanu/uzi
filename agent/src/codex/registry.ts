@@ -295,6 +295,11 @@ export class ExecutionRegistry {
     return n;
   }
 
+  /** Snapshot successful launch admissions, retained after disposal clears reservations. */
+  launchAdmissionCursor(): number {
+    return this.launchSeq;
+  }
+
   /** Snapshot the last successful callback admission for a new turn. */
   callbackAdmissionCursor(): number {
     return this.callbackAdmissionSequence;
