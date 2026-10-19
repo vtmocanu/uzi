@@ -56,7 +56,9 @@ export function SemanticPlan({ gate }: { gate: SemanticGateDTO }) {
       <h4 className="font-medium">Frozen sources</h4>
       {c.sources.map((ref, i) => <div key={i} className="min-w-0 space-y-2">
         <dl><Data label="Source identity, type, path/ref, hash and completeness" value={ref} /></dl>
-        <FrozenText label={`Read complete source ${i + 1} (quoted)`} raw={gate.sources.find(source => source.id === ref.id)!.bytes} />
+        {ref.completeness === "complete"
+          ? <FrozenText label={`Read complete source ${i + 1} (quoted)`} raw={gate.sources.find(source => source.id === ref.id)!.bytes} />
+          : <p className="text-warn">Source snapshot unavailable for source {i + 1}. Completeness is unknown. Owner decision required.</p>}
       </div>)}
       <FrozenText label="Read complete frozen plan (quoted)" raw={gate.plan} />
     </div>

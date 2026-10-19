@@ -108,6 +108,39 @@ it("shows every criterion, full frozen text, report, citations, budgets and pend
   expect(current.semantic_gate!.approval.maintainers[0].reason).toBe(hostileSemanticText);
 });
 
+it.each(["", "Passing prefix: all requirements satisfied"])(
+  "shows explicit unknown frozen source uncertainty without presenting partial bytes: %j", async partial => {
+    const gate = current.semantic_gate!;
+    const ref = { id: "source2", kind: "prd", hash: "unknown-source-hash",
+      provenance: "repo/prds/required.md@frozen-ref", completeness: "unknown" };
+    gate.presentation.candidate.sources.push(ref);
+    gate.sources.push({ id: ref.id, kind: ref.kind, provenance: ref.provenance,
+      completeness: ref.completeness, bytes: btoa(partial) });
+    gate.presentation.candidate.source_outcome = "unknown";
+    gate.presentation.candidate.coverage!.outcome = "uncertain";
+    gate.presentation.coverage.outcome = "unavailable";
+    delete gate.presentation.coverage.report;
+    const original = structuredClone(gate);
+    await mount();
+    const review = within(screen.getByRole("region", { name: "Semantic plan review" }));
+    expect(review.getByText("Source snapshot unavailable for source 2. Completeness is unknown. Owner decision required.")).toBeTruthy();
+    expect(review.getByText(/repo\/prds\/required.md@frozen-ref/)).toBeTruthy();
+    expect(review.queryByText("Read complete source 2 (quoted)")).toBeNull();
+    expect(review.queryByText(/Passing prefix: all requirements satisfied/)).toBeNull();
+    expect(review.getByText("Read complete source 1 (quoted)")).toBeTruthy();
+    expect(review.getByText("Owner decision required. Coverage: unavailable.")).toBeTruthy();
+    expect(review.getByText("Coverage report unavailable. Owner decision required.")).toBeTruthy();
+    expect(screen.queryByText(/Semantic plan data is unavailable or malformed/)).toBeNull();
+    const approve = screen.getByRole("button", { name: /^Approve plan/ }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
+    fireEvent.click(approve);
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0].body.semantic_approval).toEqual(original.approval);
+    expect(writes[0].headers["X-Uzi-Candidate-Identity-Version"]).toBe("semantic_v1");
+    expect(current.semantic_gate).toEqual(original);
+  },
+);
+
 it.each([null, {}, { approval: {} }, { ...semanticGateFixture(), plan: null },
   { ...semanticGateFixture(), sources: [{ ...semanticGateFixture().sources[0], bytes: null }] },
   { ...semanticGateFixture(), plan: "/w==" }, { ...semanticGateFixture(), plan: "%%%" }])(
