@@ -7,7 +7,7 @@ import type { RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, git, fakeGitlab, gitlabClaim, installHarness, runnerWith, worktreeDirFor } from "./runner-harness.js";
+import { api, client, git, fakeGitlab, gitlabClaim, installHarness, runnerWith, worktreeDirFor, homeDir } from "./runner-harness.js";
 import { FakeCodexExecutor, commitInTree, trackedFile } from "./runner-codex-sinks-fixture.js";
 import { observe } from "./runner-codex-capture-proof-fixture.js";
 installHarness();
@@ -76,14 +76,31 @@ function enroll(ctx: RunContext, toolId = "original-tool") {
   return { captured, entry, cancellations: () => cancellations };
 }
 
-it("public memory two failed local verifications then actual success in one held scope",async()=>{
+for (const mode of ["retry", "uncertain", "cancel-ack"] as const) it(`public memory edge ${mode} actual monitor held lineage`,async()=>{
   const f=await setup(1,{...settings,responseBudgetMs:5000});
   let releaseFeedback!:()=>void; const feedbackGate=new Promise<void>(r=>{releaseFeedback=r;});
   const o=observe();const verifications:any[]=[];
+  let original:any, heldContext:any, captureSignal:AbortSignal|undefined, capturePurpose:unknown;
+  let run:ReturnType<typeof runnerWith>;
+  let originalHold:any, originalContext:any, effectiveHeld:any;
+  const samples:any[]=[], errors:any[]=[], attempts:any[]=[], tokens:any[]=[], parents:any[]=[];
+  const lineage=(phase="observation")=>{
+    const hold=original?.workerMemory?.hold;
+    originalHold ??= hold; originalContext ??= hold?.context;
+    samples.push({phase,hold,context:hold?.context,flight:hold?.context.flight,
+      held:effectiveHeld,raw:heldContext,at:Date.now(),deadline:hold?.deadline,
+      rawDeadline:heldContext?.deadlineAt,effectiveDeadline:effectiveHeld?.deadlineAt,
+      attemptAborted:captureSignal?.aborted,heldAborted:effectiveHeld?.signal?.aborted,
+      remaining:hold ? hold.deadline-Date.now():null});
+  };
+  const errorMeta=(where:string,e:any)=>errors.push({where,name:e?.name,message:e?.message,stack:e?.stack,
+    at:Date.now(),remaining:original?.workerMemory?.hold?.deadline-Date.now(),attemptAborted:captureSignal?.aborted});
+  fs.writeFileSync(homeDir+"/session-proof","original edge session");
   const verify=git.verifyRunnerTrackingCovers.bind(git);
   git.verifyRunnerTrackingCovers=async(...args)=>{
     const actual=await verify(...args);
-    const result=verifications.length<2?false:actual;
+    const result=mode==="retry" && verifications.length<2?false:actual;
+    if(heldContext) lineage();
     verifications.push({active:o.isActive(),actual,result});
     return result;
   };
@@ -91,48 +108,110 @@ it("public memory two failed local verifications then actual success in one held
   const post=client.postMessages.bind(client), report=client.reportState.bind(client);
   client.postMessages=async(...args)=>{
     if(args[1].some(m=>m.payload.event==="worker_memory_pressure")){
-      await feedbackGate; await tick();feedback.push({active:o.isActive()});
+      await feedbackGate; await tick(); if(heldContext) lineage(); feedback.push({active:o.isActive()});
     }
     return post(...args);
   };
   client.reportState=async(...args)=>{
-    const ack=await report(...args);
+    let ack=await report(...args);
     if(args[1].recovery_cause==="worker_memory_pressure"){
-      await tick();receipts.push({active:o.isActive(),accepted:ack.memoryParkAccepted});
+      await tick(); if(heldContext) lineage();
+      if(mode==="uncertain") ack={...ack,memoryParkAccepted:undefined};
+      if(mode==="cancel-ack") {run.shutdown(); await tick();}
+      receipts.push({active:o.isActive(),accepted:ack.memoryParkAccepted,aborted:heldContext?.signal.aborted});
     }
     return ack;
   };
   let delivered=false;
   const exec=new FakeCodexExecutor(o.rig.safety,async ctx=>{
     commitInTree(ctx.worktreePath,"PUBLIC.txt","memory actual bytes\n");
-    const command=enroll(ctx);o.arm();f.pressure(950);
+    const command=enroll(ctx);original=command.captured.flight;o.arm();f.pressure(950);
     const result=await command.captured.commands.watchOutcome(command.entry);
     delivered=result.code==="worker_memory_pressure";
     ctx.emit({kind:"tool_result",payload:{tool_id:result.tool_id,result}});
     throw new Error("model stopped for memory");
-  },async ms=>{const result=await o.rig.settle(ms);releaseFeedback();return result;},
-    (ms,action,purpose,signal)=>o.capture(ms,async held=>{releaseFeedback();return action(held);},purpose,signal));
+  },async ms=>{const requestAt=Date.now();lineage("legacy-settle-entry");try{const result=await o.rig.settle(ms);console.log("LEGACY_SETTLE_RAW",JSON.stringify({requestAt,ms,requestAtPlusMs:requestAt+ms,completedAt:Date.now(),kind:result.kind,originalDeadline:original?.workerMemory?.hold?.deadline}));releaseFeedback();return result;}catch(e){errorMeta("legacy-settle",e);throw e;}},
+    async(ms,action,purpose,signal)=>{
+      captureSignal=signal;capturePurpose=purpose;
+      const a={requestAt:Date.now(),ms,signal,entryAt:0,rawDeadline:0};attempts.push(a);
+      try{return await o.capture(ms,async held=>{
+        heldContext=held;a.entryAt=Date.now();a.rawDeadline=held.deadlineAt;
+        lineage("facade-entry");releaseFeedback();
+        try{return await action(held);}catch(e){errorMeta("capture-action",e);throw e;}
+      },purpose,signal);}catch(e){errorMeta("capture-facade",e);throw e;}
+    });
   const monitoring=f.memory.run();
   try{
-    await o.execute(runnerWith(()=>({executor:exec}),fakeGitlab().gitlab,undefined,undefined,
-      {memoryRuntime:f.memory,codexBoundaryDeadlineMs:5000,checkpointIntervalMs:0}).execute(f.claim));
+    run=runnerWith(()=>({executor:exec,homeDir}),fakeGitlab().gitlab,undefined,undefined,
+      {memoryRuntime:f.memory,codexBoundaryDeadlineMs:5000,checkpointIntervalMs:0});
+    const runner:any=run, capture=runner.captureRecoveryRestorePoint.bind(run);
+    runner.captureRecoveryRestorePoint=async(...args:any[])=>{
+      effectiveHeld=args[4]?.heldCapture;
+      if(effectiveHeld) tokens.push(effectiveHeld);
+      lineage("runner-capture-entry");
+      try{return await capture(...args);}catch(e){errorMeta("runner-capture",e);throw e;}
+    };
+    const recovery=git.withRecoveryOperation.bind(git);
+    git.withRecoveryOperation=async<T>(signal:AbortSignal,deadline:number,
+      action:(signal:AbortSignal)=>Promise<T>,budget?:Parameters<typeof recovery>[3]):Promise<T>=>{
+      if(original?.workerMemory?.hold) parents.push({signal,deadline,
+        at:Date.now(),abortedAtEntry:signal.aborted});
+      try{return await recovery(signal,deadline,action,budget);}catch(e){errorMeta("parent-operation",e);throw e;}
+    };
+    try { await o.execute(run.execute(f.claim)); } finally {git.withRecoveryOperation=recovery;}
+
+    await original?.workerMemory?.operation;
+    lineage("joined");
+    console.log("LINEAGE_RAW",JSON.stringify({
+      attempts:attempts.map(a=>({requestAt:a.requestAt,ms:a.ms,requestAtPlusMs:a.requestAt+a.ms,
+        entryAt:a.entryAt,rawDeadline:a.rawDeadline,signalAborted:a.signal?.aborted})),
+      samples:samples.map(({hold,context,flight,held,raw,...x})=>({...x,
+        sameHold:hold===originalHold,sameContext:context===originalContext,sameFlight:flight===original,
+        sameEffective:held===effectiveHeld,sameRaw:raw===heldContext})),
+      parents:parents.map(({signal,...x})=>({...x,aborted:signal?.aborted,sameAttemptSignal:signal===captureSignal})),errors}));
     console.log("MEMORY_FEEDBACK",JSON.stringify(feedback),"MEMORY_ACK",JSON.stringify(receipts));
     assert.equal(delivered,true);assert.equal(f.reservations.length,1);
     assert.equal(trackedFile(2396,"PUBLIC.txt"),"memory actual bytes\n","independent actual captured bytes");
     console.log("RETRY_VERIFICATIONS",JSON.stringify(verifications));
     o.assertProof(true,true);
+    assert.ok(samples.every(x=>x.hold===originalHold&&x.context===originalContext&&x.flight===original),
+      "same original hold and context throughout");
+    assert.ok(tokens.length>0,"real Runner capture options expose effective held token");
+    assert.ok(tokens.every(h=>h===effectiveHeld&&h.context===heldContext),
+      "same effective held token and raw context through retries");
+    assert.ok(samples.filter(x=>x.held).every(x=>x.effectiveDeadline<=x.deadline),
+      "effective held token never renews original epoch-ms deadline");
+    assert.ok(parents.some(x=>x.deadline===originalHold.deadline),
+      "actual parent recovery operation retains original deadline");
+    if(mode==="cancel-ack") assert.ok(parents.some(x=>x.deadline===originalHold.deadline&&x.signal.aborted),
+      "actual original parent operation receives cancellation");
+    assert.equal(errors.filter(x=>x.name==="AssertionError").length,0,
+      "no swallowed capture hook errors");
+    assert.equal(capturePurpose,"cancel","memory capture uses cancellation purpose");
+    assert.ok(captureSignal,"original recovery cancellation signal supplied");
+    assert.equal(fs.readFileSync(homeDir+"/session-proof","utf8"),"original edge session");
+    if(mode!=="retry") {
+      assert.notEqual(original.parked,true,"uncertain or cancelled ACK never fabricates parked success");
+      assert.equal(original.retainedLocalCustody,true);
+      assert.equal(fs.existsSync(worktreeDirFor(2396)),true,"exact original clone retained");
+    }
+    if(mode==="cancel-ack") {
+      assert.equal(captureSignal!.aborted,true,"lifecycle cancellation reaches recovery operation");
+      assert.equal(heldContext.signal.aborted,true,"derived held signal propagates original cancellation");
+      assert.equal(original.workerMemory.settled,true,"original operation fully settled");
+    }
     assert.equal(o.observations().entries,1,"all retries share ONE outer capture");
     assert.equal(o.observations().returns,1,"one original outer scope returns");
-    assert.deepEqual(verifications.map(v=>v.result),[false,false,true],"two failed verdicts then actual Git success");
+    assert.deepEqual(verifications.map(v=>v.result),mode==="retry"?[false,false,true]:[true],"only verification retry recaptures locally");
     assert.ok(verifications.every(v=>v.actual===true&&v.active),"each real local verification runs inside original held scope");
     assert.ok(o.observations().source.every((v:any)=>v.active),"all protected source reads stay inside original capture");
     assert.ok(feedback.length>0,"actual pressure feedback sent");
     assert.ok(feedback.every((x:any)=>x.active),"capture held through awaited feedback delivery");
     assert.ok(receipts.length===1&&(receipts[0] as any).active,"matching park ACK inside capture");
-    assert.deepEqual((receipts[0] as any).accepted,{
+    if(mode!=="uncertain") assert.deepEqual((receipts[0] as any).accepted,{
       run_id:f.claim.run_id,worker_id:client.memoryIncarnation!.worker_id,
       register_nonce:"original-memory-registration",claim_generation:7,memory_episode:3});
-  }finally{await f.memory.stop();await monitoring;client.postMessages=post;client.reportState=report;git.verifyRunnerTrackingCovers=verify;o.restore();}
+  }finally{await original?.workerMemory?.operation;await f.memory.stop();await monitoring;client.postMessages=post;client.reportState=report;git.verifyRunnerTrackingCovers=verify;o.restore();}
 });
 
 
