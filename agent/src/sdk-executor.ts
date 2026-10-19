@@ -313,17 +313,6 @@ class CliSignalDeathError extends Error {
 }
 
 /**
- * issue #1656: if `err` is the SDK's error for a CLI child ended by SIGTERM/SIGKILL, a short
- * description of the death (`signal SIGTERM`, `exit code 143`); otherwise undefined.
- *
- * READS UNDOCUMENTED SDK INTERNALS: `getProcessExitError` (sdk.mjs) tags its Error with OWN
- * properties `errorClass: "process_killed_by_signal"` + `signal`, or
- * `errorClass: "process_exited_nonzero"` + `exitCode`; none is in the public `.d.ts`. The exit
- * codes 143/137 are the signal-shaped codes for SIGTERM/SIGKILL (the SDK reports a code, not
- * proof of the signal). Crash signals and every other code return false and fail fast.
- * test/sdk-signal-death.test.ts pins the shape against the installed SDK.
- */
-/**
  * Issue #3137: build the owner follow-up batch for an ordinary turn. In-memory `queuedOwner`
  * entries (follow-ups an interactive park received while the slot was held) go first, in
  * order, under the same rune cap and oversized-first rule as SteeringChannel.pullFollowUps.
@@ -358,6 +347,17 @@ export function fillOwnerBatch(
   return batch.length > 0 ? batch : undefined;
 }
 
+/**
+ * issue #1656: if `err` is the SDK's error for a CLI child ended by SIGTERM/SIGKILL, a short
+ * description of the death (`signal SIGTERM`, `exit code 143`); otherwise undefined.
+ *
+ * READS UNDOCUMENTED SDK INTERNALS: `getProcessExitError` (sdk.mjs) tags its Error with OWN
+ * properties `errorClass: "process_killed_by_signal"` + `signal`, or
+ * `errorClass: "process_exited_nonzero"` + `exitCode`; none is in the public `.d.ts`. The exit
+ * codes 143/137 are the signal-shaped codes for SIGTERM/SIGKILL (the SDK reports a code, not
+ * proof of the signal). Crash signals and every other code return false and fail fast.
+ * test/sdk-signal-death.test.ts pins the shape against the installed SDK.
+ */
 function foreignCliTermination(err: Error): string | undefined {
   const own = (key: string): unknown => (Object.hasOwn(err, key) ? Reflect.get(err, key) : undefined);
   const errorClass = own("errorClass");
@@ -2657,7 +2657,7 @@ export class SdkExecutor implements Executor {
       // Issue #1800: follow-ups the interactive park received while ownerBatch was still held,
       // in arrival order. They are already consumed from the server; the queue is in-memory only.
       // They refill the slot at the loop top (ahead of a fresh pull) and are serviced once the
-      // held follow-up reaches the model. A follow-up stranded by a run end stays
+      // held batch reaches the model. A follow-up stranded by a run end stays
       // consumed-but-not-included; the worker re-queues it at its next claim (from the claim-time
       // GET of consumed follow-ups), not the server.
       const queuedOwner: Array<{ id: number; body: string }> = [];
@@ -3376,15 +3376,15 @@ export class SdkExecutor implements Executor {
           if (ctx.interactive && ctx.awaitFollowUp && !finalizing) {
             // Issue #1800: defensive, not reachable through the public seams today: a turn that
             // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
-            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would
-            // consume a second follow-up from the server into an occupied slot, and one of the two
-            // would never be included. Service the held one first: run another turn instead of
+            // is still held (pulled, never evidenced) the batch has not reached the model yet. Parking
+            // would consume another follow-up from the server into an occupied slot, and one of the
+            // two would never be included. Service the held batch first: run another turn instead of
             // parking, with the same fresh budgets a received follow-up gets. Bounded: this is taken
-            // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
+            // once per held batch, keyed on its first id (`serviceTriedId`), and the system `followUp` text is cleared so the
             // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
             // through to the normal park: the follow-up stays unincluded and is re-queued at the
-            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND it
-            // (queuedOwner); queued ones are serviced once the held one reaches the model.
+            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND the
+            // batch (queuedOwner); queued ones are serviced once the held batch reaches the model.
             if (
               (ownerBatch !== undefined && serviceTriedId !== ownerBatch[0]!.id)
               || (ownerBatch === undefined && queuedOwner.length > 0)

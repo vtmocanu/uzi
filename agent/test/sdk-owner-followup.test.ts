@@ -517,6 +517,36 @@ describe("issue #3137: the Claude executor batches pending owner follow-ups into
     assert.deepStrictEqual(probe.included, [77, 78]);
   });
 
+  it("#3137 an oversized lone follow-up is pulled into an empty batch, delivered whole, and receipted", async () => {
+    const BIG = "x".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 1);
+    const queue = [BIG];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE], queue);
+    const probe = makeCtx(queue);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.pullArgs[0], { remainingRunes: MAX_FOLLOW_UP_BATCH_RUNES, batchEmpty: true });
+    assert.ok(prompts[1]!.includes(BIG), "the oversized body reaches the implement prompt whole");
+    assert.deepStrictEqual(probe.included, [1], "its id is receipted");
+  });
+
+  it("an interactive park's message does not absorb a channel follow-up queued meanwhile", async () => {
+    const queue: string[] = [];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE, DONE, DONE], queue);
+    const outcomes = [
+      { kind: "followup" as const, id: 77, body: A },
+      { kind: "ended" as const, reason: "idle" as const },
+    ];
+    const probe = makeCtx(queue, {
+      interactive: true,
+      awaitFollowUp: async () => {
+        if (outcomes[0]!.kind === "followup") queue.push(B);
+        return outcomes.shift()!;
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "the park's turn carries only its own message");
+    assert.deepStrictEqual(probe.included, [77], "only the park's message is receipted by its turn");
+  });
+
   // queuedOwner only fills when an interactive park receives a follow-up while the owner slot is
   // still held, which no public seam reaches today (a turn that parks has model evidence, which
   // empties the slot). So the mixed-source fill is driven through fillOwnerBatch directly, with a
