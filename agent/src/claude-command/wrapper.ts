@@ -11,6 +11,10 @@
 //     spilled, but the command still runs, drains and keeps its status. `set -o noclobber` stays
 //     as a second guard for a regular file that appears between the check and the open; it does
 //     NOT stop a FIFO or a device from being opened, which is why the explicit check exists;
+//     Residual, self-only race: the existence check runs before the asynchronous spill open, so
+//     a FIFO that the command itself creates at its own spill path (worker-minted, per call)
+//     inside that window can stall its own command until the command deadline. It cannot
+//     affect any other command or the worker, which never opens the spill path;
 //   - the writer `tee >( { head -c cap > spill; cat >/dev/null; } ); wait` forwards every byte
 //     to the wrapper's stdout (the supervisor transport) and spills at most `cap` bytes, then
 //     keeps draining, so a full cap or a failed spill open never SIGPIPEs the command; its

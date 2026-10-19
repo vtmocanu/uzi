@@ -23,10 +23,10 @@ import {
   type RunnerCommandSpawned,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
-import { RUNNER_UID, setprivRunnerArgs } from "../src/runner-uid.js";
+import { RUNNER_UID, runnerCommand, setprivRunnerArgs } from "../src/runner-uid.js";
 import { PROVIDER_CREDENTIAL_VARS } from "../src/sdk-spawn.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
-import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, workerRunnerRootPids, workerSpawnEnv } from "../src/worker-spawn-mark.js";
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 
 resetResidueQuarantineAfterEach();
@@ -257,6 +257,19 @@ describe("launchRunnerCommandRoot with a fake supervisor", () => {
     assert.deepEqual(killed, ["SIGKILL"]);
   });
 
+  it("reports an unkillable supervisor through onKillFailed and still rethrows the original onSpawned error", { skip: SINGLE_UID > 0 ? false : "needs a non-root process uid" }, async () => {
+    // The fake lacks the exit fields, so killUnreapedSupervisor cannot prove it unreaped and returns false.
+    const fake = newFake(SINGLE_UID);
+    const boom = new Error("record failed");
+    const reported: unknown[] = [];
+    await assert.rejects(
+      launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }),
+        depsFor(fake, { env: {}, onKillFailed: (e: unknown) => { reported.push(e); } })),
+      (e: unknown) => e === boom,
+    );
+    assert.deepEqual(reported, [boom]);
+  });
+
   it("classifies a spawn that throws as not started, without calling onSpawned", async () => {
     let called = false;
     const e2big = Object.assign(new Error("spawn E2BIG"), { code: "E2BIG" });
@@ -334,12 +347,21 @@ describe("killUnreapedSupervisor", () => {
     }
   });
 
-  it("under the split runs the forked kill with the worker spawn mark in its env", () => {
+  it("under the split runs the forked kill with the worker spawn mark and a minimal env, none of the worker's", () => {
+    const secretKey = "UZI_TEST_KILL_ENV_SECRET";
+    const prior = process.env[secretKey];
+    process.env[secretKey] = ["sk", "ant", "fragment", "value"].join("-");
     let seen: NodeJS.ProcessEnv | undefined;
-    killUnreapedSupervisor(child(), { split: true, runKill: (_command, _args, options) => { seen = options.env; return { status: 0 }; } });
+    try {
+      killUnreapedSupervisor(child(), { split: true, runKill: (_command, _args, options) => { seen = options.env; return { status: 0 }; } });
+    } finally {
+      if (prior === undefined) delete process.env[secretKey]; else process.env[secretKey] = prior;
+    }
     assert.ok(seen, "an env was passed");
     assert.ok(seen[WORKER_SPAWN_ENV], "carries the worker spawn mark");
     assert.equal(seen[RUN_ATTEMPT_ENV], undefined);
+    assert.equal(seen[secretKey], undefined, "the worker's env does not reach the forked kill");
+    assert.equal(seen.PATH, "/usr/bin:/bin");
   });
 
   it("does not throw when the kill machinery fails", () => {
@@ -425,6 +447,15 @@ let counter = 0;
 const nextSpill = (): string => path.join(scratchRoot, `spill-${String(++counter)}`, "call.log");
 /** A spill path whose directory can never be created (a path component is /dev/null). */
 const UNWRITABLE_SPILL = "/dev/null/uzi-cmd/call.log";
+
+/** SIGKILL a background holder whose pid the command wrote to `file` (safe when it never did). */
+function killPidFile(file: string): void {
+  try {
+    const pid = Number(fs.readFileSync(file, "utf8").trim());
+    if (Number.isInteger(pid) && pid > 1) process.kill(pid, "SIGKILL");
+  } catch { /* never started, or already gone */ }
+}
+const nextPidFile = (): string => path.join(scratchRoot, `holder-${String(++counter)}.pid`);
 
 interface WrapperRun {
   readonly code: number | null;
@@ -519,43 +550,45 @@ describe("WRAPPER under the host bash", () => {
   });
 
   it("returns within the writer grace when a descendant keeps the output fd open", { skip: WRAPPER_SKIP }, async () => {
-    const run = await runWrapper("sleep 300 & echo $!; exit 5", { timeoutMs: 20000 });
-    const sleeper = Number(run.head.trim().split("\n")[0]);
+    const pidFile = nextPidFile();
     try {
+      const run = await runWrapper(`sleep 300 & echo $! > ${pidFile}; exit 5`, { timeoutMs: 20000 });
       assert.equal(run.code, 5);
       assert.ok(run.exitMs <= 11000, `exit took ${String(run.exitMs)}ms`);
       assert.ok(run.exitMs >= 4000, "the wrapper waits the bounded writer grace before giving up");
-    } finally {
-      if (Number.isInteger(sleeper) && sleeper > 1) { try { process.kill(sleeper, "SIGKILL"); } catch { /* already gone */ } }
-    }
+    } finally { killPidFile(pidFile); }
   });
 
   it("honours the test-only grace argument: a small value shortens the bounded wait, a bad value falls back to the default and is never evaluated", { skip: WRAPPER_SKIP }, async () => {
-    const pids: number[] = [];
+    const pidFiles: string[] = [];
+    const holder = (): string => { const f = nextPidFile(); pidFiles.push(f); return `sleep 300 & echo $! > ${f}; exit 6`; };
     try {
-      const short = await runWrapper("sleep 300 & echo $!; exit 6", { graceTenths: "5", timeoutMs: 20000 });
-      pids.push(Number(short.head.trim().split("\n")[0]));
+      const short = await runWrapper(holder(), { graceTenths: "5", timeoutMs: 20000 });
       assert.equal(short.code, 6);
       assert.ok(short.exitMs < 3000, `a 0.5 s grace took ${String(short.exitMs)}ms`);
       // The value reaches an arithmetic context only after a digits-only check, so it cannot run code.
       const marker = path.join(scratchRoot, "grace-injection");
-      const bad = await runWrapper("sleep 300 & echo $!; exit 6", { graceTenths: `a[$(touch ${marker})]`, timeoutMs: 20000 });
-      pids.push(Number(bad.head.trim().split("\n")[0]));
+      const bad = await runWrapper(holder(), { graceTenths: `a[$(touch ${marker})]`, timeoutMs: 20000 });
       assert.equal(bad.code, 6);
       assert.ok(bad.exitMs >= 4000, `an invalid grace falls back to the 5 s default (${String(bad.exitMs)}ms)`);
       assert.equal(fs.existsSync(marker), false);
-      const huge = await runWrapper("echo ok", { graceTenths: "9999", timeoutMs: 20000 });
-      assert.equal(huge.code, 0);
+      // A 3-digit value passes the digits check but must be clamped to 50 (5 s), not honoured as 99.9 s.
+      const huge = await runWrapper(holder(), { graceTenths: "999", timeoutMs: 20000 });
+      assert.equal(huge.code, 6);
+      assert.ok(huge.exitMs >= 4000 && huge.exitMs < 7500, `an over-large grace is clamped to the 5 s cap (${String(huge.exitMs)}ms)`);
     } finally {
-      for (const pid of pids) if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+      for (const f of pidFiles) killPidFile(f);
     }
   });
 
   it("does not leak the wrapper's writer fd to the command or its descendants", { skip: WRAPPER_SKIP }, async () => {
-    const quiet = await runWrapper("sleep 300 >/dev/null 2>&1 & echo started; exit 0", { timeoutMs: 20000 });
-    assert.equal(quiet.code, 0);
-    assert.ok(quiet.exitMs <= 2000, `a quiet background process held the wrapper for ${String(quiet.exitMs)}ms`);
-    assert.ok(quiet.closed, "the transport closed promptly");
+    const pidFile = nextPidFile();
+    try {
+      const quiet = await runWrapper(`sleep 300 >/dev/null 2>&1 & echo $! > ${pidFile}; exit 0`, { timeoutMs: 20000 });
+      assert.equal(quiet.code, 0);
+      assert.ok(quiet.exitMs <= 2000, `a quiet background process held the wrapper for ${String(quiet.exitMs)}ms`);
+      assert.ok(quiet.closed, "the transport closed promptly");
+    } finally { killPidFile(pidFile); }
     // Piped so that $$ stays the command's shell (a bare ls would exec in place and list its own dir fd).
     const fds = await runWrapper('ls /proc/$$/fd | cat');
     assert.equal(fds.code, 0);
@@ -563,7 +596,7 @@ describe("WRAPPER under the host bash", () => {
     assert.deepEqual(names, ["0", "1", "2"], "only stdio is open in the command");
   });
 
-  it("refuses any pre-existing spill path (FIFO, symlink, dangling symlink) without blocking or writing through it", { skip: WRAPPER_SKIP }, async () => {
+  it("refuses any pre-existing spill path (FIFO, symlink, dangling symlink) without blocking or writing through it", { skip: WRAPPER_SKIP, timeout: 90000 }, async () => {
     const dir = path.join(scratchRoot, "preplanted");
     fs.mkdirSync(dir, { recursive: true });
     const fifo = path.join(dir, "fifo");
@@ -575,11 +608,19 @@ describe("WRAPPER under the host bash", () => {
     const dangling = path.join(dir, "dangling");
     const missing = path.join(dir, "missing-target");
     fs.symlinkSync(missing, dangling);
-    for (const spill of [fifo, link, dangling]) {
-      const run = await runWrapper("echo visible; exit 8", { spill, timeoutMs: 15000, graceTenths: "10" });
-      assert.equal(run.code, 8, spill);
-      assert.equal(run.head, "visible\n", spill);
-      assert.ok(run.exitMs <= 2000, `${spill} held the wrapper for ${String(run.exitMs)}ms`);
+    try {
+      // The default grace (no override) is used: a blocked FIFO open would hold the writer, and
+      // so the transport, for the whole grace, and the closed check proves it did not.
+      for (const spill of [fifo, link, dangling]) {
+        const run = await runWrapper("echo visible; exit 8", { spill, timeoutMs: 15000 });
+        assert.equal(run.code, 8, spill);
+        assert.equal(run.head, "visible\n", spill);
+        assert.ok(run.exitMs <= 2000, `${spill} held the wrapper for ${String(run.exitMs)}ms`);
+        assert.ok(run.closed, `${spill}: the transport closed promptly (no stuck spill open)`);
+      }
+    } finally {
+      // Release any writer a broken refusal left blocked on the FIFO open (O_RDWR never blocks).
+      try { fs.closeSync(fs.openSync(fifo, fs.constants.O_RDWR)); } catch { /* nothing to release */ }
     }
     assert.equal(fs.readFileSync(target, "utf8"), "KEEP");
     assert.equal(fs.existsSync(missing), false);
@@ -698,7 +739,19 @@ describe("real runner-uid command launcher", { skip: INIT_SKIP }, () => {
       assert.equal(outcome.clean, true);
       assert.equal(outcome.clean ? outcome.event.state : undefined, "drained");
       assert.equal(out, "hi\n");
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+      // The spill was created by the wrapper at the runner uid, so only the runner uid can read it.
+      const readEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" });
+      const cat = runnerCommand("cat", ["--", path.join(dir, "uzi-cmd", "call.log")]);
+      const spill = spawnSync(cat.command, cat.args, { env: readEnv, encoding: "utf8" });
+      assert.equal(spill.status, 0, spill.stderr);
+      assert.equal(spill.stdout, "hi\n");
+    } finally {
+      // The wrapper's runner-owned uzi-cmd/ subdir sits inside this worker-owned dir: remove it as
+      // the runner uid first, or the worker uid cannot remove the dir.
+      const rm = runnerCommand("rm", ["-rf", "--", path.join(dir, "uzi-cmd")]);
+      spawnSync(rm.command, rm.args, { env: workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }), stdio: "ignore", timeout: 10_000 });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("passes the launcher preflight", async () => {

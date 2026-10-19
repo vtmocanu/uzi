@@ -208,6 +208,9 @@ export interface LauncherDeps {
   readonly resolveRunnerUid?: () => number;
   readonly resolveCommandUid?: () => number;
   readonly resolveWorkerUid?: () => number;
+  /** Called with the original `onSpawned` error when the supervisor could not be killed after it
+   * threw (the original error is still rethrown). Default: one line on stderr. */
+  readonly onKillFailed?: (onSpawnedError: unknown) => void;
   readonly makeRunnerTrees?: MakeRunnerTrees;
   /** Scrubs provisioning stderr before it is published in a launch error. Absent: the
    * stderr is withheld entirely. Must be the complete live redactor. */
@@ -1231,7 +1234,10 @@ async function launchRunnerSupervised(spec: RunnerSupervisedLaunch, deps: Launch
       spec.onSpawned({ pid: child.pid, startTime: recordRoot(child.pid, deps.rootStartTime)?.startTime }, child);
     } catch (error) {
       // The caller could not record the root: nothing else will ever reap it.
-      killUnreapedSupervisor(child, { split });
+      if (!killUnreapedSupervisor(child, { split })) {
+        // An unreaped, unrecorded supervisor may now outlive this call: make that observable.
+        (deps.onKillFailed ?? defaultKillFailed)(error);
+      }
       throw error;
     }
   }
@@ -1281,6 +1287,11 @@ export async function launchRunnerSupervisedProbe(
   }, deps);
 }
 
+function defaultKillFailed(onSpawnedError: unknown): void {
+  const detail = onSpawnedError instanceof Error ? onSpawnedError.message : String(onSpawnedError);
+  process.stderr.write(`runner command: could not kill the unrecorded supervisor after onSpawned failed: ${detail}\n`);
+}
+
 export interface KillUnreapedDeps {
   /** Whether the uid split is active (default: this process's env). */
   readonly split?: boolean;
@@ -1311,7 +1322,7 @@ export function killUnreapedSupervisor(child: RunnerCommandChild, deps: KillUnre
       const kill = runnerCommand("kill", ["-KILL", String(pid)], true);
       const run = deps.runKill ??
         ((command, args, options) => spawnSync(command, [...args], { env: options.env, stdio: "ignore", timeout: 10_000 }));
-      const result = run(kill.command, kill.args, { env: workerSpawnEnv() });
+      const result = run(kill.command, kill.args, { env: workerSpawnEnv(STANDALONE_MODE_ENV) });
       return result.error === undefined && result.status === 0;
     }
     return typeof child.kill === "function" ? child.kill("SIGKILL") : false;
