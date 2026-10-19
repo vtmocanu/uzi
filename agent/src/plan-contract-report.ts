@@ -77,4 +77,3 @@ export function validateCoverageReport(raw: string, candidate: Candidate, source
   if (sources.some(s => !citedSources.has(s.id))) throw new Error("Omitted source");
   return report;
 }
-
