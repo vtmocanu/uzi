@@ -173,29 +173,29 @@ func (s *Service) SemanticGateForOwner(ctx context.Context, owner uuid.UUID, run
 	return &apitypes.SemanticGateDTO{Presentation: *p, Approval: semanticApprovalFor(run, *p), Sources: blobs.Sources, Plan: blobs.Plan}, nil
 }
 
-func validateSemanticApprovalIdentity(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
+// Return the validated snapshot so submitSemanticApproval can reuse it under
+// admitApproval's run-row lock, without decoding or validating identity again.
+func validateSemanticApprovalIdentity(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) (gatePresentedPayload, error) {
 	if opts.SemanticApproval == nil || opts.ExpectedGateRevision == nil || *opts.ExpectedGateRevision != run.GateRevision || run.Status != "awaiting_approval" || run.ClaimReleasedAt.Valid || run.GateRevision < 1 {
-		return ErrSemanticGateMismatch
+		return gatePresentedPayload{}, ErrSemanticGateMismatch
 	}
 	snapshot, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload)
 	if err != nil || !ok || snapshot.Semantic == nil || !sameSemanticJSON(snapshot.Semantic, p) || !sameSemanticJSON(*opts.SemanticApproval, semanticApprovalFor(run, *p)) {
-		return ErrSemanticGateMismatch
+		return gatePresentedPayload{}, ErrSemanticGateMismatch
 	}
 	_, digest, err := snapshot.digest()
 	if err != nil || !bytes.Equal(digest, run.GatePayloadDigest) || snapshot.PlanMd == nil || !run.PlanMd.Valid || *snapshot.PlanMd != run.PlanMd.String {
-		return ErrSemanticGateMismatch
+		return gatePresentedPayload{}, ErrSemanticGateMismatch
 	}
-	return validateSemanticGateFields(snapshot, p)
+	if err := validateSemanticGateFields(snapshot, p); err != nil {
+		return gatePresentedPayload{}, err
+	}
+	return snapshot, nil
 }
 
-func validateSemanticApproval(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
-	if err := validateSemanticApprovalIdentity(run, opts, p); err != nil {
-		return err
-	}
-	snapshot, _, err := decodeGatePresentedPayload(run.GatePresentedPayload)
-	if err != nil {
-		return err
-	}
+// validateSemanticApproval checks live admission fields only on the first freeze.
+// snapshot must come from validateSemanticApprovalIdentity for this locked run.
+func validateSemanticApproval(run store.Run, snapshot gatePresentedPayload) error {
 	live := gatePayloadFromRow(run)
 	a, ae := canonicalRawJSON(live.Milestones)
 	b, be := canonicalRawJSON(snapshot.Milestones)
@@ -220,7 +220,8 @@ func semanticGateContract(p *apitypes.SemanticGatePresentation, approval *apityp
 }
 
 func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run store.Run, body string, sel *AgentSelection, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation, c *semanticCoverageTx) (SubmitInputResult, error) {
-	if err := validateSemanticApprovalIdentity(run, opts, p); err != nil {
+	snapshot, err := validateSemanticApprovalIdentity(run, opts, p)
+	if err != nil {
 		return SubmitInputResult{}, err
 	}
 	blobs, err := c.payload(ctx, run.ID)
@@ -247,7 +248,7 @@ func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run sto
 		}
 		return SubmitInputResult{ID: id, CreatedAt: created}, nil
 	}
-	if err := validateSemanticApproval(run, opts, p); err != nil {
+	if err := validateSemanticApproval(run, snapshot); err != nil {
 		return SubmitInputResult{}, err
 	}
 	if changedMilestoneContract(run) {
