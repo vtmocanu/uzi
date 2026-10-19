@@ -2380,7 +2380,7 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
 describe("ordinary teardown capture eligibility", () => {
   // Unit seam only: real registry and safety, modeled root evidence; no live-kernel claim.
   for (const mode of ["clean", "already-disposed", "later-poison", "late-root", "root-cleanup",
-    "harness-cleanup", "fileop-cleanup", "foreign-facade"] as const) {
+    "harness-cleanup", "fileop-cleanup", "foreign-facade", "terminal"] as const) {
     it(`ordinary teardown capture eligibility ${mode}`, async () => {
       const rig = makeRig();
       let launches = 0;
@@ -2406,7 +2406,7 @@ describe("ordinary teardown capture eligibility", () => {
         ? { close: async () => { throw new Error("harness cleanup unconfirmed"); } } as unknown as CodexHarness : undefined;
       const fileop = mode === "fileop-cleanup"
         ? { ...fakeFileopHandle().handle, dispose: async () => { throw new Error("fileop cleanup unconfirmed"); } } : undefined;
-      const clean = await exec["tearDownEpoch"](registry, harness, fileop, 1000, true);
+      const clean = await exec["tearDownEpoch"](registry, harness, fileop, 1000, true, mode === "terminal" ? undefined : "replacement");
       assert.equal(clean, !["root-cleanup", "harness-cleanup", "fileop-cleanup"].includes(mode));
       assert.equal(exec.safety, facade, "teardown preserves the public refusal marker");
       if (mode === "later-poison") registry.poison({ category: "tool", message: "late cleanup fault" });

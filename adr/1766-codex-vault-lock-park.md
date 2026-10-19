@@ -211,11 +211,14 @@ public Codex safety marker, so a normal runner boundary cannot fall into the leg
 branch. A poisoned or disposed normal facade refuses before credential reconciliation.
 If a healthy checkpoint epoch fully tears down and the next provider's initial
 credential release exhausts, a later owned free capture can select a fresh production
-capture-only facade for that exact retired facade. Ordinary evidence requires
-observed quiescence and matching-epoch reaping, successful disposal, harness close
-and fileop cleanup, with the registry still disposed and unpoisoned. Intentional
-capture instead requires the exact completed scope/epoch/registry proof to
-revalidate clean teardown and an unchanged poison revision. Selection follows the
+capture-only facade for that exact retired facade. Ordinary evidence is created
+only by `ProviderEpoch.dispose` replacing an abandoned epoch, with observed
+quiescence and matching-epoch reaping, successful disposal, harness close and
+fileop cleanup for that exact public facade, with the registry still disposed and
+unpoisoned. Terminal run cleanup and partial-build cleanup do not create this
+ordinary fact from cleared tracking tables. Intentional capture instead requires
+the exact completed scope/epoch/registry proof to revalidate clean teardown and an
+unchanged poison revision. Selection follows the
 owned joins and outstanding-registry drain checks; arbitrary disposed registries,
 cleared tables, failed cleanup, new poison or roots, and foreign facades do not
 qualify. The new acquisition still intentionally poisons its fresh registry through

@@ -485,11 +485,13 @@ mints neither a credentialed nor a completion permit. See the
 
 Pre-start capture uses the existing capture-only facade. A later owned capture can
 also select a fresh production capture-only facade for the exact retired public
-facade after verified full teardown. Ordinary teardown must have observed
-quiescence and matching-epoch reaping, successful disposal, harness close and
-fileop cleanup; its evidence remains valid only while that registry is disposed
-and unpoisoned. Intentional capture instead retains the exact completed
-scope/epoch/registry proof and unchanged poison revision. The public safety marker
+facade after verified full teardown. Ordinary evidence is created only by
+`ProviderEpoch.dispose` replacing an abandoned epoch, with observed quiescence
+and matching-epoch reaping, successful disposal, harness close and fileop cleanup
+for that exact public facade; it remains valid only while that registry is disposed
+and unpoisoned. Terminal run cleanup and partial-build cleanup do not create this
+ordinary fact from cleared tracking tables. Intentional capture instead retains
+the exact completed scope/epoch/registry proof and unchanged poison revision. The public safety marker
 stays present, so normal boundaries still refuse rather than taking the legacy
 branch. After setup, summary and installer joins, session save, attempt binding
 and outstanding-registry drain checks, this evidence permits facade selection,

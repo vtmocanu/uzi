@@ -4868,7 +4868,7 @@ export class CodexExecutor implements Executor {
         // survive into the next epoch), then close the harness/transport and dispose the fileop.
         dispose: async (): Promise<void> => {
           await settleDepsInstall();
-          const clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true);
+          const clean = await this.tearDownEpoch(registry, epochHarness, epochFileop, boundaryDeadlineMs, true, "replacement");
           if (clean) this.unverifiedEpochRegistries.delete(registry);
         },
       };
@@ -4899,6 +4899,7 @@ export class CodexExecutor implements Executor {
     fileopHandle: FileopHelperHandle | undefined,
     deadlineMs: number,
     disposeRegistry: boolean,
+    purpose?: "replacement",
   ): Promise<boolean> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     const cap = MaintenanceBudget.current()?.cap(deadlineMs);
@@ -4940,8 +4941,9 @@ export class CodexExecutor implements Executor {
       const retiredFacade = this.epochSafeties.get(registry);
       if (retiredFacade && retiredFacade === this.safety) {
         if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
-        else if (ordinaryDrained && !registry.isPoisoned()) {
-          // This teardown observed quiescence, every root reaped, disposal and transport cleanup.
+        else if (purpose === "replacement" && ordinaryDrained && !registry.isPoisoned()) {
+          // Terminal cleanup cannot manufacture ordinary capture eligibility from cleared tables.
+          // This replacement observed quiescence, every root reaped, disposal and transport cleanup.
           // Later rejected root registration poisons even a disposed registry, invalidating this fact.
           this.verifiedDisposedCaptureFacades.set(retiredFacade,
             () => registry.state() === "disposed" && !registry.isPoisoned());
