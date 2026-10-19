@@ -19511,6 +19511,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
   let getsAtCancel = 0;
   let receiptsAtCancel = 0;
   proof.onShutdownReceipt((signal, generation) => {
+    assert.ok(signal, "the shutdown overlay retains its bounded publication signal");
     assert.equal(signal.aborted, false);
     assert.equal(generation, 1, "publication forwards the original still-bound claim generation");
     assert.ok(executor.safety);
