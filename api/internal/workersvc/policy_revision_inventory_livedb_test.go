@@ -73,7 +73,7 @@ func TestPolicyRevisionInventoryHumanAndHistoryLiveDB(t *testing.T) {
 	svc.p.PolicyHoldNegotiated = true
 	svc.p.PolicyHoldSnapshotEnabled = true
 	svc.p.TerminalPendingLease = time.Minute
-	w.ProtocolCapabilities = []string{capability.ProviderPolicyHoldV1, capability.CredentialSwitchV1,
+	w.ProtocolCapabilities = []string{capability.ProviderPolicyHoldV1, capability.CredentialSwitchV1, capability.InputReceiptsV1,
 		"cross_check_v1", "cross_check_rounds_v1", "cross_check_codex_lead_v1"}
 	e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", w.ID, w.ProtocolCapabilities)
 	input, err := e.q.CreateRunInput(e.ctx, store.CreateRunInputParams{RunID: lead, Kind: "revise_plan"})
@@ -200,7 +200,8 @@ func TestPolicyRevisionInventoryUnknownLiveDB(t *testing.T) {
 			case "selection":
 				e.exec("UPDATE runs SET policy_candidate_cross_check_id=$2 WHERE id=$1", lead, uuid.New())
 			case "gate":
-				e.exec("UPDATE runs SET gate_revision=1 WHERE id=$1", lead)
+				e.exec(`UPDATE runs SET policy_revision_source=jsonb_set(policy_revision_source,'{gate}',
+					jsonb_build_object('revision','1','presentation_id',$2::text,'payload_digest',repeat('a',64))) WHERE id=$1`, lead, uuid.NewString())
 			case "missing", "foreign":
 				id := uuid.NewString()
 				if mode == "foreign" {
