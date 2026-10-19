@@ -581,3 +581,33 @@ test("a stale ordinary temp entry still refuses inside a maintenance scope", asy
   assert.equal(result, undefined);
   assert.equal(f.calls.coverage, 0);
 });
+
+for (const near of [
+  `${ordinary.slice(0, -1)}A.json.${tempUuid}.tmp`,
+  `${ordinary}.json.${tempUuid.toUpperCase()}.tmp`,
+  `${ordinary}.json.0123abcd-0000-1000-8000-00000000abcd.tmp`,
+  `${ordinary}.json.0123abcd-0000-4000-c000-00000000abcd.tmp`,
+  `legacy-capture.json.${tempUuid}.tmp`,
+  `${ordinary}.json.${tempUuid}.tmp.x`,
+  `${ordinary}.json.${tempUuid}.tmp\n`,
+  `${ordinary}.${tempUuid}.bundle`,
+  `${ordinary}.json.tmp`,
+]) {
+  test(`a near-miss temp name still refuses an ordinary pin: ${JSON.stringify(near.slice(ordinary.length - 4))}`, async t => {
+    const f = await fixture(t);
+    await f.seal({ ...f.partial(ordinary), generation: 6 });
+    await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, near), "partial");
+    assert.equal(await f.pin(), undefined);
+  });
+}
+
+for (const kind of ["symlink", "directory"] as const) {
+  test(`an ordinary temp name that is a ${kind} still refuses an ordinary pin`, async t => {
+    const f = await fixture(t);
+    await f.seal({ ...f.partial(ordinary), generation: 6 });
+    const entry = path.join(f.recoveryRoot, f.context.runId, `${ordinary}.json.${tempUuid}.tmp`);
+    if (kind === "symlink") await fs.symlink(f.file(ordinary), entry);
+    else await fs.mkdir(entry);
+    assert.equal(await f.pin(), undefined);
+  });
+}

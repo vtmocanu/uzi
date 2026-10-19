@@ -70,14 +70,14 @@ export type ClosedSourceObservation = Readonly<{
   }>;
 }>;
 
-const UUID_PART = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
-const ORDINARY_TEMP_RE = new RegExp(`^([^/]+?)(?:\\.json\\.${UUID_PART}\\.tmp|\\.${UUID_PART}\\.bundle\\.tmp)$`);
+// randomUUID(): lowercase RFC 4122 v4. Ordinary capture ids and both temp suffixes use it.
+const UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const ORDINARY_TEMP_RE = new RegExp(`^${UUID_V4}(?:\\.json\\.${UUID_V4}\\.tmp|\\.${UUID_V4}\\.bundle\\.tmp)(?![\\s\\S])`);
 
 /** A record or bundle temp name this coordinator writes (writeRecordUnlocked, bundleTmpPath) for an
- *  ordinary capture. */
+ *  ordinary capture, whose id is always randomUUID(). */
 function ordinaryTempEntry(name: string): boolean {
-  const captureId = ORDINARY_TEMP_RE.exec(name)?.[1];
-  return captureId !== undefined && classifyRecoveryOrigin(captureId) === "ordinary";
+  return ORDINARY_TEMP_RE.test(name);
 }
 
 /** Issue #3031 staged groundwork: new-origin admission (charged WIP capture after a terminal
