@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -265,6 +266,9 @@ func TestSemanticGateResetRefusesLiveDB(t *testing.T) {
 func freezeSemanticGateNoChecker(t *testing.T) *coverageLiveFixture {
 	t.Helper()
 	f := newSemanticGateLive(t)
+	// Match a valid execution budget so changing size reaches the metadata
+	// fence, rather than an unrelated zero-ceiling database constraint.
+	f.svc.p.RunWallCeiling = 24 * time.Hour
 	f.sources = f.sources[:1]
 	f.structural.RequiredCapabilities = []string{"docker"}
 	f.structural.RequiredTools = []string{"go", "node"}
