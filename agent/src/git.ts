@@ -13936,7 +13936,7 @@ try {
       stream.removeListener("close", close);
       signal?.removeEventListener("abort", abort);
       // Keep the source error listener through owned disposal, including refusal.
-      if (!failed && !stream.readableEnded) { cancel(); stream.destroy(); }
+      if (!stream.readableEnded) { if (!failed) cancel(); stream.destroy(); }
     });
     if (stream.readableDidRead || stream.errored || stream.readableObjectMode || stream.readableEncoding) {
       fail(new Error("maintenance output is not a fresh byte pipe"));
@@ -14271,6 +14271,13 @@ try {
       let stderrBytes = 0;
       let cancellation: Promise<unknown> | undefined;
       const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
+      // Wrapper refusal can precede the source's asynchronous disposal. Private
+      // transport keeps both raw pipes owned until EOF or actual close, including
+      // cancellation; an error event alone does not settle their descriptors.
+      const rawOutputsDone = opts.joinStderr ? Promise.all([process.stdout, process.stderr]
+        .filter((stream): stream is Readable => !!stream)
+        .map(stream => finished(stream, { writable: false, error: false }).then(() => true, () => false)))
+        : Promise.resolve([true]);
       const stderr = process.stderr && this.meteredGitOutput(process.stderr, "metadataBytes", abortRecovery);
       const stderrDone = opts.joinStderr && stderr ? finished(stderr).then(() => true, () => false) : Promise.resolve(true);
       stderr?.on("data", (c: Buffer | string) => {
@@ -14303,8 +14310,10 @@ try {
       else if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
       else process.stdin?.end(stdin ?? "");
       const completion = process.completed.then(({ code }) => completionError() ? -1 : code, () => -1);
-      const exited = (opts.joinStderr ? completion.then(async code =>
-        await stderrDone && !completionError() ? code : -1) : completion).finally(async () => {
+      const exited = (opts.joinStderr ? completion.then(async code => {
+        const [stderrSettled, rawSettled] = await Promise.all([stderrDone, rawOutputsDone]);
+        return stderrSettled && rawSettled.every(Boolean) && !completionError() ? code : -1;
+      }) : completion).finally(async () => {
         recovery?.signal.removeEventListener("abort", abortRecovery);
         await cancellation;
       });

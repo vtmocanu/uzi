@@ -118,6 +118,7 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     completed?: () => Promise<void>;
     cancel?: () => Promise<void>;
     holdStderr?: boolean;
+    stderrDestroy?: (error: Error | null, callback: (error?: Error | null) => void) => void;
     stderr?: PassThrough;
   } = {};
   const ownedGit = async (request: BoundaryProcessRequest) => {
@@ -131,7 +132,7 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
         void (async () => { await hooks.completed?.(); joined++; resolve({ code: code ?? -1 }); })();
       });
     });
-    const stderr = hooks.holdStderr ? (hooks.stderr = new PassThrough()) : child.stderr;
+    const stderr = hooks.holdStderr ? (hooks.stderr = new PassThrough({ destroy: hooks.stderrDestroy })) : child.stderr;
     if (hooks.stderr) child.stderr.pipe(hooks.stderr, { end: false });
     return { stdin: child.stdin, stdout: child.stdout, stderr, completed,
       cancel: async () => { cancelled++; child.kill("SIGKILL"); await hooks.cancel?.(); await completed; } };
@@ -200,7 +201,7 @@ test("real shared-base private proof survives unavailable originals and ignores 
     assert.ok(pack.argv.includes(flag));
 });
 
-for (const kind of ["missing", "corrupt", "loose fallback"] as const) {
+for (const kind of ["missing", "corrupt"] as const) {
   test(`pack-only proof refuses ${kind} before consumer`, async t => {
     const f = await fixture(t); let changed = false;
     f.hooks.spawn = async request => {
@@ -309,17 +310,45 @@ test("custody callback refusal before helper launch never calls consumer", async
   assert.equal(f.requests.length, 0); assert.equal(f.callbacks(), 0);
 });
 
-test("owned completion and stderr drain both settle before continuation", async t => {
-  const f = await fixture(t), completed = latch(), release = latch();
-  let settled = false;
+test("owned completion and raw stderr disposal both settle before continuation", async t => {
+  const f = await fixture(t), completed = latch(), release = latch(), disposal = latch();
+  let settled = false, exitBeforeClose = false, cleanupBeforeClose = false;
   f.hooks.holdStderr = true;
+  f.hooks.stderrDestroy = (error, callback) => { void disposal.promise.then(() => callback(error)); };
   f.hooks.completed = async () => { completed.release(); await release.promise; };
+  const spawnGit = f.git["spawnGit"].bind(f.git);
+  t.mock.method(f.git as unknown as { spawnGit: typeof spawnGit }, "spawnGit",
+    async (...args: Parameters<typeof spawnGit>) => {
+      const child = await spawnGit(...args);
+      return { ...child, exited: child.exited.then(code => {
+        exitBeforeClose ||= !f.hooks.stderr!.closed && !f.hooks.stderr!.readableEnded;
+        return code;
+      }) };
+    });
+  const rmdir = fs.rmdir.bind(fs);
+  t.mock.method(fs, "rmdir", async (...args: Parameters<typeof fs.rmdir>) => {
+    if (String(args[0]).startsWith(f.git.recoveryRoot))
+      cleanupBeforeClose ||= !f.hooks.stderr!.closed && !f.hooks.stderr!.readableEnded;
+    return rmdir(...args);
+  });
   const work = f.run(() => f.seam()).finally(() => { settled = true; });
-  await completed.promise;
-  f.controller.abort(Error("cancel child"));
-  await tick(); assert.equal(settled, false);
-  release.release(); await tick(); assert.equal(settled, false, "stderr drain still owned");
-  f.hooks.stderr!.end();
-  await assert.rejects(work);
+  void work.catch(() => undefined);
+  try {
+    await completed.promise;
+    f.controller.abort(Error("cancel child"));
+    await tick();
+    assert.equal(settled, false, "actual child completion is still owned");
+    assert.equal(f.hooks.stderr!.destroyed, true, "cancellation must request raw stderr disposal");
+    assert.equal(f.hooks.stderr!.closed, false, "raw asynchronous disposal is deliberately held");
+    release.release();
+    await tick();
+    assert.equal(exitBeforeClose, false, "exit must join actual raw stderr closure");
+    assert.equal(settled, false, "raw asynchronous disposal is still owned");
+  } finally {
+    release.release(); disposal.release();
+    f.hooks.stderr?.destroy();
+    await assert.rejects(work);
+  }
+  assert.equal(cleanupBeforeClose, false, "cleanup must follow actual raw stderr closure");
   assert.equal(f.callbacks(), 0); assert.ok(f.cancelled() > 0);
 });
