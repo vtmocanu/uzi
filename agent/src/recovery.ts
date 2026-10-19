@@ -4475,8 +4475,8 @@ export class RecoveryCoordinator {
 
   /** One metadata-only pass, no retries. Inside an active maintenance scope it shares that
    * scope's counters and clock, plus a ten-second cap. Ordinary callers are not producer-charged:
-   * they keep only their own MaintenanceBudget, so a slow listing still writes the journal rather
-   * than retaining an unrecorded source. Failure blocks new reconstruction only. Immutable replay
+   * the producer-only cap never refuses their write, though their own MaintenanceBudget and every
+   * origin-proof failure still do. Failure blocks new reconstruction only. Immutable replay
    * and frozenCoverageProven retain their existing proof, including every authenticated source record. */
   private async newReconstructionRecords(runId: string, generation?: number): Promise<RecoveryRecord[] | undefined> {
     if (this.savedEvidenceOnly.getStore()) return undefined;
