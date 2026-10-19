@@ -6,6 +6,13 @@ const root = process.argv[2] ?? '/data';
 let remaining = 256;
 const deadline = Date.now() + 5000;
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+// Observed grammar only, never MAC authentication or producer authority.
+const origin = id => {
+  if (id.length === 51 && /^maintenance-v1-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![\s\S])/.test(id)) return 'producer';
+  const family = id.replace(/[A-Z]/g, letter => letter.toLowerCase());
+  if (family.startsWith('maintenance') || (family.length > 0 && 'maintenance'.startsWith(family))) return 'malformed';
+  return uuid.test(id) ? 'ordinary' : null;
+};
 const sha = /^[0-9a-f]{40}$/;
 const digest = /^[0-9a-f]{64}$/;
 const enumValue = (v, values) => values.includes(v) ? v : null;
@@ -47,9 +54,18 @@ for (const run of await names(path.join(root, 'outbox'))) {
   }
   const records = [];
   for (const file of await names(path.join(root, 'recovery', run))) {
-    if (!uuid.test(file.replace(/\.json$/, '')) || !file.endsWith('.json')) continue;
-    const r = await read(path.join(root, 'recovery', run, file)), v = r.value;
-    records.push({ capture_id: file.slice(0, -5), mtime: r.mtime ?? null, error: r.error ?? null,
+    if (!file.endsWith('.json')) continue;
+    const captureId = file.slice(0, -5), observedOrigin = origin(captureId);
+    if (!observedOrigin) continue;
+    if (observedOrigin === 'malformed') {
+      records.push({ capture_id: null, observed_origin: 'malformed', error: 'maintenance_origin_invalid' });
+      continue;
+    }
+    const r = await read(path.join(root, 'recovery', run, file));
+    const mismatch = !r.error && (observedOrigin === 'producer' || r.value?.captureId !== undefined) && r.value?.captureId !== captureId;
+    const v = mismatch ? undefined : r.value;
+    records.push({ capture_id: captureId, observed_origin: observedOrigin,
+      mtime: r.mtime ?? null, error: r.error ?? (mismatch ? 'capture_identity_mismatch' : null),
       generation: integer(v?.generation), state: enumValue(v?.state, ['pinned', 'bundled', 'uploaded', 'needs_action']),
       final_acknowledged: typeof v?.finalAcknowledged === 'boolean' ? v.finalAcknowledged : null,
       final_kind: enumValue(v?.finalRequest?.disposition?.kind, ['archive', 'settled', 'held_publication']),

@@ -189,8 +189,9 @@ export const execDocker: DockerExec = (argv, opts) =>
   });
 
 /** Who may hold the claim gate closed; `open(owner)` removes only that owner's key. `retained_ops`
- *  is the operator retained-source channel (issue #1786). */
-export type GateOwner = "cache" | "maintenance" | "retained_ops";
+ *  is the operator retained-source channel (issue #1786); `terminal_maintenance` is the model-free
+ *  terminal producer's writer exclusion (issue #3031). */
+export type GateOwner = "cache" | "maintenance" | "retained_ops" | "terminal_maintenance";
 
 /**
  * The claim gate the two claim loops and the prune share. A claim loop calls
@@ -202,6 +203,7 @@ export type GateOwner = "cache" | "maintenance" | "retained_ops";
 export class DindPruneGate {
   private readonly blockers = new Set<GateOwner>();
   private inFlight = 0;
+  private transitions = 0;
 
   /** False while the prune holds the gate; otherwise counts one in-flight claim. */
   tryEnterClaim(): boolean {
@@ -221,15 +223,28 @@ export class DindPruneGate {
   }
 
   close(owner: GateOwner = "cache"): void {
+    this.transitions++;
     this.blockers.add(owner);
   }
 
   open(owner: GateOwner = "cache"): void {
+    this.transitions++;
     this.blockers.delete(owner);
+  }
+
+  /** Monotonic count of every close/open call, by any owner: a holder that pinned it can tell
+   *  that some other owner touched the gate in between, even if the gate looks unchanged now. */
+  generation(): number {
+    return this.transitions;
   }
 
   heldBy(owner: GateOwner): boolean {
     return this.blockers.has(owner);
+  }
+
+  /** True only while `owner` is the gate's sole holder. */
+  onlyHeldBy(owner: GateOwner): boolean {
+    return this.blockers.size === 1 && this.blockers.has(owner);
   }
 
   inFlightClaims(): number {

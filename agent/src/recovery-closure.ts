@@ -1,3 +1,4 @@
+import { MaintenanceResources } from "./recovery-maintenance.js";
 import { createHash } from "node:crypto";
 import type { Readable } from "node:stream";
 
@@ -40,6 +41,8 @@ export interface ClosureObject { oid: string; type: string; size: number }
 export async function verifyClosureFrames(
   stream: Readable, objects: readonly ClosureObject[], budget: ClosureBudget, signal?: AbortSignal,
 ): Promise<void> {
+  // Refuse object production in metadata discovery even for empty batches.
+  MaintenanceResources.consumeIfActive("decoded", 0);
   const iterator = stream[Symbol.asyncIterator]();
   let chunk: Buffer = Buffer.alloc(0);
   let offset = 0;
@@ -55,6 +58,7 @@ export async function verifyClosureFrames(
   };
   const byte = async (): Promise<number> => {
     if (!await available()) throw new Error("truncated recovery object frame");
+    MaintenanceResources.consumeIfActive("metadataBytes", 1);
     return chunk[offset++]!;
   };
   for (const object of objects) {
@@ -72,6 +76,7 @@ export async function verifyClosureFrames(
       if (!await available()) throw new Error("truncated recovery object contents");
       const length = Math.min(remaining, chunk.length - offset);
       if (length > budget.limit - budget.delivered) throw new RecoveryClosureLimitError(budget.limit);
+      MaintenanceResources.consumeIfActive("decoded", length);
       budget.delivered += length;
       hash.update(chunk.subarray(offset, offset + length));
       offset += length;

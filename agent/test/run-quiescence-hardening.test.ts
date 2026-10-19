@@ -26,6 +26,7 @@ import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
 import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { RecoveryMaintenance, MaintenanceResources } from "../src/recovery-maintenance.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1783 review round — the hardening of the run-quiescence reaper: attribution of a
@@ -443,6 +444,59 @@ describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded
       }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("real helper accepts fractional maintenance remainder with a conservative integer deadline", async t => {
+    const root = makeFakeProcRoot();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const digest = "a".repeat(64);
+    let computedAt = 0;
+    t.mock.method(MaintenanceResources, "remainingMsIfActive", () => {
+      computedAt = Date.now();
+      return 119999.5;
+    });
+    for (const existing of [undefined, Date.now() + 60000]) {
+      const base = fs.mkdtempSync(path.join(tmp, "deadline-ledger-"));
+      const ledger = new RecoveryMaintenance({ root: path.join(base, "recovery-maintenance"),
+        workerToken: "deadline-fixture" });
+      const admitted = await ledger.admit({
+        identity: { run: "run", generation: 1, hold: "hold", repo: "repo", custodian: "worker",
+          bareBasename: "github.com+org+repo.git", origin: digest, originalSource: digest, sourceConfig: digest },
+        config: { decodedCap: 8 * 1024 ** 3, verifierVersion: 1 },
+        source: digest, exactCustody: true, terminalNonStopped: true,
+      });
+      assert.ok(admitted.ok);
+      const helperTmp = recordingTmp();
+      let request: ScanRequest | undefined;
+      const started = Date.now();
+      const result = await MaintenanceResources.run(admitted.value, () => withQuiescenceView({ procRoot: root }, () =>
+        reapRunProcesses(fakeReq({ targetUid: ME, reportDeadline: existing }), {
+          viaHelper: true, helperTmp,
+          spawnHelper: (_command, args, opts) => {
+            assert.equal(opts.env.TSX_DISABLE_CACHE, "1");
+            assert.equal(opts.env.TMPDIR, helperTmp.made[0]);
+            // Keep the actual helper module and validator; bypass only the uid wrapper.
+            const child = spawn(process.execPath, args.slice(args.indexOf("--import")), {
+              cwd: opts.cwd, env: opts.env, stdio: ["pipe", "pipe", "pipe"],
+            });
+            spawned.push(child);
+            const end = child.stdin!.end.bind(child.stdin!);
+            t.mock.method(child.stdin!, "end", (chunk: string) => {
+              request = JSON.parse(chunk) as ScanRequest;
+              return end(chunk);
+            });
+            return child;
+          },
+        })));
+      assert.equal(result.state, "quiescent", result.detail);
+      assert.ok(request);
+      assert.equal(Number.isSafeInteger(request.reportDeadline), true);
+      if (existing !== undefined) assert.equal(request.reportDeadline, existing, "earlier deadline is retained");
+      else assert.ok(request.reportDeadline! >= Math.floor(started + 119999.5));
+      assert.ok(request.reportDeadline! <= Math.floor(computedAt + 119999.5), "rounding never extends the original window");
+      assert.ok(Date.now() - started < 10000, "real helper completes inside its existing spawn timeout");
+      assert.deepEqual(helperTmp.removed, helperTmp.made);
     }
   });
 

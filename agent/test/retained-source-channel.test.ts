@@ -520,6 +520,20 @@ describe("discard through the real socket", () => {
     assert.equal(r2.result.reason, "no_claim_gate");
   });
 
+  it("#3031 an operator discard never runs beside the terminal producer's writer exclusion", async () => {
+    const a = await retainedAttempt("run-term", 1);
+    const rig = await rigOf({});
+    const ev = await inspectOne(rig, a);
+    rig.gate.close("terminal_maintenance");
+    const r = await send(rig.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+    assert.equal(r.result.reason, "worker_not_idle");
+    assert.equal(fs.existsSync(a.path), true);
+    assert.equal(rig.events.includes("gate_closed:retained_ops"), false, "it never closes alongside the producer");
+    assert.equal(rig.gate.heldBy("terminal_maintenance"), true, "the producer's block is left alone");
+    rig.gate.open("terminal_maintenance");
+    await rig.abort();
+  });
+
   it("an execution active after its claim completed is not idle: the discard refuses and the gate reopens", async () => {
     const a = await retainedAttempt("run-act", 1);
     const rig = await rigOf({ idle: () => false });
