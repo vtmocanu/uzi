@@ -365,9 +365,10 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
 
 /** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
  *  runs the whole push / PR-description / merge-request sequence under one held permit, so the
- *  30 s checkpoint deadline (`codexBoundaryDeadlineMs`) is far too small for it. Derivation, one
+ *  30 s milestone checkpoint deadline (`codexBoundaryDeadlineMs`) is far too small for it.
+ *  Explicit reaped done checkpoints have their own 90 s hard allowance. Derivation, one
  *  modelled slow-but-healthy finalize:
- *  - queue wait behind at most one earlier boundary (deadlineAt fixed before `await prior`): 30 s
+ *  - queue wait behind one earlier milestone in this model (fixed before `await prior`): 30 s
  *  - boundary acquire: reconcile (one HTTP, 30 s) + registry quiesce and reap: 60 s
  *  - finalize run-quiescence Docker teardown (teardownDocker 15 s + 5 s request): 20 s
  *  - git path: fetch/align stage + push stage, each allowed one op stalling to GIT_TIMEOUT_MS
@@ -380,9 +381,9 @@ const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
  *    + 31 s FORGE_RETRY_SCHEDULE backoff: 391 s
  *  - PR-description publish (60 s + 60 s): 120 s
  *  - post-MR interlock reads and reconcile: ~120 s
- *  Sum ~2661 s, rounded up to 50 min. Bounded, never unbounded (PRD #1171). Park, checkpoint,
- *  shutdown and terminal boundaries stay on `codexBoundaryDeadlineMs` (park publishes only a
- *  checkpoint). */
+ *  Sum ~2661 s, rounded up to 50 min. Bounded, never unbounded (PRD #1171). Park, milestone
+ *  checkpoint, shutdown and terminal boundaries retain `codexBoundaryDeadlineMs` (park publishes
+ *  only a checkpoint); done-checkpoint scheduling uses its separate allowance. */
 const CODEX_FINALIZE_BOUNDARY_DEADLINE_MS = 50 * 60_000;
 
 /** Issue #1864: a code point a CodexBoundaryError `diagnostic` must not contain: Unicode general
