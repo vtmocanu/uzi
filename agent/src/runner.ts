@@ -18207,7 +18207,8 @@ export class RunRunner {
           if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
           this.retainedLifecycleGuard(flight);
           // Command sandbox attribution precedes executor.run() and its safety facade.
-          // An absent permit is never evidence of a legacy single-UID profile.
+          // Only an explicit command sandbox requires readiness. Legacy executors may
+          // omit the declaration when no Codex credential is present; unknown values refuse.
           if (flight.executor.sandboxesCommands === true) {
             await check();
             await this.git.normalizeRetainedSourceObjects(bare, branch, key, source);

@@ -242,8 +242,8 @@ const fs=require("node:fs"); fs.chmodSync(process.argv[1],0o440); fs.linkSync(pr
       'require("node:fs").linkSync(process.argv[1],process.argv[2])', ...candidateNames);
   }
   if (options.corrupt) {
-    // Keep real runner status from re-reading the damaged blob while refreshing index stat data.
-    // The committed worktree is clean; real pack transport must still read and reject this blob.
+    // Select a clean-status scenario before the real pack transport rejects the damaged blob.
+    // This fixture proves fetch-integrity refusal, not corruption detection during status.
     await commandGit(clone.path, "update-index", "--assume-unchanged", "retained.txt");
     await commandNode(clone.path, `
 const fs=require("node:fs"); fs.chmodSync(process.argv[1],0o600);

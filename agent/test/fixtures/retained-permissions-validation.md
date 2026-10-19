@@ -193,7 +193,7 @@ matrix was satisfied. Reviewer, auditor and read-only tester reviewed both the
 run-only cleanup repair and its fixture integration repair without remaining
 findings. M2 was checkpointed at that revision.
 
-## M3: negative-source preservation and integrity proof corrections
+## M1 fixture correction: negative-source preservation and integrity proof
 
 The test-only correction range starts at `a1b58d6f` and ends at the commit
 containing this section. Both negative branches previously returned before
