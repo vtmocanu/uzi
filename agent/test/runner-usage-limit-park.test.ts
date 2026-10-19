@@ -92,6 +92,70 @@ function waitAbort(signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Own the shutdown fixture's cooperative executions through readiness and cleanup.
+ * Promise.race only observes early settlement; shutdown requests cancellation and
+ * allSettled drains it. An uncooperative execution can still prevent that drain.
+ */
+async function shutdownSnapshotFixture(
+  executions: Array<{ runId: string; promise: Promise<void> }>,
+  ready: Promise<void>,
+  shutdown: () => void,
+  signal: AbortSignal,
+  diagnostics: () => object,
+  snapshots: () => void,
+): Promise<void> {
+  let phase = "readiness";
+  let shutdownRequested = false;
+  const shutdownOnce = () => {
+    if (shutdownRequested) return;
+    shutdownRequested = true;
+    shutdown();
+  };
+  const failure = (reason: string) => new Error(JSON.stringify({
+    phase, reason, ...diagnostics(),
+  }));
+  const aborted = deferred();
+  const onAbort = () => {
+    shutdownOnce();
+    aborted.resolve();
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  // Observe BOTH fulfillment (execute can absorb errors) and direct rejection.
+  const earlySettlements = executions.map(({ runId, promise }) => promise.then(
+    () => { throw failure(`execution ${runId} fulfilled before both commits`); },
+    (error: unknown) => {
+      throw failure(`execution ${runId} rejected before both commits: ${String(error).slice(0, 1000)}`);
+    },
+  ));
+  let primary: unknown;
+  try {
+    await Promise.race([
+      ready,
+      ...earlySettlements,
+      aborted.promise.then(() => { throw failure("test aborted"); }),
+    ]);
+    phase = "draining";
+    shutdownOnce();
+    await Promise.all(executions.map(({ promise }) => promise));
+    phase = "snapshots";
+    snapshots();
+  } catch (error) {
+    primary = error;
+  } finally {
+    phase = "cleanup";
+    signal.removeEventListener("abort", onAbort);
+    try {
+      shutdownOnce();
+    } catch (error) {
+      if (primary === undefined) primary = error;
+    }
+    // No HOME removal until every cooperative execution has settled.
+    await Promise.allSettled(executions.map(({ promise }) => promise));
+  }
+  if (primary !== undefined) throw primary;
+}
+
 const SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const trackingRef = (iid: number) => `refs/uzi-runner/agent/issue-${iid}`;
 
@@ -1644,39 +1708,139 @@ describe("RunRunner — worker-shutdown fetch-back (PRD #218 M1)", () => {
     }
   });
 
-  it("(g): two in-flight runs each snapshot on ONE shutdown", async () => {
+  it("(g fixture): early fulfillment or rejection fails immediately and drains its sibling", async () => {
+    for (const outcome of ["fulfilled", "rejected"] as const) {
+      const early = deferred();
+      const ready = deferred();
+      const stop = new AbortController();
+      let shutdowns = 0;
+      let drained = false;
+      let snapshots = 0;
+      const execution = early.promise.then(() => {
+        if (outcome === "rejected") throw new Error("injected direct rejection");
+        // RunRunner.execute can absorb an executor failure and fulfill.
+      });
+      const sibling = waitAbort(stop.signal).then(() => { drained = true; });
+      const fixture = shutdownSnapshotFixture(
+        [{ runId: "early", promise: execution }, { runId: "sibling", promise: sibling }],
+        ready.promise,
+        () => { shutdowns++; stop.abort(); },
+        new AbortController().signal,
+        () => ({
+          runIds: ["early", "sibling"], reachedCommits: [],
+          apiStates: [{ runId: "early", status: "failed" }],
+          handlerExceptions: [{ error: "injected handler failure" }],
+        }),
+        () => { snapshots++; },
+      );
+      try {
+        early.resolve();
+        // A microtask settlement must beat the next event-loop turn. If protection
+        // regresses, release readiness in finally so this proof cannot strand work.
+        const result = await Promise.race([
+          fixture.then(() => "unexpected success", (error: unknown) => error),
+          new Promise<string>(resolve => setImmediate(() => resolve("still waiting"))),
+        ]);
+        assert.ok(result instanceof Error, "early settlement must fail before the next event-loop turn");
+        const diagnostic = JSON.parse(result.message);
+        assert.equal(diagnostic.phase, "readiness");
+        assert.match(diagnostic.reason, new RegExp(`execution early ${outcome} before both commits`));
+        if (outcome === "rejected") assert.match(diagnostic.reason, /injected direct rejection/);
+        assert.deepEqual(diagnostic.runIds, ["early", "sibling"]);
+        assert.deepEqual(diagnostic.reachedCommits, []);
+        assert.equal(diagnostic.apiStates[0].status, "failed");
+        assert.equal(diagnostic.handlerExceptions[0].error, "injected handler failure");
+        assert.equal(drained, true, "failure returns only after cooperative sibling cleanup");
+        assert.equal(shutdowns, 1);
+        assert.equal(snapshots, 0, "early exit must not reach snapshot assertions as success");
+      } finally {
+        ready.resolve();
+        await Promise.allSettled([fixture]);
+      }
+    }
+  });
+
+  it("(g fixture): test abort requests one shutdown and drains, including an already aborted signal", async () => {
+    for (const alreadyAborted of [false, true]) {
+      const testAbort = new AbortController();
+      const stop = new AbortController();
+      let shutdowns = 0;
+      let drained = false;
+      if (alreadyAborted) testAbort.abort();
+      const fixture = shutdownSnapshotFixture(
+        [{ runId: "blocked", promise: waitAbort(stop.signal).then(() => { drained = true; }) }],
+        deferred().promise,
+        () => { shutdowns++; stop.abort(); },
+        testAbort.signal,
+        () => ({ runIds: ["blocked"] }),
+        () => assert.fail("aborted fixture must not assert snapshots"),
+      );
+      testAbort.abort();
+      await assert.rejects(fixture, /test aborted/);
+      assert.equal(shutdowns, 1);
+      assert.equal(drained, true);
+    }
+  });
+
+  it("(g): two in-flight runs each snapshot on ONE shutdown", async (t) => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-218-g-"));
     try {
       const both = barrier(2);
       const shas = new Map<string, string>();
+      const executorErrors: Array<{ runId: string; error: string }> = [];
       const factory: ExecutorFactory = (runId) => ({
         homeDir: path.join(homeRoot, runId),
         executor: {
           run: async (ctx: RunContext): Promise<ExecutorResult> => {
-            shas.set(ctx.branch, commitInTree(ctx.worktreePath, "SHUT.txt", ctx.branch));
-            both.arrive();
-            await waitAbort(ctx.signal!);
-            throw new Error("aborted mid-run");
+            try {
+              shas.set(ctx.branch, commitInTree(ctx.worktreePath, "SHUT.txt", ctx.branch));
+              both.arrive();
+              await waitAbort(ctx.signal!);
+              throw new Error("aborted mid-run");
+            } catch (error) {
+              executorErrors.push({ runId, error: String(error).slice(0, 1000) });
+              throw error;
+            }
           },
         },
       });
       const runner = runnerWith(factory, gitlab);
-      const p1 = runner.execute(gitlabClaim(230, { wait_on_limit: true }));
-      const p2 = runner.execute(gitlabClaim(231, { wait_on_limit: true }));
-      await both.ready; // both committed and registered
-      runner.shutdown(); // one shutdown aborts both
-      await Promise.all([p1, p2]);
-      const bare = git.barePathFor(fx.originPath);
-      assert.strictEqual(
-        shaInBare(bare, trackingRef(230)),
-        shas.get("agent/issue-230"),
-        "run 230 fetched back",
-      );
-      assert.strictEqual(
-        shaInBare(bare, trackingRef(231)),
-        shas.get("agent/issue-231"),
-        "run 231 fetched back on the same shutdown",
+      const claims = [230, 231].map(iid => gitlabClaim(iid, { wait_on_limit: true }));
+      await shutdownSnapshotFixture(
+        claims.map(claim => ({ runId: claim.run_id, promise: runner.execute(claim) })),
+        both.ready,
+        () => runner.shutdown(),
+        t.signal,
+        () => ({
+          runIds: claims.map(claim => claim.run_id),
+          reachedCommits: [...shas],
+          apiStates: api.states.filter(s => claims.some(c => c.run_id === s.runId)).slice(-12)
+            .map(s => ({ runId: s.runId, status: s.body.status,
+              failureReason: s.body.failure_reason?.slice(0, 1000), failOrigin: s.body.fail_origin })),
+          messages: claims.map(claim => ({ runId: claim.run_id,
+            messages: api.messages(claim.run_id).slice(-4).map(message => ({
+              kind: message.kind, payload: JSON.stringify(message.payload)?.slice(0, 1000),
+            })),
+          })),
+          handlerExceptions: api.handlerExceptions.slice(-4).map(e => ({
+            method: e.method, path: e.path.slice(0, 200), error: e.error.slice(0, 1000),
+          })),
+          executorErrors: executorErrors.slice(-2),
+        }),
+        () => {
+          const bare = git.barePathFor(fx.originPath);
+          assert.strictEqual(
+            shaInBare(bare, trackingRef(230)),
+            shas.get("agent/issue-230"),
+            "run 230 fetched back",
+          );
+          assert.strictEqual(
+            shaInBare(bare, trackingRef(231)),
+            shas.get("agent/issue-231"),
+            "run 231 fetched back on the same shutdown",
+          );
+        },
       );
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
