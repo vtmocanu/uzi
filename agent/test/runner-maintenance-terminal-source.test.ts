@@ -10,7 +10,7 @@ import { SteeringChannel } from "../src/steering.js";
 import { rmTreePinned } from "../src/rmtree.js";
 import type { Executor } from "../src/executor.js";
 import { MaintenanceResources, type MaintenanceResource } from "../src/recovery-maintenance.js";
-import { canonicalJson, RecoveryCoordinator } from "../src/recovery.js";
+import { canonicalJson, RecoveryCoordinator, TERMINAL_ORIGIN_ADMISSION_ENABLED } from "../src/recovery.js";
 import { recordingLogger, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, deferred, runnerWith } from "./runner-harness.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
@@ -23,7 +23,7 @@ function command(cwd: string, ...args: string[]): string {
 type Observation = { terminal?: string; genesis: { runId: string; generation: number; clonePath: string; attemptId: string }; family?: unknown };
 type Tails = { executionTails: ReadonlyMap<string, Promise<Observation | undefined>> };
 
-for (const mode of ["normal", "origin-admission", "origin-pressure", "origin-source-limit",
+for (const mode of ["normal", "origin-production-default", "origin-admission", "origin-pressure", "origin-source-limit",
   "origin-transfer-final-family", "origin-transfer-head", "origin-transfer-revoked", "origin-transfer-missing", "notification-throw", "notification-reject", "unapplied", "lost", "stale", "wrong-status", "missing-status",
   "missing-process", "missing-reproof", "unverified", "failed-reap", "late-fence",
   "failed-home", "failed-skills", "failed-owed", "record-none", "prior-record-none", "reclaimed", "nonmatching-error", "post-run-error"] as const) {
@@ -33,6 +33,13 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
   let transferCalls = 0, transferEntered = 0, transferBodyComplete = false, transferSettled = false;
   let capturedSignal: AbortSignal | undefined;
   let pressure = false;
+  // Production default: the fixed guard keeps new-origin admission unreachable. Every other
+  // origin mode exercises the dormant admission path behind a test-only substitution.
+  const productionDefault = mode === "origin-production-default";
+  if (originMode && !productionDefault)
+    t.mock.method(RecoveryCoordinator.prototype as unknown as { terminalOriginAdmissionEnabled(): boolean },
+      "terminalOriginAdmissionEnabled", () => true);
+  let boundaryEntered = 0;
   const guard = new DataVolumeGuard({ dataDir: path.dirname(git.recoveryRoot) });
   t.mock.method(guard, "preflight", () => pressure ? "data_volume_full" : "not_disk_full");
   const claim = gitlabClaim(3031, { claim_generation: 1, inventory_guarded: true });
@@ -195,6 +202,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     const boundary = runner.withRetainedSourceBoundary.bind(runner);
     t.mock.method(runner, "withRetainedSourceBoundary", async (...[runId, paths, action]: Parameters<typeof boundary>) =>
       boundary(runId, paths, async ctx => {
+        boundaryEntered++;
         const bare = git.barePathFor(claim.repo.clone_url);
         const snapshot = async () => ({
           bareConfig: await fs.readFile(path.join(bare, "config"), "utf8"),
@@ -347,6 +355,17 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
         assert.ok((resourceTotals[resource] ?? 0) <= caps[resource], resource);
       t.diagnostic(JSON.stringify({ resourceTotals, chargedTransports, discoveryTransports,
         transferCalls, transferEntered, transferSettled, quiescence: "injected; not coupled helper capacity proof" }));
+    }
+    if (productionDefault) {
+      assert.equal(TERMINAL_ORIGIN_ADMISSION_ENABLED, false, "staged groundwork ships admission disabled");
+      assert.equal(boundaryEntered, 0, "no retained-source boundary, WIP capture or transfer");
+      assert.equal(transferCalls, 0);
+      assert.equal(capturedSignal, undefined);
+      assert.equal(chargedTransports, 0, "no charged producer transport");
+      assert.equal(discoveryTransports, 0, "no producer discovery transport");
+      assert.deepEqual(resourceTotals, {}, "no producer resource charge");
+      await assert.rejects(fs.stat(path.join(git.recoveryRoot, "..", "recovery-maintenance")), { code: "ENOENT" },
+        "no producer ledger initialised");
     }
     if (mode === "origin-transfer-missing") {
       assert.equal(transferCalls, 0);

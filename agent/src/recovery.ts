@@ -70,6 +70,12 @@ export type ClosedSourceObservation = Readonly<{
   }>;
 }>;
 
+/** Issue #3031 staged groundwork: new-origin admission (charged WIP capture after a terminal
+ *  source) stays unreachable in production until the verified transfer, archive handoff and
+ *  boot rediscovery ship with it. Saved-evidence replay is unaffected. Not configurable; the
+ *  enabling change deletes this guard. */
+export const TERMINAL_ORIGIN_ADMISSION_ENABLED: boolean = false;
+
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
  *  capture. A run kind absent from this set is not archived. */
@@ -3212,9 +3218,16 @@ export class RecoveryCoordinator {
       } finally { for (const budget of attempts.values()) budget.dispose(); }
       // Replay gets the first opportunity. A separate COMPLETE view below decides
       // whether a new origin is admissible; the advisory saved snapshot never does.
+      if (!this.terminalOriginAdmissionEnabled()) return;
       if (observation.originalContext) await M1MaintenanceResources.runDiscoveryPass(
         () => this.admitTerminalOrigin(observation, passSignal), { signal: passSignal });
     });
+  }
+
+  /** Production always reads the fixed guard; only tests substitute this method to exercise the
+   * dormant admission path end to end. */
+  private terminalOriginAdmissionEnabled(): boolean {
+    return TERMINAL_ORIGIN_ADMISSION_ENABLED;
   }
 
   /** Charged local WIP capture after durable origin publication; no bare transfer,

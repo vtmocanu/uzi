@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { writeFileSync } from "node:fs";
@@ -11,6 +11,11 @@ import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maint
 import type { PositiveOwedCandidateContext } from "../src/git.js";
 import type { RecoveryExactHold, RecoveryFinalDisposition } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+
+// Issue #3031: admission is guarded off in production (TERMINAL_ORIGIN_ADMISSION_ENABLED);
+// these tests exercise the dormant path, so they substitute the guard for this file only.
+mock.method(RecoveryCoordinator.prototype as unknown as { terminalOriginAdmissionEnabled(): boolean },
+  "terminalOriginAdmissionEnabled", () => true);
 
 const producer = "maintenance-v1-00000000-0000-4000-8000-000000000001";
 const ordinary = "00000000-0000-4000-8000-000000000002";

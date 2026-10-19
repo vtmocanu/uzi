@@ -134,6 +134,13 @@ its tsx ancestors and `/app`, is inside the documented same-uid trust limit
 (ADR-1786, ADR-2213). Exclusive-idle provides temporal closure only; the uid
 split is the boundary.
 
+**Staged.** The producer ships disabled: `TERMINAL_ORIGIN_ADMISSION_ENABLED`
+in `agent/src/recovery.ts` stops new-origin admission after saved-evidence
+replay, so production never charges the producer ledger, closes the exclusion
+gate or captures WIP. The bootstrap snapshot above is still taken at boot.
+The change that adds the verified transfer, archive handoff and boot
+rediscovery removes the guard.
+
 ### Server-owned backoff
 
 `SetRunRecoveryWait` admits only the owning worker's running, non-judge run.

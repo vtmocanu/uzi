@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -9,6 +9,11 @@ import { recordingLogger } from "./helpers.js";
 import { passingExclusion } from "./maintenance-exclusion-fixture.js";
 import { DindPruneGate } from "../src/dind-prune.js";
 import { MaintenanceWriterExclusion } from "../src/maintenance-exclusion.js";
+
+// Issue #3031: admission is guarded off in production (TERMINAL_ORIGIN_ADMISSION_ENABLED);
+// these tests exercise the dormant path, so they substitute the guard for this file only.
+mock.method(RecoveryCoordinator.prototype as unknown as { terminalOriginAdmissionEnabled(): boolean },
+  "terminalOriginAdmissionEnabled", () => true);
 
 const runId = "00000000-0000-4000-8000-000000000031";
 const holdId = "00000000-0000-4000-8000-000000000032";
