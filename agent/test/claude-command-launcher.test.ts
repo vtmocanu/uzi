@@ -46,6 +46,8 @@ class FakeSupervisor extends EventEmitter {
   readonly control = new PassThrough();
   readonly evidence = new PassThrough();
   readonly stdio = [this.stdin, this.stdout, this.stderr, this.control, this.evidence];
+  /** "stale" models a supervisor that predates the `observe` control op (it goes abnormal on it). */
+  observeMode: "supported" | "stale" = "supported";
 
   constructor(private readonly uid: number, autoStarted = true) {
     super();
@@ -62,6 +64,15 @@ class FakeSupervisor extends EventEmitter {
 
   private onControl(line: string): void {
     const cmd = JSON.parse(line) as { op: string; id: number };
+    if (cmd.op === "observe") {
+      if (this.observeMode === "stale") {
+        this.write({ event: "abnormal", reason: "unknown control op", cleanup: { state: "unconfirmed" } });
+        return;
+      }
+      this.write({ event: "observe", id: cmd.id, state: "complete", supervisor: { pid: this.pid, startTime: "100" },
+        root: { pid: this.pid + 1, startTime: "101" }, processes: [{ pid: this.pid + 1, startTime: "101", ppid: this.pid, rss: 10 }] });
+      return;
+    }
     if (cmd.op !== "dispose") return;
     this.write({ event: "dispose", id: cmd.id, state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [this.pid + 1] });
     setImmediate(() => {
@@ -312,6 +323,15 @@ describe("launchRunnerSupervisedProbe", () => {
     assert.ok(!args.includes(WRAPPER));
     assert.equal(spawnCalls[0]!.options.cwd, "/");
   });
+
+  it("the observe probe runs the fixed /bin/sleep 5 child under the same minimal env", async () => {
+    const fake = newFake();
+    await launchRunnerSupervisedProbe(depsFor(fake), undefined, "sleep");
+    const args = spawnCalls[0]!.args;
+    const setpriv = setprivRunnerArgs();
+    assert.deepEqual(args.slice(setpriv.length), [SUPERVISOR_BIN, "--expect-uid", "10002", "--", "/bin/sleep", "5"]);
+    assert.deepEqual(spawnCalls[0]!.options.env, { PATH: "/usr/bin:/bin", LANG: "C" });
+  });
 });
 
 describe("killUnreapedSupervisor", () => {
@@ -423,6 +443,23 @@ describe("preflight against the real launcher with a fake supervisor", () => {
   it("passes when the fake supervisor starts and drains", async () => {
     const fake = newFake();
     assert.deepEqual(await memoryLauncherPreflight({ launcherDeps: depsFor(fake), deadlineMs: 3000 }), { ok: true });
+  });
+
+  it("exercises one observe round trip against the live probe child before disposing", async () => {
+    const fake = newFake();
+    const ops: string[] = [];
+    fake.control.on("data", (chunk: Buffer) => { for (const line of chunk.toString().split("\n")) if (line) ops.push((JSON.parse(line) as { op: string }).op); });
+    assert.deepEqual(await memoryLauncherPreflight({ launcherDeps: depsFor(fake), deadlineMs: 3000 }), { ok: true });
+    assert.deepEqual(ops, ["observe", "dispose"]);
+    assert.deepEqual(spawnCalls[0]!.args.slice(-3), ["--", "/bin/sleep", "5"]);
+  });
+
+  it("refuses a supervisor that predates the observe op: it goes abnormal on the first observe", async () => {
+    const fake = newFake();
+    fake.observeMode = "stale";
+    const result = await memoryLauncherPreflight({ launcherDeps: depsFor(fake), deadlineMs: 3000, killUnreaped: () => false });
+    assert.equal(result.ok, false);
+    assert.match((result as { reason: string }).reason, /^supervisor lacks observe: /);
   });
 
   it("reports a profile refusal from the supervisor's abnormal evidence", async () => {

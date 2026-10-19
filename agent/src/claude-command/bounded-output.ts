@@ -3,12 +3,15 @@
 // The command's stdout and stderr are consumed continuously, so the transport never blocks the
 // command, but only a head and a tail are ever retained: the worker never buffers the full
 // stream. The inline text is head + marker + tail, at most INLINE_CAP_CHARS characters in
-// total (UTF-16 code units, the unit `String.length` counts). The full output is on the spill
-// file the wrapper writes, which this module never touches.
+// total (UTF-16 code units, the unit `String.length` counts). A best-effort copy of the output
+// may be on the spill file the wrapper writes, which this module never touches.
 //
 // Redaction. A secret can straddle a cut, so the head and tail windows are kept
 // (longest secret length - 1) characters LONGER than the final budget, redacted whole, and only
-// then trimmed. When the redacted window turns out shorter than its budget plus that margin (the
+// then trimmed. The margin is capped at MAX_MARGIN (65536) characters; a secret longer than
+// MAX_MARGIN + 1 would need more than the cap, so when the output has to be cut the inline
+// preview is omitted entirely (counts and the truncation note remain) rather than risk a partial
+// secret. When the redacted window turns out shorter than its budget plus the margin (the
 // redactor shrank it), its buffer edge would end up in the inline text, so the margin is dropped
 // from that edge instead: a partial secret at a buffer edge never reaches the model. The
 // redactor's invisible-separator matching can span more than the secret's own length; that is the
@@ -26,7 +29,7 @@ import { makeTextRedactor } from "../redact.js";
 export const INLINE_CAP_CHARS = 30_000;
 const HALF = INLINE_CAP_CHARS / 2;
 /** Upper bound on the redaction margin, so a pathological secret cannot grow retained memory. */
-const MAX_MARGIN = 8192;
+const MAX_MARGIN = 65_536;
 
 // oxlint-disable-next-line no-control-regex
 const UNSAFE_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
@@ -59,6 +62,8 @@ export interface RenderedOutput {
 export class BoundedOutput {
   private readonly redact: (text: string) => string;
   private readonly margin: number;
+  /** A secret is longer than the margin can cover: a cut output gets no inline preview. */
+  private readonly previewUnsafe: boolean;
   private readonly headKeep: number;
   private readonly tailKeep: number;
   private readonly decoders = [new StringDecoder("utf8"), new StringDecoder("utf8")];
@@ -71,6 +76,7 @@ export class BoundedOutput {
     this.redact = makeTextRedactor([...secrets]);
     const longest = secrets.reduce((max, s) => (typeof s === "string" && s.length > max ? s.length : max), 0);
     this.margin = Math.min(MAX_MARGIN, Math.max(0, longest - 1));
+    this.previewUnsafe = longest - 1 > MAX_MARGIN;
     this.headKeep = HALF + this.margin;
     this.tailKeep = HALF + this.margin;
   }
@@ -117,6 +123,9 @@ export class BoundedOutput {
   /** Assemble head + marker + tail from redacted windows. `windowsAreEdges` is true when each
    *  window ends or starts at a retention edge (so the margin must be dropped when it is short). */
   private cut(headWindow: string, tailWindow: string, windowsAreEdges: boolean): RenderedOutput {
+    if (this.previewUnsafe) {
+      return { text: `\n[... output preview omitted: ${String(this.bytes)} bytes in total ...]\n`, truncated: true };
+    }
     const marker = `\n[... output truncated: ${String(this.bytes)} bytes in total; the middle is omitted ...]\n`;
     const available = INLINE_CAP_CHARS - marker.length;
     const h = Math.ceil(available / 2);

@@ -26,6 +26,7 @@ function fakeRoot() {
   let disposes = 0;
   let observations = 0;
   let clean = true;
+  let minBudget = 0;
   let evidence: ObservationOutcome = {
     event: "observe", id: 1, state: "complete", supervisor: { pid: 50, startTime: ticks },
     root: { pid: 51, startTime: ticks }, processes: [{ pid: 51, startTime: ticks, ppid: 50, rss: 100 }],
@@ -38,15 +39,17 @@ function fakeRoot() {
     snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
     observe: async () => { observations++; return evidence; },
     waitChild: async () => new Promise(() => {}),
-    dispose: async () => {
+    dispose: async (budgetMs) => {
       disposes++;
+      // A disposal given less than `minBudget` ms cannot finish: it reports unconfirmed at once.
+      if (budgetMs !== undefined && budgetMs < minBudget) return { clean: false, reason: "dispose budget exhausted" };
       await new Promise((done) => setTimeout(done, 20));
       return clean ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
         : { clean: false, reason: "fixture unconfirmed" };
     },
   };
   return { handle, disposes: () => disposes, observations: () => observations,
-    change: (next: ObservationOutcome) => { evidence = next; }, unconfirmed: () => { clean = false; } };
+    change: (next: ObservationOutcome) => { evidence = next; }, unconfirmed: () => { clean = false; }, needsBudget: (ms: number) => { minBudget = ms; } };
 }
 
 function mint(c: CapturedMemoryContext): ClaudeCommandMetadata {
@@ -141,6 +144,7 @@ test("single-flight disposal: reap, drain, cancel and the lane's own dispose sha
   assert.equal(results[3], true);
   assert.equal(c.commands.hasConfirmedStop(entry), true);
   assert.equal(c.commands.eligibleEntries()?.length, 0, "a confirmed drain unregisters the entry");
+  assert.equal(c.commands.unregister(entry), false, "the reap path already unregistered the confirmed entry");
   assert.equal(await disposeRootOnce(root.handle, 500), true);
   assert.equal(root.disposes(), 1, "later callers still join the memoized result");
 });
@@ -172,4 +176,52 @@ test("an unconfirmed disposal records a failed drain and keeps the entry registe
   assert.equal(c.commands.hasConfirmedStop(entry), false);
   assert.ok(c.commands.drainFailure(entry), "the failed drain is recorded");
   assert.equal(c.commands.unregister(entry), false, "an unconfirmed entry cannot be unregistered");
+});
+
+const settle = () => new Promise((done) => setTimeout(done, 60));
+
+test("an unconfirmed guard cancel does not poison the root: the guard's drain retry then confirms", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  root.needsBudget(100);
+  const enrolled = (await enrollClaudeCommand(c, mint(c), root.handle, 500))!;
+  const entry = enrolled.entry;
+  // A tiny guard budget: the disposal cannot finish, and the failure is recorded, not cached.
+  await entry.cancel({ remainingMs: 30, signal: new AbortController().signal, authorized: () => true });
+  await settle();
+  assert.equal(root.disposes(), 1);
+  assert.equal(c.commands.hasConfirmedStop(entry), false);
+  assert.ok(c.commands.drainFailure(entry));
+  assert.equal(enrolled.guardStopped(), true, "the guard's own cancel ran");
+  // The retry gets a fresh disposal with the larger budget and confirms.
+  assert.deepEqual(await entry.drain(authority()), { confirmed: true, detail: undefined });
+  assert.equal(root.disposes(), 2, "the failed attempt was retried, not replayed");
+  assert.equal(c.commands.hasConfirmedStop(entry), true);
+  assert.equal(c.commands.unregister(entry), false, "a confirmed drain already unregistered the entry");
+});
+
+test("an unconfirmed guard cancel leaves the lane's own disposal free to succeed with a larger budget", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  root.needsBudget(100);
+  const enrolled = (await enrollClaudeCommand(c, mint(c), root.handle, 500))!;
+  await enrolled.entry.cancel({ remainingMs: 30, signal: new AbortController().signal, authorized: () => true });
+  await settle();
+  assert.equal(await disposeRootOnce(root.handle, 500), true);
+  assert.equal(root.disposes(), 2);
+  // A failure is not cached even for direct callers; success is, and later callers join it.
+  assert.equal(await disposeRootOnce(root.handle, 1), true);
+  assert.equal(root.disposes(), 2);
+});
+
+test("guardStopped is false until the guard's own cancel or drain reaches disposal", { timeout: 10000 }, async () => {
+  const c = captured();
+  const root = fakeRoot();
+  const enrolled = (await enrollClaudeCommand(c, mint(c), root.handle, 500))!;
+  assert.equal(enrolled.guardStopped(), false);
+  assert.deepEqual(await enrolled.reap(500), { ok: true }, "the lane's own reap is not a guard stop");
+  assert.equal(enrolled.guardStopped(), false);
+  const stale = (await enrollClaudeCommand(c, mint(c), fakeRoot().handle, 500))!;
+  await assert.rejects(stale.entry.cancel({ remainingMs: 1000, signal: AbortSignal.abort(), authorized: () => true }), /stale/);
+  assert.equal(stale.guardStopped(), false, "a refused cancel stopped nothing");
 });

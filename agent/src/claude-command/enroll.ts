@@ -9,7 +9,9 @@
 //
 // Disposal. `disposeRootOnce` is the single-flight whole-tree disposal of one supervisor
 // handle. The lane's own D7 sequence and the guard's cancel/drain call it, so a root is disposed
-// by one in-flight operation however many parties ask.
+// by one in-flight operation however many parties ask. Only an in-flight operation or a confirmed
+// success is shared: an unconfirmed disposal is dropped so a later caller (the guard's drain
+// retry, the lane's own dispose) may retry it, matching the launcher's `dispose` contract.
 
 import type { CapturedMemoryContext } from "../codex/broker.js";
 import { boundedCommandWait } from "../codex/memory-command.js";
@@ -27,6 +29,9 @@ export interface ClaudeCommandMetadata {
   /** The model command text; the registry redacts and bounds it. */
   readonly command: string;
 }
+
+/** The message of the error `enrollClaudeCommand` throws when the captured admission closed. */
+export const ADMISSION_CLOSED_MESSAGE = "captured memory admission closed";
 
 const minted = new WeakMap<ClaudeCommandMetadata, CapturedMemoryContext>();
 
@@ -53,16 +58,19 @@ export function isMintedClaudeCommand(value: ClaudeCommandMetadata | undefined, 
 const disposals = new WeakMap<CodexRootHandle, Promise<boolean>>();
 
 /**
- * Dispose one supervisor root at most once and share the result. Resolves true only for a
- * clean, drained disposal; a rejection or an unclean outcome is false. The first caller's
- * `timeoutMs` bounds the underlying disposal; later callers join the same promise.
+ * Dispose one supervisor root and share the result while it is in flight or once confirmed.
+ * Resolves true only for a clean, drained disposal; a rejection or an unclean outcome is false
+ * and is NOT cached, so a later caller starts a fresh disposal. The starting caller's
+ * `timeoutMs` bounds the underlying disposal; callers joining it share that budget.
  */
 export function disposeRootOnce(handle: CodexRootHandle, timeoutMs: number): Promise<boolean> {
-  let flight = disposals.get(handle);
-  if (!flight) {
-    flight = handle.dispose(timeoutMs).then((outcome) => outcome.clean, () => false);
-    disposals.set(handle, flight);
-  }
+  const existing = disposals.get(handle);
+  if (existing) return existing;
+  const flight: Promise<boolean> = handle.dispose(timeoutMs).then((outcome) => outcome.clean, () => false).then((ok) => {
+    if (!ok && disposals.get(handle) === flight) disposals.delete(handle);
+    return ok;
+  });
+  disposals.set(handle, flight);
   return flight;
 }
 
@@ -74,6 +82,8 @@ export interface ClaudeCommandEnrollment {
   readonly reap: (budgetMs?: number) => Promise<{ ok: boolean }>;
   /** The guard's prepared outcome for this entry, when it prepared one. */
   readonly preparedOutcome: () => ReturnType<WorkerMemoryCommands["outcome"]>;
+  /** True once the guard's own cancel or drain passed its checks and started a disposal. */
+  readonly guardStopped: () => boolean;
   readonly recordDisposal: (confirmed: boolean) => void;
   readonly unregister: () => void;
 }
@@ -93,10 +103,10 @@ export async function enrollClaudeCommand(
   if (!captured || !isMintedClaudeCommand(metadata, captured)) return undefined;
   const { commands, context, flight, lifecycleRevision } = captured;
   const current = () => commands.isCurrent(context, flight, lifecycleRevision);
-  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
+  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
   const startedAtMs = performance.now();
   const initial = await boundedCommandWait(handle.observe(deadlineMs), deadlineMs);
-  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
+  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
   // Read-only uncertainty prevents memory intervention, not ordinary execution.
   if (initial.state !== "complete") return undefined;
   if (initial.supervisor.pid !== handle.supervisorPid
@@ -117,6 +127,7 @@ export async function enrollClaudeCommand(
   // A primary that has already exited with no adopted children needs no enrollment.
   if (convert(initial, startedAtMs).rows.length === 0) return undefined;
   let entry!: Entry;
+  let guardStopped = false;
   const reap = async (budgetMs = deadlineMs): Promise<{ ok: boolean }> => {
     const budget = Math.min(deadlineMs, budgetMs);
     const completion = disposeRootOnce(handle, budget).then((ok) => {
@@ -139,6 +150,7 @@ export async function enrollClaudeCommand(
       || performance.now() >= end || !commands.checkBeforeCancel(selection, observation, performance.now(), authority.remainingMs)) {
       throw new Error("stale memory cancellation");
     }
+    guardStopped = true;
     return reap(end - performance.now());
   };
   entry = commands.register(context, {
@@ -166,6 +178,7 @@ export async function enrollClaudeCommand(
     outcome: commands.watchOutcome(entry),
     reap,
     preparedOutcome: () => commands.outcome(entry),
+    guardStopped: () => guardStopped,
     recordDisposal: (confirmed: boolean) => {
       commands.recordDrain(entry, { confirmed, detail: confirmed ? undefined : "supervisor disposal unconfirmed" });
     },

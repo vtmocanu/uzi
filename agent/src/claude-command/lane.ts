@@ -35,7 +35,7 @@ import { errMessage } from "../util.js";
 import { BoundedOutput, INLINE_CAP_CHARS } from "./bounded-output.js";
 import { guardedCommandEnv } from "./env.js";
 import {
-  disposeRootOnce, enrollClaudeCommand, mintClaudeCommandMetadata,
+  ADMISSION_CLOSED_MESSAGE, disposeRootOnce, enrollClaudeCommand, mintClaudeCommandMetadata,
   type ClaudeCommandEnrollment, type ClaudeCommandMetadata,
 } from "./enroll.js";
 import { GUARDED_COMMAND_TOOL } from "./grants.js";
@@ -45,8 +45,27 @@ export const MAX_COMMAND_TIMEOUT_MS = 3_600_000;
 export const MAX_CONCURRENT_COMMANDS = 8;
 const SPILL_CAP_BYTES = 64 * 1024 * 1024;
 export const MAX_COMMAND_BYTES = 131_000;
-const DEFAULT_GRACE_MS = 5000;
-const DEFAULT_CLEANUP_MS = 10_000;
+export const DEFAULT_GRACE_MS = 5000;
+export const DEFAULT_CLEANUP_MS = 10_000;
+/** Budget for the supervisor to report `started` (passed to the launcher explicitly). */
+const LAUNCH_STARTED_MS = 10_000;
+/** Extra wait `disposeBounded` allows beyond one cleanup step, for the single-flight join. */
+const DISPOSE_JOIN_SLACK_MS = 2000;
+
+/**
+ * Worst-case wall time of one guarded call, from the start of the launch to the tool result,
+ * when every step runs to its bound: the `started` wait, the command deadline, the transport
+ * EOF grace (exit path only), the bounded dispose (one cleanup step plus the join slack), the
+ * output-end join and the prepared-outcome join (one cleanup step each). Enrollment runs inside
+ * the command deadline, so it adds nothing.
+ *
+ * With the defaults and the 60-minute maximum: 10 s + 3600 s + 5 s + 12 s + 10 s + 10 s =
+ * 3647 s, below the 3660 s MCP server timeout (server.ts, GUARDED_SERVER_TIMEOUT_MS). The 10 s
+ * cleanup step is kept (a 30 s step would not fit under the 60 s of transport headroom).
+ */
+export function worstCaseCallMs(timeoutMs: number, graceMs = DEFAULT_GRACE_MS, cleanupMs = DEFAULT_CLEANUP_MS): number {
+  return LAUNCH_STARTED_MS + timeoutMs + graceMs + (cleanupMs + DISPOSE_JOIN_SLACK_MS) + cleanupMs + cleanupMs;
+}
 const MAX_ATTRIBUTION_RECORDS = 4096;
 const MEMORY_MESSAGE = "Shell admission is held or its captured flight has retired.";
 
@@ -103,7 +122,13 @@ type FirstEvent =
   | { kind: "exit"; code: number }
   | { kind: "deadline" }
   | { kind: "aborted" }
-  | { kind: "failed"; error: unknown };
+  | { kind: "failed"; error: unknown }
+  // The command was launched and ran; enrollment found the captured admission closed.
+  | { kind: "admission_closed" }
+  // The command was launched and ran; enrollment failed for another reason.
+  | { kind: "enroll_failed"; error: unknown }
+  // The guard's own cancel stopped the command but its outcome could not be read in time.
+  | { kind: "guard_unread" };
 
 const BAD_ID_RE = /[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
 
@@ -159,7 +184,7 @@ export class ClaudeCommandLane {
 
   constructor(opts: ClaudeCommandLaneOptions) {
     this.opts = opts;
-    this.launch = opts.launch ?? ((spec) => launchRunnerCommandRoot(spec));
+    this.launch = opts.launch ?? ((spec) => launchRunnerCommandRoot(spec, { deadlines: { started: LAUNCH_STARTED_MS } }));
     this.kill = opts.kill ?? ((child) => killUnreapedSupervisor(child));
     this.now = opts.now ?? (() => Date.now());
     this.graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
@@ -305,6 +330,11 @@ export class ClaudeCommandLane {
       || !captured.commands.admitsCommands(captured.context)) {
       return this.refuse(`Command refused (worker_memory_pressure): ${MEMORY_MESSAGE}`);
     }
+    // A turn that is already aborted launches nothing.
+    const callSignal = ex.signal instanceof AbortSignal ? ex.signal : undefined;
+    if (callSignal?.aborted || this.turnSignal?.aborted) {
+      return this.refuse("Command was cancelled before it started; nothing was run.");
+    }
     // (5) Concurrency.
     if (this.live.size >= this.maxConcurrent) {
       return this.refuse(`At most ${String(this.maxConcurrent)} commands may run at once; wait for one to finish.`);
@@ -312,8 +342,7 @@ export class ClaudeCommandLane {
     const id = randomUUID();
     const live: LiveCommand = { id, ac: new AbortController(), flow: Promise.resolve() };
     this.live.set(id, live);
-    const signal = ex.signal instanceof AbortSignal ? ex.signal : undefined;
-    const run = this.execute(live, captured, parsed, toolUseId, signal).finally(() => { this.live.delete(id); });
+    const run = this.execute(live, captured, parsed, toolUseId, callSignal).finally(() => { this.live.delete(id); });
     live.flow = run.then(() => undefined, () => undefined);
     return run;
   }
@@ -422,9 +451,16 @@ export class ClaudeCommandLane {
       try {
         enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, callSignal);
       } catch (error) { enrollError = error; }
-      const first: FirstEvent = enrollError !== undefined
-        ? { kind: "aborted" }
-        : await Promise.race([exit, deadline, aborted]);
+      let first: FirstEvent;
+      if (enrollError === undefined) {
+        first = await Promise.race([exit, deadline, aborted]);
+      } else if (callSignal?.aborted || this.turnSignal?.aborted || live.ac.signal.aborted) {
+        first = { kind: "aborted" };
+      } else if (enrollError instanceof Error && enrollError.message === ADMISSION_CLOSED_MESSAGE) {
+        first = { kind: "admission_closed" };
+      } else {
+        first = { kind: "enroll_failed", error: enrollError };
+      }
       if (timer) clearTimeout(timer);
       for (const remove of removers) remove();
 
@@ -438,6 +474,7 @@ export class ClaudeCommandLane {
       if (!(await within(ended, this.cleanupMs))) eofSeen = false;
       output.end();
       let pressure: WorkerMemoryPressureResult | undefined;
+      // A prepared outcome the guard did not resolve within one cleanup step.
       let pressureLost = false;
       const prepared = enrolled?.preparedOutcome();
       if (prepared) {
@@ -447,18 +484,17 @@ export class ClaudeCommandLane {
       this.roots.delete(live.id);
 
       // (12) Result.
-      if (enrollError !== undefined && !pressure) {
-        const closed = enrollError instanceof Error && enrollError.message === "captured memory admission closed";
-        return this.refuse(closed
-          ? `Command refused (worker_memory_pressure): ${MEMORY_MESSAGE}`
-          : `Command could not be placed under memory supervision, so it was stopped: ${sanitizeForLog(this.redact(errMessage(enrollError)), 200)}`);
-      }
       if (pressure) return this.pressureResult(captured, enrolled, metadata.commandId, pressure);
-      if (pressureLost) {
-        return this.refuse("Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read; retry with smaller or serial commands.");
-      }
       this.opts.log.debug("guarded command finished", { kind: first.kind, elapsedMs: this.now() - startedAt });
-      return this.finalResult(first, output, timeoutMs, spillRel, eofSeen);
+      if (pressureLost) {
+        // The guard prepares its outcome before its API reserve, so an unresolved outcome does
+        // not mean the guard stopped anything: only its own cancel did that.
+        if (enrolled?.guardStopped()) return this.finalResult({ kind: "guard_unread" }, output, timeoutMs, spillRel, eofSeen, []);
+        return this.finalResult(first, output, timeoutMs, spillRel, eofSeen, [
+          "A memory-guard intervention was pending and unconfirmed when the command ended, and its outcome could not be read; the result above is the command's own.",
+        ]);
+      }
+      return this.finalResult(first, output, timeoutMs, spillRel, eofSeen, []);
     } finally {
       if (timer) clearTimeout(timer);
       for (const remove of removers) remove();
@@ -467,7 +503,7 @@ export class ClaudeCommandLane {
 
   private async disposeBounded(handle: RunnerCommandRoot["handle"]): Promise<boolean> {
     const flight = disposeRootOnce(handle, this.cleanupMs);
-    try { return await boundedCommandWait(flight, this.cleanupMs + 2000); } catch { return false; }
+    try { return await boundedCommandWait(flight, this.cleanupMs + DISPOSE_JOIN_SLACK_MS); } catch { return false; }
   }
 
   private failClosed(
@@ -496,15 +532,23 @@ export class ClaudeCommandLane {
     return asText(this.redact(JSON.stringify(result)), true);
   }
 
-  private finalResult(first: FirstEvent, output: BoundedOutput, timeoutMs: number, spillRel: string, eofSeen: boolean): ToolTextResult {
+  private finalResult(
+    first: FirstEvent,
+    output: BoundedOutput,
+    timeoutMs: number,
+    spillRel: string,
+    eofSeen: boolean,
+    extraNotes: readonly string[],
+  ): ToolTextResult {
     const rendered = output.render();
     const notes: string[] = [];
     if (rendered.truncated) {
-      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; the text above is a preview (start and end). The output is also written to ${spillRel}, readable with the Read tool.`);
+      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; the text above is a preview (start and end). A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`);
       if (output.totalBytes > this.spillCapBytes) {
         notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
       }
     }
+    notes.push(...extraNotes);
     if (!eofSeen) {
       notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
     }
@@ -520,6 +564,12 @@ export class ClaudeCommandLane {
         return compose(`Command timed out after ${String(timeoutMs)} ms; it and all its descendants were stopped.`, true);
       case "aborted":
         return compose("Command was cancelled; it and all its descendants were stopped.", true);
+      case "admission_closed":
+        return compose(`Command was started, then stopped because memory-guard admission closed (worker_memory_pressure): ${MEMORY_MESSAGE} It and all its descendants were stopped.`, true);
+      case "enroll_failed":
+        return compose(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
+      case "guard_unread":
+        return compose("Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read; it and all its descendants were stopped. Retry with smaller or serial commands.", true);
       case "failed":
         return compose(`Command supervision failed (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
     }
