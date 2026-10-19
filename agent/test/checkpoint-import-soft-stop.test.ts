@@ -6,6 +6,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { GitCache, CheckpointSoftDeadlineError, type BoundaryProcessSpawner } from "../src/git.js";
 import { GitBoundaryAbortError } from "../src/checkpoint-stop.js";
+import { RunRunner } from "../src/runner.js";
+import { WorkerClient } from "../src/client.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 
@@ -117,7 +119,7 @@ const transitions = ["context", "pin", "governance", "pending", "cas", "owner", 
 // Inject only after a real transition has completed. Generation 2 forces a new context
 // write; the incoming SHA distinguishes its pin/readback from displaced-head preservation.
 function stopAtTransition(f: Awaited<ReturnType<typeof fixture>>, incoming: string,
-  transition: typeof transitions[number], trigger: () => void): BoundaryProcessSpawner {
+  transition: typeof transitions[number], trigger: () => void, generation = 2): BoundaryProcessSpawner {
   const internal = f.cache as unknown as {
     writeOwedFile(b: string, n: string, v: unknown): Promise<void>;
     checkedTrackingOwner(b: string, branch: string, sha: string): Promise<
@@ -127,14 +129,14 @@ function stopAtTransition(f: Awaited<ReturnType<typeof fixture>>, incoming: stri
   internal.writeOwedFile = async (b, n, v) => {
     await write(b, n, v);
     const record = v as { phase?: string; generation?: number };
-    if (transition === "context" && n.startsWith("context-") && record.generation === 2) trigger();
+    if (transition === "context" && n.startsWith("context-") && record.generation === generation) trigger();
     if (n.startsWith("receipt-") && record.phase === transition) trigger();
   };
   const read = internal.checkedTrackingOwner.bind(f.cache);
   internal.checkedTrackingOwner = async (b, name, sha) => {
     const owner = await read(b, name, sha);
     if (transition === "readback" && name === branch && sha === incoming &&
-        owner?.runId === run && owner.generation === 2 && owner.context) trigger();
+        owner?.runId === run && owner.generation === generation && owner.context) trigger();
     return owner;
   };
   return realSpawner(args => {
@@ -172,6 +174,115 @@ for (const transition of transitions) {
       assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), incoming,
         "a stop after committed readback retains its one private stage without more Git work");
     } finally { f.fx.cleanup(); }
+  });
+}
+
+for (const edge of [
+  { operation: "first", transition: "context", generation: 1 },
+  { operation: "displaced", transition: "pin", generation: 2 },
+  { operation: "bridge", transition: "context", generation: 2 },
+  { operation: "bridge", transition: "pending", generation: 2 },
+  { operation: "bridge", transition: "readback", generation: 2 },
+] as const) {
+  it("m3 " + edge.operation + " import settles under its lock after soft stop at " + edge.transition, async () => {
+    const f = await fixture();
+    let waiter: Promise<void> | undefined;
+    try {
+      const first = edge.operation === "first" ? undefined : f.commit("established first");
+      if (first) await f.fetch();
+      else assert.equal(fs.existsSync(f.receipt), false);
+      const incoming = f.commit("edge incoming");
+      if (edge.operation === "bridge") git(f.bare, "-c", "protocol.file.allow=always",
+        "fetch", "--no-tags", f.clone, "refs/heads/" + branch);
+      const options = { context: { ...f.options.context, generation: edge.generation } };
+      const soft = new AbortController();
+      const events: string[] = [];
+      let fired = 0;
+      let receiptAtStop: unknown;
+      let readbackOwner: unknown;
+      let readbackError: unknown;
+      const trigger = () => {
+        if (fired++) return;
+        receiptAtStop = fs.existsSync(f.receipt) ? JSON.parse(fs.readFileSync(f.receipt, "utf8")) : undefined;
+        events.push("stop");
+        soft.abort();
+        // Queue a real competing lock holder; it must enter only after committed readback.
+        waiter = f.cache.withBareLock(f.bare, async () => { events.push("next_lock"); });
+      };
+      const spawnTransition = stopAtTransition(f, incoming, edge.transition,
+        edge.operation === "displaced" ? () => undefined : trigger, edge.generation);
+      const internal = f.cache as unknown as {
+        writeOwedFile(b: string, n: string, v: unknown): Promise<void>;
+        checkedTrackingOwner(b: string, name: string, sha: string): Promise<unknown>;
+      };
+      const write = internal.writeOwedFile.bind(f.cache);
+      internal.writeOwedFile = async (b, n, v) => {
+        await write(b, n, v);
+        if (n.startsWith("context-") && (v as { generation?: number }).generation === edge.generation) {
+          events.push("incoming_context");
+        }
+      };
+      const read = internal.checkedTrackingOwner.bind(f.cache);
+      internal.checkedTrackingOwner = async (b, name, sha) => {
+        try {
+          const owner = await read(b, name, sha);
+          if (name === branch && sha === incoming) {
+            readbackOwner = owner;
+            events.push("committed_readback");
+          }
+          return owner;
+        } catch (error) { readbackError = error; throw error; }
+      };
+      const spawner: BoundaryProcessSpawner = edge.operation === "displaced"
+        ? realSpawner(args => {
+          if (args.includes("update-ref") && args.includes("refs/uzi-owed/" + run + "/" + first)) {
+            events.push("displaced_pin");
+            trigger();
+          }
+          if (args.includes("update-ref") && args.includes("refs/uzi-owed/" + run + "/" + incoming)) {
+            events.push("incoming_pin");
+          }
+          if (args.includes("--replace-all") && args.includes("uzi-trackowner." + branch + ".receiptversion")) {
+            events.push("governance");
+          }
+        }) : spawnTransition;
+      let failure: unknown;
+      await f.cache.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+        () => edge.operation === "bridge"
+          ? f.cache.updateTrackingRef(f.bare, branch, incoming, options) : f.fetch(options),
+        { softSignal: soft.signal }).catch(error => { failure = error; });
+      await waiter;
+      assert.equal(fired, 1, "the exact real transition fired once");
+      assert.ok(failure instanceof CheckpointSoftDeadlineError);
+      assert.equal(readbackError, undefined, "the real readback query must not be swallowed");
+      const receipt = JSON.parse(fs.readFileSync(f.receipt, "utf8"));
+      assert.deepEqual(receipt, { version: 1, branch, runId: run, generation: edge.generation,
+        context: receipt.context, trackingSha: incoming, phase: "committed" });
+      assert.deepEqual(readbackOwner, { runId: run, generation: edge.generation, context: receipt.context });
+      assert.ok(events.indexOf("committed_readback") > events.indexOf("stop"));
+      assert.ok(events.indexOf("next_lock") > events.indexOf("committed_readback"));
+      if (edge.operation === "first") assert.equal(receiptAtStop, undefined);
+      if (edge.operation === "displaced") {
+        assert.equal((receiptAtStop as { trackingSha: string }).trackingSha, first);
+        assert.ok(events.indexOf("stop") < events.indexOf("incoming_context"));
+        assert.ok(events.indexOf("incoming_context") < events.indexOf("incoming_pin"));
+        assert.ok(events.indexOf("incoming_pin") < events.indexOf("governance"));
+      }
+      assert.deepEqual(await f.cache.committedTrackingOwnership(f.bare, branch, run, incoming, edge.generation),
+        { kind: "owned", sha: incoming, context: options.context });
+      assert.deepEqual(await f.cache.committedTrackingOwnership(f.bare, branch, run, incoming,
+        edge.generation === 1 ? 2 : 1), { kind: "not_owned" });
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), incoming);
+      const candidates = await f.cache.enumerateOwedCandidates(f.bare, run);
+      assert.deepEqual(candidates.map(c => c.sha).sort(), first ? [first, incoming].sort() : [incoming]);
+      assert.deepEqual(candidates.find(c => c.sha === incoming)?.contexts, [options.context]);
+      if (first) assert.deepEqual(candidates.find(c => c.sha === first)?.contexts, [f.options.context]);
+      assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"),
+        edge.operation === "bridge" ? "" : incoming);
+    } finally {
+      await waiter;
+      f.fx.cleanup();
+    }
   });
 }
 
@@ -521,6 +632,86 @@ for (const interruption of ["metadata", "ref", "hard_after_metadata"] as const) 
       assert.equal(fs.readFileSync(metadataPath, "utf8"), before);
       assert.equal(fs.statSync(fence).ino, inode);
       assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-cross-check/" + run), "");
+    } finally { f.fx.cleanup(); }
+  });
+}
+
+for (const damage of ["foreign_pending", "malformed_pending"] as const) {
+  it("m3 " + damage + " refuses matching tracking after soft stop during incoming preservation", async () => {
+    const f = await fixture();
+    try {
+      const ownerRun = damage === "foreign_pending" ? "foreign-run" : run;
+      const producing = { ...f.options.context, runId: ownerRun };
+      const first = f.commit("pending established first");
+      const established = await f.cache.fetchAgentBranch(f.bare, f.clone, branch, ownerRun, { context: producing });
+      assert.equal(established.kind, "updated");
+      const receipt = JSON.parse(fs.readFileSync(f.receipt, "utf8"));
+      // Model an interrupted receipt; malformed pending also carries an unrecognized field.
+      fs.writeFileSync(f.receipt, JSON.stringify({ ...receipt, phase: "pending",
+        ...(damage === "malformed_pending" ? { extra: true } : {}) }));
+      const before = fs.readFileSync(f.receipt);
+      const config = fs.readFileSync(path.join(f.bare, "config"));
+      const oldMetadata = fs.readdirSync(path.join(f.bare, "uzi-owed")).sort()
+        .map(name => [name, fs.readFileSync(path.join(f.bare, "uzi-owed", name))] as const);
+      const stagesBefore = git(f.bare, "for-each-ref", "--format=%(refname)", "refs/uzi-incoming/");
+      assert.equal(stagesBefore, "");
+      const incoming = f.commit("pending preserved incoming");
+      const options = { context: { ...f.options.context, generation: 2 } };
+      const soft = new AbortController();
+      let pinned = 0, trackingWrites = 0, receiptWrites = 0;
+      const internal = f.cache as unknown as { writeOwedFile(b: string, n: string, v: unknown): Promise<void> };
+      const write = internal.writeOwedFile.bind(f.cache);
+      internal.writeOwedFile = async (b, n, v) => {
+        await write(b, n, v);
+        if (n.startsWith("receipt-")) receiptWrites++;
+      };
+      let failure: unknown;
+      let result: unknown;
+      await f.cache.withBoundaryProcessSpawner(realSpawner(args => {
+        if (args.includes("update-ref") && args.includes("refs/uzi-owed/" + run + "/" + incoming)) {
+          pinned++; soft.abort();
+        }
+        if (args.includes("update-ref") && args.includes("refs/uzi-runner/" + branch)) trackingWrites++;
+      }), new AbortController().signal, () => f.fetch(options), { softSignal: soft.signal })
+        .then(value => { result = value; }, error => { failure = error; });
+      assert.equal(failure, undefined, "the primary ownership refusal dominates this cooperative stop");
+      assert.deepEqual(result, { kind: "not_updated", reason: "ownership_unknown" });
+      assert.equal(pinned, 1);
+      assert.equal(trackingWrites, 0);
+      assert.equal(receiptWrites, 0, "no pending repair or adoption");
+      assert.deepEqual(fs.readFileSync(f.receipt), before);
+      assert.deepEqual(fs.readFileSync(path.join(f.bare, "config")), config);
+      for (const [name, bytes] of oldMetadata) {
+        assert.deepEqual(fs.readFileSync(path.join(f.bare, "uzi-owed", name)), bytes);
+      }
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
+      const stages = git(f.bare, "for-each-ref", "--format=%(refname) %(objectname)", "refs/uzi-incoming/").split("\n");
+      assert.equal(stages.length, 1, "exactly one new private stage for this operation");
+      assert.ok(stages[0]!.startsWith("refs/uzi-incoming/"));
+      assert.equal(stages[0]!.split(" ")[1], incoming);
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-owed/" + ownerRun + "/" + first), first);
+      assert.equal(git(f.bare, "rev-parse", "refs/uzi-owed/" + run + "/" + incoming), incoming);
+      const candidates = await f.cache.enumerateOwedCandidates(f.bare, run);
+      assert.deepEqual(candidates.find(c => c.sha === incoming)?.contexts, [options.context]);
+      assert.deepEqual(await f.cache.committedTrackingOwnership(f.bare, branch, ownerRun, first, 1),
+        { kind: "not_owned" });
+      assert.deepEqual(await f.cache.committedTrackingOwnership(f.bare, branch, run, incoming, 2),
+        { kind: "not_owned" });
+
+      // Exercise the real Runner guard with its cached producing context and the real GitCache.
+      const runner = new RunRunner(new WorkerClient("http://unused", "test", "test", nullLogger()), f.cache,
+        () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1);
+      const subject = runner as unknown as {
+        requireTrackingOwned(flight: unknown, bare: string, name: string, expected: string): Promise<string>;
+      };
+      const flight = { runId: ownerRun, owedContext: Promise.resolve(producing), runLog: nullLogger(),
+        preserveRecoveryClone: false, preserveSession: false };
+      await assert.rejects(subject.requireTrackingOwned(flight, f.bare, branch, first),
+        /tracking preservation refused/);
+      assert.equal(flight.preserveRecoveryClone, true);
+      assert.equal(flight.preserveSession, true);
+      assert.deepEqual(fs.readFileSync(f.receipt), before);
+      assert.deepEqual(fs.readFileSync(path.join(f.bare, "config")), config);
     } finally { f.fx.cleanup(); }
   });
 }
