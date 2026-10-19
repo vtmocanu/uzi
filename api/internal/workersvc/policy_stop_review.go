@@ -88,6 +88,10 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		!r.PolicyLastSourceGeneration.Valid || r.PolicyLastSourceGeneration.Int64 <= 0 || r.ClaimGeneration <= 0 || !r.StatusSince.Valid {
 		return bad()
 	}
+	selected := stopUUID(r.PolicyCandidateCrossCheckID)
+	if !policyStopSelectionValid(source, selected) {
+		return bad()
+	}
 	gate := apitypes.PolicyStopGateContext{Revision: stopDecimal(r.GateRevision), PresentationID: uuid.UUID(r.GatePresentationID.Bytes).String(), PayloadDigest: hex.EncodeToString(r.GatePayloadDigest)}
 	if *source.Gate != gate {
 		return bad()
@@ -191,7 +195,7 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		}
 		execution.ContractRevision = &rev
 	}
-	m = apitypes.PolicyStopManifest{Version: 1, RunID: r.ID.String(), OutcomeID: uuid.UUID(r.PolicyLastOutcomeID.Bytes).String(), SourceGeneration: stopDecimal(r.PolicyLastSourceGeneration.Int64), ReviewGeneration: stopDecimal(r.ClaimGeneration), SourceContext: source, Hold: apitypes.PolicyStopHoldSnapshot{Reason: textPtr(r.HoldReason), PolicyDetail: textPtr(r.PolicyHoldDetail), Since: r.StatusSince.Time}, Gate: &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate, Payload: wp}, Execution: execution, HumanFeedback: []apitypes.PolicyStopHumanFeedback{}, CrossCheckFeedback: []apitypes.PolicyStopCrossCheckFeedback{}}
+	m = apitypes.PolicyStopManifest{CandidateCrossCheckID: selected, Version: 1, RunID: r.ID.String(), OutcomeID: uuid.UUID(r.PolicyLastOutcomeID.Bytes).String(), SourceGeneration: stopDecimal(r.PolicyLastSourceGeneration.Int64), ReviewGeneration: stopDecimal(r.ClaimGeneration), SourceContext: source, Hold: apitypes.PolicyStopHoldSnapshot{Reason: textPtr(r.HoldReason), PolicyDetail: textPtr(r.PolicyHoldDetail), Since: r.StatusSince.Time}, Gate: &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate, Payload: wp}, Execution: execution, HumanFeedback: []apitypes.PolicyStopHumanFeedback{}, CrossCheckFeedback: []apitypes.PolicyStopCrossCheckFeedback{}}
 	inputs, err := qtx.ListPolicyStopRevisionInputs(ctx, r.ID)
 	if err != nil {
 		return m, err
@@ -281,6 +285,30 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 			RevisionDisposition: textPtr(cc.RevisionDisposition), RevisionSettledAt: stopTime(cc.RevisionSettledAt), RevisionSupersededByStopInputID: stopOptionalDecimal(cc.RevisionSupersededByStopInputID)})
 	}
 	return m, nil
+}
+
+// policyStopSelectionValid checks selection consistency after closed V1 parsing.
+// Row content is validated by policyStopManifestLocked's finite reference traversal.
+func policyStopSelectionValid(source apitypes.PolicyRevisionSourceV1, selected *string) bool {
+	refs := source.AssociatedCrossChecks
+	primary := source.PrimaryRevision
+	hasPrimary := primary != nil && primary.Source == "plan_cross_check"
+	if selected == nil {
+		return !hasPrimary && len(refs) == 0
+	}
+	id, err := uuid.Parse(*selected)
+	if err != nil || id == uuid.Nil || id.String() != *selected {
+		return false
+	}
+	if hasPrimary && primary.CrossCheckID != nil && *primary.CrossCheckID == *selected {
+		return true
+	}
+	for _, ref := range refs {
+		if ref.CrossCheckID != nil && *ref.CrossCheckID == *selected {
+			return true
+		}
+	}
+	return false
 }
 
 func policyStopManifestToken(m apitypes.PolicyStopManifest) (string, error) {

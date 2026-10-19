@@ -1,5 +1,6 @@
 {
   "manifest": {
+    "candidate_cross_check_id": null,
     "version": 0,
     "run_id": "",
     "outcome_id": "",

@@ -58,6 +58,7 @@ func TestPolicyStopReviewOwnerLiveDB(t *testing.T) {
 	}
 	e.exec(`INSERT INTO cross_checks(id,lead_run_id,stage,round,lead_claim_generation,plan_md,milestones,required_capabilities,required_tools,size_class,base_commit,planning_diff,candidate_digest,verdict,findings,created_at,decided_at,deadline_at,checker_harness,checker_model,checker_effort,automatic_rounds_enabled,automatic_revision_limit)
  VALUES($1,$2,'plan',1,2,$3,$4::jsonb,'{}','{}','s',$5,$6,$7,'revise','[{"body":"exact finding"}]',now(),now(),now()+interval '1 hour','claude','checker-model','high',true,2)`, ccID, id, candidate.PlanMd, string(frozen), candidate.BaseCommit, candidate.PlanningDiff, ccDigest)
+	e.exec("UPDATE runs SET policy_candidate_cross_check_id=$2 WHERE id=$1", id, ccID)
 	held, err := e.race.GetRunByID(ctx, id)
 	if err != nil {
 		t.Fatal(err)

@@ -264,6 +264,29 @@ func parsePolicyStopResolution(raw []byte, owner, runID uuid.UUID) (policyStopRe
 			return bad()
 		}
 	}
+	var manifestFields map[string]json.RawMessage
+	if err := json.Unmarshal(fields["manifest"], &manifestFields); err != nil {
+		return bad()
+	}
+	manifestKeys := []string{"candidate_cross_check_id", "version", "run_id", "outcome_id", "source_generation", "review_generation", "source_context", "hold", "gate", "execution", "human_feedback", "cross_check_feedback"}
+	if len(manifestFields) != len(manifestKeys) {
+		return bad()
+	}
+	for _, key := range manifestKeys {
+		if _, present := manifestFields[key]; !present {
+			return bad()
+		}
+	}
+	selection, present := manifestFields["candidate_cross_check_id"]
+	var selected *string
+	if !present || json.Unmarshal(selection, &selected) != nil {
+		return bad()
+	}
+	// Reparse the original bytes: decoding a struct loses required-field presence.
+	source, err := apitypes.ParsePolicyRevisionSourceV1(manifestFields["source_context"])
+	if err != nil || !policyStopSelectionValid(source, selected) {
+		return bad()
+	}
 	m := record.Manifest
 	outcome, err := uuid.Parse(m.OutcomeID)
 	if record.Version != 1 || record.ResolutionID == uuid.Nil || record.AcceptedBy != owner || owner == uuid.Nil ||

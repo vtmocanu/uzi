@@ -79,7 +79,7 @@ func newPolicyStopConfirmFixture(t *testing.T, completed int, verdict string, fe
 		}
 		source := fmt.Sprintf(`{"version":1,"gate":{"revision":"3","presentation_id":"%s","payload_digest":"%s"},"primary_revision":{"source":"run_user_input","input_id":"%d"},"associated_cross_checks":[{"source":"plan_cross_check","cross_check_id":"%s"}]}`,
 			presentation, hex.EncodeToString(digest[:]), f.humanID, f.ccID)
-		e.exec("UPDATE runs SET policy_revision_source=$2::jsonb WHERE id=$1", f.id, source)
+		e.exec("UPDATE runs SET policy_revision_source=$2::jsonb,policy_candidate_cross_check_id=$3 WHERE id=$1", f.id, source, f.ccID)
 		frozen := json.RawMessage(`[{"id":"m1","title":"m1"},{"id":"m2","title":"m2"},{"id":"m3","title":"m3"}]`)
 		candidate := workersvc.PlanCrossCheckCandidate{PlanMd: "exact candidate\n", Milestones: frozen,
 			RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s",

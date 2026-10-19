@@ -258,6 +258,15 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			}
 			return store.Run{}, e
 		}
+		n, e := txq.SetPolicyCandidateCrossCheckAssociation(ctx, store.SetPolicyCandidateCrossCheckAssociationParams{
+			CrossCheckID: existing.ID, LeadRunID: leadID, WorkerID: worker.ID, ClaimGeneration: generation,
+		})
+		if e != nil {
+			return store.Run{}, e
+		}
+		if n != 1 {
+			return store.Run{}, ErrCrossCheckRefused
+		}
 		return child, nil
 	})
 	if errors.Is(err, errRetry) {

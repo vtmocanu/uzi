@@ -229,17 +229,18 @@ type PolicyStopReview struct {
 	StopIfMatch string             `json:"stop_if_match"`
 }
 type PolicyStopManifest struct {
-	Version            int32                          `json:"version"`
-	RunID              string                         `json:"run_id"`
-	OutcomeID          string                         `json:"outcome_id"`
-	SourceGeneration   PolicyStopDecimal              `json:"source_generation"`
-	ReviewGeneration   PolicyStopDecimal              `json:"review_generation"`
-	SourceContext      PolicyRevisionSourceV1         `json:"source_context"`
-	Hold               PolicyStopHoldSnapshot         `json:"hold"`
-	Gate               *PolicyStopGateSnapshot        `json:"gate"`
-	Execution          PolicyStopExecution            `json:"execution"`
-	HumanFeedback      []PolicyStopHumanFeedback      `json:"human_feedback"`
-	CrossCheckFeedback []PolicyStopCrossCheckFeedback `json:"cross_check_feedback"`
+	CandidateCrossCheckID *string                        `json:"candidate_cross_check_id"`
+	Version               int32                          `json:"version"`
+	RunID                 string                         `json:"run_id"`
+	OutcomeID             string                         `json:"outcome_id"`
+	SourceGeneration      PolicyStopDecimal              `json:"source_generation"`
+	ReviewGeneration      PolicyStopDecimal              `json:"review_generation"`
+	SourceContext         PolicyRevisionSourceV1         `json:"source_context"`
+	Hold                  PolicyStopHoldSnapshot         `json:"hold"`
+	Gate                  *PolicyStopGateSnapshot        `json:"gate"`
+	Execution             PolicyStopExecution            `json:"execution"`
+	HumanFeedback         []PolicyStopHumanFeedback      `json:"human_feedback"`
+	CrossCheckFeedback    []PolicyStopCrossCheckFeedback `json:"cross_check_feedback"`
 }
 
 // PolicyStopHoldSnapshot binds the paused episode even when claim/outcome identity is unchanged.

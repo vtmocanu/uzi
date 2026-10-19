@@ -2829,6 +2829,7 @@ export interface PolicyStopCrossCheckFeedback {
 }
 
 export interface PolicyStopManifest {
+  candidate_cross_check_id: string | null;
   version: 1;
   run_id: string;
   outcome_id: string;

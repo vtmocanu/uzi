@@ -83,6 +83,7 @@ func policyStopReviewContractCase() contractCase {
 	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const plan = "# Revised plan\n\nKeep the source body exactly.\n"
 	m := &full.Manifest
+	m.CandidateCrossCheckID = text(crossCheckID)
 	m.RunID = runID
 	m.OutcomeID = "55555555-5555-4555-8555-555555555555"
 	m.SourceGeneration = large
