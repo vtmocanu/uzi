@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/settings"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Public issue creation supplies birth coverage. Only admission/ownership and
@@ -212,13 +213,13 @@ func TestPolicyStopNoGateRefusalsLiveDB(t *testing.T) {
 			case "future_witness":
 				e.exec("UPDATE cross_checks SET lead_claim_generation=2 WHERE lead_run_id=$1", run)
 			case "settled_witness":
-				var scope int64
-				if err := e.pool.QueryRow(e.ctx, "INSERT INTO run_user_inputs(run_id,kind,scope_ceiling,body) VALUES($1,'scope',1,'settlement fixture') RETURNING id", run).Scan(&scope); err != nil {
+				scope, err := e.q.CreateRunInput(e.ctx, store.CreateRunInputParams{RunID: run, Kind: "scope"})
+				if err != nil {
 					t.Fatal(err)
 				}
 				// Settlement is legal only for revise; preserve that database shape.
 				e.exec("UPDATE cross_checks SET verdict='revise' WHERE lead_run_id=$1", run)
-				e.exec("UPDATE cross_checks SET revision_disposition='superseded_by_stop',revision_settled_at=now(),revision_superseded_by_stop_input_id=$2 WHERE lead_run_id=$1", run, scope)
+				e.exec("UPDATE cross_checks SET revision_disposition='superseded_by_stop',revision_settled_at=now(),revision_superseded_by_stop_input_id=$2 WHERE lead_run_id=$1", run, scope.ID)
 			case "projection":
 				e.exec("UPDATE runs SET plan_md='different persisted plan' WHERE id=$1", run)
 			}
