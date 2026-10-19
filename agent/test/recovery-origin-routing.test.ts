@@ -551,3 +551,33 @@ test("a slow ordinary listing still refuses over an unfinished producer origin",
   assert.deepEqual((await f.coordinator.inspect(f.context.runId)).map(r => r.captureId), [producer]);
   assert.deepEqual(await fs.readFile(f.file(producer)), before);
 });
+
+const tempUuid = "0123abcd-0000-4000-8000-00000000abcd";
+for (const temp of [`${ordinary}.json.${tempUuid}.tmp`, `${ordinary}.${tempUuid}.bundle.tmp`]) {
+  test(`a stale ordinary temp entry does not block an ordinary pin: ${temp.slice(ordinary.length)}`, async t => {
+    const f = await fixture(t);
+    await f.seal({ ...f.partial(ordinary), generation: 6 });
+    await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, temp), "partial");
+    const pinned = await f.pin();
+    assert.ok(pinned, JSON.stringify(f.warnings));
+    assert.equal(pinned.generation, 7);
+    assert.ok(!f.warnings.some(w => w.message === "recovery: reconstruction provenance incomplete; source retained"));
+  });
+}
+
+test("a stale producer temp entry still refuses an ordinary pin", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, `${producer}.json.${tempUuid}.tmp`), "partial");
+  assert.equal(await f.pin(), undefined);
+  assert.ok(f.warnings.some(w => w.message === "recovery: reconstruction provenance incomplete; source retained"));
+});
+
+test("a stale ordinary temp entry still refuses inside a maintenance scope", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, `${ordinary}.json.${tempUuid}.tmp`), "partial");
+  const result = await MaintenanceResources.runDiscovery(() => f.freeze()).catch(() => undefined);
+  assert.equal(result, undefined);
+  assert.equal(f.calls.coverage, 0);
+});

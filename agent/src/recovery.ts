@@ -70,6 +70,16 @@ export type ClosedSourceObservation = Readonly<{
   }>;
 }>;
 
+const UUID_PART = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const ORDINARY_TEMP_RE = new RegExp(`^([^/]+?)(?:\\.json\\.${UUID_PART}\\.tmp|\\.${UUID_PART}\\.bundle\\.tmp)$`);
+
+/** A record or bundle temp name this coordinator writes (writeRecordUnlocked, bundleTmpPath) for an
+ *  ordinary capture. */
+function ordinaryTempEntry(name: string): boolean {
+  const captureId = ORDINARY_TEMP_RE.exec(name)?.[1];
+  return captureId !== undefined && classifyRecoveryOrigin(captureId) === "ordinary";
+}
+
 /** Issue #3031 staged groundwork: new-origin admission (charged WIP capture after a terminal
  *  source) stays unreachable in production until the verified transfer, archive handoff and
  *  boot rediscovery ship with it. Saved-evidence replay is unaffected. Not configurable; the
@@ -4486,7 +4496,7 @@ export class RecoveryCoordinator {
         signal: MaintenanceBudget.signal() ?? new AbortController().signal,
         deadline: Date.now() + Math.min(producer ? 10_000 : Infinity, MaintenanceBudget.current()?.remainingMs() ?? Infinity,
           M1MaintenanceResources.remainingMsIfActive()),
-      }, true);
+      }, true, !producer);
       for (const record of records) {
         // Unknown generations cannot exclude a producer from the target source proof.
         if ((generation === undefined || record.generation === undefined || record.generation === generation) &&
@@ -4538,7 +4548,8 @@ export class RecoveryCoordinator {
 
   /** One bounded pass over physical JSON files; any failed read blocks authority.
    * Paths must resolve inside this coordinator's root, with no symlink file reads. */
-  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false): Promise<RecoveryRecord[]> {
+  private async checkedRecords(runId: string, budget?: { signal: AbortSignal; deadline: number }, completeOrigin = false,
+    ordinaryTemps = false): Promise<RecoveryRecord[]> {
     this.checkJournalMetadata(budget);
     const dir = await this.checkedRecordDirectory(runId, budget);
     this.checkJournalMetadata(budget);
@@ -4571,7 +4582,11 @@ export class RecoveryCoordinator {
         // Unknown entries, including truncated namespace filenames and incomplete writes,
         // cannot prove an empty or ordinary-only inventory. Names grant no origin authority.
         this.checkJournalMetadata(budget);
-        if (!bundles.has(name)) throw new Error("unknown recovery journal entry");
+        // Ordinary callers tolerate this coordinator's own interrupted temp writes of an ordinary
+        // capture (a crash between write and rename); they grant no authority. Producer scopes and
+        // a producer capture's temp stay strict.
+        if (!bundles.has(name) && !(ordinaryTemps && ordinaryTempEntry(name)))
+          throw new Error("unknown recovery journal entry");
         const stat = await fs.lstat(path.join(dir, name));
         this.checkJournalMetadata(budget);
         if (!stat.isFile()) {
