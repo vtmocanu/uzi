@@ -5947,7 +5947,9 @@ export class GitCache {
       const [host, repo] = splitHostAndPath(raw);
       if (!repo || raw.length > 4096 || (!host && !path.isAbsolute(raw))) return undefined;
       if (!host) return JSON.stringify(["", path.normalize(raw)]);
-      return JSON.stringify([host.toLowerCase(), repo.replace(/\/+$/, "").replace(/\.git$/, "")]);
+      let end = repo.length;
+      while (end > 0 && repo[end - 1] === "/") end--;
+      return JSON.stringify([host.toLowerCase(), repo.slice(0, end).replace(/\.git$/, "")]);
     };
     const expected = canonical(originalUrl);
     if (!expected) return undefined;
