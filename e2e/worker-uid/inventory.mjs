@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions', 'claude-command-launcher'];
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',

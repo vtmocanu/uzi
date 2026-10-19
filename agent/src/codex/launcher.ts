@@ -44,13 +44,15 @@ import type { Readable, Writable } from "node:stream";
 import {
   CODEX_SESSION_GID,
   COMMAND_UID,
+  RUNNER_UID,
   WORKER_UID,
   commandRootCommand,
   runnerCommand,
   uidSplitActive,
   workerBoundaryCommand,
 } from "../runner-uid.js";
-import { registerWorkerRunnerRoot, workerSpawnEnv, type StartTimeReader } from "../worker-spawn-mark.js";
+import { recordRoot, registerWorkerRunnerRoot, workerSpawnEnv, type StartTimeReader } from "../worker-spawn-mark.js";
+import { wrapperArgv } from "../claude-command/wrapper.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -1123,6 +1125,186 @@ async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps)
   }
   return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup,
     deps.armStartedDeadlineForTest);
+}
+
+// ─── Issue #2471 (M1): a supervised runner-uid command root for the Claude guard ─────────────
+//
+// The Claude adapter's guarded commands run under the same immutable supervisor as a Codex
+// command root, but at the RUNNER uid (the uid the Claude CLI already uses), not the command
+// uid. Differences from launchEffectRoot, all deliberate: no `--drop-controller-caps`, no
+// cleanup token, no cleanup-on-launch authority, and the supervisor root is NOT added to the
+// worker-wide runner-root registry (the lane records it per attempt through `onSpawned`).
+
+/** A child the launcher spawned and still owns; ChildProcess satisfies it structurally. */
+export interface RunnerCommandChild extends SupervisorProcess {
+  readonly exitCode?: number | null;
+  readonly signalCode?: NodeJS.Signals | null;
+  kill?(signal?: NodeJS.Signals | number): boolean;
+}
+
+/** The supervisor root identity handed to `onSpawned`; `startTime` is the procfs start tick
+ *  (as {@link recordRoot} reads it) and is undefined when it could not be read. */
+export interface RunnerCommandSpawned {
+  readonly pid: number;
+  readonly startTime: number | undefined;
+}
+
+export interface RunnerCommandLaunchSpec {
+  /** The model command text; passed as a positional argument, never interpolated. */
+  readonly command: string;
+  /** The absolute worktree root the command starts in. */
+  readonly cwd: string;
+  /** REQUIRED explicit env. Build it with `guardedCommandEnv`; nothing is inherited. */
+  readonly env: Readonly<Record<string, string>>;
+  /** Worker-minted absolute spill file path. */
+  readonly spillPath: string;
+  /** Maximum spill bytes (a positive safe integer). */
+  readonly spillCapBytes: number;
+  readonly supervisorBin: string;
+  /**
+   * Called synchronously right after the spawn, before `started` is awaited, with the
+   * supervisor root identity and the still-unreaped child. It is also the only handle on the
+   * child when the launch later rejects (use {@link killUnreapedSupervisor} then).
+   */
+  readonly onSpawned?: (root: RunnerCommandSpawned, child: RunnerCommandChild) => void;
+}
+
+export interface RunnerCommandRoot {
+  readonly handle: CodexRootHandle;
+  readonly child: RunnerCommandChild;
+}
+
+/** The supervisor was never started (the spawn threw, e.g. E2BIG). Nothing to dispose or poison. */
+export class RunnerCommandNotStartedError extends Error {
+  constructor(cause: unknown) {
+    const code = typeof cause === "object" && cause !== null && "code" in cause ? String(cause.code) : "unknown";
+    super(`runner command was not started (${code})`, { cause });
+    this.name = "RunnerCommandNotStartedError";
+  }
+}
+
+interface RunnerSupervisedLaunch {
+  readonly tail: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly supervisorBin: string;
+  readonly onSpawned?: RunnerCommandLaunchSpec["onSpawned"];
+}
+
+async function launchRunnerSupervised(spec: RunnerSupervisedLaunch, deps: LauncherDeps): Promise<RunnerCommandRoot> {
+  const profileEnv = deps.env ?? process.env;
+  if (spec.supervisorBin !== SUPERVISOR_BIN) {
+    throw new TrustedExecutionRefusal(`supervisorBin must equal the immutable image path ${SUPERVISOR_BIN}`);
+  }
+  if (typeof spec.cwd !== "string" || !isAbsolute(spec.cwd)) throw new TrustedExecutionRefusal("cwd must be an absolute path");
+  if (typeof spec.env !== "object" || spec.env === null || Array.isArray(spec.env)) {
+    throw new TrustedExecutionRefusal("runner command requires an explicit env object");
+  }
+  const split = uidSplitActive(profileEnv);
+  const uid = split ? RUNNER_UID : process.getuid?.();
+  if (typeof uid !== "number" || !Number.isInteger(uid) || uid <= 0) {
+    throw new TrustedExecutionRefusal(`runner command uid is unavailable or invalid: ${String(uid)}`);
+  }
+  // No `--drop-controller-caps`, no cleanup token: the root keeps the runner posture the
+  // Claude CLI already has, and the supervisor's profile check runs unchanged.
+  const wrapped = runnerCommand(spec.supervisorBin, ["--expect-uid", String(uid), "--", ...spec.tail], split);
+  let child: RunnerCommandChild;
+  try {
+    child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
+      cwd: spec.cwd,
+      env: { ...spec.env },
+      stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
+    }) as RunnerCommandChild;
+  } catch (cause) {
+    throw new RunnerCommandNotStartedError(cause);
+  }
+  if (child.pid === undefined) {
+    // An asynchronous spawn failure (ENOENT and the like): there is no process to track.
+    child.on("error", () => undefined);
+    throw new RunnerCommandNotStartedError(undefined);
+  }
+  // The wrapper redirects the command's stdin from /dev/null; closing the transport stdin here
+  // keeps the supervisor's own stdin from ever carrying data.
+  try { child.stdin?.end(); } catch { /* the stream is already closed */ }
+  if (spec.onSpawned) {
+    spec.onSpawned({ pid: child.pid, startTime: recordRoot(child.pid, deps.rootStartTime)?.startTime }, child);
+  }
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", undefined,
+    deps.armStartedDeadlineForTest);
+  return { handle, child };
+}
+
+/**
+ * Launch a guarded model command under the immutable supervisor at the runner uid (the split's
+ * `RUNNER_UID` via setpriv, else the worker's own uid). Resolves once the supervisor reports
+ * `started`; the caller owns `handle.dispose`. Not wrapped in tree cleanup and not registered
+ * in the worker-wide runner-root registry. A spawn that throws rejects with
+ * {@link RunnerCommandNotStartedError}.
+ */
+export async function launchRunnerCommandRoot(spec: RunnerCommandLaunchSpec, deps: LauncherDeps = {}): Promise<RunnerCommandRoot> {
+  if (typeof spec.command !== "string") throw new TrustedExecutionRefusal("runner command must be a string");
+  if (typeof spec.spillPath !== "string" || !isAbsolute(spec.spillPath)) {
+    throw new TrustedExecutionRefusal("runner command spill path must be absolute");
+  }
+  if (!Number.isSafeInteger(spec.spillCapBytes) || spec.spillCapBytes <= 0) {
+    throw new TrustedExecutionRefusal("runner command spill cap must be a positive safe integer");
+  }
+  return launchRunnerSupervised({
+    tail: wrapperArgv({ spillPath: spec.spillPath, spillCapBytes: spec.spillCapBytes, command: spec.command }),
+    cwd: spec.cwd,
+    env: spec.env,
+    supervisorBin: spec.supervisorBin,
+    onSpawned: spec.onSpawned,
+  }, deps);
+}
+
+/**
+ * The launcher preflight probe: the same root-launch primitive as {@link launchRunnerCommandRoot}
+ * with an inert `/bin/true` child instead of the wrapper, at cwd `/` and a minimal env.
+ */
+export async function launchRunnerSupervisedProbe(
+  deps: LauncherDeps = {},
+  onSpawned?: RunnerCommandLaunchSpec["onSpawned"],
+): Promise<RunnerCommandRoot> {
+  return launchRunnerSupervised({
+    tail: ["/bin/true"],
+    cwd: "/",
+    env: { PATH: "/usr/bin:/bin", LANG: "C" },
+    supervisorBin: SUPERVISOR_BIN,
+    onSpawned,
+  }, deps);
+}
+
+export interface KillUnreapedDeps {
+  /** Whether the uid split is active (default: this process's env). */
+  readonly split?: boolean;
+  /** The synchronous runner of the split kill (default: spawnSync). */
+  readonly runKill?: (command: string, args: readonly string[]) => { readonly status: number | null; readonly error?: Error };
+}
+
+/**
+ * SIGKILL the supervisor the launcher spawned, only while it is still unreaped
+ * (`exitCode === null && signalCode === null`), in one synchronous section: an unreaped child's
+ * pid cannot have been reused. Under the split the worker lacks permission over the runner uid,
+ * so it forks `kill -KILL` as the runner uid; single-uid it signals the child directly.
+ * @returns whether a kill was issued (a child that exited, or lacks the exit fields, is never signalled).
+ */
+export function killUnreapedSupervisor(child: RunnerCommandChild, deps: KillUnreapedDeps = {}): boolean {
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  const pid = child.pid;
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 1) return false;
+  const split = deps.split ?? uidSplitActive();
+  try {
+    if (split) {
+      const kill = runnerCommand("kill", ["-KILL", String(pid)], true);
+      const run = deps.runKill ?? ((command, args) => spawnSync(command, [...args], { stdio: "ignore", timeout: 10_000 }));
+      run(kill.command, kill.args);
+      return true;
+    }
+    return typeof child.kill === "function" ? child.kill("SIGKILL") : false;
+  } catch {
+    return false;
+  }
 }
 
 async function createHandle(

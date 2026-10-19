@@ -30,7 +30,7 @@ import { killRunnerGroup, killRunnerGroupOnly, runnerSpawn } from "./runner-uid.
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The variables that carry a provider credential into the Claude CLI's environment (sdk-env.ts). */
-const PROVIDER_CREDENTIAL_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const;
+export const PROVIDER_CREDENTIAL_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] as const;
 
 function carriesProviderCredential(spawnEnv: Record<string, string | undefined> | undefined): boolean {
   return spawnEnv !== undefined && PROVIDER_CREDENTIAL_VARS.some((k) => (spawnEnv[k] ?? "") !== "");

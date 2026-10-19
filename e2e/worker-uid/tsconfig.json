@@ -12,6 +12,7 @@
     "../../agent/test/entrypoint-migration.test.ts",
     "../../agent/test/git-planning-diff.test.ts",
     "../../agent/test/git-retained-permissions.test.ts",
+    "../../agent/test/claude-command-launcher.test.ts",
     "./**/*.mts"
   ],
   "exclude": [
