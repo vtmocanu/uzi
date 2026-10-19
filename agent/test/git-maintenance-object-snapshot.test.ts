@@ -129,6 +129,94 @@ async function fixture(t: test.TestContext, profile: { split?: boolean; mode?: n
   return { git, dir, clone, objects, out, source, hooks, physical, controller, run, snapshot, charge,
     callbacks: () => callbacks, launches: () => launches };
 }
+function longFixturePath(root: string, length: number): string {
+  while (length - Buffer.byteLength(root) - 1 > 200) root += "/" + "p".repeat(200);
+  return root + "/" + "q".repeat(length - Buffer.byteLength(root) - 1);
+}
+async function removeLongFixtureOutput(out: string, children: ReadonlyArray<readonly [string, boolean]>) {
+  let directory: Handle | undefined;
+  try {
+    directory = await fs.open(out, 0);
+    for (const [name, isDirectory] of children) {
+      try {
+        const p = "/proc/self/fd/" + directory.fd + "/" + name;
+        if (isDirectory) await fs.rmdir(p); else await fs.unlink(p);
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  finally { await directory?.close(); }
+  try { await fs.rmdir(out); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+for (const allowed of [true, false]) {
+  test("derived source directory paths enforce 4096 bytes: " + allowed, async t => {
+    const f = await fixture(t), clone = longFixturePath(path.join(f.dir, "runner"), allowed ? 4070 : 4078);
+    const objects = path.join(clone, ".git", "objects");
+    await fs.mkdir(objects, { recursive: true });
+    const directory = await fs.open(objects, 0);
+    try {
+      await fs.mkdir("/proc/self/fd/" + directory.fd + "/nested-long");
+      const stat = await fs.lstat(clone, { bigint: true });
+      const capture = () => f.run(() => f.snapshot(undefined, {
+        clonePath: clone, identity: stat.dev + ":" + stat.ino,
+      }));
+      if (allowed) {
+        await capture();
+        assert.ok((await fs.lstat(path.join(f.out, "nested-long"))).isDirectory());
+      } else await assert.rejects(capture(), refused);
+    } finally {
+      try { await fs.rmdir("/proc/self/fd/" + directory.fd + "/nested-long"); }
+      finally { await directory.close(); }
+    }
+  });
+  test("derived destination directory paths enforce 4096 bytes: " + allowed, async t => {
+    const f = await fixture(t);
+    await fs.mkdir(path.join(f.objects, "nested-long"));
+    const parent = longFixturePath(f.git.recoveryRoot, allowed ? 4066 : 4076);
+    await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+    const out = parent + "/snapshot-long";
+    const capture = () => f.run(() => f.snapshot(undefined, f.source, out));
+    try {
+      if (allowed) {
+        await capture();
+        assert.equal(await fs.readFile(path.join(out, "leaf"), "utf8"), "abc");
+        assert.ok((await fs.lstat(path.join(out, "nested-long"))).isDirectory());
+      } else await assert.rejects(capture(), refused);
+    } finally {
+      // Descriptor-relative cleanup also handles the original buggy overlong tree.
+      // Only these known fixture-created children can exist in the exclusive output.
+      await removeLongFixtureOutput(out, [["nested-long", true], ["leaf", false]]);
+    }
+  });
+}
+test("derived regular source file paths cannot exceed 4096 bytes", async t => {
+  const f = await fixture(t), clone = longFixturePath(path.join(f.dir, "runner"), 4078);
+  const objects = path.join(clone, ".git", "objects");
+  await fs.mkdir(objects, { recursive: true });
+  const directory = await fs.open(objects, 0);
+  const file = "/proc/self/fd/" + directory.fd + "/payload-long";
+  try {
+    await fs.writeFile(file, "abc");
+    const stat = await fs.lstat(clone, { bigint: true });
+    await assert.rejects(f.run(() => f.snapshot(undefined, {
+      clonePath: clone, identity: stat.dev + ":" + stat.ino,
+    })), refused);
+    assert.equal(await fs.readFile(file, "utf8"), "abc");
+  } finally { try { await fs.unlink(file); } finally { await directory.close(); } }
+});
+test("derived regular destination file paths cannot exceed 4096 bytes", async t => {
+  const f = await fixture(t);
+  await fs.writeFile(path.join(f.objects, "payload-long"), "abc");
+  const parent = longFixturePath(f.git.recoveryRoot, 4076);
+  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  const out = parent + "/snapshot-long";
+  try {
+    await assert.rejects(f.run(() => f.snapshot(undefined, f.source, out)), refused);
+    assert.equal(await fs.readFile(path.join(f.objects, "payload-long"), "utf8"), "abc");
+  } finally {
+    await removeLongFixtureOutput(out, [["payload-long", false], ["leaf", false]]);
+  }
+});
 test("detaches actual loose objects, pack/index and nested encoded bytes without source writes or launches", async t => {
   const f = await fixture(t);
   await exec("/usr/bin/git", ["init", "--quiet", "--template=", f.clone]);

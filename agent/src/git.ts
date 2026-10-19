@@ -11729,6 +11729,11 @@ try {
       if (Buffer.byteLength(p) > 4096) throw refused();
       return p;
     };
+    const absoluteChild = (parent: Pin, name: string) => {
+      meta(8448); // UTF-16 path and bookkeeping capacity before concatenation.
+      if (Buffer.byteLength(parent.absolute) + 1 + Buffer.byteLength(name) > 4096) throw refused();
+      return parent.absolute + "/" + name;
+    };
     const stat = async (p: string, admin: boolean) => {
       visit(admin); meta(2048);
       const s = await fs.lstat(p, { bigint: true }); check(); return s;
@@ -11817,7 +11822,7 @@ try {
       }
       if (!info.isDirectory() || info.isSymbolicLink()) throw refused();
       // Pin even this preliminary control lookup: no symlink-following probe.
-      const d = await pin(p, objects.absolute + "/info", objects.output, true, !objects.output);
+      const d = await pin(p, absoluteChild(objects, "info"), objects.output, true, !objects.output);
       for (const name of ["alternates", "http-alternates"]) await absent(child(d, name), objects.output);
     };
     const createDirectory = async (parent: Pin, name: string, absolute: string) => {
@@ -11848,8 +11853,8 @@ try {
       MaintenanceResources.consume("sources", 1);
       const clone = await absoluteDirectory(source.clonePath, false);
       if (String(clone.stat.dev) + ":" + String(clone.stat.ino) !== source.identity) throw refused();
-      const gd = await pin(child(clone, ".git"), source.clonePath + "/.git", false, true);
-      const objects = await pin(child(gd, "objects"), source.clonePath + "/.git/objects", false, true, true);
+      const gd = await pin(child(clone, ".git"), absoluteChild(clone, ".git"), false, true);
+      const objects = await pin(child(gd, "objects"), absoluteChild(gd, "objects"), false, true, true);
       await controlsAbsent(objects);
       const parent = await absoluteDirectory(path.dirname(outDir), true);
       const destination = await createDirectory(parent, path.basename(outDir), outDir);
@@ -11914,13 +11919,14 @@ try {
             meta(16384); const rel = relative ? relative + "/" + name : name;
             if (Buffer.byteLength(rel) > 4096 || depth + 1 > 64 ||
                 (relative === "info" && (name === "alternates" || name === "http-alternates"))) throw refused();
+            const sourceAbsolute = absoluteChild(src, name), targetAbsolute = absoluteChild(dst, name);
             const observed = await stat(child(src, name), false);
             visit(false); meta(2048);
             inputs.push({ parent: src, name, stat: observed, directory: observed.isDirectory(), size: 0 });
             if (observed.isDirectory()) {
-              const sub = await pin(child(src, name), src.absolute + "/" + name, false, true, true);
+              const sub = await pin(child(src, name), sourceAbsolute, false, true, true);
               if (!unchanged(observed, sub.stat)) throw refused();
-              const target = await createDirectory(dst, name, dst.absolute + "/" + name);
+              const target = await createDirectory(dst, name, targetAbsolute);
               await walk(sub, target, rel, depth + 1);
             } else await copyFile(src, dst, name, observed);
           }
