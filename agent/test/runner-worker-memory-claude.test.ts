@@ -144,3 +144,30 @@ test("credential capture settles guarded commands first and goes incomplete whil
     assert.equal((await settle({ run: async () => { throw new Error("unused"); } })).kind, "observed_empty");
   } finally { await f.memory.stop(); }
 });
+
+/** Run a Claude claim whose executor is told the memory invalidation and ends with `ending(stop)`. */
+async function invalidatedRun(ending: (stop: Error) => Error) {
+  const f = await setup();
+  const monitoring = f.memory.run();
+  let told: Error | undefined;
+  const executor: Executor = { run: async ctx => {
+    ctx.onMemoryAuthorityLost!(stop => { told = stop; });
+    ctx.capturedMemory!();
+    client.revokeMemoryAuthority();
+    assert.ok(told, "the invalidation reached the executor");
+    throw ending(told);
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: f.memory }).execute(f.claim);
+    return { failed: api.states.some(s => s.body.status === "failed") };
+  } finally { await f.memory.stop(); await monitoring.catch(() => undefined); }
+}
+
+test("a Claude executor that rejects with the carried retained stop lands in the retained-custody arm, not a failure", async () => {
+  // The carrier rethrows exactly the stop the runner delivered.
+  assert.equal((await invalidatedRun(stop => stop)).failed, false, "the retained stop reports no model failure");
+});
+
+test("a Claude executor that rebuilds the error after the invalidation is reported as a failure (the control)", async () => {
+  assert.equal((await invalidatedRun(() => new Error("rebuilt after the invalidation"))).failed, true);
+});

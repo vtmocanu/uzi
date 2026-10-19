@@ -66,6 +66,25 @@ const DISPOSE_JOIN_SLACK_MS = 2000;
 export function worstCaseCallMs(timeoutMs: number, graceMs = DEFAULT_GRACE_MS, cleanupMs = DEFAULT_CLEANUP_MS): number {
   return LAUNCH_STARTED_MS + timeoutMs + graceMs + (cleanupMs + DISPOSE_JOIN_SLACK_MS) + cleanupMs + cleanupMs;
 }
+
+/**
+ * Worst-case wall time for the lane to dispose and confirm a command whose abort arrives at the
+ * least convenient moment, counted from the abort: the launcher's `started` wait cannot be
+ * interrupted (LAUNCH_STARTED_MS), the enrollment observe honours the abort (nothing), then the
+ * bounded dispose (one cleanup step plus the join slack), the output-end join and the
+ * prepared-outcome join (one cleanup step each). The transport EOF grace is exit path only, so an
+ * abort does not pay it. With the defaults: 10 s + 12 s + 10 s + 10 s = 42 s.
+ */
+export function worstCaseAbortJoinMs(cleanupMs = DEFAULT_CLEANUP_MS): number {
+  return LAUNCH_STARTED_MS + (cleanupMs + DISPOSE_JOIN_SLACK_MS) + cleanupMs + cleanupMs;
+}
+
+/**
+ * Budget every join of the lane (quiesce at a turn end, the run-end join, the sink settle) gives
+ * a command's disposal: the worst case above plus an 18 s margin for scheduling and the
+ * supervisor's own reply latency. Pinned against {@link worstCaseAbortJoinMs} in a unit test.
+ */
+export const GUARDED_LANE_JOIN_MS = 60_000;
 const MAX_ATTRIBUTION_RECORDS = 4096;
 const MEMORY_MESSAGE = "Shell admission is held or its captured flight has retired.";
 
@@ -240,6 +259,8 @@ export class ClaudeCommandLane {
    */
   async quiesce(deadlineMs: number): Promise<void> {
     this.turnOpen = false;
+    // Spawns happen after beginTurn, so the registry is only readable inside a turn.
+    this.captured = undefined;
     this.records.clear();
     this.consumed.clear();
     const flows = [...this.live.values()].map((live) => live.flow);
@@ -452,7 +473,7 @@ export class ClaudeCommandLane {
     try {
       // (8) Enrol while the command already runs and drains.
       try {
-        enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, callSignal);
+        enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, AbortSignal.any(sources));
       } catch (error) { enrollError = error; }
       let first: FirstEvent;
       if (enrollError === undefined) {

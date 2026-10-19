@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { CredentialSwitchSignal } from "../src/steering.js";
 import type { RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate } from "../src/protocol.js";
@@ -294,6 +295,87 @@ describe("typed trip carrier", () => {
     assert.equal(seen.length, 1, "no implement turn starts after the memory authority is lost");
   });
 
+  it("an invalidation between turns signals no CLI pid (the last turn's pid may be recycled)", async () => {
+    const stop = new Stop();
+    let fire: (stop: Error) => void = () => {};
+    const kills: Array<number | undefined> = [];
+    let killsAtFire = -1;
+    const spawn = (): never => Object.assign(new EventEmitter(), { pid: 41000 }) as never;
+    const { queryFn } = fakeTurns([
+      (_signal, options) => (async function* () {
+        options.spawnClaudeCodeProcess!({ command: "claude", args: [], cwd: "/", env: {}, signal: new AbortController().signal });
+        yield submitPlan("plan");
+        yield resultSuccess();
+      })(),
+      [signalDone(), resultSuccess()],
+    ]);
+    const { capture } = fakeCapture();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, spawn, rootStartTime: () => 1, killCliGroup: () => true, kill: (pid) => { kills.push(pid); return true; } }).run(makeCtx({
+        capturedMemory: capture,
+        onMemoryAuthorityLost: (listener) => { fire = listener; return () => {}; },
+        // The plan turn's CLI has exited by now; the invalidation arrives at the gate.
+        gatePlan: async () => { fire(stop); killsAtFire = kills.length; return { kind: "approve", selection: { status: "absent" } }; },
+      })),
+      (err: unknown) => err === stop,
+    );
+    assert.equal(killsAtFire, 0, "no kill is issued for a trip that lands with no live turn");
+  });
+
+  it("an invalidation during a live turn group-kills that turn's CLI", async () => {
+    const stop = new Stop();
+    let fire: (stop: Error) => void = () => {};
+    const kills: Array<number | undefined> = [];
+    let killedAtFire: Array<number | undefined> = [];
+    const spawn = (): never => Object.assign(new EventEmitter(), { pid: 41001 }) as never;
+    const { queryFn } = fakeTurns([
+      [submitPlan("plan"), resultSuccess()],
+      // eslint-disable-next-line require-yield
+      (signal, options) => (async function* () {
+        options.spawnClaudeCodeProcess!({ command: "claude", args: [], cwd: "/", env: {}, signal: new AbortController().signal });
+        fire(stop);
+        killedAtFire = [...kills];
+        await hang(signal);
+      })(),
+    ]);
+    const { capture } = fakeCapture();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn, spawn, rootStartTime: () => 1, killCliGroup: () => true, kill: (pid) => { kills.push(pid); return true; } }).run(makeCtx({
+        capturedMemory: capture,
+        onMemoryAuthorityLost: (listener) => { fire = listener; return () => {}; },
+      })),
+      (err: unknown) => err === stop,
+    );
+    assert.deepEqual(killedAtFire, [41001]);
+  });
+
+  it("a credential switch that gives up while a carried stop is pending rethrows the stop and does not continue", async () => {
+    const stop = new Stop();
+    let fire: (stop: Error) => void = () => {};
+    let gates = 0;
+    let switches = 0;
+    const { queryFn, seen } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const { capture } = fakeCapture();
+    await assert.rejects(
+      new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({
+        capturedMemory: capture,
+        onMemoryAuthorityLost: (listener) => { fire = listener; return () => {}; },
+        gatePlan: async () => {
+          gates++;
+          // The invalidation lands first (the carrier), then the credential switch interrupts the gate.
+          if (gates > 1) return { kind: "approve", selection: { status: "absent" } };
+          fire(stop);
+          throw new CredentialSwitchSignal();
+        },
+        attemptCredentialSwitch: async () => { switches++; return "gave_up"; },
+      })),
+      (err: unknown) => err === stop,
+    );
+    assert.equal(switches, 1);
+    assert.equal(gates, 1, "the clear-and-continue path did not re-present the gate");
+    assert.equal(seen.length, 1, "no implement turn starts");
+  });
+
   it("pause first, then invalidation: the pause parks and reports normally", async () => {
     const stop = new Stop();
     let fire: (stop: Error) => void = () => {};
@@ -381,10 +463,14 @@ describe("protected CLI roots and executor seams", () => {
       procs.push(proc);
       return proc as never;
     };
+    // Read inside the script, right after the exit and before the run ends: the run-end sweep
+    // would otherwise satisfy the exit expectation on its own.
+    let unprotectsAtExit = -1;
     const { queryFn } = fakeTurns([
       (_signal, options) => (async function* () {
         const proc = options.spawnClaudeCodeProcess!({ command: "claude", args: [], cwd: "/", env: {}, signal: new AbortController().signal });
         (proc as unknown as EventEmitter).emit("exit", 0, null);
+        unprotectsAtExit = registry.unprotects.length;
         yield submitPlan("plan");
         yield resultSuccess();
       })(),
@@ -400,6 +486,7 @@ describe("protected CLI roots and executor seams", () => {
       ["provider", { pid: 40000, startTime: "400000" }],
       ["provider", { pid: 40001, startTime: "400010" }],
     ]);
+    assert.equal(unprotectsAtExit, 1, "the exit hook unprotects the exited root before the run ends");
     assert.equal(registry.unprotects.length, 2, "the exited root at its exit and the other by the run-end sweep");
     assert.equal(registry.unprotects[0], registry.protects[0], "the exit unprotects exactly its own root");
   });

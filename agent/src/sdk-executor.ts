@@ -25,7 +25,7 @@
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
-import { ClaudeCommandLane } from "./claude-command/lane.js";
+import { ClaudeCommandLane, GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import { buildGuardedCommandServer } from "./claude-command/server.js";
 import { GUARDED_COMMAND_SERVER, GUARDED_COMMAND_TOOL, shapeGuardedGrants, type UnavailableRole } from "./claude-command/grants.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
@@ -170,9 +170,9 @@ const REASON_CANCELLED = "run cancelled";
 // text, is what the turn throws.
 const REASON_MEMORY_AUTHORITY_LOST = "worker memory authority lost";
 /** Issue #2471: budget for the guarded command lane to dispose and confirm every live command
- *  at a turn end. Above the worst per-call cleanup (5 s transport grace, 12 s dispose, 10 s
- *  output join, 10 s outcome join). */
-const GUARDED_LANE_QUIESCE_MS = 45_000;
+ *  at a turn end: the lane's own join budget (worst-case abort cleanup of 42 s plus margin; see
+ *  worstCaseAbortJoinMs in claude-command/lane.ts, pinned by a unit test). */
+const GUARDED_LANE_QUIESCE_MS = GUARDED_LANE_JOIN_MS;
 // PRD #1190 M2: the internal trip reason for a `now` pause abort. Never a failure_reason — it
 // is converted to a thrown PauseNowSignal at every driveTurn throw site (tripError), which the
 // implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
@@ -758,8 +758,6 @@ interface DriveState {
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   /** Issue #2471: the guarded command lane of a memory-guard-bound run; undefined otherwise. */
   lane?: ClaudeCommandLane;
-  /** Issue #2471: roles the plan turn's roster withheld under the guard. */
-  planUnavailable: UnavailableRole[];
   /** Issue #2471: drops the runner's memory-authority listener. */
   unsubscribeAuthority?: () => void;
   isIssueRun: boolean;
@@ -1366,6 +1364,10 @@ export class SdkExecutor implements Executor {
         if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
         this.unprotectAllCliRoots();
         if (laneFailure !== undefined && summaryResult !== undefined) rethrow(laneFailure);
+        // The run is already throwing: the original error stands, the join failure is only logged.
+        if (laneFailure !== undefined) {
+          this.log.warn("guarded command lane join failed while the run was already failing", { error: errMessage(laneFailure) });
+        }
       }
     } finally {
       ctx.terminalLifecycleSignal?.removeEventListener("abort", onTerminal);
@@ -1612,7 +1614,7 @@ export class SdkExecutor implements Executor {
         kind: "status",
         agent: "worker",
         payload: {
-          text: `not planning with ${planUnavailable.map((role) => role.name).join(", ")}: unavailable on this run: ${planUnavailable[0]!.reason}`,
+          text: `not planning with ${planUnavailable.map((role) => `${role.name} is unavailable on this run: ${role.reason}`).join("; ")}`,
         },
       });
     }
@@ -1955,7 +1957,6 @@ export class SdkExecutor implements Executor {
       subagentCanWrite,
       preToolUse,
       lane,
-      planUnavailable,
       unsubscribeAuthority,
       isIssueRun,
       environmentFacts,
@@ -2738,7 +2739,7 @@ export class SdkExecutor implements Executor {
           kind: "status",
           agent: "worker",
           payload: {
-            text: `not implementing with ${implementUnavailable.map((role) => role.name).join(", ")}: unavailable on this run: ${implementUnavailable[0]!.reason}`,
+            text: `not implementing with ${implementUnavailable.map((role) => `${role.name} is unavailable on this run: ${role.reason}`).join("; ")}`,
           },
         });
       }
@@ -4701,6 +4702,8 @@ export class SdkExecutor implements Executor {
       if (idleTimer) clearTimeout(idleTimer);
       this.disarmWall(state);
       state.currentAbort = undefined;
+      // The turn's CLI has exited: forget its pid so no later trip can signal a recycled one.
+      state.currentChild = {};
       if (lane) {
         // Issue #2471: no model command outlives its turn, so this runs before every catch arm of
         // the implement loop and before any pause, wall or credential-switch park. A failed join
@@ -5166,8 +5169,11 @@ export class SdkExecutor implements Executor {
     state.tripError = error;
     state.tripReason = REASON_MEMORY_AUTHORITY_LOST;
     this.log.warn("run memory-guard trip, aborting SDK", { reason: REASON_MEMORY_AUTHORITY_LOST });
+    // Kill the CLI only while a turn is live: between turns currentChild holds the previous
+    // turn's exited pid, which the kernel may have recycled (issue #1656).
+    const live = state.currentAbort !== undefined;
     state.currentAbort?.abort();
-    this.kill(state.currentChild.pid);
+    if (live) this.kill(state.currentChild.pid);
   }
 
   /** Clear a handled trip so the aborted turn restarts. A memory-authority carrier is never

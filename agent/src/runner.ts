@@ -11,6 +11,7 @@ import os from "node:os";
 import { basename as pathBasename, dirname as pathDirname, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
+import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
@@ -1020,8 +1021,9 @@ class E2EDropExecutionError extends Error {
  *  UZI_E2E_DROP_ON_SENTINEL is set). Named like the stub sentinels; inert in production. */
 const E2E_DROP_SENTINEL = "UZI_STUB_DROP";
 
-/** Issue #2471: bound for settling a guard-bound Claude flight's model commands at a sink. */
-const GUARDED_COMMAND_SETTLE_MS = 45_000;
+/** Issue #2471: bound for settling a guard-bound Claude flight's model commands at a sink: the
+ *  lane's own join budget (worst-case abort cleanup plus margin, see GUARDED_LANE_JOIN_MS). */
+const GUARDED_COMMAND_SETTLE_MS = GUARDED_LANE_JOIN_MS;
 
 /**
  * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
@@ -12313,7 +12315,7 @@ export class RunRunner {
       await action(undefined);
     } else {
       await executor.closeAndSettlePlanSummary?.();
-      await this.settleGuardedCommands(executor);
+      await this.settleGuardedCommands(executor, req.deadlineMs);
       executor.killAgentTree?.();
       await action(undefined);
     }

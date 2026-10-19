@@ -74,6 +74,25 @@ export function disposeRootOnce(handle: CodexRootHandle, timeoutMs: number): Pro
   return flight;
 }
 
+/** The bounded wait on `observed`, cut short (undefined) the moment `signal` aborts. The losing
+ *  side is never left as an unhandled rejection. */
+async function observeUnlessAborted<T>(observed: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T | undefined> {
+  const bounded = boundedCommandWait(observed, timeoutMs);
+  if (!signal) return bounded;
+  if (signal.aborted) { bounded.catch(() => undefined); return undefined; }
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<undefined>((resolve) => {
+    onAbort = () => resolve(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([bounded, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+    bounded.catch(() => undefined);
+  }
+}
+
 export interface ClaudeCommandEnrollment {
   readonly entry: Entry;
   /** Resolves when the guard resolves a pressure outcome for this entry (watch only). */
@@ -105,8 +124,10 @@ export async function enrollClaudeCommand(
   const current = () => commands.isCurrent(context, flight, lifecycleRevision);
   if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
   const startedAtMs = performance.now();
-  const initial = await boundedCommandWait(handle.observe(deadlineMs), deadlineMs);
-  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
+  // The initial observe honours the abort: an aborted command goes straight to disposal instead of
+  // waiting out the observe budget (the disposal join budget in lane.ts counts on this).
+  const initial = await observeUnlessAborted(handle.observe(deadlineMs), deadlineMs, signal);
+  if (!initial || !current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error(ADMISSION_CLOSED_MESSAGE);
   // Read-only uncertainty prevents memory intervention, not ordinary execution.
   if (initial.state !== "complete") return undefined;
   if (initial.supervisor.pid !== handle.supervisorPid

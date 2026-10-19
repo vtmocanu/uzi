@@ -11,7 +11,7 @@ import {
 import { GUARDED_COMMAND_TOOL } from "../src/claude-command/grants.js";
 import {
   ClaudeCommandLane, DEFAULT_CLEANUP_MS, DEFAULT_GRACE_MS, GuardedCommandUnconfirmedError, MAX_COMMAND_TIMEOUT_MS,
-  worstCaseCallMs, type ClaudeCommandLaneOptions,
+  GUARDED_LANE_JOIN_MS, worstCaseAbortJoinMs, worstCaseCallMs, type ClaudeCommandLaneOptions,
 } from "../src/claude-command/lane.js";
 import { GUARDED_COMMAND_DESCRIPTION, GUARDED_SERVER_TIMEOUT_MS, buildGuardedCommandServer } from "../src/claude-command/server.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
@@ -801,6 +801,59 @@ test("the worst-case call time fits under the MCP transport timeout with the def
   assert.ok(worst <= 3_660_000);
   // A 30 s cleanup step would not fit: the reason the step stays at 10 s.
   assert.ok(worstCaseCallMs(MAX_COMMAND_TIMEOUT_MS, DEFAULT_GRACE_MS, 30_000) > GUARDED_SERVER_TIMEOUT_MS);
+});
+
+test("the lane join budget covers the worst abort cleanup with a margin of at least 15 s", { timeout: 10000 }, () => {
+  const abortWorst = worstCaseAbortJoinMs();
+  // started wait + (dispose + join slack) + output join + outcome join, with the defaults.
+  assert.equal(abortWorst, 42_000);
+  assert.ok(GUARDED_LANE_JOIN_MS >= 60_000);
+  assert.ok(GUARDED_LANE_JOIN_MS >= abortWorst + 15_000, `join ${String(GUARDED_LANE_JOIN_MS)} vs worst ${String(abortWorst)}`);
+  // Even the exit-path steps (transport grace) plus one unabortable enrollment observe, which the
+  // abort-aware observe no longer pays, fit: the 52 s the first design needed, plus the grace.
+  assert.ok(GUARDED_LANE_JOIN_MS > worstCaseCallMs(0) + DEFAULT_CLEANUP_MS);
+});
+
+test("an abort during the enrollment observe goes straight to disposal instead of waiting the observe out", { timeout: 10000 }, async () => {
+  const h = harness({ cleanupMs: 2000 });
+  h.script.current = (root) => {
+    // The observe never answers: only the abort can end the enrollment wait.
+    (root.handle as unknown as { observe: () => Promise<never> }).observe = () => new Promise<never>(() => {});
+  };
+  const call = new AbortController();
+  const startedAt = Date.now();
+  const pending = h.call({ command: "sleep 100" }, undefined, call.signal);
+  await until(() => h.roots.length === 1, "launch");
+  call.abort();
+  const r = await pending;
+  assert.match(text(r), /Command was cancelled; it and all its descendants were stopped\./);
+  assert.equal(h.roots[0]!.disposes(), 1);
+  assert.ok(Date.now() - startedAt < 1500, "the abort did not wait out the 2 s observe budget");
+});
+
+test("quiesce aborts a command that is still enrolling without waiting the observe budget", { timeout: 10000 }, async () => {
+  const h = harness({ cleanupMs: 2000 });
+  h.script.current = (root) => {
+    (root.handle as unknown as { observe: () => Promise<never> }).observe = () => new Promise<never>(() => {});
+  };
+  const pending = h.call({ command: "sleep 100" });
+  await until(() => h.roots.length === 1, "launch");
+  const startedAt = Date.now();
+  await h.lane.quiesce(5000);
+  assert.match(text(await pending), /Command was cancelled/);
+  assert.ok(Date.now() - startedAt < 1500);
+  assert.equal(h.lane.poisoned, false);
+});
+
+test("the registry is readable inside a turn and undefined once the turn is quiesced", { timeout: 10000 }, async () => {
+  const h = harness({}, false);
+  assert.equal(h.lane.registry, undefined, "before the first turn");
+  h.lane.beginTurn();
+  assert.equal(h.lane.registry, h.c.commands);
+  await h.lane.quiesce(1000);
+  assert.equal(h.lane.registry, undefined, "between turns");
+  h.lane.beginTurn();
+  assert.equal(h.lane.registry, h.c.commands, "the next turn captures again");
 });
 
 // -- the MCP server ----------------------------------------------------------------------------
