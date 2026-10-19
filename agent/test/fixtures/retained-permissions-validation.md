@@ -290,3 +290,32 @@ were not run; the retained/custody paths include phases 45, 52 and 72.
 Focused evidence does not substitute for the final gates or same-image UID
 proof. Delivery reports those results, tested revisions, and local step
 timing separately; CI critical-path impact remains unmeasured until CI runs.
+
+## Codex lost-refresh E2E fixture precondition
+
+CI on validation PR #3126 (exact head `c2d98f1c`, run 39197954995) was red
+only in `test-codex-refresh-lostreply-e2e`: all four variants stopped at the
+resumed-attempt check. A local Linux single-target run of
+`TestCodexRefreshLostReplyE2E` reproduced 4/4 failures on unmodified `c2d98f1c`;
+a fixed-code diagnostic showed `retained_readiness_profile` three times, then
+`budget_exhausted`. The fixture's test-double executor did not declare
+`sandboxesCommands`, while its claim carries Codex secrets, so the runner gate
+correctly refused retained recovery. Production Codex executors always declare
+it; the gate is unchanged.
+
+The fixture now declares `sandboxesCommands: true` and replaces only its own
+GitCache readiness method with a recorder. This host has no worker/command UID
+split, so the real helper cannot launch there; the real-UID lane remains the
+permission proof (49 required leaves and both PSI calibrations passed in that
+CI run). The fixture asserts no readiness call before the reclaim, then exactly
+one call bound to the fixture's bare path, branch, run and predecessor clone,
+made before the resumed executor ran. A failed resume now reports only known
+fixed codes. All other fixture assertions and deadlines are unchanged.
+
+Local evidence (Linux container, throwaway Postgres, caps `-p=2`,
+`GOMAXPROCS=4`, concurrency 2, `go test -race -count=1`): the corrected fixture
+passed 4/4 twice. Each probe failed 4/4: no `sandboxesCommands`
+(`retained_readiness_profile` x3, `budget_exhausted`), zero recorded calls, two
+calls, and readiness moved after the resumed executor started (runner call
+removed, executor call added). Agent typecheck and lint passed, and
+`TestStaleWorkerCancelE2E`, which CI does not run, passed 4/4.
