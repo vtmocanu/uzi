@@ -106,6 +106,28 @@ elif args[0] == "start":
     if "-diag-" in name:
         workload = name.split("-diag-")[1].rsplit("-", 1)[0]
         if mode == "diag-garbage": print("not a diagnostic"); sys.exit(0)
+        if workload.startswith("guarded-"):
+            if mode == "guarded-killed": sys.exit(137)
+            if mode == "guarded-hung": sys.exit(124)
+            tool = {"toolUseId": "toolu_x", "isError": True, "outcome": "guard_acted", "pressureToolIdMatches": True,
+                    "pressure": {"code": "worker_memory_pressure", "tool_id": "toolu_x", "outcome": "confirmed_drained"}, "head": None}
+            if mode == "guarded-oom-before-guard":
+                tool.update(outcome="oom_before_guard", pressure=None, pressureToolIdMatches=None, head="Exit code: 137")
+            if mode == "guarded-wrong-tool": tool["pressure"]["tool_id"] = "toolu_other"
+            cleanup = {"liveCountBeforeQuiesce": 0, "liveCountAfter": 0, "quiesceConfirmed": True, "poisoned": False,
+                       "registryEligibleEntries": 0, "commandPidsGone": True, "otherProcessPidsRemaining": [],
+                       "oomKillBefore": 0, "oomKillAfter": 1 if mode == "guarded-oom-before-guard" else 0, "memoryPeakBytes": 4096}
+            if mode == "guarded-leak": cleanup["otherProcessPidsRemaining"] = [77]
+            if mode == "guarded-unquiesced": cleanup["quiesceConfirmed"] = False
+            print("UZI_NODE_DIAGNOSTIC_BEGIN")
+            print(json.dumps({"schemaVersion": 1, "workload": workload, "leg": "guarded", "nodeVersion": "v24.0.0",
+                              "psiSynthesized": True, "baselineBytes": 100,
+                              "growth": {"series": [[1, 3.0, 100], [2, 250.0, 700]], "sampleCount": 2, "peakSeriesBytes": 700},
+                              "timeline": {"crossingSampleCompletedMs": 250.0}, "budget": {"crossingToReserveRequestMs": 5.0,
+                              "cancelToConfirmedDrainMs": 55.0, "crossingToConfirmedDrainMs": 110.0},
+                              "tool": tool, "cleanup": cleanup}))
+            print("UZI_NODE_DIAGNOSTIC_END")
+            sys.exit(0 if mode != "diag-nonzero" else 3)
         if mode == "diag-two-lines":
             print("UZI_NODE_DIAGNOSTIC_BEGIN\n{}\n{}\nUZI_NODE_DIAGNOSTIC_END"); sys.exit(0)
         child = {"exitCode": 0, "signal": None, "timedOut": False, "wallMs": 700,
@@ -418,16 +440,17 @@ class RunnerTest(unittest.TestCase):
         env = {"PATH": str(self.root / "bin") + os.pathsep + os.defpath, "FAKE_ROOT": str(self.root), "FAKE_MODE": mode}
         return calibration.Host(manifest, directory, "unused"), directory, patch.dict(os.environ, env)
 
-    def test_diagnostics_measure_six_owned_isolated_containers_and_clean_all(self):
+    def test_diagnostics_measure_eight_owned_isolated_containers_and_clean_all(self):
         host, directory, env = self.diagnostic_host("")
         with env, contextlib.redirect_stderr(io.StringIO()) as stderr:
             results = host.measure_diagnostics()
         self.assertEqual([(r["limitBytes"], r["workload"]) for r in results],
-                         [(size, w) for size in calibration.DIAG_SIZES for w in calibration.DIAG_WORKLOADS])
+                         [(size, w) for size in calibration.DIAG_SIZES
+                          for w in calibration.DIAG_WORKLOADS + calibration.DIAG_GUARDED_WORKLOADS])
         self.assertEqual(json.loads((directory / "node-diagnostic.json").read_text()), results)
         calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
         creates = [c for c in calls if c[:2] == ["docker", "create"]]
-        self.assertEqual(len(creates), 6)
+        self.assertEqual(len(creates), 8)
         for command in creates:
             self.assertEqual(command[command.index("--network") + 1], "none")
             self.assertEqual(command[command.index("--user") + 1], "10003:10003")
@@ -436,18 +459,31 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(command[command.index("--pids-limit") + 1], "128")
             self.assertEqual(command[command.index("--cgroupns") + 1], "private")
             self.assertTrue(command[-2].endswith("calibration-diagnostic.mts"))
-        self.assertEqual(len([c for c in calls if c[0] == "timeout" and c[3:5] == ["docker", "start"]]), 6)
-        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "rm"]]), 6)
+        # Only the guarded containers mount the agent sources the real lane imports (read-only).
+        guarded = [c for c in creates if c[-1] in calibration.DIAG_GUARDED_WORKLOADS]
+        self.assertEqual(len(guarded), 2)
+        for command in guarded:
+            mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
+            self.assertTrue(any(m.endswith("/agent/src,readonly") for m in mounts))
+        for command in set(map(tuple, creates)) - set(map(tuple, guarded)):
+            self.assertFalse(any(arg.endswith("/agent/src,readonly") for arg in command))
+        self.assertEqual(len([c for c in calls if c[0] == "timeout" and c[3:5] == ["docker", "start"]]), 8)
+        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "rm"]]), 8)
         self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
         self.assertEqual(host.requests, [])
-        self.assertEqual(stderr.getvalue().count("node diagnostic "), 6)
+        self.assertEqual(stderr.getvalue().count("node diagnostic "), 8)
+        self.assertEqual(stderr.getvalue().count("cancel_to_drain_ms=55.0"), 2)
         # The node version is measurement only (no required major): captured in the JSON and the summary.
         for result in results:
             self.assertIsInstance(result["nodeVersion"], str)
             self.assertTrue(result["nodeVersion"])
-        self.assertEqual(stderr.getvalue().count("node=" + results[0]["nodeVersion"]), 6)
+        self.assertEqual(stderr.getvalue().count("node=" + results[0]["nodeVersion"]), 8)
         journal = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
-        self.assertEqual(len(journal), 6)
+        self.assertEqual(len(journal), 8)
+        # The guarded measurement keeps its tool result and says whether PSI was synthesized.
+        for result in [r for r in results if r.get("leg") == "guarded"]:
+            self.assertEqual(result["tool"]["pressure"]["code"], "worker_memory_pressure")
+            self.assertIs(result["psiSynthesized"], True)
 
     def test_diagnostic_oom_or_timeout_is_a_recorded_measurement_not_failure(self):
         for mode in ("diag-oom", "diag-timeout"):
@@ -455,9 +491,38 @@ class RunnerTest(unittest.TestCase):
                 host, directory, env = self.diagnostic_host(mode)
                 with env, contextlib.redirect_stderr(io.StringIO()) as stderr:
                     results = host.measure_diagnostics()
-                self.assertEqual(len(results), 6)
+                self.assertEqual(len(results), 8)
                 self.assertIn("oom_killed" if mode == "diag-oom" else "timed_out", stderr.getvalue())
                 self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+
+    def test_guarded_measurement_outcomes_are_recorded_not_failures(self):
+        for mode, outcome in (("guarded-oom-before-guard", "oom_before_guard"), ("guarded-killed", "container_killed_no_report")):
+            with self.subTest(mode=mode):
+                (self.root / "state.json").write_text("{}")
+                host, directory, env = self.diagnostic_host(mode)
+                with env, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    results = host.measure_diagnostics()
+                guarded = [r for r in results if r.get("leg") == "guarded"]
+                self.assertEqual([r["tool"]["outcome"] for r in guarded], [outcome, outcome])
+                self.assertIn(outcome, stderr.getvalue())
+                self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+                self.assertEqual(host.requests, [])
+
+    def test_guarded_harness_faults_fail_after_owned_cleanup(self):
+        # Reaching the guarded container means the three plain workloads of the first size ran first.
+        for mode in ("guarded-hung", "guarded-leak", "guarded-unquiesced", "guarded-wrong-tool"):
+            with self.subTest(mode=mode):
+                (self.root / "state.json").write_text("{}")
+                host, directory, env = self.diagnostic_host(mode)
+                with env, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(ValueError):
+                    host.measure_diagnostics()
+                calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+                creates = [c for c in calls if c[:2] == ["docker", "create"]]
+                self.assertEqual(len(creates), 4)
+                self.assertTrue(creates[-1][-1] in calibration.DIAG_GUARDED_WORKLOADS)
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "rm"]]), 4)
+                self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+                self.assertTrue((directory / "node-diagnostic.json").exists())
 
     def test_diagnostic_nonzero_host_exit_is_recorded(self):
         host, _, env = self.diagnostic_host("diag-nonzero")

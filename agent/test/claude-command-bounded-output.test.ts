@@ -51,6 +51,20 @@ test("exactly the cap is not truncated and one more character is", { timeout: 10
   assert.ok(r.text.length <= INLINE_CAP_CHARS);
 });
 
+test("a render budget below the cap bounds the text, cutting output that would otherwise fit", { timeout: 10000 }, () => {
+  for (const size of [100, 500, 29_000, 30_000, 100_000]) {
+    const out = new BoundedOutput();
+    feed(out, `HEAD${"m".repeat(size)}TAIL`);
+    const r = out.render(400);
+    assert.ok(r.text.length <= 400, `${String(size)} chars rendered ${String(r.text.length)}`);
+    assert.equal(r.truncated, size + 8 > 400);
+  }
+  const out = new BoundedOutput();
+  feed(out, "x".repeat(INLINE_CAP_CHARS));
+  assert.equal(out.render(INLINE_CAP_CHARS + 5000).text.length, INLINE_CAP_CHARS, "the budget never exceeds the inline cap");
+  assert.equal(out.render(1000).truncated, true);
+});
+
 test("200 MiB of streamed output keeps retained worker memory bounded", { timeout: 60000 }, () => {
   const out = new BoundedOutput([SECRET]);
   const chunk = Buffer.alloc(64 * 1024, "y");

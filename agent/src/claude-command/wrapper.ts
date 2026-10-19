@@ -18,6 +18,14 @@
 //     shared), and procfs exposes the supervisor argv, spill path included. The stall is
 //     bounded by the stalled command's deadline and never reaches the worker, which never
 //     opens the spill path;
+//   - the spill's parent directory must also be physically where the path names it
+//     (`cd -P` plus `pwd` equal to the dirname, so the caller passes a path built from the
+//     resolved worktree): model code at the same uid can replace `.uzi`, `.uzi/scratch` or
+//     `.uzi/scratch/uzi-cmd` with a symlink to another writable directory, and the unredacted
+//     spill would then land outside the scratch area, possibly in a tracked path. Any mismatch
+//     (or an uncreatable parent) redirects the spill to /dev/null like the final-component
+//     refusal. A parent swapped after this check, before the asynchronous spill open, is the
+//     same class of bounded same-uid race as the one above;
 //   - the writer `tee >( { head -c cap > spill; cat >/dev/null; } ); wait` forwards every byte
 //     to the wrapper's stdout (the supervisor transport) and spills at most `cap` bytes, then
 //     keeps draining, so a full cap or a failed spill open never SIGPIPEs the command; its
@@ -52,8 +60,9 @@ export const WRAPPER = [
   'grace=${4:-50}',
   '[[ $grace =~ ^[0-9]{1,3}$ ]] || grace=50',
   '(( 10#$grace > 50 )) && grace=50',
-  'mkdir -p -- "$(dirname -- "$spill")" 2>/dev/null',
-  'if [[ -e $spill || -L $spill ]]; then spill=/dev/null; fi',
+  'dir=$(dirname -- "$spill")',
+  'mkdir -p -- "$dir" 2>/dev/null',
+  'if [[ -e $spill || -L $spill || "$(cd -P -- "$dir" 2>/dev/null && pwd)" != "$dir" ]]; then spill=/dev/null; fi',
   'exec {w}> >(tee >( { head -c "$cap" 2>/dev/null > "$spill"; cat >/dev/null; } ); wait)',
   'writer=$!',
   'exec 2>/dev/null',

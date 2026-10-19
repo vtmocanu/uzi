@@ -646,7 +646,7 @@ whose capability bounding set or NoNewPrivs fails the supervisor profile.
 
 **Not built.** The API does not check whether a worker can run Claude
 guard-bound work before dispatching it; that server-side eligibility gate is a
-maintainer follow-up. Until then, enable the guard fleet-wide only after
+maintainer follow-up, tracked as [#3142](https://github.com/vtmocanu/uzi/issues/3142). Until then, enable the guard fleet-wide only after
 checking that workers pass the preflight, and watch for refused startups
 after enabling it.
 

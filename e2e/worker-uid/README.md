@@ -242,7 +242,7 @@ an active-leg failure. A demonstrated unavailable reader before any command
 launch permits collecting the other size's failed prerequisite evidence.
 
 Earlier local prerequisite probes lacked `memory.pressure` at both sizes.
-On any such host this fixture fails before load; there is no PSI substitute or
+On any such host this fixture fails before load; it has no PSI substitute (only the Node diagnostic guarded leg below does) or
 privileged fallback. CI acceptance requires both complete successful bound
 reports; local prerequisite failures and synthetic regressions provide no
 measurement acceptance. Docker-free regression data lives in
@@ -253,6 +253,44 @@ python3 -B -m unittest discover -s e2e/worker-uid -p 'calibration*_test.py'
 node --import ./agent/node_modules/tsx/dist/loader.mjs --test --test-concurrency=1 --test-timeout=120000 e2e/worker-uid/calibration-producer.test.mts
 cd agent && npx tsc --noEmit -p ../e2e/worker-uid/tsconfig.json
 ```
+
+### Node assert diagnostic calibration (issue #2471)
+
+After the two reports, `calibration.py` runs a measurement-only step of eight serial
+containers (both sizes, same flags as the fixtures, `--user 10003`, capless, no network).
+Per size: the generic Node 24 workload `many-mismatch` (`assert.deepStrictEqual` on two
+200,000-pair arrays, every second pair differing) and its two controls, `equivalent`
+(equal arrays) and `bounded-diagnostic` (boolean compare plus a fixed short message), each
+as a plain child so a kernel OOM kill is observable; and the **guarded leg**
+`guarded-many-mismatch`, the same workload run as a guarded Claude command. The guarded
+leg drives the real `ClaudeCommandLane` (`lane.hook` then `lane.handle`, as the SDK does),
+the real `launchRunnerCommandRoot` with the image supervisor at the container's own uid,
+a real `WorkerMemoryCommands` context, the real `WorkerMemoryReader` and the real
+`WorkerMemoryMonitor`; only the reservation ack service is a loopback fixture
+(`calibration-claude-guard.mts`). Each result is one JSON line between the
+`UZI_NODE_DIAGNOSTIC_BEGIN/END` markers and is kept in `node-diagnostic.json`.
+
+The guarded measurement reports the node version; the sampled series
+(`[sampleId, ms, currentBytes]`, bounded to 200) and peak growth; the threshold-crossing
+sample, reservation request/grant, cancel and confirmed-drain times with the derived
+crossing-to-reserve, cancel-to-drain and crossing-to-drain latencies; the exact
+`worker_memory_pressure` tool result the lane returned for the attributed tool use (or the
+recorded `oom_before_guard`, `deadline`, `exited_before_guard` or `other` outcome); and
+cleanup evidence (lane live count and quiesce, empty registry, the command's pids gone, no
+leftover process, `oom_kill` delta, `memory.peak`). The guard's high-water mark (half the
+cgroup limit), the 250 ms sampling period and the 5 s response budget are measurement
+parameters picked to give the guard room to act, never hosted production thresholds. A guard
+that did not act in time or an OOM kill is a recorded result; a lane or launcher construction
+failure, unparseable output or unconfirmed cleanup fails like any host error, after the owned
+container is removed. A kernel kill of the container's main process before it reports (exit
+137) is recorded as `container_killed_no_report`.
+
+A host kernel without PSI (no `memory.pressure`) makes the production reader report
+`absent`. Only in this guarded leg's harness the reader gets a `readBytes` that is the real
+bounded read except that an absent `memory.pressure` is replaced by an all-zero PSI
+document; every other file (current, max, stat, events) stays real. Any such run sets
+`psiSynthesized: true` in the measurement, so a report never claims real PSI. The two
+Codex fixtures above have no such substitute and still fail on that host.
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.

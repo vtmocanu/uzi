@@ -2,6 +2,10 @@
 // calibration.py (measure_diagnostics) as `calibration-diagnostic.mts <workload>`.
 // The parent spawns a CHILD node running the workload so an OOM kill of the child is
 // observable, then prints exactly one compact JSON result between marker lines.
+//
+// The GUARDED leg (`guarded-many-mismatch`) runs the same many-mismatch workload as a guarded
+// command through the real Claude command lane, launcher, reader and monitor
+// (calibration-claude-guard.mts) and prints one compact JSON measurement between the same markers.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -12,6 +16,7 @@ export const BEGIN = "UZI_NODE_DIAGNOSTIC_BEGIN";
 export const END = "UZI_NODE_DIAGNOSTIC_END";
 export const WORKLOADS = ["many-mismatch", "equivalent", "bounded-diagnostic"] as const;
 export type Workload = (typeof WORKLOADS)[number];
+export const GUARDED_WORKLOAD = "guarded-many-mismatch";
 // Pairs per array; every second pair mismatches in the mismatching workloads.
 export const PAIRS = 200_000;
 export const CHILD_DEADLINE_MS = 20_000;
@@ -99,6 +104,24 @@ async function parent(workload: Workload) {
   console.log(END);
 }
 
+// The guarded leg: the child command line is this same file's `--child many-mismatch` mode.
+async function guarded() {
+  const { measureGuardedLeg } = await import("./calibration-claude-guard.mjs");
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const command = [process.execPath, ...process.execArgv, new URL(import.meta.url).pathname, "--child", "many-mismatch"].map(quote).join(" ");
+  const limitBytes = Number(readText("/sys/fs/cgroup/memory.max")?.trim());
+  const scratch = process.env["TMPDIR"] ?? "/tmp";
+  const worktree = scratch + "/guarded-worktree";
+  fs.mkdirSync(worktree, { recursive: true });
+  const env = { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C", HOME: process.env["HOME"] ?? scratch, TMPDIR: scratch };
+  const measured = await measureGuardedLeg({ command, limitBytes, worktree, env });
+  const result = { schemaVersion: 1, workload: GUARDED_WORKLOAD, nodeVersion: process.version, pairs: PAIRS,
+    childWorkload: "many-mismatch", ...measured };
+  console.log(BEGIN);
+  console.log(JSON.stringify(result));
+  console.log(END);
+}
+
 function isWorkload(value: unknown): value is Workload {
   return (WORKLOADS as readonly unknown[]).includes(value);
 }
@@ -108,6 +131,8 @@ if (process.argv[1]?.endsWith("calibration-diagnostic.mts")) {
   if (args[0] === "--child") {
     if (!isWorkload(args[1])) throw new Error("unknown workload");
     console.log(JSON.stringify(runWorkload(args[1])));
+  } else if (args[0] === GUARDED_WORKLOAD) {
+    await guarded();
   } else {
     if (!isWorkload(args[0])) throw new Error("unknown workload");
     await parent(args[0]);

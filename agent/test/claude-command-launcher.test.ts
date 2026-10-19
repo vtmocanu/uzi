@@ -492,7 +492,8 @@ const version = process.platform === "linux" ? bashVersion() : undefined;
 const WRAPPER_SKIP = version && (version.major > 5 || (version.major === 5 && version.minor >= 1))
   ? false : "needs Linux with /bin/bash 5.1 or later (wait for the last process substitution)";
 
-const scratchRoot = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "claude-command-launcher-"));
+// Resolved: the wrapper only spills when the spill parent is physically where it is named.
+const scratchRoot = fs.realpathSync(fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), "claude-command-launcher-")));
 after(() => { fs.rmSync(scratchRoot, { recursive: true, force: true }); });
 let counter = 0;
 const nextSpill = (): string => path.join(scratchRoot, `spill-${String(++counter)}`, "call.log");
@@ -678,6 +679,34 @@ describe("WRAPPER under the host bash", () => {
     assert.equal(fs.readFileSync(target, "utf8"), "KEEP");
     assert.equal(fs.existsSync(missing), false);
     assert.equal(fs.lstatSync(fifo).isFIFO(), true);
+  });
+
+  it("never spills through a symlinked parent directory or ancestor, and keeps the status and output", { skip: WRAPPER_SKIP }, async () => {
+    const base = path.join(scratchRoot, "symlinked-parent");
+    const outside = path.join(base, "outside");
+    fs.mkdirSync(outside, { recursive: true });
+    // (a) the immediate parent (.uzi/scratch/uzi-cmd) is a symlink to an outside directory.
+    const wtA = path.join(base, "wt-a");
+    fs.mkdirSync(path.join(wtA, ".uzi", "scratch"), { recursive: true });
+    fs.symlinkSync(outside, path.join(wtA, ".uzi", "scratch", "uzi-cmd"));
+    const runA = await runWrapper("echo visible; exit 6", { spill: path.join(wtA, ".uzi", "scratch", "uzi-cmd", "a.log") });
+    assert.equal(runA.code, 6);
+    assert.equal(runA.head, "visible\n");
+    // (b) an ancestor (.uzi/scratch) is a symlink to an outside directory.
+    const wtB = path.join(base, "wt-b");
+    fs.mkdirSync(path.join(wtB, ".uzi"), { recursive: true });
+    fs.symlinkSync(outside, path.join(wtB, ".uzi", "scratch"));
+    const runB = await runWrapper("echo visible; exit 7", { spill: path.join(wtB, ".uzi", "scratch", "uzi-cmd", "b.log") });
+    assert.equal(runB.code, 7);
+    assert.equal(runB.head, "visible\n");
+    // The wrapper's mkdir -p may still create an empty directory through the ancestor link; no file lands.
+    const files = fs.readdirSync(outside, { recursive: true, withFileTypes: true }).filter((e) => !e.isDirectory());
+    assert.deepEqual(files, [], "no spill file was written outside the scratch area");
+    // A real parent chain still spills.
+    const spill = path.join(base, "wt-c", ".uzi", "scratch", "uzi-cmd", "c.log");
+    const runC = await runWrapper("echo spilled", { spill });
+    assert.equal(runC.code, 0);
+    assert.equal(fs.readFileSync(spill, "utf8"), "spilled\n");
   });
 
   it("caps the spill at the byte limit while the transport still receives every byte", { skip: WRAPPER_SKIP }, async () => {

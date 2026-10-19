@@ -15,6 +15,7 @@
 // trips the turn with a GuardedCommandUnconfirmedError and refuses every later command.
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import type { HookCallback, HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import type { CapturedMemoryContext } from "../codex/broker.js";
@@ -192,6 +193,8 @@ export class ClaudeCommandLane {
   private readonly maxTimeoutMs: number;
   private readonly spillCapBytes: number;
   private readonly redact: (text: string) => string;
+  /** The physical worktree the spill path is built from (see WRAPPER's parent check). */
+  private readonly spillRoot: string;
   private readonly live = new Map<string, LiveCommand>();
   private readonly roots = new Map<string, RecordedRoot>();
   private readonly records = new Map<string, string>();
@@ -214,6 +217,10 @@ export class ClaudeCommandLane {
     this.maxTimeoutMs = opts.maxTimeoutMs ?? MAX_COMMAND_TIMEOUT_MS;
     this.spillCapBytes = opts.spillCapBytes ?? SPILL_CAP_BYTES;
     this.redact = makeTextRedactor([...opts.secrets]);
+    // The wrapper only spills when the spill parent is physically where it is named, so the path
+    // must be built from the resolved worktree. When it cannot be resolved, hand the wrapper a
+    // path it rejects (the command still runs, unspilled).
+    try { this.spillRoot = fs.realpathSync(opts.worktree); } catch { this.spillRoot = "/dev/null"; }
   }
 
   /** Commands currently launching or running. */
@@ -397,7 +404,7 @@ export class ClaudeCommandLane {
         command: args.command,
         cwd: this.opts.worktree,
         env: guardedCommandEnv(this.opts.cliEnv),
-        spillPath: path.join(this.opts.worktree, spillRel),
+        spillPath: path.join(this.spillRoot, spillRel),
         spillCapBytes: this.spillCapBytes,
         supervisorBin: SUPERVISOR_BIN,
         onSpawned: (root, child) => {
@@ -453,7 +460,12 @@ export class ClaudeCommandLane {
     // (10) First of: wrapper exit, abort (call, turn, lane), deadline. The deadline timer is the
     // worker's own and independent of the MCP transport timeout.
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<FirstEvent>((resolve) => { timer = setTimeout(() => resolve({ kind: "deadline" }), timeoutMs); });
+    // The deadline is also a signal, so an enrollment still observing when it fires stops at once
+    // instead of letting the command run on for the rest of the observe budget.
+    const deadlineAc = new AbortController();
+    const deadline = new Promise<FirstEvent>((resolve) => {
+      timer = setTimeout(() => { deadlineAc.abort(); resolve({ kind: "deadline" }); }, timeoutMs);
+    });
     const sources = [live.ac.signal, callSignal, this.turnSignal].filter((s): s is AbortSignal => s !== undefined);
     const removers: Array<() => void> = [];
     const aborted = new Promise<FirstEvent>((resolve) => {
@@ -474,13 +486,15 @@ export class ClaudeCommandLane {
     try {
       // (8) Enrol while the command already runs and drains.
       try {
-        enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, AbortSignal.any(sources));
+        enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, AbortSignal.any([...sources, deadlineAc.signal]));
       } catch (error) { enrollError = error; }
       let first: FirstEvent;
       if (enrollError === undefined) {
         first = await Promise.race([exit, deadline, aborted]);
       } else if (callSignal?.aborted || this.turnSignal?.aborted || live.ac.signal.aborted) {
         first = { kind: "aborted" };
+      } else if (deadlineAc.signal.aborted) {
+        first = { kind: "deadline" };
       } else if (enrollError instanceof Error && enrollError.message === ADMISSION_CLOSED_MESSAGE) {
         first = { kind: "admission_closed" };
       } else {
@@ -565,40 +579,57 @@ export class ClaudeCommandLane {
     eofSeen: boolean,
     extraNotes: readonly string[],
   ): ToolTextResult {
-    const rendered = output.render();
-    const notes: string[] = [];
-    if (rendered.truncated) {
-      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; ${rendered.previewOmitted
-        ? "no inline preview is shown, because a configured secret is too long to redact safely across the cut"
-        : "the text above is a preview (start and end)"}. A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`);
-      if (output.totalBytes > this.spillCapBytes) {
-        notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
+    const spillNote = (previewOmitted: boolean): string => `Output exceeded ${String(INLINE_CAP_CHARS)} characters; ${previewOmitted
+      ? "no inline preview is shown, because a configured secret is too long to redact safely across the cut"
+      : "the text above is a preview (start and end)"}. A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`;
+    const notesFor = (truncated: boolean, previewOmitted: boolean): string[] => {
+      const notes: string[] = [];
+      if (truncated) {
+        notes.push(spillNote(previewOmitted));
+        if (output.totalBytes > this.spillCapBytes) {
+          notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
+        }
       }
-    }
-    notes.push(...extraNotes);
-    if (!eofSeen) {
-      notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
-    }
-    const compose = (headline: string, isError: boolean): ToolTextResult => {
-      const parts = [headline];
-      if (rendered.text.length > 0) parts.push(rendered.text);
-      if (notes.length > 0) parts.push(notes.map((note) => `[${note}]`).join("\n"));
-      return asText(parts.join("\n"), isError);
+      notes.push(...extraNotes);
+      if (!eofSeen) {
+        notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
+      }
+      return notes;
     };
+    const { headline, isError } = this.headlineOf(first, timeoutMs);
+    const compose = (text: string, notes: readonly string[]): string => {
+      const parts = [headline];
+      if (text.length > 0) parts.push(text);
+      if (notes.length > 0) parts.push(notes.map((note) => `[${note}]`).join("\n"));
+      return parts.join("\n");
+    };
+    // The whole returned text, headline and notes included, stays within INLINE_CAP_CHARS.
+    let rendered = output.render();
+    if (compose(rendered.text, notesFor(rendered.truncated, rendered.previewOmitted === true)).length > INLINE_CAP_CHARS) {
+      // Reserve room for the headline and the (longest) truncation notes, then render to fit.
+      const reserved = compose("", notesFor(true, true)).length + 1;
+      rendered = output.render(INLINE_CAP_CHARS - reserved);
+    }
+    const notes = notesFor(rendered.truncated, rendered.previewOmitted === true);
+    return asText(compose(rendered.text, notes), isError);
+  }
+
+  private headlineOf(first: FirstEvent, timeoutMs: number): { headline: string; isError: boolean } {
+    const err = (headline: string) => ({ headline, isError: true });
     switch (first.kind) {
-      case "exit": return compose(`Exit code: ${String(first.code)}`, first.code !== 0);
+      case "exit": return { headline: `Exit code: ${String(first.code)}`, isError: first.code !== 0 };
       case "deadline":
-        return compose(`Command timed out after ${String(timeoutMs)} ms; it and all its descendants were stopped.`, true);
+        return err(`Command timed out after ${String(timeoutMs)} ms; it and all its descendants were stopped.`);
       case "aborted":
-        return compose("Command was cancelled; it and all its descendants were stopped.", true);
+        return err("Command was cancelled; it and all its descendants were stopped.");
       case "admission_closed":
-        return compose(`Command was started, then stopped because memory-guard admission closed (worker_memory_pressure): ${MEMORY_MESSAGE} It and all its descendants were stopped.`, true);
+        return err(`Command was started, then stopped because memory-guard admission closed (worker_memory_pressure): ${MEMORY_MESSAGE} It and all its descendants were stopped.`);
       case "enroll_failed":
-        return compose(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
+        return err(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`);
       case "guard_unread":
-        return compose(`Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read${first.exitCode === undefined ? "" : `; the command's own exit code was ${String(first.exitCode)}`}; it and all its descendants were stopped. Retry with smaller or serial commands.`, true);
+        return err(`Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read${first.exitCode === undefined ? "" : `; the command's own exit code was ${String(first.exitCode)}`}; it and all its descendants were stopped. Retry with smaller or serial commands.`);
       case "failed":
-        return compose(`Command supervision failed (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
+        return err(`Command supervision failed (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`);
     }
   }
 }

@@ -552,8 +552,8 @@ runs once at startup, and until then each new run claim on that worker, includin
 requeued run that lands back on it, fails with "Worker memory enrollment
 requires the full worker claim and registration" and is reported as a run
 failure. This now applies to Claude claims too. A server-side check that sends
-Claude guard-bound work only to capable workers is not built; maintainers
-file it as a follow-up.
+Claude guard-bound work only to capable workers is not built; it is tracked as
+[#3142](https://github.com/vtmocanu/uzi/issues/3142).
 
 After an intervention, another intervention/retry requires confirmed drain,
 a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample

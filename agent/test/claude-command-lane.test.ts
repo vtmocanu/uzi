@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { PassThrough } from "node:stream";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
 import type { CapturedMemoryContext } from "../src/codex/broker.js";
@@ -463,9 +465,51 @@ test("output over 30000 characters is a preview that names the repo-relative spi
   assert.match(body, /best-effort basis \(it may be absent or truncated\)/);
   assert.doesNotMatch(body, /is also written to/);
   assert.ok(body.includes("HEAD") && body.includes("TAIL"));
-  const inline = body.slice(body.indexOf("\n") + 1, body.indexOf("\n[Output exceeded"));
-  assert.ok(inline.length <= 30_000, `inline ${String(inline.length)}`);
+  assert.ok(body.length <= 30_000, `result ${String(body.length)}`);
   assert.doesNotMatch(body, /truncated at/);
+});
+
+test("the spill path is built from the resolved worktree, so a symlinked worktree still passes the wrapper's parent check", { timeout: 10000 }, async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "claude-lane-wt-")));
+  try {
+    fs.mkdirSync(path.join(root, "real"));
+    fs.symlinkSync(path.join(root, "real"), path.join(root, "link"));
+    const h = harness({ worktree: path.join(root, "link") });
+    await h.call({ command: "echo hi" });
+    assert.equal(h.specs[0]!.spillPath.startsWith(`${path.join(root, "real")}/.uzi/scratch/uzi-cmd/`), true, h.specs[0]!.spillPath);
+    assert.equal(h.specs[0]!.cwd, path.join(root, "link"));
+    // An unresolvable worktree hands the wrapper a path it rejects; the command still launches.
+    const gone = harness({ worktree: path.join(root, "missing") });
+    assert.match(text(await gone.call({ command: "echo hi" })), /^Exit code: 0/);
+    assert.equal(gone.specs[0]!.spillPath.startsWith("/dev/null/"), true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("the whole result text, headline and notes included, stays within 30000 characters", { timeout: 20000 }, async () => {
+  for (const size of [29_980, 29_990, 29_999, 30_000, 30_001, 60_000]) {
+    const h = harness();
+    h.script.current = (root) => { root.stdout.write("y".repeat(size)); setImmediate(() => root.exitWith(3)); };
+    const body = text(await h.call({ command: "gen" }));
+    assert.ok(body.length <= 30_000, `${String(size)} chars of output returned ${String(body.length)}`);
+    assert.match(body, /^Exit code: 3/);
+  }
+  // With the other notes present as well.
+  const h = harness();
+  h.script.current = (root) => { root.stdout.write("y".repeat(40_000)); setImmediate(() => root.exitWith(0)); };
+  assert.ok(text(await h.call({ command: "gen" })).length <= 30_000);
+});
+
+test("the command deadline stops a command whose enrollment is still observing", { timeout: 10000 }, async () => {
+  const h = harness({ cleanupMs: 4000 });
+  h.script.current = (root) => {
+    // The initial observe never answers; only the deadline can end the enrollment wait.
+    (root.handle as unknown as { observe: () => Promise<never> }).observe = () => new Promise<never>(() => {});
+  };
+  const startedAt = Date.now();
+  const r = await h.call({ command: "sleep 100", timeout: 50 });
+  assert.match(text(r), /Command timed out after 50 ms; it and all its descendants were stopped\./);
+  assert.equal(h.roots[0]!.disposes(), 1);
+  assert.ok(Date.now() - startedAt < 1500, `disposal began ${String(Date.now() - startedAt)} ms after the call, not within the deadline`);
 });
 
 test("more than 64 MiB of output states that the spill file is truncated and bounded", { timeout: 60000 }, async () => {
@@ -479,7 +523,7 @@ test("more than 64 MiB of output states that the spill file is truncated and bou
   const body = text(await h.call({ command: "gen" }));
   assert.match(body, /The spill file is truncated at 64 MiB; it is bounded and not the full output\./);
   assert.match(body, /preview/);
-  assert.ok(body.length < 31_000);
+  assert.ok(body.length <= 30_000, `result ${String(body.length)}`);
 });
 
 test("secrets are redacted from the inline output and the command text is never echoed", { timeout: 10000 }, async () => {

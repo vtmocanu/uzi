@@ -53,7 +53,7 @@ function wellFormedEdges(text: string): string {
 }
 
 export interface RenderedOutput {
-  /** The inline text, at most INLINE_CAP_CHARS characters. */
+  /** The inline text, at most the render budget (INLINE_CAP_CHARS by default). */
   readonly text: string;
   /** True when the middle of the output was omitted (the inline text is a preview). */
   readonly truncated: boolean;
@@ -110,26 +110,28 @@ export class BoundedOutput {
     if (this.tail.length > 2 * this.tailKeep) this.tail = this.tail.slice(-this.tailKeep);
   }
 
-  render(): RenderedOutput {
+  /** Render at most `maxChars` characters (default and upper bound INLINE_CAP_CHARS). */
+  render(maxChars: number = INLINE_CAP_CHARS): RenderedOutput {
+    const max = Math.min(INLINE_CAP_CHARS, maxChars);
     // Everything seen is still held: head and tail overlap or abut.
     const missing = this.chars - this.head.length;
     if (missing <= 0 || (missing <= this.tail.length)) {
       const full = missing <= 0 ? this.head : this.head + this.tail.slice(this.tail.length - missing);
       const clean = displaySafe(this.redact(full));
-      if (clean.length <= INLINE_CAP_CHARS) return { text: clean, truncated: false };
-      return this.cut(clean, clean, false);
+      if (clean.length <= max) return { text: clean, truncated: false };
+      return this.cut(clean, clean, false, max);
     }
-    return this.cut(this.redact(this.head), this.redact(this.tail), true);
+    return this.cut(this.redact(this.head), this.redact(this.tail), true, max);
   }
 
   /** Assemble head + marker + tail from redacted windows. `windowsAreEdges` is true when each
    *  window ends or starts at a retention edge (so the margin must be dropped when it is short). */
-  private cut(headWindow: string, tailWindow: string, windowsAreEdges: boolean): RenderedOutput {
+  private cut(headWindow: string, tailWindow: string, windowsAreEdges: boolean, max: number): RenderedOutput {
     if (this.previewUnsafe) {
       return { text: `\n[... output preview omitted: ${String(this.bytes)} bytes in total ...]\n`, truncated: true, previewOmitted: true };
     }
     const marker = `\n[... output truncated: ${String(this.bytes)} bytes in total; the middle is omitted ...]\n`;
-    const available = INLINE_CAP_CHARS - marker.length;
+    const available = Math.max(0, max - marker.length);
     const h = Math.ceil(available / 2);
     const t = available - h;
     let headPart: string;
