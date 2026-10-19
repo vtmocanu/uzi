@@ -33,7 +33,7 @@ if kind == "git":
     sys.exit(0)
 if kind == "timeout":
     assert args[0] == "--kill-after=5s"
-    assert float(args[1][:-1]) <= 65  # the guarded leg bound (DIAG_GUARDED_SECONDS)
+    assert float(args[1][:-1]) <= 90  # the guarded leg bound (DIAG_GUARDED_SECONDS)
     if mode == "timeout" and args[2:5] == ["docker", "start", "--attach"] and (root / "probe-done").exists():
         sys.exit(124)
     if args[2:5] == ["docker", "start", "--attach"]:

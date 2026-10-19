@@ -285,8 +285,8 @@ failure, a launch failure or lane refusal, a supervision or enrollment failure, 
 without the guard's result, a workload that never started (exit 127, an import error), unparseable
 output or unconfirmed cleanup fails like any host error, after the owned
 container is removed. A kernel kill of the container's main process before it reports (exit
-137) is recorded as `container_killed_no_report`. The guarded container's host bound is 65 s (the
-plain workloads keep 30 s), above the leg's ~52 s in-container worst case, so a slow `deadline`
+137) is recorded as `container_killed_no_report`. The guarded container's host bound is 90 s (the
+plain workloads keep 30 s), above the leg's ~59 s in-container worst case, so a slow `deadline`
 outcome is recorded rather than cut by the host.
 
 A host kernel without PSI (no `memory.pressure`) makes the production reader report

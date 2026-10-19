@@ -31,15 +31,16 @@ DIAG_SIZES = (1024 ** 3, 2 * 1024 ** 3)
 # create <=10s, inspect <=10s, start/capture <=bound+5s, owned cleanup <=29s. A plain workload's bound
 # is DIAG_SECONDS (30s), so ~84s worst case per container. The guarded leg's in-container worst case
 # is the sum of its own bounds (calibration-claude-guard.mts, calibration-diagnostic.mts): ~0.75s
-# baseline, <=10s for the launcher's started report, the 15s command deadline, <=~6s of post-deadline
-# dispose (1s grace plus 5s cleanup) and ended/pressure waits (allowed 10s), then the monitor settle
-# (8s) and the lane quiesce (8s): ~52s. DIAG_GUARDED_SECONDS (65s) exceeds that with ~13s margin, so
+# baseline, <=10s for the launcher's started report, the 15s command deadline, on the deadline path
+# <=7s of dispose (5s cleanup plus 2s join slack; the 1s grace applies only after an exit), then the
+# ended and pressure waits (5s each), the monitor settle (8s) and the lane quiesce (8s): ~59s, before
+# container start and the tsx compile. DIAG_GUARDED_SECONDS (90s) leaves a real margin over that, so
 # a slow but legitimate "deadline" outcome is recorded rather than cut by the host. Its container is
-# ~119s worst case, so the step adds at most ~12.4 minutes. About 14s is typical (the workload until the
+# ~144s worst case, so the step adds at most ~13.2 minutes. About 14s is typical (the workload until the
 # guard acts or the deadline, then bounded quiesce and settle); a hung leg is cut at
 # DIAG_GUARDED_SECONDS by the host and fails like any other host error.
 DIAG_SECONDS = 30
-DIAG_GUARDED_SECONDS = 65
+DIAG_GUARDED_SECONDS = 90
 DIAG_OUTPUT_BYTES = 64 * 1024
 # Host exit codes that mean the container's main process was killed by the kernel before it could
 # report (docker start --attach returns the container's exit code): a recorded guarded outcome, not
