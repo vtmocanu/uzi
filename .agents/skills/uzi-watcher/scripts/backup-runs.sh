@@ -569,7 +569,7 @@ select_clone(){
         and (.stage as $s | ["capturing","captured","adopting","ready-for-model","blocked"] | index($s) != null)
         and (if has("restoreTip") then (.restoreTip | sha) else true end)
         and (if has("successor") then (.successor | src) else true end)
-        and (if has("blocker") then (.blocker as $b | ["capture_failed","source_missing","adoption_failed","budget_exhausted","clock_invalid","oversize","prerequisites_unavailable","quiescence_failed","preservation_failed","decoded_history_limit"] | index($b) != null) else true end)
+        and (if has("blocker") then (.blocker as $b | ["capture_failed","source_missing","adoption_failed","budget_exhausted","clock_invalid","oversize","prerequisites_unavailable","quiescence_failed","preservation_failed","decoded_history_limit","readiness_cleanup_unconfirmed"] | index($b) != null) else true end)
         and (if .stage == "blocked" then has("blocker") else true end)
         and (if .stage == "captured" or .stage == "adopting" or .stage == "ready-for-model" then has("restoreTip") else true end)
         and (if .stage == "ready-for-model" then has("successor") else true end);

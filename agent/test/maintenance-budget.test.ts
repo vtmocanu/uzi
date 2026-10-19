@@ -108,6 +108,42 @@ test("late attempt activation reaches awaiting callers once and isolates run and
   assert.equal(MaintenanceBudget.current(), undefined);
 });
 
+test("operation cancellation forfeits only its inert waiter, retaining the original owner", async () => {
+  const stop = new AbortController();
+  let release!: (value: string) => void;
+  let ownerSettled = false;
+  const owner = new Promise<string>(resolve => { release = resolve; });
+  void owner.then(() => { ownerSettled = true; });
+  const waiting = MaintenanceBudget.waitFor(owner, stop.signal);
+  const rejected = assert.rejects(waiting, /operation stopped/);
+  try {
+    stop.abort(new Error("operation stopped"));
+    await rejected;
+    assert.equal(ownerSettled, false);
+  } finally { release("owner result"); await Promise.allSettled([owner, waiting, rejected]); }
+  assert.equal(await owner, "owner result");
+});
+
+test("operation signal preserves ambient maintenance fences and late activation", async t => {
+  let now = 0;
+  const budget = new MaintenanceBudget(10, () => now);
+  t.after(() => budget.dispose());
+  const operation = new AbortController();
+  let release!: () => void;
+  const owner = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await MaintenanceBudget.runAttempt("operation:1", () => budget, async () => {
+      const waiting = MaintenanceBudget.waitFor(owner, operation.signal);
+      const rejected = assert.rejects(waiting, /maintenance deadline/);
+      MaintenanceBudget.observeCancellation();
+      now = 10;
+      assert.throws(() => budget.check(), /maintenance deadline/);
+      await rejected;
+      assert.equal(operation.signal.aborted, false);
+    });
+  } finally { release(); await owner; }
+});
+
 test("attempt activation inherits an expired explicit cap without renewing", t => {
   let now = 0, factories = 0;
   const budget = new MaintenanceBudget(10, () => now);

@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { CheckpointSoftDeadlineError } from "../src/git.js";
 import { SinkGate } from "../src/sink-gate.js";
 
 // issue #1597 M2 — the per-flight sink gate: gated paths serialise, a tick only try-acquires and is
@@ -106,6 +107,42 @@ describe("SinkGate (issue #1597 M2)", () => {
   it("releases on a throw", async () => {
     const gate = new SinkGate();
     await assert.rejects(gate.run(async () => { throw new Error("x"); }), /x/);
+    assert.equal(gate.isHeld(), false);
+  });
+});
+
+
+describe("m1 cooperative sink admission", () => {
+  it("forfeits the middle waiter without overtaking the active predecessor", async () => {
+    const gate = new SinkGate();
+    let release!: () => void;
+    const events: string[] = [];
+    const active = gate.run(async () => { await new Promise<void>(r => { release = r; }); events.push("active"); });
+    await tick();
+    const stop = new AbortController();
+    const cancelled = gate.run(async () => { assert.fail("cancelled waiter ran"); }, { signal: stop.signal });
+    const rejection = assert.rejects(cancelled, CheckpointSoftDeadlineError);
+    const third = gate.run(async () => { events.push("third"); });
+    stop.abort();
+    await rejection;
+    assert.deepEqual(events, []);
+    release();
+    await Promise.all([active, third]);
+    assert.deepEqual(events, ["active", "third"]);
+  });
+  it("checks already stopped and reentrant calls before running", async () => {
+    const gate = new SinkGate();
+    const stop = new AbortController(); stop.abort();
+    await assert.rejects(gate.run(async () => assert.fail("ran"), { signal: stop.signal }), CheckpointSoftDeadlineError);
+    await gate.run(async () => {
+      await assert.rejects(gate.run(async () => assert.fail("reentered"), { signal: stop.signal }), CheckpointSoftDeadlineError);
+    });
+    assert.equal(gate.isHeld(), false);
+  });
+  it("handles synchronous tick release during preemption", async () => {
+    const gate = new SinkGate();
+    const release = gate.tryAcquire(() => release!());
+    await gate.run(async () => {});
     assert.equal(gate.isHeld(), false);
   });
 });

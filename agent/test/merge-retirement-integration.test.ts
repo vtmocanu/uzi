@@ -97,6 +97,8 @@ it("combined report and recovery cancellation settles both before releasing the 
   reportAbort.abort();
   await firstCancel.promise;
   recoveryAbort.abort();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(cancellations, 2, "both independent cancellation requests must be admitted before terminal completion");
   await secondCancel.promise;
   const next = git.withBareLock(f.bare, async () => { successor = true; });
   closed.resolve(); stdout.end(); stderr.end();

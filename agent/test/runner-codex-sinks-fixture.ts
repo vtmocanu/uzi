@@ -202,6 +202,29 @@ export function manualDeadline(boundary: BoundaryRequest["boundary"]): {
 
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Absolute virtual clock with independently cancelled deadlines; no real long waits. */
+export function virtualBoundaryClock() {
+  let current = Date.now();
+  const pending = new Set<{ at: number; fire: () => void }>();
+  const budgets: Array<{ boundary: string; sink?: string; ms: number }> = [];
+  const arm = (fire: () => void, ms: number) => {
+    const entry = { at: current + ms, fire };
+    pending.add(entry);
+    return { deadlineAt: entry.at, cancel: () => { pending.delete(entry); } };
+  };
+  const armDeadline: ArmBoundaryDeadline = (request, ms, fire) => {
+    budgets.push({ boundary: request.boundary, sink: request.sink, ms });
+    return arm(fire, ms).cancel;
+  };
+  return { now: () => current, arm, armDeadline, budgets,
+    advance(ms: number) {
+      current += ms;
+      const due = [...pending].filter(entry => entry.at <= current);
+      for (const entry of due) if (pending.delete(entry)) entry.fire();
+    },
+  };
+}
+
 export function codexRig(
   opts: {
     authMode?: "subscription" | "api_key";
@@ -211,6 +234,7 @@ export function codexRig(
     blockReconcile?: boolean;
     /** Forwarded to createCodexExecutionSafety (issue #1513): event-gates a boundary deadline. */
     armDeadline?: ArmBoundaryDeadline;
+    now?: () => number;
     /** Delay before each permit-held process spawn: reproduces suite load deterministically. */
     processSpawnDelayMs?: number;
     /** Replace one test-owned boundary process, leaving every other Git child real. */
@@ -308,6 +332,7 @@ export function codexRig(
       };
     },
     opts.armDeadline,
+    opts.now,
   );
   const boundaries: string[] = [];
   const disposeBoundaries: string[] = [];

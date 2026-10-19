@@ -433,6 +433,8 @@ export class FakeApi {
    *  that predates the feature); `postStatus` is the POST status (204 = saved). Every call is
    *  recorded so a test can assert exactly what the worker read and saved. */
   decisionsMemo: { get?: { status: number; body: unknown }; postStatus: number } = { postStatus: 204 };
+  interruptedCallsResponse?: { status: number; body: unknown };
+  readonly interruptedCallsGets: Array<{ runId: string; generation: string | null; nonce: string | undefined }> = [];
   readonly decisionsMemoGets: Array<{ runId: string; claimGeneration: string | null }> = [];
   readonly decisionsMemoPosts: Array<{ runId: string; body: { claim_generation?: number; body?: string } }> = [];
 
@@ -1473,6 +1475,16 @@ export class FakeApi {
       if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
       if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
       return send(res, 200, o.identity);
+    }
+
+    const interruptedMatch = /^\/api\/worker\/runs\/([^/]+)\/interrupted-calls$/.exec(p);
+    if (req.method === "GET" && interruptedMatch) {
+      this.interruptedCallsGets.push({
+        runId: interruptedMatch[1]!, generation: url.searchParams.get("claim_generation"),
+        nonce: req.headers["x-worker-register-nonce"] as string | undefined,
+      });
+      const response = this.interruptedCallsResponse;
+      return send(res, response?.status ?? 404, response?.body ?? {});
     }
 
     // Issue #2083: the decisions-memo routes.

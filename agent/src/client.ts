@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
@@ -868,6 +869,8 @@ export interface ClientOptions {
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
+  /** #3124: combined headers+body bound for the optional interrupted-calls read. Injected by tests. */
+  interruptedCallsTimeoutMs?: number;
 }
 
 export type CodexReleaseExpectation =
@@ -1156,6 +1159,32 @@ export class WorkerClient {
   private completionIncarnation = 0;
   // Input observations are invalidated at registration entry, including same-ID failures.
   private inputObservationEpoch = 0;
+  private interruptedEpoch = 0;
+  private interruptedIdentity: InterruptedRegistration | undefined;
+
+  get interruptedCallsRegistration(): InterruptedRegistration | undefined { return this.interruptedIdentity; }
+
+  revokeInterruptedCallsAuthority(): void {
+    ++this.interruptedEpoch;
+    this.interruptedIdentity = undefined;
+  }
+
+  async getInterruptedCalls(runId: string, generation: number, identity: InterruptedRegistration, signal: AbortSignal): Promise<InterruptedCalls | undefined> {
+    if (this.interruptedIdentity !== identity) return;
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(this.interruptedCallsTimeoutMs)]);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/interrupted-calls?claim_generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.interruptedCallsTimeoutMs, deadline, { "X-Worker-Register-Nonce": identity.nonce });
+    if (res.status !== 200) {
+      void res.body?.cancel().catch(() => undefined);
+      return;
+    }
+    const bytes = await readBoundedBytes(res, 16 * 1024, true, deadline);
+    const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    MaintenanceBudget.current()?.check();
+    deadline.throwIfAborted();
+    if (this.interruptedIdentity !== identity) return;
+    return decodeInterruptedCalls(raw, runId, generation, identity);
+  }
   private completionRetirementIncarnation: Readonly<object> = {};
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
@@ -1187,6 +1216,7 @@ export class WorkerClient {
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
+  private readonly interruptedCallsTimeoutMs: number;
   /**
    * API-supported FEATURES, distinct from the image's implemented capabilities.
    * Register replaces this cache; complete readable heartbeat responses up to 1 MiB
@@ -1211,6 +1241,11 @@ export class WorkerClient {
 
   /** Fence pending registration completions as well as already captured permits. */
   revokeMemoryAuthority(): void {
+    this.revokeInterruptedCallsAuthority();
+    this.revokeMemoryOnlyAuthority();
+  }
+
+  private revokeMemoryOnlyAuthority(): void {
     ++this.memoryRegistrationRevision;
     this.invalidateMemoryIncarnation();
   }
@@ -1320,7 +1355,7 @@ export class WorkerClient {
 
   private replaceServerFeatures(features: readonly string[]): void {
     this.serverFeatures = new Set(features);
-    if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryAuthority();
+    if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryOnlyAuthority();
   }
 
   constructor(
@@ -1337,6 +1372,7 @@ export class WorkerClient {
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
+    this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
 
   async register(
@@ -1348,6 +1384,8 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
+    this.revokeInterruptedCallsAuthority();
+    const interruptedEpoch = this.interruptedEpoch;
     const memoryRevision = ++this.memoryRegistrationRevision;
     this.invalidateMemoryIncarnation();
     this.inputObservationEpoch++;
@@ -1387,6 +1425,8 @@ export class WorkerClient {
     // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
     if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    if (interruptedEpoch !== this.interruptedEpoch) return res;
+    this.interruptedIdentity = interruptedRegistration(res.worker_id, res.register_nonce, interruptedEpoch);
     if (memoryRevision !== this.memoryRegistrationRevision) return res;
     if (Array.isArray(res.protocol_features) && res.protocol_features.includes("worker_memory_pressure_v1")
       && memoryUUID(res.worker_id) && memoryNonce(res.register_nonce)) {
@@ -1471,7 +1511,7 @@ export class WorkerClient {
    *  closes and every other negotiated extension stays on. */
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
-    if (f === "worker_memory_pressure_v1") this.revokeMemoryAuthority();
+    if (f === "worker_memory_pressure_v1") this.revokeMemoryOnlyAuthority();
   }
 
   async heartbeat(
@@ -4057,10 +4097,12 @@ export class WorkerClient {
     body: unknown,
     timeoutMs = this.httpTimeoutMs,
     callerSignal?: AbortSignal,
+    requestHeaders?: Readonly<Record<string, string>>,
   ): Promise<Response> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
       "X-Client-Version": this.version,
+      ...requestHeaders,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     // `body` is SET CONDITIONALLY rather than passed as `body: undefined` (PRD #103
