@@ -25,41 +25,42 @@ period before escalation.
 
 ## Initial pins and provenance
 
-The initial 40 heavy paths are ranked from a complete historical CI baseline
-plus confirmed CI measurements for three later additions. The historical
-baseline is the user-supplied 531-file timing export:
-run 39110542922, head 7bb71a18, attempt 1; artifacts
-agent-tests-1-attempt-1/shard-1.xml and agent-tests-2-attempt-1/shard-2.xml.
-The exported weight map's SHA-256 is
-fd92f33c47c49f863b09453bf4c68e92ae949953783caeecad03f1d0e4b2dcc0.
-These are summed testcase seconds at file concurrency three, not wall time.
-The export was supplied rather than independently downloaded.
+The initial 40 heavy memberships were chosen longest first from the complete
+531-file CI baseline (run 39110542922, head 7bb71a18, attempt 1), supplemented
+with confirmed CI measurements for three later additions. Once chosen, heavy
+memberships are frozen; receiving new weights prompts comparison, not automatic
+regeneration of the pin list.
 
-Three later main tests were absent from that baseline. Their supplemental
-summed testcase costs come from the run owner's normal-main run 39148053925,
-head 67dc5605f1a4d4d4bf30414484f66fb9d975e7c7, attempt 1, using the same two
-attempt-1 artifact names: client-completion-publication-ack 0.1 seconds,
-clone-retention-diagnostics 5.8 seconds, and runner-completion-publication-guard
-148.6 seconds (all test/*.test.ts paths). The latter enters the top 40;
-runner-recovery-settlement returns to hashing with its measured historical
-cost. The full refreshed map was unavailable, so all historical weights remain
-unchanged; partial refreshed updates to existing files are not substituted.
-This is an explicitly mixed-run estimate, not a verified same-run refresh.
-The new unit-test-shards regression has unknown CI cost and remains hashed.
+The complete refreshed input is the run owner's normal-main timing export from
+run 39148053925, head 67dc5605f1a4d4d4bf30414484f66fb9d975e7c7, attempt 1;
+artifacts agent-tests-1-attempt-1/shard-1.xml and
+agent-tests-2-attempt-1/shard-2.xml. Its 535-row SHA-256 is
+0dd664a3136bc31844c5d6abd44a9552707444b76fe69fc6bd4d83a2c5757ee6.
+The supplied checksum and reported shard sums were verified against the export;
+run attribution and success were owner-reported, not independently downloaded.
+These are summed testcase seconds, not file or job wall time.
 
-Allocation seeds both shards with the measured load of their hashed remainder,
-then adds the estimated M4 overhead to shard 1 in concurrency-equivalent load
-units. Heavy tests are assigned longest first to the lighter shard, with path
-order breaking weight ties and shard 1 breaking equal estimated-load ties.
+Reconciliation finds 534 matching tracked tests. The CI-only
+mutation-safety-prompt test is absent from this checkout and excluded from its
+load assessment. The branch's new unit-test-shards regression has unknown CI
+cost and remains hashed; no absent measurement is assigned zero cost or copied
+from another file. Matching file counts alone do not establish inventory identity.
+
+Allocation initially seeds both shards with the measured load of their hashed
+remainder, then adds the estimated M4 overhead to shard 1 in concurrency-equivalent
+load units. Heavy tests are assigned longest first to the lighter shard, with
+path order breaking weight ties and shard 1 breaking equal estimated-load ties.
+The refreshed assessment uses only matching measurements from the complete new
+export, without historical or local timing substitutions. It retains the frozen
+memberships after comparison with regenerated longest-first pins: regeneration
+would move many heavy memberships without improving the estimated load gap.
+The PR description records that comparison and the execution evidence.
+
 M4's seed uses the run owner's 45 wall seconds from run 39148053925,
-multiplied by concurrency three. That run's concurrency of three is inferred
-from Node's default on the reported four-vCPU runner, not logged. The seed
-therefore remains an assumption-based load conversion, not a same-run total
-for the historical baseline. Cross-run variance and indivisible file scheduling
-limit these projections; review sensitivity and verify normal-main wall time.
-Use the actual per-file values without adjusting them to approximate issue
-aggregates. Tests absent from the baseline and supplements retain
-unknown costs and remain hashed; they are never assigned zero measured cost.
+multiplied by concurrency three. That concurrency is inferred from Node's default
+on the reported four-vCPU runner, not logged. This remains an assumption-based
+load conversion. Run variance, unknown costs and indivisible file scheduling
+limit projections; review sensitivity and verify normal-main wall time.
 
 Re-pinning should use fresh CI measurements and measured hashed remainder,
 with M4 accounted for at the observed concurrency. Membership stability is
