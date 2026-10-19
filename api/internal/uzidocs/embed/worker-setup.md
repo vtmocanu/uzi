@@ -607,7 +607,7 @@ supersede abort, output-cap or ordinary command cleanup ownership.
 
 ### Claude runs with the guard enabled
 
-On a guard-bound Claude run (`RunRunner` runs: the issue, mr_rework, ci_fix, self_improve, prompt and task kinds), the worker replaces
+On a guard-bound Claude run (`RunRunner` runs: the issue, mr_rework, ci_fix, self_improve, prompt and task kinds, not task-review), the worker replaces
 native `Bash` with its own in-process command tool, `mcp__uzi_cmd__bash`, and
 disables native `Bash` and `Monitor`. What changes for those runs
 ([ADR-2396 D8](../adr/2396-worker-memory-guard.md#d8-claude-adapter)):
@@ -632,7 +632,7 @@ disables native `Bash` and `Monitor`. What changes for those runs
   advertising `worker_memory_pressure_v1`, or the worker shuts down), the turn
   is aborted and follows the existing recovery/requeue policy. Restart the
   worker to regain authority, as for Codex: registration runs once at startup,
-  and until then each new claim on that worker, including a requeued run that
+  and until then each new run claim on that worker, including a requeued run that
   lands back on it, fails with "Worker memory enrollment requires the full
   worker claim and registration" and is reported as a run failure.
 
