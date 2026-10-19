@@ -26,6 +26,35 @@ interface ImportObservation {
   checkedTrackingOwner(bare: string, branch: string, sha: string): Promise<{ runId: string } | undefined>;
 }
 
+async function settleFixtureOperations(operations: readonly Promise<unknown>[], cleanup: () => void): Promise<void> {
+  try {
+    const settled = await Promise.allSettled(operations);
+    // Propagate failures only after every owned operation has settled.
+    await Promise.all(settled.map(result => result.status === "fulfilled" ? result.value : Promise.reject(result.reason)));
+  } finally { cleanup(); }
+}
+
+for (const rejectedOperation of ["execution", "predecessor"] as const) {
+  it("m3 fixture " + rejectedOperation + " rejection waits for owned siblings before cleanup", async () => {
+    const sibling = deferred();
+    const failure = new Error("fixture operation rejected");
+    const events: string[] = [];
+    let observedFailure: unknown;
+    const rejected = Promise.reject(failure);
+    const execution = rejectedOperation === "execution" ? rejected : Promise.resolve();
+    const predecessors = rejectedOperation === "predecessor" ? [rejected, sibling.promise] : [sibling.promise];
+    const completed = settleFixtureOperations([execution, ...predecessors], () => { events.push("cleanup"); })
+      .then(() => { events.push("resolved"); }, error => { observedFailure = error; events.push("rejected"); });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const beforeSiblingSettled = [...events];
+    sibling.resolve();
+    await completed;
+    assert.deepEqual(beforeSiblingSettled, [], "cleanup and error propagation wait for every owned sibling");
+    assert.deepEqual(events, ["cleanup", "rejected"]);
+    assert.strictEqual(observedFailure, failure);
+  });
+}
+
 for (const [index, point] of points.entries()) {
   it(point === "expired pending" ? "m3 shutdown expiry during pending settlement fails closed with source custody" :
     "m3 shutdown during done at " + point + " preserves independent content within the original grace", async t => {
@@ -311,11 +340,7 @@ for (const [index, point] of points.entries()) {
       assert.equal(lateQueueMutations, 0, "forfeited bare waiter never starts a mutation");
     } finally {
       for (const release of releases) release();
-      try {
-        const settled = await Promise.allSettled([execution, ...predecessors]);
-        // Propagate failures only after every owned operation has settled.
-        await Promise.all(settled.map(result => result.status === "fulfilled" ? result.value : Promise.reject(result.reason)));
-      } finally { proof.cleanup(); }
+      await settleFixtureOperations([execution, ...predecessors], () => proof.cleanup());
     }
   });
 }
