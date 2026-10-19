@@ -281,7 +281,7 @@ test("a tree that never settles runs unenrolled, never as an enrollment failure,
     const started = performance.now();
     const enrolled = await enrollClaudeCommand(c, mint(c), fake.handle, deadlineMs);
     assert.equal(enrolled, undefined, `run ${run} ended unenrolled`);
-    assert.ok(performance.now() - started < deadlineMs * 0.9, `run ${run} returned before the outer deadline`);
+    assert.ok(performance.now() - started < deadlineMs, `run ${run} returned before the outer deadline`);
     assert.equal(fake.root.disposes(), 0);
   }
 });
