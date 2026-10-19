@@ -419,6 +419,7 @@ export interface RecoveryCoordinatorOptions {
     open: () => boolean; quiesce: (paths: string[]) => Promise<boolean>;
     isLivePath: (clonePath: string) => boolean;
     captureWip?: GitCache["captureMaintenanceWip"];
+    withMaintenanceTransfer?: <V>(action: (check: () => void) => Promise<V>) => Promise<V>;
   }) => Promise<T>, signal?: AbortSignal) => Promise<{ entered: false } | { entered: true; value: T }>;
   withCompletionSourceBoundary?: (
     source: CompletionSource,
@@ -3306,8 +3307,10 @@ export class RecoveryCoordinator {
           if (!ctx.open() || residueQuarantine() !== undefined || !current(held.token) ||
               family.originals.some(s => ctx.isLivePath(s.clonePath))) refused("boundary_closed");
         };
-        if (typeof ctx.captureWip !== "function") return refused("boundary_closed");
+        if (typeof ctx.captureWip !== "function" || typeof ctx.withMaintenanceTransfer !== "function")
+          return refused("boundary_closed");
         const captureWip = ctx.captureWip;
+        const withMaintenanceTransfer = ctx.withMaintenanceTransfer;
         // Renew exact custody under discovery counters, outside discovery at charge.
         stage = "exact_hold_refused";
         const chargedHold = await M1MaintenanceResources.runDiscovery(async () => {
@@ -3419,6 +3422,16 @@ export class RecoveryCoordinator {
                 (result.kind !== "clean" && result.kind !== "committed") ||
                 (result.kind === "clean" ? result.head !== sourceSha || result.parent !== null :
                   result.head === sourceSha || result.parent !== sourceSha)) return refused("source_unverified");
+            // captureWip has joined and disposed its owner. Continue only under a fresh
+            // child owner of this same reservation; a WIP result alone is not settlement.
+            await withMaintenanceTransfer(async transferCheck => {
+              transferCheck();
+              await fresh(result.head);
+              await revalidate();
+              transferCheck();
+            });
+            // The transfer callback's return precedes its child join and final family proof.
+            // Accept lineage only after the owner returns, with a fresh semantic observation.
             await fresh(result.head);
             await revalidate();
             check();

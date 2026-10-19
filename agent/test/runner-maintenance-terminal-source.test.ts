@@ -9,7 +9,7 @@ import { WorkerClient } from "../src/client.js";
 import { SteeringChannel } from "../src/steering.js";
 import { rmTreePinned } from "../src/rmtree.js";
 import type { Executor } from "../src/executor.js";
-import { MaintenanceResources } from "../src/recovery-maintenance.js";
+import { MaintenanceResources, type MaintenanceResource } from "../src/recovery-maintenance.js";
 import { canonicalJson, RecoveryCoordinator } from "../src/recovery.js";
 import { recordingLogger, nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, git, gitlabClaim, homeDir, installHarness, deferred, runnerWith } from "./runner-harness.js";
@@ -22,11 +22,15 @@ function command(cwd: string, ...args: string[]): string {
 type Observation = { terminal?: string; genesis: { runId: string; generation: number; clonePath: string; attemptId: string }; family?: unknown };
 type Tails = { executionTails: ReadonlyMap<string, Promise<Observation | undefined>> };
 
-for (const mode of ["normal", "origin-admission", "origin-pressure", "origin-source-limit", "notification-throw", "notification-reject", "unapplied", "lost", "stale", "wrong-status", "missing-status",
+for (const mode of ["normal", "origin-admission", "origin-pressure", "origin-source-limit",
+  "origin-transfer-final-family", "origin-transfer-head", "origin-transfer-revoked", "origin-transfer-missing", "notification-throw", "notification-reject", "unapplied", "lost", "stale", "wrong-status", "missing-status",
   "missing-process", "missing-reproof", "unverified", "failed-reap", "late-fence",
   "failed-home", "failed-skills", "failed-owed", "record-none", "prior-record-none", "reclaimed", "nonmatching-error", "post-run-error"] as const) {
 it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
-  const originMode = mode === "origin-admission" || mode === "origin-pressure" || mode === "origin-source-limit";
+  const originMode = mode.startsWith("origin-");
+  const dirtyOrigin = mode === "origin-admission" || mode.startsWith("origin-transfer-");
+  let transferCalls = 0, transferEntered = 0, transferBodyComplete = false, transferSettled = false;
+  let capturedSignal: AbortSignal | undefined;
   let pressure = false;
   const guard = new DataVolumeGuard({ dataDir: path.dirname(git.recoveryRoot) });
   t.mock.method(guard, "preflight", () => pressure ? "data_volume_full" : "not_disk_full");
@@ -36,7 +40,13 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     name === "recovery_inventory_v1" || name === "claim_generation_fence" || feature(name));
   t.mock.method(client, "listRecoveryHolds", async () => ({ run_id: claim.run_id, holds: [{ hold_id: "fixture-hold", generation: 1, inventory_guarded: true, has_available_capture: false }] }));
   let chargedTransports = 0, discoveryTransports = 0;
+  const resourceTotals: Partial<Record<MaintenanceResource, number>> = {};
   if (originMode) {
+    const consume = MaintenanceResources.consume.bind(MaintenanceResources);
+    t.mock.method(MaintenanceResources, "consume", (resource: MaintenanceResource, amount: number) => {
+      consume(resource, amount);
+      resourceTotals[resource] = (resourceTotals[resource] ?? 0) + amount;
+    });
     claim.repo.id = "00000000-0000-4000-8000-000000000033";
     const workerId = "00000000-0000-4000-8000-000000000034";
     const holdId = "00000000-0000-4000-8000-000000000032";
@@ -53,6 +63,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
           original_worker_id: workerId, original_worker_identity: "human-label", live_worker_id: workerId,
           live_run_id: claim.run_id, inventory_guarded: true, state: "open", run_status: "failed",
           current_claim_generation: 1, claim_released: true,
+          ...(mode === "origin-transfer-revoked" && transferBodyComplete ? { run_status: "stopped" } : {}),
         } } : { run_id: claim.run_id, holds: [{ hold_id: holdId, generation: 1,
           inventory_guarded: true, has_available_capture: false }] });
       },
@@ -172,7 +183,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       }
       return {
         process: models && (mode === "missing-process" || (mode === "missing-reproof" && request.site === "settle_transfer:after_runner_git"))
-        ? undefined : { state: models && mode === "unverified" ? "unverified" : "quiescent", processes: [], killed: [], detail: "" },
+        ? undefined : { state: (models && mode === "unverified") ||
+          (mode === "origin-transfer-final-family" && transferBodyComplete) ? "unverified" : "quiescent", processes: [], killed: [], detail: "" },
         docker: { state: originMode && request.site === "retained_ops" ? "docker_unconfirmed" : "not_wired", removed: [], detail: "" },
       };
     },
@@ -191,27 +203,56 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
           tracked: await fs.readFile(path.join(source, "README.md"), "utf8"),
           untracked: await fs.readFile(path.join(source, "unique-untracked"), "utf8"),
         });
-        if (mode === "origin-admission") await fs.writeFile(path.join(source, "maintenance-wip"), unique);
+        if (dirtyOrigin) await fs.writeFile(path.join(source, "maintenance-wip"), unique);
         const before = await snapshot(), beforeAttempts = attempts, beforeModels = models;
         const upload = t.mock.method(client, "uploadRecoveryBundle");
         const reserve = t.mock.method(client, "reserveRecoveryCapture");
         const held = t.mock.method(client, "publishHeld");
-        const result = await action(ctx);
+        const forwarded: typeof ctx = {
+          ...ctx,
+          captureWip: async (...args) => {
+            const value = await ctx.captureWip(...args);
+            capturedSignal = MaintenanceResources.signalIfActive();
+            return value;
+          },
+          withMaintenanceTransfer: async action => {
+            transferCalls++;
+            assert.ok(capturedSignal, "WIP has actually returned before transfer");
+            assert.equal(MaintenanceResources.signalIfActive(), capturedSignal, "same original resource slot");
+            const value = await ctx.withMaintenanceTransfer(async check => {
+              transferEntered++;
+              check();
+              const result = await action(check);
+              transferBodyComplete = true;
+              if (mode === "origin-transfer-head") command(source, "reset", "--soft", "HEAD^");
+              return result;
+            });
+            transferSettled = true;
+            return value;
+          },
+        };
+        if (mode === "origin-transfer-missing") Reflect.deleteProperty(forwarded, "withMaintenanceTransfer");
+        const result = await action(forwarded);
         assert.equal(models, beforeModels);
         assert.equal(upload.mock.callCount(), 0);
         assert.equal(reserve.mock.callCount(), 0);
         assert.equal(held.mock.callCount(), 0);
         upload.mock.restore(); reserve.mock.restore(); held.mock.restore();
         const after = await snapshot();
-        if (mode === "origin-admission") {
-          assert.equal(chargedTransports, 12, "warm real WorkerClient list/exact transports");
+        if (dirtyOrigin && mode !== "origin-transfer-missing") {
+          assert.equal(transferCalls, 1);
+          assert.equal(transferEntered, 1);
+          assert.equal(transferSettled, mode !== "origin-transfer-final-family");
+          assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 12 : 14, "warm real WorkerClient list/exact transports");
           assert.equal(discoveryTransports, 4, "discovery has separate counters");
-          t.diagnostic(JSON.stringify({ chargedTransports, discoveryTransports }));
-          assert.notEqual(after.head, before.head);
+          t.diagnostic(JSON.stringify({ chargedTransports, discoveryTransports, transferCalls, transferEntered, transferSettled }));
+          if (mode !== "origin-transfer-head") assert.notEqual(after.head, before.head);
           assert.notDeepEqual(after.index, before.index);
           assert.deepEqual({ ...after, head: before.head, index: before.index }, before);
-          assert.equal(command(source, "rev-parse", "HEAD^"), before.head);
-          assert.equal(command(source, "status", "--porcelain"), "");
+          if (mode !== "origin-transfer-head") {
+            assert.equal(command(source, "rev-parse", "HEAD^"), before.head);
+            assert.equal(command(source, "status", "--porcelain"), "");
+          }
         } else assert.deepEqual(after, before, "refusal leaves source unchanged");
         assert.equal(attempts, beforeAttempts, "origin publication grants no capture permit");
         return result;
@@ -288,6 +329,28 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
   try {
     await executing;
     if (originMode) await notifiedWork;
+    if (dirtyOrigin && mode !== "origin-transfer-missing") {
+      // Assert outside the coordinator callback: its refusal catch must not swallow a failed test.
+      assert.equal(transferCalls, 1, "active coordinator enters the transfer owner");
+      assert.equal(transferEntered, 1);
+      assert.equal(transferBodyComplete, true);
+      assert.equal(transferSettled, mode !== "origin-transfer-final-family");
+      assert.equal(chargedTransports, mode === "origin-transfer-final-family" || mode === "origin-transfer-head" ? 12 : 14);
+      assert.equal(discoveryTransports, 4);
+      assert.equal(resourceTotals.rpcAttempts, chargedTransports, "all charged strict client attempts counted");
+      const caps = { decoded: git.recoveryDecodedLimitBytes, closureEntries: 65536, sourceBytes: 256 * 1024 ** 2,
+        sourceEntries: 65536, artifactBytes: 256 * 1024 ** 2, metadataBytes: 256 * 1024 ** 2,
+        adminEntries: 4096, sources: 128, launches: 512, rpcAttempts: 32 };
+      for (const resource of Object.keys(caps) as MaintenanceResource[])
+        assert.ok((resourceTotals[resource] ?? 0) <= caps[resource], resource);
+      t.diagnostic(JSON.stringify({ resourceTotals, chargedTransports, discoveryTransports,
+        transferCalls, transferEntered, transferSettled, quiescence: "injected; not coupled helper capacity proof" }));
+    }
+    if (mode === "origin-transfer-missing") {
+      assert.equal(transferCalls, 0);
+      assert.equal(capturedSignal, undefined, "missing transfer capability refuses before source capture");
+      await assert.rejects(fs.stat(path.join(git.recoveryRoot, "..", "recovery-maintenance")), { code: "ENOENT" });
+    }
     assert.equal(models, 1);
     assert.ok(api.states.some(s => s.body.status === "failed"));
     assert.ok(terminalAcks > 0, "actual FAILED ACK was received before fixture faults");
@@ -305,7 +368,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       const prefixes = records.filter(r => r.captureId.startsWith("maintenance-v1-"));
       const originalObservation = await tail;
       assert.ok((originalObservation as unknown as { originalContext?: unknown })?.originalContext, JSON.stringify(originalObservation));
-      assert.equal(prefixes.length, mode === "origin-admission" ? 1 : 0, JSON.stringify({ records: records.map(r => ({ id: r.captureId, state: r.state })), logs: log.lines.slice(-3) }));
+      assert.equal(prefixes.length, dirtyOrigin && mode !== "origin-transfer-missing" ? 1 : 0, JSON.stringify({ records: records.map(r => ({ id: r.captureId, state: r.state })), logs: log.lines.slice(-3) }));
       if (mode === "origin-pressure") {
         assert.equal(guard.preflight(), "data_volume_full");
         const ops = await runner.withRetainedSourceBoundary(claim.run_id, [source], async ctx => {
@@ -318,16 +381,17 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
         const ledger = JSON.parse(await fs.readFile(path.join(git.recoveryRoot, "..", "recovery-maintenance", "complete.json"), "utf8")).value;
         assert.equal(ledger.cycles[0].slots.length, 1, "paid descriptor refusal consumes its existing slot");
         assert.equal(ledger.cycles[0].fenced, true);
-      } else {
+      } else if (dirtyOrigin && mode !== "origin-transfer-missing") {
         const prefix = prefixes[0];
         assert.ok(prefix);
         const resultHead = command(source, "rev-parse", "HEAD");
-        assert.equal(prefix.sourceSha, command(source, "rev-parse", "HEAD^"), JSON.stringify(log.lines.slice(-5)));
+        assert.equal(prefix.sourceSha, mode === "origin-transfer-head" ? resultHead : command(source, "rev-parse", "HEAD^"), JSON.stringify(log.lines.slice(-5)));
         assert.equal(prefix.attemptedHeadSha, undefined);
         const ledger = JSON.parse(await fs.readFile(path.join(git.recoveryRoot, "..", "recovery-maintenance", "complete.json"), "utf8")).value;
         const cycle = ledger.cycles[0];
         const output = createHash("sha256").update(canonicalJson(["maintenance-wip-v1", cycle.identity, resultHead])).digest("hex");
-        assert.ok(cycle.outputs.includes(output));
+        assert.equal(cycle.outputs.includes(output), mode === "origin-admission", "only settled current transfer accepts WIP lineage");
+        assert.equal(cycle.outputs.length, mode === "origin-admission" ? 2 : 1, "failed transfer retains only original CID fence");
         assert.equal(cycle.slots.length, 1);
         assert.equal(cycle.fenced, true);
         assert.equal(prefix.heldPolicy, undefined);

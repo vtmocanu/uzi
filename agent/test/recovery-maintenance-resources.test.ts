@@ -259,6 +259,7 @@ for (const resource of Object.keys(caps) as Array<keyof typeof caps>) {
         maintenanceOriginDigest: async () => "b".repeat(64), worktreeHead: async () => "a".repeat(40) } as never,
       withTerminalSourceBoundary: async (_run, _paths, action) => ({ entered: true, value: await action({
         open: () => true, isLivePath: () => false, quiesce: async () => true,
+        withMaintenanceTransfer: async () => { throw new Error("unexpected transfer"); },
         captureWip: async () => { captures++; throw new Error("unexpected capture"); },
       }) }),
     });

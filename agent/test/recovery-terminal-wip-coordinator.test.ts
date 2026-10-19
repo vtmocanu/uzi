@@ -95,6 +95,16 @@ async function fixture(t: test.TestContext, mode: string, options: {
         open: () => open && !executing,
         isLivePath: () => executing,
         quiesce: async () => { throw new Error("bridge owns quiescence"); },
+        withMaintenanceTransfer: async action => {
+          // Coordinator fixture only; the runner ownership tests exercise actual child settlement.
+          const check = () => { signal.signal.throwIfAborted(); MaintenanceResources.check(); };
+          check();
+          if (!quiescent) throw new Error("not quiescent");
+          const result = await action(check);
+          check();
+          if (!quiescent) throw new Error("not quiescent");
+          return result;
+        },
         captureWip: mode === "missing-bridge" ? undefined : async (_path, oldHead, callbacks) => {
           quiesceCalls++; events.push("quiesce");
           if (!quiescent) throw new Error("not quiescent");
@@ -230,7 +240,7 @@ for (const status of ["queued", "claimed", "running", "awaiting_approval", "awai
 
 // With both journal directories present the observations are: discovery, before
 // charge, pre-publication, before temporary open, before rename, add, commit,
-// and result. Each independent fixture stops at its selected observation.
+// transfer entry and post-settlement lineage acceptance. Each fixture stops at its selected observation.
 const observationBoundaries = [
   { call: 2, name: "before charge", origins: 0, outputs: 0, git: [] },
   { call: 3, name: "pre-publication", origins: 0, outputs: 0, git: [] },
@@ -238,7 +248,8 @@ const observationBoundaries = [
   { call: 5, name: "before rename", origins: 0, outputs: 1, git: [] },
   { call: 6, name: "before add", origins: 1, outputs: 1, git: ["git-status"] },
   { call: 7, name: "before commit", origins: 1, outputs: 1, git: ["git-status", "git-add"] },
-  { call: 8, name: "result", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
+  { call: 8, name: "transfer entry", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
+  { call: 9, name: "post-settlement lineage", origins: 1, outputs: 1, git: ["git-status", "git-add", "git-commit"] },
 ];
 for (const [index, status] of terminalStatuses.entries()) {
   const nonterminal = ["running", "parked", "unknown"][index]!;
@@ -320,7 +331,7 @@ for (const directories of [0, 1, 2]) test("terminal WIP charged transports with 
   if (directories === 0) await fs.mkdir(f.dir);
   await f.run();
   assert.equal((await f.table()).cycles[0].outputs.length, 2);
-  assert.equal(f.counts().chargedRpc, 12 + 2 * directories);
+  assert.equal(f.counts().chargedRpc, 14 + 2 * directories);
   assert.equal(f.counts().discoveryRpc, 4);
   t.diagnostic(JSON.stringify(f.counts()));
 });

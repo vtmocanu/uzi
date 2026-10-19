@@ -80,6 +80,16 @@ async function fixture(t: test.TestContext) {
         open: () => open && !executing,
         isLivePath: () => executing,
         quiesce: async () => { throw new Error("bridge owns quiescence"); },
+        withMaintenanceTransfer: async action => {
+          // Coordinator fixture only; the runner ownership tests exercise actual child settlement.
+          const check = () => { signal.signal.throwIfAborted(); MaintenanceResources.check(); };
+          check();
+          if (!quiescent) throw new Error("not quiescent");
+          const result = await action(check);
+          check();
+          if (!quiescent) throw new Error("not quiescent");
+          return result;
+        },
         captureWip: async (_path, oldHead, callbacks) => {
           quiesceCalls++; events.push("quiesce");
           if (!quiescent) throw new Error("not quiescent");
