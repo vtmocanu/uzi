@@ -54,6 +54,25 @@ func TestPolicyRevisionGatePublicationLiveDB(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionGateAwaitingInputLiveDB(t *testing.T) {
+	e, f, run := revisionGateFixture(t)
+	f.mustPublish(run, gateReq(i64(1), uid()), 1)
+	before := append([]byte{}, mustRun(t, e, run).PolicyRevisionSource...)
+	question := "policy-source-question"
+	_, applied, _, err := f.report(run, StateRequest{
+		State: "awaiting_input", ClaimGeneration: i64(1), OpenQuestionID: &question,
+	})
+	if err != nil || !applied {
+		t.Fatalf("question park applied=%v err=%v", applied, err)
+	}
+	parked := mustRun(t, e, run)
+	if parked.Status != "awaiting_input" || !bytes.Equal(before, parked.PolicyRevisionSource) {
+		t.Fatal("question park changed source or did not park")
+	}
+	f.mustPublish(run, gateReq(i64(1), uid()), 2)
+	assertRevisionGateBound(t, e, run, 2)
+}
+
 func TestPolicyRevisionGatePreservesInventoryLiveDB(t *testing.T) {
 	e, svc, w, run, candidate := revisionInventoryFixture(t)
 	first, err := svc.SubmitPlanCrossCheck(e.ctx, w, run, 1, candidate)
@@ -238,7 +257,9 @@ func TestPolicyRevisionGateControlsLiveDB(t *testing.T) {
 			case "declined":
 				e.exec("UPDATE runs SET status='paused' WHERE id=$1", run)
 			case "ineligible":
-				e.exec("UPDATE runs SET harness='claude' WHERE id=$1", run)
+				e.exec(`UPDATE runs SET harness='claude', codex_secret_id=NULL, codex_auth_mode=NULL,
+					codex_secret_label=NULL, codex_account_key=NULL, codex_material_revision=NULL,
+					codex_account_revision=NULL WHERE id=$1`, run)
 				req.PresentationID = uid()
 			case "exact_retry":
 				active := seedRevisionTarget(t, f, run, 1)
