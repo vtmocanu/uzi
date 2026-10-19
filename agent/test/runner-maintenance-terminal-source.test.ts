@@ -40,6 +40,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     t.mock.method(RecoveryCoordinator.prototype as unknown as { terminalOriginAdmissionEnabled(): boolean },
       "terminalOriginAdmissionEnabled", () => true);
   let boundaryEntered = 0;
+  const exclusion = passingExclusion();
   const guard = new DataVolumeGuard({ dataDir: path.dirname(git.recoveryRoot) });
   t.mock.method(guard, "preflight", () => pressure ? "data_volume_full" : "not_disk_full");
   const claim = gitlabClaim(3031, { claim_generation: 1, inventory_guarded: true });
@@ -169,7 +170,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
       reapAttributedProcesses: async () => ({ complete: mode !== "failed-reap", killed: [], left: [] }),
     },
   }), fakeGitlab().gitlab, "fixture-journal-key", log.logger, {
-    maintenanceExclusion: passingExclusion(),
+    maintenanceExclusion: exclusion,
     dockerHost: "http://unused.invalid", recoveryRetryMs: 1,
     ...(mode === "origin-pressure" ? { dataVolume: guard } : {}),
     ...(mode === "failed-home" || mode === "failed-skills" ? {
@@ -342,6 +343,7 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     if (dirtyOrigin && mode !== "origin-transfer-missing") {
       // Assert outside the coordinator callback: its refusal catch must not swallow a failed test.
       assert.equal(transferCalls, 1, "active coordinator enters the transfer owner");
+      assert.ok(exclusion.entered > 0 && exclusion.proofs > 0, "admission runs under the writer exclusion");
       assert.equal(transferEntered, 1);
       assert.equal(transferBodyComplete, true);
       assert.equal(transferSettled, mode !== "origin-transfer-final-family");
@@ -359,6 +361,8 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
     if (productionDefault) {
       assert.equal(TERMINAL_ORIGIN_ADMISSION_ENABLED, false, "staged groundwork ships admission disabled");
       assert.equal(boundaryEntered, 0, "no retained-source boundary, WIP capture or transfer");
+      assert.equal(exclusion.entered, 0, "writer exclusion never entered");
+      assert.equal(exclusion.proofs, 0, "no exclusive-idle proof");
       assert.equal(transferCalls, 0);
       assert.equal(capturedSignal, undefined);
       assert.equal(chargedTransports, 0, "no charged producer transport");
