@@ -92,6 +92,7 @@ for (const mode of ["third", "deadline", "generic", "cleanup"] as const) {
     for (const diagnostic of diagnostics) {
       assert.equal(diagnostic.error, undefined, "no duplicate raw error field");
       assert.ok(!JSON.stringify(diagnostic).includes(secret));
+      assert.ok(!JSON.stringify(diagnostic).includes(secret.slice(0, 10)));
       assert.ok(!JSON.stringify(diagnostic).includes("ijklmnopqrst"));
       if (mode === "cleanup") {
         assert.equal(diagnostic.diagnostic_code, "retained_readiness_cleanup");
@@ -117,3 +118,28 @@ for (const mode of ["third", "deadline", "generic", "cleanup"] as const) {
     assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local work\n");
   });
 }
+
+it("an asynchronous readiness refusal stops retained recovery before successor admission", async () => {
+  const { claim, bare, clone } = await seed();
+  const log = recordingLogger();
+  let refusals = 0, models = 0;
+  // The refusal settles after a microtask, so only an awaited readiness pass can propagate it.
+  git.normalizeRetainedSourceObjects = async () => {
+    await Promise.resolve();
+    refusals++;
+    throw new Error("retained_readiness_access");
+  };
+  await runnerWith(() => ({ executor: {
+    sandboxesCommands: true,
+    run: async () => { models++; throw new Error("must not enter model"); },
+  } }), fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 }).execute(claim);
+  assert.ok(refusals > 0, "the readiness refusal was reached");
+  assert.equal(models, 0, "no successor is admitted after a readiness refusal");
+  const diagnostics = log.lines.filter((line: any) => line.msg === warning) as Array<Record<string, any>>;
+  assert.equal(diagnostics.length, refusals, "every refusal surfaced in its own iteration");
+  assert.ok(diagnostics.every(line => line.diagnostic_code === "retained_readiness_access"));
+  const journal = JSON.parse(command(bare, "config", `uzi-recovery.${clone.branch}.clone`));
+  assert.equal(journal.recovery.stage, "blocked");
+  assert.equal(journal.recovery.attempts, refusals);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "local work\n");
+});
