@@ -92,7 +92,7 @@ without changing the agent project. A sixth file, `agent/test/git-retained-permi
 
 A seventh file, `agent/test/claude-command-launcher.test.ts`, contributes its three literal leaves under the single `INIT_SKIP`-gated suite `real runner-uid command launcher` (issue #2471): the image supervisor launched at runner UID 10002 through the guarded-command wrapper, the memory-guard launcher preflight, and the image bash version. Its fake-supervisor and host-bash wrapper tests run in the normal host shards, not in this lane.
 
-The default inventory retains the five old files and adds the retained recovery file; `node e2e/worker-uid/inventory.mjs command` emits the separate command
+The default inventory retains the five old files and adds the retained recovery file and the claude-command-launcher file (its three literal leaves above); `node e2e/worker-uid/inventory.mjs command` emits the separate command
 inventory. `expected.json` / `results.xml` and `command-expected.json` /
 `command-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and

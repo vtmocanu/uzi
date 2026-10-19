@@ -1227,7 +1227,13 @@ async function launchRunnerSupervised(spec: RunnerSupervisedLaunch, deps: Launch
   // keeps the supervisor's own stdin from ever carrying data.
   try { child.stdin?.end(); } catch { /* the stream is already closed */ }
   if (spec.onSpawned) {
-    spec.onSpawned({ pid: child.pid, startTime: recordRoot(child.pid, deps.rootStartTime)?.startTime }, child);
+    try {
+      spec.onSpawned({ pid: child.pid, startTime: recordRoot(child.pid, deps.rootStartTime)?.startTime }, child);
+    } catch (error) {
+      // The caller could not record the root: nothing else will ever reap it.
+      killUnreapedSupervisor(child, { split });
+      throw error;
+    }
   }
   const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", undefined,
     deps.armStartedDeadlineForTest);
@@ -1279,7 +1285,11 @@ export interface KillUnreapedDeps {
   /** Whether the uid split is active (default: this process's env). */
   readonly split?: boolean;
   /** The synchronous runner of the split kill (default: spawnSync). */
-  readonly runKill?: (command: string, args: readonly string[]) => { readonly status: number | null; readonly error?: Error };
+  readonly runKill?: (
+    command: string,
+    args: readonly string[],
+    options: { readonly env: NodeJS.ProcessEnv },
+  ) => { readonly status: number | null; readonly error?: Error };
 }
 
 /**
@@ -1287,7 +1297,9 @@ export interface KillUnreapedDeps {
  * (`exitCode === null && signalCode === null`), in one synchronous section: an unreaped child's
  * pid cannot have been reused. Under the split the worker lacks permission over the runner uid,
  * so it forks `kill -KILL` as the runner uid; single-uid it signals the child directly.
- * @returns whether a kill was issued (a child that exited, or lacks the exit fields, is never signalled).
+ * @returns whether the kill was delivered: single-uid, `child.kill` returned true; under the
+ *   split, the forked `kill -KILL` ran without a spawn error and exited 0. A child that exited,
+ *   lacks the exit fields, or whose kill failed or threw returns false.
  */
 export function killUnreapedSupervisor(child: RunnerCommandChild, deps: KillUnreapedDeps = {}): boolean {
   if (child.exitCode !== null || child.signalCode !== null) return false;
@@ -1297,9 +1309,10 @@ export function killUnreapedSupervisor(child: RunnerCommandChild, deps: KillUnre
   try {
     if (split) {
       const kill = runnerCommand("kill", ["-KILL", String(pid)], true);
-      const run = deps.runKill ?? ((command, args) => spawnSync(command, [...args], { stdio: "ignore", timeout: 10_000 }));
-      run(kill.command, kill.args);
-      return true;
+      const run = deps.runKill ??
+        ((command, args, options) => spawnSync(command, [...args], { env: options.env, stdio: "ignore", timeout: 10_000 }));
+      const result = run(kill.command, kill.args, { env: workerSpawnEnv() });
+      return result.error === undefined && result.status === 0;
     }
     return typeof child.kill === "function" ? child.kill("SIGKILL") : false;
   } catch {

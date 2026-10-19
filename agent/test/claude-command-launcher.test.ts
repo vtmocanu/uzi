@@ -245,6 +245,18 @@ describe("launchRunnerCommandRoot with a fake supervisor", () => {
     assert.equal(outcome.clean ? outcome.event.state : undefined, "drained");
   });
 
+  it("kills the unreaped supervisor and rethrows when onSpawned throws", { skip: SINGLE_UID > 0 ? false : "needs a non-root process uid" }, async () => {
+    const fake = newFake(SINGLE_UID);
+    const killed: unknown[] = [];
+    Object.assign(fake, { exitCode: null, signalCode: null, kill: (signal?: unknown) => { killed.push(signal); return true; } });
+    const boom = new Error("record failed");
+    await assert.rejects(
+      launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }), depsFor(fake, { env: {} })),
+      (e: unknown) => e === boom,
+    );
+    assert.deepEqual(killed, ["SIGKILL"]);
+  });
+
   it("classifies a spawn that throws as not started, without calling onSpawned", async () => {
     let called = false;
     const e2big = Object.assign(new Error("spawn E2BIG"), { code: "E2BIG" });
@@ -308,6 +320,26 @@ describe("killUnreapedSupervisor", () => {
     assert.deepEqual(c.killed, []);
     assert.equal(runs.length, 1);
     assert.deepEqual(runs[0]![1], [...setprivRunnerArgs(), "kill", "-KILL", "4242"]);
+  });
+
+  it("under the split reports delivery only when the forked kill ran and exited 0", () => {
+    const results: Array<[{ status: number | null; error?: Error }, boolean]> = [
+      [{ status: null, error: new Error("spawn setpriv ENOENT") }, false],
+      [{ status: 1 }, false],
+      [{ status: null }, false],
+      [{ status: 0 }, true],
+    ];
+    for (const [result, expected] of results) {
+      assert.equal(killUnreapedSupervisor(child(), { split: true, runKill: () => result }), expected, JSON.stringify(result));
+    }
+  });
+
+  it("under the split runs the forked kill with the worker spawn mark in its env", () => {
+    let seen: NodeJS.ProcessEnv | undefined;
+    killUnreapedSupervisor(child(), { split: true, runKill: (_command, _args, options) => { seen = options.env; return { status: 0 }; } });
+    assert.ok(seen, "an env was passed");
+    assert.ok(seen[WORKER_SPAWN_ENV], "carries the worker spawn mark");
+    assert.equal(seen[RUN_ATTEMPT_ENV], undefined);
   });
 
   it("does not throw when the kill machinery fails", () => {
@@ -401,21 +433,26 @@ interface WrapperRun {
   readonly head: string;
   readonly tail: string;
   readonly stderr: string;
+  /** Whether the transport (wrapper stdout) closed shortly after the wrapper exited. */
+  readonly closed: boolean;
 }
 
 const WRAPPER_ENV = { PATH: process.env.PATH ?? "/usr/bin:/bin" };
 
 /** Run WRAPPER like the supervisor does: stdin open, stdout/stderr piped. Resolves shortly after
  *  `exit` (not `close`), because a descendant holding the pipe must not hold the verdict. */
-function runWrapper(command: string, opts: { spill?: string; cap?: number; readerDelayMs?: number; timeoutMs?: number } = {}): Promise<WrapperRun> {
+function runWrapper(command: string, opts: { spill?: string; cap?: number; readerDelayMs?: number; timeoutMs?: number; graceTenths?: string } = {}): Promise<WrapperRun> {
   return new Promise((resolve, reject) => {
     const started = Date.now();
-    const child = spawn(BASH, ["-c", WRAPPER, "uzi-cmd", opts.spill ?? nextSpill(), String(opts.cap ?? 1024), command],
+    const child = spawn(BASH, ["-c", WRAPPER, "uzi-cmd", opts.spill ?? nextSpill(), String(opts.cap ?? 1024), command,
+      ...(opts.graceTenths === undefined ? [] : [opts.graceTenths])],
       { stdio: ["pipe", "pipe", "pipe"], env: WRAPPER_ENV });
     let bytes = 0;
     let head = "";
     let tail = "";
     let stderr = "";
+    let closed = false;
+    child.stdout.once("close", () => { closed = true; });
     const onData = (chunk: Buffer): void => {
       bytes += chunk.length;
       if (head.length < 4096) head += chunk.toString("latin1", 0, 4096);
@@ -431,10 +468,10 @@ function runWrapper(command: string, opts: { spill?: string; cap?: number; reade
     child.once("exit", (code) => {
       const exitMs = Date.now() - started;
       clearTimeout(timer);
-      const finish = (): void => resolve({ code, exitMs, bytes, head, tail, stderr });
+      const finish = (): void => resolve({ code, exitMs, bytes, head, tail, stderr, closed });
       // A flushed pipe delivers its last chunks right after exit; a pipe held open by a
       // descendant never closes, so do not wait for it.
-      child.stdout.once("close", finish);
+      if (closed) finish(); else child.stdout.once("close", finish);
       setTimeout(finish, 400);
     });
     child.once("error", reject);
@@ -491,6 +528,62 @@ describe("WRAPPER under the host bash", () => {
     } finally {
       if (Number.isInteger(sleeper) && sleeper > 1) { try { process.kill(sleeper, "SIGKILL"); } catch { /* already gone */ } }
     }
+  });
+
+  it("honours the test-only grace argument: a small value shortens the bounded wait, a bad value falls back to the default and is never evaluated", { skip: WRAPPER_SKIP }, async () => {
+    const pids: number[] = [];
+    try {
+      const short = await runWrapper("sleep 300 & echo $!; exit 6", { graceTenths: "5", timeoutMs: 20000 });
+      pids.push(Number(short.head.trim().split("\n")[0]));
+      assert.equal(short.code, 6);
+      assert.ok(short.exitMs < 3000, `a 0.5 s grace took ${String(short.exitMs)}ms`);
+      // The value reaches an arithmetic context only after a digits-only check, so it cannot run code.
+      const marker = path.join(scratchRoot, "grace-injection");
+      const bad = await runWrapper("sleep 300 & echo $!; exit 6", { graceTenths: `a[$(touch ${marker})]`, timeoutMs: 20000 });
+      pids.push(Number(bad.head.trim().split("\n")[0]));
+      assert.equal(bad.code, 6);
+      assert.ok(bad.exitMs >= 4000, `an invalid grace falls back to the 5 s default (${String(bad.exitMs)}ms)`);
+      assert.equal(fs.existsSync(marker), false);
+      const huge = await runWrapper("echo ok", { graceTenths: "9999", timeoutMs: 20000 });
+      assert.equal(huge.code, 0);
+    } finally {
+      for (const pid of pids) if (Number.isInteger(pid) && pid > 1) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    }
+  });
+
+  it("does not leak the wrapper's writer fd to the command or its descendants", { skip: WRAPPER_SKIP }, async () => {
+    const quiet = await runWrapper("sleep 300 >/dev/null 2>&1 & echo started; exit 0", { timeoutMs: 20000 });
+    assert.equal(quiet.code, 0);
+    assert.ok(quiet.exitMs <= 2000, `a quiet background process held the wrapper for ${String(quiet.exitMs)}ms`);
+    assert.ok(quiet.closed, "the transport closed promptly");
+    // Piped so that $$ stays the command's shell (a bare ls would exec in place and list its own dir fd).
+    const fds = await runWrapper('ls /proc/$$/fd | cat');
+    assert.equal(fds.code, 0);
+    const names = fds.head.trim().split(/\s+/).sort();
+    assert.deepEqual(names, ["0", "1", "2"], "only stdio is open in the command");
+  });
+
+  it("refuses any pre-existing spill path (FIFO, symlink, dangling symlink) without blocking or writing through it", { skip: WRAPPER_SKIP }, async () => {
+    const dir = path.join(scratchRoot, "preplanted");
+    fs.mkdirSync(dir, { recursive: true });
+    const fifo = path.join(dir, "fifo");
+    assert.equal(spawnSync("mkfifo", [fifo]).status, 0);
+    const target = path.join(dir, "target");
+    fs.writeFileSync(target, "KEEP");
+    const link = path.join(dir, "link");
+    fs.symlinkSync(target, link);
+    const dangling = path.join(dir, "dangling");
+    const missing = path.join(dir, "missing-target");
+    fs.symlinkSync(missing, dangling);
+    for (const spill of [fifo, link, dangling]) {
+      const run = await runWrapper("echo visible; exit 8", { spill, timeoutMs: 15000, graceTenths: "10" });
+      assert.equal(run.code, 8, spill);
+      assert.equal(run.head, "visible\n", spill);
+      assert.ok(run.exitMs <= 2000, `${spill} held the wrapper for ${String(run.exitMs)}ms`);
+    }
+    assert.equal(fs.readFileSync(target, "utf8"), "KEEP");
+    assert.equal(fs.existsSync(missing), false);
+    assert.equal(fs.lstatSync(fifo).isFIFO(), true);
   });
 
   it("caps the spill at the byte limit while the transport still receives every byte", { skip: WRAPPER_SKIP }, async () => {
