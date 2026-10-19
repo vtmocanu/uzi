@@ -10580,8 +10580,14 @@ export class RunRunner {
         } catch (error) {
           // A forfeited gate has no source-clean certificate. Reconcile behind the
           // safety queue under the original hard allowance, without acquiring the sink again.
-          if (!entered && error instanceof CheckpointSoftDeadlineError) await acquire();
-          else throw error;
+          if (!entered && error instanceof CheckpointSoftDeadlineError) {
+            // Reconcile admission only: neither plan-summary settlement, source
+            // quiescence nor the checkpoint action may run without the sink gate.
+            await executor.safety!.withBoundary({ boundary: "checkpoint", sink: "done_checkpoint",
+              deadlineMs: Math.max(0, attempt.deadlineAt - now()), checkpointStop: stop,
+              activeStep: () => steps.current() }, async () => { throw error; });
+          }
+          throw error;
         }
       } catch (error) {
         outcome = error instanceof CheckpointSoftDeadlineError ? "soft_stop" : "failed";

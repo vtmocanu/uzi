@@ -1,4 +1,4 @@
-import { cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
+import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
 //
@@ -1002,7 +1002,11 @@ export function buildRunLaneReconcile(
     // after reconciliation; only hard/authority fences cancel the exchange.
     const signal = AbortSignal.any([boundarySignal,
       ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
-    const expired = () => signal.aborted || now() >= deadlineAt ||
+    const checkpointAuthorityExpired = () => {
+      try { checkCheckpointStop(request.checkpointStop); return false; }
+      catch (error) { return !(error instanceof CheckpointSoftDeadlineError); }
+    };
+    const expired = () => signal.aborted || checkpointAuthorityExpired() || now() >= deadlineAt ||
       (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
@@ -1079,7 +1083,7 @@ export function buildRunLaneReconcile(
             }
             const failure = codexRefreshFailure(err);
             // The boundary deadline after a send cannot prove whether the provider spent the token.
-            if (failure === "cancelled" && signal.aborted) {
+            if (failure === "cancelled") {
               operationUncertain = true;
               return blocked("refresh_unknown");
             }

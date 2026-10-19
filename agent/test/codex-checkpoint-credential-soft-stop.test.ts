@@ -6,11 +6,13 @@ import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { selectCodexBinding } from "../src/codex/select.js";
 import type { BoundaryRequest } from "../src/harness.js";
+import { PauseNowSignal } from "../src/steering.js";
 
 for (const authMode of ["subscription", "api_key"] as const) {
-  for (const stopAt of ["before exchange", "during exchange"] as const) {
+  for (const stopAt of ["before exchange", "during exchange", "during cooperative pause"] as const) {
     it(`${authMode} checkpoint soft stop ${stopAt} does not poison credential reconciliation`, async () => {
       const soft = new AbortController(), lifecycle = new AbortController();
+      const capturedLifecycle = new AbortController();
       const selected = selectCodexBinding({ codex: {
         auth_mode: authMode, access_token: "fixture", capability: "fixture",
         ...(authMode === "subscription" ? { generation: 3, chatgpt_account_id: "fixture-account", chatgpt_plan_type: null } : {}),
@@ -22,10 +24,11 @@ for (const authMode of ["subscription", "api_key"] as const) {
       let calls = 0, vaultChecks = 0;
       const exchange = async (_runId: string, body: { observed_generation?: number }, _expected: unknown, signal?: AbortSignal) => {
         calls++;
-        if (stopAt === "during exchange" && calls === 1) {
+        if (stopAt !== "before exchange" && calls === 1) {
           // The HTTP operation has started. A cooperative scheduling timeout must
           // not cancel it and manufacture an unknown credential outcome.
           soft.abort();
+          if (stopAt === "during cooperative pause") capturedLifecycle.abort(new PauseNowSignal());
           await Promise.resolve();
           exchangeSignals.push(signal?.aborted ?? false);
         }
@@ -44,7 +47,8 @@ for (const authMode of ["subscription", "api_key"] as const) {
       const safety = createCodexExecutionSafety(registry, async () => assert.fail("no root spawn"), installer.reconcile);
       const request: BoundaryRequest = {
         boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 90_000,
-        checkpointStop: { signal: soft.signal, lifecycleSignal: lifecycle.signal },
+        checkpointStop: { signal: soft.signal, lifecycleSignal: capturedLifecycle.signal,
+          cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal },
       };
       await assert.rejects(safety.withBoundary(request, async () => assert.fail("no action after the soft stop")), CheckpointSoftDeadlineError);
       assert.equal(registry.isPoisoned(), false, "a clean scheduling stop leaves the registry reusable");
