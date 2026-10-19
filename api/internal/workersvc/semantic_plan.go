@@ -190,7 +190,8 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 		}
 		mids[m.ID] = true
 	}
-	if !utf8.ValidString(structural.PlanMd) || len(structural.PlanMd) > 256*1024 {
+	displayPlan, _ := stripNUL(structural.PlanMd)
+	if !utf8.ValidString(structural.PlanMd) || len(structural.PlanMd) > 256*1024 || strings.TrimSpace(displayPlan) == "" {
 		return fail()
 	}
 	sources := map[string]apitypes.SemanticSourceCapture{}

@@ -7,12 +7,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestSemanticGateExactApproval(t *testing.T) {
 	structural, proposal, sources := semanticFixture()
+	structural.PlanMd = "implement\x00 café 😀 behavior"
 	proposal.Criteria[0].Kind = "maintainer"
 	proposal.Criteria[0].Maintainer = &apitypes.SemanticMaintainer{Reason: "owner infrastructure", Conditions: []string{"deployment available"}, VerificationSteps: []string{"observe rollout"}}
 	candidate, _, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources)
@@ -23,7 +23,7 @@ func TestSemanticGateExactApproval(t *testing.T) {
 	candidate.Digest = "current"
 	candidate.Criteria[0].ID = uuid.NewString()
 	c := &semanticCoverageTx{candidate: candidate, policy: apitypes.SemanticPolicy{MaxReviews: 3, MaxTokens: 120000, MaxSeconds: 900}}
-	run := store.Run{Status: "awaiting_approval", GateRevision: 2, ClaimGeneration: 7, PlanMd: pgconv.Text(structural.PlanMd), MilestonesCandidate: structural.Milestones}
+	run := store.Run{Status: "awaiting_approval", GateRevision: 2, ClaimGeneration: 7, PlanMd: stripNULParam(&structural.PlanMd), MilestonesCandidate: structural.Milestones}
 	p := semanticGateProjection(c, run)
 	payload := gatePayloadFromRow(run)
 	payload.Semantic = &p
@@ -40,6 +40,9 @@ func TestSemanticGateExactApproval(t *testing.T) {
 		name string
 		edit func(*store.Run, *SubmitInputOptions, *apitypes.SemanticGatePresentation)
 	}{
+		{"stored display", func(r *store.Run, _ *SubmitInputOptions, _ *apitypes.SemanticGatePresentation) {
+			r.PlanMd.String += "changed"
+		}},
 		{"unbound", func(_ *store.Run, o *SubmitInputOptions, _ *apitypes.SemanticGatePresentation) {
 			o.SemanticApproval = nil
 		}},
@@ -101,6 +104,55 @@ func TestSemanticGateExactApproval(t *testing.T) {
 	}
 	if !sameSemanticJSON(decoded.SemanticApproval, &approval) || !sameSemanticJSON(decoded.SemanticPresentation, &p) {
 		t.Fatal("revision decode lost semantic binding")
+	}
+}
+
+func TestSemanticRawPlanDisplayIdentity(t *testing.T) {
+	structural, proposal, sources := semanticFixture()
+	prd := apitypes.SemanticSourceCapture{ID: "linked-prd", Kind: "prd", Provenance: "repo:prd", Completeness: "complete", Bytes: []byte("café\x00 😀 requirement")}
+	sources = append(sources, prd)
+	proposal.Criteria[0].Citations = append(proposal.Criteria[0].Citations, apitypes.SemanticCitation{SourceID: prd.ID, Hash: semanticHash(prd.Bytes), Start: 0, End: len(prd.Bytes)})
+	structural.PlanMd = "café\x00 😀 plan"
+	raw, fp, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	structural.PlanMd = "café 😀 plan"
+	visible, otherFP, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.PlanHash == visible.PlanHash || fp == otherFP || raw.PlanFieldsDigest != visible.PlanFieldsDigest {
+		t.Fatal("raw identity or display projection conflated")
+	}
+	payload := gatePresentedPayload{PlanMd: &structural.PlanMd, Milestones: structural.Milestones}
+	p := &apitypes.SemanticGatePresentation{Candidate: raw}
+	if err := validateSemanticGateFields(payload, p); err != nil {
+		t.Fatal(err)
+	}
+	// Reproduce the old writer's digest without changing persisted mappings.
+	oldPlan := "café\x00 😀 plan"
+	legacy := payload
+	legacy.PlanMd = &oldPlan
+	canonical, err := legacy.canonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Candidate.PlanFieldsDigest = semanticHash(canonical)
+	if err := validateSemanticGateFields(payload, p); err == nil {
+		t.Fatal("legacy raw fields digest silently reinterpreted")
+	}
+	for _, plan := range []string{"\x00", " \x00\n\t"} {
+		structural.PlanMd = plan
+		if _, _, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources); err == nil {
+			t.Fatal("display-empty raw plan accepted")
+		}
+	}
+	structural.PlanMd = "valid plan"
+	sources[0].Bytes = []byte("\x00")
+	proposal.Criteria[0].Citations[0] = apitypes.SemanticCitation{SourceID: sources[0].ID, Hash: semanticHash(sources[0].Bytes), Start: 0, End: 1}
+	if _, _, err := compileSemanticProposal(structural, semanticJSON(t, proposal), sources); err != nil {
+		t.Fatalf("NUL-only raw source rejected: %v", err)
 	}
 }
 

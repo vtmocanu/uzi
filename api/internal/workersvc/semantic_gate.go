@@ -182,10 +182,10 @@ func validateSemanticApprovalIdentity(run store.Run, opts SubmitInputOptions, p 
 		return ErrSemanticGateMismatch
 	}
 	_, digest, err := snapshot.digest()
-	if err != nil || !bytes.Equal(digest, run.GatePayloadDigest) || snapshot.PlanMd == nil || !run.PlanMd.Valid || *snapshot.PlanMd != run.PlanMd.String || semanticHash([]byte(run.PlanMd.String)) != p.Candidate.PlanHash {
+	if err != nil || !bytes.Equal(digest, run.GatePayloadDigest) || snapshot.PlanMd == nil || !run.PlanMd.Valid || *snapshot.PlanMd != run.PlanMd.String {
 		return ErrSemanticGateMismatch
 	}
-	return nil
+	return validateSemanticGateFields(snapshot, p)
 }
 
 func validateSemanticApproval(run store.Run, opts SubmitInputOptions, p *apitypes.SemanticGatePresentation) error {
@@ -223,8 +223,13 @@ func (s *Service) submitSemanticApproval(ctx context.Context, tx pgx.Tx, run sto
 	if err := validateSemanticApprovalIdentity(run, opts, p); err != nil {
 		return SubmitInputResult{}, err
 	}
-	if _, err := c.payload(ctx, run.ID); err != nil {
+	blobs, err := c.payload(ctx, run.ID)
+	if err != nil {
 		return SubmitInputResult{}, err
+	}
+	projected, _ := stripNUL(string(blobs.Plan))
+	if !run.PlanMd.Valid || projected != run.PlanMd.String {
+		return SubmitInputResult{}, ErrSemanticGateMismatch
 	}
 	// Replay authorizes the stored decision and returns its original receipt.
 	// Body, selection and override are not stored as request identity and have

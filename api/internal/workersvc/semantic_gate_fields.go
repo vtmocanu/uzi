@@ -23,6 +23,8 @@ func semanticEnrollmentPresent(ctx context.Context, q *store.Queries, id uuid.UU
 // addition to semantic_v1's existing checker identity (which also includes diff
 // and base). Witnesses and revision counters belong to the presentation digest.
 func semanticPlanFieldsDigest(plan string, milestones json.RawMessage, caps, tools []string, size string) (string, error) {
+	// Match the existing PostgreSQL display projection; raw identity stays in PlanHash.
+	plan, _ = stripNUL(plan)
 	p := gatePresentedPayload{PlanMd: &plan, Milestones: milestones, RequiredCapabilities: caps, RequiredTools: tools, SizeClass: nonEmptyPtr(size)}
 	raw, err := p.canonicalJSON()
 	if err != nil {
