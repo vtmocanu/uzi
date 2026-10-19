@@ -753,7 +753,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			dto.BranchHasOpenMr = stats.MrCount > 0
 		}
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
+	writeOwnerRun(w, dto)
 }
 
 // maxRunMessagesPage caps the ?limit= page size on ListRunMessages so a single
@@ -914,7 +914,7 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req apitypes.RunInputRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := h.decodeOwnerRunInput(r, user.ID, id, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
