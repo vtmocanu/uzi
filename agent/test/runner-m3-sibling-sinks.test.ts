@@ -170,7 +170,8 @@ for (const mode of ["shutdown", "park"] as const) {
     };
     const awaitEvent = (event: Promise<unknown>, label: string) => waitForTestEvent(
       Promise.race([event, ...executions.map(run => run.then(() => { throw new Error("execution ended before " + label); }))]),
-      label, 5_000);
+      // Fixture prepare includes real clone/fsync/pack work before the simulated done clock starts.
+      label, label.endsWith(" prepare") ? 20_000 : 5_000);
     let testFailure: unknown;
     const settlementFailures: unknown[] = [];
     try {
