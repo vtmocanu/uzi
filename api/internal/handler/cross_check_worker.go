@@ -250,6 +250,10 @@ func writeCrossCheckStatus(w http.ResponseWriter, status workersvc.PlanCrossChec
 	candidate := crossCheckResponse(status.CrossCheck, status.LeadLastSeq)
 	if status.Candidate != nil {
 		candidate.Candidate = *status.Candidate
+		// PlanCrossCheckStatusWithReconciliation validated this immutable history snapshot.
+		if status.Candidate.CandidateIdentityVersion == "semantic_v1" && status.Candidate.SemanticCandidate != nil {
+			w.Header().Set("X-Uzi-Candidate-Identity-Version", "semantic_v1")
+		}
 	}
 	candidate.leadReconciliationResponse = reconciliationResponse(status.LeadLastSeq, status.Reconciliation)
 	httpx.JSON(w, http.StatusOK, candidate)

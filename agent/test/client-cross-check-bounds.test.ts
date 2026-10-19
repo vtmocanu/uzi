@@ -54,7 +54,7 @@ function streamingResponse(bytes: Uint8Array, status = 200, chunkBytes = CHUNK_B
 
 describe("cross-check response byte bounds", () => {
   for (const operation of operations) {
-    it(`${operation.name} rejects an 8 MiB structural stream despite Content-Length: 1`, async (t) => {
+    it(`${operation.name} rejects an 8 MiB stream despite Content-Length: 1 and cancels at overflow`, async (t) => {
       // The cap-sized prefix is itself valid JSON, so truncating instead of
       // rejecting could wrongly accept an incomplete response.
       const bytes = Buffer.alloc(8 * 1024 * 1024, " ");
@@ -63,11 +63,9 @@ describe("cross-check response byte bounds", () => {
       const fetchMock = t.mock.method(globalThis, "fetch", async () => stream.response);
       t.mock.method(stream.response, "text", async () => { assert.fail("must stream before buffering"); });
       await assert.rejects(operation.call(newClient()), /response body exceeds 6291456 bytes/);
-      const planReply = operation.name !== "reportCrossCheckVerdict";
-      // Plan replies may contain a full semantic candidate, so they read to EOF
-      // under 20 MiB before applying the old structural cap to the decoded body.
-      assert.equal(stream.consumed(), planReply ? bytes.byteLength : CAP + CHUNK_BYTES);
-      assert.equal(stream.cancelled(), !planReply);
+      assert.equal(stream.consumed(), CAP + CHUNK_BYTES);
+      assert.ok(stream.consumed() < bytes.byteLength);
+      assert.equal(stream.cancelled(), true);
       assert.equal(fetchMock.mock.callCount(), 1, "must not add retries");
     });
 
@@ -95,7 +93,7 @@ describe("cross-check response byte bounds", () => {
       const stream = streamingResponse(bytes, 200, bytes.byteLength);
       t.mock.method(globalThis, "fetch", async () => stream.response);
       await assert.rejects(operation.call(newClient()), /response body exceeds 6291456 bytes/);
-      assert.equal(stream.cancelled(), operation.name === "reportCrossCheckVerdict");
+      assert.equal(stream.cancelled(), true);
     });
 
     it(`${operation.name} preserves HTTP status and Retry-After with bounded error reads`, async (t) => {

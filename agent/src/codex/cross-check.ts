@@ -1,6 +1,7 @@
 // Dedicated one-turn checker lifecycle. It never enters CodexExecutor's lead loop.
 import path from "node:path";
 import { SCRATCH_PLACEMENT_FACT } from "../scratch-guidance.js";
+import { SEMANTIC_ENVELOPE_MAX_BYTES } from "../semantic-plan.js";
 import { decodeCodeFindings, decodeCrossCheckClaim } from "../code-cross-check-contract.js";
 import { buildRepoInstructionsContext } from "../prompt.js";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -154,7 +155,7 @@ export function crossCheckPrompt(claim: ClaimResponse): string {
   throw new Error("cross-check candidate input exceeds cap");
  }
  const candidate = JSON.stringify({ ...c, planning_diff: undefined });
- const candidateCap = c.candidate_identity_version === "semantic_v1" ? 6 * 1024 * 1024 : 2 * 1024 * 1024;
+ const candidateCap = c.candidate_identity_version === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : 2 * 1024 * 1024;
  if (Buffer.byteLength(candidate) > candidateCap) throw new Error("cross-check candidate input exceeds cap");
  return [fence("issue_title", claim.issue_title), fence("issue_body", claim.issue_description),
   fence("candidate", candidate),

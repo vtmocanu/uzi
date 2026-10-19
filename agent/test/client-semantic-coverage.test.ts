@@ -25,7 +25,7 @@ it("M2 high-density approved fields survive semantic HTTP, canonical decoding, c
   // Match Go encoding/json escaping on every server response; no passing prefix.
   const goResponse = (value: unknown, init?: ResponseInit) =>
     new Response(JSON.stringify(value).replace(/</g, "\\u003c"), init);
-  assert.ok(Buffer.byteLength(JSON.stringify(f.compiled).replace(/</g, "\\u003c")) > 20 * 1024 * 1024);
+  assert.ok(Buffer.byteLength(JSON.stringify(f.compiled).replace(/</g, "\\u003c")) > 32 * 1024 * 1024);
   const client = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
     fetch: async (input, init) => {
       const path = new URL(String(input)).pathname;
@@ -36,14 +36,15 @@ it("M2 high-density approved fields survive semantic HTTP, canonical decoding, c
         return goResponse(f.compiled);
       }
       if (path.endsWith("/reserve")) return goResponse(reservation);
-      if (path.endsWith("/claim")) return goResponse(claim, { headers: { "X-Uzi-Claim-Kind": "cross_check" } });
+      if (path.endsWith("/claim")) return goResponse(claim, { headers: { "X-Uzi-Claim-Kind": "cross_check",
+        "X-Uzi-Candidate-Identity-Version": "semantic_v1" } });
       if (init?.method === "POST") {
         const body = JSON.parse(String(init.body));
         assert.equal(body.semantic_candidate, undefined);
         assert.equal(body.candidate_identity_version, "semantic_v1");
         assert.ok(Buffer.byteLength(String(init.body)) < 8 * 1024 * 1024);
       }
-      return goResponse(f.response);
+      return goResponse(f.response, { headers: { "X-Uzi-Candidate-Identity-Version": "semantic_v1" } });
     },
   });
   assert.deepEqual((await client.submitSemanticCandidate("run", 1, f.structural, f.proposal, f.sources)).candidate, f.compiled.candidate);
@@ -58,20 +59,136 @@ it("M2 high-density approved fields survive semantic HTTP, canonical decoding, c
   assert.deepEqual((await client.claimCrossCheck())?.cross_check, f.checker);
 });
 
+it("M2 high-density validated semantic checker prompt preserves every criterion and source identity", () => {
+  const f = semanticBoundaryFixture();
+  const checker = decodeCrossCheckClaim(f.checker);
+  assert.equal(Buffer.byteLength(JSON.stringify(checker)), 7_954_175);
+  const prompt = crossCheckPrompt(makeClaim({ kind: "cross_check", cross_check: checker }));
+  assert.ok(prompt.includes(JSON.stringify(f.compiled.candidate)));
+  for (const criterion of f.compiled.candidate.criteria) {
+    assert.ok(prompt.includes(JSON.stringify(criterion)));
+    assert.ok(prompt.includes(criterion.id));
+  }
+  for (const source of f.compiled.candidate.sources) {
+    assert.ok(prompt.includes(JSON.stringify(source)));
+    assert.ok(prompt.includes(source.id));
+  }
+});
+
 it("M2 semantic transport rejects above 64 MiB and cannot widen structural replies with a worker flag", async () => {
   const f = semanticBoundaryFixture();
   let body = JSON.stringify({ ...f.response, candidate: f.structural }) + " ".repeat(6 * 1024 * 1024);
+  let marked = false;
   const client = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
-    fetch: async () => new Response(body),
+    fetch: async () => new Response(body, { headers: marked ? {
+      "X-Uzi-Candidate-Identity-Version": "semantic_v1", "X-Uzi-Claim-Kind": "cross_check",
+    } : {} }),
   });
   await assert.rejects(client.submitPlanCrossCheck("run", 1, { ...f.structural,
     candidate_identity_version: "semantic_v1", semantic_candidate: f.compiled.candidate }), /exceeds 6291456/);
   body = JSON.stringify(f.compiled).padEnd(64 * 1024 * 1024 + 1, " ");
   await assert.rejects(client.submitSemanticCandidate("run", 1, f.structural, f.proposal, f.sources), /exceeds 67108864/);
   await assert.rejects(client.reserveSemanticCoverage("run", 1, { ...f.binding, request_id: randomUUID(), supported: true }), /exceeds 67108864/);
+  marked = true;
   body = JSON.stringify(f.response).padEnd(64 * 1024 * 1024 + 1, " ");
   await assert.rejects(client.planCrossCheckStatus("run", 1), /exceeds 67108864/);
   await assert.rejects(client.claimCrossCheck(), /exceeds 67108864/);
+});
+
+it("M2 semantic markers reject unknown versions and ineligible endpoints before consuming bodies", async () => {
+  for (const marker of ["future", "semantic_v1"]) {
+    for (const bytes of [1, 7 * 1024 * 1024]) {
+      let pulls = 0, cancelled = 0;
+      const client = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
+        fetch: async () => new Response(new ReadableStream<Uint8Array>({
+          pull(controller) { pulls++; controller.enqueue(new Uint8Array(bytes)); },
+          cancel() { cancelled++; },
+        }, { highWaterMark: 0 }), { headers: { "X-Uzi-Candidate-Identity-Version": marker } }),
+      });
+      await assert.rejects(client.codeCrossCheckStatus("run", 1), /identity marker/);
+      assert.equal(pulls, 0);
+      assert.equal(cancelled, 1);
+      if (marker === "future") {
+        await assert.rejects(client.planCrossCheckStatus("run", 1), /identity marker/);
+        await assert.rejects(client.claimCrossCheck(), /identity marker/);
+        assert.equal(pulls, 0);
+        assert.equal(cancelled, 3);
+      }
+    }
+  }
+});
+
+it("M2 semantic marker and full candidate must agree at every body size", async () => {
+  const f = await fixture();
+  const candidate = { ...f.structural, candidate_identity_version: "semantic_v1", semantic_candidate: f.compiled.candidate };
+  const response = { result: "candidate", candidate, candidate_digest: f.compiled.candidate.digest,
+    candidate_generation: 1, checker_run_id: null, round: 1, deadline_at: "2030-01-01T00:00:00Z",
+    verdict: "pending", reason_class: "", findings: null, lead_last_seq: 0 };
+  const checker = { ...candidate, stage: "plan", lead_run_id: randomUUID(), round: 1,
+    candidate_digest: response.candidate_digest, deadline_at: response.deadline_at };
+  let wire: unknown, marker: string | undefined;
+  let padding = 0;
+  const client = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
+    fetch: async () => new Response(JSON.stringify(wire) + " ".repeat(padding), { headers: {
+      "X-Uzi-Claim-Kind": "cross_check", ...(marker ? { "X-Uzi-Candidate-Identity-Version": marker } : {}),
+    } }),
+  });
+  for (padding of [0, 7 * 1024 * 1024]) {
+    marker = undefined;
+    wire = response;
+    await assert.rejects(client.submitPlanCrossCheck("run", 1, f.structural),
+      padding ? /exceeds 6291456/ : /missing.*identity marker/);
+    await assert.rejects(client.planCrossCheckStatus("run", 1),
+      padding ? /exceeds 6291456/ : /missing.*identity marker/);
+    wire = { kind: "cross_check", cross_check: checker };
+    await assert.rejects(client.claimCrossCheck(), padding ? /exceeds 2097152/ : /missing.*identity marker/);
+    marker = "semantic_v1";
+    for (wire of [
+      null, { result: "no_row", reason_class: "no_candidate", lead_last_seq: 0 },
+      { result: "parked", lead_last_seq: 0 }, { ...response, candidate: f.structural },
+      { ...response, candidate: { ...candidate, semantic_candidate: undefined } },
+      { ...response, candidate_digest: "0".repeat(64) },
+    ]) {
+      await assert.rejects(client.submitPlanCrossCheck("run", 1, f.structural));
+      await assert.rejects(client.planCrossCheckStatus("run", 1));
+    }
+    for (wire of [
+      null, { kind: "cross_check" }, { kind: "cross_check", cross_check: { ...checker, ...f.structural,
+        candidate_identity_version: undefined, semantic_candidate: undefined } },
+      { kind: "cross_check", cross_check: { ...checker, stage: "code" } },
+      { kind: "cross_check", cross_check: { ...checker, semantic_candidate: undefined } },
+      { kind: "cross_check", cross_check: { ...checker, candidate_digest: "0".repeat(64) } },
+    ]) await assert.rejects(client.claimCrossCheck());
+  }
+});
+
+it("M2 semantic 64 MiB streaming bound cancels overflow before EOF and accepts exact-cap status", async () => {
+  const f = semanticBoundaryFixture();
+  let cancelled = 0, sent = 0;
+  const client = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
+    fetch: async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const size = Math.min(1024 * 1024, 64 * 1024 * 1024 + 1 - sent);
+        assert.ok(size > 0, "overflow must reject without waiting for EOF");
+        sent += size; controller.enqueue(new Uint8Array(size));
+      },
+      cancel() { cancelled++; },
+    }, { highWaterMark: 0 }), { headers: { "X-Uzi-Candidate-Identity-Version": "semantic_v1" } }),
+  });
+  await assert.rejects(client.planCrossCheckStatus("run", 1), /exceeds 67108864/);
+  assert.equal(cancelled, 1);
+  sent = 0;
+  await assert.rejects(client.claimCrossCheck(), /exceeds 67108864/);
+  assert.equal(cancelled, 2);
+
+  const raw = JSON.stringify(f.response).padEnd(64 * 1024 * 1024, " ");
+  const exact = new WorkerClient("http://example.test", "fixture", "test", nullLogger(), {
+    fetch: async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(Buffer.from(raw)); controller.close(); },
+      cancel() { assert.fail("exact-cap source must reach EOF"); },
+    }), { headers: { "X-Uzi-Candidate-Identity-Version": "semantic_v1" } }),
+  });
+  assert.equal((await exact.planCrossCheckStatus("run", 1)).result, "candidate");
 });
 
 async function fixture() {

@@ -148,8 +148,46 @@ func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 	retryBody := map[string]any{"claim_generation": 7, "stage": "plan", "round": 1, "plan_md": structural.PlanMd, "milestones": structural.Milestones, "required_capabilities": []string{}, "required_tools": []string{}, "size_class": "s", "base_commit": structural.BaseCommit, "planning_diff": "diff"}
 	var checker planCrossCheckCandidateResponse
 	rec = checkerCall(http.MethodPost, "", retryBody)
-	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &checker) != nil || checker.Candidate.CandidateIdentityVersion != "semantic_v1" || checker.Candidate.SemanticCandidate == nil || checker.Candidate.SemanticCandidate.Digest != compiled.Candidate.Digest {
+	if rec.Header().Get("X-Uzi-Candidate-Identity-Version") != "semantic_v1" || rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &checker) != nil || checker.Candidate.CandidateIdentityVersion != "semantic_v1" || checker.Candidate.SemanticCandidate == nil || checker.Candidate.SemanticCandidate.Digest != compiled.Candidate.Digest {
 		t.Fatalf("semantic exact retry: %d %s", rec.Code, rec.Body.String())
+	}
+	if !reflect.DeepEqual(checker.Candidate.SemanticCandidate, &compiled.Candidate) {
+		t.Fatal("submit changed the server candidate")
+	}
+	rec = checkerCall(http.MethodGet, "/plan/1?claim_generation=7", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Uzi-Candidate-Identity-Version") != "semantic_v1" ||
+		json.Unmarshal(rec.Body.Bytes(), &checker) != nil || !reflect.DeepEqual(checker.Candidate.SemanticCandidate, &compiled.Candidate) {
+		t.Fatalf("semantic status: %d %s", rec.Code, rec.Body.String())
+	}
+	// Exercise the production checker claim writer with the service-rehydrated
+	// frozen candidate. Claim admission/credential minting is outside this seam.
+	payload := &workersvc.ClaimPayload{Kind: "cross_check", RunID: child.String(), CrossCheck: &workersvc.ClaimPlanCrossCheck{
+		Stage: "plan", Round: 1, LeadRunID: run.String(), CandidateDigest: checker.CandidateDigest,
+		DeadlineAt: checker.DeadlineAt, PlanCrossCheckCandidate: checker.Candidate,
+	}}
+	rawClaim, err := workersvc.MarshalCrossCheckClaim(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimRec := httptest.NewRecorder()
+	writeWorkerRunClaim(claimRec, payload)
+	if claimRec.Code != http.StatusOK || claimRec.Header().Get("X-Uzi-Claim-Kind") != "cross_check" ||
+		claimRec.Header().Get("X-Uzi-Candidate-Identity-Version") != "semantic_v1" || !bytes.Equal(claimRec.Body.Bytes(), rawClaim) {
+		t.Fatal("semantic checker claim marker or bytes changed")
+	}
+	for _, corrupt := range []bool{false, true} {
+		c := compiled.Candidate
+		c.Criteria = append([]apitypes.SemanticCriterion(nil), c.Criteria...)
+		payload.CrossCheck.SemanticCandidate = nil
+		if corrupt {
+			c.Criteria[0].DoneWhen += "corrupt"
+			payload.CrossCheck.SemanticCandidate = &c
+		}
+		refused := httptest.NewRecorder()
+		writeWorkerRunClaim(refused, payload)
+		if refused.Code != http.StatusInternalServerError || refused.Header().Get("X-Uzi-Candidate-Identity-Version") != "" {
+			t.Fatal("invalid semantic checker emitted marker")
+		}
 	}
 	proposal.Criteria[0].Text = "revised behavior"
 	body["proposal"] = proposal
@@ -161,8 +199,20 @@ func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 		t.Fatal("old checker authorized a replacement candidate")
 	}
 	rec = checkerCall(http.MethodGet, "/plan/1?claim_generation=7", nil)
-	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &checker) != nil || checker.Candidate.SemanticCandidate == nil || checker.Candidate.SemanticCandidate.Digest != compiled.Candidate.Digest {
+	if rec.Header().Get("X-Uzi-Candidate-Identity-Version") != "semantic_v1" || rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &checker) != nil || checker.Candidate.SemanticCandidate == nil || checker.Candidate.SemanticCandidate.Digest != compiled.Candidate.Digest {
 		t.Fatalf("historical checker lost immutable payload: %d %s", rec.Code, rec.Body.String())
+	}
+	// Corrupt and missing immutable history must fail before either response
+	// writer can emit a semantic marker. The mutable current candidate is newer.
+	cliMustExec(t, pool, `UPDATE semantic_candidate_history SET candidate=jsonb_set(candidate,'{criteria}', '[]') WHERE run_id=$1 AND revision=1`, run)
+	rec = checkerCall(http.MethodGet, "/plan/1?claim_generation=7", nil)
+	if rec.Code == http.StatusOK || rec.Header().Get("X-Uzi-Candidate-Identity-Version") != "" {
+		t.Fatal("corrupt history emitted semantic status marker")
+	}
+	cliMustExec(t, pool, `DELETE FROM semantic_candidate_history WHERE run_id=$1 AND revision=1`, run)
+	rec = checkerCall(http.MethodGet, "/plan/1?claim_generation=7", nil)
+	if rec.Code == http.StatusOK || rec.Header().Get("X-Uzi-Candidate-Identity-Version") != "" {
+		t.Fatal("missing history emitted semantic status marker")
 	}
 	for _, suffix := range []string{"/coverage?claim_generation=6", "/coverage?claim_generation=8"} {
 		if rec := call(http.MethodGet, suffix, nil); rec.Code != http.StatusConflict {

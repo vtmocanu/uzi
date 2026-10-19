@@ -1683,10 +1683,11 @@ export class WorkerClient {
       }
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims keep their existing decoder.
-      const claim = (dedicated || marker === "cross_check"
-        ? JSON.parse(await readCrossCheckText(res, CROSS_CHECK_RESPONSE_MAX_BYTES, deadline, "claim"))
+      const claim = (dedicated || marker === "cross_check" || res.headers.has("X-Uzi-Candidate-Identity-Version")
+        ? JSON.parse(await readCrossCheckText(res, 2 * 1024 * 1024, deadline,
+          dedicated || marker === "cross_check" ? "claim" : undefined))
         : await res.json()) as ClaimResponse;
-      if (claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
+      if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
         throw new Error("cross-check claim marker and kind disagree");
       }
@@ -4265,27 +4266,37 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
   return new TextDecoder().decode(await readBoundedBytes(res, maxBytes, rejectOverflow, signal));
 }
 
-/** Only plan replies and checker claims opt into the larger read. A worker flag
- * cannot widen a structural reply: the complete server candidate must decode and
- * its digest must match the enclosing server identity before the old cap lifts. */
+/** The server marker grants a bounded transport budget only. The complete
+ * semantic candidate and its enclosing digest must still validate after reading. */
 async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
   semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
-  const raw = await readBoundedBytes(res, semanticContext ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const marker = res.headers.get("X-Uzi-Candidate-Identity-Version");
+  if (marker !== null && (marker !== "semantic_v1" || !semanticContext)) {
+    void res.body?.cancel().catch(() => undefined);
+    throw new Error("invalid cross-check candidate identity marker");
+  }
+  const raw = await readBoundedBytes(res, marker === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
   const text = new TextDecoder().decode(raw);
-  if (semanticContext && raw.length > maxBytes) {
-    try {
-      const wire: unknown = JSON.parse(text);
-      let candidate: PlanCrossCheckCandidate | ReturnType<typeof decodeCrossCheckClaim> | undefined;
+  if (semanticContext) {
+    const wire: unknown = text ? JSON.parse(text) : undefined;
+    const candidate = crossCheckRecord(wire)
+      ? semanticContext === "claim" ? wire.cross_check : wire.candidate
+      : undefined;
+    const semantic = crossCheckRecord(candidate) &&
+      (candidate.candidate_identity_version !== undefined || candidate.semantic_candidate !== undefined);
+    if (marker === null && semantic) throw new Error("missing cross-check candidate identity marker");
+    if (marker !== null) {
+      let decoded: PlanCrossCheckCandidate | ReturnType<typeof decodeCrossCheckClaim> | undefined;
       if (semanticContext === "claim") {
-        if (crossCheckRecord(wire) && wire.kind === "cross_check") candidate = decodeCrossCheckClaim(wire.cross_check);
+        if (crossCheckRecord(wire) && wire.kind === "cross_check") decoded = decodeCrossCheckClaim(wire.cross_check);
       } else {
         const response = decodePlanCrossCheckResponse(wire, semanticContext.generation, semanticContext.round);
-        if (response.result === "candidate") candidate = response.candidate;
+        if (response.result === "candidate") decoded = response.candidate;
       }
-      if (!candidate || candidate.candidate_identity_version !== "semantic_v1" || !candidate.semantic_candidate) {
-        throw new Error("missing semantic candidate");
+      if (!decoded || decoded.candidate_identity_version !== "semantic_v1" || !decoded.semantic_candidate) {
+        throw new Error("cross-check candidate identity marker and body disagree");
       }
-    } catch { throw new ResponseBodyOverflowError(maxBytes); }
+    }
   }
   return text;
 }

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import { decodeCrossCheckClaim } from "../src/code-cross-check-contract.js";
 import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
@@ -1317,7 +1318,22 @@ export class FakeApi {
           acceptedCandidate: request.method === "POST" && status === 200 &&
             (body as { result?: string } | null)?.result === "candidate" });
         if (drop) res.destroy();
-        else send(res, status, body);
+        else {
+          const snapshot = body as { result?: string; candidate?: Record<string, unknown>;
+            candidate_digest?: string; round?: number; deadline_at?: string } | null;
+          if (status === 200 && (request.method === "POST" || request.method === "GET") &&
+              snapshot?.result === "candidate" && snapshot.candidate?.candidate_identity_version === "semantic_v1" &&
+              (snapshot.candidate.stage === undefined || snapshot.candidate.stage === "plan")) {
+            try {
+              decodeCrossCheckClaim({ ...snapshot.candidate, stage: "plan", lead_run_id: request.runId,
+                candidate_digest: snapshot.candidate_digest, round: snapshot.round, deadline_at: snapshot.deadline_at });
+              res.setHeader("X-Uzi-Candidate-Identity-Version", "semantic_v1");
+            } catch {
+              // Leave malformed fixtures unmarked so the HTTP client rejects them.
+            }
+          }
+          send(res, status, body);
+        }
       };
       if (request.method === "POST" && this.checkedFencedRuns.has(request.runId))
         return reply(409, { reason: "cross_check_refused" });
