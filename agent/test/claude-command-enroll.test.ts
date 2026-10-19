@@ -273,7 +273,7 @@ function launcherLikeStale(replyMs: () => number) {
   return { handle, calls: () => calls, root };
 }
 
-test("a tree that never settles runs unenrolled, never as an enrollment failure, within the window", { timeout: 60000 }, async () => {
+test("a tree that never settles runs unenrolled, never as an enrollment failure, before the outer enrollment deadline", { timeout: 60000 }, async () => {
   const deadlineMs = 100;
   for (let run = 0; run < 200; run++) {
     const c = captured();

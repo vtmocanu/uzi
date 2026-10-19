@@ -585,7 +585,7 @@ feature growth creates no authority; shrink revokes reservation/signal authority
 while the original flight still owns settlement, feedback and source custody.
 
 One monitor shares the worker's cgroup budget across its configured
-concurrency. It can intervene in enrolled **Codex model shell commands**,
+concurrency. It can intervene in enrolled **Codex and Claude model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
 tree RSS ranks candidates while total cgroup usage determines pressure.
 It does not subtract file memory. Internal probes,
@@ -607,7 +607,7 @@ supersede abort, output-cap or ordinary command cleanup ownership.
 
 ### Claude runs with the guard enabled
 
-On a guard-bound Claude run (the issue run flight), the worker replaces
+On a guard-bound Claude run (`RunRunner` runs: the issue, mr_rework, ci_fix, self_improve, prompt and task kinds), the worker replaces
 native `Bash` with its own in-process command tool, `mcp__uzi_cmd__bash`, and
 disables native `Bash` and `Monitor`. What changes for those runs
 ([ADR-2396 D8](../adr/2396-worker-memory-guard.md#d8-claude-adapter)):
@@ -625,18 +625,22 @@ disables native `Bash` and `Monitor`. What changes for those runs
   shell grants are all scoped `Bash(...)` entries is unavailable on that run.
   Inherit-all roles are unchanged. With the guard disabled nothing changes.
 - Commands run at the runner uid with the CLI environment minus provider
-  credentials and the worker token. This matches native `Bash`; it is not
-  isolation.
+  credentials, the worker token, `UZI_API_URL` and the worker spawn mark. This
+  matches native `Bash`; it is not isolation.
 - On pressure the selected call receives a `worker_memory_pressure` tool
-  error. If the worker loses memory authority mid-turn, the turn is aborted
-  and follows the existing recovery/requeue policy; as for Codex, a fresh
-  registration/restart regains authority.
+  error. If the worker loses memory authority mid-turn (the API stops
+  advertising `worker_memory_pressure_v1`, or the worker shuts down), the turn
+  is aborted and follows the existing recovery/requeue policy. Restart the
+  worker to regain authority, as for Codex: registration runs once at startup,
+  and until then each new claim on that worker, including a requeued run that
+  lands back on it, fails with "Worker memory enrollment requires the full
+  worker claim and registration" and is reported as a run failure.
 
 **Startup preflight.** With the guard enabled the worker launches the command
 supervisor with an inert child before registering, and requires it to start,
 answer one observation and drain cleanly within 15 seconds. On failure it logs
 `memory guard launcher preflight FAILED — refusing to register` with a
-`profile:<field>` reason and does not start. This applies to every
+reason (for a supervisor profile refusal, `profile:<field>`) and does not start. This applies to every
 guard-enabled worker, including Codex-only workers, and single-uid workers
 whose capability bounding set or NoNewPrivs fails the supervisor profile.
 

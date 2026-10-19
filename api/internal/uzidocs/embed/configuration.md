@@ -545,9 +545,13 @@ command tool in place of native `Bash`; see
 scoped-only `Bash` roles). Enabling the guard also runs a launcher preflight at
 startup, and a worker that fails it refuses to register, including a
 Codex-only worker. If a Claude run loses memory authority mid-turn (for
-example a registration change), the turn is aborted and continues through the
-existing recovery/requeue policy; a fresh registration/restart is how the
-worker regains authority, as for Codex. A server-side check that sends
+the API stops advertising `worker_memory_pressure_v1`, or the worker shuts
+down), the turn is aborted and continues through the existing recovery/requeue
+policy. Restart the worker to regain authority, as for Codex: registration
+runs once at startup, and until then each new claim on that worker, including a
+requeued run that lands back on it, fails with "Worker memory enrollment
+requires the full worker claim and registration" and is reported as a run
+failure. This now applies to Claude claims too. A server-side check that sends
 Claude guard-bound work only to capable workers is not built; maintainers
 file it as a follow-up.
 
