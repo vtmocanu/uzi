@@ -3098,6 +3098,7 @@ export class RunRunner {
           processes: true, dockerHost: this.dockerHost, registry: this.liveAttempts,
           otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
           site: "retained_ops",
+          producerWorkLimits: { metadataBytes: 16 * 1024 ** 2, adminEntries: 128 },
         });
         return outcome.process?.state === "quiescent" && open() &&
           (!this.dockerHost || outcome.docker.state === "docker_unconfirmed");

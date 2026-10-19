@@ -236,8 +236,20 @@ export interface ProcTable {
 
 const PROC_ROOT = path.join("/", "proc");
 const meteredProcTables = new WeakSet<ProcTable>();
+const helperMeteredProcTables = new WeakMap<ProcTable, HelperWork | undefined>();
 const HELPER_WORK_LIMITS = { adminEntries: 512, metadataBytes: 32 * 1024 * 1024 };
 type HelperWorkLimits = typeof HELPER_WORK_LIMITS;
+const PRODUCER_WORK_LIMITS = { adminEntries: 128, metadataBytes: 16 * 1024 * 1024 };
+
+function validateProducerWorkLimits(limits: unknown, mode: QuiesceMode, workerWide?: boolean): void {
+  if (limits === undefined) return;
+  if (!MaintenanceResources.active() || MaintenanceResources.discoveryActive() ||
+      mode !== "capture" || workerWide === true || !isHelperWorkLimits(limits) ||
+      limits.adminEntries <= 0 || limits.adminEntries > PRODUCER_WORK_LIMITS.adminEntries ||
+      limits.metadataBytes <= 0 || limits.metadataBytes > PRODUCER_WORK_LIMITS.metadataBytes)
+    throw new Error("invalid producer quiescence envelope");
+  MaintenanceResources.check();
+}
 type HelperScanRequest = ScanRequest & { workLimits?: HelperWorkLimits };
 
 /** One sticky allowance for all raw proc work in one child invocation, including rescans.
@@ -323,9 +335,10 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       },
     };
     meteredProcTables.add(table);
+    helperMeteredProcTables.set(table, work);
     return table;
   }
-  return {
+  const table: ProcTable = {
     listPids: () =>
       fs
         .readdirSync(root)
@@ -336,6 +349,8 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
     readCwd: (pid) => fs.readlinkSync(path.join(root, String(pid), "cwd")),
     readStat: (pid) => fs.readFileSync(path.join(root, String(pid), "stat"), "utf8"),
   };
+  helperMeteredProcTables.set(table, work);
+  return table;
 }
 
 /** The real process table (Linux procfs). */
@@ -868,6 +883,11 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const baseTable = deps.table ?? (reportBudget && testView && "procRoot" in testView
     ? procfsTableAt(testView.procRoot, reportBudget) : view?.table) ??
     (reportBudget || helperWork.getStore() ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
+  // procfsTableAt binds raw reservations at construction. Returned rows/strings cannot
+  // account for ignored directory entries, EOF or prebuffer reservations in another context.
+  const work = helperWork.getStore();
+  if (work && helperMeteredProcTables.has(baseTable) && helperMeteredProcTables.get(baseTable) !== work)
+    return { state: "unverified", processes: [], killed: [], detail: "proc table helper work context mismatch" };
   let tableFailure: unknown;
   let bytes = 0;
   const bounded = <T>(read: () => T, cap?: number): T => {
@@ -877,8 +897,12 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
       const result = read();
-      if (scoped && !meteredProcTables.has(baseTable) && typeof result === "string") {
-        MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(result));
+      if (typeof result === "string") {
+        const work = helperWork.getStore();
+        if (work && helperMeteredProcTables.get(baseTable) !== work)
+          work.consume("metadataBytes", Buffer.byteLength(result));
+        if (scoped && !meteredProcTables.has(baseTable))
+          MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(result));
       }
       if ((reportBudget || scoped) && typeof result === "string" && cap !== undefined) {
         const length = Buffer.byteLength(result);
@@ -896,6 +920,8 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const table: ProcTable = reportBudget || ambient || scoped ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
+      const work = helperWork.getStore();
+      if (work && helperMeteredProcTables.get(baseTable) !== work) work.consume("adminEntries", pids.length);
       if (!meteredProcTables.has(baseTable)) MaintenanceResources.consumeIfActive("adminEntries", pids.length);
       if (pids.length > 4096) throw new Error("process PID budget");
       return pids;
@@ -1275,8 +1301,10 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  */
 async function reapProcessesViaHelper(
   req: HelperScanRequest,
-  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
+  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
+  validateProducerWorkLimits(opts.producerWorkLimits, req.mode, req.workerWide);
+  const limits = { ...(opts.producerWorkLimits ?? HELPER_WORK_LIMITS) };
   const ambient = MaintenanceBudget.current();
   const scoped = MaintenanceResources.active();
   const resourceSignal = MaintenanceResources.signalIfActive();
@@ -1366,9 +1394,9 @@ async function reapProcessesViaHelper(
       if (remaining && Math.floor(remaining()) <= 0) throw new Error("maintenance helper operation expired");
       if (scoped) {
         // Reserve the whole child envelope before dispatch, without refunds even on partial failure.
-        MaintenanceResources.consume("adminEntries", HELPER_WORK_LIMITS.adminEntries);
-        MaintenanceResources.consume("metadataBytes", HELPER_WORK_LIMITS.metadataBytes);
-        req = { ...req, workLimits: { ...HELPER_WORK_LIMITS } };
+        MaintenanceResources.consume("adminEntries", limits.adminEntries);
+        MaintenanceResources.consume("metadataBytes", limits.metadataBytes);
+        req = { ...req, workLimits: { ...limits } };
       }
       MaintenanceResources.consumeIfActive("launches", 1);
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
@@ -1447,6 +1475,8 @@ async function reapProcessesViaHelper(
 
 /** Options for {@link reapRunProcesses}. */
 export interface ReapRunOptions extends ReapDeps {
+  /** Charged capture only; positive limits at most 16 MiB metadata and 128 admin entries. */
+  producerWorkLimits?: HelperWorkLimits;
   /** Run the scan in the runner-uid helper (default: when the uid split is active). */
   viaHelper?: boolean;
   spawnHelper?: HelperSpawn;
@@ -1463,15 +1493,19 @@ function defaultTargetUid(): number {
 export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = {}): Promise<ProcessQuiescence> {
   const viaHelper = opts.viaHelper ?? uidSplitActive();
   try {
+    validateProducerWorkLimits(opts.producerWorkLimits, req.mode, req.workerWide);
     if (viaHelper) {
     return await reapProcessesViaHelper(req, {
       spawnHelper: opts.spawnHelper,
       timeoutMs: opts.helperTimeoutMs,
       helperTmp: opts.helperTmp,
       reportBudget: opts.reportBudget,
+      producerWorkLimits: opts.producerWorkLimits,
     });
   }
-    return await reapProcesses(req, opts);
+    // In-process work keeps actual scoped parent metering and a sticky local envelope.
+    return await (opts.producerWorkLimits === undefined ? reapProcesses(req, opts) :
+      helperWork.run(new HelperWork(opts.producerWorkLimits), () => reapProcesses(req, opts)));
   } catch (err) {
     return { state: "unverified", processes: [], killed: [], detail: `reap failed: ${(err as Error).message}` };
   }
@@ -1747,6 +1781,8 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
 
 /** One quiescence request for a run's clone. */
 export interface QuiesceRunRequest {
+  /** Producer retained-family capture only; ordinary boundaries omit this option. */
+  producerWorkLimits?: HelperWorkLimits;
   reportBudget?: { signal: AbortSignal; deadline: number };
   mode: QuiesceMode;
   /** This attempt, when there is one (its marker is "own"). */
@@ -1786,6 +1822,16 @@ export interface QuiesceRunDeps {
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
+  const producerWorkLimits = req.producerWorkLimits === undefined ? deps.reap?.producerWorkLimits : req.producerWorkLimits;
+  try {
+    validateProducerWorkLimits(producerWorkLimits, req.mode, req.workerWide);
+    if (producerWorkLimits !== undefined && (!req.processes || req.site !== "retained_ops"))
+      throw new Error("invalid producer quiescence site");
+  } catch (err) {
+    return { process: { state: "unverified", processes: [], killed: [], detail: (err as Error).message },
+      docker: { state: "not_wired", removed: [], detail: "" } };
+  }
+  const reapOptions = { ...deps.reap, producerWorkLimits };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
     const scan: ScanRequest = {
@@ -1813,8 +1859,8 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       workerNonce: workerSpawnNonce(),
     };
     processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
-      req.reportBudget ? { ...deps.reap, reportBudget: req.reportBudget,
-        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : deps.reap);
+      req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
+        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
   }
   const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
     (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
@@ -1832,7 +1878,7 @@ function isHelperWorkLimits(v: unknown): v is HelperWorkLimits {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const o = v as Record<string, unknown>;
   return Object.keys(o).length === 2 && (Object.keys(HELPER_WORK_LIMITS) as (keyof HelperWorkLimits)[])
-    .every(key => Number.isSafeInteger(o[key]) && (o[key] as number) >= 0 &&
+    .every(key => Object.hasOwn(o, key) && Number.isSafeInteger(o[key]) && (o[key] as number) >= 0 &&
       (o[key] as number) <= HELPER_WORK_LIMITS[key]);
 }
 

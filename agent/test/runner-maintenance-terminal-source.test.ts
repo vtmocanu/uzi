@@ -161,11 +161,21 @@ it(`#3031 fresh ordinary FAILED unsaved source: ${mode}`, async (t) => {
         return rmTreePinned(parent, name, options);
       } },
     } : {}),
-    quiesceRun: async request => ({
-      process: models && (mode === "missing-process" || (mode === "missing-reproof" && request.site === "settle_transfer:after_runner_git"))
+    quiesceRun: async request => {
+      if (request.producerWorkLimits !== undefined) {
+        assert.equal(request.site, "retained_ops");
+        assert.equal(request.mode, "capture");
+        assert.deepEqual(request.producerWorkLimits, { metadataBytes: 16 * 1024 ** 2, adminEntries: 128 });
+        MaintenanceResources.check();
+      } else if (MaintenanceResources.active() && !MaintenanceResources.discoveryActive() && request.site === "retained_ops") {
+        assert.fail("charged family proof omitted producer envelope");
+      }
+      return {
+        process: models && (mode === "missing-process" || (mode === "missing-reproof" && request.site === "settle_transfer:after_runner_git"))
         ? undefined : { state: models && mode === "unverified" ? "unverified" : "quiescent", processes: [], killed: [], detail: "" },
-      docker: { state: originMode && request.site === "retained_ops" ? "docker_unconfirmed" : "not_wired", removed: [], detail: "" },
-    }),
+        docker: { state: originMode && request.site === "retained_ops" ? "docker_unconfirmed" : "not_wired", removed: [], detail: "" },
+      };
+    },
   });
   if (originMode) {
     const boundary = runner.withRetainedSourceBoundary.bind(runner);

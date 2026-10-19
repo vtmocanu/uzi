@@ -10730,7 +10730,7 @@ try {
       }
       // Compare on the same raw byte pass: HEAD for clean, staged blobs before commit.
       // No fourth enumeration, smaller blob limit, or additional source reservation.
-      const input = await this.maintenanceWipInput(clonePath, {}, step === "status" ? headIndex : step === "commit" ? index : "");
+      const input = await this.maintenanceWipInput(clonePath, { metadataBytes: 16 * 1024 ** 2 }, step === "status" ? headIndex : step === "commit" ? index : "");
       if (step === "commit" && !input.agrees) throw refused();
       if (sourceDigest !== undefined && sourceDigest !== input.digest) throw refused();
       sourceDigest = input.digest;

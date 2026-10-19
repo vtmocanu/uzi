@@ -80,6 +80,22 @@ async function fixture(t: test.TestContext, monotonicNow?: () => number) {
 }
 
 describe("guarded maintenance WIP capture", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+  test("dirty capture uses three matched 16 MiB raw metadata envelopes without reducing source caps", async t => {
+    const f = await fixture(t);
+    await f.dirty();
+    let proofs = 0;
+    f.intercept(request => {
+      if (request.argv[2]?.includes("entryLimit")) {
+        proofs++;
+        assert.deepEqual(request.argv.slice(4, 7), [String(64 * 1024 ** 2), "16384", String(16 * 1024 ** 2)]);
+      }
+      return undefined;
+    });
+    f.run(() => MaintenanceResources.consume("metadataBytes", 196 * 1024 ** 2));
+    assert.equal((await f.capture()).kind, "committed");
+    assert.equal(proofs, 3);
+  });
+
   test("real tracked/untracked/binary WIP, ignored bytes and ordered owned effects", async t => {
     const f = await fixture(t);
     await f.dirty();

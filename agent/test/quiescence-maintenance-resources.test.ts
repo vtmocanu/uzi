@@ -8,7 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import { RecoveryMaintenance, MaintenanceResources } from "../src/recovery-maintenance.js";
-import { reapRunProcesses, runnerHelperTmp, procfsTableAt, teardownDocker, type ScanRequest } from "../src/run-quiescence.js";
+import { reapRunProcesses, runnerHelperTmp, procfsTableAt, teardownDocker, type ScanRequest, quiesceRunAttempt, LiveAttemptRegistry, setQuiescenceViewForTests } from "../src/run-quiescence.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
 const request: ScanRequest = {
@@ -486,3 +487,191 @@ test("Docker container and mount rows consume the shared administrative quota", 
   assert.equal(result.state, "docker_error");
   assert.equal(requests, 1, "mount exhaustion must not dispatch deletion");
 });
+
+const producerEnvelope = { metadataBytes: 16 * 1024 ** 2, adminEntries: 128 };
+const producerRequest = () => ({
+  mode: "capture" as const, attempt: undefined, cloneKey: request.targetKey,
+  targetPaths: request.targetPaths, processes: true, dockerHost: undefined,
+  registry: new LiveAttemptRegistry(), site: "retained_ops", producerWorkLimits: producerEnvelope,
+});
+
+for (const exhaustion of [undefined, "adminEntries", "metadataBytes"] as const) {
+  test("producer parent and real helper enforce matching envelope: " + (exhaustion ?? "success"), async t => {
+    const f = await fixture(t), root = path.join(f.dir, "proc");
+    await fs.promises.mkdir(root);
+    if (exhaustion === "adminEntries") {
+      // Raw ignored entries count too; EOF requires a 129th entry.
+      for (let i = 0; i < 128; i++) await fs.promises.writeFile(path.join(root, "ignored" + i), "");
+    }
+    if (exhaustion === "metadataBytes") {
+      await fs.promises.mkdir(path.join(root, "100"));
+      await fs.promises.writeFile(path.join(root, "100/status"), "Name: fixture\nUid:\t99999\t99999\t99999\t99999\n");
+    }
+    setQuiescenceViewForTests({ procRoot: root });
+    t.after(restoreHermeticView);
+    const limits = exhaustion === "metadataBytes" ? { ...producerEnvelope, metadataBytes: 1 } : producerEnvelope;
+    let input = "", outputBytes = 0;
+    const result = await f.run(() => quiesceRunAttempt({ ...producerRequest(), producerWorkLimits: limits }, {
+      reap: { viaHelper: true, helperTmp: { make: () => f.dir, remove: () => {} },
+        spawnHelper: (_command, args, opts) => {
+          const c = childProcess.spawn(process.execPath, args.slice(args.indexOf("--import")), {
+            ...opts, stdio: ["pipe", "pipe", "pipe"],
+          });
+          c.stdout.on("data", (chunk: Buffer) => { outputBytes += chunk.length; });
+          const end = c.stdin.end.bind(c.stdin);
+          t.mock.method(c.stdin, "end", (chunk: string) => { input = chunk; return end(chunk); });
+          return c;
+        } },
+    }));
+    assert.equal(result.process?.state, exhaustion ? "unverified" : "quiescent", result.process?.detail);
+    assert.deepEqual(JSON.parse(input).workLimits, limits);
+    // Even exhausted children retain the entire original parent reservation.
+    f.run(() => {
+      MaintenanceResources.consume("metadataBytes", byteCap - limits.metadataBytes - Buffer.byteLength(input) - outputBytes);
+      assert.throws(() => MaintenanceResources.consume("metadataBytes", 1), /maintenance_resource_exhausted/);
+    });
+  });
+}
+
+test("producer admin reservation is 128 and is never refunded on helper failure", async t => {
+  const f = await fixture(t);
+  const result = await f.run(() => reapRunProcesses(request, {
+    viaHelper: true, producerWorkLimits: producerEnvelope,
+    helperTmp: { make: () => f.dir, remove: () => {} },
+    spawnHelper: () => { throw new Error("controlled failure"); },
+  }));
+  assert.equal(result.state, "unverified");
+  f.run(() => {
+    MaintenanceResources.consume("adminEntries", 4096 - 128);
+    assert.throws(() => MaintenanceResources.consume("adminEntries", 1), /maintenance_resource_exhausted/);
+  });
+});
+
+test("invalid producer envelopes and discovery/unscoped misuse have zero effects or debits", async t => {
+  let effects = 0;
+  const deps = { reap: { viaHelper: true,
+    helperTmp: { make: () => { effects++; return "/unused"; }, remove: () => { effects++; } },
+    spawnHelper: () => { effects++; throw new Error("unexpected"); } } };
+  for (const limits of [null, {}, [], { ...producerEnvelope, extra: 1 },
+    { ...producerEnvelope, metadataBytes: 16 * 1024 ** 2 + 1 },
+    { ...producerEnvelope, adminEntries: 129 }, { ...producerEnvelope, adminEntries: 1.5 },
+    { ...producerEnvelope, metadataBytes: NaN }, { ...producerEnvelope, metadataBytes: Infinity },
+    { ...producerEnvelope, metadataBytes: -1 }, { ...producerEnvelope, metadataBytes: 0 }]) {
+    const f = await fixture(t);
+    await f.run(async () => {
+      const result = await quiesceRunAttempt({ ...producerRequest(),
+        producerWorkLimits: limits as typeof producerEnvelope }, deps);
+      assert.equal(result.process?.state, "unverified");
+      MaintenanceResources.consume("metadataBytes", byteCap);
+      MaintenanceResources.consume("adminEntries", 4096);
+    });
+  }
+  for (const run of [<T>(action: () => Promise<T>) => action(),
+    <T>(action: () => Promise<T>) => MaintenanceResources.runDiscovery(action)]) {
+    assert.equal((await run(() => quiesceRunAttempt(producerRequest(), deps))).process?.state, "unverified");
+  }
+  for (const change of [{ mode: "own" as const }, { workerWide: true }, { processes: false }, { site: "finalize" }]) {
+    const f = await fixture(t);
+    assert.equal((await f.run(() => quiesceRunAttempt({ ...producerRequest(), ...change }, deps))).process?.state, "unverified");
+  }
+  assert.equal(effects, 0);
+});
+
+for (const resource of ["adminEntries", "metadataBytes"] as const) {
+  test("in-process producer cannot bypass local " + resource + " envelope", async t => {
+    const f = await fixture(t);
+    const table = {
+      listPids: () => [100, 101],
+      readStatus: () => "Name: fixture\nUid:\t99999\t99999\t99999\t99999\n",
+      readStat: () => "", readEnviron: () => "", readCwd: () => "",
+    };
+    const result = await f.run(() => reapRunProcesses(request, { viaHelper: false, table,
+      producerWorkLimits: { ...producerEnvelope, [resource]: 1 },
+    }));
+    assert.equal(result.state, "unverified", result.detail);
+  });
+}
+
+for (const scopedCreation of [false, true]) {
+  test("in-process producer refuses preconstructed native ignored rows: scoped=" + scopedCreation, async t => {
+    const f = await fixture(t), root = path.join(f.dir, "proc");
+    await fs.promises.mkdir(root);
+    for (let i = 0; i < 128; i++) await fs.promises.writeFile(path.join(root, "ignored" + i), "");
+    const table = scopedCreation ? f.run(() => procfsTableAt(root)) : procfsTableAt(root);
+    let opens = 0;
+    t.mock.method(fs, "opendirSync", () => { opens++; throw new Error("unexpected raw directory read"); });
+    t.mock.method(fs, "readdirSync", () => { opens++; throw new Error("unexpected raw directory read"); });
+    const result = await f.run(() => reapRunProcesses(request, {
+      viaHelper: false, table, producerWorkLimits: producerEnvelope,
+    }));
+    assert.equal(result.state, "unverified", "128 ignored rows plus EOF must not bypass the local envelope");
+    assert.match(result.detail, /proc table helper work context mismatch/);
+    assert.equal(opens, 0, "refuse the foreign native table before raw I/O");
+    f.run(() => MaintenanceResources.consume("adminEntries", 4096));
+  });
+}
+
+test("in-process producer enforces its allowance on a previously metered proc table", async t => {
+  const f = await fixture(t), root = path.join(f.dir, "proc");
+  await fs.promises.mkdir(root);
+  await fs.promises.mkdir(path.join(root, "100"));
+  await fs.promises.writeFile(path.join(root, "100/status"), "Name: fixture\nUid:\t99999\t99999\t99999\t99999\n");
+  const table = f.run(() => procfsTableAt(root));
+  let reads = 0;
+  t.mock.method(fs, "readSync", () => { reads++; throw new Error("unexpected raw metadata read"); });
+  const result = await f.run(() => reapRunProcesses(request, {
+    viaHelper: false, table, producerWorkLimits: { ...producerEnvelope, metadataBytes: 1 },
+  }));
+  assert.equal(result.state, "unverified", result.detail);
+  assert.match(result.detail, /proc table helper work context mismatch/);
+  assert.equal(reads, 0, "foreign raw metadata must not be read before local reservations");
+});
+
+for (const exhaustion of [undefined, "adminEntries", "metadataBytes"] as const) {
+  test("default native in-process producer enforces raw envelope: " + (exhaustion ?? "success"), async t => {
+    const f = await fixture(t), root = path.join(f.dir, "proc");
+    await fs.promises.mkdir(root);
+    if (exhaustion === "adminEntries") {
+      for (let i = 0; i < 128; i++) await fs.promises.writeFile(path.join(root, "ignored" + i), "");
+    }
+    if (exhaustion === "metadataBytes") {
+      await fs.promises.mkdir(path.join(root, "100"));
+      await fs.promises.writeFile(path.join(root, "100/status"), "Name: fixture\nUid:\t99999\t99999\t99999\t99999\n");
+    }
+    setQuiescenceViewForTests({ procRoot: root });
+    t.after(restoreHermeticView);
+    let reads = 0;
+    const read = fs.readSync.bind(fs);
+    t.mock.method(fs, "readSync", (...args: Parameters<typeof fs.readSync>) => { reads++; return read(...args); });
+    const result = await f.run(() => reapRunProcesses(request, {
+      viaHelper: false,
+      producerWorkLimits: exhaustion === "metadataBytes" ? { ...producerEnvelope, metadataBytes: 1 } : producerEnvelope,
+    }));
+    assert.equal(result.state, exhaustion ? "unverified" : "quiescent", result.detail);
+    if (exhaustion === "metadataBytes") assert.equal(reads, 0, "reserve metadata before reading any bytes");
+    if (exhaustion === "adminEntries") {
+      f.run(() => {
+        MaintenanceResources.consume("adminEntries", 4096 - 128);
+        assert.throws(() => MaintenanceResources.consume("adminEntries", 1), /maintenance_resource_exhausted/);
+      });
+    }
+  });
+}
+
+for (const resource of ["adminEntries", "metadataBytes"] as const) {
+  test("producer parent refuses insufficient " + resource + " before helper dispatch", async t => {
+    const f = await fixture(t);
+    let launches = 0;
+    await f.run(async () => {
+      MaintenanceResources.consume(resource, (resource === "adminEntries" ? 4096 : byteCap) - producerEnvelope[resource] + 1);
+      const result = await reapRunProcesses(request, { viaHelper: true, producerWorkLimits: producerEnvelope,
+        helperTmp: { make: () => f.dir, remove: () => {} },
+        spawnHelper: () => { launches++; throw new Error("unexpected"); },
+      });
+      assert.equal(result.state, "unverified");
+      // Failed reservation revokes the original slot; later work gets no renewed allowance.
+      assert.throws(() => MaintenanceResources.consume(resource, producerEnvelope[resource]), /maintenance_token_invalid/);
+    });
+    assert.equal(launches, 0);
+  });
+}
