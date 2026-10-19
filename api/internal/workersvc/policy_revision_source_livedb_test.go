@@ -246,7 +246,7 @@ func (tx *revisionWriterTx) QueryRow(ctx context.Context, sql string, args ...an
 func (tx *revisionWriterTx) Commit(ctx context.Context) error {
 	if tx.wrote && tx.owner.point == "commit" {
 		tx.owner.hits++
-		_ = tx.Tx.Rollback(ctx)
+		_ = tx.Rollback(ctx)
 		return errors.New("injected later transaction failure")
 	}
 	return tx.Tx.Commit(ctx)

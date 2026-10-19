@@ -55,9 +55,10 @@ func TestPolicyRevisionWriterUnknownApprovalLiveDB(t *testing.T) {
 				t.Fatalf("taken revision was not recorded: %+v %v", taken, err)
 			}
 			payload := []byte("{}")
-			if mode == "null" {
+			switch mode {
+			case "null":
 				payload = []byte(`{"policy_revision":null}`)
-			} else if mode == "wrong_identity" {
+			case "wrong_identity":
 				wrong := uuid.NewString()
 				payload = revisionWriterPayload(t, source, apitypes.PolicyRevisionRef{Source: "plan_cross_check", CrossCheckID: &wrong})
 			}
