@@ -62,7 +62,7 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	if terminalStatuses[run.Status] {
 		return empty, ErrRunTerminal
 	}
-	if run.Status != "running" {
+	if run.Status != "running" && run.Status != "awaiting_approval" {
 		return empty, ErrInvalidState
 	}
 	if !run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 {
@@ -110,6 +110,9 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 			return empty, err
 		}
 		return candidate, nil
+	}
+	if err = requireSemanticMutation(ctx, q, run, workerID); err != nil {
+		return empty, err
 	}
 	if revision >= 128 {
 		return empty, fmt.Errorf("semantic candidate capacity exceeded")

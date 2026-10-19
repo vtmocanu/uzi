@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,6 +45,8 @@ type semanticCoverageInvocation struct {
 	Settlement *apitypes.SemanticCoverageSettleRequest `json:"settlement,omitempty"`
 }
 type semanticCoverageTx struct {
+	run       store.Run
+	worker    uuid.UUID
 	q         *store.Queries
 	candidate apitypes.SemanticCandidate
 	policy    apitypes.SemanticPolicy
@@ -89,7 +92,7 @@ func (s *Service) withSemanticCoverage(ctx context.Context, workerID, runID uuid
 	if terminalStatuses[run.Status] {
 		return ErrRunTerminal
 	}
-	if run.Status != "running" {
+	if run.Status != "running" && run.Status != "awaiting_approval" {
 		return ErrInvalidState
 	}
 	if !run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 {
@@ -109,7 +112,7 @@ func (s *Service) withSemanticCoverage(ctx context.Context, workerID, runID uuid
 	if enrollment.Profile != "semantic" || !validCoveragePolicy(enrollment.Policy) {
 		return errCoverageUnavailable
 	}
-	c := &semanticCoverageTx{q: q, policy: enrollment.Policy, now: time.Now().UTC(), ledger: semanticCoverageLedger{Version: 1}}
+	c := &semanticCoverageTx{run: run, worker: workerID, q: q, policy: enrollment.Policy, now: time.Now().UTC(), ledger: semanticCoverageLedger{Version: 1}}
 	if s.now != nil {
 		c.now = s.now().UTC()
 	}
@@ -142,6 +145,10 @@ func (s *Service) withSemanticCoverage(ctx context.Context, workerID, runID uuid
 			return fmt.Errorf("invalid coverage ledger")
 		}
 	}
+	before, err := json.Marshal(c.ledger)
+	if err != nil {
+		return err
+	}
 	if err = f(c); err != nil {
 		return err
 	}
@@ -149,8 +156,10 @@ func (s *Service) withSemanticCoverage(ctx context.Context, workerID, runID uuid
 	if err != nil {
 		return err
 	}
-	if err = q.UpdateSemanticReviewState(ctx, store.UpdateSemanticReviewStateParams{RunID: runID, ReviewState: raw}); err != nil {
-		return err
+	if !bytes.Equal(before, raw) {
+		if err = q.UpdateSemanticReviewState(ctx, store.UpdateSemanticReviewStateParams{RunID: runID, ReviewState: raw}); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }
@@ -276,6 +285,9 @@ func (c *semanticCoverageTx) reserve(ctx context.Context, runID, workerID uuid.U
 				return nil
 			}
 		}
+	}
+	if err := requireSemanticMutation(ctx, c.q, c.run, c.worker); err != nil {
+		return err
 	}
 	r := c.review(req.ReviewID)
 	if req.ReviewID != "" && r == nil {
@@ -417,6 +429,9 @@ func (s *Service) SettleSemanticCoverage(ctx context.Context, workerID, runID uu
 			}
 			return nil
 		}
+		if err := requireSemanticMutation(ctx, c.q, c.run, c.worker); err != nil {
+			return err
+		}
 		if req.Tokens != nil && *req.Tokens > i.Reserved {
 			return fmt.Errorf("coverage usage exceeds reservation")
 		}
@@ -471,6 +486,9 @@ func (s *Service) PublishSemanticCoverage(ctx context.Context, workerID, runID u
 				return fmt.Errorf("coverage report conflict")
 			}
 			return nil
+		}
+		if err := requireSemanticMutation(ctx, c.q, c.run, c.worker); err != nil {
+			return err
 		}
 		if !c.now.Before(r.Deadline) {
 			return fmt.Errorf("coverage deadline expired")

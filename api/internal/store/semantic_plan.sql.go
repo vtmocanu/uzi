@@ -85,6 +85,41 @@ func (q *Queries) GetSemanticSnapshotBytes(ctx context.Context, runID uuid.UUID)
 	return bytes, err
 }
 
+const hasPendingSemanticRevision = `-- name: HasPendingSemanticRevision :one
+SELECT EXISTS (
+    SELECT 1 FROM run_user_inputs
+    WHERE run_id = $1 AND kind = 'revise_plan'
+      -- Empty feedback is ignored by steering; Unicode whitespace is empty too.
+      AND btrim(body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+      AND disposition IS DISTINCT FROM 'superseded'
+      AND applied_at IS NULL AND consumed_at IS NOT NULL
+      AND consumed_worker_id = $2
+      AND consumed_claim_generation = $3
+      AND gate_binding = 'bound' AND gate_revision = $4
+)::boolean
+`
+
+type HasPendingSemanticRevisionParams struct {
+	RunID           uuid.UUID   `json:"run_id"`
+	WorkerID        pgtype.UUID `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	GateRevision    pgtype.Int8 `json:"gate_revision"`
+}
+
+// The caller holds the run lock and has fenced ownership and claim generation.
+// Any pending bound receipt suffices; queue order does not grant authority.
+func (q *Queries) HasPendingSemanticRevision(ctx context.Context, arg HasPendingSemanticRevisionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasPendingSemanticRevision,
+		arg.RunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.GateRevision,
+	)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const hasSemanticSnapshot = `-- name: HasSemanticSnapshot :one
 SELECT EXISTS(SELECT 1 FROM semantic_snapshots WHERE run_id = $1 AND hash = $2)::boolean
 `

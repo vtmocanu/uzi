@@ -123,13 +123,20 @@ func TestSemanticGateRefusalWritesNothingLiveDB(t *testing.T) {
 	for _, scenario := range []string{"foreign_owner", "unbound", "candidate", "criteria", "source", "generation", "cancel", "release", "maintainer", "report", "ordinary_answer", "no_tx"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newSemanticGateLive(t)
+			if scenario == "source" {
+				f.sources[1].Completeness = "complete"
+				f.sources[1].Bytes = []byte("original PRD requirement")
+				f.submit(t)
+			}
 			req := gateReportRequest(t, f)
 			gate := presentSemanticGate(t, f, req)
+			originalBinding := SemanticCoverageBinding(f.candidate)
 			owner := f.e.userID
 			switch scenario {
 			case "foreign_owner":
 				owner = uuid.New()
 			case "candidate", "criteria", "source":
+				// Inject independent identity drift; revision admission has its own real-flow tests.
 				f.e.exec(t, "UPDATE runs SET status='running' WHERE id=$1", f.run)
 				switch scenario {
 				case "candidate":
@@ -137,9 +144,12 @@ func TestSemanticGateRefusalWritesNothingLiveDB(t *testing.T) {
 				case "criteria":
 					f.proposal.Criteria[0].DoneWhen += " independently verified"
 				case "source":
-					f.sources[0].Provenance += ":edited"
+					f.sources[1].Bytes = []byte("changed PRD requirement")
 				}
 				f.submit(t)
+				if scenario == "source" && SemanticCoverageBinding(f.candidate).SourceDigest == originalBinding.SourceDigest {
+					t.Fatal("source fixture did not change persisted source identity")
+				}
 				f.e.exec(t, "UPDATE runs SET status='awaiting_approval' WHERE id=$1", f.run)
 			case "generation":
 				f.e.exec(t, "UPDATE runs SET claim_generation=8 WHERE id=$1", f.run)
@@ -175,17 +185,19 @@ func TestSemanticGateRefusalWritesNothingLiveDB(t *testing.T) {
 }
 
 func TestSemanticGateMutationAndReportGenerationLiveDB(t *testing.T) {
-	f := newSemanticGateLive(t)
+	f := newSemanticRevisionLive(t)
 	publication := publishGateCoverage(t, f)
 	req := gateReportRequest(t, f)
 	old := presentSemanticGate(t, f, req)
-	f.e.exec(t, "UPDATE runs SET status='running' WHERE id=$1", f.run)
+	revisionID := submitSemanticRevision(t, f, old, "clarify the criterion", true)
 	f.proposal.Criteria[0].Text += " edited by human"
 	f.submit(t)
 	if err := f.svc.PublishSemanticCoverage(f.e.ctx, f.worker, f.run, 7, publication); err == nil {
 		t.Fatal("stale report accepted")
 	}
 	newer := gateReportRequest(t, f)
+	newer.ExpectedGateRevision = &old.Approval.PresentationRevision
+	newer.RevisionInputID = &revisionID
 	gate := presentSemanticGate(t, f, newer)
 	if gate.Presentation.Coverage.Report != nil || gate.Presentation.Coverage.Outcome != "unavailable" || gate.Presentation.Coverage.ChargedTokens != 20 {
 		t.Fatal("human revision reused certificate or reset budget")

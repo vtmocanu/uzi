@@ -90,7 +90,7 @@ func TestSemanticCoverageReportBounds(t *testing.T) {
 }
 
 func TestSemanticCandidatePayload(t *testing.T) {
-	for _, mode := range []string{"persisted", "replacement", "empty identity", "foreign worker", "stale generation", "released", "terminal", "not running", "unenrolled", "corrupt source", "missing source", "null source", "corrupt plan"} {
+	for _, mode := range []string{"persisted", "replacement", "empty identity", "foreign worker", "stale generation", "released", "terminal", "not running", "awaiting approval", "unenrolled", "corrupt source", "missing source", "null source", "corrupt plan"} {
 		t.Run(mode, func(t *testing.T) {
 			worker, runID := uuid.New(), uuid.New()
 			plan, issue, empty := []byte("plan\x00bytes"), []byte("server\x00issue"), []byte{}
@@ -119,6 +119,8 @@ func TestSemanticCandidatePayload(t *testing.T) {
 			case "terminal":
 				run.Status = "completed"
 			case "not running":
+				run.Status = "paused"
+			case "awaiting approval":
 				run.Status = "awaiting_approval"
 			case "unenrolled":
 				run.CompletionContractVersion.Valid = false
@@ -168,7 +170,7 @@ func TestSemanticCandidatePayload(t *testing.T) {
 			}
 			svc := &Service{txBeginner: tx}
 			got, err := svc.SemanticCandidatePayload(t.Context(), worker, runID, 7, expected)
-			if mode != "persisted" {
+			if mode != "persisted" && mode != "awaiting approval" {
 				if err == nil || tx.committed || !reflect.DeepEqual(got, apitypes.SemanticCandidateResponse{}) {
 					t.Fatalf("refused payload: %+v err=%v committed=%v", got, err, tx.committed)
 				}

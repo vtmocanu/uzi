@@ -1,3 +1,18 @@
+-- The caller holds the run lock and has fenced ownership and claim generation.
+-- Any pending bound receipt suffices; queue order does not grant authority.
+-- name: HasPendingSemanticRevision :one
+SELECT EXISTS (
+    SELECT 1 FROM run_user_inputs
+    WHERE run_id = @run_id AND kind = 'revise_plan'
+      -- Empty feedback is ignored by steering; Unicode whitespace is empty too.
+      AND btrim(body, E' \t\n\r\f\013\u0085\u00A0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF') <> ''
+      AND disposition IS DISTINCT FROM 'superseded'
+      AND applied_at IS NULL AND consumed_at IS NOT NULL
+      AND consumed_worker_id = @worker_id
+      AND consumed_claim_generation = @claim_generation
+      AND gate_binding = 'bound' AND gate_revision = @gate_revision
+)::boolean;
+
 -- All writes are made under the runs row lock by the semantic transaction seam.
 -- No query creates semantic enrollment.
 -- name: GetSemanticPlanning :one
