@@ -511,8 +511,9 @@ export const CLAUDE_GUARDED_COMMAND_APPEND = [
   "Inline output is capped at 30000 characters with a preview; the full output goes to a spill",
   "file capped at 64 MiB, and output beyond that is truncated, so the spill is bounded and not a",
   "promise of full output. At most 8 commands run at once and further calls are refused: wait for",
-  "one to finish. The Monitor tool is unavailable. Work that needs an unavailable role goes to the",
-  "owner via ask_user.",
+  "one to finish. The Monitor tool is unavailable. If required work needs a role that is",
+  "unavailable on this run, do not substitute another role: a subagent reports it to the lead, and",
+  "the lead raises it with the owner via ask_user.",
 ].join("\n");
 
 /**

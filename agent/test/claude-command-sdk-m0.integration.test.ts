@@ -175,6 +175,8 @@ interface HandlerCall {
   hasSignal: boolean;
 }
 interface HookRecord {
+  /** Which registered matcher fired: the production "Bash" one or the "mcp__uzi_cmd__bash" one. */
+  tag: "bash-matcher" | "mcp-matcher";
   at: number;
   tool_name: string;
   tool_use_id: string;
@@ -215,6 +217,8 @@ interface Scenario {
   behave: (call: HandlerCall, r: ScenarioResult, extra: unknown) => Promise<string>;
   /** Abort the query once this resolves (turn-abort case). */
   abortAfterHandler?: boolean;
+  /** Control scenario: no guardedCommand, no sentinel server, native Bash runs (calibrates the marker). */
+  control?: boolean;
 }
 
 const DENY_MARK = "DENYME";
@@ -290,11 +294,12 @@ async function runScenario(sc: Scenario, roots: string[]): Promise<ScenarioResul
     ],
   });
 
-  const hook: HookCallback = async (input: HookInput): Promise<HookJSONOutput> => {
+  const makeHook = (tag: HookRecord["tag"]): HookCallback => async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse") return {};
     const ti = (input.tool_input ?? {}) as { command?: unknown };
     const denied = typeof ti.command === "string" && ti.command.includes(DENY_MARK);
     r.hooks.push({
+      tag,
       at: Date.now(),
       tool_name: input.tool_name,
       tool_use_id: input.tool_use_id,
@@ -324,10 +329,14 @@ async function runScenario(sc: Scenario, roots: string[]): Promise<ScenarioResul
     skills: [],
     systemPrompt: "You are a scripted test agent.",
     agents: sc.agents ?? {},
-    mcpServers: { [GUARDED_COMMAND_SERVER]: server },
-    preToolUse: [{ matcher: "Bash|mcp__uzi_cmd__bash", hooks: [hook] }],
+    mcpServers: sc.control ? {} : { [GUARDED_COMMAND_SERVER]: server },
+    // The two production matcher strings, registered separately so each firing is attributable.
+    preToolUse: [
+      { matcher: "Bash", hooks: [makeHook("bash-matcher")] },
+      { matcher: GUARDED_COMMAND_TOOL, hooks: [makeHook("mcp-matcher")] },
+    ],
     model: "claude-sonnet-4-5",
-    guardedCommand: true,
+    ...(sc.control ? {} : { guardedCommand: true as const }),
   };
   const controller = new AbortController();
   const options: Options = { ...buildSdkOptions(cfg), abortController: controller };
@@ -414,7 +423,8 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
       name: "ABORT",
       serverTimeout: 120_000,
       abortAfterHandler: true,
-      script: ({ step }) => (step === 0 ? { kind: "tools", calls: [{ name: "Bash", input: { command: "sleep 1000" } }] } : { kind: "text", text: "after" }),
+      // Any request after the aborted call (step >= 1) tries to run another command; it must never execute.
+      script: ({ step }) => ({ kind: "tools", calls: [{ name: "Bash", input: { command: step === 0 ? "sleep 1000" : "echo POSTABORT" } }] }),
       behave: async (_call, r, extra) => {
         const sig = (extra as { signal?: AbortSignal } | undefined)?.signal;
         sig?.addEventListener("abort", () => {
@@ -422,6 +432,14 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
         });
         return new Promise<string>(() => {});
       },
+    },
+    {
+      name: "CONTROL",
+      control: true,
+      serverTimeout: 120_000,
+      behave: okBehave,
+      script: ({ step, native }) =>
+        step === 0 ? { kind: "tools", calls: [{ name: "Bash", input: { command: `touch '${native}'; echo CONTROL-A`, description: "control" } }] } : { kind: "text", text: "control done" },
     },
     {
       name: "TIMEOUT_CUT",
@@ -470,13 +488,19 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
   };
   const diag = (r: ScenarioResult): string =>
     `\nscenario ${r.name}: queryError=${r.queryError} calls=${JSON.stringify(r.calls.map((c) => c.args))} hooks=${JSON.stringify(r.hooks)} observed=${JSON.stringify(r.observed.map((o) => [o.role, o.step, o.lastResult.slice(0, 120)]))}`;
-  const nonDenied = (r: ScenarioResult): HookRecord[] => r.hooks.filter((h) => !h.denied);
+  const nonDenied = (r: ScenarioResult): HookRecord[] => r.hooks.filter((h) => !h.denied && h.tag === "mcp-matcher");
+  const mcpHooks = (r: ScenarioResult): HookRecord[] => r.hooks.filter((h) => h.tag === "mcp-matcher");
+  const bashTagHooks = (r: ScenarioResult): HookRecord[] => r.hooks.filter((h) => h.tag === "bash-matcher");
 
   it("item 1: a model Bash tool_use reaches the sentinel on the lead, an inherit-all subagent and an explicit-grant subagent", { timeout: 120_000 }, () => {
     const lead = get("LEAD");
     const inherit = get("INHERIT");
     const explicit = get("EXPLICIT");
     result("1-cli", { sdkInit: lead.initVersion });
+    // A bump of either pin invalidates this proof: re-run M0 for the new SDK before changing the pins.
+    const sdkPkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "node_modules", "@anthropic-ai", "claude-agent-sdk", "package.json"), "utf8")) as { version: string };
+    assert.equal(sdkPkg.version, "0.3.292", "installed SDK package version changed: re-run M0 for the new SDK");
+    assert.equal(lead.initVersion, "2.1.292", "bundled CLI version changed: re-run M0 for the new SDK");
     for (const r of [lead, inherit, explicit]) {
       result("1-offered", {
         scenario: r.name,
@@ -492,30 +516,50 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     assert.ok(lead.offered.lead?.includes(GUARDED_COMMAND_TOOL), `mapped tool not offered to the lead: ${lead.offered.lead}`);
     assert.ok(inherit.offered.sub?.includes(GUARDED_COMMAND_TOOL), `mapped tool not offered to the inherit-all subagent: ${inherit.offered.sub}`);
     assert.ok(explicit.offered.sub?.includes(GUARDED_COMMAND_TOOL), `mapped tool not offered to the explicit subagent: ${explicit.offered.sub}`);
+    for (const [who, tools] of [["lead", lead.offered.lead], ["inherit-all subagent", inherit.offered.sub], ["explicit subagent", explicit.offered.sub]] as const) {
+      assert.ok(tools, `${who} made no request`);
+      for (const forbidden of ["Bash", "Monitor"]) assert.ok(!tools.includes(forbidden), `${forbidden} offered to the ${who}: ${tools.join(",")}`);
+    }
   });
 
   it("item 2: native Bash never executes (the marker file stays absent)", { timeout: 120_000 }, () => {
     const names = ["LEAD", "INHERIT", "EXPLICIT", "PLAN"];
-    result("2", Object.fromEntries(names.map((n) => [n, { nativeRan: get(n).nativeRan }])));
+    result("2", { ...Object.fromEntries(names.map((n) => [n, { nativeRan: get(n).nativeRan }])), CONTROL: { nativeRan: get("CONTROL").nativeRan, handlerCalls: get("CONTROL").calls.length } });
+    // Calibration: with the guard off, the same scripted native Bash creates the marker, so its absence below means something.
+    assert.equal(get("CONTROL").nativeRan, true, `control: native Bash did not create the marker, so marker absence proves nothing${diag(get("CONTROL"))}`);
+    assert.equal(get("CONTROL").calls.length, 0, "control: the sentinel handler was reached without routing");
     for (const n of names) assert.equal(get(n).nativeRan, false, `native Bash created the marker in ${n}${diag(get(n))}`);
   });
 
-  it("item 3: PreToolUse fires for the aliased call on the lead and subagent paths and a deny blocks the handler", { timeout: 120_000 }, () => {
+  it("item 3: the mcp__uzi_cmd__bash-matched PreToolUse fires on the lead and subagent paths and a deny blocks the handler", { timeout: 120_000 }, () => {
     const lead = get("LEAD");
     const explicit = get("EXPLICIT");
+    const perId = (r: ScenarioResult, tag: HookRecord["tag"]): Record<string, number> => {
+      const counts: Record<string, number> = {};
+      for (const h of r.hooks.filter((x) => x.tag === tag)) counts[h.tool_use_id] = (counts[h.tool_use_id] ?? 0) + 1;
+      return counts;
+    };
     result("3", {
-      leadHookToolNames: lead.hooks.map((h) => h.tool_name),
-      subHookToolNames: explicit.hooks.map((h) => h.tool_name),
+      leadMcpMatcherToolNames: mcpHooks(lead).map((h) => h.tool_name),
+      subMcpMatcherToolNames: mcpHooks(explicit).map((h) => h.tool_name),
+      leadBashMatcherFired: bashTagHooks(lead).length > 0,
+      subBashMatcherFired: bashTagHooks(explicit).length > 0,
+      leadBashMatcherToolNames: bashTagHooks(lead).map((h) => h.tool_name),
+      subBashMatcherToolNames: bashTagHooks(explicit).map((h) => h.tool_name),
+      leadMcpRecordsPerToolUseId: perId(lead, "mcp-matcher"),
+      leadBashRecordsPerToolUseId: perId(lead, "bash-matcher"),
+      subMcpRecordsPerToolUseId: perId(explicit, "mcp-matcher"),
+      subBashRecordsPerToolUseId: perId(explicit, "bash-matcher"),
       leadDeniedHandlerCalls: lead.calls.filter((c) => String(c.args.command).includes(DENY_MARK)).length,
       subDeniedHandlerCalls: explicit.calls.filter((c) => String(c.args.command).includes(DENY_MARK)).length,
       leadDenyResult: lead.observed.filter((o) => o.step === 2).map((o) => o.lastResult.slice(0, 160)),
       subDenyResult: explicit.observed.filter((o) => o.role === "sub" && o.step === 2).map((o) => o.lastResult.slice(0, 160)),
     });
-    assert.ok(nonDenied(lead).some((h) => h.agent_id === undefined && String(h.command).includes("LEAD-A")), `no lead hook record${diag(lead)}`);
-    assert.ok(nonDenied(explicit).some((h) => typeof h.agent_id === "string" && String(h.command).includes("SUB-A")), `no subagent hook record${diag(explicit)}`);
-    for (const h of [...lead.hooks, ...explicit.hooks]) assert.match(h.tool_name, /^(Bash|mcp__uzi_cmd__bash)$/);
+    assert.ok(nonDenied(lead).some((h) => h.agent_id === undefined && String(h.command).includes("LEAD-A")), `no lead mcp-matcher hook record${diag(lead)}`);
+    assert.ok(nonDenied(explicit).some((h) => typeof h.agent_id === "string" && String(h.command).includes("SUB-A")), `no subagent mcp-matcher hook record${diag(explicit)}`);
+    for (const h of [...mcpHooks(lead), ...mcpHooks(explicit)]) assert.equal(h.tool_name, GUARDED_COMMAND_TOOL);
     for (const r of [lead, explicit]) {
-      assert.ok(r.hooks.some((h) => h.denied), `the deny command never reached the hook in ${r.name}${diag(r)}`);
+      assert.ok(mcpHooks(r).some((h) => h.denied), `the deny command never reached the mcp-matched hook in ${r.name}${diag(r)}`);
       assert.equal(r.calls.filter((c) => String(c.args.command).includes(DENY_MARK)).length, 0, `a denied call reached the handler in ${r.name}${diag(r)}`);
     }
   });
@@ -536,16 +580,19 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
       subHookAgentId: nonDenied(explicit).map((h) => h.agent_id),
     });
     for (const id of ids) assert.equal(typeof id, "string", `handler _meta has no string toolUseId${diag(lead)}`);
+    for (const r of [lead, explicit]) {
+      for (const c of r.calls) assert.ok(r.issuedIds.includes(c.toolUseId as string), `handler toolUseId ${String(c.toolUseId)} was not issued by the fake in ${r.name}${diag(r)}`);
+    }
     assert.notEqual(ids[0], ids[1], "parallel calls share a toolUseId");
     for (const c of leadCalls) {
-      const h = lead.hooks.filter((x) => x.tool_use_id === c.toolUseId);
+      const h = mcpHooks(lead).filter((x) => x.tool_use_id === c.toolUseId);
       assert.equal(h.length, 1, `no unique hook record for ${String(c.toolUseId)}${diag(lead)}`);
       assert.equal(h[0]!.command, c.args.command, "hook and handler disagree on the command");
       assert.equal(h[0]!.agent_id, undefined, "lead hook record carries an agent_id");
     }
     const subCall = explicit.calls.find((c) => String(c.args.command).includes("SUB-A"));
     assert.ok(subCall, `no subagent handler call${diag(explicit)}`);
-    const subHooks = explicit.hooks.filter((x) => x.tool_use_id === subCall.toolUseId);
+    const subHooks = mcpHooks(explicit).filter((x) => x.tool_use_id === subCall.toolUseId);
     assert.equal(subHooks.length, 1, `no unique hook record for the subagent call${diag(explicit)}`);
     assert.equal(typeof subHooks[0]!.agent_id, "string", "subagent hook record has no agent_id");
   });
@@ -572,17 +619,28 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
       extraHasSignal: r.calls[0]?.hasSignal,
       extraSignalAbortedAfterMs: r.extra["extraSignalAbortedAt"] ? (r.extra["extraSignalAbortedAt"] as number) - requestedAt : null,
       fakeRequests: r.requestCount(),
+      postAbortIssuedIds: r.issuedIds.length - 1,
+      postAbortHookRecords: r.hooks.filter((h) => String(h.command).includes("POSTABORT")).length,
+      postAbortHandlerCalls: r.calls.filter((c) => String(c.args.command).includes("POSTABORT")).length,
       // The CLI sends one more request carrying an interruption tool_result; recorded, not a retry.
-      followUps: r.observed.filter((o) => o.step >= 1).map((o) => ({ afterAbortMs: o.at - requestedAt, result: o.lastResult.slice(0, 120) })),
+      followUpCount: r.observed.filter((o) => o.step >= 1).length,
+      followUps: r.observed.filter((o) => o.step >= 1).slice(0, 3).map((o) => ({ afterAbortMs: o.at - requestedAt, result: o.lastResult.slice(0, 120) })),
     });
     assert.ok(settleMs < 10_000, `the query took ${settleMs} ms to settle after abort${diag(r)}`);
     assert.equal(r.calls.length, 1, `the tool call was retried${diag(r)}`);
-    // No retried tool call: the fake must never be asked to answer a request that carries a REAL
-    // result for the aborted call, and the model is never handed a second tool_use to run again.
+    assert.equal(r.calls[0]?.hasSignal, true, `the handler extra carried no signal${diag(r)}`);
+    assert.ok(r.extra["extraSignalAbortedAt"] !== undefined, `the handler extra.signal never aborted after the query abort${diag(r)}`);
+    // The scripted follow-up carries a POSTABORT Bash call: it must never reach a hook or the handler.
+    assert.ok(![...r.hooks, ...r.calls].some((x) => JSON.stringify("command" in x ? x.command : x.args).includes("POSTABORT")), `a POSTABORT command reached a hook or the handler${diag(r)}`);
+    // The scripted model keeps answering follow-ups with a POSTABORT tool_use, so the CLI may keep
+    // requesting until its process is torn down. Observed: the first follow-up carries the
+    // interruption result and every later one carries a rejection of the new tool_use; none carries a
+    // real handler result, and (asserted above) no POSTABORT command reached a hook or the handler.
     const followUps = r.observed.filter((o) => o.step >= 1);
-    assert.ok(followUps.length <= 1, `more than one follow-up request after the aborted call${diag(r)}`);
-    for (const f of followUps) assert.match(f.lastResult, /interrupted before a result was received/, `follow-up carried a non-interruption result${diag(r)}`);
-    assert.equal(r.issuedIds.length, 1, `the fake issued a second tool_use after the abort${diag(r)}`);
+    assert.ok(followUps.length >= 1, `no follow-up request was observed${diag(r)}`);
+    assert.match(followUps[0]!.lastResult, /interrupted before a result was received/, `first follow-up carried a non-interruption result${diag(r)}`);
+    for (const f of followUps.slice(1)) assert.match(f.lastResult, /doesn't want to take this action/, `a later follow-up carried a non-rejection result${diag(r)}`);
+    for (const f of followUps) assert.ok(!f.lastResult.includes("SENTINEL-OK"), `a follow-up carried a real handler result${diag(r)}`);
   });
 
   it("item 7: the per-server timeout governs - 3000 ms cuts a 5 s handler, a max-plus-grace timeout lets a 15 s handler finish", { timeout: 120_000 }, () => {

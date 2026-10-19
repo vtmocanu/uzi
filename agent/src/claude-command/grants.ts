@@ -26,7 +26,8 @@ const SCOPED_BASH_RE = /^Bash\(/;
  * - explicit `tools` with plain `Bash`: replaced by {@link GUARDED_COMMAND_TOOL}, scoped
  *   `Bash(...)` entries dropped, the server named in `mcpServers`;
  * - explicit `tools` whose only shell grants are scoped `Bash(...)`: the role is unavailable;
- * - explicit `tools` without Bash, and inherit-all definitions: tools unchanged.
+ * - explicit `tools` without Bash, and inherit-all definitions: tools unchanged;
+ * - `disallowedTools` naming `Bash` also gains {@link GUARDED_COMMAND_TOOL} (fail closed).
  * Every surviving definition swaps the long-command prompt append for the guarded one; an
  * absent append throws (fail closed), so a prompt that still teaches background commands
  * can never ship.
@@ -67,6 +68,12 @@ export function shapeGuardedGrants(agents: Record<string, AgentDefinition>): Sha
       } else {
         next.tools = [...tools];
       }
+    }
+    // An inherit-all definition that denies plain `Bash` would regain the shell through the
+    // tool alias (the deny names the alias source, not the mapped tool), so deny the mapped
+    // tool too and keep the definition shell-less.
+    if (def.disallowedTools?.includes("Bash") && !def.disallowedTools.includes(GUARDED_COMMAND_TOOL)) {
+      next.disallowedTools = [...def.disallowedTools, GUARDED_COMMAND_TOOL];
     }
     out[name] = next;
   }

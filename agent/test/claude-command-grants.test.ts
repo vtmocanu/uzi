@@ -90,6 +90,16 @@ describe("shapeGuardedGrants", () => {
     assert.ok(agents.c!.prompt.includes(CLAUDE_GUARDED_COMMAND_APPEND));
   });
 
+  it("denies the mapped tool too when disallowedTools names Bash, and leaves other denies alone", () => {
+    const input = { c: def(undefined, { disallowedTools: ["Bash", "Edit"] }), d: def(undefined, { disallowedTools: ["Edit"] }) };
+    const { agents } = shapeGuardedGrants(input);
+    assert.deepEqual(agents.c!.disallowedTools, ["Bash", "Edit", GUARDED_COMMAND_TOOL]);
+    assert.deepEqual(agents.d!.disallowedTools, ["Edit"]);
+    assert.deepEqual(input.c.disallowedTools, ["Bash", "Edit"], "input not mutated");
+    const again = shapeGuardedGrants({ c: def(undefined, { disallowedTools: ["Bash", GUARDED_COMMAND_TOOL] }) });
+    assert.deepEqual(again.agents.c!.disallowedTools, ["Bash", GUARDED_COMMAND_TOOL]);
+  });
+
   it("throws when a definition prompt lacks the long-command append", () => {
     assert.throws(() => shapeGuardedGrants({ x: def(["Bash"], { prompt: "no append here" }) }), /long-command append/);
   });
