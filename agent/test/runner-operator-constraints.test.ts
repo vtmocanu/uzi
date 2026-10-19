@@ -9,6 +9,7 @@ import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { GitCache } from "../src/git.js";
 import type { Executor, RunContext } from "../src/executor.js";
+import { MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 
 // Issue #1660 acceptance across claims: a follow-up consumed during claim 1 must reach a
 // subagent dispatched during claim 2. The steering channel is per claim, so without the
@@ -164,11 +165,11 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
         repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
         last_seq: 0,
       });
-    /** An executor that pulls once as a loop top would, reports it included, and returns what it saw. */
-    const pulling = (out: { pulled?: { id: number; body: string } | undefined }): Executor => ({
+    /** An executor that pulls one batch as a loop top would, reports every entry included, and returns what it saw. */
+    const pulling = (out: { pulled?: { id: number; body: string }[] }): Executor => ({
       async run(ctx) {
-        out.pulled = ctx.pullFollowUp?.();
-        if (out.pulled) ctx.followUpIncluded?.(out.pulled.id);
+        out.pulled = ctx.pullFollowUps?.(MAX_FOLLOW_UP_BATCH_RUNES, true);
+        for (const f of out.pulled ?? []) ctx.followUpIncluded?.(f.id);
         return { branch: ctx.branch };
       },
     });
@@ -176,17 +177,24 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
       await new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, { pollMs: 5 }).execute(claim);
     };
 
-    it("hands the executor a consumed follow-up with no included_at, then reports it included", async () => {
+    it("hands the executor every consumed follow-up with no included_at as one batch, then reports each included", async () => {
       const claim = claimFor(81);
       api.overrideFollowUps(claim.run_id, 200, {
-        inputs: [{ id: 4, kind: "follow_up", body: "use port 5433", inclusion_reported: true }],
+        inputs: [
+          { id: 4, kind: "follow_up", body: "use port 5433", inclusion_reported: true },
+          { id: 5, kind: "follow_up", body: "and log to stderr", inclusion_reported: true },
+        ],
       });
-      const out: { pulled?: { id: number; body: string } } = {};
+      const out: { pulled?: { id: number; body: string }[] } = {};
       await run(claim, pulling(out));
-      assert.deepStrictEqual(out.pulled, { id: 4, body: "use port 5433" }, "the first pull of the new claim is the unincluded follow-up");
+      assert.deepStrictEqual(
+        out.pulled,
+        [{ id: 4, body: "use port 5433" }, { id: 5, body: "and log to stderr" }],
+        "the first batch pull of the new claim is every unincluded follow-up, oldest first",
+      );
       const receipts = api.inclusionCalls.filter((c) => c.runId === claim.run_id);
       assert.ok(receipts.length >= 1, "the inclusion was reported to the api");
-      assert.deepStrictEqual(receipts[0]!.ids, [4]);
+      assert.deepStrictEqual(receipts.flatMap((c) => c.ids).sort(), [4, 5]);
     });
 
     it("re-queues nothing for an included row, an old api's row, or a failed reload", async () => {
@@ -197,9 +205,9 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
       ] as const) {
         const claim = claimFor(iid);
         api.overrideFollowUps(claim.run_id, reload.status, reload.body);
-        const out: { pulled?: { id: number; body: string } } = {};
+        const out: { pulled?: { id: number; body: string }[] } = {};
         await run(claim, pulling(out));
-        assert.strictEqual(out.pulled, undefined, `issue ${iid}: nothing re-queued`);
+        assert.deepStrictEqual(out.pulled, [], `issue ${iid}: nothing re-queued`);
       }
     });
   });

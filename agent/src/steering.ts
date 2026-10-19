@@ -1984,7 +1984,7 @@ export class SteeringChannel {
 
   /** PRD #1416 M2: consume the worker-authoritative safety steer — return it and clear the slot,
    *  so it is delivered exactly once per arm. Both executors call this at their loop top ahead of
-   *  pullFollowUp, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
+   *  pullFollowUps, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
   pullSafetySteer(): string | undefined {
     const steer = this.safetySteer;
     this.safetySteer = undefined;

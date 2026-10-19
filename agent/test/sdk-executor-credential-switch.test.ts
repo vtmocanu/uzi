@@ -96,7 +96,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emits:
     config: null,
     sessionId: null,
     gatePlan: async () => verdict,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     checkpoint: async () => {},
     reportIteration: async () => undefined,
     ...overrides,

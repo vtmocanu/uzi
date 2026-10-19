@@ -150,7 +150,7 @@ function makeCtx(
     config: null,
     sessionId: null,
     gatePlan: async () => verdict,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     checkpoint: async () => {},
     reportIteration: async (n) => {
       iterations.push(n);

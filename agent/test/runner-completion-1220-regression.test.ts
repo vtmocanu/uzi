@@ -155,7 +155,7 @@ function makeInterlockedCtx(unmetScript: string[][]): CompletionProbe {
     sessionId: null,
     onSessionId: () => {},
     gatePlan: async () => approve,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: async () => undefined,
     completionInterlock: true,
     checkpoint: async () => {
