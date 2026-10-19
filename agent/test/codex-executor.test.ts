@@ -15794,7 +15794,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     const rig = makeMultiEpochRig([script("th-1", [bare, (th, tn) => [done(11, th, tn)]])]);
     const seams = followUpSeams([A]);
     const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#3137 held-slot run");
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 held-slot run");
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.ok(texts.length >= 2, "a second drive followed the evidence-free turn");
     assert.ok(texts[0]!.includes(A) && texts[1]!.includes(A), "the held batch is re-delivered");
@@ -15839,6 +15839,61 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.deepEqual(seams.pulls, [[A, B]], "exactly one non-empty pull, no channel pull while held");
     assert.deepEqual(includedAtPark, [[]], "no receipt before the recreation");
     assert.deepEqual(seams.included, [1, 2], "each id receipted exactly once, by the turn on the new epoch");
+  });
+
+  it("#3137 a held batch survives a loop-top epoch recreation (refused loop-top park) before model evidence", async () => {
+    // Epoch 0's only turn streams thread/started and a completed terminal: no model evidence, so
+    // the batch stays held. At the next loop top a pending `wall` pause is refused (the park reaps),
+    // and the loop-top recreation mints epoch 1 before the owner slot fill.
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1")).push(turnCompleted("completed", "th-1", "tn-1"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(agentMessage("working", th)).push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const seams = followUpSeams([A, B]);
+    let mode: "wall" | null = null;
+    let parks = 0;
+    const includedAtPark: number[][] = [];
+    const launchesAtPark: number[] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUps: seams.pullFollowUps,
+      followUpIncluded: seams.followUpIncluded,
+      reportIteration: async (iteration) => {
+        if (iteration === 2) { mode = "wall"; return { pauseRequested: true }; }
+        return undefined;
+      },
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => {
+        parks++;
+        includedAtPark.push([...seams.included]);
+        launchesAtPark.push(rig.providerLaunches());
+        return "refused";
+      },
+      takeWallParkRefresh: () => ({ totalSeconds: 600, usedSeconds: 0 }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 loop-top recreate run");
+    assert.equal(parks, 1, "the loop-top wall park was refused once");
+    assert.deepEqual(launchesAtPark, [1], "the park ran before any recreation");
+    assert.equal(rig.providerLaunches(), 2, "the loop-top block recreated the provider epoch");
+    const t0 = turnTexts(rig.epochs[0]!.transport);
+    const t1 = turnTexts(rig.epochs[1]!.transport);
+    assert.equal(t0.length, 1, "the bare turn ran on the first epoch");
+    assert.ok(t0[0]!.includes(A) && t0[0]!.includes(B), "the first epoch's turn carried the batch");
+    assert.equal(t1.length, 1, "the new epoch ran the delivering turn");
+    assert.ok(t1[0]!.includes(A) && t1[0]!.includes(B) && t1[0]!.indexOf(A) < t1[0]!.indexOf(B), "the new epoch's turn carries A then B");
+    assert.deepEqual(seams.pulls, [[A, B]], "exactly one non-empty pull, none while held");
+    assert.deepEqual(includedAtPark, [[]], "nothing receipted before the recreation");
+    assert.deepEqual(seams.included, [1, 2], "each id receipted once, by the turn on the new epoch");
   });
 
   it("a root tool item/completed with no start this turn does not stamp the follow-up when the turn fails", async () => {

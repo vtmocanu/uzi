@@ -528,7 +528,7 @@ describe("issue #3137: the Claude executor batches pending owner follow-ups into
     assert.deepStrictEqual(probe.included, [1], "its id is receipted");
   });
 
-  it("an interactive park's message does not absorb a channel follow-up queued meanwhile", async () => {
+  it("#3137 an interactive park's message does not absorb a channel follow-up queued meanwhile", async () => {
     const queue: string[] = [];
     const { queryFn, prompts } = fakeTurns([PLAN, DONE, DONE, DONE], queue);
     const outcomes = [
