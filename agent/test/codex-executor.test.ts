@@ -18939,20 +18939,39 @@ describe("2833 Codex inline summaries", () => {
     it(`A owned summary ${phase} remains joined during ${expired ? "expired" : "unexpired"} capture`, async t => {
       const entered = m1Barrier(), release = m1Barrier(), disposing = m1Barrier(), disposed = m1Barrier();
       const registryPolls: (() => void)[] = [];
-      const pollHandles = new Set<ReturnType<typeof setTimeout>>();
+      const timerHandles = new Set<ReturnType<typeof setTimeout>>();
+      const advisoryTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
       const realTimeout = globalThis.setTimeout;
       const realClearTimeout = globalThis.clearTimeout;
       const now = Date.now.bind(Date);
       let advance = 0;
       t.mock.method(Date, "now", () => now() + advance);
+      t.mock.method(globalThis, "clearTimeout", (handle: Parameters<typeof clearTimeout>[0]) => {
+        if (typeof handle === "object" && handle !== null) {
+          advisoryTimers.delete(handle);
+          timerHandles.delete(handle);
+        }
+        return realClearTimeout(handle);
+      });
       t.mock.method(globalThis, "setTimeout", (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
-        if (expired && (ms ?? Infinity) <= 25 && new Error().stack?.includes("settleForCapture")) {
+        const stack = new Error().stack ?? "";
+        if (stack.includes("settleIntentSummary")) {
+          // Deliver the executor advisory bound before observing raw summary custody.
+          const handle = realTimeout(() => {}, 60_000);
+          handle.unref();
+          timerHandles.add(handle);
+          advisoryTimers.set(handle, () => {
+            realClearTimeout(handle); timerHandles.delete(handle); fn(...args);
+          });
+          return handle;
+        }
+        if (expired && (ms ?? Infinity) <= 25 && stack.includes("settleForCapture")) {
           // Deliver registry polling explicitly, without spending wall time.
           const handle = realTimeout(() => {}, 60_000);
           handle.unref();
-          pollHandles.add(handle);
+          timerHandles.add(handle);
           registryPolls.push(() => {
-            realClearTimeout(handle); pollHandles.delete(handle); fn(...args);
+            realClearTimeout(handle); timerHandles.delete(handle); fn(...args);
           });
           return handle;
         }
@@ -19004,7 +19023,13 @@ describe("2833 Codex inline summaries", () => {
         await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
         capture = executor.withCredentialFreeCapture(5_000, async () => { callback = true; });
         void capture.then(() => { captured = true; });
-        for (let i = 0; i < 40; i++) await drain();
+        for (let i = 0; i < 40; i++) {
+          await drain();
+          const callbacks = [...advisoryTimers.values()];
+          advisoryTimers.clear();
+          callbacks.forEach(fire => fire());
+        }
+        await drain();
         if (expired) {
           advance = 6_000;
           registryPolls.splice(0).forEach(fire => fire());
@@ -19030,7 +19055,10 @@ describe("2833 Codex inline summaries", () => {
         release.resolve(); disposed.resolve(); rig.transport.end();
         registryPolls.splice(0).forEach(fire => fire());
         try { await capture; await running; }
-        finally { for (const handle of pollHandles) realClearTimeout(handle); }
+        finally {
+          for (const handle of timerHandles) realClearTimeout(handle);
+          timerHandles.clear(); advisoryTimers.clear(); registryPolls.length = 0;
+        }
       }
     });
   }
