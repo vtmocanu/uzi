@@ -206,13 +206,24 @@ untyped `recovery_wait`; keep the custody hold. The run does not open its merge 
 way — finalize, and the completion authority that would open the MR, run only after a successful
 resume past the lock.
 
-Retiring an intentionally capture-drained epoch preserves the public Codex safety
-marker, so a normal runner boundary cannot fall into the legacy branch. A poisoned
-or disposed normal facade refuses before credential reconciliation. A later owned
-free capture may select the existing internal capture-only machinery after the exact
-completed scope/epoch/registry proof revalidates clean teardown and an unchanged
-poison revision. Human decision C1 also permits `HeldRunCommandCache.drained` to
-read that exact existing registry proof for cache settlement, requiring `disposed`
+Retiring a verified ordinary or intentionally capture-drained epoch preserves the
+public Codex safety marker, so a normal runner boundary cannot fall into the legacy
+branch. A poisoned or disposed normal facade refuses before credential reconciliation.
+If a healthy checkpoint epoch fully tears down and the next provider's initial
+credential release exhausts, a later owned free capture can select a fresh production
+capture-only facade for that exact retired facade. Ordinary evidence requires
+observed quiescence and matching-epoch reaping, successful disposal, harness close
+and fileop cleanup, with the registry still disposed and unpoisoned. Intentional
+capture instead requires the exact completed scope/epoch/registry proof to
+revalidate clean teardown and an unchanged poison revision. Selection follows the
+owned joins and outstanding-registry drain checks; arbitrary disposed registries,
+cleared tables, failed cleanup, new poison or roots, and foreign facades do not
+qualify. The new acquisition still intentionally poisons its fresh registry through
+`settleForCapture`, with its own settlement under the original deadline and no
+model/provider, reconciliation, credential-release or PAT authority. This ordinary
+teardown evidence does not broaden cache eligibility or retention. Human decision
+C1 still permits `HeldRunCommandCache.drained` to
+read the exact existing completed-capture proof for cache settlement, requiring `disposed`
 state and `acceptsCompletedCapture`; later poison, changed root/launch/callback
 facts, unclean cache tracking or open roots retain the cache. This narrow reader
 grants no general clean status, admission, credential-release or capture authority.

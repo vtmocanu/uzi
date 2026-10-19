@@ -483,7 +483,25 @@ Lost supervision or incomplete settlement grants no capture authority. This cont
 mints neither a credentialed nor a completion permit. See the
 [remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 
-Pre-start capture uses the existing capture-only facade. The optional fifth
+Pre-start capture uses the existing capture-only facade. A later owned capture can
+also select a fresh production capture-only facade for the exact retired public
+facade after verified full teardown. Ordinary teardown must have observed
+quiescence and matching-epoch reaping, successful disposal, harness close and
+fileop cleanup; its evidence remains valid only while that registry is disposed
+and unpoisoned. Intentional capture instead retains the exact completed
+scope/epoch/registry proof and unchanged poison revision. The public safety marker
+stays present, so normal boundaries still refuse rather than taking the legacy
+branch. After setup, summary and installer joins, session save, attempt binding
+and outstanding-registry drain checks, this evidence permits facade selection,
+not capture authority. The fresh acquisition still calls `settleForCapture`,
+intentionally poisons its new registry and uses its own settlement within the
+original deadline. Arbitrary disposal, cleared tracking tables, failed cleanup,
+new poison or roots, and foreign facades cannot substitute for either evidence
+origin. This adds no model/provider, reconciliation, credential-release or PAT
+authority and changes no command-cache eligibility or retention rule.
+Refs #2852 (AI-synced 2026-10-18).
+
+The optional fifth
 `Executor.withCredentialFreeCapture` argument is worker-internal immutable
 `marker`/`cloneKey`/`clonePath` metadata, not a wire field. The executor snapshots
 it before yielding, selects `captureReaperAttempt` under `captureTail` after prior

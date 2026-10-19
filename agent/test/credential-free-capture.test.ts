@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { setImmediate } from "node:timers/promises";
 import { GitCache, gitEnv } from "../src/git.js";
+import { RunRunner } from "../src/runner.js";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { ExecutionRegistry, MAX_POISON_ERRORS, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
@@ -82,6 +83,35 @@ function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?:
 }
 
 describe("credential-free capture foundation (#2852)", () => {
+  it("runner checkpoint overlay refuses capture before ownership, source or credential reads", async () => {
+    const r = rig();
+    let ownership = 0, sourceReads = 0, credentialReads = 0;
+    const receiver = { git: r.git, requireTrackingOwned: async () => { ownership++; } } as unknown as RunRunner;
+    const claim = {
+      get repo() { sourceReads++; return { forge_type: "github" }; },
+      get secrets() { credentialReads++; return { forge_pat: "overlay-sentinel" }; },
+    } as Parameters<RunRunner["buildCheckpointOverlay"]>[0];
+    const flight = { branch: "work" } as Parameters<RunRunner["buildCheckpointOverlay"]>[1];
+    const invoke = () => RunRunner.prototype["buildCheckpointOverlay"].call(receiver, claim, flight, "/capture/worker.git");
+    const result = await r.safety.withCredentialFreeCapture(1000, context =>
+      r.git.withCredentialFreeCapture(context, async () => {
+        await assert.rejects(invoke(), /credentialed overlay unavailable during capture/);
+        assert.equal(ownership, 0, "overlay must refuse before checking tracking ownership");
+        assert.equal(sourceReads, 0);
+        assert.equal(credentialReads, 0);
+        assert.equal(r.specs.length, 0);
+      }));
+    assert.equal(result.kind, "observed_empty");
+    const nonGithub = { repo: { forge_type: "gitlab" },
+      get secrets() { credentialReads++; throw new Error("unexpected credential read"); },
+    } as unknown as Parameters<RunRunner["buildCheckpointOverlay"]>[0];
+    assert.equal(await RunRunner.prototype["buildCheckpointOverlay"].call(
+      receiver, nonGithub, flight, "/capture/worker.git"), undefined);
+    assert.equal(ownership, 1, "outside capture the existing non-GitHub path checks ownership");
+    assert.equal(credentialReads, 0);
+    assert.equal(r.specs.length, 0);
+  });
+
   it("refuses missing process wiring before callback entry or reads without reconciliation", async () => {
     let entries = 0;
     let reads = 0;

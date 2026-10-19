@@ -55,7 +55,7 @@ import { WorkerClient, RequestError, CodexRequestFailure } from "../src/client.j
 import { ProviderPolicyRefusal } from "../src/provider-policy-refusal.js";
 import { RunRunner } from "../src/runner.js";
 import { resolveRunKind } from "../src/run-kind.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, assertCaptureLaunch } from "../src/git.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
@@ -586,6 +586,35 @@ interface Rig {
   deps: CodexExecutorDeps;
 }
 
+// These callers exercise GitCache's fixed capture producers after acquisition. The
+// production launch validator pins argv/env, including the cancel content helper.
+// OS streams/exit are real; the underlying fixture's drainage evidence stays modeled.
+function forwardCredentialFreeGitRoot(
+  spec: CodexEffectLaunchSpec, deadline: number | undefined, handle: CodexRootHandle, cancel = false,
+): CodexRootHandle {
+  const argv = spec.identity === "command"
+    ? spec.args.slice(spec.args.indexOf("--") + 1) : [spec.command, ...spec.args];
+  if (argv[0] !== "/usr/bin/git" && !(cancel && argv[0] === process.execPath)) return handle;
+  assertCaptureLaunch(spec);
+  assert.ok(deadline !== undefined && deadline > 0, "fixed capture launch requires its original finite deadline");
+  if (argv[0] === process.execPath) {
+    assert.equal(spec.identity, "command");
+    assert.equal(argv[1], "-e");
+    assert.equal(argv[3], spec.cwd);
+    assert.equal(argv.length, 5, "fixed cancel helper and original absolute deadline only");
+  }
+  const child = spawn(argv[0]!, argv.slice(1), { cwd: spec.cwd, env: spec.env, stdio: "pipe" });
+  // One deadline, one signal to this owned child; siblings are independent.
+  const timer = setTimeout(() => child.kill(), deadline);
+  const exited = new Promise<{ event: "child_exit"; code: number }>((resolve, reject) => {
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("close", code => { clearTimeout(timer); resolve({ event: "child_exit", code: code ?? 1 }); });
+  });
+  return { ...handle, transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
+    waitChild: async () => exited,
+    dispose: async ms => { await exited; return handle.dispose(ms); } };
+}
+
 function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
   const transport = new FakeTransport(opts.responder ?? defaultResponder);
   const client = fakeClient(opts.token);
@@ -794,12 +823,14 @@ describe("M3 actual runner memory Codex delivery", () => {
       })]);
       const launch = rig.deps.launchEffectRoot!;
       let modelLaunches = 0, modelDisposals = 0, probeDisposals = 0, installSettled = false;
+      let captureActive = false;
       let finishModel: (() => void) | undefined;
       const finishes: (() => void)[] = [];
       rig.deps = { ...rig.deps, spawnCommand: undefined, deferRegistryTeardown: true,
         installDeps: async () => { installSettled = true; return { results: [], truncated: false }; },
         launchEffectRoot: async (spec, deadline) => {
           const handle = await launch(spec, deadline);
+          if (captureActive) return forwardCredentialFreeGitRoot(spec, deadline, handle);
           if (spec.args.includes("/usr/local/bin/uzi-codex-fileop")) return handle;
           const probe = spec.args.includes(ENV_PROBE_SCRIPT);
           const pressured = spec.args.includes("echo m3-pressure");
@@ -847,9 +878,12 @@ describe("M3 actual runner memory Codex delivery", () => {
         },
         withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
           assert.ok(ms > 0 && ms <= 5000, "settlement stays inside the finite owner budget");
-          const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
-          settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
-          return result;
+          captureActive = true;
+          try {
+            const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
+            settlements.push(result.kind === "observed_empty" ? { kind: result.kind } : result);
+            return result;
+          } finally { captureActive = false; }
         },
         settleForCredentialFreeCapture: async (...args) => {
           assert.ok(args[0] > 0 && args[0] <= 5000, "settlement stays inside the finite owner budget");
@@ -920,7 +954,8 @@ describe("M3 actual runner memory Codex delivery", () => {
           await waitFor(() => transport.responses.length >= 4, "done callback response");
           transport.push(turnCompleted("completed", "m3-thread", "m3-turn"));
         } else {
-          await waitFor(() => f.parkReceipts.length === 1 || settlements.length > 0, "owner settlement", 6000);
+          await waitFor(() => f.parkReceipts.length === 1 || settlements.length > 0, "owner settlement", 6000)
+            .catch(error => { throw new Error(`${String(error)}; owner log: ${JSON.stringify(ownerLog.lines)}`); });
           assert.equal(installSettled, true, "dependency installer completed before owner capture");
           assert.equal(await fs.readFile(path.join(m2Runner.homeDir, "m3-session-proof"), "utf8"), "original home");
           assert.ok(await fs.stat(m2Runner.worktreeDirFor(2396)), "owner retains clone even before hold ACK");
@@ -2121,7 +2156,11 @@ describe("#2493 initial credential release", () => {
     const url = await api.listen();
     const fx = makeFixture();
     const rig = makeMultiEpochRig([]);
-    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1 };
+    const launchCapture = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, initialCredentialBaseDelayMs: 1,
+      launchEffectRoot: async (spec, deadline) =>
+        forwardCredentialFreeGitRoot(spec, deadline, await launchCapture(spec, deadline)),
+    };
     api.recoveryWaitRequiresRunning = true;
     const client = new WorkerClient(url, "release-worker", "test", noopLog, { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
     const claim = makeClaim({
@@ -2334,6 +2373,80 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
         await api.close();
         fx.cleanup();
       }
+    });
+  }
+});
+
+describe("ordinary teardown capture eligibility", () => {
+  // Unit seam only: real registry and safety, modeled root evidence; no live-kernel claim.
+  for (const mode of ["clean", "already-disposed", "later-poison", "late-root", "root-cleanup",
+    "harness-cleanup", "fileop-cleanup", "foreign-facade"] as const) {
+    it(`ordinary teardown capture eligibility ${mode}`, async () => {
+      const rig = makeRig();
+      let launches = 0;
+      const launch = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (...args) => { launches++; return launch(...args); } };
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+      const tracked = trackedRoot();
+      const root: RegisteredRoot = { ...tracked.root, dispose: async ms => {
+        await tracked.root.dispose(ms);
+        if (mode === "root-cleanup") throw new Error("root cleanup unconfirmed");
+      } };
+      const reservation = registry.reserveLaunch(root.kind);
+      assert.equal(reservation.kind, "reserved");
+      if (reservation.kind !== "reserved") throw new Error("missing launch reservation");
+      assert.equal(registry.registerRoot(reservation.reservation, root).ok, true);
+      const facade = createCodexExecutionSafety(registry, async () => { throw new Error("no normal spawn"); });
+      exec.safety = facade;
+      exec["epochSafeties"].set(registry, facade);
+      exec["unverifiedEpochRegistries"].add(registry);
+      if (mode === "already-disposed") assert.equal((await registry.disposeTools(1000)).kind, "disposed");
+      const harness = mode === "harness-cleanup"
+        ? { close: async () => { throw new Error("harness cleanup unconfirmed"); } } as unknown as CodexHarness : undefined;
+      const fileop = mode === "fileop-cleanup"
+        ? { ...fakeFileopHandle().handle, dispose: async () => { throw new Error("fileop cleanup unconfirmed"); } } : undefined;
+      const clean = await exec["tearDownEpoch"](registry, harness, fileop, 1000, true);
+      assert.equal(clean, !["root-cleanup", "harness-cleanup", "fileop-cleanup"].includes(mode));
+      assert.equal(exec.safety, facade, "teardown preserves the public refusal marker");
+      if (mode === "later-poison") registry.poison({ category: "tool", message: "late cleanup fault" });
+      if (mode === "late-root") {
+        assert.equal(registry.registerRoot(reservation.reservation, root).ok, false);
+        assert.equal(registry.isPoisoned(), true, "late invalid registration poisons disposed epoch");
+      }
+      if (mode === "foreign-facade") {
+        const foreign = new ExecutionRegistry(newLocalExecutionEpoch(2853));
+        assert.equal((await foreign.disposeTools(1000)).kind, "disposed");
+        exec.safety = createCodexExecutionSafety(foreign, async () => { throw new Error("no foreign spawn"); });
+      }
+      const current = exec.safety;
+      let actions = 0;
+      const result = await exec.withCredentialFreeCapture(1000, async () => {
+        actions++;
+        const fresh = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(fresh);
+        assert.notEqual(fresh, registry);
+        assert.equal(fresh.isPoisoned(), true, "N1: replacement still intentionally poisons before capture");
+        return "local-only";
+      });
+      if (mode === "clean") {
+        assert.deepEqual(result, { kind: "observed_empty", value: "local-only" });
+        assert.equal(actions, 1);
+        assert.notEqual(exec.safety, current, "ordinary proof selects a fresh capture-only facade");
+        await assert.rejects(exec.safety!.withBoundary({ boundary: "finalize", deadlineMs: 1000 },
+          async () => { throw new Error("normal boundary entered"); }),
+          error => error instanceof CodexBoundaryError || error instanceof TrustedExecutionRefusal);
+      } else {
+        assert.equal(result.kind, "incomplete");
+        assert.equal(actions, 0, "ineligible teardown must refuse before capture callback");
+        assert.equal(exec.safety, current);
+      }
+      assert.equal(launches, 0);
+      assert.equal(rig.client.releaseCalls.length, 0);
+      assert.equal(rig.client.refreshCalls.length, 0);
+      assert.equal(rig.probeCalls.length, 0);
+      await registry.disposeTools(1000);
+      await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
     });
   }
 });
@@ -2683,9 +2796,16 @@ describe("m1 credential-free owner cancel", () => {
       const recovery = makeRecoveryCoordinator(recoveryClient, recoveryGit);
       const rig = makeRig({ responder: quietResponder });
       rig.deps = { ...rig.deps, deferRegistryTeardown: true };
-      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       let settlingCancel = false;
+      const launchCancel = rig.deps.launchEffectRoot!;
+      rig.deps = { ...rig.deps, launchEffectRoot: async (spec, deadline) => {
+        const handle = await launchCancel(spec, deadline);
+        return settlingCancel ? forwardCredentialFreeGitRoot(spec, deadline, handle, true) : handle;
+      } };
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
       let settlementKind: string | undefined;
+      let captureEntered = false;
+      let captureError: unknown;
       const reap = rig.root.reap.bind(rig.root);
       rig.root.reap = async (...args) => {
         if (scenario.quarantine === "settle" && settlingCancel && !quarantineSeamReached) await pauseForQuarantine();
@@ -2802,9 +2922,16 @@ describe("m1 credential-free owner cancel", () => {
           withCredentialFreeCapture: async (ms, action, purpose, signal, attempt) => {
             settlingCancel = purpose === "cancel";
             try {
-              const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, action, purpose, signal, attempt]);
+              const observedAction: typeof action = async context => {
+                captureEntered = true;
+                return action(context);
+              };
+              const result = await Reflect.apply(executor.withCredentialFreeCapture, executor, [ms, observedAction, purpose, signal, attempt]);
               settlementKind = result.kind;
               return result;
+            } catch (error) {
+              captureError = error;
+              throw error;
             } finally { settlingCancel = false; }
           },
           settleForCredentialFreeCapture: async (ms, purpose) => {
@@ -3112,7 +3239,16 @@ describe("m1 credential-free owner cancel", () => {
         if (scenario.releaseTransport) {
           assert.ok(realFlight, "real flight captured");
           assert.equal(dispositionObserved, true);
-          assert.equal(settlementKind, "observed_empty");
+          assert.equal(captureEntered, true, "real capture admission precedes the release ACK");
+          if (scenario.releaseTransport === "oversized") {
+            // Action errors are rethrown; they are not a returned settlement result.
+            assert.equal(settlementKind, undefined);
+            assert.ok(captureError instanceof Error);
+            assert.equal(captureError, releaseError, "capture preserves the exact overflow error");
+          } else {
+            assert.equal(settlementKind, "observed_empty");
+            assert.equal(captureError, undefined);
+          }
           assert.deepEqual({ disposition, ...preservationAfterDisposition }, {
             disposition: shouldRelease ? "released" : "retained",
             preserveRecoveryClone: !shouldRelease, preserveSession: !shouldRelease,
@@ -3159,7 +3295,11 @@ describe("m1 credential-free owner cancel", () => {
         assert.equal(records.some(record => record.generation === 7), !shouldRelease, "own journal follows exact release proof");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/8^{commit}`), startHead, "sibling pin untouched");
         assert.equal(await git.revParse(bare, `refs/uzi-recovery-pin/${claim.run_id}/7^{commit}`), shouldRelease ? null : startHead, "own exact-generation pin follows release proof");
-        if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
+        if (scenario.drain === "root") {
+          assert.equal(settlementKind, "incomplete", "surviving provider refuses capture");
+          assert.equal(observations.includes("owner_cancel"), false, "no inspection before root drainage");
+          assert.equal(observations.includes("inspect"), false);
+        } else if (!["before-cancel", "settle"].includes(scenario.quarantine ?? "")) {
           assert.ok(observations.includes("owner_cancel"));
           assert.ok(cancelLogs.some(line => rec(line).msg === "owner cancel Docker teardown"), "Docker state logged when initial proof reached");
         }
@@ -4701,113 +4841,79 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     assert.equal(replyOf1(rig).success, true, "the parent spawn_agent callback succeeded after the child settled");
   });
 
-  it("(20a) a refused wall-park re-drive runs on the recreated epoch's fresh registry, so the interrupted drive's unsettled callback cannot hold idle (issue #1782)", async () => {
-    const IDLE_MS = 90;
-    const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start") return { thread: { id: "th-1" } };
-      if (c.method === "turn/start") {
-        if (c.turnStartCount === 1) c.transport.push(threadStarted());
-        return { turn: { id: "tn-1" } };
-      }
-      return {};
-    } });
-    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 50, boundaryDeadlineMs: 50 };
-
-    // Capture the real epoch registry as the executor subscribes its idle watchdog.
-    // Both drives must use this same registry; the first reservation stays unsettled.
-    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
-    let registry: ExecutionRegistry | undefined;
-    const captureRegistry = (value: ExecutionRegistry): void => { registry = value; };
-    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
-      captureRegistry(this);
-      return subscribe.call(this, listener);
-    };
-    let parks = 0;
-    const { ctx } = makeCtx({
-      parkForWall: async () => ++parks === 1 ? "refused" : "parked",
-      takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
-    });
-    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    try {
-      await waitFor(() => rig.transport.turnStartCount === 1 && registry !== undefined, "first drive and registry");
-      const epoch = registry!;
-      const stale = epoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
-      assert.equal(stale.kind, "admitted");
-
-      await waitFor(() => rig.transport.turnStartCount === 2, "refused park re-drive");
-      // Issue #1782: a refused park recreates the epoch, so the re-drive runs on a FRESH registry and
-      // the interrupted drive's unsettled callback is left behind on the disposed one.
-      assert.notEqual(registry, epoch, "the re-drive uses the recreated epoch's registry");
-      assert.equal(registry!.inFlightCallbackCount(), 0, "the fresh registry carries no stale callback");
-      const reDriveEpoch = registry!;
-      const current = reDriveEpoch.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "current", fingerprint: "current" });
-      assert.equal(current.kind, "admitted");
-      if (current.kind !== "admitted") return;
-
-      await new Promise<void>((resolve) => setTimeout(resolve, IDLE_MS + 50));
-      assert.equal(parks, 1, "a callback admitted in the current drive suppresses idle");
-      reDriveEpoch.settleCallback(current.token, "ok");
-      assert.equal(reDriveEpoch.inFlightCallbackCount(), 0, "the current callback settled");
-      await assert.rejects(
-        withTimeout(running, 2000, "idle after the current callback settles"),
-        /codex run idle timeout/,
-        "the current drive idles even though the interrupted drive's callback never settled",
-      );
-      assert.equal(parks, 1, "idle did not consume the bounded wall budget");
-    } finally {
-      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
-      rig.transport.end();
-      await running.catch(() => undefined);
-    }
-  });
-
-  it("(20b) a same-registry re-drive after a withdrawn pause ignores an unsettled callback from the interrupted drive for idle", async () => {
-    // The withdrawn-pause `continue` in driveTurnWithWallPark re-drives on the SAME registry (no epoch
-    // recreation), so the cursor taken at the re-drive's start is the only thing keeping the
-    // interrupted drive's unsettled reservation from suppressing idle for the re-drive.
-    const IDLE_MS = 90;
-    const rig = makeRig({ responder: (c) => {
-      if (c.method === "thread/start") return { thread: { id: "th-1" } };
-      if (c.method === "turn/start") {
-        if (c.turnStartCount === 1) c.transport.push(threadStarted());
-        return { turn: { id: `tn-${c.turnStartCount}` } };
-      }
-      return {};
-    } });
-    rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: 5000, boundaryDeadlineMs: 50 };
-    const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
-    const registries: ExecutionRegistry[] = [];
-    ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
-      if (!registries.includes(this)) registries.push(this);
-      return subscribe.call(this, listener);
-    };
-    const controller = new AbortController();
-    const { ctx } = makeCtx({
-      signal: controller.signal,
-      pauseModeRequested: () => null, // the pause is withdrawn before it is handled
-    });
-    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
-    try {
-      await waitFor(() => rig.transport.turnStartCount === 1 && registries.length === 1, "first drive and registry");
-      const registry = registries[0]!;
-      const stale = registry.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
-      assert.equal(stale.kind, "admitted");
-      controller.abort(new PauseNowSignal());
-
-      await waitFor(() => rig.transport.turnStartCount === 2, "withdrawn-pause re-drive");
-      assert.equal(registries.length, 1, "the re-drive stayed on the same registry");
-      assert.equal(registry.inFlightCallbackCount(), 1, "the interrupted drive's callback is still unsettled");
-      await assert.rejects(
-        withTimeout(running, 2000, "idle on the re-drive"),
-        /codex run idle timeout/,
-        "the re-drive idles although the interrupted drive's callback never settled",
-      );
-    } finally {
-      ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
-      rig.transport.end();
-      await running.catch(() => undefined);
-    }
-  });
+  for (const route of ["refused wall", "withdrawn pause"] as const) {
+    for (const drainOld of [false, true]) it(
+      `(20${route === "refused wall" ? "a" : "b"}) ${route} ${drainOld ? "recreates after the old callback settles before checking idle" : "refuses an unsettled old callback"}`,
+      async () => {
+        const IDLE_MS = 90;
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method === "turn/start") {
+            if (c.turnStartCount === 1) c.transport.push(threadStarted());
+            return { turn: { id: `tn-${c.turnStartCount}` } };
+          }
+          return {};
+        } });
+        rig.deps = { ...rig.deps, idleMs: IDLE_MS, wallMs: route === "refused wall" ? 50 : 5000,
+          boundaryDeadlineMs: 50 };
+        const subscribe = ExecutionRegistry.prototype.subscribeCallbacks;
+        const registries: ExecutionRegistry[] = [];
+        ExecutionRegistry.prototype.subscribeCallbacks = function (listener) {
+          if (!registries.includes(this)) registries.push(this);
+          return subscribe.call(this, listener);
+        };
+        const controller = new AbortController();
+        let parks = 0;
+        const { ctx } = makeCtx({
+          signal: controller.signal,
+          pauseModeRequested: () => null,
+          parkForWall: async () => { parks++; return "refused"; },
+          takeWallParkRefresh: () => ({ totalSeconds: 1, usedSeconds: 0 }),
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        // Rejection is expected in the uncertain case; observe it before waiting on fixture events.
+        void running.catch(() => undefined);
+        try {
+          await waitFor(() => rig.transport.turnStartCount === 1 && registries.length === 1, "first drive and registry");
+          const old = registries[0]!;
+          const stale = old.reserveCallback({ threadId: "th-1", turnId: "tn-1", callId: "stale", fingerprint: "stale" });
+          assert.equal(stale.kind, "admitted");
+          if (stale.kind !== "admitted") throw new Error("old callback was not admitted");
+          assert.equal(old.inFlightCallbackCount(), 1, "the old callback is pending before pause handling");
+          if (drainOld) old.settleCallback(stale.token, "ok");
+          if (route === "withdrawn pause") controller.abort(new PauseNowSignal());
+          if (!drainOld) {
+            await assert.rejects(withTimeout(running, 2000, "uncertain epoch refusal"),
+              /prior Codex epoch cleanup unproven/);
+            assert.equal(rig.providerLaunches(), 1, "uncertain old epoch admits no replacement");
+            assert.equal(rig.transport.turnStartCount, 1, "uncertain callback never permits continuation");
+            assert.equal(rig.client.releaseCalls.length, 1, "uncertain cleanup permits no fresh credential release");
+            assert.equal(rig.client.refreshCalls.length, 0, "uncertain cleanup permits no refresh");
+            old.settleCallback(stale.token, "ok");
+            return;
+          }
+          await waitFor(() => rig.transport.turnStartCount === 2, "fresh epoch re-drive");
+          assert.equal(rig.providerLaunches(), 2);
+          assert.equal(old.inFlightCallbackCount(), 0, "old callback was joined");
+          const fresh = registries.at(-1)!;
+          assert.notEqual(fresh, old, "even a withdrawn pause recreates the drained epoch");
+          assert.equal(fresh.inFlightCallbackCount(), 0);
+          const current = fresh.reserveCallback({ threadId: "th-1", turnId: "tn-2", callId: "current", fingerprint: "current" });
+          assert.equal(current.kind, "admitted");
+          if (current.kind !== "admitted") throw new Error("current callback was not admitted");
+          await new Promise<void>(resolve => setTimeout(resolve, IDLE_MS + 50));
+          assert.equal(parks, route === "refused wall" ? 1 : 0, "current callback suppresses idle without a stale wall park");
+          fresh.settleCallback(current.token, "ok");
+          await assert.rejects(withTimeout(running, 2000, "idle after current callback settles"), /codex run idle timeout/);
+          assert.equal(parks, route === "refused wall" ? 1 : 0, "idle does not consume the newer wall budget");
+        } finally {
+          ExecutionRegistry.prototype.subscribeCallbacks = subscribe;
+          rig.transport.end();
+          await running.catch(() => undefined);
+        }
+      },
+    );
+  }
 
   it("(C4a) a child's token_usage_updated flows through the REAL delegation flow and is charged to the CHILD's configured model, not the root's", async () => {
     // The executor→accountant wiring seam: startChildTurn calls harness.recordChildThreadModel
@@ -15771,9 +15877,8 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     // ctx.onSessionId, which the executor calls after its evidence check on that same event), so a
     // stamp-on-first-event rule would fire on it; only model output may stamp.
     const rig = makeMultiEpochRig([
-      script("th-1", [quiet, (th, tn) => [done(11, th, tn)]], (n) => {
-        starts = n;
-      }),
+      script("th-1", [quiet], () => { starts++; }),
+      script("th-1", [(th, tn) => [done(11, th, tn)]], () => { starts++; }),
     ]);
     const seams = followUpSeams([A]);
     const startsAtStamp: number[] = [];

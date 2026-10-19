@@ -4908,6 +4908,7 @@ export class CodexExecutor implements Executor {
     // Only intentional capture poison with unchanged exact-epoch evidence permits
     // outstanding-set removal. Pre-existing faults remain unproven.
     const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
+    let ordinaryDrained = false;
     let registryClean = !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
     if (disposeRegistry && registry.state() !== "disposed") {
       // A completed capture already observed every root empty; ordinary quiesce/reap
@@ -4919,6 +4920,7 @@ export class CodexExecutor implements Executor {
           if (q.kind === "quiescent") {
             const reaped = await registry.reapProcesses(remaining(), q.epoch);
             drained = reaped.kind === "observed_empty";
+            ordinaryDrained = drained;
           }
         } catch { /* Disposal is still attempted after a failed drain. */ }
       }
@@ -4936,8 +4938,14 @@ export class CodexExecutor implements Executor {
       // Only a later owned capture can use this exact completed teardown to select a
       // fresh capture-only facade; it still needs its own settlement and deadline.
       const retiredFacade = this.epochSafeties.get(registry);
-      if (captureClean() && retiredFacade && retiredFacade === this.safety) {
-        this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
+      if (retiredFacade && retiredFacade === this.safety) {
+        if (captureClean()) this.verifiedDisposedCaptureFacades.set(retiredFacade, captureClean);
+        else if (ordinaryDrained && !registry.isPoisoned()) {
+          // This teardown observed quiescence, every root reaped, disposal and transport cleanup.
+          // Later rejected root registration poisons even a disposed registry, invalidating this fact.
+          this.verifiedDisposedCaptureFacades.set(retiredFacade,
+            () => registry.state() === "disposed" && !registry.isPoisoned());
+        }
       }
       this.unverifiedEpochRegistries.delete(registry);
       this.epochSafeties.delete(registry);

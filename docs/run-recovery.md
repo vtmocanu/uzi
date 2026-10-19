@@ -82,9 +82,13 @@ The worker attempts preservation using its existing recovery path. Under the
 execution closed through capture and settlement of the supervised capture processes,
 including credential-free recovery and retained-source capture. Setup, auth and
 executor-owned summary cleanup stay joined even after authority or summary delivery
-expires; unconfirmed cleanup blocks capture and credential continuation. Local
-capture moves capturable work from the ephemeral clone into the durable worker
-bare; blanket refusal would regress verified park/pause preservation. It does not
+expires; unconfirmed cleanup blocks capture and credential continuation. If a
+healthy checkpoint fully stopped and cleaned up the prior Codex execution, then
+initial credential release for its replacement exhausts, credential-free preservation
+can still proceed after fresh settlement within the original deadline. This grants
+no model or credential authority and does not change source retention. Local capture
+moves capturable work from the ephemeral clone into the durable worker bare;
+blanket refusal would regress verified park/pause preservation. It does not
 prove that latest work is archived or authorize source deletion. After an accepted
 owner pause, later source checks require fresh capture authority. If that proof
 refuses, the exact parked source, session, journal and custody remain retained;
