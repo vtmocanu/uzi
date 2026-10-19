@@ -322,6 +322,37 @@ describe("typed trip carrier", () => {
     assert.equal(killsAtFire, 0, "no kill is issued for a trip that lands with no live turn");
   });
 
+  it("a pause that trips at the plan gate (between turns) never signals the finished turn's CLI pid", async () => {
+    // Regression for the between-turns pid reset: driveTurn's finally forgets the CLI pid, so the
+    // generic trip (pause, cancel, wall) that lands at the gate has no pid left to group-kill.
+    let pause: () => void = () => {};
+    const kills: Array<number | undefined> = [];
+    let killedAtFire: Array<number | undefined> = [];
+    let spawned: number | undefined;
+    const spawn = (): never => { spawned = 41002; return Object.assign(new EventEmitter(), { pid: 41002 }) as never; };
+    const { queryFn } = fakeTurns([
+      (_signal, options) => (async function* () {
+        options.spawnClaudeCodeProcess!({ command: "claude", args: [], cwd: "/", env: {}, signal: new AbortController().signal });
+        yield submitPlan("plan");
+        yield resultSuccess();
+      })(),
+      [signalDone(), resultSuccess()],
+    ]);
+    const { capture } = fakeCapture();
+    let parks = 0;
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, spawn, rootStartTime: () => 1, killCliGroup: () => true, kill: (pid) => { kills.push(pid); return true; } }).run(makeCtx({
+      capturedMemory: capture,
+      onPauseNow: (cb) => { pause = cb; },
+      parkForPause: async () => { parks++; return true; },
+      // The plan turn's CLI (pid 41002) has exited by now; the pause lands at the gate.
+      gatePlan: async () => { pause(); killedAtFire = [...kills]; return { kind: "approve", selection: { status: "absent" } }; },
+    }));
+    assert.equal(spawned, 41002, "the plan turn did spawn a CLI with the pid under test");
+    assert.equal(killedAtFire.includes(41002), false, "the pause at the gate never names the finished turn's pid");
+    assert.ok(result.pausedAt, "the pause still parks the run");
+    assert.equal(parks, 1);
+  });
+
   it("an invalidation during a live turn group-kills that turn's CLI", async () => {
     const stop = new Stop();
     let fire: (stop: Error) => void = () => {};
