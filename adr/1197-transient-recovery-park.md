@@ -141,6 +141,16 @@ gate or captures WIP. The bootstrap snapshot above is still taken at boot.
 The change that adds the verified transfer, archive handoff and boot
 rediscovery removes the guard.
 
+Reachable now, independently of the guard: after a run ends failed or
+blocked, the runner starts a pass that replays that run's saved evidence
+(an owed FINAL) under the existing replay proofs, and live re-drive waits
+while it holds the pass set. On shutdown the worker aborts every recovery
+pass and joins it. A pass step that ignores the abort (a git child, an RPC
+on its own timeout) still runs to its own limit, which can outlast the
+container grace; that was equally true before the join, since the process
+never exits before such a child ends. Linking the pass abort into every git
+and RPC scope is owed before the guard is removed.
+
 ### Server-owned backoff
 
 `SetRunRecoveryWait` admits only the owning worker's running, non-judge run.
