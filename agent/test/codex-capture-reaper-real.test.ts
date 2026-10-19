@@ -39,7 +39,7 @@ async function plant(uid: "runner" | "command", marker: string, key: string) {
   assert.match(status, uid === "runner" ? /^Uid:\s+10002\s/m : /^Uid:\s+10003\s/m);
   return { child, closed, pid: child.pid, startTime };
 }
-async function proof(hold: boolean) {
+async function proof(hold: boolean, mode: "capture" | "own" = "capture", report = false) {
   setQuiescenceViewForTests(undefined); // Actual fixed scanner refuses every test view.
   const attempt = newRunAttempt("real-capture", 1, path.join(os.tmpdir(), "capture-real"), () => []);
   const foreign = newRunAttempt("real-foreign", 1, path.join(os.tmpdir(), "capture-foreign"), () => []);
@@ -61,6 +61,9 @@ async function proof(hold: boolean) {
         assert.ok(request.argv.some(arg => arg.endsWith("run-quiescence.ts")));
         const scan = JSON.parse(input);
         assert.equal(scan.targetUid, RUNNER_UID);
+        assert.equal(scan.mode, mode);
+        assert.equal(Object.hasOwn(scan, "reportDeadline"), report, "only genuine reportBudget changes legacy JSON");
+        if (report) assert.ok(Number.isSafeInteger(scan.reportDeadline));
         assert.equal(scan.ownMarker, attempt.marker);
         assert.deepEqual(scan.targetPaths, [attempt.clonePath]);
         assert.ok(scan.liveMarkers.includes(foreign.marker));
@@ -78,9 +81,10 @@ async function proof(hold: boolean) {
       };
       return root;
     }, undefined, { reaperAttempt: () => attempt });
-  const request = { mode: "capture" as const, attempt, cloneKey: attempt.cloneKey,
+  const request = { mode, attempt, cloneKey: attempt.cloneKey,
     targetPaths: [attempt.clonePath], processes: true, dockerHost: undefined, registry: live,
-    otherClaimInFlight: true };
+    otherClaimInFlight: true,
+    ...(report ? { reportBudget: { deadline: Date.now() + 30000, signal: new AbortController().signal } } : {}) };
   try {
     plants.push(await plant("runner", attempt.marker, attempt.cloneKey));
     plants.push(await plant("runner", foreign.marker, foreign.cloneKey));
@@ -113,11 +117,18 @@ async function proof(hold: boolean) {
     const result = await capture;
     assert.equal(result.kind, "observed_empty");
     const verdict = (await pending).process!;
-    assert.equal(verdict.state, "quiescent", JSON.stringify(verdict));
-    assert.ok(verdict.killed.includes(own.pid), "same-own PID selected by actual fixed scanner");
-    await own.closed;
-    assert.equal(own.child.signalCode, "SIGKILL");
-    assert.throws(() => identity(own.pid), /ENOENT/, "same PID/starttime is gone before verdict");
+    if (report) {
+      assert.notEqual(verdict.state, "quiescent", "owned writer blocks report protection");
+      assert.deepEqual(verdict.killed, [], "report retirement must kill NOTHING");
+      assert.ok(verdict.processes.some(p => p.pid === own.pid), "actual owned writer was observed");
+      assert.equal(identity(own.pid), own.startTime, "report preserves the exact owned writer");
+    } else {
+      assert.equal(verdict.state, "quiescent", JSON.stringify(verdict));
+      assert.ok(verdict.killed.includes(own.pid), "same-own PID selected by actual fixed scanner");
+      await own.closed;
+      assert.equal(own.child.signalCode, "SIGKILL");
+      assert.throws(() => identity(own.pid), /ENOENT/, "same PID/starttime is gone before verdict");
+    }
     assert.equal(identity(other.pid), other.startTime, "foreign attempt survives with same identity");
     assert.equal(identity(otherUid.pid), otherUid.startTime, "foreign UID survives with same identity");
     assert.deepEqual(operations, ["/bin/mktemp", process.execPath, "/bin/rm"]);
@@ -134,4 +145,6 @@ async function proof(hold: boolean) {
 describe("fixed capture reaper: real worker profile", { skip: GROUP_B_SKIP }, () => {
   it("fixed capture reaper: real runner procfs and signal compatibility", async () => { await proof(false); });
   it("fixed capture reaper: descendant settlement precedes verdict", async () => { await proof(true); });
+  it("fixed capture reaper: own mode kills owned residue before capture proceeds", async () => { await proof(false, "own"); });
+  it("fixed capture reaper: genuine report preserves the same owned writer", async () => { await proof(false, "capture", true); });
 });

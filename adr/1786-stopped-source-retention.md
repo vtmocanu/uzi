@@ -34,6 +34,9 @@ old clone bytes. Ordinary seeding trust is unchanged. Refusing every credential-
 capture would strand capturable work in the ephemeral clone rather than the durable
 worker bare and regress verified park/pause preservation; successful local capture
 still proves neither archive availability nor permission to delete the predecessor.
+Exact completed-capture evidence also has a narrow disposed-registry cache
+attestation reader under [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect);
+this grants no source cleanup or general clean status. Refs #2852 (AI-synced 2026-10-18).
 Existing terminal executor disposal does not close the gap between snapshot coverage
 and writer-exclusion proof; strengthened terminal proof (C) and healthy credentialed pre-publish closure (B)
 remain unshipped. A does not establish Docker writer exclusion:

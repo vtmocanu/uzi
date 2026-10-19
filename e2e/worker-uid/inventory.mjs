@@ -81,10 +81,12 @@ export function inventoryForSource(source, file) {
     const required = [
       'fixed capture reaper: real runner procfs and signal compatibility',
       'fixed capture reaper: descendant settlement precedes verdict',
+      'fixed capture reaper: own mode kills owned residue before capture proceeds',
+      'fixed capture reaper: genuine report preserves the same owned writer',
     ];
-    if (gates !== 1 || expected.length !== 2 || required.some(title =>
+    if (gates !== 1 || expected.length !== required.length || required.some(title =>
       !expected.some(test => test.names.length === 2 && test.names[0] === 'fixed capture reaper: real worker profile' && test.names[1] === title))) {
-      throw new Error(`${file}: expected one UID gate and both required literal fixed reaper leaves`);
+      throw new Error(`${file}: expected one UID gate and all required literal fixed reaper leaves`);
     }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);

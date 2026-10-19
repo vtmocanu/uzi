@@ -280,6 +280,11 @@ export class ExecutionRegistry {
     return this.poisoned;
   }
 
+  /** Retained failed reaps remain live facts, including rejected admissions. */
+  hasUnreapedBoundaryRoot(): boolean {
+    return this.roots.some(record => record.root.kind === "boundary_action" && !record.reaped);
+  }
+
   pendingLaunchCount(): number {
     return this.launches.size;
   }

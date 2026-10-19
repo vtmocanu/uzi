@@ -65,7 +65,7 @@ describe("fixed capture reaper: portable closed admission", () => {
           assert.equal(parsed.ownMarker, attempt.marker);
           assert.deepEqual(parsed.targetPaths, [attempt.clonePath]);
           assert.equal(parsed.targetUid, 10002);
-          assert.ok(parsed.reportDeadline <= Date.now() + 10000);
+          assert.equal(Object.hasOwn(parsed, "reportDeadline"), false, "ordinary scans preserve legacy kill-mode JSON");
         } else assert.equal(input, "");
         return { root: { kind: "boundary_action", dispose: async () => {},
           reap: async () => { if (scan) { entered.resolve(); await release.promise; } return { ok: true }; } },

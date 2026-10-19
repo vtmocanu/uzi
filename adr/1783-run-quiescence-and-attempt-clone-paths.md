@@ -302,6 +302,32 @@ removes the tree.
   synthesis bindings, including exact invocation and dynamic environment ownership,
   are described in [ADR-1106](1106-codex-harness.md#process-root-ownership).
 
+  **H/C amendment, Refs #2852 (AI-synced 2026-10-18):** ordinary scoped
+  helpers retain legacy JSON without `reportDeadline` and unbounded kill-mode
+  procfs reads. Genuine `reportBudget` includes the floored deadline and selects
+  no-kill report observation, with no new read bounds. Parent operations share
+  the minimum absolute scope/report/helper/ambient deadline. Fixed temporary
+  creation, existing Node/tsx helper invocation and exact temporary removal use
+  registered supervisor roots. Safety refuses reaper entry with pending launches,
+  callbacks or unreaped capture children, and ordinary child admission during the
+  exclusive pipeline. It joins admitted startup/full completion before releasing
+  that pipeline and the safety queue. Raw scoped fallback and mismatched
+  attempt/clone-key/target bindings refuse; late/nonzero/overflow/cancel-cleanup
+  failure is unverified. Outside executing-flight scope the legacy route remains,
+  without new resource waits or budget renewal.
+
+  Human decision C1 adds `HeldRunCommandCache.drained` as a narrow reader of the
+  executor's existing `completedCaptures`, alongside epoch teardown. An intentionally
+  poisoned registry counts as drained for cache settlement only when it is
+  `disposed` and `acceptsCompletedCapture` accepts its exact recorded proof.
+  Additional poison/revision, changed roots/launches/callbacks, other poison,
+  the sticky unclean flag or open cache roots retain the cache. This prevents
+  multi-GiB caches remaining after verified pause/gate capture and terminal
+  settlement; it creates no proof, general clean status, admission or
+  credential-release authority. Disk-pressure behavior is unchanged. Both free
+  capture and reaper roots bypass `cacheForLaunch` / `track`; ordinary cached
+  roots retain existing accounting, with no new decorated-environment exception.
+
   For pending Codex memory capture, the same `executionTails` promise is installed
   synchronously before factory work and owns the original preservation operation
   through capture callback completion and cleanup. The public observer can return

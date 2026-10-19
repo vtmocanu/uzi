@@ -9,6 +9,10 @@ interface Scope {
   readonly live: () => boolean;
   readonly spawn: (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
   readonly track: (pending: Promise<unknown>) => void;
+  readonly owner: object;
+  readonly enterExclusive: () => object;
+  readonly leaveExclusive: (token: object) => void;
+  readonly validateExclusive: (token: object, request?: BoundaryProcessRequest) => void;
   accepting: boolean;
 }
 type ReaperOperation = "create" | "scan" | "remove";
@@ -20,7 +24,7 @@ interface ReaperTempOwner {
 }
 
 const scopes = new AsyncLocalStorage<Scope>();
-const requests = new WeakMap<BoundaryProcessRequest, { scope: Scope; pipeline: { running: boolean }; input: string; deadlineAt: number; canonical: string; owner: ReaperTempOwner; kind: ReaperOperation; signal: AbortSignal }>();
+const requests = new WeakMap<BoundaryProcessRequest, { scope: Scope; pipeline: { running: boolean; token: object }; input: string; deadlineAt: number; canonical: string; owner: ReaperTempOwner; kind: ReaperOperation; signal: AbortSignal }>();
 
 /** Safety owns activation and revocation; inherited stores remain refusal markers. */
 export function reaperCaptureScope(
@@ -56,7 +60,9 @@ function runClosedReaper<T>(
       scope!.attempt.clonePath !== attempt.clonePath) {
     throw new TrustedExecutionRefusal("reaper attempt does not belong to this capture");
   }
-  const pipeline = { running: true };
+  // Claim synchronously before the first pipeline effect; siblings fail immediately.
+  const pipeline = { running: true, token: scope!.enterExclusive() };
+  const children: Promise<unknown>[] = [];
   // Register the full pipeline before invoking any code, including synchronous failures.
   const pending = Promise.resolve().then(() => action({
     signal: scope!.signal,
@@ -67,12 +73,24 @@ function runClosedReaper<T>(
       if (!Number.isFinite(deadlineAt) || deadlineAt > scope!.deadlineAt || Date.now() >= deadlineAt) {
         throw new TrustedExecutionRefusal("invalid reaper deadline");
       }
+      scope!.validateExclusive(pipeline.token);
       requests.set(request, { scope: scope!, pipeline, input, deadlineAt, owner, kind, signal,
         canonical: JSON.stringify(request) });
       assertClosedReaperRequest(request);
-      return scope!.spawn(request);
+      const child = scope!.spawn(request);
+      // Include startup and full root completion even when the action ignores its handle.
+      const completed = child.then(handle => handle.completed);
+      children.push(completed);
+      void completed.catch(() => undefined);
+      return child;
     },
-  })).finally(() => { pipeline.running = false; });
+  })).finally(async () => {
+    pipeline.running = false;
+    // No stage can start after revocation. Each admitted child has its existing deadline;
+    // join every sibling even if one fails before releasing safety's exclusive guard.
+    try { await Promise.allSettled(children); }
+    finally { scope!.leaveExclusive(pipeline.token); }
+  });
   scope!.track(pending);
   void pending.catch(() => undefined);
   return pending;
@@ -87,15 +105,16 @@ export function isClosedReaperRequest(request: BoundaryProcessRequest): boolean 
   return requests.has(request);
 }
 
-export function assertClosedReaperRequest(request: BoundaryProcessRequest, signal?: AbortSignal): string {
+export function assertClosedReaperRequest(request: BoundaryProcessRequest, signal?: AbortSignal, owner?: object): string {
   const bound = requests.get(request);
-  if (!bound || (signal && signal !== bound.scope.signal)) {
+  if (!bound || (signal && signal !== bound.scope.signal) || (owner && owner !== bound.scope.owner)) {
     throw new TrustedExecutionRefusal("unbound reaper operation");
   }
   if (!bound.pipeline.running || !bound.scope.live() || bound.scope.signal.aborted ||
       Date.now() >= bound.scope.deadlineAt) {
     throw new TrustedExecutionRefusal("reaper capture scope unavailable");
   }
+  bound.scope.validateExclusive(bound.pipeline.token, request);
   bound.signal.throwIfAborted();
   const argv = bound.kind === "create"
     ? ["/bin/mktemp", "-d", path.join(bound.owner.base, "uzi-quiesce-XXXXXXXXXX")]
@@ -378,6 +397,8 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       readCwd: pid => { check(); return fs.readlinkSync(path.join(root, String(pid), "cwd")); },
     };
   }
+  // Ordinary killing retains the shipped, unbounded legacy procfs reads.
+  // Only the report-budget branch above changes the read policy.
   return {
     listPids: () =>
       fs
@@ -1755,7 +1776,7 @@ function reapScopedRunProcesses(
       ambient?.check();
       if (Date.now() >= deadline) throw new Error("scoped reaper deadline");
     };
-    const input = JSON.stringify({ ...frozen, reportDeadline: deadline });
+    const input = JSON.stringify(reportBudget ? { ...frozen, reportDeadline: deadline } : frozen);
     if (Buffer.byteLength(input) > HELPER_REQUEST_MAX) throw new Error("scoped reaper input overflow");
     const base = runnerTmpdir() ?? os.tmpdir();
     const owner: ReaperTempOwner = { base, scanPath: runnerPath() ?? HELPER_PATH, removed: false };

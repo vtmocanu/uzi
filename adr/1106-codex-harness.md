@@ -483,6 +483,28 @@ Lost supervision or incomplete settlement grants no capture authority. This cont
 mints neither a credentialed nor a completion permit. See the
 [remaining sink gaps](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
 
+The scoped reaper uses registered supervisor roots for fixed `mktemp`, the existing
+Node/tsx run-quiescence helper flag, and removal of the exact private temporary
+directory. Ordinary scans send legacy JSON without `reportDeadline` and retain
+unbounded kill-mode procfs reads. A genuine `reportBudget` adds the floored deadline
+and selects no-kill report observation; no new procfs read bounds, bootstrap,
+helper flag, request schema or supervisor protocol are introduced. The parent caps
+operations at the minimum absolute scope, report (when present), helper and ambient
+deadlines. Late completion, nonzero exit, output overflow or cancellation-cleanup
+failure is unverified. Safety's exclusive guard refuses reaping with pending launches,
+callbacks or unreaped capture children, and refuses ordinary child admission while
+the pipeline is active. Started children join through full root completion before
+pipeline guard and safety queue release. Raw scoped fallback is refused; exact
+attempt, clone key and target binding remain required. Outside executing-flight
+scope, maintenance and Claude retain the legacy route without added flight waits
+or budgets. Refs #2852 (AI-synced 2026-10-18).
+
+Free-capture roots and the closed-reaper branch bypass `cacheForLaunch` / `track`;
+ordinary cached command roots keep their existing accounting. This adds no decorated
+environment exception. The exact completed-capture cache attestation reader is
+specified in [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+Refs #2852 (AI-synced 2026-10-18).
+
 GitCache binds the restricted launch policy: the canonical environment includes
 exactly one empty `credential.helper` and one empty `core.askpass`, with no
 credential-bearing override. The strict GitCache builder policy matches the complete

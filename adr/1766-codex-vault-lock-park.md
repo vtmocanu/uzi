@@ -211,7 +211,12 @@ marker, so a normal runner boundary cannot fall into the legacy branch. A poison
 or disposed normal facade refuses before credential reconciliation. A later owned
 free capture may select the existing internal capture-only machinery after the exact
 completed scope/epoch/registry proof revalidates clean teardown and an unchanged
-poison revision; removal evidence itself grants neither ordinary nor capture authority.
+poison revision. Human decision C1 also permits `HeldRunCommandCache.drained` to
+read that exact existing registry proof for cache settlement, requiring `disposed`
+state and `acceptsCompletedCapture`; later poison, changed root/launch/callback
+facts, unclean cache tracking or open roots retain the cache. This narrow reader
+grants no general clean status, admission, credential-release or capture authority.
+Refs #2852 (AI-synced 2026-10-18).
 That acquisition still needs its own settlement and deadline. New poison or unknown
 cleanup retains the outstanding registry and refuses capture.
 

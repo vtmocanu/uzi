@@ -3344,7 +3344,8 @@ export class CodexExecutor implements Executor {
       if (startCacheHolder !== undefined) {
         try {
           this.assertCaptureAdmission(setupRevision);
-          runCache = new HeldRunCommandCache(await this.trackEpochSetup(() => startCacheHolder(randomUUID())));
+          runCache = new HeldRunCommandCache(await this.trackEpochSetup(() => startCacheHolder(randomUUID())),
+            registry => this.completedCaptures.get(registry));
         } catch (error) {
           this.log.warn("codex command cache unavailable; commands run without a shared cache", {
             error: errMessage(error),
@@ -5924,7 +5925,7 @@ export interface RunCommandCache {
   /** Wrap a launch whose spec carries this cache, so its root's disposal outcome counts
    *  toward the drained attestation. */
   track(launch: EffectLaunch): EffectLaunch;
-  /** Record a registry whose poison makes the attestation false. */
+  /** Record a registry whose poison requires exact completed capture evidence at disposal. */
   watchRegistry(registry: ExecutionRegistry): void;
 }
 
@@ -5940,8 +5941,8 @@ function cacheForLaunch(cache: RunCommandCache | undefined, launch: EffectLaunch
  *
  * DRAINED ATTESTATION: true iff every command-identity root launched WITH this cache
  * reported a clean disposal (its registeredRoot reap/dispose, which both go through
- * the handle's dispose) AND no provider-epoch registry of the run was ever poisoned
- * (`isPoisoned()` is sticky across disposal). A launch that threw after the spec named the
+ * the handle's dispose) AND every poisoned provider-epoch registry is disposed with
+ * its existing exact completed capture proof still accepted. A launch that threw after the spec named the
  * cache makes it false unless that invocation receives the launcher's fresh, exact-attempt
  * certificate for fully closed rejected-startup cleanup. An unclean or rejected disposal,
  * or a root never disposed by the terminal settle, also makes it false. False is the safe
@@ -5955,7 +5956,10 @@ export class HeldRunCommandCache implements RunCommandCache {
   private unclean = false;
   private settling: Promise<void> | undefined;
 
-  constructor(holder: CommandCacheHolder) {
+  constructor(
+    holder: CommandCacheHolder,
+    private readonly completedCapture?: (registry: ExecutionRegistry) => CompletedCredentialFreeCapture | undefined,
+  ) {
     this.holder = holder;
   }
 
@@ -6013,7 +6017,13 @@ export class HeldRunCommandCache implements RunCommandCache {
   }
 
   drained(): boolean {
-    return !this.unclean && this.openRoots === 0 && !this.registries.some((registry) => registry.isPoisoned());
+    return !this.unclean && this.openRoots === 0 && this.registries.every((registry) => {
+      if (!registry.isPoisoned()) return true;
+      // Read the executor-owned evidence for this exact registry at settlement;
+      // later poison invalidates it even after disposal has cleared live tables.
+      const proof = this.completedCapture?.(registry);
+      return proof !== undefined && registry.state() === "disposed" && registry.acceptsCompletedCapture(proof);
+    });
   }
 
   /**
@@ -6459,7 +6469,7 @@ const productionEffectLaunch: EffectLaunch = (spec, deadlineMs, startupCleanup) 
 /**
  * TEST SEAM (issue #1769 m3) — NOT called by production code. Builds the same boundary-process
  * spawner {@link CodexExecutor} wires into `createCodexExecutionSafety` (`makeBoundaryProcessSpawner`,
- * without a run command cache), so a fixture can drive a REAL boundary scope: a `command`
+ * with an optional run command cache), so a fixture can drive a REAL boundary scope: a `command`
  * identity request launches `commandEffectSpec(request.cwd, request.cwd, …)` (the command
  * sandbox rooted at the request's cwd, under the supervisor), a `worker_pat` one launches the
  * plain supervised spec, and both register as `boundary_action` roots.
@@ -6474,8 +6484,9 @@ export function boundaryProcessSpawnerForTest(
   mode: CommandSandboxMode,
   launch: EffectLaunch = productionEffectLaunch,
   log?: Pick<Logger, "warn">,
+  cache?: RunCommandCache,
 ): SpawnBoundaryProcessSeam {
-  return makeBoundaryProcessSpawner(launch, mode, log);
+  return makeBoundaryProcessSpawner(launch, mode, log, cache);
 }
 
 function makeBoundaryProcessSpawner(

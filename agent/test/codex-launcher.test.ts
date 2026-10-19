@@ -42,7 +42,7 @@ import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
 import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
-import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
+import { boundaryProcessSpawnerForTest, HeldRunCommandCache } from "../src/codex/codex-executor.js";
 import { GitCache, gitEnv, createCaptureContext, assertCaptureRequest, bindCaptureLaunch } from "../src/git.js";
 import * as gitApi from "../src/git.js";
 import * as captureApi from "../src/credential-free-capture.js";
@@ -2157,6 +2157,64 @@ describe("launcher observation contract", () => {
     assert.equal(outcome.state, "unavailable");
     if (outcome.state === "unavailable") assert.equal(outcome.reason, "transport");
     assert.equal((await handle.dispose()).clean, false);
+  });
+});
+
+describe("C3 held cache real effect launcher", () => {
+  it("ordinary command Git uses held cache then canonical capture bypasses it at synchronous launch", async () => {
+    const cacheDir = "/var/cache/uzi-codex-cmd/" + "11111111-2222-4333-8444-555555555555";
+    const cache = new HeldRunCommandCache({
+      token: cacheDir.split("/").at(-1)!, path: cacheDir, alive: () => true,
+      release: async () => ({ state: "removed", reason: "" }),
+    });
+    const specs: CodexEffectLaunchSpec[] = [];
+    let actual = 0;
+    const adapter = boundaryProcessSpawnerForTest("required", async spec => {
+      specs.push(spec);
+      const fake = newFake({ uid: COMMAND_UID });
+      return launchCodexEffectRoot(spec, baseDeps(fake, {
+        resolveCommandUid: () => COMMAND_UID,
+        spawnSupervisor: (command, args, options) => {
+          actual++;
+          spawnCalls.push({ command, args, options });
+          fake.emitChildExit(0);
+          return fake as unknown as SupervisorProcess;
+        },
+      }));
+    }, nullLogger(), cache);
+    const request: BoundaryProcessRequest = {
+      identity: "command", cwd: "/capture/runner",
+      argv: ["/usr/bin/git", "status", "--porcelain"], env: gitEnv(),
+    };
+    const ordinary = await adapter(request, 1000);
+    await ordinary.waitChild(1000);
+    assert.equal((await ordinary.root.reap(1000)).ok, true);
+    assert.ok(specs[0]!.args.includes("--cache"), "positive control proves cache is wired");
+    assert.equal(specs[0]!.env.GOMODCACHE, cacheDir + "/gomod");
+    assert.equal(specs[0]!.env.GOCACHE, cacheDir + "/gocache");
+    assert.equal(specs[0]!.env.npm_config_cache, cacheDir + "/npm");
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2853));
+    const safety = createCodexExecutionSafety(registry, async () => { throw new Error("unused"); },
+      undefined, undefined, adapter);
+    const git = new GitCache(process.env.TMPDIR!, nullLogger());
+    const result = await safety.withCredentialFreeCapture(1000, context =>
+      git.withCredentialFreeCapture(context, () => git.worktreeStatus(request.cwd)));
+    assert.equal(result.kind, "observed_empty");
+    if (result.kind === "observed_empty") assert.deepEqual(result.value, []);
+    assert.equal(actual, 2, "both roots reach actual synchronous supervisor launch");
+    const captured = specs[1]!;
+    assert.equal(captured.identity, "command");
+    assert.equal(captured.command, "/usr/local/bin/uzi-codex-command-sandbox");
+    assert.deepEqual(captured.args.slice(captured.args.indexOf("--") + 1),
+      ["/usr/bin/git", "-C", request.cwd, "status", "--porcelain"],
+      "transformed wrapper retains the public status operation canonical Git argv");
+    assert.equal(captured.args[captured.args.indexOf("--mode") + 1], "required");
+    assert.ok(!captured.args.includes("--cache"));
+    for (const key of ["GOMODCACHE", "GOCACHE", "npm_config_cache"]) {
+      assert.equal(captured.env[key], undefined, key);
+      assert.equal(spawnCalls[1]!.options.env[key], undefined, "actual spawn " + key);
+    }
+    await safety.dispose({ boundary: "terminal", deadlineMs: 1000 });
   });
 });
 

@@ -325,6 +325,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private heldPermit: BoundaryPermit | undefined;
   private currentDeadlineAt = 0;
   private pendingActions: Promise<unknown>[] = [];
+  private exclusiveReaper: object | undefined;
+  private readonly reaperReservations = new WeakSet<BoundaryProcessRequest>();
   private heldCapture: CredentialFreeCaptureContext | undefined;
   private lastCaptureCompletion: CompletedCredentialFreeCapture | undefined;
   private captureReserve: ((request?: BoundaryProcessRequest) => ReturnType<ExecutionRegistry["reserveLaunch"]>) | undefined;
@@ -446,10 +448,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.captureReserve = lane.reserve;
       this.currentDeadlineAt = captureDeadlineAt;
       this.pendingActions = [];
-      const reaper = reaperCaptureScope({ attempt: this.reaperAttempt?.(), signal: controller.signal,
-        deadlineAt: captureDeadlineAt, live: () => this.heldCapture === context && lane.live(),
-        spawn: request => this.spawnOwnedProcess(context, request),
-        track: pending => { this.pendingActions.push(pending); } });
+      const reaper = this.createReaperScope(context, captureDeadlineAt,
+        () => this.heldCapture === context && lane.live());
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
         if (controller.signal.aborted || remaining() <= 0) {
@@ -618,10 +618,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     this.currentDeadlineAt = deadlineAt;
     this.pendingActions = [];
 
-    const reaper = reaperCaptureScope({ attempt: this.reaperAttempt?.(), signal: permit.signal,
-      deadlineAt, live: () => this.heldPermit === permit && this.registry.state() === "closed",
-      spawn: request => this.spawnOwnedProcess(permit, request),
-      track: pending => { this.pendingActions.push(pending); } });
+    const reaper = this.createReaperScope(permit, deadlineAt,
+      () => this.heldPermit === permit && this.registry.state() === "closed");
     let outcome: { ok: true; value: T } | { ok: false; error: unknown };
     try {
       outcome = { ok: true, value: await reaper.run(() => action(permit)) };
@@ -703,12 +701,50 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     return startup;
   }
 
+  private createReaperScope(
+    owner: BoundaryPermit | CredentialFreeCaptureContext,
+    deadlineAt: number,
+    live: () => boolean,
+  ): ReturnType<typeof reaperCaptureScope> {
+    const requireEmpty = (ownReservation = false): void => {
+      if (this.registry.pendingLaunchCount() !== (ownReservation ? 1 : 0) ||
+          this.registry.inFlightCallbackCount() !== 0 || this.registry.hasUnreapedBoundaryRoot()) {
+        throw new TrustedExecutionRefusal("reaper requires no live capture children or callbacks");
+      }
+    };
+    return reaperCaptureScope({
+      owner, attempt: this.reaperAttempt?.(), signal: owner.signal, deadlineAt, live,
+      spawn: request => this.spawnOwnedProcess(owner, request),
+      track: pending => { this.pendingActions.push(pending); },
+      enterExclusive: () => {
+        if (!live() || this.exclusiveReaper) throw new TrustedExecutionRefusal("reaper pipeline admission refused");
+        requireEmpty();
+        const token = Object.freeze({});
+        this.exclusiveReaper = token;
+        return token;
+      },
+      validateExclusive: (token, request) => {
+        if (!live() || this.exclusiveReaper !== token ||
+            (this.heldCapture !== owner && this.heldPermit !== owner)) {
+          throw new TrustedExecutionRefusal("reaper pipeline owner expired");
+        }
+        // Before reservation require zero; the launcher's final synchronous check
+        // excludes only this request's safety-owned, still-pending reservation.
+        requireEmpty(request !== undefined && this.reaperReservations.has(request));
+      },
+      leaveExclusive: token => {
+        if (this.exclusiveReaper === token) this.exclusiveReaper = undefined;
+      },
+    });
+  }
+
   private async startOwnedProcess(
     permit: BoundaryPermit | CredentialFreeCaptureContext,
     request: BoundaryProcessRequest,
   ): Promise<BoundaryProcessHandle> {
     const capture = this.heldCapture === permit ? this.heldCapture : undefined;
-    if (isClosedReaperRequest(request)) assertClosedReaperRequest(request, permit.signal);
+    if (isClosedReaperRequest(request)) assertClosedReaperRequest(request, permit.signal, permit);
+    else if (this.exclusiveReaper) throw new TrustedExecutionRefusal("reaper pipeline owns child admission");
     else if (capture) assertCaptureRequest(capture, request);
     else if (this.heldPermit !== permit) throw new TrustedExecutionRefusal("codex boundary process refused: stale permit");
     if (permit.signal.aborted) throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
@@ -742,6 +778,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       : undefined;
     const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
     let launched: SpawnedBoundaryProcess;
+    if (reaperRequest) this.reaperReservations.add(request);
     try {
       const launch = this.seams.spawnProcess(request, Math.max(1, childDeadlineAt - Date.now()), startupCleanup);
       launched = await launch;
@@ -762,6 +799,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       const error = new CodexLaunchError(classification, cleanupVerified ? "verified" : "unconfirmed", cause);
       this.registry.poison({ category: classification === "started_deadline" ? "timeout" : "tool", message: error.message });
       throw error;
+    } finally {
+      this.reaperReservations.delete(request);
     }
     const registered = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!registered.ok) {
@@ -935,6 +974,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         return { kind: "refused", reason: "command_roots_live" };
       }
     }
+    if (this.exclusiveReaper) throw new TrustedExecutionRefusal("reaper pipeline owns child admission");
     // Reserve the boundary_action root BEFORE spawning anything.
     const reserved = this.registry.reserveLaunch("boundary_action");
     if (reserved.kind !== "reserved") {

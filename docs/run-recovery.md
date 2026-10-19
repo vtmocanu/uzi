@@ -659,6 +659,15 @@ checked before credentials or another model turn; a locked vault can defer recre
 into credential recovery. This does not make an open approval gate parkable. Healthy
 credentialed capture gaps (B) and the terminal snapshot/late-writer limitation (C)
 remain open; existing terminal disposal does not remove that snapshot limitation.
+After terminal settlement, verified capture evidence can attest that the disposed
+Codex registry drained for command-cache release. Later poison, changed registry
+facts, unclean cache roots or open roots retain that cache. This avoids retaining
+large caches after verified pause/gate capture, without granting source deletion,
+credential release or a general clean status. Scoped reaper helpers retain ordinary
+kill behavior; no-kill observation requires a genuine report budget. Existing
+absolute deadlines expire without detaching owned cleanup or renewing authority.
+The detailed boundary is in [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect).
+Refs #2852 (AI-synced 2026-10-18).
 A does not complete #2852. Independent #3031 work is not a prerequisite and gains no
 model-free capture coverage or changes to producers, ledger, custody or settlement.
 

@@ -51,7 +51,7 @@ test("command inventory requires explicit literal test declarations from the sco
   }
 });
 
-test("fixed reaper inventory pins both literal leaves under exactly one UID gate", () => {
+test("fixed reaper inventory pins all literal leaves under exactly one UID gate", () => {
   const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/reaper-inventory."));
   const api = new API({ cwd: scratch });
   try {
@@ -59,6 +59,8 @@ test("fixed reaper inventory pins both literal leaves under exactly one UID gate
     const fixtures = [
       { name: "actual", source },
       { name: "missing", source: source.replace("fixed capture reaper: descendant settlement precedes verdict", "changed"), error: /required literal fixed reaper/ },
+      { name: "missing-own", source: source.replace("fixed capture reaper: own mode kills owned residue before capture proceeds", "changed"), error: /required literal fixed reaper/ },
+      { name: "missing-report", source: source.replace("fixed capture reaper: genuine report preserves the same owned writer", "changed"), error: /required literal fixed reaper/ },
       { name: "ungated", source: source.replace("skip: GROUP_B_SKIP", "skip: false"), error: /required literal fixed reaper/ },
       { name: "duplicate-gate", source: source + '\ndescribe("extra", { skip: GROUP_B_SKIP }, () => {});', error: /required literal fixed reaper/ },
     ];
@@ -68,7 +70,7 @@ test("fixed reaper inventory pins both literal leaves under exactly one UID gate
     for (const fixture of fixtures) {
       const collect = () => inventoryForSource(program.getSourceFile(path.join(scratch, fixture.name + ".mts")), "codex-capture-reaper-real");
       if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
-      else assert.equal(collect().length, 2);
+      else assert.equal(collect().length, 4);
     }
   } finally {
     api.close();

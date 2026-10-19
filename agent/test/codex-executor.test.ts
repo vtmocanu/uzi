@@ -10996,6 +10996,60 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     assert.deepEqual(c.holder.releases, [true]);
   });
 
+  for (const fault of ["none", "later-poison", "unclean-capture"] as const) {
+    it(`C3 public pause capture terminal cache settlement ${fault}`, async () => {
+      const c = cacheRig({ defer: true,
+        unclean: (_index, spec) => fault === "unclean-capture" && spec.args.includes("status"),
+      });
+      const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+      const git = new GitCache(process.env.TMPDIR!, noopLog);
+      let captures = 0;
+      const { ctx } = makeCtx({
+        pauseModeRequested: () => "now",
+        reportIteration: async () => ({ pauseRequested: false }),
+        parkForPause: async () => {
+          captures++;
+          const capture = () => exec.withCredentialFreeCapture(1000, async context => {
+            assert.deepEqual(c.holder.releases, [], "capture keeps the holder alive");
+            if (fault === "unclean-capture") {
+              assert.equal(await git.withCredentialFreeCapture(context,
+                () => git.worktreeStatus(WORKSPACE)), null, "unclean canonical Git has no trusted result");
+            }
+            return true;
+          });
+          if (fault === "unclean-capture") {
+            await assert.rejects(capture(), error => {
+              assert.ok(error instanceof CodexBoundaryError);
+              assert.equal(error.diagnostic, "codex boundary failed at action: capture child cleanup failed");
+              return true;
+            });
+          } else assert.equal((await capture()).kind, "observed_empty");
+          return true;
+        },
+      });
+      assert.ok((await withTimeout(exec.run(ctx), 3000, "C3 seeded pause")).pausedAt);
+      assert.equal(captures, 1, "real executor invokes the pause capture");
+      assert.deepEqual(c.holder.releases, [], "deferred run has not settled the holder");
+      if (fault === "later-poison") {
+        // Fault injection only; release and evidence lookup stay on the public production route.
+        const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(registry);
+        registry.poison({ category: "tool", message: "C3 later cleanup uncertainty" });
+      }
+      if (fault === "unclean-capture") {
+        const root = c.specs.find(spec => spec.args.includes("status"));
+        assert.ok(root, "canonical scoped Git actually launched");
+        assert.ok(!root.args.includes("--cache"));
+        for (const key of CACHE_KEYS) assert.equal(root.env[key], undefined);
+      }
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      assert.deepEqual(c.holder.releases, [fault === "none"],
+        "only exact completed capture plus terminal disposal can drain the cache");
+      await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      assert.deepEqual(c.holder.releases, [fault === "none"], "terminal settlement is idempotent");
+    });
+  }
+
   it("deferred mode with NO epoch built (setup failure) releases in run()'s finally", async () => {
     const c = cacheRig({ defer: true });
     c.rig.deps = {
