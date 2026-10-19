@@ -8,11 +8,20 @@ import { ExecutionRegistry, MAX_POISON_ERRORS, newLocalExecutionEpoch } from "..
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
 import { CodexLaunchError, type CodexEffectLaunchSpec, type CodexRootHandle } from "../src/codex/launcher.js";
 import type { BoundaryProcessRequest, CredentialFreeCaptureContext } from "../src/harness.js";
-import { assertCaptureLaunch, captureGitSpawner, validateCaptureGitRequest } from "../src/credential-free-capture.js";
+import { assertCaptureLaunch } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import fs from "node:fs";
 import path from "node:path";
 import { credentialFreeGitFixture, latch } from "./credential-free-git-fixture.js";
+
+function scopedRequest(git: GitCache, context: CredentialFreeCaptureContext, request: BoundaryProcessRequest) {
+  const internal = git as unknown as {
+    execScoped(command: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string; timeout?: number },
+      identity: BoundaryProcessRequest["identity"]): Promise<{ stdout: string; stderr: string }>;
+  };
+  return git.withCredentialFreeCapture(context, () => internal.execScoped(request.argv[0]!, request.argv.slice(1),
+    { env: request.env, cwd: request.cwd, timeout: request.timeoutMs }, request.identity));
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -121,9 +130,10 @@ describe("credential-free capture foundation (#2852)", () => {
       });
     let completed = false;
     const first = safety.withCredentialFreeCapture(10_000, async context => {
-      const spawn = captureGitSpawner(context, () => {});
+      const git = new GitCache(process.env.TMPDIR!, nullLogger());
+      const spawn = (request: BoundaryProcessRequest) => scopedRequest(git, context, request);
       // Caller discards startup: safety must still own the failure and cleanup.
-      void spawn({ argv: ["/usr/bin/git", "status"], cwd: "/capture/runner", identity: "command", env: gitEnv() });
+      void spawn({ argv: ["/usr/bin/git", "status"], cwd: "/capture/runner", identity: "command", env: gitEnv() }).catch(() => {});
     }).then(value => ({ value }), error => ({ error })).then(value => { completed = true; return value; });
     launch.resolve();
     await disposing.promise;
@@ -160,7 +170,8 @@ describe("credential-free capture foundation (#2852)", () => {
           throw new CodexLaunchError(classification, "verified", new Error("unconfirmed"));
         });
       await assert.rejects(safety.withCredentialFreeCapture(10_000, async context => {
-        const spawn = captureGitSpawner(context, () => {});
+        const git = new GitCache(process.env.TMPDIR!, nullLogger());
+        const spawn = (request: BoundaryProcessRequest) => scopedRequest(git, context, request);
         await spawn({ argv: ["/usr/bin/git", "status"], cwd: "/capture/runner", identity: "command", env: gitEnv() });
       }));
       assert.equal(authorizationSeen, true);
@@ -412,8 +423,7 @@ describe("credential-free real Git producer positives", () => {
         ["GIT_SHALLOW_FILE", r.bare], ["GIT_GRAFT_FILE", r.bare],
       ]) {
         await r.safety.withCredentialFreeCapture(10_000, async context => {
-          const spawn = captureGitSpawner(context, request =>
-            validateCaptureGitRequest(request, [reader.env], "/usr/bin/git", process.execPath, "unused-helper"));
+          const spawn = (request: BoundaryProcessRequest) => scopedRequest(r.git, context, request);
           await assert.rejects(async () => spawn({ ...reader, env: { ...reader.env, [key!]: value } }),
             /credential-free capture launch refused/, key);
         });
@@ -519,8 +529,7 @@ describe("credential-free real Git producer positives", () => {
       const launches = r.requests.length;
       for (const [name, altered] of alters) {
         await r.safety.withCredentialFreeCapture(10_000, async context => {
-          const spawn = captureGitSpawner(context, request => validateCaptureGitRequest(
-            request, [helper.env], "/usr/bin/git", process.execPath, helper.argv[2]!));
+          const spawn = (request: BoundaryProcessRequest) => scopedRequest(r.git, context, request);
           await assert.rejects(async () => spawn(altered), /credential-free capture launch refused/, name);
         });
       }
@@ -535,8 +544,8 @@ describe("credential-free real Git producer positives", () => {
   });
 });
 
-// Supplemental policy cells. These use a genuine safety context and the internal
-// policy adapter, not a claim that a runner or GitCache exposes arbitrary spawn.
+// Supplemental policy cells use a test-only private execScoped invocation.
+// GitCache owns and executes the complete canonical policy before registration.
 describe("credential-free canonical policy before launcher admission", () => {
   const baseRequest = (): BoundaryProcessRequest => ({
     argv: ["/usr/bin/git", "status", "--porcelain"], cwd: "/capture/runner",
@@ -597,9 +606,7 @@ describe("credential-free canonical policy before launcher admission", () => {
     it("rejects " + name + " with zero launcher calls", async () => {
       const r = rig();
       await r.safety.withCredentialFreeCapture(10_000, async (context: CredentialFreeCaptureContext) => {
-        const canonical = gitEnv();
-        const spawn = captureGitSpawner(context, request =>
-          validateCaptureGitRequest(request, [canonical], "/usr/bin/git", process.execPath, "unused-helper"));
+        const spawn = (request: BoundaryProcessRequest) => scopedRequest(r.git, context, request);
         await assert.rejects(async () => spawn(alter(baseRequest())), error => {
           assert.match(String(error), /credential-free capture launch refused/);
           assert.equal(String(error).includes("capture-sentinel"), false);

@@ -138,7 +138,7 @@ import {
   type SpawnBoundaryProcessSeam,
   type SpawnedBoundaryProcess,
 } from "./safety.js";
-import { bindCaptureLaunch, isCaptureRequest } from "../credential-free-capture.js";
+import { bindCaptureLaunch, isCaptureRequest } from "../git.js";
 import {
   CodexHarness,
   CodexResumeError,

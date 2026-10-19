@@ -43,8 +43,10 @@ import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark
 import { ResidueQuarantinedError, latchResidueQuarantine } from "../src/residue-quarantine.js";
 import { nullLogger } from "./helpers.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
-import { createCaptureContext, captureGitSpawner, validateCaptureGitRequest, assertCaptureRequest } from "../src/credential-free-capture.js";
-import { gitEnv } from "../src/git.js";
+import { GitCache, gitEnv, createCaptureContext, assertCaptureRequest } from "../src/git.js";
+import * as gitApi from "../src/git.js";
+import * as captureApi from "../src/credential-free-capture.js";
+import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
 
 import { prepareSupervisedProvision, buildProvisionEnv, type SupervisedProvisionRequest } from "../src/provision.js";
@@ -2158,6 +2160,41 @@ describe("launcher observation contract", () => {
   });
 });
 
+describe("C2 private capture issuer regression", () => {
+  it("context-only callback cannot issue non-Git worker requests while canonical Git launches", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
+    let supervisorCalls = 0;
+    const adapter = boundaryProcessSpawnerForTest("required", async spec => {
+      const fake = newFake({ uid: spec.identity === "command" ? COMMAND_UID : WORKER_UID });
+      return launchCodexEffectRoot(spec, baseDeps(fake, {
+        resolveCommandUid: () => COMMAND_UID, resolveWorkerUid: () => WORKER_UID,
+        spawnSupervisor: () => {
+          supervisorCalls++;
+          fake.emitChildExit(0);
+          return fake as unknown as SupervisorProcess;
+        },
+      }));
+    });
+    const safety = createCodexExecutionSafety(registry, async () => { throw new Error("unused"); },
+      undefined, undefined, adapter);
+    const git = new GitCache(process.env.TMPDIR!, nullLogger());
+    const result = await safety.withCredentialFreeCapture(10_000, async context => {
+      for (const api of [captureApi, gitApi]) {
+        const issuer = (api as unknown as Record<string, unknown>).captureGitSpawner;
+        if (typeof issuer !== "function") continue;
+        const spawn = issuer(context, () => {}) as (r: BoundaryProcessRequest) => Promise<import("../src/harness.js").BoundaryProcessHandle>;
+        const handle = await spawn({ argv: ["/capture/inert-non-git", "sentinel"],
+          cwd: "/capture/runner", identity: "worker_pat", env: { GIT_ASKPASS: "forbidden-sentinel" } });
+        await handle.completed;
+      }
+      assert.equal(supervisorCalls, 0, "context-only no-op issuer reached the actual supervisor");
+      await git.withCredentialFreeCapture(context, () => git.worktreeStatus("/capture/runner"));
+    });
+    assert.equal(result.kind, "observed_empty");
+    assert.ok(supervisorCalls > 0, "canonical Git positive must reach the same actual supervisor");
+  });
+});
+
 // Every candidate below is data. Only the injected supervisor sees launch strings.
 describe("C2 real effect launcher capture policy", () => {
   type Alter = (r: BoundaryProcessRequest) => BoundaryProcessRequest;
@@ -2222,7 +2259,17 @@ describe("C2 real effect launcher capture policy", () => {
       let prepared = false;
       let actual = false;
       let boundRequest: BoundaryProcessRequest;
-      const canonical = gitEnv();
+      const git = new GitCache(process.env.TMPDIR!, nullLogger());
+      const internal = git as unknown as {
+        captureSynthesisEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
+        execScoped(command: string, args: string[], options: { env: NodeJS.ProcessEnv; cwd: string }, identity: BoundaryProcessRequest["identity"]): Promise<{ stdout: string; stderr: string }>;
+      };
+      const synthesis = internal.captureSynthesisEnvironment.bind(git);
+      internal.captureSynthesisEnvironment = env => {
+        checks++;
+        const dynamic = synthesis(env);
+        return options.invalidateCanonical && prepared ? { ...dynamic, GIT_CONFIG_KEY_0: "invalidated" } : dynamic;
+      };
       const fake = newFake({ uid: identity === "command" ? COMMAND_UID : WORKER_UID });
       const request: BoundaryProcessRequest = {
         identity, cwd: "/capture/runner", argv: ["/usr/bin/git", "status", "--porcelain"], env: gitEnv(),
@@ -2230,7 +2277,6 @@ describe("C2 real effect launcher capture policy", () => {
       const adapter = boundaryProcessSpawnerForTest("required", async spec => {
         await Promise.resolve(); // actual async preparation, after production binding
         prepared = true;
-        if (options.invalidateCanonical) delete canonical.GIT_CONFIG_KEY_0;
         if (options.alterRequest) {
           const altered = options.alterRequest(boundRequest);
           if (altered.env !== boundRequest.env) Object.assign(boundRequest.env, altered.env);
@@ -2268,10 +2314,9 @@ describe("C2 real effect launcher capture policy", () => {
             cancel: async () => { await child.root.dispose(1000); },
           };
         }, () => live);
-      const spawn = captureGitSpawner(context, r => {
-        checks++;
-        validateCaptureGitRequest(r, [canonical], "/usr/bin/git", process.execPath, "unused-helper");
-      });
+      const spawn = (r: BoundaryProcessRequest) =>
+        git.withCredentialFreeCapture(context, () => internal.execScoped(r.argv[0]!, r.argv.slice(1),
+          { env: r.env, cwd: r.cwd }, r.identity));
       return { request, spawn, context, revoke: () => { live = false; },
         state: () => ({ checks, prepared, actual }) };
     }
@@ -2298,11 +2343,11 @@ describe("C2 real effect launcher capture policy", () => {
       for (const key of ["credential.helper", "core.askpass"]) {
         assert.deepEqual(pairs.filter(([k]) => k === key), [[key, ""]]);
       }
-      const handle = await r.spawn(r.request);
+      const output = await r.spawn(r.request);
       assert.equal(r.state().actual, true);
       assert.equal(r.state().checks, 3, "complete validator did not repeat at actual spawn");
       assert.equal(spawnCalls.length, 1);
-      assert.equal((await handle.completed).code, 0);
+      assert.deepEqual(output, { stdout: "", stderr: "" }, "real execScoped joined successful exit and root cleanup");
     });
 
     for (const [name, alter] of cells) {

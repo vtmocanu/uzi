@@ -4,7 +4,7 @@ import { GitCache, gitEnv, type FetchAgentBranchOptions } from "../src/git.js";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
-import { assertCaptureLaunch } from "../src/credential-free-capture.js";
+import { assertCaptureLaunch } from "../src/git.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
 import type { CodexEffectLaunchSpec, CodexRootHandle } from "../src/codex/launcher.js";
 import { makeFixture } from "./fixture-repo.js";

@@ -61,7 +61,7 @@ import {
 import type { CodexAppServerAuthMode } from "./appserver-auth.js";
 import { SESSION_SEED_APP_ROOT, sessionSeedInvocation } from "./session-seed-cli.js";
 import { ResidueQuarantinedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen } from "../residue-quarantine.js";
-import { assertCaptureLaunch } from "../credential-free-capture.js";
+import { assertCaptureLaunch } from "../git.js";
 import { assertSupervisedInstallRequest, type SupervisedInstallRequest } from "../js-deps.js";
 import { assertSupervisedProvisionRequest, type SupervisedProvisionRequest, type RunResult } from "../provision.js";
 

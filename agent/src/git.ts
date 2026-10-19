@@ -1,3 +1,4 @@
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -17,7 +18,7 @@ import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
 import type { CredentialFreeCaptureContext } from "./harness.js";
-import { captureGitSpawner, validateCaptureGitRequest } from "./credential-free-capture.js";
+import { validateCaptureGitRequest } from "./credential-free-capture.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
@@ -50,6 +51,118 @@ import {
   type SecretFinding,
 } from "./secret-scan-guard.js";
 import { lookupAttributes, type PathAttributes } from "./pr-size.js";
+
+// Capture acquisition and request issuance share GitCache canonical policy ownership.
+type Spawner = (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
+interface Acquisition {
+  readonly spawn: Spawner;
+  readonly live: () => boolean;
+}
+const acquisitions = new WeakMap<CredentialFreeCaptureContext, Acquisition>();
+const requests = new WeakMap<BoundaryProcessRequest, { context: CredentialFreeCaptureContext; validate: () => void }>();
+interface Launch {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly identity: string;
+}
+const launches = new WeakMap<object, () => void>();
+
+function refuseCapture(): never {
+  throw new TrustedExecutionRefusal("credential-free capture launch refused");
+}
+
+/** Safety alone creates an acquisition, after the registry observed_empty check. */
+export function createCaptureContext(
+  signal: AbortSignal, deadlineAt: number, spawn: Spawner, live: () => boolean,
+): CredentialFreeCaptureContext {
+  const context = Object.freeze({ signal, deadlineAt }) as CredentialFreeCaptureContext;
+  acquisitions.set(context, { spawn, live });
+  return context;
+}
+
+function acquisition(context: CredentialFreeCaptureContext): Acquisition {
+  const held = acquisitions.get(context);
+  if (!held || !held.live() || context.signal.aborted || Date.now() >= context.deadlineAt) refuseCapture();
+  return held;
+}
+
+/** Bind privately inside GitCache; callers receive no spawner on the context. */
+function captureGitSpawner(
+  context: CredentialFreeCaptureContext,
+  validate: (request: BoundaryProcessRequest) => void,
+): Spawner {
+  acquisition(context);
+  return (raw) => {
+    acquisition(context);
+    // Copy before the first await: no retained caller-owned array or env survives.
+    const request = Object.freeze({ ...raw, argv: Object.freeze([...raw.argv]), env: Object.freeze({ ...raw.env }) });
+    const check = () => { acquisition(context); validate(request); };
+    check();
+    requests.set(request, { context, validate: check });
+    return acquisition(context).spawn(request);
+  };
+}
+
+export function assertCaptureRequest(context: CredentialFreeCaptureContext, request: BoundaryProcessRequest): void {
+  const held = requests.get(request);
+  if (!held || held.context !== context) refuseCapture();
+  held.validate();
+}
+
+export function isCaptureRequest(request: BoundaryProcessRequest): boolean {
+  return requests.has(request);
+}
+
+/** The executor binds its trusted identity/sandbox transformation before launch. */
+export function bindCaptureLaunch(request: BoundaryProcessRequest, spec: Launch): void {
+  const held = requests.get(request);
+  if (!held) return;
+  held.validate();
+  const checkTransformation = () => {
+    if (spec.identity !== request.identity || spec.cwd !== request.cwd) refuseCapture();
+    let argv: readonly string[];
+    if (request.identity === "command") {
+      const tmp = spec.env.HOME;
+      if (!tmp || !/^\/tmp\/uzi-codex-command-[0-9a-f-]{36}$/.test(tmp) ||
+          spec.env.TMPDIR !== tmp || spec.command !== "/usr/local/bin/uzi-codex-command-sandbox" ||
+          spec.args[0] !== "--root" || spec.args[1] !== request.cwd ||
+          spec.args[2] !== "--tmp" || spec.args[3] !== tmp ||
+          spec.args[4] !== "--cwd" || spec.args[5] !== request.cwd ||
+          spec.args[6] !== "--mode" || spec.args[8] !== "--") refuseCapture();
+      argv = spec.args.slice(9);
+    } else argv = [spec.command, ...spec.args];
+    if (argv.length !== request.argv.length || argv.some((arg, i) => arg !== request.argv[i])) refuseCapture();
+    const keys = new Set([...Object.keys(spec.env), ...Object.keys(request.env)]);
+    for (const key of keys) {
+      if (request.identity === "command" && (key === "HOME" || key === "TMPDIR")) continue;
+      if (spec.env[key] !== request.env[key] || Object.hasOwn(spec.env, key) !== Object.hasOwn(request.env, key)) refuseCapture();
+    }
+  };
+  checkTransformation();
+  const command = spec.command;
+  const args = Object.freeze([...spec.args]);
+  const cwd = spec.cwd;
+  const identity = spec.identity;
+  const env = Object.freeze({ ...spec.env });
+  Object.freeze(spec.args);
+  Object.freeze(spec.env);
+  Object.freeze(spec);
+  launches.set(spec, () => {
+    held.validate();
+    checkTransformation();
+    if (spec.command !== command || spec.cwd !== cwd || spec.identity !== identity ||
+        spec.args.length !== args.length || spec.args.some((arg, i) => arg !== args[i]) ||
+        Object.keys(spec.env).length !== Object.keys(env).length ||
+        Object.entries(spec.env).some(([key, value]) => env[key] !== value)) refuseCapture();
+  });
+}
+
+/** Synchronous final check at the real supervisor spawn, after all wrapper awaits. */
+export function assertCaptureLaunch(spec: Launch): void {
+  launches.get(spec)?.();
+}
 
 const execFileAsync = promisify(execFile);
 

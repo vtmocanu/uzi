@@ -16,7 +16,7 @@
 // supervisor); everything here is unit-testable with fakes.
 
 import { MaintenanceBudget } from "../maintenance-budget.js";
-import { assertCaptureRequest, createCaptureContext } from "../credential-free-capture.js";
+import { assertCaptureRequest, createCaptureContext } from "../git.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { CheckpointChildStartupTimeoutError } from "../harness.js";
 import type {
