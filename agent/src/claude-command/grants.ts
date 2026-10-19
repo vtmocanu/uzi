@@ -72,8 +72,11 @@ export function shapeGuardedGrants(agents: Record<string, AgentDefinition>): Sha
     // An inherit-all definition that denies plain `Bash` would regain the shell through the
     // tool alias (the deny names the alias source, not the mapped tool), so deny the mapped
     // tool too and keep the definition shell-less.
-    if (def.disallowedTools?.includes("Bash") && !def.disallowedTools.includes(GUARDED_COMMAND_TOOL)) {
-      next.disallowedTools = [...def.disallowedTools, GUARDED_COMMAND_TOOL];
+    // A scoped `Bash(...)` deny cannot be expressed on the mapped tool, so it fails closed too.
+    const denied = def.disallowedTools ?? [];
+    const deniesShell = denied.some((t) => t === "Bash" || SCOPED_BASH_RE.test(t));
+    if (deniesShell && !denied.includes(GUARDED_COMMAND_TOOL)) {
+      next.disallowedTools = [...denied, GUARDED_COMMAND_TOOL];
     }
     out[name] = next;
   }

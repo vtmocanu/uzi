@@ -35,9 +35,10 @@ Both runs: SDK 0.3.292, CLI 2.1.292, serverTimeoutMs 3660000.
 
 ## CI knob proofs (claude-command-sdk-m0.integration.test.ts)
 
-- A 3 s server timeout cut a 5 s handler at about 3.0 s; the model received the text
-  `MCP server "uzi_cmd" tool "bash" timed out after 3s`. The handler kept running after
-  the cut and completed: the CLI does not cancel the handler.
+- A 3 s server timeout cut a 5 s handler at about 3.0 s (asserted). The recorded result text
+  was `MCP server "uzi_cmd" tool "bash" timed out after 3s` (observation, not asserted). The
+  test handler ignores its signal, so this run does not show whether the CLI signals the
+  handler at the cut; the command lane must enforce its own deadline regardless.
 - A 15 s handler completed and its result reached the model under a 3660000 ms server
   timeout.
 
@@ -49,5 +50,5 @@ The first follow-up carries a tool_result marked as interrupted. When the script
 contains a further tool call, each later request carries a rejection ("The user doesn't want
 to take this action right now"); one run saw dozens of such requests within about two
 seconds. The M0 test asserts that a Bash call scripted into those responses reaches neither
-a hook nor the handler. The production lane therefore never relies on the CLI to stop
-commands: it owns the abort, and the existing executor teardown stops the CLI.
+a hook nor the handler. The production lane therefore must never rely on the CLI to stop
+commands: it must own the abort, with the existing executor teardown stopping the CLI.

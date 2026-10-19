@@ -307,7 +307,9 @@ async function runScenario(sc: Scenario, roots: string[]): Promise<ScenarioResul
       command: ti.command,
       denied,
     });
-    if (denied) {
+    // Only the mcp-matched hook may deny, so item 3 proves that hook's deny (not the
+    // Bash-matched one's) is what blocks the handler.
+    if (denied && tag === "mcp-matcher") {
       return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "m0 deny" } };
     }
     return {};
@@ -558,6 +560,13 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
     assert.ok(nonDenied(lead).some((h) => h.agent_id === undefined && String(h.command).includes("LEAD-A")), `no lead mcp-matcher hook record${diag(lead)}`);
     assert.ok(nonDenied(explicit).some((h) => typeof h.agent_id === "string" && String(h.command).includes("SUB-A")), `no subagent mcp-matcher hook record${diag(explicit)}`);
     for (const h of [...mcpHooks(lead), ...mcpHooks(explicit)]) assert.equal(h.tool_name, GUARDED_COMMAND_TOOL);
+    // Pinned invariant: the Bash matcher also fires for a routed call, but reports the MAPPED
+    // tool name, so a hook keyed on tool_name === "Bash" (buildPreToolUseHook) screens nothing.
+    // Production must screen the mapped name (guarded hook and handler).
+    for (const r of [lead, explicit]) {
+      assert.ok(bashTagHooks(r).length > 0, `the Bash-matched hook never fired in ${r.name}${diag(r)}`);
+      for (const h of bashTagHooks(r)) assert.equal(h.tool_name, GUARDED_COMMAND_TOOL, `Bash-matched hook saw ${String(h.tool_name)}`);
+    }
     for (const r of [lead, explicit]) {
       assert.ok(mcpHooks(r).some((h) => h.denied), `the deny command never reached the mcp-matched hook in ${r.name}${diag(r)}`);
       assert.equal(r.calls.filter((c) => String(c.args.command).includes(DENY_MARK)).length, 0, `a denied call reached the handler in ${r.name}${diag(r)}`);
@@ -622,7 +631,8 @@ describe("M0 real-CLI proof: Bash routes to the guarded sentinel (issue #2471)",
       postAbortIssuedIds: r.issuedIds.length - 1,
       postAbortHookRecords: r.hooks.filter((h) => String(h.command).includes("POSTABORT")).length,
       postAbortHandlerCalls: r.calls.filter((c) => String(c.args.command).includes("POSTABORT")).length,
-      // The CLI sends one more request carrying an interruption tool_result; recorded, not a retry.
+      // After the abort the CLI keeps querying the model until torn down: the first follow-up
+      // carries an interruption tool_result, later ones carry rejections; none runs a tool.
       followUpCount: r.observed.filter((o) => o.step >= 1).length,
       followUps: r.observed.filter((o) => o.step >= 1).slice(0, 3).map((o) => ({ afterAbortMs: o.at - requestedAt, result: o.lastResult.slice(0, 120) })),
     });

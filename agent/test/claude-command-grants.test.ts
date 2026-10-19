@@ -98,6 +98,8 @@ describe("shapeGuardedGrants", () => {
     assert.deepEqual(input.c.disallowedTools, ["Bash", "Edit"], "input not mutated");
     const again = shapeGuardedGrants({ c: def(undefined, { disallowedTools: ["Bash", GUARDED_COMMAND_TOOL] }) });
     assert.deepEqual(again.agents.c!.disallowedTools, ["Bash", GUARDED_COMMAND_TOOL]);
+    const scoped = shapeGuardedGrants({ e: def(undefined, { disallowedTools: ["Bash(rm:*)"] }) });
+    assert.deepEqual(scoped.agents.e!.disallowedTools, ["Bash(rm:*)", GUARDED_COMMAND_TOOL], "a scoped Bash deny fails closed");
   });
 
   it("throws when a definition prompt lacks the long-command append", () => {
