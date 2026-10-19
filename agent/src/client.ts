@@ -869,6 +869,8 @@ export interface ClientOptions {
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
+  /** #3124: combined headers+body bound for the optional interrupted-calls read. Injected by tests. */
+  interruptedCallsTimeoutMs?: number;
 }
 
 export type CodexReleaseExpectation =
@@ -1169,9 +1171,9 @@ export class WorkerClient {
 
   async getInterruptedCalls(runId: string, generation: number, identity: InterruptedRegistration, signal: AbortSignal): Promise<InterruptedCalls | undefined> {
     if (this.interruptedIdentity !== identity) return;
-    const deadline = AbortSignal.any([signal, AbortSignal.timeout(2000)]);
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(this.interruptedCallsTimeoutMs)]);
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/interrupted-calls?claim_generation=${generation}`;
-    const res = await this.fetchRaw("GET", path, undefined, 2000, deadline, { "X-Worker-Register-Nonce": identity.nonce });
+    const res = await this.fetchRaw("GET", path, undefined, this.interruptedCallsTimeoutMs, deadline, { "X-Worker-Register-Nonce": identity.nonce });
     if (res.status !== 200) {
       void res.body?.cancel().catch(() => undefined);
       return;
@@ -1214,6 +1216,7 @@ export class WorkerClient {
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
+  private readonly interruptedCallsTimeoutMs: number;
   /**
    * API-supported FEATURES, distinct from the image's implemented capabilities.
    * Register replaces this cache; complete readable heartbeat responses up to 1 MiB
@@ -1369,6 +1372,7 @@ export class WorkerClient {
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
+    this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
 
   async register(

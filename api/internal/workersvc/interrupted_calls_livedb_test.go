@@ -25,6 +25,12 @@ func TestInterruptedCallsLockDeadlineLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if interruptedCallsTimeout != time.Second {
+		t.Fatalf("production read bound = %v, want 1s", interruptedCallsTimeout)
+	}
+	// Scale the service bound so this test does not wait a real second.
+	interruptedCallsTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { interruptedCallsTimeout = time.Second })
 	svc := New(e.q, nil, Params{})
 	lock, err := e.pool.Begin(e.ctx)
 	if err != nil {
@@ -34,7 +40,7 @@ func TestInterruptedCallsLockDeadlineLiveDB(t *testing.T) {
 	if _, err := lock.Exec(e.ctx, "LOCK TABLE run_messages IN ACCESS EXCLUSIVE MODE"); err != nil {
 		t.Fatal(err)
 	}
-	for _, parentBound := range []time.Duration{0, 80 * time.Millisecond} {
+	for _, parentBound := range []time.Duration{0, 40 * time.Millisecond} {
 		t.Run(parentBound.String(), func(t *testing.T) {
 			ctx := e.ctx
 			if parentBound > 0 {
@@ -48,11 +54,11 @@ func TestInterruptedCallsLockDeadlineLiveDB(t *testing.T) {
 			if !errors.Is(err, context.DeadlineExceeded) || len(raw) != 0 {
 				t.Fatalf("locked read returned %q, %v", raw, err)
 			}
-			bound := time.Second
+			bound := interruptedCallsTimeout
 			if parentBound > 0 {
 				bound = parentBound
 			}
-			if elapsed > bound+time.Second {
+			if elapsed > bound+500*time.Millisecond {
 				t.Fatalf("deadline not enforced: %v, bound %v", elapsed, bound)
 			}
 			t.Logf("relation-lock wait cancelled after %v (context bound %v)", elapsed, bound)

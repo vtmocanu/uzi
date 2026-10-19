@@ -198,17 +198,21 @@ describe("M2 transport and registration", () => {
       } finally { unsubscribe(); }
     }
   });
-  it("bounds combined headers and body to two seconds and cancels the stream", async () => {
+  it("bounds combined headers and body to one deadline and cancels the stream", async () => {
     let cancelled = false;
-    const client = transportClient(async (url) => {
-      if (String(url).endsWith("/register")) return Response.json({ worker_id: worker, register_nonce: identity.nonce });
-      await new Promise(r => setTimeout(r, 350));
-      return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("{")); }, cancel() { cancelled = true; } }));
+    // Production default is 2000 ms; a scaled injected bound keeps this test off real 2 s waits.
+    const client = new WorkerClient("http://example.invalid", "join-fixture", "test", nullLogger(), {
+      interruptedCallsTimeoutMs: 300,
+      fetch: async (url) => {
+        if (String(url).endsWith("/register")) return Response.json({ worker_id: worker, register_nonce: identity.nonce });
+        await new Promise(r => setTimeout(r, 150));
+        return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("{")); }, cancel() { cancelled = true; } }));
+      },
     });
     await client.register("worker");
     const start = performance.now();
     await assert.rejects(client.getInterruptedCalls(run, 3, client.interruptedCallsRegistration!, new AbortController().signal));
-    assert.ok(performance.now() - start < 2250, "body did not get a renewed deadline");
+    assert.ok(performance.now() - start < 420, "body did not get a renewed deadline");
     assert.ok(cancelled);
   });
   it("rejects actual byte overflow, malformed JSON and invalid UTF8; errors and 404 are optional", async () => {

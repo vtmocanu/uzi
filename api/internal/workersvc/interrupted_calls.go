@@ -14,6 +14,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// interruptedCallsTimeout bounds the read; tests scale it so they do not wait a real second.
+var interruptedCallsTimeout = time.Second
+
 type interruptedCallsReader interface {
 	InterruptedCallsWindow(context.Context, store.InterruptedCallsWindowParams) ([]store.InterruptedCallsWindowRow, error)
 }
@@ -24,7 +27,7 @@ func (s *Service) InterruptedCalls(ctx context.Context, w store.Worker, run uuid
 	if run == uuid.Nil || nonce == "" || len(nonce) > 128 || !utf8.ValidString(nonce) || generation < 2 {
 		return nil, ErrInvalidState
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	ctx, cancel := context.WithTimeout(ctx, interruptedCallsTimeout)
 	defer cancel()
 	q, ok := s.q.(interruptedCallsReader)
 	if !ok {
