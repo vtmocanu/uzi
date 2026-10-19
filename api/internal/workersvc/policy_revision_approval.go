@@ -137,15 +137,21 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 	if source.Gate == nil {
 		// Birth coverage is not approval. Seeded plans are validated at creation;
 		// agent plans are stored by the guarded autopilot plan/running pair.
-		return r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != "" &&
-			(!r.PlanCrossCheckRequired || r.PolicyCandidateCrossCheckID.Valid) &&
-			(r.PlanSource == planSourceSeeded || (r.AutoApprove && r.PlanSource == "agent"))
+		return policyRevisionNoGatePlanApproved(r)
 	}
 	// A published gate requires its own applied receipt, including auto/seeded runs.
 	approved, err := q.HasPolicyCurrentGateApproval(ctx, store.HasPolicyCurrentGateApprovalParams{
 		RunID: r.ID, GateRevision: r.GateRevision,
 	})
 	return err == nil && approved
+}
+
+// policyRevisionNoGatePlanApproved checks persisted plan provenance only. Source,
+// selection, input inventory and exact checker witnesses are validated by callers.
+func policyRevisionNoGatePlanApproved(r store.Run) bool {
+	return r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != "" &&
+		(!r.PlanCrossCheckRequired || r.PolicyCandidateCrossCheckID.Valid) &&
+		(r.PlanSource == planSourceSeeded || (r.AutoApprove && r.PlanSource == "agent"))
 }
 
 // policyRevisionGateMatches uses the same canonical gate helpers as

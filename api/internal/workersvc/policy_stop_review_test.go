@@ -177,6 +177,24 @@ func TestPolicyStopAcceptedManifestSelection(t *testing.T) {
 	if _, err := parsePolicyStopResolution(encode(m), owner, run); err == nil {
 		t.Fatal("selection outside V1 accepted")
 	}
+	// Hashing inconsistent gate authority must not authenticate a receipt.
+	gate := apitypes.PolicyStopGateContext{Revision: "1", PresentationID: uuid.NewString(), PayloadDigest: strings.Repeat("a", 64)}
+	for _, mode := range []string{"source_only", "manifest_only", "different", "matching"} {
+		m := base
+		if mode != "manifest_only" {
+			m.SourceContext.Gate = &gate
+		}
+		if mode != "source_only" {
+			m.Gate = &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate}
+		}
+		if mode == "different" {
+			m.Gate.Revision = "2"
+		}
+		_, err := parsePolicyStopResolution(encode(m), owner, run)
+		if (err == nil) != (mode == "matching") {
+			t.Fatalf("rehashed gate/source %s: %v", mode, err)
+		}
+	}
 	a, _ := policyStopManifestToken(base)
 	b, _ := policyStopManifestToken(m)
 	if a == b {

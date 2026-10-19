@@ -84,7 +84,7 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		return apitypes.PolicyStopManifest{}, stopReviewConflict("policy_stop_review_unverifiable")
 	}
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || source.Gate == nil || r.GateRevision <= 0 || !r.GatePresentationID.Valid || !r.PolicyLastOutcomeID.Valid ||
+	if err != nil || !r.PolicyLastOutcomeID.Valid ||
 		!r.PolicyLastSourceGeneration.Valid || r.PolicyLastSourceGeneration.Int64 <= 0 || r.ClaimGeneration <= 0 || !r.StatusSince.Valid {
 		return bad()
 	}
@@ -92,32 +92,52 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 	if !policyStopSelectionValid(source, selected) {
 		return bad()
 	}
-	gate := apitypes.PolicyStopGateContext{Revision: stopDecimal(r.GateRevision), PresentationID: uuid.UUID(r.GatePresentationID.Bytes).String(), PayloadDigest: hex.EncodeToString(r.GatePayloadDigest)}
-	if *source.Gate != gate {
-		return bad()
-	}
-	payload, ok, err := decodeGatePresentedPayload(r.GatePresentedPayload)
-	if err != nil || !ok {
-		return bad()
-	}
-	_, sum, err := payload.digest()
-	if err != nil || !bytes.Equal(sum, r.GatePayloadDigest) {
-		return bad()
-	}
-	// Compare the persisted visible candidate, without witness-only presentation metadata.
-	current := gatePayloadFromRow(r)
-	visible := payload
-	visible.ReviseCount = nil
-	visible.CheckpointWitness = nil
-	visible.WitnessWorkerID = nil
-	visible.WitnessClaimGeneration = nil
-	a, err := visible.canonicalJSON()
-	if err != nil {
-		return bad()
-	}
-	b, err := current.canonicalJSON()
-	if err != nil || !bytes.Equal(a, b) {
-		return bad()
+	noGate := source.Gate == nil
+	var gateSnapshot *apitypes.PolicyStopGateSnapshot
+	var payload gatePresentedPayload
+	var a []byte
+	if noGate {
+		if !policyRevisionSourceGateMatches(r, source) || source.PrimaryRevision != nil || !policyRevisionNoGatePlanApproved(r) {
+			return bad()
+		}
+		payload = policyAutopilotPayloadFromRow(r)
+		a, err = payload.canonicalJSON()
+		if err != nil {
+			return bad()
+		}
+	} else {
+		if r.GateRevision <= 0 || !r.GatePresentationID.Valid {
+			return bad()
+		}
+		gate := apitypes.PolicyStopGateContext{Revision: stopDecimal(r.GateRevision), PresentationID: uuid.UUID(r.GatePresentationID.Bytes).String(), PayloadDigest: hex.EncodeToString(r.GatePayloadDigest)}
+		if *source.Gate != gate {
+			return bad()
+		}
+		var ok bool
+		payload, ok, err = decodeGatePresentedPayload(r.GatePresentedPayload)
+		if err != nil || !ok {
+			return bad()
+		}
+		_, sum, err := payload.digest()
+		if err != nil || !bytes.Equal(sum, r.GatePayloadDigest) {
+			return bad()
+		}
+		// Compare the persisted visible candidate, without witness-only presentation metadata.
+		current := gatePayloadFromRow(r)
+		visible := payload
+		visible.ReviseCount = nil
+		visible.CheckpointWitness = nil
+		visible.WitnessWorkerID = nil
+		visible.WitnessClaimGeneration = nil
+		a, err = visible.canonicalJSON()
+		if err != nil {
+			return bad()
+		}
+		b, err := current.canonicalJSON()
+		if err != nil || !bytes.Equal(a, b) {
+			return bad()
+		}
+		gateSnapshot = &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate}
 	}
 	frozen, err := DecodeMilestones(r.MilestonesFrozen)
 	if err != nil || len(frozen) == 0 {
@@ -174,6 +194,9 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		}
 		wp.WitnessClaimGeneration = &v
 	}
+	if gateSnapshot != nil {
+		gateSnapshot.Payload = wp
+	}
 	completedCount := len(completed)
 	if completedCount < 1 || completedCount > math.MaxInt32 {
 		return bad()
@@ -195,13 +218,18 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		}
 		execution.ContractRevision = &rev
 	}
-	m = apitypes.PolicyStopManifest{CandidateCrossCheckID: selected, Version: 1, RunID: r.ID.String(), OutcomeID: uuid.UUID(r.PolicyLastOutcomeID.Bytes).String(), SourceGeneration: stopDecimal(r.PolicyLastSourceGeneration.Int64), ReviewGeneration: stopDecimal(r.ClaimGeneration), SourceContext: source, Hold: apitypes.PolicyStopHoldSnapshot{Reason: textPtr(r.HoldReason), PolicyDetail: textPtr(r.PolicyHoldDetail), Since: r.StatusSince.Time}, Gate: &apitypes.PolicyStopGateSnapshot{PolicyStopGateContext: gate, Payload: wp}, Execution: execution, HumanFeedback: []apitypes.PolicyStopHumanFeedback{}, CrossCheckFeedback: []apitypes.PolicyStopCrossCheckFeedback{}}
+	m = apitypes.PolicyStopManifest{CandidateCrossCheckID: selected, Version: 1, RunID: r.ID.String(), OutcomeID: uuid.UUID(r.PolicyLastOutcomeID.Bytes).String(), SourceGeneration: stopDecimal(r.PolicyLastSourceGeneration.Int64), ReviewGeneration: stopDecimal(r.ClaimGeneration), SourceContext: source, Hold: apitypes.PolicyStopHoldSnapshot{Reason: textPtr(r.HoldReason), PolicyDetail: textPtr(r.PolicyHoldDetail), Since: r.StatusSince.Time}, Gate: gateSnapshot, Execution: execution, HumanFeedback: []apitypes.PolicyStopHumanFeedback{}, CrossCheckFeedback: []apitypes.PolicyStopCrossCheckFeedback{}}
 	inputs, err := qtx.ListPolicyStopRevisionInputs(ctx, r.ID)
 	if err != nil {
 		return m, err
 	}
 	primaryFound := source.PrimaryRevision == nil || source.PrimaryRevision.Source != "run_user_input"
 	for _, input := range inputs {
+		if noGate {
+			// At verified gate zero, no positively bound older gate exists.
+			// Every inventoried revision is applicable, as in the approval reader.
+			return bad()
+		}
 		primary := source.PrimaryRevision != nil && source.PrimaryRevision.InputID != nil && *source.PrimaryRevision.InputID == stopDecimal(input.ID)
 		if input.GateBinding.Valid && input.GateBinding.String == "bound" && input.GateRevision.Valid {
 			if input.GateRevision.Int64 != r.GateRevision {
@@ -253,6 +281,9 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		}
 		if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 ||
 			(cc.Verdict != "revise" && cc.Verdict != "approve") || !cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid {
+			return bad()
+		}
+		if noGate && (cc.Verdict != "approve" || cc.LeadClaimGeneration > r.ClaimGeneration || cc.RevisionSupersededByStopInputID.Valid) {
 			return bad()
 		}
 		candidate := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}

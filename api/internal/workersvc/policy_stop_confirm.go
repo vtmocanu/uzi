@@ -288,6 +288,12 @@ func parsePolicyStopResolution(raw []byte, owner, runID uuid.UUID) (policyStopRe
 		return bad()
 	}
 	m := record.Manifest
+	if (m.Gate == nil) != (source.Gate == nil) {
+		return bad()
+	}
+	if m.Gate != nil && m.Gate.PolicyStopGateContext != *source.Gate {
+		return bad()
+	}
 	outcome, err := uuid.Parse(m.OutcomeID)
 	if record.Version != 1 || record.ResolutionID == uuid.Nil || record.AcceptedBy != owner || owner == uuid.Nil ||
 		record.AcceptedAt.IsZero() || record.ScopeInputID <= 0 || m.Version != 1 || m.RunID != runID.String() ||
