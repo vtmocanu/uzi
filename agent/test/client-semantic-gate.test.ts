@@ -31,7 +31,7 @@ async function fixture() {
   const ack = { run: { id: "run", status: "awaiting_approval" }, ...server.gateAck(7, 4) };
   response = ack;
   return { client, requests, body, ack, respondWire: (value: () => Response) => { wireResponse = value; }, respond: (value: unknown, status = 200) => {
-    response = value; responseStatus = status;
+    wireResponse = undefined; response = value; responseStatus = status;
   } };
 }
 
@@ -139,6 +139,29 @@ it("throwing semantic candidate decoding remains malformed for running ACKs", as
   await assert.rejects(f.client.reportSemanticPlanGateState("run", {
     ...f.body, status: "running",
   }), /malformed semantic presentation ACK/);
+});
+
+it("semantic running storage requires a positively confirmed run and status", async () => {
+  const f = await fixture();
+  const body = { ...f.body, status: "running" as const };
+  for (const raw of ["", "{", "null", JSON.stringify({ run: { status: "running" } }),
+    JSON.stringify({ run: { id: "foreign", status: "running" } }),
+    JSON.stringify({ run: { id: "run", status: "paused" } })]) {
+    f.respondWire(() => new Response(raw));
+    await assert.rejects(f.client.reportSemanticPlanGateState("run", body), /ACK/);
+  }
+  f.respond({ run: { id: "run", status: "running" } });
+  const ack = await f.client.reportSemanticPlanGateState("run", body);
+  assert.equal(ack.applied, true);
+  assert.equal(ack.status, "running");
+  assert.equal(ack.runId, "run");
+  f.respond({ run: { id: "run", status: "paused", hold_reason: "budget_exhausted" },
+    disposition: "stale_claim" }, 409);
+  const parked = await f.client.reportSemanticPlanGateState("run", body);
+  assert.equal(parked.applied, false);
+  assert.equal(parked.status, "paused");
+  assert.equal(parked.staleClaim, true);
+  assert.equal(parked.holdReason, "budget_exhausted");
 });
 
 it("semantic strict decoder refusal makes one fenced attempt with no downgrade", async () => {

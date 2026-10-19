@@ -2001,6 +2001,8 @@ export class WorkerClient {
     const ack = await this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, frozen, signal,
       SEMANTIC_GATE_ACK_MAX_BYTES);
     if (ack.semanticGateMalformed) throw new Error("malformed semantic presentation ACK");
+    if (ack.applied && (ack.runId !== runId || ack.status !== frozen.status || ack.staleClaim))
+      throw new Error("semantic state ACK does not confirm the requested run and status");
     if (ack.applied && frozen.status === "awaiting_approval") {
       const gate = ack.semanticGate;
       if (ack.status !== "awaiting_approval" || ack.staleClaim || !gate ||
