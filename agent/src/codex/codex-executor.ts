@@ -4911,7 +4911,8 @@ export class CodexExecutor implements Executor {
     const captureClean = () => captureProof !== undefined && registry.acceptsCompletedCapture(captureProof);
     let ordinaryDrained = false;
     let ordinaryObservationUnchanged: (() => boolean) | undefined;
-    let registryClean = !disposeRegistry || (registry.state() === "disposed" && (!registry.isPoisoned() || captureClean()));
+    let registryClean = !disposeRegistry || (registry.state() === "disposed" &&
+      (captureClean() || (!registry.isPoisoned() && !this.unverifiedEpochRegistries.has(registry))));
     if (disposeRegistry && registry.state() !== "disposed") {
       // A completed capture already observed every root empty; ordinary quiesce/reap
       // refuses its poisoned epoch. Every other epoch still needs both observations.
