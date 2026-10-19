@@ -13,6 +13,8 @@
 // success is shared: an unconfirmed disposal is dropped so a later caller (the guard's drain
 // retry, the lane's own dispose) may retry it, matching the launcher's `dispose` contract.
 
+import { setTimeout as delay } from "node:timers/promises";
+
 import type { CapturedMemoryContext } from "../codex/broker.js";
 import { boundedCommandWait } from "../codex/memory-command.js";
 import type { CodexRootHandle } from "../codex/launcher.js";
@@ -95,25 +97,29 @@ async function observeUnlessAborted<T>(observed: Promise<T>, timeoutMs: number, 
 
 /** Pause between initial observations that raced the wrapper's own startup. */
 const STALE_RETRY_MS = 20;
+/** Upper bound of the re-sampling window; a shorter deadline shrinks it to a quarter of itself. */
+const STALE_WINDOW_MS = 1000;
 
 /**
- * The initial supervisor observation. The supervisor rejects a sample as `stale` when a process
- * in the tree appears, exits or changes parent between its two passes. While the wrapper is still
- * forking (process substitution, `tee`) that is a transient condition, not an uncertain tree, so
- * it is re-sampled until a sample is stable. Every other outcome is returned as is. The retries
- * stay inside `deadlineMs`, and `stop` aborts the loop and its pause timer.
+ * The initial supervisor observation. The launcher reports `unavailable`/`stale` when a process
+ * in the tree appears, exits or changes parent between the supervisor's two passes, and also for
+ * a malformed observe header (`validObservation`) or a supervisor/root start-time change. While
+ * the wrapper is still forking (process substitution, `tee`) that is a transient condition, so
+ * the sample is repeated. The repeating is bounded: it stops once min(STALE_WINDOW_MS,
+ * deadlineMs / 4) has elapsed and returns the last stale sample (the command then runs
+ * unenrolled), so a tree that never settles (make -j, a test runner) cannot hold enrollment up.
+ * Each observe has its own budget of deadlineMs / 2, so the last one, started inside the window,
+ * settles by 3/4 of the deadline, before the outer `deadlineMs` bound in `enrollClaudeCommand`.
+ * Every other outcome is returned as is. `stop` aborts the loop and its pause timer.
  */
 async function initialObservation(handle: CodexRootHandle, deadlineMs: number, stop: AbortSignal) {
-  const end = performance.now() + deadlineMs;
+  const windowEnd = performance.now() + Math.min(STALE_WINDOW_MS, deadlineMs / 4);
+  const observeBudgetMs = Math.max(1, deadlineMs / 2);
   for (;;) {
-    const sample = await handle.observe(Math.max(1, end - performance.now()));
+    const sample = await handle.observe(observeBudgetMs);
     const transient = sample.state === "unavailable" && sample.reason === "stale";
-    if (!transient || stop.aborted || performance.now() + STALE_RETRY_MS >= end) return sample;
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, STALE_RETRY_MS);
-      stop.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
-    });
-    if (stop.aborted) return sample;
+    if (!transient || stop.aborted || performance.now() + STALE_RETRY_MS >= windowEnd) return sample;
+    try { await delay(STALE_RETRY_MS, undefined, { signal: stop }); } catch { return sample; }
   }
 }
 

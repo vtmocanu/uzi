@@ -252,3 +252,51 @@ test("a persistently stale initial observation stays unenrolled within the obser
   assert.ok(root.observations() > 1, "the stale sample was retried");
   assert.equal(root.disposes(), 0, "uncertainty never disposes");
 });
+
+/** A handle whose observe behaves like the launcher's: one request in flight, its own budget timer
+ *  (a late reply settles as `timeout`), and a stale reply after a few ms. */
+function launcherLikeStale(replyMs: () => number) {
+  let calls = 0;
+  let inFlight = false;
+  const root = fakeRoot();
+  const handle: CodexRootHandle = { ...root.handle, observe: (budgetMs?: number) => {
+    calls++;
+    if (inFlight) return Promise.resolve<ObservationOutcome>({ event: "observe", id: calls, state: "unavailable", reason: "busy" } as unknown as ObservationOutcome);
+    inFlight = true;
+    return new Promise<ObservationOutcome>((resolve) => {
+      let done = false;
+      const settle = (outcome: ObservationOutcome) => { if (done) return; done = true; inFlight = false; clearTimeout(budget); clearTimeout(reply); resolve(outcome); };
+      const budget = setTimeout(() => settle({ event: "observe", id: calls, state: "unavailable", reason: "timeout" }), budgetMs ?? 1000);
+      const reply = setTimeout(() => settle({ event: "observe", id: calls, state: "unavailable", reason: "stale" }), replyMs());
+    });
+  } };
+  return { handle, calls: () => calls, root };
+}
+
+test("a tree that never settles runs unenrolled, never as an enrollment failure, within the window", { timeout: 60000 }, async () => {
+  const deadlineMs = 100;
+  for (let run = 0; run < 200; run++) {
+    const c = captured();
+    const fake = launcherLikeStale(() => 1 + (run % 7));
+    const started = performance.now();
+    const enrolled = await enrollClaudeCommand(c, mint(c), fake.handle, deadlineMs);
+    assert.equal(enrolled, undefined, `run ${run} ended unenrolled`);
+    assert.ok(performance.now() - started < deadlineMs * 0.9, `run ${run} returned before the outer deadline`);
+    assert.equal(fake.root.disposes(), 0);
+  }
+});
+
+test("the stale re-sampling stops when the command is aborted", { timeout: 10000 }, async () => {
+  const c = captured();
+  const fake = launcherLikeStale(() => 1);
+  const abort = new AbortController();
+  const pending = enrollClaudeCommand(c, mint(c), fake.handle, 10_000, abort.signal);
+  await new Promise((done) => setTimeout(done, 60));
+  assert.ok(fake.calls() > 1, "the loop was sampling");
+  abort.abort();
+  await assert.rejects(pending, /admission closed/);
+  await new Promise((done) => setTimeout(done, 30));
+  const after = fake.calls();
+  await new Promise((done) => setTimeout(done, 100));
+  assert.equal(fake.calls(), after, "no observe is issued after the abort settled");
+});

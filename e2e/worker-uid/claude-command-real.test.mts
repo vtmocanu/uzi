@@ -298,7 +298,9 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       assert.equal(laneB.liveCount, 1);
       // The sibling is blocked reading a fifo: it finishes only when released, never on a timer a
       // loaded host could outrun, and it keeps one stable process for the liveness check above.
-      fs.writeFileSync(path.join(rig.dir, "release-b"), "go\n");
+      // O_NONBLOCK: a plain open for writing blocks forever if the fifo's reader died; this fails ENXIO.
+      const releaseFd = fs.openSync(path.join(rig.dir, "release-b"), fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+      try { fs.writeSync(releaseFd, "go\n"); } finally { fs.closeSync(releaseFd); }
       const resultB = await callB.pending;
       assert.equal(resultB.isError, false);
       assert.match(textOf(resultB), /^Exit code: 0\n/);

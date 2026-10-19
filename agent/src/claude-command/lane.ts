@@ -57,7 +57,8 @@ const DISPOSE_JOIN_SLACK_MS = 2000;
  * when every step runs to its bound: the `started` wait, the command deadline, the transport
  * EOF grace (exit path only), the bounded dispose (one cleanup step plus the join slack), the
  * output-end join and the prepared-outcome join (one cleanup step each). Enrollment runs inside
- * the command deadline, so it adds nothing.
+ * the command deadline, so it adds nothing (its stale re-sampling stops after
+ * min(1 s, cleanupMs / 4) and each observe is bounded by cleanupMs / 2; see `initialObservation`).
  *
  * With the defaults and the 60-minute maximum: 10 s + 3600 s + 5 s + 12 s + 10 s + 10 s =
  * 3647 s, below the 3660 s MCP server timeout (server.ts, GUARDED_SERVER_TIMEOUT_MS). The 10 s
