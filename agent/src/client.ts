@@ -4504,11 +4504,17 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
     if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
-      const gate = semanticGateAckSchema.safeParse({
-        semantic_presentation: parsed.semantic_presentation, semantic_approval: parsed.semantic_approval,
-      });
-      if (gate.success) out.semanticGate = gate.data;
-      else out.semanticGateMalformed = true;
+      try {
+        const gate = semanticGateAckSchema.safeParse({
+          semantic_presentation: parsed.semantic_presentation, semantic_approval: parsed.semantic_approval,
+        });
+        if (gate.success) out.semanticGate = gate.data;
+        else out.semanticGateMalformed = true;
+      } catch {
+        // Nested canonical decoders may throw inside a schema transform.
+        // Presence must remain malformed rather than becoming a legacy ACK.
+        out.semanticGateMalformed = true;
+      }
     }
     const semanticMarker = res.headers.get("X-Uzi-Candidate-Identity-Version");
     if (semanticMarker !== null && (semanticMarker !== "semantic_v1" || !out.semanticGate))

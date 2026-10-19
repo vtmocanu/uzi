@@ -127,6 +127,20 @@ it("semantic state preserves candidate and generation and reads exact server pre
   assert.equal(ack.sentClaimGeneration, 7);
 });
 
+it("throwing semantic candidate decoding remains malformed for running ACKs", async () => {
+  const f = await fixture();
+  const wire = { run: { id: "run", status: "running" },
+    semantic_presentation: { candidate: {} }, semantic_approval: {} };
+  const decoded = await readRunAck(new Response(JSON.stringify(wire), {
+    headers: { "X-Uzi-Candidate-Identity-Version": "semantic_v1" },
+  }));
+  assert.equal(decoded.semanticGateMalformed, true);
+  f.respond(wire);
+  await assert.rejects(f.client.reportSemanticPlanGateState("run", {
+    ...f.body, status: "running",
+  }), /malformed semantic presentation ACK/);
+});
+
 it("semantic strict decoder refusal makes one fenced attempt with no downgrade", async () => {
   const f = await fixture();
   f.respond({ error: "invalid request body" }, 400);
