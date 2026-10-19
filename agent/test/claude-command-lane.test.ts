@@ -730,6 +730,7 @@ test("an unresolved prepared outcome never hides the command's own exit code and
   assert.equal(r.isError, true);
   assert.match(text(r), /stopped by the worker memory guard \(worker_memory_pressure\) but its outcome could not be read/);
   assert.match(text(r), /until-stop/);
+  assert.match(text(r), /the command's own exit code was \d+;/, "an exit the command had is reported with the guard stop");
 });
 
 test("R16: a turn abort with a prepared outcome still returns the guard's pressure result", { timeout: 10000 }, async () => {

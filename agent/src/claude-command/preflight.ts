@@ -67,8 +67,9 @@ function failureReason(error: unknown): string {
 
 /**
  * One `observe` against the live probe root. Returns a failure reason, or undefined when the
- * supervisor answered without a protocol failure: `complete`, or `unavailable` for a reason that
- * says nothing about the control protocol (`unreadable`, `busy`). `transport` (the supervisor
+ * supervisor answered without a protocol failure: `complete`, or `unavailable` with reason
+ * `unreadable` only. `busy` fails closed (an observation already in flight on a fresh probe
+ * root shows no support was demonstrated). `transport` (the supervisor
  * went abnormal or closed), `stale`/`oversize` (a malformed reply) and `timeout` (no answer, so
  * support cannot be shown) fail closed.
  */
@@ -80,7 +81,7 @@ async function observeVerdict(handle: CodexRootHandle, budgetMs: number): Promis
     return `supervisor lacks observe: ${failureReason(error)}`;
   }
   if (outcome.state === "complete") return undefined;
-  // "busy" is local (an observation already in flight) and proves nothing about the protocol.
+  // Only "unreadable" shows the supervisor answered; "busy" and every other reason fail closed.
   if (outcome.reason === "unreadable") return undefined;
   return `supervisor lacks observe: unavailable (${outcome.reason})`;
 }

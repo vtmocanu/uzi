@@ -1020,6 +1020,9 @@ class E2EDropExecutionError extends Error {
  *  UZI_E2E_DROP_ON_SENTINEL is set). Named like the stub sentinels; inert in production. */
 const E2E_DROP_SENTINEL = "UZI_STUB_DROP";
 
+/** Issue #2471: bound for settling a guard-bound Claude flight's model commands at a sink. */
+const GUARDED_COMMAND_SETTLE_MS = 45_000;
+
 /**
  * PRD #1247 M5b (BLOCKING-2/3 rework): a held-state credential switch could not be CONFIRMED, so
  * the flight must STOP without continuing in place — but, unlike StaleClaimError, it must RETAIN
@@ -1807,6 +1810,9 @@ type MemoryFlight = {
   readonly feedback: Map<string, { readonly context: MemoryContext; readonly result: WorkerMemoryPressureResult;
     operation?: Promise<boolean> }>;
   unsubscribe?: () => void;
+  /** Issue #2471: executor listeners told when the worker memory runtime invalidates this flight
+   *  (the invalidation subscription only; never a renewal, non-running report or preservation). */
+  authorityLost?: Set<(stop: Error) => void>;
 };
 
 interface RunFlight {
@@ -11075,7 +11081,17 @@ export class RunRunner {
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,
-      ...(flight.workerMemory ? { capturedMemory: () => this.captureWorkerMemory(flight) } : {}),
+      ...(flight.workerMemory ? {
+        capturedMemory: () => this.captureWorkerMemory(flight),
+        // Issue #2471: the run's redaction secrets for the guarded command lane's output windows.
+        guardedCommandSecrets: [...flight.runScopedSecrets, this.joinToken]
+          .filter((secret): secret is string => typeof secret === "string" && secret.length > 0),
+        onMemoryAuthorityLost: (listener: (stop: Error) => void) => {
+          const memory = flight.workerMemory!;
+          (memory.authorityLost ??= new Set()).add(listener);
+          return () => { memory.authorityLost?.delete(listener); };
+        },
+      } : {}),
       kind: resolveRunKind(claim.kind),
       issueIid: claim.issue_iid,
       issueTitle: claim.issue_title,
@@ -12297,6 +12313,7 @@ export class RunRunner {
       await action(undefined);
     } else {
       await executor.closeAndSettlePlanSummary?.();
+      await this.settleGuardedCommands(executor);
       executor.killAgentTree?.();
       await action(undefined);
     }
@@ -12453,6 +12470,7 @@ export class RunRunner {
       MaintenanceBudget.current()?.check();
       await executor.closeAndSettlePlanSummary?.(MaintenanceBudget.current()?.remainingMs());
       MaintenanceBudget.current()?.check();
+      await this.settleGuardedCommands(executor, MaintenanceBudget.current()?.remainingMs());
       executor.killAgentTree?.();
       // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
       // own: every proof there (the capture, its re-proofs, the pre-settle reap) is a
@@ -15462,6 +15480,24 @@ export class RunRunner {
     return { kind: "unknown" };
   }
 
+  /**
+   * Issue #2471: before a sink that only calls killAgentTree acts, give a guard-bound Claude
+   * executor the chance to dispose and confirm its model commands (a no-op for every other
+   * executor). Bounded; an unconfirmed settle is logged, and the attributed-process reap and the
+   * recorded lane roots still apply at the sinks that run them. Never throws.
+   */
+  private async settleGuardedCommands(executor: Executor, budgetMs?: number): Promise<void> {
+    if (!executor.settleWorkerCommands) return;
+    const deadlineMs = Math.max(0, Math.min(GUARDED_COMMAND_SETTLE_MS, budgetMs ?? GUARDED_COMMAND_SETTLE_MS));
+    try {
+      if (!(await executor.settleWorkerCommands(deadlineMs)).confirmed) {
+        this.log.warn("guarded worker commands were not confirmed settled before the sink");
+      }
+    } catch (err) {
+      this.log.warn("guarded worker command settle failed", { error: errMessage(err) });
+    }
+  }
+
   /** Issue #1766 (R2): settle the executor for a credential-free capture. A Codex executor settles
    *  its live registry (never reconciling or minting a permit); a legacy executor was already
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
@@ -15470,6 +15506,16 @@ export class RunRunner {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     await executor.closeAndSettlePlanSummary?.(deadlineMs);
     deadlineMs = Math.max(0, deadlineAt - Date.now());
+    // Issue #2471: a guard-bound Claude flight's model commands are not covered by the
+    // killAgentTree reap, so they settle (disposed and confirmed) before the capture proceeds.
+    if (executor.settleWorkerCommands) {
+      let confirmed = false;
+      try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch { /* unconfirmed */ }
+      if (!confirmed) {
+        return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
+      }
+      deadlineMs = Math.max(0, deadlineAt - Date.now());
+    }
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
@@ -15566,6 +15612,7 @@ export class RunRunner {
     // data_volume_full park.
     const disk = cause.kind === "data_volume_full" ? cause : undefined;
     await executor.closeAndSettlePlanSummary?.();
+    await this.settleGuardedCommands(executor);
     executor.killAgentTree?.();
     if (disk) {
       // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
@@ -16842,6 +16889,7 @@ export class RunRunner {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
     await flight.executor.closeAndSettlePlanSummary?.();
+    await this.settleGuardedCommands(flight.executor);
     flight.executor.killAgentTree?.();
     // Retain clone and session throughout capture and ambiguous delivery.
     flight.preserveRecoveryClone = true;
@@ -17013,6 +17061,7 @@ export class RunRunner {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like the
     //    completion hold. Idempotent — phasePublish's walled branch reaps again.
     await flight.executor.closeAndSettlePlanSummary?.();
+    await this.settleGuardedCommands(flight.executor);
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front (D4/D17): the wall park NEVER fails, so — unlike the completion
     //    hold, which clears the flags when it gives up — these STAY set through a degraded park and a
@@ -17235,6 +17284,7 @@ export class RunRunner {
     flight.keepGuardedInventoryOpen = true;
     // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
     await flight.executor.closeAndSettlePlanSummary?.();
+    await this.settleGuardedCommands(flight.executor);
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
     flight.preserveRecoveryClone = true;
@@ -17528,7 +17578,7 @@ export class RunRunner {
   }
 
   private bindWorkerMemory(claim: ClaimResponse, flight: RunFlight): void {
-    if (!this.memoryRuntime || !claim.secrets.codex) return;
+    if (!this.memoryRuntime) return;
     const incarnation = this.client.memoryIncarnation;
     const policy = claim.memory_policy === null ? this.memoryRuntime.configuredMemoryPolicy : claim.memory_policy;
     const count = claim.memory_intervention_count;
@@ -17538,7 +17588,7 @@ export class RunRunner {
         policy?.version !== 1 || !Number.isSafeInteger(policy.max_interventions) ||
         policy.max_interventions < 1 || policy.max_interventions > 9999 ||
         !Number.isSafeInteger(count) || (count ?? -1) < 0 || count! > policy.max_interventions)
-      throw new Error("Codex memory enrollment requires the full worker claim and registration");
+      throw new Error("Worker memory enrollment requires the full worker claim and registration");
     const capturedClaim = Object.freeze({ ...claim, memory_policy: Object.freeze({ ...policy }) });
     const memory: MemoryFlight = {
       incarnation, claim: capturedClaim, lifecycleRevision: 0, spent: count!,
@@ -17548,6 +17598,11 @@ export class RunRunner {
     memory.unsubscribe = this.memoryRuntime.subscribeInvalidation(() => {
       memory.ended = true;
       this.retireWorkerMemory(flight);
+      // Told after the flight retired, each with its own stop instance; a listener failure
+      // never blocks the others or the invalidation.
+      for (const listener of memory.authorityLost ?? []) {
+        try { listener(new RetainedRecoveryStop()); } catch { /* the listener owns its failure */ }
+      }
     });
     const retire = () => this.retireWorkerMemory(flight);
     // Listeners own only this flight and are removed at its terminal reconciliation.

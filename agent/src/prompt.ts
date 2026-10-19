@@ -497,7 +497,7 @@ export const CLAUDE_LONG_COMMAND_APPEND = [
  * Issue #2471: the shell-tool guidance for a guard-bound Claude flight, where `Bash` is
  * routed to the supervised in-process command tool. It replaces
  * {@link CLAUDE_LONG_COMMAND_APPEND} (grants.ts shapeGuardedGrants swaps it in every
- * subagent definition); the lead wiring lands separately.
+ * subagent definition) and that buildLeadSystemPrompt uses for a guard-bound lead.
  */
 export const CLAUDE_GUARDED_COMMAND_APPEND = [
   "On this run the Bash tool runs each command under a supervisor with a stated deadline.",
@@ -624,6 +624,10 @@ export interface LeadSystemPromptOptions {
   /** The harness running this lead. Explicit "claude" and "codex" select their
    *  command-lifetime guidance; absent appends neither recipe. */
   harness?: "claude" | "codex";
+  /** Issue #2471: the lead runs on a memory-guard-bound Claude flight, where Bash is the
+   *  supervised foreground command tool. Replaces the native long-command recipe, and lists the
+   *  roles withheld from this run. Ignored for any other harness. */
+  guardedCommand?: { unavailable: readonly { name: string; reason: string }[] };
 }
 
 // isMrReworkKind reports whether the run kind is the PRD #700 mr_rework kind (the
@@ -667,7 +671,15 @@ export function buildLeadSystemPrompt(
   // untrusted-repo fence (repoInstructions is pushed last).
   parts.push(LEAD_GATE_SEQUENCING_APPEND);
   parts.push(LEAD_FAST_CHECK_APPEND);
-  if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
+  if (opts.harness === "claude") {
+    parts.push(opts.guardedCommand ? CLAUDE_GUARDED_COMMAND_APPEND : CLAUDE_LONG_COMMAND_APPEND);
+    if (opts.guardedCommand && opts.guardedCommand.unavailable.length > 0) {
+      parts.push([
+        "Subagent roles withheld from this run (do not dispatch them):",
+        ...opts.guardedCommand.unavailable.map((role) => `- ${role.name}: unavailable on this run: ${role.reason}`),
+      ].join("\n"));
+    }
+  }
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND, CODEX_LEAD_DISPATCH_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/

@@ -128,7 +128,7 @@ type FirstEvent =
   // The command was launched and ran; enrollment failed for another reason.
   | { kind: "enroll_failed"; error: unknown }
   // The guard's own cancel stopped the command but its outcome could not be read in time.
-  | { kind: "guard_unread" };
+  | { kind: "guard_unread"; exitCode?: number };
 
 const BAD_ID_RE = /[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
 
@@ -200,6 +200,9 @@ export class ClaudeCommandLane {
   get liveCount(): number { return this.live.size; }
   /** True once a disposal could not be confirmed; no command launches afterwards. */
   get poisoned(): boolean { return this.poisonError !== undefined; }
+
+  /** The worker-wide command registry of the current turn's captured context (undefined between turns). */
+  get registry(): CapturedMemoryContext["commands"] | undefined { return this.captured?.commands; }
 
   /** Supervisor roots of commands that are still live (pid + procfs start time). */
   recordedRoots(): RecordedRoot[] { return [...this.roots.values()].map((root) => ({ ...root })); }
@@ -489,7 +492,7 @@ export class ClaudeCommandLane {
       if (pressureLost) {
         // The guard prepares its outcome before its API reserve, so an unresolved outcome does
         // not mean the guard stopped anything: only its own cancel did that.
-        if (enrolled?.guardStopped()) return this.finalResult({ kind: "guard_unread" }, output, timeoutMs, spillRel, eofSeen, []);
+        if (enrolled?.guardStopped()) return this.finalResult(first.kind === "exit" ? { kind: "guard_unread", exitCode: first.code } : { kind: "guard_unread" }, output, timeoutMs, spillRel, eofSeen, []);
         return this.finalResult(first, output, timeoutMs, spillRel, eofSeen, [
           "A memory-guard intervention was pending and unconfirmed when the command ended, and its outcome could not be read; the result above is the command's own.",
         ]);
@@ -571,7 +574,7 @@ export class ClaudeCommandLane {
       case "enroll_failed":
         return compose(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
       case "guard_unread":
-        return compose("Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read; it and all its descendants were stopped. Retry with smaller or serial commands.", true);
+        return compose(`Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read${first.exitCode === undefined ? "" : `; the command's own exit code was ${String(first.exitCode)}`}; it and all its descendants were stopped. Retry with smaller or serial commands.`, true);
       case "failed":
         return compose(`Command supervision failed (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
     }

@@ -237,6 +237,13 @@ export interface RunContext {
    * An explicit accessor returning undefined refuses epoch startup, even when the
    * executor has a static capturedMemory option. */
   capturedMemory?(): CapturedMemoryContext | undefined;
+  /** Issue #2471: the run's redaction secrets, present with `capturedMemory`; the guarded Claude
+   *  command lane redacts its inline output windows against them. Never sent to the model. */
+  guardedCommandSecrets?: readonly string[];
+  /** Issue #2471: register a listener told, with the runner's own stop, when the worker memory
+   *  runtime invalidates this flight's memory authority mid-run. Present with `capturedMemory`.
+   *  Returns the unsubscribe. Not fired by epoch renewal, non-running reports or preservation. */
+  onMemoryAuthorityLost?(listener: (stop: Error) => void): () => void;
   /** Issue #2083: whether the server enabled the private decisions memo for this run (claim-
    *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
   decisionsMemoEnabled?: boolean;
@@ -931,6 +938,13 @@ export interface Executor {
    * Codex executors.
    */
   reapAttributedProcesses?(): Promise<RunProcessReap>;
+  /**
+   * Issue #2471: dispose and confirm the model commands of a memory-guard-bound Claude flight
+   * within `deadlineMs`, and refuse new ones until the next turn. `confirmed: false` means a
+   * command's process tree could not be proven stopped. Resolves `{confirmed: true}` at once for
+   * an executor with no guarded lane. Absent on the stub/test and Codex executors.
+   */
+  settleWorkerCommands?(deadlineMs: number): Promise<{ confirmed: boolean }>;
   /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process

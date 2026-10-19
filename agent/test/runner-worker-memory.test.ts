@@ -1060,12 +1060,13 @@ test("runtime freezes and validates configured policy; first null claim seeds it
   } finally { await memory.stop(); }
 });
 
-test("runner fails closed on incomplete enabled Codex claims; Claude has no accessor", async () => {
+test("runner fails closed on incomplete enabled Codex claims; a complete Claude claim gets the accessor (#2471)", async () => {
   const f = await setup();
   let calls = 0;
+  let accessor: unknown;
   const executor: Executor = { run: async ctx => {
     calls++;
-    assert.equal(ctx.capturedMemory, undefined);
+    accessor = ctx.capturedMemory;
     throw new Error("fixture end");
   } };
   const r = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: f.memory });
@@ -1077,6 +1078,7 @@ test("runner fails closed on incomplete enabled Codex claims; Claude has no acce
     const claude = { ...f.claim, secrets: { forge_pat: f.claim.secrets.forge_pat } };
     await r.execute(claude);
     assert.equal(calls, 1);
+    assert.equal(typeof accessor, "function", "a guard-bound runner enrols a Claude claim too");
   } finally { await f.memory.stop(); }
 });
 

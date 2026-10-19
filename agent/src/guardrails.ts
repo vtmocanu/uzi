@@ -1312,6 +1312,8 @@ export function buildAgentGuardHook(
   allowed: Iterable<string>,
   log: Logger,
   operatorConstraints: () => readonly string[] | null = () => [],
+  /** Issue #2471: roles withheld from this run, with the reason a dispatch to one is denied. */
+  unavailableReasons: ReadonlyMap<string, string> = new Map(),
 ): (input: HookInput) => Promise<HookJSONOutput> {
   const allowSet = new Set(allowed);
   return async (input: HookInput): Promise<HookJSONOutput> => {
@@ -1323,7 +1325,7 @@ export function buildAgentGuardHook(
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "deny",
-          permissionDecisionReason: REASON_UNKNOWN_SUBAGENT,
+          permissionDecisionReason: (sub !== undefined && unavailableReasons.get(sub)) || REASON_UNKNOWN_SUBAGENT,
         },
       };
     }
