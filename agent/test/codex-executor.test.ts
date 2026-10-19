@@ -18499,10 +18499,13 @@ describe("M3 Codex bounded park controls", () => {
     assert.equal(parksAtApproval, 0);
     assert.equal(parks, 1);
     assert.ok(result.pausedAt, "implementation park paused the run");
-    // The implementation continuation advertises park_run; it must be in the thread/start vocabulary.
-    if (prompts[0]!.includes(PARK_RUN_CONTINUATION)) {
-      assert.ok(starts[0]!.tools?.some((t) => t.name === "park_run"));
-    }
+    // The implementation turn carries the park continuation; the tool it asks for must be in the
+    // vocabulary persisted at the planning thread/start, since thread/resume registers none.
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0]!.includes(PARK_RUN_CONTINUATION), "implementation prompt carries the park continuation");
+    const requested = PARK_RUN_CONTINUATION.match(/call (\w+)/)?.[1];
+    assert.equal(requested, "park_run");
+    assert.ok(starts[0]!.tools?.some((t) => t.name === requested), "continuation's tool is in the persisted vocabulary");
   });
 });
 
