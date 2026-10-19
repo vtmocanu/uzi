@@ -1407,14 +1407,18 @@ chain in the diagram above, with no intervening `running`.
   2026-08-23 overlay amendment, and why merge precedes rebase.
 - **Proactive worker memory guard** (#2396): off by default, with six explicit
   numeric settings and no calibrated production thresholds. One worker-wide
-  cgroup monitor ranks enrolled Codex model command trees by approximate RSS
-  and acts through exact registered supervisor identities. It adds no process
+  cgroup monitor ranks enrolled Codex and Claude model command trees by
+  approximate RSS and acts through exact registered supervisor identities. It adds no process
   authority or concurrency change. The API persists frozen episode allowance;
   uncertain/exhausted intervention takes the capture/owner-only memory-hold
   path, retaining source when disposition is unconfirmed. Register establishes
   authority; heartbeat growth cannot create it, and shrink revokes further
   reservation/signalling without erasing original settlement obligations.
-  Claude enrollment is deferred to #2471; separately accounted DinD, sudden
+  On a guard-bound Claude run native `Bash` is replaced by a worker-owned
+  in-process MCP command tool (foreground only, same-uid parity with native
+  `Bash`, not isolation), and startup preflight refuses to register a worker
+  whose launcher fails (ADR-2396 D8); a server-side Claude eligibility gate is
+  not built. Separately accounted DinD, sudden
   bursts, stalled sampling and node pressure remain limitations. Rollout,
   destructive schema rollback versus operational disable, and command deadline
   boundaries are recorded in [ADR-2396](adr/2396-worker-memory-guard.md);

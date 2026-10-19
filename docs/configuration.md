@@ -532,11 +532,24 @@ reservation or signalling. Original settlement, feedback and source-custody
 obligations remain with the captured flight after revocation; an unconfirmed
 ACK does not establish release. Intervention uses the captured worker
 incarnation, claim generation and memory episode.
-The delivered adapter enrolls trusted Codex model shell commands through
-their exact registered supervisor handle and process start ticks.
-Claude enrollment (#2471), internal probes, provider/credential processes,
+The delivered adapters enroll trusted Codex and Claude model shell commands
+through their exact registered supervisor handle and process start ticks.
+Internal probes, provider/credential processes,
 boundary/checkpoint/capture operations and cross-checker authority are outside
-this adapter's scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+the adapters' scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+With the guard enabled, a Claude run's shell is a worker-owned foreground
+command tool in place of native `Bash`; see
+[Worker setup](./worker-setup.md#proactive-memory-guard) for what changes
+(deadlines, an 8-command limit, output caps, unavailable `Monitor` and
+scoped-only `Bash` roles). Enabling the guard also runs a launcher preflight at
+startup, and a worker that fails it refuses to register, including a
+Codex-only worker. If a Claude run loses memory authority mid-turn (for
+example a registration change), the turn is aborted and continues through the
+existing recovery/requeue policy; a fresh registration/restart is how the
+worker regains authority, as for Codex. A server-side check that sends
+Claude guard-bound work only to capable workers is not built; maintainers
+file it as a follow-up.
 
 After an intervention, another intervention/retry requires confirmed drain,
 a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
