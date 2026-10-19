@@ -42,7 +42,7 @@ for (const entry of ["parkForPause", "PauseNowSignal-plan", "requestParkRun"] as
     } finally {o.restore();}
   });
 }
-for (const exit of ["loop-park", "loop-terminal-after-refusal", "confirm-terminal", "confirm-held", "receipt-failed"] as const) {
+for (const exit of ["loop-park", "loop-terminal-after-refusal", "confirm-terminal", "confirm-held", "receipt-failed", "cancel-disabled-recovery"] as const) {
   it(`public credential recovery ${exit}`, async () => {
     const {gitlab} = fakeGitlab();
     client.protocolFeatures=[VAULT_FEATURE];
@@ -62,6 +62,17 @@ for (const exit of ["loop-park", "loop-terminal-after-refusal", "confirm-termina
     if (exit==="confirm-terminal" || exit==="confirm-held")
       api.failStateWhen(claim.run_id,b=>w.deferred() && b.status==="running",
         {runStatus:exit==="confirm-terminal"?"cancelled":"paused"});
+    if (exit==="cancel-disabled-recovery") {
+      const report=client.reportState.bind(client);
+      client.reportState=async (id,body,signal)=>{
+        if(w.deferred() && body.status==="running") {
+          api.setInputs(claim.run_id,[{id:1,kind:"cancel"}]);
+          const modelSignal=w.ctx()!.signal!;
+          if(!modelSignal.aborted) await new Promise<void>(resolve=>modelSignal.addEventListener("abort",()=>resolve(),{once:true}));
+        }
+        return report(id,body,signal);
+      };
+    }
     if (exit==="receipt-failed") {
       const report=client.reportState.bind(client);
       client.reportState=async (id,body,signal)=>{
@@ -74,6 +85,11 @@ for (const exit of ["loop-park", "loop-terminal-after-refusal", "confirm-termina
       assertCaptured(2853);
       if(exit==="loop-park") assert.equal(parkReports(claim.run_id).length,1);
       else assert.equal(parkReports(claim.run_id).length,0);
+      if(exit==="cancel-disabled-recovery") {
+        assert.ok(api.states.some(s=>s.body.status==="failed" && s.body.failure_reason==="run cancelled"),
+          "actual cancellation ACK landed");
+        assert.equal(o.observations().entries,1,"original capture attempt is not replayed");
+      }
       o.assertProof(exit!=="confirm-terminal" && exit!=="loop-terminal-after-refusal");
     } finally {o.restore();}
   });

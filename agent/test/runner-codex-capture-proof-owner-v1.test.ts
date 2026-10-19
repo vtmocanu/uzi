@@ -10,14 +10,15 @@ import { JOIN_TOKEN, command, recoveryOf } from "./runner-held-publication-fixtu
 
 installHarness();
 
-for (const missing of [false, true]) {
-  it(`A owner V1 ${missing ? "MISSING_SCOPE" : "accepted"}`, async t => {
+for (const mode of ["accepted", "MISSING_SCOPE", "root refusal"] as const) {
+  const missing = mode === "MISSING_SCOPE";
+  it(`A owner V1 ${mode}`, async t => {
     const claim = gitlabClaim(30301, { claim_generation: 7 });
     claim.repo.default_branch = "main";
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
     command(fx.originPath, ["branch", "agent/issue-30301", "main"]);
     client.protocolFeatures = ["recovery_release_exact_echo"];
-    const sourceFilter: { sourcePath?: string } = {};
+    const sourceFilter: { sourcePath?: string; refusal?: boolean } = { refusal: mode === "root refusal" };
     const proof = observe(sourceFilter);
     t.after(() => proof.restore());
 
@@ -122,12 +123,19 @@ for (const missing of [false, true]) {
 
     await proof.execute(r.execute(claim));
 
-    if (missing) {
+    if (missing || mode === "root refusal") {
+      if (!missing) {
+        proof.assertRefusal();
+        assert.equal(budget, flight!.cancellationBudget, "refusal retains original cancellation budget");
+        assert.equal(budget?.deadline, originalDeadline, "refusal never renews cancellation deadline");
+        assert.equal(capturePurpose, "cancel");
+        assert.equal(captureSignal, budget?.signal);
+      }
       const retained = fs.statSync(sourcePath);
       assert.equal(retained.ino, cloneIdentity!.ino, "exact source clone inode retained");
       assert.equal(retained.dev, cloneIdentity!.dev, "exact source clone device retained");
       assert.deepEqual(fs.readFileSync(path.join(sourcePath, "README.md")), sourceBytes!, "source bytes retained");
-      assert.equal(events.filter(x => ["clean-entry", "release-http", "pin-delete"].includes(x.name)).length, 0,
+      assert.equal(events.filter(x => ["clean-entry", "release-http", "release-ack", "forget", "pin-delete"].includes(x.name)).length, 0,
         "missing scope forbids source/release/pin operations");
       return;
     }

@@ -51,7 +51,8 @@ export function validateCaptureGitRequest(
     // environment is not represented as the outer canonical config.
     if (request.identity !== "command" || request.argv[1] !== "-e" ||
         request.argv[2] !== cancelContentHelper || request.argv[3] !== request.cwd ||
-        (request.argv.length !== 4 && (request.argv.length !== 5 || !/^\d+$/.test(request.argv[4]!)))) refuse();
+        request.argv.length !== 5 || !Number.isSafeInteger(Number(request.argv[4])) ||
+        String(Number(request.argv[4])) !== request.argv[4] || Number(request.argv[4]) <= Date.now()) refuse();
     return;
   }
   if (request.argv[0] !== gitBin) refuse();

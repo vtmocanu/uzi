@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { codexRig } from "./runner-codex-sinks-fixture.js";
 import { observe } from "./runner-codex-capture-proof-fixture.js";
 import type { ExecutorFactory } from "../src/runner.js";
@@ -36,7 +37,7 @@ afterEach(() => {
   callbackFailures = [];
   assert.deepEqual(failures, [], "runner must not swallow model callback assertions");
 });
-for (const stage of ["newcapture", "missing-capability"] as string[]) {
+for (const stage of ["newcapture", "captured", "adopting", "missing-capability"] as string[]) {
   it(`A guarded retained public scope proof: ${stage}`, async t => {
     const { claim, bare, clone } = await seed();
     claim.inventory_guarded = true;
@@ -55,6 +56,22 @@ for (const stage of ["newcapture", "missing-capability"] as string[]) {
     // Exercise the real authenticated exact-hold decoder before the producer.
     const exact = await client.getExactRecoveryHold(claim.run_id, 2, {holdId,repoId:claim.repo.id});
     assert.equal(exact?.hold_id, holdId);
+    if (stage === "captured" || stage === "adopting") {
+      const key = "issue-2512";
+      const source = { runId: claim.run_id, clonePath: clone.path };
+      const reservation = await git.reserveRecoveryIteration(bare, clone.branch, key, source, 2);
+      await git.commitWipMarker(clone.path);
+      await fixtureFetchTracking(git, bare, clone.path, clone.branch, claim.run_id, 2);
+      const tip = command(clone.path, "rev-parse", "HEAD");
+      await git.recordRecoveryCapture(bare, clone.branch, key, source, reservation.attempts, tip);
+      if (stage === "adopting") {
+        const seam = t.mock.method(git as any, "seedRunnerClone", async () => { throw new Error("setup interrupted after adopting journal"); });
+        await assert.rejects(git.prepareRecoverySuccessor(bare, clone.branch, key, source,
+          reservation.attempts, "20261008T171401Z-g2-0123456789abcdef"), /setup interrupted/);
+        seam.mock.restore();
+        assert.equal(readJournal(bare, clone.branch).recovery.stage, "adopting");
+      }
+    }
     const observer = observe({ sourcePath: clone.path });
     const before = readJournal(bare, clone.branch);
     let verifiedCalls = 0, verifiedTrue = 0, facts = 0;
@@ -153,7 +170,10 @@ for (const stage of ["newcapture", "missing-capability"] as string[]) {
       } else {
         assert.equal(models, 1);
         assert.equal(created, 2);
-        assert.equal(verifiedCalls, 0);
+        assert.equal(verifiedCalls, stage === "newcapture" ? 0 : 1);
+        assert.equal(verifiedTrue, stage === "newcapture" ? 0 : 1, "real seeded restore point verified");
+        assert.ok(readJournal(bare, clone.branch).retainedSources.some((s:any) => s.clonePath === clone.path),
+          "predecessor journal custody retained");
         assert.equal(facts, 1);
         assert.deepEqual(factScopes, [true], "capture held through actual journal capture fact");
         observer.assertProof(true);

@@ -9,6 +9,8 @@ import { boundaryProcessSpawnerForTest } from "../src/codex/codex-executor.js";
 import { CodexLaunchError, type CodexEffectLaunchSpec, type CodexRootHandle } from "../src/codex/launcher.js";
 import type { BoundaryProcessRequest, CredentialFreeCaptureContext } from "../src/harness.js";
 import { assertCaptureLaunch } from "../src/git.js";
+import { validateCaptureGitRequest } from "../src/credential-free-capture.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { nullLogger } from "./helpers.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -32,7 +34,7 @@ function deferred<T>() {
 
 // The real GitCache, safety owner, registry, and production sandbox adapter run.
 // Only the OS supervisor is replaced: primary exit and ECHILD drain are distinct.
-function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?: (spec: CodexEffectLaunchSpec) => string; setup?: (spec: CodexEffectLaunchSpec) => Promise<void> } = {}) {
+function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?: (spec: CodexEffectLaunchSpec) => string; setup?: (spec: CodexEffectLaunchSpec) => Promise<void>; drainFor?: (spec: CodexEffectLaunchSpec) => Promise<void> | undefined } = {}) {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
   const specs: CodexEffectLaunchSpec[] = [];
   const primaryExited = deferred<void>();
@@ -60,6 +62,7 @@ function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?:
         disposed++;
         reaping.resolve();
         await options.drain;
+        await options.drainFor?.(spec);
         return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
       },
       failed: undefined,
@@ -516,12 +519,30 @@ describe("credential-free real Git producer positives", () => {
       const helper = r.requests.find(request => request.argv[0] === process.execPath);
       assert.ok(helper, "the real producer reached its private fixed helper");
       assert.equal(helper.identity, "command");
+      assert.equal(helper.argv.length, 5);
+      assert.ok(Number.isSafeInteger(Number(helper.argv[4])));
+      const pairs = Array.from({ length: Number(helper.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [helper.env[`GIT_CONFIG_KEY_${i}`], helper.env[`GIT_CONFIG_VALUE_${i}`]]);
+      for (const key of ["credential.helper", "core.askpass"])
+        assert.deepEqual(pairs.filter(pair => pair[0] === key), [[key, ""]]);
+      const policy = (request: BoundaryProcessRequest) => validateCaptureGitRequest(
+        request, [helper.env], "/usr/bin/git", process.execPath, helper.argv[2]!);
+      policy(helper);
+      for (const value of ["9", "9".repeat(400), "9007199254740992", "Infinity", "NaN",
+        String(Date.now() - 1), "1.5", "+9999999999999", "09999999999999", "1e13", " 9999999999999", ""]) {
+        assert.throws(() => policy({ ...helper, argv: [...helper.argv.slice(0, 4), value] }),
+          /credential-free capture launch refused/, "numeric policy: " + value);
+      }
+      assert.throws(() => policy({ ...helper, argv: helper.argv.slice(0, 4) }),
+        /credential-free capture launch refused/, "explicit deadline required");
       assert.equal(r.disposed(), r.requests.length, "helper and Git roots fully disposed");
       assert.equal(r.registry.rootCount(), r.requests.length, "roots remain in the ownership inventory");
 
       // Replay DATA only through the actual validator, before trusted registration.
       // Never execute a substituted script, executable, argv or environment.
       const alters: Array<[string, BoundaryProcessRequest]> = [
+        ["raw canonical request", helper],
+        ["forged provenance flags", { ...helper, captureCancelContent: true, producer: "credentialFreeCancelCleanHead" } as BoundaryProcessRequest],
         ["script", { ...helper, argv: helper.argv.map((arg, i) => i === 2 ? arg + "\n// substituted" : arg) }],
         ["executable", { ...helper, argv: ["/capture/substituted-node", ...helper.argv.slice(1)] }],
         ["argv", { ...helper, argv: [...helper.argv, "substituted"] }],
@@ -543,6 +564,193 @@ describe("credential-free real Git producer positives", () => {
       assert.equal(r.requests.filter(request => request.argv[0] === process.execPath).length, 1,
         "changed clone content never reaches the helper launcher");
     } finally { r.cleanup(); }
+  });
+});
+
+describe("credential-free fixed helper deadline binding", () => {
+  const sha = "a".repeat(40);
+  const isHelper = (spec: CodexEffectLaunchSpec) => spec.args.includes(process.execPath);
+  const output = (spec: CodexEffectLaunchSpec) => isHelper(spec) ? "clean\n"
+    : spec.args.includes("rev-parse") ? sha + "\n" : "";
+  const produce = (r: ReturnType<typeof rig>) =>
+    r.git.credentialFreeCancelCleanHead("/capture/runner", "/capture/worker.git", sha);
+
+  it("binds the allocated integer and freezes setup, joins cleanup, then revokes within the same capture", async () => {
+    const draining = latch(), release = latch(), resume = latch();
+    let helperSpec: CodexEffectLaunchSpec | undefined;
+    const r = rig({ output, drainFor: spec => {
+      if (!isHelper(spec)) return undefined;
+      draining.resolve();
+      return release.promise;
+    }, setup: async spec => {
+      if (!isHelper(spec)) return;
+      await setImmediate();
+      helperSpec = spec;
+      assert.equal(Reflect.set(spec.args, spec.args.length - 1, "9"), false);
+      assert.equal(Reflect.set(spec.env, "NODE_OPTIONS", "--substituted"), false);
+      assertCaptureLaunch(spec);
+    } });
+    const internal = r.git as any, original = internal.execScoped.bind(r.git);
+    let late: Promise<unknown> | undefined;
+    let allocated = "";
+    internal.execScoped = async (command: string, args: string[], opts: any, identity: any) => {
+      if (command !== process.execPath) return original(command, args, opts, identity);
+      allocated = args[3]!;
+      assert.equal(Object.isFrozen(args), true);
+      assert.equal(Object.isFrozen(opts.env), true);
+      late = (async () => {
+        await resume.promise;
+        return original(command, args, opts, identity);
+      })();
+      return original(command, args, opts, identity);
+    };
+    let settled = false;
+    try {
+      const result = await r.safety.withCredentialFreeCapture(10_000, context =>
+        r.git.withCredentialFreeCapture(context, async () => {
+          const pending = produce(r).then(value => { settled = true; return value; });
+          const reached = await Promise.race([draining.promise.then(() => "draining"),
+            pending.then(() => "completed")]);
+          assert.equal(reached, "draining");
+          assert.equal(settled, false, "primary/helper output cannot release full-root custody");
+          assert.ok(helperSpec);
+          assert.equal(r.registry.rootCount(), r.specs.length);
+          assertCaptureLaunch(helperSpec);
+          release.resolve();
+          assert.equal(await pending, sha);
+          assert.throws(() => assertCaptureLaunch(helperSpec!), /credential-free capture launch refused/);
+          const before = r.specs.length;
+          resume.resolve();
+          await assert.rejects(late!, /credential-free capture launch refused/);
+          assert.equal(r.specs.length, before, "revoked descendant cannot relaunch while capture is live");
+          return sha;
+        }));
+      assert.equal(result.kind, "observed_empty");
+      assert.ok(Number.isSafeInteger(Number(allocated)));
+    } finally { release.resolve(); resume.resolve(); await late?.catch(() => undefined); }
+  });
+
+  for (const value of ["different future integer", "9", "9".repeat(400), "9007199254740992",
+    "Infinity", "NaN", "1.5", "01", "+9", "1e13", ""] as const)
+    it("rejects private helper deadline substitution " + (value.length > 30 ? "huge decimal" : JSON.stringify(value)), async () => {
+      const r = rig({ output });
+      const internal = r.git as any, original = internal.execScoped.bind(r.git);
+      let checked = false;
+      internal.execScoped = async (command: string, args: string[], opts: any, identity: any) => {
+        if (command !== process.execPath) return original(command, args, opts, identity);
+        const replacement = value === "different future integer" ? String(Number(args[3]) - 1) : value;
+        assert.notEqual(replacement, args[3]);
+        if (value === "different future integer") {
+          assert.ok(Number.isSafeInteger(Number(replacement)));
+          assert.ok(Number(replacement) > Date.now());
+        }
+        const before = r.specs.length;
+        // Validator DATA only; the rig has no OS execution API.
+        await assert.rejects(async () => internal.boundaryProcesses.getStore().spawn({
+          argv: [command, ...args.slice(0, 3), replacement], cwd: opts.cwd, env: opts.env, identity,
+        }), /credential-free capture launch refused/);
+        checked = true;
+        assert.equal(r.specs.length, before);
+        throw new Error("substitution control complete");
+      };
+      const result = await r.safety.withCredentialFreeCapture(10_000, context =>
+        r.git.withCredentialFreeCapture(context, () => produce(r)));
+      assert.equal(result.kind, "observed_empty");
+      if (result.kind === "observed_empty") assert.equal(result.value, null);
+      assert.equal(checked, true, "actual private producer issued its frozen helper");
+      assert.equal(r.specs.some(isHelper), false);
+    });
+
+  for (const bound of ["maintenance", "capture", "report", "recovery"] as const)
+    it("rounds fractional maintenance DOWN and retains the original " + bound + " bound", async () => {
+      const clock = Date.now, wall = clock();
+      let tick = 0;
+      const budget = new MaintenanceBudget(9000.75, () => tick);
+      let allocated = 0;
+      const r = rig({ output, setup: async spec => {
+        if (!isHelper(spec)) return;
+        await setImmediate();
+        allocated = Number(spec.args.at(-1));
+        assert.equal(allocated, wall + (bound === "maintenance" ? 9000 : 4000));
+        tick = 1.25;
+        assert.equal(Number(spec.args.at(-1)), allocated, "setup cannot renew allocated deadline");
+      } });
+      Date.now = () => wall;
+      try {
+        const result = await r.safety.withCredentialFreeCapture(bound === "capture" ? 4000 : 10_000, context =>
+          r.git.withCredentialFreeCapture(context, () =>
+            r.git.withReportProofBudget({ signal: new AbortController().signal,
+              deadline: wall + (bound === "report" ? 4000 : 20_000) }, () =>
+              r.git.withRecoveryOperation(new AbortController().signal,
+                wall + (bound === "recovery" ? 4000 : 20_000), () => produce(r), budget))));
+        assert.equal(result.kind, "observed_empty");
+        if (result.kind === "observed_empty") assert.equal(result.value, sha);
+        assert.ok(allocated > 0, "actual helper reached final setup");
+      } finally { Date.now = clock; budget.dispose(); }
+    });
+
+  for (const cell of ["deadline", "maintenance", "report abort", "recovery abort"] as const)
+    it("refuses " + cell + " after asynchronous setup before helper spawn", async () => {
+      const clock = Date.now, wall = clock();
+      let tick = 0, setups = 0;
+      const budget = new MaintenanceBudget(9000.75, () => tick);
+      const report = new AbortController(), recovery = new AbortController();
+      const r = rig({ output, setup: async spec => {
+        if (!isHelper(spec)) return;
+        await setImmediate();
+        setups++;
+        if (cell === "deadline") Date.now = () => Number(spec.args.at(-1));
+        if (cell === "maintenance") tick = 9001;
+        if (cell === "report abort") report.abort(new Error("report setup abort"));
+        if (cell === "recovery abort") recovery.abort(new Error("recovery setup abort"));
+        assert.throws(() => assertCaptureLaunch(spec),
+          /credential-free capture launch refused|maintenance deadline exhausted|setup abort/);
+        // Restore only wall time; revoked deadline is also checked by rig immediately below.
+      } });
+      Date.now = () => wall;
+      try {
+        await assert.rejects(r.safety.withCredentialFreeCapture(10_000, context =>
+          r.git.withCredentialFreeCapture(context, () =>
+            r.git.withReportProofBudget({ signal: report.signal, deadline: wall + 15_000 }, () =>
+              r.git.withRecoveryOperation(recovery.signal, wall + 15_000, () => produce(r), budget)))),
+          /codex boundary failed at action/);
+        assert.equal(setups, 1);
+        assert.equal(r.specs.some(isHelper), false, "final launch refused before fake spawn");
+      } finally { Date.now = clock; budget.dispose(); }
+    });
+
+  it("retains flightless legacy helper argv without capture or a new budget", async () => {
+    const r = await credentialFreeGitFixture();
+    const internal = r.git as any, original = internal.execScoped.bind(r.git);
+    let helperArgs: string[] | undefined;
+    internal.execScoped = (command: string, args: string[], opts: any, identity: any) => {
+      if (args[0] === "-e") {
+        helperArgs = [...args];
+        assert.equal(identity, "command");
+        assert.equal(internal.boundaryProcesses.getStore(), undefined);
+        assert.equal(MaintenanceBudget.current(), undefined);
+        assert.equal(args.length, 3, "legacy helper retains optional deadline omission");
+        assert.equal(args[2], r.clone);
+      }
+      return original(command, args, opts, identity);
+    };
+    try {
+      assert.equal(await r.git.credentialFreeCancelCleanHead(r.clone, r.bare, r.base), r.base);
+      assert.ok(helperArgs, "actual legacy fixed helper executed");
+      assert.equal(r.requests.length, 0, "no capture queue, sink, or registry needed");
+    } finally { r.cleanup(); }
+  });
+
+  it("does not launch with an already exhausted maintenance budget", async () => {
+    let tick = 0;
+    const budget = new MaintenanceBudget(10_000, () => tick);
+    const r = rig({ output });
+    try {
+      tick = 10_001;
+      assert.throws(MaintenanceBudget.run.bind(null, budget, () => produce(r)),
+        /maintenance deadline exhausted/);
+      assert.equal(r.specs.length, 0);
+    } finally { budget.dispose(); }
   });
 });
 

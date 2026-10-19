@@ -2057,6 +2057,10 @@ export class GitCache {
   private readonly captureSynthesis = new AsyncLocalStorage<{
     argv: readonly string[]; env: NodeJS.ProcessEnv; live: () => boolean;
   }>();
+  private readonly captureCancelContent = new AsyncLocalStorage<{
+    context: CredentialFreeCaptureContext; argv: readonly string[]; env: NodeJS.ProcessEnv;
+    cwd: string; deadline: number; live: () => boolean; checkBudget: () => void;
+  }>();
   private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
@@ -2239,10 +2243,20 @@ export class GitCache {
       // Capture the private invocation at issuance, then retain it through the final
       // launcher check. Shape-valid paths/dates alone grant no synthesis authority.
       const synthesis = this.captureSynthesis.getStore();
+      const helper = this.captureCancelContent.getStore();
       const dynamic = this.captureSynthesisEnvironment(request.env);
       const hasDynamic = Object.keys(dynamic).length > 0;
       const candidates = hasDynamic && synthesis ? environments.map(env => ({ ...env, ...synthesis.env })) : environments;
       return () => {
+        if (request.argv[0] === process.execPath) {
+          if (!helper || helper.context !== context || !helper.live() || request.identity !== "command" ||
+              request.cwd !== helper.cwd || request.argv.length !== helper.argv.length ||
+              request.argv.some((arg, i) => arg !== helper.argv[i]) ||
+              Object.keys(request.env).length !== Object.keys(helper.env).length ||
+              Object.entries(request.env).some(([key, value]) => !Object.hasOwn(helper.env, key) || helper.env[key] !== value) ||
+              !Number.isSafeInteger(helper.deadline) || Date.now() >= helper.deadline) refuseCapture();
+          helper.checkBudget();
+        }
         if (hasDynamic && (!synthesis || !synthesis.live() || request.identity !== "worker_pat" || request.cwd !== "/" ||
             request.argv.length !== synthesis.argv.length || request.argv.some((arg, i) => arg !== synthesis.argv[i]))) refuseCapture();
         validateCaptureGitRequest(request, candidates, GIT_BIN, process.execPath, CANCEL_CONTENT_HELPER);
@@ -10344,16 +10358,41 @@ export class GitCache {
       const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
       if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
       const report = this.reportProofs.getStore();
-      const args = ["-e", CANCEL_CONTENT_HELPER, cwd, ...(report ? [String(report.deadline)] : [])];
+      const capture = this.boundaryProcesses.getStore()?.capture;
+      const recovery = capture ? this.recoveryOperation() : undefined;
+      const now = Date.now();
+      // Allocate once: fractional monotonic maintenance time is rounded down;
+      // later launch checks consume the same deadline rather than renewing it.
+      const deadline = capture ? Math.floor(Math.min(now + 28000, capture.deadlineAt,
+        report?.deadline ?? Infinity, recovery?.deadline ?? Infinity,
+        recovery?.budget ? now + Math.floor(recovery.budget.remainingMs()) : Infinity)) : undefined;
+      if (capture && (!Number.isSafeInteger(deadline) || deadline! <= now)) refuseCapture();
+      const args = ["-e", CANCEL_CONTENT_HELPER, cwd,
+        ...(capture ? [String(deadline)] : report ? [String(report.deadline)] : [])];
       const wrapped = this.boundaryProcesses.getStore()
         ? { command: process.execPath, args }
         : runnerCommand(process.execPath, args);
       const input = JSON.stringify(manifest);
       if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
-      const proof = await this.execScoped(wrapped.command, wrapped.args, {
-        env: unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }),
-        cwd, input, timeout: 30000, maxBuffer: 1024,
+      const env = Object.freeze(unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() }));
+      const execute = () => this.execScoped(wrapped.command, wrapped.args, {
+        env, cwd, input, timeout: 30000, maxBuffer: 1024,
       }, "command");
+      let proof: { stdout: string; stderr: string };
+      if (capture) {
+        let live = true;
+        Object.freeze(wrapped.args);
+        const argv = Object.freeze([wrapped.command, ...wrapped.args]);
+        const checkBudget = () => {
+          report?.signal.throwIfAborted();
+          recovery?.signal.throwIfAborted();
+          recovery?.budget?.check();
+        };
+        try {
+          proof = await this.captureCancelContent.run({ context: capture, argv, env, cwd,
+            deadline: deadline!, live: () => live, checkBudget }, execute);
+        } finally { live = false; }
+      } else proof = await execute();
       if (proof.stdout !== "clean\n") return null;
       const after = (await read(["rev-parse", "--verify", "HEAD^{commit}"])).trim();
       return status.length === 0 && before === after ? after : null;
