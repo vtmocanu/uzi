@@ -87,10 +87,8 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 			return empty, err
 		}
 	}
-	structural, err = NormalizePlanCrossCheckCandidate(structural)
-	if err != nil {
-		return empty, err
-	}
+	// The compiler validates and canonicalizes a copy for checker identity.
+	// Keep the raw plan here for its fingerprint, exact snapshot and byte budget.
 	structural.CandidateIdentityVersion, structural.SemanticCandidate = "", nil
 	candidate, fp, err := compileSemanticProposal(structural, proposal, captures)
 	if err != nil {

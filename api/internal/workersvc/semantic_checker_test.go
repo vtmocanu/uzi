@@ -215,6 +215,48 @@ func TestSemanticCheckerIdentity(t *testing.T) {
 	}
 }
 
+func TestSemanticProposalRawPlanIdentity(t *testing.T) {
+	structural, proposal, sources := semanticFixture()
+	rawProposal := semanticJSON(t, proposal)
+	first, firstFP, err := compileSemanticProposal(structural, rawProposal, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := NormalizePlanCrossCheckCandidate(structural)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDigest, err := canonical.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, control := range []string{"\u202e", "\x00"} {
+		t.Run(fmt.Sprintf("%x", []byte(control)), func(t *testing.T) {
+			changed := structural
+			changed.PlanMd += control
+			normalized, err := NormalizePlanCrossCheckCandidate(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest, err := normalized.Digest()
+			if err != nil || !bytes.Equal(digest, firstDigest) {
+				t.Fatal("fixture must preserve canonical seven-field structural digest")
+			}
+			candidate, fp, err := compileSemanticProposal(changed, rawProposal, sources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if candidate.PlanHash == first.PlanHash || fp == firstFP {
+				t.Fatal("different raw plans reused proposal fingerprint")
+			}
+			retry, retryFP, err := compileSemanticProposal(changed, rawProposal, sources)
+			if err != nil || retryFP != fp || !bytes.Equal(semanticJSON(t, retry), semanticJSON(t, candidate)) {
+				t.Fatal("identical raw retry changed compiler identity")
+			}
+		})
+	}
+}
+
 func TestSemanticFrozenIssueCapture(t *testing.T) {
 	sources := []apitypes.SemanticSourceCapture{{ID: "issue", Kind: "issue", Provenance: "worker:forged", Completeness: "unknown", Bytes: []byte("frozen")}}
 	got, err := frozenIssueCaptures("frozen", sources)

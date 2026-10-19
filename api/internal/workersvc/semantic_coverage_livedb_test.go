@@ -291,6 +291,68 @@ func TestSemanticCoverageDormantLiveDB(t *testing.T) {
 	}
 }
 
+func TestSemanticCoverageRawPlanRevisionsLiveDB(t *testing.T) {
+	f := newCoverageLiveFixture(t)
+	first := f.candidate
+	originalPlan := f.structural.PlanMd
+	reservation := f.reserve(t, "")
+	if reservation.Outcome != "reserved" {
+		t.Fatalf("reservation=%+v", reservation)
+	}
+	used := 25
+	f.settle(t, reservation, "success", &used)
+	report := apitypes.SemanticCoverageReport{
+		SemanticCoverageBinding: SemanticCoverageBinding(first),
+		Requirements: []apitypes.SemanticCoverageResult{{
+			RequirementID: "r1", Status: "represented", Explanation: "behavior represented",
+			Citations: first.Criteria[0].Citations, CriterionIDs: []string{first.Criteria[0].ID},
+		}},
+		Criteria: []apitypes.SemanticCoverageAtomicity{{CriterionID: first.Criteria[0].ID, Atomic: true, Explanation: "atomic behavior"}},
+	}
+	publication := semanticJSON(t, apitypes.SemanticCoveragePublishRequest{ReviewID: reservation.ReviewID, InvocationID: reservation.InvocationID, Report: report})
+	if err := f.svc.PublishSemanticCoverage(f.e.ctx, f.worker, f.run, 7, publication); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.status(t); got.Report == nil || got.Outcome != "uncertain" || got.ChargedTokens != used {
+		t.Fatalf("initial report missing: %+v", got)
+	}
+	previous := first
+	// Two independent raw edits each return to A; no historical mapping may revive.
+	for _, plan := range []string{originalPlan + "\u202e", originalPlan, originalPlan + "\x00", originalPlan} {
+		f.structural.PlanMd = plan
+		f.submit(t)
+		current := f.candidate
+		if current.Revision != previous.Revision+1 || current.Digest == previous.Digest || current.Digest == first.Digest {
+			t.Fatalf("raw plan change reused revision/digest: previous=%+v current=%+v", previous, current)
+		}
+		if current.PlanHash != semanticHash([]byte(plan)) {
+			t.Fatal("raw plan hash lost before compilation")
+		}
+		for i, criterion := range current.Criteria {
+			if _, err := uuid.Parse(criterion.ID); err != nil || criterion.ID == previous.Criteria[i].ID || criterion.ID == first.Criteria[i].ID {
+				t.Fatal("raw plan change reused criterion UUID")
+			}
+		}
+		payload, err := f.svc.SemanticCandidatePayload(f.e.ctx, f.worker, f.run, 7, current.Digest)
+		if err != nil || !bytes.Equal(payload.Plan, []byte(plan)) {
+			t.Fatalf("raw plan snapshot changed: %q err=%v", payload.Plan, err)
+		}
+		got := f.status(t)
+		if got.Report != nil || got.Outcome != "unavailable" || got.SemanticCoverageBinding != SemanticCoverageBinding(current) ||
+			got.Reviews != 1 || got.Invocations != 1 || got.ChargedTokens != used {
+			t.Fatalf("stale coverage or reset charges: %+v", got)
+		}
+		if err := f.svc.PublishSemanticCoverage(f.e.ctx, f.worker, f.run, 7, publication); err == nil {
+			t.Fatal("historical report accepted for fresh raw plan revision")
+		}
+		f.submit(t)
+		if !bytes.Equal(semanticJSON(t, current), semanticJSON(t, f.candidate)) {
+			t.Fatal("identical raw retry changed persisted mapping")
+		}
+		previous = current
+	}
+}
+
 func TestSemanticCoveragePublicationLiveDB(t *testing.T) {
 	f := newCoverageLiveFixture(t)
 	reservation := f.reserve(t, "")

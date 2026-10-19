@@ -32,9 +32,10 @@ func semanticCheckerDigest(structural PlanCrossCheckCandidate, candidate apitype
 	}
 	canonical, err := json.Marshal(struct {
 		Structural string
+		PlanHash   string
 		Sources    []apitypes.SemanticSourceRef
 		Criteria   []apitypes.ProposedSemanticCriterion
-	}{hex.EncodeToString(structuralDigest), candidate.Sources, criteria})
+	}{hex.EncodeToString(structuralDigest), candidate.PlanHash, candidate.Sources, criteria})
 	if err != nil {
 		return nil, err
 	}
