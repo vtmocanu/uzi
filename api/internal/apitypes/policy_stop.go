@@ -96,6 +96,51 @@ type PolicyStopGateContext struct {
 	PresentationID string            `json:"presentation_id"`
 	PayloadDigest  string            `json:"payload_digest"`
 }
+
+// PolicyRevisionCarrier is the optional plan_revising.payload.policy_revision
+// value. Gate nil means explicit known absence; a missing carrier is handled by
+// the source writer, not by this parser.
+type PolicyRevisionCarrier struct {
+	Gate     *PolicyStopGateContext `json:"gate"`
+	Revision PolicyRevisionRef      `json:"revision"`
+}
+
+// ParsePolicyRevisionCarrier parses a present, closed carrier value.
+func ParsePolicyRevisionCarrier(b []byte) (PolicyRevisionCarrier, error) {
+	var v PolicyRevisionCarrier
+	if err := policyStopClosedJSON(b, &v); err != nil {
+		return v, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return v, err
+	}
+	if !policyStopExactKeys(fields, "gate", "revision") {
+		return v, errors.New("invalid policy revision carrier")
+	}
+	if err := policyStopValidateGate(fields["gate"], v.Gate); err != nil {
+		return v, err
+	}
+	if err := v.Revision.Validate(); err != nil {
+		return v, err
+	}
+	return v, nil
+}
+
+func policyStopValidateGate(raw json.RawMessage, gate *PolicyStopGateContext) error {
+	if gate == nil {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if !policyStopExactKeys(fields, "revision", "presentation_id", "payload_digest") || gate.Revision.Validate() != nil || !policyStopUUID.MatchString(gate.PresentationID) || !policyStopDigest.MatchString(gate.PayloadDigest) {
+		return errors.New("invalid revision source gate")
+	}
+	return nil
+}
+
 type PolicyRevisionSourceV1 struct {
 	Version               int32                  `json:"version"`
 	Gate                  *PolicyStopGateContext `json:"gate"`
@@ -117,14 +162,8 @@ func ParsePolicyRevisionSourceV1(b []byte) (PolicyRevisionSourceV1, error) {
 	if !policyStopExactKeys(fields, "version", "gate", "primary_revision", "associated_cross_checks") || v.Version != 1 || v.AssociatedCrossChecks == nil {
 		return v, errors.New("unknown revision source coverage")
 	}
-	if v.Gate != nil {
-		var gateFields map[string]json.RawMessage
-		if err := json.Unmarshal(fields["gate"], &gateFields); err != nil {
-			return v, err
-		}
-		if !policyStopExactKeys(gateFields, "revision", "presentation_id", "payload_digest") || v.Gate.Revision.Validate() != nil || !policyStopUUID.MatchString(v.Gate.PresentationID) || !policyStopDigest.MatchString(v.Gate.PayloadDigest) {
-			return v, errors.New("invalid revision source gate")
-		}
+	if err := policyStopValidateGate(fields["gate"], v.Gate); err != nil {
+		return v, err
 	}
 	seen := map[string]bool{}
 	for _, ref := range v.AssociatedCrossChecks {

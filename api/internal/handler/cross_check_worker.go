@@ -363,6 +363,7 @@ type planCrossCheckCandidateResponse struct {
 	AutomaticRevisionLimit int32                             `json:"automatic_revision_limit"`
 	AutomaticRoundsEnabled bool                              `json:"automatic_rounds_enabled"`
 	Round                  int32                             `json:"round"`
+	CrossCheckID           string                            `json:"cross_check_id"`
 	CheckerRunID           *string                           `json:"checker_run_id"`
 	CandidateDigest        string                            `json:"candidate_digest"`
 	CandidateGeneration    int64                             `json:"candidate_generation"`
@@ -382,7 +383,7 @@ func crossCheckResponse(cc store.CrossCheck, lastSeq int32) planCrossCheckCandid
 		childID = &value
 	}
 	return planCrossCheckCandidateResponse{
-		Result: "candidate", Round: cc.Round, AutomaticRevisionLimit: cc.AutomaticRevisionLimit, AutomaticRoundsEnabled: cc.AutomaticRoundsEnabled, CheckerRunID: childID,
+		Result: "candidate", CrossCheckID: cc.ID.String(), Round: cc.Round, AutomaticRevisionLimit: cc.AutomaticRevisionLimit, AutomaticRoundsEnabled: cc.AutomaticRoundsEnabled, CheckerRunID: childID,
 		CandidateDigest: hex.EncodeToString(cc.CandidateDigest), CandidateGeneration: cc.LeadClaimGeneration,
 		Candidate: workersvc.PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: json.RawMessage(cc.Milestones),
 			RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String,
