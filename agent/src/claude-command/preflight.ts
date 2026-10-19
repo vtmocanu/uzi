@@ -3,14 +3,19 @@
 // it accept the profile, or it refuses to register (worker.ts throws on a failed result).
 //
 // The probe launches the supervisor through the same root-launch primitive the guarded command
-// uses, with an inert `/bin/true` child instead of the wrapper. It requires `started` evidence,
-// then a clean disposal: state drained and a supervisor exit of 0 (both enforced by the
-// handle's dispose), all within one deadline. It never throws; failures are results.
+// uses, with an inert `/bin/sleep 5` child instead of the wrapper. It requires `started`
+// evidence, one `observe` round trip that does not show a protocol failure (a supervisor that
+// predates the `observe` control op goes abnormal on it, and every guarded command's first
+// enrollment observe would then poison the lane), then a clean disposal: state drained and a
+// supervisor exit of 0 (both enforced by the handle's dispose), all within one deadline. It
+// never throws; failures are results.
 
 import {
   killUnreapedSupervisor,
   launchRunnerSupervisedProbe,
+  type CodexRootHandle,
   type LauncherDeps,
+  type ObservationOutcome,
   type RunnerCommandChild,
   type RunnerCommandRoot,
   type RunnerCommandSpawned,
@@ -21,6 +26,8 @@ export type MemoryLauncherPreflightResult = { ok: true } | { ok: false; reason: 
 /** What the preflight asks its launch seam for: deadlines and the post-spawn child hook. */
 export interface MemoryLauncherProbeOptions {
   readonly deadlines: { readonly started: number };
+  /** The fixed inert child the probe runs: alive long enough for one observe. */
+  readonly child: "sleep";
   readonly onSpawned: (root: RunnerCommandSpawned, child: RunnerCommandChild) => void;
 }
 
@@ -58,6 +65,25 @@ function failureReason(error: unknown): string {
   return (fallback ?? String(error)).slice(0, MAX_REASON_CHARS);
 }
 
+/**
+ * One `observe` against the live probe root. Returns a failure reason, or undefined when the
+ * supervisor answered without a protocol failure: `complete`, or `unavailable` for a reason that
+ * says nothing about the control protocol (`unreadable`, `busy`). `transport` (the supervisor
+ * went abnormal or closed), `stale`/`oversize` (a malformed reply) and `timeout` (no answer, so
+ * support cannot be shown) fail closed.
+ */
+async function observeVerdict(handle: CodexRootHandle, budgetMs: number): Promise<string | undefined> {
+  let outcome: ObservationOutcome;
+  try {
+    outcome = await handle.observe(budgetMs);
+  } catch (error) {
+    return `supervisor lacks observe: ${failureReason(error)}`;
+  }
+  if (outcome.state === "complete") return undefined;
+  if (outcome.reason === "unreadable" || outcome.reason === "busy") return undefined;
+  return `supervisor lacks observe: unavailable (${outcome.reason})`;
+}
+
 export async function memoryLauncherPreflight(deps: MemoryLauncherPreflightDeps = {}): Promise<MemoryLauncherPreflightResult> {
   const deadlineMs = deps.deadlineMs ?? DEFAULT_PREFLIGHT_DEADLINE_MS;
   const startedAt = Date.now();
@@ -65,18 +91,25 @@ export async function memoryLauncherPreflight(deps: MemoryLauncherPreflightDeps 
   let child: RunnerCommandChild | undefined;
   const launch = deps.launch ?? ((options: MemoryLauncherProbeOptions) =>
     launchRunnerSupervisedProbe({ ...deps.launcherDeps, deadlines: { ...deps.launcherDeps?.deadlines, ...options.deadlines } },
-      options.onSpawned));
+      options.onSpawned, options.child));
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`launcher preflight deadline exceeded (${String(deadlineMs)}ms)`)), deadlineMs);
   });
   const attempt = (async (): Promise<MemoryLauncherPreflightResult> => {
     const root = await launch({
+      child: "sleep",
       deadlines: { started: deadlineMs },
       onSpawned: (_root, spawned) => { child = spawned; },
     });
     child ??= root.child;
     if (!root.handle.started) return { ok: false, reason: "no started evidence" };
+    const observeFailure = await observeVerdict(root.handle, remaining());
+    if (observeFailure) {
+      // Best effort: stop the sleeping child cleanly; the verdict stands whatever this returns.
+      try { await root.handle.dispose(remaining()); } catch { /* the verdict stands */ }
+      return { ok: false, reason: observeFailure };
+    }
     const outcome = await root.handle.dispose(remaining());
     if (!outcome.clean) return { ok: false, reason: failureReason(new Error(outcome.reason)) };
     if (outcome.event?.state !== "drained") return { ok: false, reason: "disposal was not drained" };

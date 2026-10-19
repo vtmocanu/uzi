@@ -135,3 +135,39 @@ test("a cut through a surrogate pair never emits a lone surrogate", { timeout: 2
     assert.ok(r.text.length <= INLINE_CAP_CHARS);
   }
 });
+
+test("a 10000-character secret straddling the head or the tail cut never leaks a prefix", { timeout: 120000 }, () => {
+  const long = "Q9Z7W4X2-".repeat(1112).slice(0, 10_000);
+  for (const offset of [14_000, 14_900, 14_950, 15_000, 19_000]) {
+    const out = new BoundedOutput([long]);
+    feed(out, `${"a".repeat(offset)}${long}${"b".repeat(60_000)}`);
+    const { head, tail } = split(out.render().text);
+    assert.match(head, FILLER_OK, `head cut leaked at offset ${String(offset)}`);
+    assert.match(tail, FILLER_OK);
+  }
+  for (const after of [14_000, 14_900, 14_950, 15_000, 19_000]) {
+    const out = new BoundedOutput([long]);
+    feed(out, `${"a".repeat(60_000)}${long}${"b".repeat(after)}`);
+    const { head, tail } = split(out.render().text);
+    assert.match(head, FILLER_OK);
+    assert.match(tail, FILLER_OK, `tail cut leaked with ${String(after)} chars after the secret`);
+  }
+});
+
+test("a secret longer than the margin cap omits the inline preview of a cut output but keeps the counts", { timeout: 60000 }, () => {
+  const huge = "Q9Z7W4X2-".repeat(8000).slice(0, 70_000);
+  const out = new BoundedOutput([huge]);
+  feed(out, `${"a".repeat(20_000)}${huge}${"b".repeat(50_000)}`);
+  const r = out.render();
+  assert.equal(r.truncated, true);
+  assert.ok(!/[Q9Z7W4X2ab]/.test(r.text.replace(/\d+ bytes in total/, "")), "no output character is shown");
+  assert.match(r.text, /preview omitted: 140000 bytes in total/);
+  // Retained memory stays bounded by the cap, not by the secret length.
+  assert.ok(out.retainedChars <= 3 * (INLINE_CAP_CHARS / 2 + 65_536));
+  // A short output is still whole-redacted and shown.
+  const small = new BoundedOutput([huge]);
+  feed(small, `x ${huge} y`);
+  const s = small.render();
+  assert.equal(s.truncated, false);
+  assert.ok(!s.text.includes("Q9Z7"));
+});

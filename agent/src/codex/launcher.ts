@@ -1271,16 +1271,26 @@ export async function launchRunnerCommandRoot(spec: RunnerCommandLaunchSpec, dep
   }, deps);
 }
 
+/** The fixed inert children the preflight probe may run (argv constants, never caller text). */
+const PROBE_TAILS = {
+  true: ["/bin/true"],
+  // Alive briefly, so the probe can exercise an `observe` round trip against a live root.
+  sleep: ["/bin/sleep", "5"],
+} as const;
+export type RunnerSupervisedProbeChild = keyof typeof PROBE_TAILS;
+
 /**
  * The launcher preflight probe: the same root-launch primitive as {@link launchRunnerCommandRoot}
- * with an inert `/bin/true` child instead of the wrapper, at cwd `/` and a minimal env.
+ * with an inert fixed child (`/bin/true` by default, `/bin/sleep 5` for the observe probe)
+ * instead of the wrapper, at cwd `/` and a minimal env.
  */
 export async function launchRunnerSupervisedProbe(
   deps: LauncherDeps = {},
   onSpawned?: RunnerCommandLaunchSpec["onSpawned"],
+  child: RunnerSupervisedProbeChild = "true",
 ): Promise<RunnerCommandRoot> {
   return launchRunnerSupervised({
-    tail: ["/bin/true"],
+    tail: PROBE_TAILS[child],
     cwd: "/",
     env: { PATH: "/usr/bin:/bin", LANG: "C" },
     supervisorBin: SUPERVISOR_BIN,

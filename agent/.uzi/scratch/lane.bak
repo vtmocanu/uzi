@@ -1,0 +1,577 @@
+// The guarded command lane for a memory-guard-bound Claude flight (issue #2471, M2).
+//
+// On a guard-bound flight the native Bash tool is aliased to the in-process MCP tool
+// `mcp__uzi_cmd__bash` (server.ts). This lane is that tool's handler. It runs every model
+// command under the immutable supervisor at the runner uid (launchRunnerCommandRoot), enrols
+// it into the worker memory registry, drains its output into a bounded head+tail buffer, and
+// owns the command's deadline, cancellation and whole-tree disposal itself: the CLI does not
+// stop a handler after an abort (see test/fixtures/claude-command-m0-long-call.md), so nothing
+// here relies on it.
+//
+// Disposal order (ADR D7), per command: bounded transport-EOF grace (exit path only), the
+// single-flight supervisor dispose, recordDrain, join the output end, join the guard's prepared
+// pressure outcome, and, on a confirmed drain only, unregister + drop the recorded root. An
+// unconfirmed disposal fails closed: the lane poisons itself, kills the unreaped supervisor,
+// trips the turn with a GuardedCommandUnconfirmedError and refuses every later command.
+
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import type { HookCallback, HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
+import type { CapturedMemoryContext } from "../codex/broker.js";
+import {
+  SUPERVISOR_BIN, SupervisedChildExitTimeoutError, RunnerCommandNotStartedError, killUnreapedSupervisor,
+  launchRunnerCommandRoot,
+  type RunnerCommandChild, type RunnerCommandLaunchSpec, type RunnerCommandRoot,
+} from "../codex/launcher.js";
+import { boundedCommandWait } from "../codex/memory-command.js";
+import { screenBashCommand } from "../guardrails.js";
+import type { Logger } from "../log.js";
+import type { WorkerMemoryPressureResult } from "../protocol.js";
+import { makeTextRedactor } from "../redact.js";
+import { sanitizeForLog } from "../run-quiescence.js";
+import { asText, type ToolTextResult } from "../tool-evidence.js";
+import type { RecordedRoot } from "../worker-spawn-mark.js";
+import { errMessage } from "../util.js";
+import { BoundedOutput, INLINE_CAP_CHARS } from "./bounded-output.js";
+import { guardedCommandEnv } from "./env.js";
+import {
+  ADMISSION_CLOSED_MESSAGE, disposeRootOnce, enrollClaudeCommand, mintClaudeCommandMetadata,
+  type ClaudeCommandEnrollment, type ClaudeCommandMetadata,
+} from "./enroll.js";
+import { GUARDED_COMMAND_TOOL } from "./grants.js";
+
+export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+export const MAX_COMMAND_TIMEOUT_MS = 3_600_000;
+export const MAX_CONCURRENT_COMMANDS = 8;
+const SPILL_CAP_BYTES = 64 * 1024 * 1024;
+export const MAX_COMMAND_BYTES = 131_000;
+export const DEFAULT_GRACE_MS = 5000;
+export const DEFAULT_CLEANUP_MS = 10_000;
+/** Budget for the supervisor to report `started` (passed to the launcher explicitly). */
+export const LAUNCH_STARTED_MS = 10_000;
+/** Extra wait `disposeBounded` allows beyond one cleanup step, for the single-flight join. */
+const DISPOSE_JOIN_SLACK_MS = 2000;
+
+/**
+ * Worst-case wall time of one guarded call, from the start of the launch to the tool result,
+ * when every step runs to its bound: the `started` wait, the command deadline, the transport
+ * EOF grace (exit path only), the bounded dispose (one cleanup step plus the join slack), the
+ * output-end join and the prepared-outcome join (one cleanup step each). Enrollment runs inside
+ * the command deadline, so it adds nothing.
+ *
+ * With the defaults and the 60-minute maximum: 10 s + 3600 s + 5 s + 12 s + 10 s + 10 s =
+ * 3647 s, below the 3660 s MCP server timeout (server.ts, GUARDED_SERVER_TIMEOUT_MS). The 10 s
+ * cleanup step is kept (a 30 s step would not fit under the 60 s of transport headroom).
+ */
+export function worstCaseCallMs(timeoutMs: number, graceMs = DEFAULT_GRACE_MS, cleanupMs = DEFAULT_CLEANUP_MS): number {
+  return LAUNCH_STARTED_MS + timeoutMs + graceMs + (cleanupMs + DISPOSE_JOIN_SLACK_MS) + cleanupMs + cleanupMs;
+}
+const MAX_ATTRIBUTION_RECORDS = 4096;
+const MEMORY_MESSAGE = "Shell admission is held or its captured flight has retired.";
+
+/** A guarded command's whole-tree disposal could not be confirmed. The lane is poisoned. */
+export class GuardedCommandUnconfirmedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GuardedCommandUnconfirmedError";
+  }
+}
+
+export interface ClaudeCommandLaneOptions {
+  /** Absolute worktree root; every command starts here. */
+  readonly worktree: string;
+  /** The flight's Claude CLI env; the command env is derived from it by guardedCommandEnv. */
+  readonly cliEnv: Readonly<Record<string, string | undefined>>;
+  readonly secretPaths: readonly string[];
+  readonly dockerWired: boolean;
+  /** Secrets redacted from the inline output. */
+  readonly secrets: readonly string[];
+  readonly log: Pick<Logger, "debug" | "info" | "warn">;
+  /** Capture the worker-memory context for one turn (may throw the runner's retained stop). */
+  readonly capturedMemory: () => CapturedMemoryContext;
+  /** Abort the current turn with this exact error (the executor's typed carrier; M3 wires it). */
+  readonly tripTurn: (error: Error) => void;
+  readonly launch?: (spec: RunnerCommandLaunchSpec) => Promise<RunnerCommandRoot>;
+  readonly kill?: (child: RunnerCommandChild) => boolean;
+  readonly now?: () => number;
+  /** Bounded wait for transport EOF after the wrapper exits (default 5000). */
+  readonly graceMs?: number;
+  /** Budget for each cleanup step: dispose, output join, outcome join (default 10000). */
+  readonly cleanupMs?: number;
+  readonly maxConcurrent?: number;
+  readonly defaultTimeoutMs?: number;
+  readonly maxTimeoutMs?: number;
+  readonly spillCapBytes?: number;
+}
+
+interface LiveCommand {
+  readonly id: string;
+  readonly ac: AbortController;
+  child?: RunnerCommandChild;
+  flow: Promise<void>;
+}
+
+interface ParsedArgs {
+  readonly command: string;
+  readonly timeout: number | undefined;
+  readonly description: string | undefined;
+  readonly background: boolean;
+}
+
+type FirstEvent =
+  | { kind: "exit"; code: number }
+  | { kind: "deadline" }
+  | { kind: "aborted" }
+  | { kind: "failed"; error: unknown }
+  // The command was launched and ran; enrollment found the captured admission closed.
+  | { kind: "admission_closed" }
+  // The command was launched and ran; enrollment failed for another reason.
+  | { kind: "enroll_failed"; error: unknown }
+  // The guard's own cancel stopped the command but its outcome could not be read in time.
+  | { kind: "guard_unread" };
+
+const BAD_ID_RE = /[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u;
+
+function wellFormedId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 256 && !BAD_ID_RE.test(value);
+}
+
+function bashCommandOf(toolInput: unknown): string | undefined {
+  if (toolInput && typeof toolInput === "object" && "command" in toolInput) {
+    const command = (toolInput as { command?: unknown }).command;
+    if (typeof command === "string") return command;
+  }
+  return undefined;
+}
+
+/** Resolve true when `promise` settles within `ms`, false on the timeout. Never rejects. */
+async function within(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(1, ms)); }),
+    ]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+function sizeLabel(bytes: number): string {
+  const mib = bytes / (1024 * 1024);
+  return Number.isInteger(mib) ? `${String(mib)} MiB` : `${String(bytes)} bytes`;
+}
+
+export class ClaudeCommandLane {
+  private readonly opts: ClaudeCommandLaneOptions;
+  private readonly launch: (spec: RunnerCommandLaunchSpec) => Promise<RunnerCommandRoot>;
+  private readonly kill: (child: RunnerCommandChild) => boolean;
+  private readonly now: () => number;
+  private readonly graceMs: number;
+  private readonly cleanupMs: number;
+  private readonly maxConcurrent: number;
+  private readonly defaultTimeoutMs: number;
+  private readonly maxTimeoutMs: number;
+  private readonly spillCapBytes: number;
+  private readonly redact: (text: string) => string;
+  private readonly live = new Map<string, LiveCommand>();
+  private readonly roots = new Map<string, RecordedRoot>();
+  private readonly records = new Map<string, string>();
+  private readonly consumed = new Set<string>();
+  private captured: CapturedMemoryContext | undefined;
+  private turnSignal: AbortSignal | undefined;
+  private turnOpen = false;
+  private authorityLost = false;
+  private poisonError: GuardedCommandUnconfirmedError | undefined;
+
+  constructor(opts: ClaudeCommandLaneOptions) {
+    this.opts = opts;
+    this.launch = opts.launch ?? ((spec) => launchRunnerCommandRoot(spec, { deadlines: { started: LAUNCH_STARTED_MS } }));
+    this.kill = opts.kill ?? ((child) => killUnreapedSupervisor(child));
+    this.now = opts.now ?? (() => Date.now());
+    this.graceMs = opts.graceMs ?? DEFAULT_GRACE_MS;
+    this.cleanupMs = opts.cleanupMs ?? DEFAULT_CLEANUP_MS;
+    this.maxConcurrent = opts.maxConcurrent ?? MAX_CONCURRENT_COMMANDS;
+    this.defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    this.maxTimeoutMs = opts.maxTimeoutMs ?? MAX_COMMAND_TIMEOUT_MS;
+    this.spillCapBytes = opts.spillCapBytes ?? SPILL_CAP_BYTES;
+    this.redact = makeTextRedactor([...opts.secrets]);
+  }
+
+  /** Commands currently launching or running. */
+  get liveCount(): number { return this.live.size; }
+  /** True once a disposal could not be confirmed; no command launches afterwards. */
+  get poisoned(): boolean { return this.poisonError !== undefined; }
+
+  /** Supervisor roots of commands that are still live (pid + procfs start time). */
+  recordedRoots(): RecordedRoot[] { return [...this.roots.values()].map((root) => ({ ...root })); }
+
+  /**
+   * Capture the turn's memory context once. A capture failure trips the turn with the original
+   * error and rethrows it; no tool result is ever fabricated for it.
+   */
+  beginTurn(signal?: AbortSignal): void {
+    let captured: CapturedMemoryContext;
+    try {
+      captured = this.opts.capturedMemory();
+    } catch (error) {
+      this.captured = undefined;
+      this.turnOpen = false;
+      this.opts.tripTurn(error instanceof Error ? error : new Error(errMessage(error)));
+      throw error;
+    }
+    this.captured = captured;
+    this.turnSignal = signal;
+    this.authorityLost = false;
+    this.turnOpen = true;
+  }
+
+  /** The runner ended this flight's memory authority mid-turn: trip it and stop every command. */
+  onAuthorityLost(stop: Error): void {
+    this.authorityLost = true;
+    this.opts.tripTurn(stop);
+    for (const live of this.live.values()) live.ac.abort(stop);
+  }
+
+  /**
+   * Dispose and confirm every live command within `deadlineMs`, clear attribution records and
+   * close the turn to new commands. Idempotent. An unconfirmed root poisons the lane and throws.
+   */
+  async quiesce(deadlineMs: number): Promise<void> {
+    this.turnOpen = false;
+    this.records.clear();
+    this.consumed.clear();
+    const flows = [...this.live.values()].map((live) => live.flow);
+    for (const live of this.live.values()) live.ac.abort(new Error("lane quiesce"));
+    if (flows.length > 0 && !(await within(Promise.all(flows), deadlineMs))) {
+      for (const live of this.live.values()) if (live.child) this.kill(live.child);
+      this.poison(new GuardedCommandUnconfirmedError("guarded command cleanup did not finish within the join deadline"), false);
+    }
+    if (this.poisonError) throw this.poisonError;
+  }
+
+  /** PreToolUse hook for both matcher names: screens the command and records attribution. */
+  readonly hook: HookCallback = async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse") return {};
+    if (input.tool_name !== GUARDED_COMMAND_TOOL && input.tool_name !== "Bash") return {};
+    const command = bashCommandOf(input.tool_input);
+    if (command === undefined) return {};
+    const screen = screenBashCommand(command, this.opts.secretPaths, this.opts.dockerWired);
+    if (screen.denied) {
+      this.opts.log.warn("guardrail denied a guarded command", { reason: screen.reason });
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: screen.reason ?? "denied by guardrail",
+        },
+      };
+    }
+    this.recordAttribution(input.tool_use_id, input.agent_id);
+    return {};
+  };
+
+  private recordAttribution(toolUseId: unknown, agentId: string | undefined): void {
+    // Both matchers fire for one call: the second record is a no-op, and a consumed id never re-arms.
+    if (!this.turnOpen || this.poisonError || !wellFormedId(toolUseId)) return;
+    if (this.records.has(toolUseId) || this.consumed.has(toolUseId)) return;
+    if (this.records.size >= MAX_ATTRIBUTION_RECORDS) return;
+    this.records.set(toolUseId, agentId ?? "");
+  }
+
+  private poison(error: GuardedCommandUnconfirmedError, trip: boolean): void {
+    if (this.poisonError) return;
+    this.poisonError = error;
+    this.roots.clear();
+    for (const live of this.live.values()) live.ac.abort(error);
+    if (trip) this.opts.tripTurn(error);
+  }
+
+  private refuse(text: string): ToolTextResult { return asText(text, true); }
+
+  private parseArgs(args: unknown): ParsedArgs | string {
+    if (typeof args !== "object" || args === null) return "invalid arguments";
+    const a = args as Record<string, unknown>;
+    const command = a["command"];
+    if (typeof command !== "string" || command.length === 0 || Buffer.byteLength(command) > MAX_COMMAND_BYTES) {
+      return `command must be a non-empty string of at most ${String(MAX_COMMAND_BYTES)} bytes`;
+    }
+    const timeout = a["timeout"];
+    if (timeout !== undefined && (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1 || timeout > this.maxTimeoutMs)) {
+      return `timeout must be an integer from 1 to ${String(this.maxTimeoutMs)} milliseconds`;
+    }
+    const description = typeof a["description"] === "string" ? a["description"] : undefined;
+    return { command, timeout, description, background: a["run_in_background"] === true };
+  }
+
+  /** The MCP handler. Never throws: every failure is a visible tool result. */
+  async handle(args: unknown, extra: unknown): Promise<ToolTextResult> {
+    if (this.poisonError) return this.refuse("Commands are unavailable: an earlier command's cleanup could not be confirmed.");
+    // (1) Attribution: the handler's tool_use id must match an unconsumed PreToolUse record.
+    const ex = (typeof extra === "object" && extra !== null ? extra : {}) as { _meta?: unknown; signal?: unknown };
+    const meta = typeof ex._meta === "object" && ex._meta !== null ? ex._meta as Record<string, unknown> : {};
+    const toolUseId = meta["claudecode/toolUseId"];
+    if (!wellFormedId(toolUseId) || !this.records.has(toolUseId)) {
+      return this.refuse("Command refused: this call could not be attributed to a screened tool use, so nothing was run.");
+    }
+    this.records.delete(toolUseId);
+    this.consumed.add(toolUseId);
+    // (2) Foreground only.
+    if (typeof args === "object" && args !== null && (args as Record<string, unknown>)["run_in_background"] === true) {
+      return this.refuse(`Background commands are not supported on this run; run it in the foreground with an explicit timeout, at most ${String(this.maxTimeoutMs)} ms.`);
+    }
+    const parsed = this.parseArgs(args);
+    if (typeof parsed === "string") return this.refuse(`Command refused: ${parsed}.`);
+    // (3) Screening, independent of the hook.
+    const screen = screenBashCommand(parsed.command, this.opts.secretPaths, this.opts.dockerWired);
+    if (screen.denied) return this.refuse(screen.reason ?? "denied by guardrail");
+    // (4) Admission on the turn's captured context.
+    const captured = this.captured;
+    if (!this.turnOpen || captured === undefined) return this.refuse("Command refused: no active memory context for this turn.");
+    if (this.authorityLost || !captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
+      || !captured.commands.admitsCommands(captured.context)) {
+      return this.refuse(`Command refused (worker_memory_pressure): ${MEMORY_MESSAGE}`);
+    }
+    // A turn that is already aborted launches nothing.
+    const callSignal = ex.signal instanceof AbortSignal ? ex.signal : undefined;
+    if (callSignal?.aborted || this.turnSignal?.aborted) {
+      return this.refuse("Command was cancelled before it started; nothing was run.");
+    }
+    // (5) Concurrency.
+    if (this.live.size >= this.maxConcurrent) {
+      return this.refuse(`At most ${String(this.maxConcurrent)} commands may run at once; wait for one to finish.`);
+    }
+    const id = randomUUID();
+    const live: LiveCommand = { id, ac: new AbortController(), flow: Promise.resolve() };
+    this.live.set(id, live);
+    const run = this.execute(live, captured, parsed, toolUseId, callSignal).finally(() => { this.live.delete(id); });
+    live.flow = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async execute(
+    live: LiveCommand,
+    captured: CapturedMemoryContext,
+    args: ParsedArgs,
+    toolUseId: string,
+    callSignal: AbortSignal | undefined,
+  ): Promise<ToolTextResult> {
+    const commandId = live.id;
+    const spillRel = `.uzi/scratch/uzi-cmd/${commandId}.log`;
+    const timeoutMs = args.timeout ?? this.defaultTimeoutMs;
+    const startedAt = this.now();
+    // (6) Mint the enrollment metadata for this call.
+    const metadata = mintClaudeCommandMetadata(captured, {
+      toolId: toolUseId, attemptId: randomUUID(), commandId, command: args.command,
+    });
+    if (args.description !== undefined) {
+      this.opts.log.debug("guarded command", { description: sanitizeForLog(this.redact(args.description), 200) });
+    }
+    // (7) Launch. The supervisor root is recorded synchronously at spawn.
+    let launched: RunnerCommandRoot;
+    try {
+      launched = await this.launch({
+        command: args.command,
+        cwd: this.opts.worktree,
+        env: guardedCommandEnv(this.opts.cliEnv),
+        spillPath: path.join(this.opts.worktree, spillRel),
+        spillCapBytes: this.spillCapBytes,
+        supervisorBin: SUPERVISOR_BIN,
+        onSpawned: (root, child) => {
+          live.child = child;
+          if (root.startTime !== undefined) this.roots.set(live.id, { pid: root.pid, startTime: root.startTime });
+        },
+      });
+    } catch (error) {
+      if (error instanceof RunnerCommandNotStartedError || live.child === undefined) {
+        return this.refuse(`Command could not be started: ${sanitizeForLog(this.redact(errMessage(error)), 300)}`);
+      }
+      // A supervisor exists but never reported started: its tree cannot be vouched for.
+      this.kill(live.child);
+      const unconfirmed = new GuardedCommandUnconfirmedError("a guarded command's supervisor failed to start and its cleanup could not be confirmed");
+      this.poison(unconfirmed, true);
+      return this.refuse("Command cleanup could not be confirmed after a failed start; no further commands will run.");
+    }
+    live.child = launched.child;
+    try {
+      return await this.supervise(live, captured, metadata, launched, timeoutMs, spillRel, callSignal, startedAt);
+    } catch (error) {
+      // Unexpected: the root may still be alive. Fail closed.
+      this.opts.log.warn("guarded command lane error", { error: sanitizeForLog(this.redact(errMessage(error)), 300) });
+      return this.failClosed(live, undefined, "an unexpected error interrupted command cleanup");
+    }
+  }
+
+  private async supervise(
+    live: LiveCommand,
+    captured: CapturedMemoryContext,
+    metadata: ClaudeCommandMetadata,
+    launched: RunnerCommandRoot,
+    timeoutMs: number,
+    spillRel: string,
+    callSignal: AbortSignal | undefined,
+    startedAt: number,
+  ): Promise<ToolTextResult> {
+    const { handle } = launched;
+    // (9) Drain the transport from the moment it exists, so the command never blocks on it.
+    const output = new BoundedOutput(this.opts.secrets);
+    const streams = [handle.transport.stdout, handle.transport.stderr] as const;
+    streams.forEach((stream, source) => {
+      stream?.on("data", (chunk: Buffer | string) => { output.write(source as 0 | 1, chunk); });
+      stream?.on("error", () => undefined);
+    });
+    const ended = Promise.all(streams.map((stream) => new Promise<void>((resolve) => {
+      if (!stream || stream.readableEnded || stream.destroyed) { resolve(); return; }
+      stream.once("end", () => resolve());
+      stream.once("close", () => resolve());
+      stream.once("error", () => resolve());
+    }))).then(() => { output.end(); });
+
+    // (10) First of: wrapper exit, abort (call, turn, lane), deadline. The deadline timer is the
+    // worker's own and independent of the MCP transport timeout.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<FirstEvent>((resolve) => { timer = setTimeout(() => resolve({ kind: "deadline" }), timeoutMs); });
+    const sources = [live.ac.signal, callSignal, this.turnSignal].filter((s): s is AbortSignal => s !== undefined);
+    const removers: Array<() => void> = [];
+    const aborted = new Promise<FirstEvent>((resolve) => {
+      for (const signal of sources) {
+        if (signal.aborted) { resolve({ kind: "aborted" }); continue; }
+        const onAbort = () => resolve({ kind: "aborted" });
+        signal.addEventListener("abort", onAbort, { once: true });
+        removers.push(() => signal.removeEventListener("abort", onAbort));
+      }
+    });
+    const exit = handle.waitChild(timeoutMs + this.cleanupMs + this.graceMs).then(
+      (result): FirstEvent => ({ kind: "exit", code: result.code }),
+      (error: unknown): FirstEvent => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" } : { kind: "failed", error }),
+    );
+
+    let enrolled: ClaudeCommandEnrollment | undefined;
+    let enrollError: unknown;
+    try {
+      // (8) Enrol while the command already runs and drains.
+      try {
+        enrolled = await enrollClaudeCommand(captured, metadata, handle, this.cleanupMs, callSignal);
+      } catch (error) { enrollError = error; }
+      let first: FirstEvent;
+      if (enrollError === undefined) {
+        first = await Promise.race([exit, deadline, aborted]);
+      } else if (callSignal?.aborted || this.turnSignal?.aborted || live.ac.signal.aborted) {
+        first = { kind: "aborted" };
+      } else if (enrollError instanceof Error && enrollError.message === ADMISSION_CLOSED_MESSAGE) {
+        first = { kind: "admission_closed" };
+      } else {
+        first = { kind: "enroll_failed", error: enrollError };
+      }
+      if (timer) clearTimeout(timer);
+      for (const remove of removers) remove();
+
+      // (11) D7 order.
+      let eofSeen = true;
+      if (first.kind === "exit") eofSeen = await within(ended, this.graceMs);
+      const confirmed = await this.disposeBounded(handle);
+      enrolled?.recordDisposal(confirmed);
+      if (!confirmed) return this.failClosed(live, enrolled, "the command's process tree could not be confirmed stopped");
+      // Join the output end after the tree is gone; an end that never arrives means a cut tail.
+      if (!(await within(ended, this.cleanupMs))) eofSeen = false;
+      output.end();
+      let pressure: WorkerMemoryPressureResult | undefined;
+      // A prepared outcome the guard did not resolve within one cleanup step.
+      let pressureLost = false;
+      const prepared = enrolled?.preparedOutcome();
+      if (prepared) {
+        try { pressure = await boundedCommandWait(prepared, this.cleanupMs); } catch { pressureLost = true; }
+      }
+      enrolled?.unregister();
+      this.roots.delete(live.id);
+
+      // (12) Result.
+      if (pressure) return this.pressureResult(captured, enrolled, metadata.commandId, pressure);
+      this.opts.log.debug("guarded command finished", { kind: first.kind, elapsedMs: this.now() - startedAt });
+      if (pressureLost) {
+        // The guard prepares its outcome before its API reserve, so an unresolved outcome does
+        // not mean the guard stopped anything: only its own cancel did that.
+        if (enrolled?.guardStopped()) return this.finalResult({ kind: "guard_unread" }, output, timeoutMs, spillRel, eofSeen, []);
+        return this.finalResult(first, output, timeoutMs, spillRel, eofSeen, [
+          "A memory-guard intervention was pending and unconfirmed when the command ended, and its outcome could not be read; the result above is the command's own.",
+        ]);
+      }
+      return this.finalResult(first, output, timeoutMs, spillRel, eofSeen, []);
+    } finally {
+      if (timer) clearTimeout(timer);
+      for (const remove of removers) remove();
+    }
+  }
+
+  private async disposeBounded(handle: RunnerCommandRoot["handle"]): Promise<boolean> {
+    const flight = disposeRootOnce(handle, this.cleanupMs);
+    try { return await boundedCommandWait(flight, this.cleanupMs + DISPOSE_JOIN_SLACK_MS); } catch { return false; }
+  }
+
+  private failClosed(
+    live: LiveCommand,
+    enrolled: ClaudeCommandEnrollment | undefined,
+    reason: string,
+  ): ToolTextResult {
+    enrolled?.recordDisposal(false);
+    if (live.child) this.kill(live.child);
+    this.poison(new GuardedCommandUnconfirmedError(`guarded command cleanup could not be confirmed: ${reason}`), true);
+    return this.refuse("Command cleanup could not be confirmed; no further commands will run on this run.");
+  }
+
+  private pressureResult(
+    captured: CapturedMemoryContext,
+    enrolled: ClaudeCommandEnrollment | undefined,
+    commandId: string,
+    result: WorkerMemoryPressureResult,
+  ): ToolTextResult {
+    const context = captured.context;
+    if (!enrolled || result.tool_id !== enrolled.entry.toolId || result.attempt_id !== enrolled.entry.attemptId
+      || result.command_id !== commandId || result.run_id !== context.run_id || result.worker_id !== context.worker_id
+      || result.claim_generation !== context.claim_generation || result.memory_episode !== context.memory_episode) {
+      return this.refuse("memory_result_mismatch: Memory result does not belong to this shell callback.");
+    }
+    return asText(this.redact(JSON.stringify(result)), true);
+  }
+
+  private finalResult(
+    first: FirstEvent,
+    output: BoundedOutput,
+    timeoutMs: number,
+    spillRel: string,
+    eofSeen: boolean,
+    extraNotes: readonly string[],
+  ): ToolTextResult {
+    const rendered = output.render();
+    const notes: string[] = [];
+    if (rendered.truncated) {
+      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; the text above is a preview (start and end). A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`);
+      if (output.totalBytes > this.spillCapBytes) {
+        notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
+      }
+    }
+    notes.push(...extraNotes);
+    if (!eofSeen) {
+      notes.push("Output may be incomplete: a background process kept the output open after the command ended and was stopped.");
+    }
+    const compose = (headline: string, isError: boolean): ToolTextResult => {
+      const parts = [headline];
+      if (rendered.text.length > 0) parts.push(rendered.text);
+      if (notes.length > 0) parts.push(notes.map((note) => `[${note}]`).join("\n"));
+      return asText(parts.join("\n"), isError);
+    };
+    switch (first.kind) {
+      case "exit": return compose(`Exit code: ${String(first.code)}`, first.code !== 0);
+      case "deadline":
+        return compose(`Command timed out after ${String(timeoutMs)} ms; it and all its descendants were stopped.`, true);
+      case "aborted":
+        return compose("Command was cancelled; it and all its descendants were stopped.", true);
+      case "admission_closed":
+        return compose(`Command was started, then stopped because memory-guard admission closed (worker_memory_pressure): ${MEMORY_MESSAGE} It and all its descendants were stopped.`, true);
+      case "enroll_failed":
+        return compose(`Command was started, then stopped because it could not be placed under memory supervision (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
+      case "guard_unread":
+        return compose("Command was stopped by the worker memory guard (worker_memory_pressure) but its outcome could not be read; it and all its descendants were stopped. Retry with smaller or serial commands.", true);
+      case "failed":
+        return compose(`Command supervision failed (${sanitizeForLog(this.redact(errMessage(first.error)), 200)}); it and all its descendants were stopped.`, true);
+    }
+  }
+}

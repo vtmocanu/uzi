@@ -10,7 +10,8 @@ import {
 } from "../src/codex/launcher.js";
 import { GUARDED_COMMAND_TOOL } from "../src/claude-command/grants.js";
 import {
-  ClaudeCommandLane, GuardedCommandUnconfirmedError, type ClaudeCommandLaneOptions,
+  ClaudeCommandLane, DEFAULT_CLEANUP_MS, DEFAULT_GRACE_MS, GuardedCommandUnconfirmedError, MAX_COMMAND_TIMEOUT_MS,
+  worstCaseCallMs, type ClaudeCommandLaneOptions,
 } from "../src/claude-command/lane.js";
 import { GUARDED_COMMAND_DESCRIPTION, GUARDED_SERVER_TIMEOUT_MS, buildGuardedCommandServer } from "../src/claude-command/server.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
@@ -459,6 +460,8 @@ test("output over 30000 characters is a preview that names the repo-relative spi
   assert.ok(body.includes(`.uzi/scratch/uzi-cmd/${id}.log`));
   assert.ok(!body.includes(`${WT}/.uzi`), "the path is repo-relative");
   assert.match(body, /preview/);
+  assert.match(body, /best-effort basis \(it may be absent or truncated\)/);
+  assert.doesNotMatch(body, /is also written to/);
   assert.ok(body.includes("HEAD") && body.includes("TAIL"));
   const inline = body.slice(body.indexOf("\n") + 1, body.indexOf("\n[Output exceeded"));
   assert.ok(inline.length <= 30_000, `inline ${String(inline.length)}`);
@@ -610,14 +613,183 @@ test("quiesce poisons, kills and throws when a root cannot be confirmed within t
 
 test("more than 256 sequential enrolled commands keep the registry selectable", { timeout: 60000 }, async () => {
   const h = harness();
+  let enrolled = 0;
+  const register = h.c.commands.register.bind(h.c.commands);
+  h.c.commands.register = ((...args: Parameters<typeof register>) => { enrolled++; return register(...args); }) as typeof register;
   for (let i = 0; i < 300; i++) {
     const r = await h.call({ command: "true" });
     assert.match(text(r), /^Exit code: 0/);
   }
   assert.equal(h.roots.length, 300);
+  assert.equal(enrolled, 300, "every command was actually enrolled, so the cap is what the lane's unregister protects");
   const eligible = h.c.commands.eligibleEntries();
   assert.ok(eligible, "the registry still selects (it stops above 256 retained entries)");
   assert.equal(eligible.length, 0);
+});
+
+// -- result text, ordering and timing pins -----------------------------------------------------
+
+test("a turn that is already aborted launches nothing and says so", { timeout: 10000 }, async () => {
+  const h = harness();
+  const call = new AbortController();
+  call.abort();
+  const r = await h.call({ command: "echo hi" }, undefined, call.signal);
+  assert.equal(r.isError, true);
+  assert.match(text(r), /cancelled before it started; nothing was run/);
+  assert.equal(h.specs.length, 0);
+  const turn = new AbortController();
+  h.lane.beginTurn(turn.signal);
+  turn.abort();
+  assert.match(text(await h.call({ command: "echo hi" })), /cancelled before it started/);
+  assert.equal(h.specs.length, 0);
+  assert.equal(h.lane.liveCount, 0);
+});
+
+test("enrollment failing after launch never claims the command did not run", { timeout: 10000 }, async () => {
+  // (a) Admission closes while the enrollment observes: the command ran, output so far is kept.
+  const closed = harness();
+  closed.script.current = (root) => {
+    root.stdout.write("ran-before-stop\n");
+    const observe = root.handle.observe;
+    (root.handle as { observe: typeof observe }).observe = async (ms) => { closed.c.commands.retire(closed.c.context); return observe(ms); };
+  };
+  const r1 = await closed.call({ command: "build" });
+  const body1 = text(r1);
+  assert.equal(r1.isError, true);
+  assert.match(body1, /started, then stopped because memory-guard admission closed \(worker_memory_pressure\)/);
+  assert.match(body1, /ran-before-stop/);
+  assert.doesNotMatch(body1, /refused|did not run|nothing was run/);
+  assert.equal(closed.roots[0]!.disposes(), 1);
+  assert.equal(closed.lane.poisoned, false);
+
+  // (b) A cancellation of the call during enrollment is a cancellation, not a memory refusal.
+  const cancelled = harness();
+  const call = new AbortController();
+  cancelled.script.current = (root) => {
+    root.stdout.write("partial\n");
+    const observe = root.handle.observe;
+    (root.handle as { observe: typeof observe }).observe = async (ms) => { call.abort(); return observe(ms); };
+  };
+  const body2 = text(await cancelled.call({ command: "build" }, undefined, call.signal));
+  assert.match(body2, /Command was cancelled; it and all its descendants were stopped\./);
+  assert.match(body2, /partial/);
+  assert.doesNotMatch(body2, /worker_memory_pressure/);
+
+  // (c) Any other enrollment failure also reports a started-then-stopped command with its output.
+  const bad = harness();
+  bad.script.current = (root) => {
+    root.stdout.write("some-output\n");
+    (root.handle as { observe: unknown }).observe = async () => ({
+      event: "observe", id: 1, state: "complete", supervisor: { pid: 999, startTime: ticks },
+      root: { pid: 1000, startTime: ticks }, processes: [{ pid: 1000, startTime: ticks, ppid: 999, rss: 1 }],
+    });
+  };
+  const body3 = text(await bad.call({ command: "build" }));
+  assert.match(body3, /started, then stopped because it could not be placed under memory supervision/);
+  assert.match(body3, /some-output/);
+  assert.equal(bad.roots[0]!.disposes(), 1);
+});
+
+test("an unresolved prepared outcome never hides the command's own exit code and output", { timeout: 10000 }, async () => {
+  for (const code of [0, 3]) {
+    const h = harness();
+    h.script.current = () => {};
+    const pending = h.call({ command: "build" });
+    await until(() => h.c.commands.eligibleEntries()?.length === 1, "enrollment");
+    h.c.commands.prepareOutcome(h.c.commands.eligibleEntries()![0]!);
+    h.roots[0]!.stdout.write("real-output\n");
+    h.roots[0]!.exitWith(code);
+    const r = await pending;
+    const body = text(r);
+    assert.match(body, new RegExp(`^Exit code: ${String(code)}`));
+    assert.match(body, /real-output/);
+    assert.match(body, /memory-guard intervention was pending and unconfirmed/);
+    assert.doesNotMatch(body, /stopped by the worker memory guard/);
+    assert.equal(r.isError, code !== 0);
+    assert.equal(h.lane.poisoned, false);
+  }
+  // Only when the guard's own cancel disposed the process is it reported as a guard stop.
+  const h = harness();
+  h.script.current = (root) => { root.stdout.write("until-stop\n"); };
+  const pending = h.call({ command: "build" });
+  await until(() => h.c.commands.eligibleEntries()?.length === 1, "enrollment");
+  const entry = h.c.commands.eligibleEntries()![0]!;
+  h.c.commands.prepareOutcome(entry);
+  await entry.cancel({ remainingMs: 1000, signal: new AbortController().signal, authorized: () => true });
+  const r = await pending;
+  assert.equal(r.isError, true);
+  assert.match(text(r), /stopped by the worker memory guard \(worker_memory_pressure\) but its outcome could not be read/);
+  assert.match(text(r), /until-stop/);
+});
+
+test("R16: a turn abort with a prepared outcome still returns the guard's pressure result", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = () => {};
+  const turn = new AbortController();
+  h.lane.beginTurn(turn.signal);
+  const pending = h.call({ command: "yes" });
+  await until(() => h.c.commands.eligibleEntries()?.length === 1, "enrollment");
+  const entry = h.c.commands.eligibleEntries()![0]!;
+  h.c.commands.prepareOutcome(entry);
+  turn.abort();
+  await until(() => h.roots[0]!.disposes() === 1, "disposal after the abort");
+  assert.equal(h.c.commands.resolveToolOutcome(entry, resultFor(entry)), true);
+  const r = await pending;
+  assert.equal(r.isError, true);
+  assert.deepEqual(JSON.parse(text(r)), resultFor(entry), "the pressure result, not the cancellation text");
+});
+
+test("D7: the lane unregisters only after joining the prepared outcome, and before the result", { timeout: 10000 }, async () => {
+  const h = harness();
+  h.script.current = () => {};
+  const events: string[] = [];
+  const unregister = h.c.commands.unregister.bind(h.c.commands);
+  h.c.commands.unregister = ((entry: Parameters<typeof unregister>[0]) => { events.push("unregister"); return unregister(entry); }) as typeof unregister;
+  const pending = h.call({ command: "yes", timeout: 60 }).then((r) => { events.push("result"); return r; });
+  await until(() => h.c.commands.eligibleEntries()?.length === 1, "enrollment");
+  const entry = h.c.commands.eligibleEntries()![0]!;
+  h.c.commands.prepareOutcome(entry);
+  await until(() => h.roots[0]!.disposes() === 1, "the lane's own disposal at the deadline");
+  await new Promise((done) => setTimeout(done, 60));
+  assert.equal(events.length, 0, "disposed, but neither unregistered nor answered while the outcome is pending");
+  events.push("outcome");
+  assert.equal(h.c.commands.resolveToolOutcome(entry, resultFor(entry)), true);
+  await pending;
+  assert.deepEqual(events, ["outcome", "unregister", "result"]);
+});
+
+test("a backgrounded command that releases its output returns promptly; one that holds stdout waits one EOF grace", { timeout: 10000 }, async () => {
+  // `sleep 300 >/dev/null 2>&1 &` closes the transport: the exit is the whole story.
+  const quick = harness({ graceMs: 400 });
+  quick.script.current = (root) => { root.stdout.write("started\n"); setImmediate(() => root.exitWith(0)); };
+  let t = Date.now();
+  const body1 = text(await quick.call({ command: "sleep 300 >/dev/null 2>&1 &" }));
+  assert.ok(Date.now() - t < 350, "no EOF grace wait when the output ended with the wrapper");
+  assert.match(body1, /^Exit code: 0/);
+  assert.doesNotMatch(body1, /may be incomplete/);
+
+  // `sleep 300 & echo started` keeps the inherited stdout open: wait the lane grace, then dispose.
+  const holding = harness({ graceMs: 400 });
+  holding.script.current = (root) => { root.holdOutput(); root.stdout.write("started\n"); setImmediate(() => root.exitWith(0)); };
+  t = Date.now();
+  const r = await holding.call({ command: "sleep 300 & echo started" });
+  const elapsed = Date.now() - t;
+  assert.ok(elapsed >= 380 && elapsed < 1500, `returned after ${String(elapsed)} ms`);
+  assert.match(text(r), /^Exit code: 0/);
+  assert.equal(r.isError, false);
+  assert.match(text(r), /started/);
+  assert.match(text(r), /Output may be incomplete/);
+  assert.equal(holding.roots[0]!.disposes(), 1);
+});
+
+test("the worst-case call time fits under the MCP transport timeout with the default steps", { timeout: 10000 }, () => {
+  assert.equal(DEFAULT_GRACE_MS, 5000);
+  assert.equal(DEFAULT_CLEANUP_MS, 10_000);
+  const worst = worstCaseCallMs(MAX_COMMAND_TIMEOUT_MS);
+  assert.ok(worst < GUARDED_SERVER_TIMEOUT_MS, `worst case ${String(worst)} ms vs ${String(GUARDED_SERVER_TIMEOUT_MS)} ms`);
+  assert.ok(worst <= 3_660_000);
+  // A 30 s cleanup step would not fit: the reason the step stays at 10 s.
+  assert.ok(worstCaseCallMs(MAX_COMMAND_TIMEOUT_MS, DEFAULT_GRACE_MS, 30_000) > GUARDED_SERVER_TIMEOUT_MS);
 });
 
 // -- the MCP server ----------------------------------------------------------------------------
@@ -627,9 +799,11 @@ test("the server description states the lane's limits and the transport timeout 
   for (const phrase of [
     "Foreground only", "run_in_background is refused", "no long-running mode", "120000 ms", "3600000 ms", "60 minutes",
     "blocker", "repository root", "cd dir && command", "30000 characters", ".uzi/scratch/uzi-cmd/<id>.log", "64 MiB", "At most 8 commands",
+    "best-effort copy", "may be absent or truncated",
   ]) {
     assert.ok(GUARDED_COMMAND_DESCRIPTION.includes(phrase), phrase);
   }
+  assert.ok(!GUARDED_COMMAND_DESCRIPTION.includes("is also written to"));
   const h = harness();
   const server = buildGuardedCommandServer(h.lane);
   assert.equal(server.type, "sdk");

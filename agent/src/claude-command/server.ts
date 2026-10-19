@@ -22,7 +22,7 @@ export const GUARDED_COMMAND_DESCRIPTION = [
   `The default deadline is 2 minutes (${String(DEFAULT_COMMAND_TIMEOUT_MS)} ms) and the maximum is 60 minutes (${String(MAX_COMMAND_TIMEOUT_MS)} ms); pass an explicit timeout in milliseconds for a long required check.`,
   "At the deadline the command and every descendant process are stopped and drained. A required check that cannot finish within 60 minutes is a blocker to report, not something to skip.",
   "Every call starts at the repository root: use `cd dir && command` to work elsewhere.",
-  `Inline output is capped at ${String(INLINE_CAP_CHARS)} characters (a start-and-end preview). The output is also written to .uzi/scratch/uzi-cmd/<id>.log, capped at 64 MiB and truncated beyond that (bounded, not the full output); the path is in the result.`,
+  `Inline output is capped at ${String(INLINE_CAP_CHARS)} characters (a start-and-end preview). A best-effort copy of the output may be written to .uzi/scratch/uzi-cmd/<id>.log; it may be absent or truncated, is capped at 64 MiB and truncated beyond that (bounded, not the full output), and a previewed result names its path.`,
   `At most ${String(MAX_CONCURRENT_COMMANDS)} commands may run at once; further calls are refused until one finishes.`,
 ].join(" ");
 
