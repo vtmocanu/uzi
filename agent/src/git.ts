@@ -13364,11 +13364,15 @@ try {
    * stderr kept (capped) for the failure message. `exited` never rejects (-1 on a spawn error,
    * a signal death or a rejected completion); `abort` ends the child's input and, outside a
    * boundary, kills it, so the caller can always await `exited` to a terminal state.
+   * Opt-in `streamStdout` returns exit-gated artifact bytes instead of draining stdout;
+   * abandonment or abort cancels the owned producer. Callers must still await `exited`.
    */
   private async spawnGitAsRunnerWithStdin(
     cwd: string,
     args: string[],
-  ): Promise<{ stdin: Writable; exited: Promise<{ code: number; stderr: string }>; abort: () => void }> {
+    opts: { streamStdout?: boolean } = {},
+  ): Promise<{ stdin: Writable; stdout?: Readable; exited: Promise<{ code: number; stderr: string }>; abort: () => void }> {
+    if (opts.streamStdout) MaintenanceResources.consumeIfActive("artifactBytes", 0);
     const base = gitEnv();
     const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
     const tmp = runnerTmpdir();
@@ -13378,8 +13382,8 @@ try {
     const producerScope = AsyncLocalStorage.snapshot();
     let outputFailed = false;
     const completionCode = (code: number): number => producerScope(() => {
-      if (!metered) return code;
       if (outputFailed) return -1;
+      if (!metered) return code;
       try { this.checkRecoveryInterruption(); MaintenanceResources.checkIfActive(); return code; }
       catch { return -1; }
     });
@@ -13392,21 +13396,34 @@ try {
       stderrBytes += chunk.length;
     };
     const outputDrains: Promise<void>[] = [];
+    const joinOutput = (output: Readable): void => {
+      if (output.errored) outputFailed = true;
+      outputDrains.push(new Promise<void>(resolve => {
+        output.once("end", resolve);
+        output.once("error", () => { outputFailed = true; resolve(); });
+        output.once("close", () => { if (!output.readableEnded) outputFailed = true; resolve(); });
+      }));
+    };
     const drainOutput = (source: Readable | null, cancel: () => void, keep = false): void => {
       if (!source) return;
       const output = this.meteredGitOutput(source, "metadataBytes", cancel);
-      if (metered) {
-        if (output.errored) outputFailed = true;
-        outputDrains.push(new Promise<void>(resolve => {
-          output.once("end", resolve);
-          output.once("error", () => { outputFailed = true; resolve(); });
-          output.once("close", () => { if (!output.readableEnded) outputFailed = true; resolve(); });
-        }));
-      }
+      if (metered) joinOutput(output);
       if (keep) output.on("data", keepStderr);
       else output.resume();
     };
     const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
+    let gated: ReturnType<typeof exitGatedStream> | undefined;
+    const attachStdout = (source: Readable, cancel: () => void, supervised = false): void => {
+      if (!opts.streamStdout) { drainOutput(source, cancel); return; }
+      const cancelProducer = () => producerScope(cancel);
+      const output = this.meteredGitOutput(source, "artifactBytes", cancelProducer);
+      joinOutput(output);
+      gated = exitGatedStream(output, cancelProducer, supervised);
+    };
+    const gateExit = (result: { code: number; stderr: string }): void => {
+      gated?.exited(result.code === 0 ? undefined
+        : new Error(`git ${args.join(" ")} exited ${result.code}${result.stderr ? `: ${result.stderr}` : ""}`));
+    };
     const boundary = this.boundaryProcesses.getStore();
     const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
@@ -13423,26 +13440,30 @@ try {
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
       if (recovery?.signal.aborted) abortRecovery();
       void process.completed.finally(() => recovery?.signal.removeEventListener("abort", abortRecovery)).catch(() => undefined);
-      if (!process.stdin) {
+      if (!process.stdin || (opts.streamStdout && !process.stdout)) {
         // Nothing can be streamed; still settle the root before reporting.
         await Promise.allSettled([process.cancel(), process.completed]);
-        throw new Error("supervised git process has no stdin");
+        throw new Error(`supervised git process has no ${process.stdin ? "stdout" : "stdin"}`);
       }
       const stdin = process.stdin;
       stdin.on("error", () => undefined);
-      drainOutput(process.stdout, abortRecovery);
+      if (process.stdout) attachStdout(process.stdout, abortRecovery, true);
       drainOutput(process.stderr, abortRecovery, true);
       const exited = process.completed.then(
         async ({ code }) => {
-          if (metered) await Promise.all(outputDrains);
+          if (metered || opts.streamStdout) await Promise.all(outputDrains);
           return { code: completionCode(code), stderr: stderrText() };
         },
         async (error: unknown) => {
-          if (metered) await Promise.all(outputDrains);
+          if (metered || opts.streamStdout) await Promise.all(outputDrains);
           return { code: -1, stderr: stderrText() || gitErrorMessage(error) };
         },
       ).finally(async () => { await cancellation; });
-      return { stdin, exited, abort: () => stdin.destroy() };
+      void exited.then(gateExit);
+      return { stdin, stdout: gated?.out, exited, abort: () => {
+        stdin.destroy();
+        if (gated) { gated.out.destroy(); producerScope(abortRecovery); }
+      } };
     }
     const wrapped = runnerCommand("git", withDir(cwd, args));
     const timeoutMs = recovery ? this.recoveryRemaining(recovery) : undefined;
@@ -13458,27 +13479,34 @@ try {
     });
     if (recovery?.signal.aborted) abortRecovery();
     child.stdin.on("error", () => undefined);
-    drainOutput(child.stdout, abortRecovery);
+    attachStdout(child.stdout, abortRecovery);
     drainOutput(child.stderr, abortRecovery, true);
     const exited = new Promise<{ code: number; stderr: string }>((resolve) => {
       let failure: unknown;
       child.once("error", (error) => {
         failure = error;
-        if (!recovery?.budget && !metered) resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) });
+        if (!opts.streamStdout && !recovery?.budget && !metered) resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) });
       });
       child.once("close", (code) => {
         const finish = () => resolve({ code: completionCode(failure ? -1 : code ?? -1),
           stderr: stderrText() || (failure ? gitErrorMessage(failure) : "") });
-        if (metered) void Promise.all(outputDrains).then(finish);
+        if (metered || opts.streamStdout) void Promise.all(outputDrains).then(finish);
         else finish();
       });
     });
+    void exited.then(gateExit);
     return {
       stdin: child.stdin,
+      stdout: gated?.out,
       exited,
       abort: () => {
-        child.stdin.destroy();
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        if (gated) {
+          gated.out.destroy();
+          producerScope(abortRecovery);
+        } else {
+          child.stdin.destroy();
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }
       },
     };
   }
