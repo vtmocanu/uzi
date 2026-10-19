@@ -99,8 +99,13 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 	if err != nil || len(raw) <= 1<<20 || len(raw) > apitypes.SemanticRunInputMaxBytes {
 		t.Fatalf("max echo bytes=%d err=%v", len(raw), err)
 	}
-	if _, err := client.SubmitRunInputWithOptions(ctx, id.String(), input); err != nil {
+	firstReceipt, err := client.SubmitRunInputWithOptions(ctx, id.String(), input)
+	if err != nil {
 		t.Fatalf("full exact approval: %v", err)
+	}
+	replayedReceipt, err := client.SubmitRunInputWithOptions(ctx, id.String(), input)
+	if err != nil || !reflect.DeepEqual(firstReceipt, replayedReceipt) {
+		t.Fatalf("response-loss approval replay changed receipt: first=%+v replay=%+v err=%v", firstReceipt, replayedReceipt, err)
 	}
 	after, err := client.GetRun(ctx, id.String())
 	if err != nil || !reflect.DeepEqual(after.SemanticGate, gate) {

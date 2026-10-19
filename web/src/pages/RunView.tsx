@@ -2547,9 +2547,11 @@ export function RunView() {
           busy={busy}
           canSteer={canSteer}
           revisionMismatch={revisionMismatch}
-          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+          onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
-              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+              semanticApproval !== undefined
+                ? submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision, undefined, semanticApproval)
+                : submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
             )
           }
           onResetApprove={(selection, overrideCapabilities, expectedGateRevision, reset) =>

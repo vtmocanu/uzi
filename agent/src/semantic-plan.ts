@@ -98,6 +98,7 @@ const coverage = z.strictObject({
 const semanticCandidateSchema = z.strictObject({
   candidate_identity_version: z.literal("semantic_v1"), revision: integer.positive(),
   digest: hash, sources: z.array(sourceRef).min(1).max(9), plan_hash: hash,
+  plan_fields_digest: hash.optional(),
   source_outcome: completeness,
   criteria: z.array(canonicalCriterion).min(1).max(256).refine(checkCounts, "Too many criteria per milestone"),
   coverage: coverage.nullable().optional(),

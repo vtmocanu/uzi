@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { Readable } from "node:stream";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
@@ -1988,6 +1989,29 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
+  /** Semantic writes require existing fences and never use compatibility stripping. */
+  async reportSemanticPlanGateState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
+    const frozen: PlanCrossCheckStateRequest = JSON.parse(JSON.stringify(body));
+    if (!Number.isSafeInteger(frozen.claim_generation) || (frozen.claim_generation ?? 0) <= 0 ||
+        !this.hasFeature("claim_generation_fence") || !this.hasFeature("gate_revision_v1") ||
+        !/^[0-9a-f]{64}$/.test(frozen.candidate_digest ?? "") ||
+        (frozen.status !== "running" && frozen.status !== "awaiting_approval") ||
+        (frozen.status === "awaiting_approval" && !frozen.presentation_id))
+      throw new Error("semantic plan state requires exact candidate, generation and gate negotiation");
+    const ack = await this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, frozen, signal,
+      SEMANTIC_GATE_ACK_MAX_BYTES);
+    if (ack.semanticGateMalformed) throw new Error("malformed semantic presentation ACK");
+    if (ack.applied && frozen.status === "awaiting_approval") {
+      const gate = ack.semanticGate;
+      if (ack.status !== "awaiting_approval" || ack.staleClaim || !gate ||
+          gate.semantic_approval.presentation_revision !== ack.gateRevision ||
+          gate.semantic_approval.claim_generation !== frozen.claim_generation ||
+          gate.semantic_approval.candidate_digest !== frozen.candidate_digest)
+        throw new Error("semantic presentation ACK does not match candidate and claim");
+    }
+    return ack;
+  }
+
   /**
    * Report a run state and return what the server made of it. Every report —
    * terminal (completed/failed) and non-terminal (running/awaiting_approval/
@@ -2229,6 +2253,8 @@ export class WorkerClient {
           }
           if (body.claim_generation !== undefined)
             ack.sentClaimGeneration = body.claim_generation;
+          if (fields.semanticGate !== undefined) ack.semanticGate = fields.semanticGate;
+          if (fields.semanticGateMalformed) ack.semanticGateMalformed = true;
           if (fields.completionProjection !== undefined)
             ack.completionProjection = fields.completionProjection;
           if (fields.completionAttempts !== undefined)
@@ -4360,6 +4386,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   applied?: boolean;
+  semanticGate?: StateAck["semanticGate"];
+  semanticGateMalformed?: true;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -4401,6 +4429,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
+      semantic_presentation?: unknown;
+      semantic_approval?: unknown;
       completed_publication_receipt?: unknown;
       completed_publication_reason?: unknown;
       run?: {
@@ -4439,6 +4469,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const run = parsed?.run;
     const out: {
       applied?: boolean;
+      semanticGate?: StateAck["semanticGate"];
+      semanticGateMalformed?: true;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -4471,6 +4503,22 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (isRecord(parsed) && (Object.hasOwn(parsed, "semantic_presentation") || Object.hasOwn(parsed, "semantic_approval"))) {
+      try {
+        const gate = semanticGateAckSchema.safeParse({
+          semantic_presentation: parsed.semantic_presentation, semantic_approval: parsed.semantic_approval,
+        });
+        if (gate.success) out.semanticGate = gate.data;
+        else out.semanticGateMalformed = true;
+      } catch {
+        // Nested canonical decoders may throw inside a schema transform.
+        // Presence must remain malformed rather than becoming a legacy ACK.
+        out.semanticGateMalformed = true;
+      }
+    }
+    const semanticMarker = res.headers.get("X-Uzi-Candidate-Identity-Version");
+    if (semanticMarker !== null && (semanticMarker !== "semantic_v1" || !out.semanticGate))
+      out.semanticGateMalformed = true;
     if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
     if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
     const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);

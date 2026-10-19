@@ -11,6 +11,7 @@
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
+import type { SemanticGateAck } from "./semantic-gate-wire.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -2795,6 +2796,9 @@ export interface StateAck {
   workerIdentityMatches?: boolean;
   /** The actual request generation, after feature and strict-decode fallback selection. */
   sentClaimGeneration?: number;
+  /** Exact server presentation; malformed presence never becomes legacy absence. */
+  semanticGate?: SemanticGateAck;
+  semanticGateMalformed?: true;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

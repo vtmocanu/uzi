@@ -21,10 +21,11 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   let replay = false;
   let reviewId: string | undefined;
   const requests: unknown[] = [];
+  const deadline = new Date(Date.now() + 900000).toISOString();
   const status = (): SemanticCoverageStatus => ({
     ...compiled!.binding, outcome: persisted ? "complete" : "unavailable",
     reviews, invocations: calls, charged_tokens: charged, remaining_tokens: 120000 - charged,
-    deadline: new Date(Date.now() + 900000).toISOString(), ...(persisted ? { report: persisted } : {}),
+    deadline, ...(persisted ? { report: persisted } : {}),
   });
   const report = (): Report => ({
     ...compiled!.binding,
@@ -76,7 +77,25 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   client.publishSemanticCoverage = async (_id, _gen, request) => {
     events.push("publish"); persisted = request.report; return status();
   };
-  return { report, status, requests, compiled: () => compiled!, sources: () => sources,
+  const gateAck = (generation: number, revision: number) => {
+    const evidence = status();
+    const maintainers = compiled!.candidate.criteria.filter(c => c.kind === "maintainer")
+      .map(c => ({ id: c.id, ...c.maintainer! }));
+    return {
+      gate_revision: revision,
+      semantic_presentation: {
+        candidate: compiled!.candidate, binding: compiled!.binding, claim_generation: generation,
+        coverage: evidence, consumed_seconds: 0, remaining_seconds: 900, remaining_reviews: 3 - reviews,
+        maintainers,
+      },
+      semantic_approval: {
+        presentation_revision: revision, presentation_digest: hash(JSON.stringify({ evidence, revision, generation })),
+        candidate_identity_version: "semantic_v1", candidate_revision: compiled!.candidate.revision,
+        ...compiled!.binding, claim_generation: generation, maintainers,
+      },
+    };
+  };
+  return { report, status, requests, gateAck, compiled: () => compiled!, sources: () => sources,
     deny: () => { denied = true; }, replay: () => { replay = true; },
     persisted: () => persisted };
 }

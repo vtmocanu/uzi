@@ -180,6 +180,10 @@ cat > "$W/stub.conf" <<'STUBCONF'
 server {
     listen 8080;
     gzip off;
+    location ~ "^/api/runs/[0-9a-fA-F-]{36}/inputs$" {
+        client_max_body_size 18m;
+        return 200 '{"input":"STUB-SEMANTIC-INPUT"}';
+    }
     location = /api/identity {
         default_type application/json;
         alias /usr/share/nginx/stub/identity.json;
@@ -197,6 +201,12 @@ server {
 }
 STUBCONF
 # nginx runs as uid 101 inside the image: everything copied in must be world-readable.
+# Exercise the exact owner-input proxy ceiling and its first rejected byte.
+dd if=/dev/zero of="$W/approval-exact.bin" bs=1048576 count=17 2>/dev/null
+cp "$W/approval-exact.bin" "$W/approval-over.bin"
+printf x >> "$W/approval-over.bin"
+dd if=/dev/zero of="$W/ordinary-over.bin" bs=1048576 count=1 2>/dev/null
+printf x >> "$W/ordinary-over.bin"
 find "$W" -type d -exec chmod 755 {} +
 find "$W" -type f -exec chmod 644 {} +
 
@@ -363,6 +373,15 @@ for v in $VARIANTS; do
     fetch "$v-apifiles" "$port" /api/v1/files
     check "/api/v1/files: status 200 (got $STATUS)" has_status 200
     check "/api/v1/files: reaches the stub" raw_eq "$v-apifiles" "$STUB/files.json"
+    owner_input=/api/runs/12345678-1234-4123-8123-123456789012/inputs
+    fetch "$v-input-exact" "$port" "$owner_input" -X POST --data-binary "@$W/approval-exact.bin"
+    check "semantic input: exact 17 MiB reaches upstream (got $STATUS)" has_status 200
+    fetch "$v-input-over" "$port" "$owner_input" -X POST --data-binary "@$W/approval-over.bin"
+    check "semantic input: 17 MiB plus one byte rejected (got $STATUS)" has_status 413
+    fetch "$v-ordinary-over" "$port" /api/identity -X POST --data-binary "@$W/ordinary-over.bin"
+    check "ordinary API: 1 MiB plus one byte rejected (got $STATUS)" has_status 413
+    fetch "$v-worker-over" "$port" "/api/worker/runs/12345678-1234-4123-8123-123456789012/inputs" -X POST --data-binary "@$W/ordinary-over.bin"
+    check "worker inputs: larger owner limit is not inherited (got $STATUS)" has_status 413
   fi
 done
 
