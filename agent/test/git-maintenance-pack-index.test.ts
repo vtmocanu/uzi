@@ -352,14 +352,27 @@ test("successful owned exit still waits for stderr EOF", async t => {
   let closed!: () => void;
   const closing = new Promise<void>(r => { closed = r; });
   f.owner.holdStderr = true;
-  f.owner.afterClose = async () => { closed(); };
+  let ownedExit = false, validationBeforeEof = 0, validationAfterEof = 0;
+  const lstat = fs.lstat.bind(fs);
+  t.mock.method(fs, "lstat", async (...args: Parameters<typeof fs.lstat>) => {
+    // Observe the FIRST validation dispatch, before native filesystem latency.
+    // A disabled join must not hide behind later asynchronous readback checks.
+    if (ownedExit) {
+      if (f.owner.stderr?.readableEnded) validationAfterEof++;
+      else validationBeforeEof++;
+    }
+    return lstat(...args);
+  });
+  f.owner.afterClose = async () => { ownedExit = true; closed(); };
   let settled = false;
   const result = f.run(() => f.index()).then(v => { settled = true; return v; }, e => { settled = true; return e; });
   try {
     await Promise.race([closing, result.then(() => { throw Error("settled before child exit"); })]);
     await tick();
+    assert.equal(validationBeforeEof, 0, "no validation dispatch before owned stderr EOF");
     assert.equal(settled, false);
   } finally { f.owner.stderr?.end(); await result; }
+  assert.ok(validationAfterEof > 0, "the observation seam must see real validation");
   assert.equal((await result).path, f.output);
 });
 for (const kind of ["wrong", "high bit", "extra", "short"] as const) {
@@ -474,5 +487,3 @@ test("custody callback only runs at actual launch and descriptor release effects
   assert.equal(calls, 2);
   assert.equal(result.path, f.output);
 });
-
-
