@@ -663,7 +663,15 @@ export class MaintenanceResources {
     options.signal?.throwIfAborted();
     const state = parent?.state ?? {};
     // A nested cancellation must constrain later sibling segments too.
-    if (options.signal) state.signal = AbortSignal.any([...(state.signal ? [state.signal] : []), options.signal]);
+    if (options.signal) {
+      const signal = options.signal;
+      state.signal = AbortSignal.any([...(state.signal ? [state.signal] : []), signal]);
+      const controller = state.scope?.controller;
+      // Existing operations retain the reservation signal; relay late cancellation into it.
+      // The reservation controller also removes this listener when the outer pass closes.
+      if (controller) signal.addEventListener("abort", () => controller.abort(signal.reason),
+        { once: true, signal: controller.signal });
+    }
     const pass: DiscoveryPass = { closed: false, state, parent };
     try { return await discoveryPass.run(pass, action); }
     finally {

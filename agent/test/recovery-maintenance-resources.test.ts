@@ -142,6 +142,42 @@ test("tighter parent deadline and nested cancellation win", async () => {
   });
 });
 
+for (const registration of ["between segments", "during active segment"] as const) {
+  test(`nested pass cancellation aborts pending operation registered ${registration}`, async () => {
+    const controller = new AbortController();
+    const reason = new Error("nested pass cancelled");
+    await R.runDiscoveryPass(async () => {
+      await R.runDiscovery(async () => {});
+      const operation = async (register: (action: () => Promise<void>) => Promise<void>) => {
+        const signal = R.signalIfActive()!;
+        let release!: () => void;
+        const pending = new Promise<void>(resolve => { release = resolve; });
+        signal.addEventListener("abort", release, { once: true });
+        try {
+          await register(async () => {
+            controller.abort(reason);
+            assert.equal(signal.aborted, true,
+              "nested pass cancellation must abort active discovery operation signal before any resource check");
+            assert.equal(signal.reason, reason);
+            await pending;
+          });
+        } finally {
+          signal.removeEventListener("abort", release);
+          release();
+          await pending;
+        }
+      };
+      await assert.rejects(
+        registration === "between segments"
+          ? R.runDiscoveryPass(() => R.runDiscovery(() => operation(action => action())), { signal: controller.signal })
+          : R.runDiscovery(() => operation(action => R.runDiscoveryPass(action, { signal: controller.signal }))),
+        error => error === reason,
+      );
+      await assert.rejects(R.runDiscovery(async () => assert.fail("cancelled sibling ran")), error => error === reason);
+    });
+  });
+}
+
 test("charged production keeps one token and its own counters and timer", async t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   let wall = 1_000_000, mono = 0;
