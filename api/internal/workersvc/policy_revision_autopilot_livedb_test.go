@@ -101,6 +101,24 @@ func TestPolicyRevisionSeededActualPlanLiveDB(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionAutopilotFutureGateFeedbackLiveDB(t *testing.T) {
+	e, f, run, req := autopilotRevisionFixture(t)
+	autopilotRevisionReport(t, f, run, req)
+	e.exec("UPDATE runs SET policy_refusal_count=1 WHERE id=$1", run)
+	assertAutopilotApproval(t, e, run, true)
+	stale := mustRun(t, e, run)
+	// Real publication moves the live row to gate 1. The queued revision row
+	// is an explicit input fixture bound to that actual gate, not a fabricated
+	// future gate on the live row. This models the reader's snapshot boundary;
+	// full Claim transaction wiring is a separate requirement.
+	f.mustPublish(run, acceptanceGateRequest(), 1)
+	acceptanceInput(t, e, run, "revise_plan", 1)
+	assertAutopilotApproval(t, e, run, false)
+	if policyRevisionPlanApproved(e.ctx, e.q, stale, true) {
+		t.Fatal("future-gate feedback granted stale no-gate approval")
+	}
+}
+
 func TestPolicyRevisionAutopilotNegativeEvidenceLiveDB(t *testing.T) {
 	for _, mode := range []string{"pending_human", "unknown_history", "malformed", "selection", "primary"} {
 		t.Run(mode, func(t *testing.T) {

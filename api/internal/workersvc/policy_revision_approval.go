@@ -84,11 +84,12 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 	if err != nil {
 		return false
 	}
-	// One inventory read, with no retries. Other bound gates are inapplicable;
-	// an unbound pending revision cannot establish absence at this gate.
+	// One inventory read, with no retries. Only positively bound older gates
+	// are inapplicable. Current, unbound and future revisions cannot establish
+	// absence, including when this snapshot predates a later publication.
 	for _, input := range inputs {
 		if input.GateBinding.Valid && input.GateBinding.String == "bound" &&
-			input.GateRevision.Valid && input.GateRevision.Int64 != r.GateRevision {
+			input.GateRevision.Valid && input.GateRevision.Int64 > 0 && input.GateRevision.Int64 < r.GateRevision {
 			continue
 		}
 		return false
