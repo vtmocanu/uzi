@@ -53,7 +53,7 @@ it("semantic hard ACK preserves all 256 criteria across eight milestones with Go
   const source = { ...p.candidate.sources[0]!, id: sourceId, provenance: fill("origin", 2048) };
   p.candidate.sources = [source];
   p.candidate.criteria = Array.from({ length: 256 }, (_, i) => ({
-    id: randomUUID(), milestone_id: fill("m" + Math.floor(i / 32), 64), kind: "maintainer" as const,
+    id: randomUUID(), milestone_id: ("m" + Math.floor(i / 32)).padEnd(64, "x"), kind: "maintainer" as const,
     text: fill("text" + i, 2048), done_when: fill("done" + i, 2048),
     citations: Array.from({ length: 8 }, (_, j) => ({ source_id: sourceId, hash: source.hash, start: j, end: j + 1 })),
     evidence_requirements: Array.from({ length: 8 }, (_, j) => ({

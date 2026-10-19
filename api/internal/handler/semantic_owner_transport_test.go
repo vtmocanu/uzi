@@ -33,7 +33,7 @@ func semanticOwnerMaxRequest(t *testing.T) semanticCandidateRequest {
 	}
 	var milestones []workersvc.Milestone
 	for i := range 8 {
-		id := fmt.Sprintf("m%d", i) + strings.Repeat("<", 62)
+		id := fmt.Sprintf("m%d", i) + strings.Repeat("x", 62)
 		milestones = append(milestones, workersvc.Milestone{ID: id, Title: "Milestone"})
 	}
 	for i := range proposal.Criteria {
