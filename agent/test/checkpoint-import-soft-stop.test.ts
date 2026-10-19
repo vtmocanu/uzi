@@ -60,8 +60,7 @@ it("m1 expected candidate mismatch preserves ownership and one stage without sub
     const newer = f.commit("newer");
     const before = fs.readFileSync(f.receipt, "utf8");
     const options = { ...f.options, expectedCandidateSha: first };
-    const result = await f.fetch(options);
-    assert.deepEqual(result, { kind: "not_updated", reason: "ownership_unknown" });
+    await assert.rejects(f.fetch(options), { name: "Error", message: "checkpoint candidate changed during acquisition" });
     assert.equal(git(f.bare, "rev-parse", "refs/uzi-runner/" + branch), first);
     assert.equal(fs.readFileSync(f.receipt, "utf8"), before);
     assert.equal(git(f.bare, "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"), newer);

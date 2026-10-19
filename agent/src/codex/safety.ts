@@ -379,11 +379,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     };
     stop?.signal.addEventListener("abort", observe);
     stop?.lifecycleSignal?.addEventListener("abort", observe);
+    stop?.terminalSignal?.addEventListener("abort", observe);
     observe();
     return () => {
       cancel();
       stop?.signal.removeEventListener("abort", observe);
       stop?.lifecycleSignal?.removeEventListener("abort", observe);
+      stop?.terminalSignal?.removeEventListener("abort", observe);
       authority?.removeEventListener("abort", expire);
     };
   }

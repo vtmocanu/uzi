@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
 import { SinkGate } from "../src/sink-gate.js";
 import type { CheckpointStop } from "../src/checkpoint-stop.js";
 import type { Executor } from "../src/executor.js";
@@ -9,6 +12,8 @@ import { checkCode } from "../src/code-cross-check-gate.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { codexRig, commitInTree, installRecoveryRootCleanup, virtualBoundaryClock } from "./runner-codex-sinks-fixture.js";
 import { recordingLogger } from "./helpers.js";
+import { PauseNowSignal, type SteeringChannel } from "../src/steering.js";
+import { spyPublishLands } from "./runner-codex-sinks-fixture.js";
 
 installHarness();
 installRecoveryRootCleanup();
@@ -357,4 +362,140 @@ it("m2 known bridge preservation refusal invalidates the first snapshot before f
   await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0 })
     .execute(gitlabClaim(312307, { kind: "task", branch: publishedBranch, open_mr: false, code_cross_check_required: true, claim_generation: 1 }));
   assert.equal(verified, true); assert.equal(submit.mock.callCount(), 1);
+});
+
+for (const mode of ["now", "wall", "withdrawn-now"] as const) {
+  it(`m2 genuine ${mode} during done leaves a clean registry for the production park route`, async () => {
+    const restore = spyPublishLands();
+    let rig: ReturnType<typeof codexRig> | undefined;
+    let injected = false, checkpointReturned = false, cleanAfterDone: boolean | undefined;
+    let parkResult: unknown;
+    const claim = gitlabClaim(312308);
+    if (mode === "withdrawn-now") api.stateAckWire = (body, run) => body.status === "paused"
+      ? { status: 200, body: { applied: false, run: { ...run, status: "running" } } } : undefined;
+    const executor: Executor = {
+      get safety() { return rig?.safety; },
+      run: async ctx => {
+        const execution = new AbortController();
+        const forward = () => { if (!(ctx.signal?.reason instanceof PauseNowSignal)) execution.abort(ctx.signal?.reason); };
+        if (ctx.signal?.aborted) forward();
+        else ctx.signal?.addEventListener("abort", forward, { once: true });
+        rig = codexRig({ lifecycleSignal: AbortSignal.any([execution.signal, ctx.terminalLifecycleSignal!]) });
+        const withBoundary = rig.safety.withBoundary.bind(rig.safety);
+        rig.safety.withBoundary = async (request, action) => {
+          if (!injected && request.sink === "done_checkpoint") {
+            injected = true;
+            const active = (worker as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> }).activeRuns.get(claim.run_id)!;
+            const route = active.steering as unknown as { route(kind: string, body?: string, id?: number): void };
+            route.route("pause", mode === "wall" ? "wall" : "now", 1);
+            if (mode === "withdrawn-now") route.route("pause_cancel", undefined, 2);
+          }
+          return withBoundary(request, action);
+        };
+        commitInTree(ctx.worktreePath, "pause-done.txt", "pause admission\n");
+        await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+        checkpointReturned = true;
+        cleanAfterDone = !rig.registry.isPoisoned();
+        const at = { completedCount: 1, total: 1 };
+        if (mode === "wall") {
+          parkResult = await ctx.parkForWall!(at);
+          return parkResult === "parked" || parkResult === "undeliverable"
+            ? { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } }
+            : { branch: ctx.branch };
+        }
+        // A withdrawn turn remains dropped. The owner ACK decides the pending park.
+        parkResult = await ctx.parkForPause!(at);
+        return parkResult ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      },
+    };
+    const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { checkpointIntervalMs: 0 });
+    try {
+      await worker.execute(claim);
+      assert.equal(injected, true);
+      assert.equal(checkpointReturned, true);
+      assert.equal(cleanAfterDone, true);
+      assert.equal(parkResult, mode === "wall" ? "parked" : mode !== "withdrawn-now");
+      if (mode === "wall") {
+        const park = api.wallParkRequests.find(s => s.runId === claim.run_id);
+        assert.match(String(park?.body.head), /^[0-9a-f]{40}$/, "the clean source permits a verified local wall capture");
+      } else assert.equal(rig!.registry.isPoisoned(), false);
+      assert.ok(api.states.some(s => s.runId === claim.run_id && s.body.status === "paused") ||
+        api.wallParkRequests.some(s => s.runId === claim.run_id));
+      assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"), mode === "withdrawn-now");
+      assert.ok(!api.states.some(s => s.runId === claim.run_id && s.body.status === "failed"));
+    } finally {
+      restore();
+      await Promise.allSettled([rig?.installer.settle() ?? Promise.resolve()]);
+    }
+  });
+}
+
+it("m2 real candidate acquisition mismatch is advisory without retention and guarded finalize continues", async t => {
+  const { logger, lines } = recordingLogger();
+  const snapshots: unknown[] = [];
+  t.mock.method(client, "codeCrossCheckStatus", async () => ({ stage: "code", result: "no_row", repo_instructions_enabled: false }));
+  t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number, snapshot: Parameters<typeof client.submitCodeCrossCheck>[2]) => {
+    snapshots.push(snapshot);
+    throw new Error("fixture response unavailable");
+  });
+  let rig: ReturnType<typeof codexRig> | undefined;
+  let mismatch = false, returned = false;
+  let beforeReceipt: string | undefined, beforeHead: string | undefined, movedHead: string | undefined;
+  let acquisitionState: { receipt: string; head: string; stage: string } | undefined;
+  const receiptPath = (bare: string, branch: string) => path.join(bare, "uzi-owed",
+    "receipt-" + createHash("sha256").update(branch).digest("hex") + ".json");
+  const flags: Array<{ preserveRecoveryClone: boolean; preserveSession: boolean }> = [];
+  const fetch = git.fetchAgentBranch.bind(git);
+  t.mock.method(git, "fetchAgentBranch", async (...args: Parameters<typeof git.fetchAgentBranch>) => {
+    if (mismatch && args[4].expectedCandidateSha) {
+      commitInTree(args[1], "moved.txt", "candidate moved during acquisition\n");
+      movedHead = execFileSync("git", ["-C", args[1], "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      try { return await fetch(...args); }
+      finally {
+        acquisitionState = {
+          receipt: fs.readFileSync(receiptPath(args[0], args[2]), "utf8"),
+          head: execFileSync("git", ["-C", args[0], "rev-parse", "refs/uzi-runner/" + args[2]], { encoding: "utf8" }).trim(),
+          stage: execFileSync("git", ["-C", args[0], "for-each-ref", "--format=%(objectname)", "refs/uzi-incoming/"], { encoding: "utf8" }).trim(),
+        };
+      }
+    }
+    return fetch(...args);
+  });
+  const executor: Executor = {
+    get safety() { return rig?.safety; },
+    run: async ctx => {
+      rig = codexRig({ lifecycleSignal: AbortSignal.any([ctx.signal!, ctx.terminalLifecycleSignal!]) });
+      commitInTree(ctx.worktreePath, "prior.txt", "prior owned work\n");
+      await ctx.checkpoint!({ reap: false });
+      const bare = git.barePathFor(fx.originPath);
+      beforeReceipt = fs.readFileSync(receiptPath(bare, ctx.branch), "utf8");
+      beforeHead = await git.trackingTip(bare, ctx.branch) ?? undefined;
+      commitInTree(ctx.worktreePath, "candidate.txt", "original\n");
+      mismatch = true;
+      await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+      await ctx.codeCrossCheckGate!({ interlocked: true });
+      mismatch = false; returned = true;
+      return { branch: ctx.branch };
+    },
+  };
+  const worker = runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, logger, { checkpointIntervalMs: 0 });
+  type Flight = { preserveRecoveryClone: boolean; preserveSession: boolean };
+  const seam = worker as unknown as { fetchBackBestEffort(...args: [string, string, string, Flight, ...unknown[]]): Promise<unknown> };
+  const original = seam.fetchBackBestEffort.bind(worker);
+  t.mock.method(seam, "fetchBackBestEffort", async (...args: Parameters<typeof seam.fetchBackBestEffort>) => {
+    try { return await original(...args); }
+    finally { if (mismatch) flags.push({ preserveRecoveryClone: args[3].preserveRecoveryClone, preserveSession: args[3].preserveSession }); }
+  });
+  try {
+    await worker.execute(gitlabClaim(312309, { code_cross_check_required: true, claim_generation: 1 }));
+    assert.equal(returned, true);
+    assert.ok(beforeReceipt && beforeHead && movedHead && acquisitionState);
+    assert.deepEqual(acquisitionState, { receipt: beforeReceipt, head: beforeHead, stage: movedHead });
+    assert.deepEqual(snapshots, [{ reason_class: "snapshot_failed" }]);
+    assert.equal(flags.length, 1, "fresh snapshot sees the changed head before a second acquisition");
+    assert.ok(flags.every(f => !f.preserveRecoveryClone && !f.preserveSession));
+    assert.ok(!JSON.stringify(lines).includes("tracking preservation refused"), JSON.stringify(lines));
+    assert.ok(rig!.boundaries.includes("finalize"), "guarded finalize still acquires its permit");
+    assert.ok(api.states.some(s => s.body.status === "completed"));
+  } finally { await Promise.allSettled([rig?.installer.settle() ?? Promise.resolve()]); }
 });

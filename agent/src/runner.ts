@@ -10548,7 +10548,10 @@ export class RunRunner {
       const lifecycle = steering.lifecycleSignal();
       const stop: CheckpointStop = { signal: controller.signal, lifecycleSignal: lifecycle, now,
         workerShutdown: () => steering.workerShutdownCheckpoint(),
-        authorityRevoked: () => ["now", "wall", "disk"].includes(steering.getPauseMode() ?? "") };
+        terminalSignal: AbortSignal.any([steering.terminalLifecycleSignal(), steering.checkpointAuthoritySignal()]),
+        cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal,
+        authorityRevoked: () => steering.isCancelled() || steering.claimFence() !== undefined ||
+          steering.pendingCredentialSwitch() !== undefined || steering.getPauseMode() === "disk" };
       const interrupt = () => controller.abort();
       lifecycle.addEventListener("abort", interrupt, { once: true });
       this.shutdownSignal.signal.addEventListener("abort", interrupt, { once: true });
@@ -10716,6 +10719,12 @@ export class RunRunner {
         if (codeDoneSnapshot && fetchedBack.kind !== "updated") { codeSnapshot = undefined; codeFreshReceipt = undefined; codeEmptyPrompt = false; }
         if (fetchedBack.kind === "refused") {
           if (opts.doneAttempt) throw new PreservationRefusedError();
+          bodyOutcome = "no_new_work";
+          return;
+        }
+        // Failed acquisition proves no new tracking owner. Do not turn that absence
+        // into a preservation refusal while skipping this advisory attempt.
+        if (opts.doneAttempt && fetchedBack.kind === "failed") {
           bodyOutcome = "no_new_work";
           return;
         }
@@ -12011,7 +12020,7 @@ export class RunRunner {
               try {
                 const snapshotAction = async (_permit?: BoundaryPermit, attempt?: NonNullable<CheckpointBodyOpts["doneAttempt"]>) => {
                   attempt?.steps.enter("checkpoint_code_head");
-                  if (!completion.interlocked || !codeSnapshot) {
+                  if (!completion.interlocked || (executor.safety && !codeSnapshot)) {
                     if (!completion.interlocked && doneCandidate === undefined) doneCandidate = await this.git.branchTip(runnerClone.path, runnerClone.branch);
                     const original = doneCandidate;
                     if (!original || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== original) {

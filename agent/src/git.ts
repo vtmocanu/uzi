@@ -4407,7 +4407,7 @@ export class GitCache {
         const incoming = await this.resolveCommitStrict(barePath, stage);
         await this.requireOwedCommit(barePath, incoming);
         if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
-          return { kind: "not_updated", reason: "ownership_unknown" };
+          throw new Error("checkpoint candidate changed during acquisition");
         }
         this.checkCheckpointCooperation();
         let result: TrackingUpdateResult;

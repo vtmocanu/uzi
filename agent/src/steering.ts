@@ -1404,6 +1404,12 @@ export class SteeringChannel {
   }
 
   private readonly shutdownStop = new AbortController();
+
+  /** Revocation fence also fires for disk/switch delivery after a cooperative pause. */
+  checkpointAuthoritySignal(): AbortSignal {
+    return this.shutdownStop.signal;
+  }
+
   private shutdownCheckpoint?: GracefulShutdownCheckpoint;
 
   workerShutdownCheckpoint(): GracefulShutdownCheckpoint | undefined {
@@ -2422,7 +2428,6 @@ export class SteeringChannel {
         if (this.pauseMode === "disk") break;
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
-          this.shutdownStop.abort();
           const signal = new PauseNowSignal();
           if (!this.cancel.signal.aborted) this.cancel.abort(signal);
           this.abortLifecycle(signal, false);

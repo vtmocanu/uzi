@@ -2129,7 +2129,7 @@ it("m2 acquisition preserves authority attribution after source reconciliation",
   });
 });
 
-for (const reason of ["owner_cancel", "claim_loss", "normal_wall", "shutdown_revoked", "worker_shutdown"] as const) {
+for (const reason of ["owner_cancel", "claim_loss", "untyped_lifecycle", "shutdown_revoked", "worker_shutdown"] as const) {
   it("m2 mutation permit retains hard authority for " + reason, async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(3142));
     const lifecycle = new AbortController(), soft = new AbortController(), authority = new AbortController();
