@@ -104,8 +104,8 @@ func TestPolicyRevisionApprovalNoRevisionClaimLiveDB(t *testing.T) {
 	}{
 		{"current_applied_approval", 3, false, false, false, false, true},
 		{"old_applied_approval", 2, false, false, false, false, false},
-		{"known_auto", 2, false, true, false, false, true},
-		{"known_seeded", 2, false, false, true, false, true},
+		{"known_auto", 2, false, true, false, false, false},
+		{"known_seeded", 2, false, false, true, false, false},
 		{"pending_blocks_auto", 3, true, true, false, false, false},
 		{"pending_blocks_seeded", 3, true, false, true, false, false},
 		{"unknown_blocks_current_approval", 3, false, false, false, true, false},

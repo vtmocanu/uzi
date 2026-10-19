@@ -204,7 +204,11 @@ func policyAcceptanceHumanPrimary(ctx context.Context, tx pgx.Tx, r store.Run, v
 	var metadata struct {
 		Receipt *revisionRetryReceipt `json:"revision_retry_receipt"`
 	}
-	if json.Unmarshal(r.GatePresentedPayload, &metadata) != nil {
+	if len(r.GatePresentedPayload) == 0 {
+		if r.GateRevision != 0 || r.GatePresentationID.Valid {
+			return false, nil
+		}
+	} else if json.Unmarshal(r.GatePresentedPayload, &metadata) != nil {
 		return false, nil
 	}
 	if receipt := metadata.Receipt; receipt != nil {

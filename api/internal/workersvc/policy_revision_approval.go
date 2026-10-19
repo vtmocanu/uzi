@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -65,7 +67,8 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 		return err == nil && !hasRevision
 	}
 	source, err := apitypes.ParsePolicyRevisionSourceV1(r.PolicyRevisionSource)
-	if err != nil || !policyRevisionGateMatches(r, source) {
+	if err != nil || !policyRevisionSourceGateMatches(r, source) ||
+		!policyStopSelectionValid(source, stopUUID(r.PolicyCandidateCrossCheckID)) {
 		return false
 	}
 	// A primary revision remains unapproved even after its row was Stop-settled.
@@ -99,8 +102,8 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 		}
 		cc, err := q.GetPolicyStopCrossCheck(ctx, id)
 		if err != nil || cc.LeadRunID != r.ID || cc.Stage != "plan" ||
-			cc.Round < 1 || cc.LeadClaimGeneration <= 0 || cc.Verdict != "approve" ||
-			!cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid {
+			cc.Round < 1 || cc.LeadClaimGeneration <= 0 || cc.LeadClaimGeneration > r.ClaimGeneration || cc.Verdict != "approve" ||
+			!cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid || cc.RevisionSupersededByStopInputID.Valid {
 			return false
 		}
 		candidate := PlanCrossCheckCandidate{
@@ -117,18 +120,31 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 			RequiredCapabilities: capability.Filter(cc.RequiredCapabilities),
 			RequiredTools:        capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String),
 		}
+		if r.Kind != runkind.Issue {
+			projection.Milestones = nil
+		}
 		projected, err := projection.canonicalJSON()
-		current, currentErr := gatePayloadFromRow(r).canonicalJSON()
+		currentPayload := gatePayloadFromRow(r)
+		if source.Gate == nil {
+			currentPayload = policyAutopilotPayloadFromRow(r)
+		}
+		current, currentErr := currentPayload.canonicalJSON()
 		if err != nil || currentErr != nil || !bytes.Equal(projected, current) {
 			return false
 		}
 	}
-	// Auto/seeded authority is permitted only after verified absence of applicable
-	// revisions. Historical approval alone cannot authorize this candidate.
+	if source.Gate == nil {
+		// Birth coverage is not approval. Seeded plans are validated at creation;
+		// agent plans are stored by the guarded autopilot plan/running pair.
+		return r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != "" &&
+			(!r.PlanCrossCheckRequired || r.PolicyCandidateCrossCheckID.Valid) &&
+			(r.PlanSource == planSourceSeeded || (r.AutoApprove && r.PlanSource == "agent"))
+	}
+	// A published gate requires its own applied receipt, including auto/seeded runs.
 	approved, err := q.HasPolicyCurrentGateApproval(ctx, store.HasPolicyCurrentGateApprovalParams{
 		RunID: r.ID, GateRevision: r.GateRevision,
 	})
-	return err == nil && (approved || r.AutoApprove || r.PlanSource == planSourceSeeded)
+	return err == nil && approved
 }
 
 // policyRevisionGateMatches uses the same canonical gate helpers as

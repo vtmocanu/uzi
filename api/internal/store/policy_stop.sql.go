@@ -12,6 +12,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acceptPolicyAutopilotRevisionSource = `-- name: AcceptPolicyAutopilotRevisionSource :execrows
+UPDATE runs SET
+ policy_revision_source = $1::jsonb,
+ policy_candidate_cross_check_id = $2::uuid
+WHERE id = $3::uuid AND user_id = $4::uuid
+ AND worker_id = $5::uuid
+ AND claim_generation = $6::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status = 'running'
+ AND harness = 'codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL
+ AND auto_approve AND plan_source = 'agent' AND plan_md = $7::text
+ AND btrim(plan_md) <> ''
+ AND gate_revision = 0 AND gate_presentation_id IS NULL
+ AND gate_payload_digest IS NULL AND gate_presented_payload IS NULL
+ AND policy_revision_source = $8::jsonb
+ AND policy_candidate_cross_check_id IS NOT DISTINCT FROM $9::uuid
+ AND NOT (credential_switch_requested_at IS NOT NULL
+          AND credential_switch_generation IS NOT NULL
+          AND credential_switch_generation = claim_generation)
+`
+
+type AcceptPolicyAutopilotRevisionSourceParams struct {
+	Source               []byte      `json:"source"`
+	SelectedCrossCheckID pgtype.UUID `json:"selected_cross_check_id"`
+	RunID                uuid.UUID   `json:"run_id"`
+	OwnerID              uuid.UUID   `json:"owner_id"`
+	WorkerID             uuid.UUID   `json:"worker_id"`
+	ClaimGeneration      int64       `json:"claim_generation"`
+	PlanMd               pgtype.Text `json:"plan_md"`
+	PreviousSource       []byte      `json:"previous_source"`
+	PreviousCrossCheckID pgtype.UUID `json:"previous_cross_check_id"`
+}
+
+// The caller holds the current claim lock, authenticates complete prewrite V1
+// history with plan_md NULL, then proves both normal plan/running writes applied.
+// Identical stored-plan retries and heartbeats must never call this writer.
+func (q *Queries) AcceptPolicyAutopilotRevisionSource(ctx context.Context, arg AcceptPolicyAutopilotRevisionSourceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acceptPolicyAutopilotRevisionSource,
+		arg.Source,
+		arg.SelectedCrossCheckID,
+		arg.RunID,
+		arg.OwnerID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.PlanMd,
+		arg.PreviousSource,
+		arg.PreviousCrossCheckID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const acceptPolicyRevisionSource = `-- name: AcceptPolicyRevisionSource :execrows
 UPDATE runs SET
  policy_revision_source = $1::jsonb,

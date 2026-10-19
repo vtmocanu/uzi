@@ -57,6 +57,29 @@ WHERE id = sqlc.arg(run_id)::uuid AND user_id = sqlc.arg(owner_id)::uuid
    AND approval.superseded_by_stop_input_id IS NULL
  );
 
+-- name: AcceptPolicyAutopilotRevisionSource :execrows
+-- The caller holds the current claim lock, authenticates complete prewrite V1
+-- history with plan_md NULL, then proves both normal plan/running writes applied.
+-- Identical stored-plan retries and heartbeats must never call this writer.
+UPDATE runs SET
+ policy_revision_source = sqlc.arg(source)::jsonb,
+ policy_candidate_cross_check_id = sqlc.narg(selected_cross_check_id)::uuid
+WHERE id = sqlc.arg(run_id)::uuid AND user_id = sqlc.arg(owner_id)::uuid
+ AND worker_id = sqlc.arg(worker_id)::uuid
+ AND claim_generation = sqlc.arg(claim_generation)::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status = 'running'
+ AND harness = 'codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL
+ AND auto_approve AND plan_source = 'agent' AND plan_md = sqlc.narg(plan_md)::text
+ AND btrim(plan_md) <> ''
+ AND gate_revision = 0 AND gate_presentation_id IS NULL
+ AND gate_payload_digest IS NULL AND gate_presented_payload IS NULL
+ AND policy_revision_source = sqlc.arg(previous_source)::jsonb
+ AND policy_candidate_cross_check_id IS NOT DISTINCT FROM sqlc.narg(previous_cross_check_id)::uuid
+ AND NOT (credential_switch_requested_at IS NOT NULL
+          AND credential_switch_generation IS NOT NULL
+          AND credential_switch_generation = claim_generation);
+
 -- name: ListPolicyStopRevisionInputs :many
 SELECT * FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'revise_plan'

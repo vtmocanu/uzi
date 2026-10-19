@@ -4576,6 +4576,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	var providerHeld bool
 	switch req.State {
 	case "running":
+		var autopilotAcceptance *policyAutopilotAcceptance
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
 		// awaiting_approval, so its approved plan text rides THIS self-contained `running`
 		// report instead. Persist it via the guarded, idempotent SetRunAutopilotPlan whose
@@ -4611,6 +4612,12 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				fenceTx = tx
 				q = store.New(tx)
 			}
+			// owned is the locked prewrite snapshot. No first-plan proof is
+			// prepared for a heartbeat, stored-plan retry or unfenced report.
+			autopilotAcceptance, err = preparePolicyAutopilotAcceptance(ctx, fenceTx, wkr, owned, req.ClaimGeneration)
+			if err != nil {
+				return store.Run{}, false, err
+			}
 			var planRows int64
 			planParams := store.SetRunAutopilotPlanParams{
 				PlanMd: planBody, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
@@ -4623,6 +4630,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
 			if err != nil {
 				return store.Run{}, false, err
+			}
+			if autopilotAcceptance != nil && planRows != 1 {
+				return store.Run{}, false, fmt.Errorf("policy autopilot plan fence: affected %d rows", planRows)
 			}
 			if planRows == 0 {
 				// A concurrent cancel/park is a state refusal, not an invalid plan.
@@ -4698,6 +4708,23 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 		}
 		rows, err = q.SetRunRunning(ctx, runningParams)
+		if err == nil && rows == 0 && req.PlanMd != nil && fenceTx != nil && autopilotAcceptance == nil {
+			// Source uncertainty does not relax the normal plan/running atomic
+			// pair. Return a refusal before commit; deferred rollback also undoes
+			// the preceding guarded plan write.
+			return owned, false, nil
+		}
+		if autopilotAcceptance != nil {
+			if err != nil {
+				return store.Run{}, false, err
+			}
+			if rows != 1 {
+				return store.Run{}, false, fmt.Errorf("policy autopilot running fence: affected %d rows", rows)
+			}
+			if err := acceptPolicyAutopilotRevision(ctx, fenceTx, autopilotAcceptance, stripNULParam(req.PlanMd)); err != nil {
+				return store.Run{}, false, err
+			}
+		}
 	case "awaiting_approval":
 		// PRD #122 M1: the CANDIDATE milestone list rides the pre-approval report.
 		// milestonesParam validates + kind-gates it (Decision 12/13) and returns NULL
