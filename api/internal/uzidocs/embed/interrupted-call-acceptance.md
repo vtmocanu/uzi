@@ -55,12 +55,11 @@ changes, and the default branch is not an authorized known-good replacement.
 ## Local integration record — 2026-10-19
 
 This record covers local executable checks, separately from the hosted acceptance
-below. Base revision: `28534e917aeb23a31ddaa9400d85d1712c99fa25`.
-API LiveDB candidate: `2671e1b27e3243fcf716a61ddd7f5a6b54dce9c5`.
-Wire-contract and affected-agent candidate:
-`8a611802ddb04fb7141550f2c73fb847ecb0ca5d`. The API implementation is unchanged
-between those candidate revisions; the later revision adds independent
-Go/TypeScript checks of the actual marshaled wire fixtures.
+below. They ran against pre-merge candidate revisions of this change and its base;
+the pull request records the revisions. The API implementation is unchanged
+between the API LiveDB candidate and the later wire-contract and affected-agent
+candidate, which adds independent Go/TypeScript checks of the actual marshaled
+wire fixtures.
 
 The candidate `./e2e/run-store-it.sh` exited 0: 3,035 top-level passes and no skips.
 Named new tests actually ran: `TestInterruptedCallsPlanLiveDB`,
