@@ -365,6 +365,13 @@ for (const failure of ["write failure", "cancel", "callback rejection"]) {
     const f = await fixture(t), closing = latch(), release = latch();
     const removals = new Map<string, number>();
     let opened = 0, closed = 0, injected = false, outputReady = false, earlyCleanup = false;
+    let heldCloseSettled = false, snapshotSettled = false, snapshotBeforeClose = false;
+    const snapshot = f.git["snapshotMaintenanceObjects"].bind(f.git);
+    t.mock.method(f.git as unknown as { snapshotMaintenanceObjects: typeof snapshot }, "snapshotMaintenanceObjects",
+      async (...args: Parameters<typeof snapshot>) => {
+        try { return await snapshot(...args); }
+        finally { snapshotSettled = true; snapshotBeforeClose ||= !heldCloseSettled; }
+      });
     const unlink = fs.unlink.bind(fs), rmdir = fs.rmdir.bind(fs);
     const record = (p: unknown) => {
       const name = f.physical(p);
@@ -380,6 +387,7 @@ for (const failure of ["write failure", "cancel", "callback rejection"]) {
       t.mock.method(file, "close", async () => {
         if (p === path.join(f.clone, ".git", "objects")) { closing.release(); await release.promise; }
         await close(); closed++;
+        if (p === path.join(f.clone, ".git", "objects")) heldCloseSettled = true;
       });
       if (p.startsWith(path.join(f.git.recoveryRoot, "unit", "source") + "/")) {
         const write = file.write.bind(file);
@@ -400,11 +408,17 @@ for (const failure of ["write failure", "cancel", "callback rejection"]) {
       }
     };
     const work = assert.rejects(f.run(() => f.seam()));
-    let heldRemovals = 0;
-    try { await closing.promise; heldRemovals = removals.size; }
-    finally { release.release(); }
-    await work;
-    assert.equal(heldRemovals, 0, "outer cleanup must await held descriptor close");
+    try {
+      await closing.promise;
+      // Let the fixture progress for a bounded 64 event-loop turns while close stays held.
+      for (let i = 0; i < 64; i++) await tick();
+      assert.equal(removals.size, 0, "outer cleanup must await held descriptor close");
+      assert.equal(snapshotSettled, false, "snapshot must await held descriptor close before returning");
+    } finally {
+      release.release();
+      await work;
+    }
+    assert.equal(snapshotBeforeClose, false, "snapshot return must follow held descriptor close");
     assert.equal(earlyCleanup, false, "every snapshot handle closed before outer cleanup");
     assert.equal(injected, true);
     assert.ok(removals.size > 0);
@@ -424,9 +438,9 @@ for (const mutation of ["earlier source sibling", "earlier output sibling", "sou
       const write = file.write.bind(file);
       t.mock.method(file, "write", async (...args: Parameters<typeof file.write>) => {
         if (!changed && previous && previous !== p) {
-          changed = true;
           if (mutation === "earlier source sibling") {
             const source = path.join(objects, path.relative(path.join(f.git.recoveryRoot, "unit", "source"), previous));
+            await fs.chmod(source, 0o600);
             await fs.appendFile(source, "changed");
           } else if (mutation === "earlier output sibling") {
             await fs.appendFile(previous, "changed");
@@ -436,13 +450,14 @@ for (const mutation of ["earlier source sibling", "earlier output sibling", "sou
             await fs.mkdir(info, { recursive: true });
             await fs.writeFile(path.join(info, "alternates"), "");
           }
+          changed = true;
         }
         previous = p;
         return write(...args);
       });
     };
     await assert.rejects(f.run(() => f.seam()));
-    assert.equal(changed, true);
+    assert.equal(changed, true, "intended fixture mutation must complete before guard refusal");
     assert.equal(f.requests.length, 0, "no rev-list, pack producer or verifier launch");
     assert.equal(f.callbacks(), 0);
   });
