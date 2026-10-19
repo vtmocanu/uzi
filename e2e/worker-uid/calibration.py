@@ -28,18 +28,27 @@ DIAG_WORKLOADS = ("many-mismatch", "equivalent", "bounded-diagnostic")
 DIAG_GUARDED_WORKLOADS = ("guarded-many-mismatch",)
 DIAG_SIZES = (1024 ** 3, 2 * 1024 ** 3)
 # Eight containers (three plain workloads plus the guarded leg, per size), each bounded in turn:
-# create <=10s, inspect <=10s, start/capture <=DIAG_SECONDS+5s (35s), owned cleanup <=29s. Worst case
-# ~84s per container, so the step adds at most ~11.2 minutes. The guarded leg is far shorter in practice
-# (about 14s measured: ~1s baseline and tool launch, the workload until the guard acts or its own 15s
-# command deadline, then bounded lane quiesce <=8s and monitor settle <=8s); a hung leg is cut at
-# DIAG_SECONDS by the host and fails like any other host error.
+# create <=10s, inspect <=10s, start/capture <=bound+5s, owned cleanup <=29s. A plain workload's bound
+# is DIAG_SECONDS (30s), so ~84s worst case per container. The guarded leg's in-container worst case
+# is the sum of its own bounds (calibration-claude-guard.mts, calibration-diagnostic.mts): ~0.75s
+# baseline, <=10s for the launcher's started report, the 15s command deadline, <=~6s of post-deadline
+# dispose (1s grace plus 5s cleanup) and ended/pressure waits (allowed 10s), then the monitor settle
+# (8s) and the lane quiesce (8s): ~52s. DIAG_GUARDED_SECONDS (65s) exceeds that with ~13s margin, so
+# a slow but legitimate "deadline" outcome is recorded rather than cut by the host. Its container is
+# ~119s worst case, so the step adds at most ~12.4 minutes. About 14s is typical (the workload until the
+# guard acts or the deadline, then bounded quiesce and settle); a hung leg is cut at
+# DIAG_GUARDED_SECONDS by the host and fails like any other host error.
 DIAG_SECONDS = 30
+DIAG_GUARDED_SECONDS = 65
 DIAG_OUTPUT_BYTES = 64 * 1024
 # Host exit codes that mean the container's main process was killed by the kernel before it could
 # report (docker start --attach returns the container's exit code): a recorded guarded outcome, not
 # an error. 124 (the host deadline) is deliberately not in this set.
 GUARDED_KILLED_EXIT = (137,)
-GUARDED_OUTCOMES = ("guard_acted", "oom_before_guard", "deadline", "exited_before_guard", "other")
+# Measured outcomes only. Lane refusals, launch failures, supervision/enrollment failures, an admission
+# closed without the guard's result, a workload that never started and the catch-all "other" are harness
+# faults (calibration-claude-guard.mts records them under their own names), never accepted here.
+GUARDED_OUTCOMES = ("guard_acted", "oom_before_guard", "deadline", "exited_before_guard")
 
 
 def diagnostic(message):
@@ -409,8 +418,9 @@ class Host:
         cid = self.diagnostic_create(name, size, workload)
         started = time.monotonic()
         output = self.directory / ("diagnostic-" + workload + "-" + str(size) + ".stdout")
-        rc = bounded.capture(["timeout", "--kill-after=5s", str(DIAG_SECONDS) + "s", "docker", "start", "--attach", cid],
-                             output, DIAG_SECONDS + 5, DIAG_OUTPUT_BYTES)
+        seconds = DIAG_GUARDED_SECONDS if workload in DIAG_GUARDED_WORKLOADS else DIAG_SECONDS
+        rc = bounded.capture(["timeout", "--kill-after=5s", str(seconds) + "s", "docker", "start", "--attach", cid],
+                             output, seconds + 5, DIAG_OUTPUT_BYTES)
         wall = time.monotonic() - started
         raw = output.read_bytes()
         (self.directory / (output.stem + ".status")).write_text(f"EXIT={rc}\n")

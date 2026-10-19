@@ -33,7 +33,7 @@ if kind == "git":
     sys.exit(0)
 if kind == "timeout":
     assert args[0] == "--kill-after=5s"
-    assert float(args[1][:-1]) <= 55
+    assert float(args[1][:-1]) <= 65  # the guarded leg bound (DIAG_GUARDED_SECONDS)
     if mode == "timeout" and args[2:5] == ["docker", "start", "--attach"] and (root / "probe-done").exists():
         sys.exit(124)
     if args[2:5] == ["docker", "start", "--attach"]:
@@ -113,6 +113,8 @@ elif args[0] == "start":
                     "pressure": {"code": "worker_memory_pressure", "tool_id": "toolu_x", "outcome": "confirmed_drained"}, "head": None}
             if mode == "guarded-oom-before-guard":
                 tool.update(outcome="oom_before_guard", pressure=None, pressureToolIdMatches=None, head="Exit code: 137")
+            if mode.startswith("guarded-bad-"):
+                tool.update(outcome=mode[len("guarded-bad-"):], pressure=None, pressureToolIdMatches=None, head="x")
             if mode == "guarded-wrong-tool": tool["pressure"]["tool_id"] = "toolu_other"
             cleanup = {"liveCountBeforeQuiesce": 0, "liveCountAfter": 0, "quiesceConfirmed": True, "poisoned": False,
                        "registryEligibleEntries": 0, "commandPidsGone": True, "otherProcessPidsRemaining": [],
@@ -510,7 +512,9 @@ class RunnerTest(unittest.TestCase):
 
     def test_guarded_harness_faults_fail_after_owned_cleanup(self):
         # Reaching the guarded container means the three plain workloads of the first size ran first.
-        for mode in ("guarded-hung", "guarded-leak", "guarded-unquiesced", "guarded-wrong-tool"):
+        for mode in ("guarded-hung", "guarded-leak", "guarded-unquiesced", "guarded-wrong-tool", "guarded-bad-other",
+                     "guarded-bad-launch_failed", "guarded-bad-result_mismatch", "guarded-bad-supervision_failed",
+                     "guarded-bad-enroll_failed", "guarded-bad-admission_closed", "guarded-bad-workload_not_started"):
             with self.subTest(mode=mode):
                 (self.root / "state.json").write_text("{}")
                 host, directory, env = self.diagnostic_host(mode)

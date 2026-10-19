@@ -479,7 +479,9 @@ test("the spill path is built from the resolved worktree, so a symlinked worktre
     assert.equal(h.specs[0]!.spillPath.startsWith(`${path.join(root, "real")}/.uzi/scratch/uzi-cmd/`), true, h.specs[0]!.spillPath);
     assert.equal(h.specs[0]!.cwd, path.join(root, "link"));
     // An unresolvable worktree hands the wrapper a path it rejects; the command still launches.
-    const gone = harness({ worktree: path.join(root, "missing") });
+    const warnings: string[] = [];
+    const gone = harness({ worktree: path.join(root, "missing"), log: { debug() {}, info() {}, warn: (message: string) => { warnings.push(message); } } });
+    assert.equal(warnings.filter((m) => m.includes("spill disabled")).length, 1);
     assert.match(text(await gone.call({ command: "echo hi" })), /^Exit code: 0/);
     assert.equal(gone.specs[0]!.spillPath.startsWith("/dev/null/"), true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -492,6 +494,15 @@ test("the whole result text, headline and notes included, stays within 30000 cha
     const body = text(await h.call({ command: "gen" }));
     assert.ok(body.length <= 30_000, `${String(size)} chars of output returned ${String(body.length)}`);
     assert.match(body, /^Exit code: 3/);
+  }
+  // The truncation note must be truthful when the raw output was below the limit and only the
+  // headline pushed the result over it (29,990 chars + "Exit code: 3").
+  {
+    const near = harness();
+    near.script.current = (root) => { root.stdout.write("y".repeat(29_990)); setImmediate(() => root.exitWith(3)); };
+    const body = text(await near.call({ command: "gen" }));
+    assert.match(body, /inline limit \(which includes this result's notes\)/);
+    assert.doesNotMatch(body, /Output exceeded 30000 characters/);
   }
   // With the other notes present as well.
   const h = harness();

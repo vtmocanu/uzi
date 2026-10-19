@@ -220,7 +220,10 @@ export class ClaudeCommandLane {
     // The wrapper only spills when the spill parent is physically where it is named, so the path
     // must be built from the resolved worktree. When it cannot be resolved, hand the wrapper a
     // path it rejects (the command still runs, unspilled).
-    try { this.spillRoot = fs.realpathSync(opts.worktree); } catch { this.spillRoot = "/dev/null"; }
+    try { this.spillRoot = fs.realpathSync(opts.worktree); } catch (error) {
+      this.spillRoot = "/dev/null";
+      opts.log.warn("guarded command spill disabled for this run: the worktree could not be resolved", { error: sanitizeForLog(errMessage(error), 300) });
+    }
   }
 
   /** Commands currently launching or running. */
@@ -579,7 +582,7 @@ export class ClaudeCommandLane {
     eofSeen: boolean,
     extraNotes: readonly string[],
   ): ToolTextResult {
-    const spillNote = (previewOmitted: boolean): string => `Output exceeded ${String(INLINE_CAP_CHARS)} characters; ${previewOmitted
+    const spillNote = (previewOmitted: boolean): string => `Output reached the ${String(INLINE_CAP_CHARS)}-character inline limit (which includes this result's notes); ${previewOmitted
       ? "no inline preview is shown, because a configured secret is too long to redact safely across the cut"
       : "the text above is a preview (start and end)"}. A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`;
     const notesFor = (truncated: boolean, previewOmitted: boolean): string[] => {

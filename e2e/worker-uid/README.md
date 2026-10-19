@@ -275,15 +275,19 @@ The guarded measurement reports the node version; the sampled series
 sample, reservation request/grant, cancel and confirmed-drain times with the derived
 crossing-to-reserve, cancel-to-drain and crossing-to-drain latencies; the exact
 `worker_memory_pressure` tool result the lane returned for the attributed tool use (or the
-recorded `oom_before_guard`, `deadline`, `exited_before_guard` or `other` outcome); and
+recorded `oom_before_guard`, `deadline` or `exited_before_guard` outcome; the last requires the workload's own report line in the output as evidence it started); and
 cleanup evidence (lane live count and quiesce, empty registry, the command's pids gone, no
 leftover process, `oom_kill` delta, `memory.peak`). The guard's high-water mark (half the
 cgroup limit), the 250 ms sampling period and the 5 s response budget are measurement
 parameters picked to give the guard room to act, never hosted production thresholds. A guard
 that did not act in time or an OOM kill is a recorded result; a lane or launcher construction
-failure, unparseable output or unconfirmed cleanup fails like any host error, after the owned
+failure, a launch failure or lane refusal, a supervision or enrollment failure, an admission closed
+without the guard's result, a workload that never started (exit 127, an import error), unparseable
+output or unconfirmed cleanup fails like any host error, after the owned
 container is removed. A kernel kill of the container's main process before it reports (exit
-137) is recorded as `container_killed_no_report`.
+137) is recorded as `container_killed_no_report`. The guarded container's host bound is 65 s (the
+plain workloads keep 30 s), above the leg's ~52 s in-container worst case, so a slow `deadline`
+outcome is recorded rather than cut by the host.
 
 A host kernel without PSI (no `memory.pressure`) makes the production reader report
 `absent`. Only in this guarded leg's harness the reader gets a `readBytes` that is the real

@@ -47,7 +47,14 @@ export type GuardedOutcome =
   | "guard_acted" // the lane returned the guard's worker_memory_pressure result for the attributed tool use
   | "oom_before_guard" // the cgroup OOM killer acted and the guard returned no pressure result
   | "deadline" // the command hit its own deadline
-  | "exited_before_guard" // the command ended on its own (any exit code) without the guard acting
+  | "exited_before_guard" // the workload ran (its own report is in the output) and ended on its own without the guard acting
+  // Harness faults, never measurements: calibration.py parse_guarded rejects every one of them.
+  | "launch_failed" // "Command could not be started"
+  | "result_mismatch" // "memory_result_mismatch"
+  | "supervision_failed" // "Command supervision failed"
+  | "enroll_failed" // "could not be placed under memory supervision"
+  | "admission_closed" // memory-guard admission closed without the guard's pressure result
+  | "workload_not_started" // the command ended but the workload never reported (exit 127, import error, ...)
   | "other";
 
 export interface GuardedLegInput {
@@ -344,10 +351,19 @@ export async function measureGuardedLeg(input: GuardedLegInput) {
     const [, t1, b1] = series[i - 1]!, [, t2, b2] = series[i]!;
     if (t2 > t1) peakGrowthBytesPerSecond = Math.max(peakGrowthBytesPerSecond, Math.round(((b2 - b1) / (t2 - t1)) * 1000));
   }
+  // The workload child prints one JSON report line (calibration-diagnostic.mts runWorkload) when it
+  // finishes, so that line is the evidence it actually started and ran; an exit with none (exit 127,
+  // an import error) is a harness fault.
+  const workloadReported = /"outcome":"(passed|assertion|other_error)"/.test(resultText);
   const outcome: GuardedOutcome = pressure ? "guard_acted"
     : oomKillDelta ? "oom_before_guard"
     : resultText.startsWith("Command timed out") ? "deadline"
-    : resultText.startsWith("Exit code: ") ? "exited_before_guard" : "other";
+    : resultText.startsWith("Exit code: ") ? (workloadReported ? "exited_before_guard" : "workload_not_started")
+    : resultText.startsWith("Command could not be started") ? "launch_failed"
+    : resultText.startsWith("memory_result_mismatch") ? "result_mismatch"
+    : resultText.startsWith("Command supervision failed") ? "supervision_failed"
+    : resultText.includes("could not be placed under memory supervision") ? "enroll_failed"
+    : resultText.includes("memory-guard admission closed") ? "admission_closed" : "other";
 
   const remainingPids = otherPids().filter((pid) => !processesBeforeCall.has(pid));
   const commandPids = [...seenPids];

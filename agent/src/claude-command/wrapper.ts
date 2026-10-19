@@ -24,8 +24,12 @@
 //     `.uzi/scratch/uzi-cmd` with a symlink to another writable directory, and the unredacted
 //     spill would then land outside the scratch area, possibly in a tracked path. Any mismatch
 //     (or an uncreatable parent) redirects the spill to /dev/null like the final-component
-//     refusal. A parent swapped after this check, before the asynchronous spill open, is the
-//     same class of bounded same-uid race as the one above;
+//     refusal. `mkdir -p` runs BEFORE this physical-path check, so when an ancestor of the spill
+//     directory is a symlink the empty directories are still created at its target (no spill
+//     file is written there). A parent swapped after this check, before the asynchronous spill
+//     open, is a different race from the FIFO stall above: at worst it misplaces the capped raw
+//     output of the model's own command, which same-uid model code could already write anywhere
+//     it can write, and it does not stall anything;
 //   - the writer `tee >( { head -c cap > spill; cat >/dev/null; } ); wait` forwards every byte
 //     to the wrapper's stdout (the supervisor transport) and spills at most `cap` bytes, then
 //     keeps draining, so a full cap or a failed spill open never SIGPIPEs the command; its
