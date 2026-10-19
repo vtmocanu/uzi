@@ -9,7 +9,8 @@ import { runnerCommand } from "../src/runner-uid.js";
 import { setQuiescenceViewForTests } from "../src/run-quiescence.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { noProofReseed, recordingLogger } from "./helpers.js";
-import { codexRig } from "./runner-codex-sinks-fixture.js";
+import { CodexExecutor } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 const CONTENT = "unpublished command work for retained permissions\n";
@@ -131,12 +132,9 @@ export async function retainedPermissionsCase(options: Options = {}) {
   fs.mkdirSync(shared);
   fs.chownSync(shared, -1, 10002);
   fs.chmodSync(shared, 0o2770);
-  // This fixture starts no provider roots. Every real command root is awaited and disposed.
-  // The shared empty table keeps the existing runner-identity scan hermetic and readable;
-  // the default test table lives below the worker-private TMPDIR and is not runner-readable.
-  const emptyProc = path.join(shared, "empty-proc");
-  fs.mkdirSync(emptyProc, { mode: 0o755 });
-  setQuiescenceViewForTests({ procRoot: emptyProc });
+  // The production fixed reaper requires actual procfs, with acquisition-local
+  // attempt identity supplied through CodexExecutor below.
+  setQuiescenceViewForTests(undefined);
 
   // Dummy private files prove both credential boundaries without introducing any real credential.
   const workerSecret = path.join(shared, "worker-private");
@@ -366,14 +364,29 @@ catch(e) { if(e.code!=="EACCES") throw e; }
   };
   client.releaseRecoveryCustody = async () => { releases++; throw new Error("fixture must retain custody"); };
   const log = recordingLogger();
-  const capture = codexRig().capture;
+  const selection = selectCodexBinding({ codex: {
+    auth_mode: "api_key", access_token: "fixture-access", capability: "fixture-cap",
+  } });
+  assert.equal(selection.kind, "codex");
+  if (selection.kind !== "codex") throw new Error("fixture binding unavailable");
+  // Use the production pre-start capture path for immutable attempt binding and
+  // supervised launch/cleanup. Provider startup remains forbidden in this fixture.
+  const captureExecutor = new CodexExecutor(log.logger, path.join(homeDir, claim.run_id), {
+    binding: selection.binding, client, commandSandbox: "required",
+    provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1",
+      envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+  }, {
+    installDeps: async () => { throw new Error("must not install"); },
+    provisionRunTools: async () => { throw new Error("must not provision"); },
+    launchProviderRoot: async () => { models++; throw new Error("must not start provider"); },
+  });
   await runnerWith(runId => ({
     homeDir: path.join(homeDir, runId),
     executor: {
       sandboxesCommands: true,
-      withCredentialFreeCapture: (ms, action, purpose, signal) => {
+      withCredentialFreeCapture: (ms, action, purpose, signal, attempt) => {
         settlements++;
-        return capture(ms, action, purpose, signal);
+        return captureExecutor.withCredentialFreeCapture(ms, action, purpose, signal, attempt);
       },
       run: async () => { models++; throw new Error("must not start provider/model"); },
     },

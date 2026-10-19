@@ -161,8 +161,10 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
               assert.equal(active, true, event.phase + " retains capture custody");
               assert.equal(rig.registry.state(), "poisoned", event.phase + " keeps successor admission closed");
             }
+            // Sequential completed scopes contribute equally to both counters;
+            // the current entered scope must still have no matching return.
             if (event.phase === "primary-held" || event.phase === "full-root-held")
-              holds.push({ phase: event.phase, active, pending: !done, captureReturned: returns > 0 });
+              holds.push({ phase: event.phase, active, pending: !done, captureReturned: returns >= entries });
           } finally { event.release(); }
         }
         await settled;

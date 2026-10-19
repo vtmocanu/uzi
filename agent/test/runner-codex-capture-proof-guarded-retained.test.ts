@@ -115,21 +115,38 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
     }
     let supplied: Parameters<NonNullable<Executor["withCredentialFreeCapture"]>>[4];
     const proofCalls: QuiesceRunRequest[] = [];
+    const acquisitions: Array<{ metadata: NonNullable<typeof supplied>; proofs: QuiesceRunRequest[] }> = [];
+    let normalized = 0;
     const prestartCapture: NonNullable<Executor["withCredentialFreeCapture"]> = async (ms, action, purpose, signal, metadata) => {
-      if (newCapture) {
+      {
         assert.ok(metadata);
         assert.equal(metadata.clonePath, clone.path);
         assert.notEqual(metadata.marker.split(":").at(-1), before.attemptId);
         assert.notEqual(metadata.marker, sourceMarker, "probe differs from real prior source marker");
         assert.equal(Object.isFrozen(metadata), true);
         supplied = metadata;
+        assert.ok(acquisitions.every(x => x.metadata.marker !== metadata.marker), "fresh probe per acquisition");
+        acquisitions.push({ metadata, proofs: [] });
       }
       return observer.capture(ms, action, purpose, signal);
     };
+    // Hermetic ordering seam only: real UID permission and custody proof lives in retained-permissions-fixture.
+    t.mock.method(git, "normalizeRetainedSourceObjects", async (...args: Parameters<typeof git.normalizeRetainedSourceObjects>) => {
+      assert.equal(stage === "missing-capability", false, "missing capability never reaches readiness");
+      assert.equal(observer.isActive(), false, "normalization stays outside Git-only capture");
+      assert.equal(acquisitions.length, 1, "initial scoped predecessor proof finished first");
+      assert.equal(observer.observations().entries, 1);
+      assert.equal(observer.observations().returns, 1);
+      assert.ok(acquisitions[0]!.proofs.length > 0);
+      assert.deepEqual(args, [bare, clone.branch, "issue-2512", before]);
+      normalized++;
+    });
     let verifiedCalls = 0, verifiedTrue = 0, facts = 0;
     const factScopes: boolean[] = [];
     const verify = git.verifiedRecoveryRestorePoint.bind(git);
     t.mock.method(git, "verifiedRecoveryRestorePoint", async (...args: Parameters<typeof verify>) => {
+      assert.equal(normalized, 1);
+      assert.equal(observer.isActive(), true);
       observer.recordSource(clone.path);
       verifiedCalls++;
       const result = await verify(...args);
@@ -167,7 +184,7 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
             assert.notEqual(ctx.worktreePath, clone.path);
             assert.ok(ctx.runAttempt, "successor has a real normal attempt");
             assert.notEqual(ctx.runAttempt.marker, sourceMarker);
-            if (newCapture) assert.notEqual(ctx.runAttempt.marker, supplied!.marker);
+            assert.ok(acquisitions.every(x => x.metadata.marker !== ctx.runAttempt!.marker), "normal attempt differs from every acquisition probe");
             assert.equal(readJournal(bare, clone.branch).attemptId, ctx.runAttempt.marker.split(":").at(-1), "successor journal carries actual new ID");
             assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
           } catch (error) { callbackFailures.push(error); }
@@ -178,10 +195,13 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
     const diagnostics = recordingLogger();
     const r = runnerWith(make, fakeGitlab().gitlab, JOIN_TOKEN, diagnostics.logger, { recoveryRetryMs: 1, liveAttempts: live,
       quiesceRun: async req => {
-        if (newCapture && req.targetPaths.includes(clone.path)) {
+        if (req.targetPaths.includes(clone.path)) {
           proofCalls.push(req);
           if (observer.isActive()) {
             assert.ok(req.attempt);
+            const acquisition = acquisitions.at(-1)!;
+            acquisition.proofs.push(req);
+            assert.ok(acquisition.proofs.every(x => x.attempt === req.attempt), "same acquisition object through initial/body/reproof");
             assert.deepEqual({ marker: req.attempt.marker, cloneKey: req.attempt.cloneKey, clonePath: req.attempt.clonePath }, supplied);
             assert.equal(req.mode, "capture");
             assert.deepEqual(req.targetPaths, [clone.path]);
@@ -199,6 +219,7 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
       for (const method of methods) {
         const original = (target as any)[method].bind(target);
         t.mock.method(target as any, method, async (...args:any[]) => {
+          assert.equal(normalized, 1, "readiness precedes source and guarded producer work");
           spans.push({method,phase:"entry",active:observer.isActive()});
           const result = await original(...args);
           spans.push({method,phase:"return",active:observer.isActive(),result:!!result});
@@ -238,6 +259,8 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
       if (stage === "missing-capability") {
         observer.assertRefusal();
         assert.equal(models, 0);
+        assert.equal(normalized, 0);
+        assert.equal(verifiedCalls, 0);
         assert.equal(facts, 0);
         assert.equal(readJournal(bare, clone.branch).clonePath, before.clonePath);
       } else {
@@ -251,9 +274,16 @@ for (const stage of ["newcapture", "pending-entry", "captured", "adopting", "mis
         assert.equal(facts, 1);
         assert.deepEqual(factScopes, [true], "capture held through actual journal capture fact");
         observer.assertProof(true);
+        assert.equal(normalized, 1);
+        assert.equal(acquisitions.length, 2);
+        for (const acquisition of acquisitions) {
+          if (newCapture || acquisition === acquisitions[0]) assert.ok(acquisition.proofs.length > 0);
+          assert.ok(!registryWrites.includes(acquisition.metadata.marker), "neither acquisition probe registered");
+        }
         if (newCapture) {
+          assert.notEqual(acquisitions[0]!.proofs[0]!.attempt, acquisitions[1]!.proofs[0]!.attempt);
           assert.ok(proofCalls[0]);
-          assert.equal(proofCalls[0].attempt, undefined, "outside predecessor guard has no normal attempt");
+          assert.equal(proofCalls[0].attempt, acquisitions[0]!.proofs[0]!.attempt, "initial predecessor guard uses its acquisition-local attempt");
           const inside = proofCalls.filter(req => req.attempt?.marker === supplied?.marker);
           assert.ok(inside.length >= 2, "inside Body and after-Git reproof both reached");
           const firstInside = inside[0];

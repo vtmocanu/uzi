@@ -1,5 +1,6 @@
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
+import { provisionRunTools } from "../src/provision-run.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
 import { m3Calls } from "./m3-recovery-fixture.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
@@ -21413,14 +21414,27 @@ describe("#2852 default provision binding", () => {
     if (tier2) await fs.writeFile(path.join(repo, "devbox.json"), JSON.stringify({ packages: ["hello"] }));
     const native = provisionNative(options);
     const rig = makeRig({ responder: done });
-    rig.deps = { ...rig.deps, deferRegistryTeardown: true, provisionRunTools: undefined, launchCodexProvisionRootForTest: native.launcher };
+    const backoffEntered = installerBarrier(), releaseBackoff = installerBarrier();
+    rig.deps = { ...rig.deps, deferRegistryTeardown: true,
+      provisionRunTools: options.transientOnce && options.hold
+        ? (ctx, opts) => provisionRunTools(ctx, { ...opts,
+          provision: (input, deps) => {
+            assert.ok(opts.provision, "retain production supervised provision binding");
+            return opts.provision(input, { ...deps, sleep: async () => {
+              backoffEntered.resolve();
+              await releaseBackoff.promise;
+            } });
+          },
+        }) : undefined,
+      launchCodexProvisionRootForTest: native.launcher };
     const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, path.join(dir, "home"));
     const controller = new AbortController();
     const { ctx } = makeCtx({ runId: "28520000-0000-4000-8000-000000000001", worktreePath: repo,
       signal: controller.signal, config: { tool_packages: packages, repo_devbox_opt_in: tier2 } as RunContext["config"] });
     const run = exec.run(ctx).then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
-    return { native, rig, exec, controller, run, cleanup: async () => {
-      controller.abort(); native.release();
+    return { native, rig, exec, controller, run, backoffEntered: backoffEntered.promise,
+      releaseBackoff: () => releaseBackoff.resolve(), cleanup: async () => {
+      controller.abort(); native.release(); releaseBackoff.resolve();
       await withTimeout(run, 5000, "provision cleanup");
       native.destroy(); await fs.rm(dir, { recursive: true, force: true });
     } };
@@ -21475,11 +21489,11 @@ describe("#2852 default provision binding", () => {
       if (phase === "backoff") {
         await withTimeout(fx.native.disposing, 2000, "failed primary cleanup");
         fx.native.release();
-        await new Promise(resolve => setTimeout(resolve, 20));
+        await withTimeout(fx.backoffEntered, 2000, "provision retry sleep entry");
       }
       let body = 0;
       const capture = fx.exec.withCredentialFreeCapture(1000, async () => { body++; });
-      fx.native.release();
+      fx.native.release(); fx.releaseBackoff();
       assert.equal((await withTimeout(capture, 3000, "cancel setup")).kind, "observed_empty");
       await withTimeout(fx.run, 3000, "cancelled provisioning");
       assert.equal(body, 1);
@@ -21496,10 +21510,10 @@ describe("#2852 default provision binding", () => {
       if (phase === "backoff") {
         await withTimeout(fx.native.disposing, 2000, "lifecycle primary cleanup");
         fx.native.release();
-        await new Promise(resolve => setTimeout(resolve, 20));
+        await withTimeout(fx.backoffEntered, 2000, "provision retry sleep entry");
       }
       fx.controller.abort(new Error("owner cancellation"));
-      fx.native.release();
+      fx.native.release(); fx.releaseBackoff();
       const result = await withTimeout(fx.run, 3000, "lifecycle cancelled provision");
       assert.ok(result.error);
       assert.equal(fx.native.calls.length, 1);
