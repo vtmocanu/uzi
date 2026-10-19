@@ -27,8 +27,8 @@ annotations:
 dependencies:
   - name: cluster
     alias: postgres
-    # Pinned to the same `cluster` chart version the fleet's other CNPG apps use
-    # for fleet consistency, NOT the latest. Bump together with the fleet.
+    # Pinned to the `cluster` chart version the fleet's newest CNPG apps use (some
+    # still run 0.6.1), NOT the latest. Bump together with the fleet.
     #
     # The rendered Cluster always emits `.spec.monitoring.tls.enabled`. The CNPG
     # operator's Cluster CRD declares that field (operator 1.30.1, the fleet's and
