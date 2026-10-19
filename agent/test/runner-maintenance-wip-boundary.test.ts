@@ -643,6 +643,12 @@ test("transfer callback and real owned child join before release: " + mode, asyn
   }
 });
 
+// Issue #3132 made worktreeHead rethrow a hard boundary abort instead of answering null.
+// Only the hard permit-boundary abort qualifies, never an arbitrary rejection.
+const boundaryAbort = (error: unknown): boolean => error instanceof Error && error.name === "AbortError" &&
+  /^permit-held git (output collection|operation) aborted/.test(error.message) &&
+  (error as { checkpointBoundary?: unknown }).checkpointBoundary === "hard";
+
 test("escaped asynchronous Git callback cannot launch after transfer return", async t => {
   const f = await fixture(t);
   const release = deferred();
@@ -655,7 +661,7 @@ test("escaped asynchronous Git callback cannot launch after transfer return", as
       late = (async () => { await release.promise; return git.worktreeHead(f.root); })();
     });
     release.resolve();
-    assert.equal(await late, null);
+    await assert.rejects(late, boundaryAbort);
     assert.throws(check, refused);
     assert.equal(f.pids.length, count);
   }));
@@ -675,14 +681,15 @@ test("transfer signal aborts and joins an active real Git-spawned child: " + mod
     onSpawn: () => { if (armed) spawned.resolve(); },
     signalGroup: (_pid, sig) => { if (armed) signals.push(sig); return undefined; },
   } } });
-  let completed = false;
+  let completed = false, headOutcome: unknown;
   const pending = MaintenanceBudget.run(budget, () => f.run(() => f.boundary(async ctx => {
     await ctx.captureWip(f.root, f.old, callbacks);
     armed = true;
     await ctx.withMaintenanceTransfer(async check => {
       check();
-      assert.equal(await git.worktreeHead(f.root), null, "aborted child cannot provide a Git answer");
-      callbackIO.resolve();
+      // Recorded and asserted outside: the transfer converts a callback failure into its refusal.
+      try { headOutcome = await git.worktreeHead(f.root).then(value => ({ value }), (error: unknown) => error); }
+      finally { callbackIO.resolve(); }
       await releaseIO.promise;
     });
   }, [f.root], caller.signal))).finally(() => { completed = true; });
@@ -701,6 +708,7 @@ test("transfer signal aborts and joins an active real Git-spawned child: " + mod
   await rejected;
   for (const pid of f.pids) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   assert.equal(f.runner.isExecuting("run"), false);
+  assert.ok(boundaryAbort(headOutcome), "aborted child cannot provide a Git answer: " + String(headOutcome));
 });
 
 for (const mode of ["unknown-probe", "survivor"] as const)
@@ -759,6 +767,7 @@ test("transfer joins a real unawaited child after callback " + mode, async t => 
     await ctx.withMaintenanceTransfer(async check => {
       lateCheck = check;
       child = git.worktreeHead(f.root);
+      void child.catch(() => undefined);
       await spawned.promise;
       if (mode === "throw") throw new Error("private callback failure");
     });
@@ -771,7 +780,7 @@ test("transfer joins a real unawaited child after callback " + mode, async t => 
     assert.equal(f.runner.isExecuting("run"), true);
     assert.equal(f.view.inventoryReservations.has("run"), true);
     assert.throws(lateCheck, refused, "callback scope closes before child settlement completes");
-    assert.equal(await child, null);
+    await assert.rejects(child, boundaryAbort);
   } finally { releaseCleanup.resolve(); }
   await outcome;
   assert.equal(f.runner.isExecuting("run"), false);
@@ -819,7 +828,7 @@ test("capture budget cancellation reaches a transfer child after scope exit", as
       await spawned.promise;
       now = 120_000;
       assert.throws(() => original.check());
-      await child;
+      await assert.rejects(child, boundaryAbort);
       signalledBeforeReturn = signals.includes("SIGTERM");
     });
   })), refused);
