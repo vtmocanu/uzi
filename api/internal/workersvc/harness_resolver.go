@@ -483,8 +483,8 @@ var errCodexCreateRequiresTx = errors.New("codex run creation requires an atomic
 // guess. (M1 builds and proves the seam; M2/M3 wire the production origins onto it.)
 //
 // Ordering (D1): begin tx → derive qtx via WithTx → resolve D11 through qtx (re-reading the
-// credential/default facts inside the tx that commits) → insert(qtx, resolved) → when codex,
-// freeze through the SAME qtx → commit. Any error rolls the whole transaction back, so a Codex
+// credential/default facts inside the tx that commits) → insert(qtx, resolved) → initialize
+// closed coverage for eligible Codex roots → when codex, freeze through the SAME qtx → commit. Any error rolls the whole transaction back, so a Codex
 // freeze failure leaves NO runs row.
 //
 // A nil txBeginner is FAIL CLOSED for Codex (errCodexCreateRequiresTx): the binding freeze must
@@ -531,6 +531,18 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	run, err := insert(qtx, res)
 	if err != nil {
 		return store.Run{}, resolvedHarness{}, err
+	}
+
+	// Every successful production insert closure returns its newly inserted row;
+	// retries of cross-check creation return an error rather than an existing row.
+	// Initialize only here, before freeze/commit, never on claim or a later read.
+	if policyEligible(run) && !run.TargetRunID.Valid && !run.ReviewTargetRunID.Valid && !run.ThenFixOfRunID.Valid {
+		run, err = qtx.InitializePolicyRevisionSource(ctx, store.InitializePolicyRevisionSourceParams{
+			RunID: run.ID, UserID: userID,
+		})
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
 	}
 
 	if res.Harness == HarnessCodex {

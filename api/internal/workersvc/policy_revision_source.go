@@ -60,11 +60,8 @@ func decodePolicyRevisionWire(m IncomingMessage) policyRevisionWire {
 // the authenticated worker/run locks. This recorder extends existing complete V1
 // coverage; it cannot bootstrap unknown coverage from a single taken source.
 func (s *Service) writePolicyRevisionSource(ctx context.Context, tx pgx.Tx, w store.Worker, r store.Run, gen *int64, seq int32, wire policyRevisionWire) error {
-	if !s.p.PolicyHoldNegotiated || !s.p.PolicyHoldSnapshotEnabled || s.p.TerminalPendingLease <= 0 ||
-		!slices.Contains(w.ProtocolCapabilities, capability.ProviderPolicyHoldV1) ||
-		!slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchV1) ||
-		!policyEligible(r) || r.TargetRunID.Valid || len(r.PolicyStopResolution) > 0 ||
-		gen == nil || *gen <= 0 || *gen != r.ClaimGeneration || r.ClaimReleasedAt.Valid ||
+	if !policyEligible(r) || r.TargetRunID.Valid || len(r.PolicyStopResolution) > 0 ||
+		r.ClaimGeneration <= 0 || (gen != nil && (*gen <= 0 || *gen != r.ClaimGeneration)) || r.ClaimReleasedAt.Valid ||
 		!r.WorkerID.Valid || uuid.UUID(r.WorkerID.Bytes) != w.ID || r.UserID != w.UserID ||
 		!slices.Contains([]string{"claimed", "running", "awaiting_approval"}, r.Status) {
 		return nil
@@ -74,15 +71,23 @@ func (s *Service) writePolicyRevisionSource(ctx context.Context, tx pgx.Tx, w st
 	if err != nil {
 		return err
 	}
-	if int64(seq) != latest {
+	if int64(seq) != latest && seq <= r.LastSeq {
 		return nil
 	}
-	raw, err := policyRevisionUpdatedSource(ctx, tx, r, w, wire)
-	if err != nil {
-		return err
+	// A revision newer than the locked pre-append LastSeq destroys coverage even
+	// when a later plan in this batch overtakes it. That plan does not establish
+	// source acceptance. Only the latest revision can certify new coverage.
+	var raw []byte
+	if int64(seq) == latest && gen != nil && s.p.PolicyHoldNegotiated && s.p.PolicyHoldSnapshotEnabled && s.p.TerminalPendingLease > 0 &&
+		slices.Contains(w.ProtocolCapabilities, capability.ProviderPolicyHoldV1) &&
+		slices.Contains(w.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		raw, err = policyRevisionUpdatedSource(ctx, tx, r, w, wire)
+		if err != nil {
+			return err
+		}
 	}
 	rows, err := q.SetPolicyRevisionSource(ctx, store.SetPolicyRevisionSourceParams{
-		Source: raw, RunID: r.ID, WorkerID: w.ID, ClaimGeneration: *gen,
+		Source: raw, RunID: r.ID, WorkerID: w.ID, ClaimGeneration: r.ClaimGeneration,
 	})
 	if err != nil {
 		return err

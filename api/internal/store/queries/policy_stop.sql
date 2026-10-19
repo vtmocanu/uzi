@@ -1,3 +1,19 @@
+-- name: InitializePolicyRevisionSource :one
+-- Only createRunAtomic calls this, immediately after a fresh INSERT in its
+-- transaction. Closed coverage is server truth, not a candidate approval.
+UPDATE runs
+SET policy_revision_source = '{"version":1,"gate":null,"primary_revision":null,"associated_cross_checks":[]}'::jsonb
+WHERE id = sqlc.arg(run_id)::uuid AND user_id = sqlc.arg(user_id)::uuid
+ AND harness = 'codex' AND NOT interactive AND target_run_id IS NULL
+ AND review_target_run_id IS NULL AND then_fix_of_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve')
+ AND status = 'queued' AND claim_generation = 0 AND worker_id IS NULL
+ AND claim_released_at IS NULL AND policy_stop_resolution IS NULL
+ AND policy_revision_source IS NULL AND policy_refusal_count = 0
+ AND gate_revision = 0 AND gate_presentation_id IS NULL
+ AND gate_payload_digest IS NULL AND gate_presented_payload IS NULL
+RETURNING *;
+
 -- name: SetPolicyRevisionSource :execrows
 -- Caller holds the worker/run claim transaction and authenticates finite coverage.
 UPDATE runs SET policy_revision_source = sqlc.narg(source)::jsonb

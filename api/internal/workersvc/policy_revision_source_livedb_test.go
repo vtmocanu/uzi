@@ -191,6 +191,11 @@ func TestPolicyRevisionWriterOrderingLiveDB(t *testing.T) {
 				if err != nil || got.PrimaryRevision == nil {
 					t.Fatalf("highest seq lost: %s %v", after.PolicyRevisionSource, err)
 				}
+			} else if mode == "unsupported" || mode == "later_plan" {
+				var isNull bool
+				if err := e.pool.QueryRow(e.ctx, "SELECT policy_revision_source IS NULL FROM runs WHERE id=$1", e.runID).Scan(&isNull); err != nil || !isNull {
+					t.Fatalf("unproven authoritative revision must invalidate coverage to SQL NULL: %v %v", isNull, err)
+				}
 			} else if !bytes.Equal(before, after.PolicyRevisionSource) {
 				t.Fatal("source changed without authoritative eligible latest revision")
 			}
