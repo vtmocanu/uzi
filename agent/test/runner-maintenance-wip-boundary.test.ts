@@ -501,14 +501,16 @@ test("a different valid slot cannot continue an earlier capture", async t => {
     config: RecoveryMaintenance.configuration(), exactCustody: true, terminalNonStopped: true, source: "b".repeat(64),
   });
   assert.ok(admitted.ok);
+  let entered = false;
   try {
     await assert.rejects(f.boundary(async ctx => {
       await f.run(() => ctx.captureWip(f.root, f.old, callbacks));
       const count = f.pids.length;
       await assert.rejects(MaintenanceResources.run(admitted.value,
-        () => ctx.withMaintenanceTransfer(async () => assert.fail("foreign slot callback"))), refused);
+        () => ctx.withMaintenanceTransfer(async () => { entered = true; })), refused);
       assert.equal(f.pids.length, count);
     }), refused);
+    assert.equal(entered, false, "a foreign slot never enters the callback");
     MaintenanceResources.run(admitted.value, () => MaintenanceResources.check());
   } finally { await ledger.finish(admitted.value, "transient"); }
 });
@@ -533,12 +535,14 @@ test("transfer checks local authority at " + at + ": " + mode, async t => {
     if (mode === "unquiet") f.quiet(false);
     if (mode === "exhausted") assert.throws(() => MaintenanceResources.consume("launches", 513));
   };
+  let entered = false;
   await assert.rejects(MaintenanceBudget.run(budget, () => f.run(() => f.boundary(async ctx => {
     await ctx.captureWip(f.root, f.old, callbacks);
     const count = f.pids.length;
     if (at === "entry") revoke();
     await assert.rejects(ctx.withMaintenanceTransfer(async check => {
-      if (at === "entry") assert.fail("refused before callback");
+      entered = true;
+      if (at === "entry") return;
       revoke();
       if (mode === "unquiet") { check(); return; } // Positive post-transfer proof is separately required.
       assert.throws(check);
@@ -546,6 +550,7 @@ test("transfer checks local authority at " + at + ": " + mode, async t => {
     }), /maintenance_|abort/i);
     assert.equal(f.pids.length, count);
   }, [f.root], caller.signal))), /maintenance_|abort/i);
+  assert.equal(entered, at === "spawn", "entry refusal must precede the callback");
 });
 
 test("transfer quiescence reentry is denied synchronously and uses one family envelope", async t => {
@@ -732,9 +737,12 @@ test("transfer uncertainty retains the original unresolved tail: " + mode, async
 for (const mode of ["return", "throw"] as const)
 test("transfer joins a real unawaited child after callback " + mode, async t => {
   let armed = false;
+  const signals: string[] = [];
   const spawned = deferred(), cleanupEntered = deferred(), releaseCleanup = deferred();
   const f = await fixture(t, { checkpointTestHooks: { tickSpawn: {
-    rewrite: request => armed ? { ...request, argv: [process.execPath, "-e", "setInterval(() => {}, 1000)"] } : request,
+    // A missing abort reaches an assertion after natural exit, never a timeout.
+    rewrite: request => armed ? { ...request, argv: [process.execPath, "-e", "setTimeout(() => {}, 1000)"] } : request,
+    signalGroup: (_group, signal) => { if (armed) signals.push(signal); return undefined; },
     onSpawn: () => { if (armed) spawned.resolve(); },
   } } });
   let completed = false, lateCheck!: () => void, child!: Promise<string | null>;
@@ -758,6 +766,7 @@ test("transfer joins a real unawaited child after callback " + mode, async t => 
   const outcome = mode === "throw" ? assert.rejects(pending, refused) : pending;
   try {
     await cleanupEntered.promise;
+    assert.ok(signals.includes("SIGTERM"), "phase return aborts its owned child");
     assert.equal(completed, false);
     assert.equal(f.runner.isExecuting("run"), true);
     assert.equal(f.view.inventoryReservations.has("run"), true);
@@ -766,6 +775,74 @@ test("transfer joins a real unawaited child after callback " + mode, async t => 
   } finally { releaseCleanup.resolve(); }
   await outcome;
   assert.equal(f.runner.isExecuting("run"), false);
+});
+
+for (const state of ["aborted", "expired-disposed"] as const)
+for (const replacement of ["absent", "longer"] as const)
+test("capture budget survives scope exit: " + state + "/" + replacement, async t => {
+  const f = await fixture(t);
+  let now = 0, entered = false;
+  const original = new MaintenanceBudget(120_000, () => now);
+  const longer = new MaintenanceBudget(600_000);
+  t.after(() => { original.dispose(); longer.dispose(); });
+  await assert.rejects(f.run(() => f.boundary(async ctx => {
+    await MaintenanceBudget.run(original, () => ctx.captureWip(f.root, f.old, callbacks));
+    now = 120_000;
+    if (state === "aborted") assert.throws(() => original.check());
+    else {
+      original.dispose();
+      assert.equal(original.signal.aborted, false, "deadline must be checked even without its timer");
+    }
+    const transfer = () => ctx.withMaintenanceTransfer(async () => { entered = true; });
+    await (replacement === "longer" ? MaintenanceBudget.run(longer, transfer) : transfer());
+  })), refused);
+  assert.equal(entered, false);
+  assert.equal(original.deadline, 120_000, "the original deadline is never rebased");
+});
+
+test("capture budget cancellation reaches a transfer child after scope exit", async t => {
+  let armed = false, now = 0, signalledBeforeReturn = false;
+  const spawned = deferred(), signals: string[] = [];
+  const f = await fixture(t, { checkpointTestHooks: { tickSpawn: {
+    rewrite: request => armed ? { ...request, argv: [process.execPath, "-e", "setTimeout(() => {}, 1000)"] } : request,
+    onSpawn: () => { if (armed) spawned.resolve(); },
+    signalGroup: (_group, signal) => { if (armed) signals.push(signal); return undefined; },
+  } } });
+  const original = new MaintenanceBudget(120_000, () => now);
+  t.after(() => original.dispose());
+  await assert.rejects(f.run(() => f.boundary(async ctx => {
+    await MaintenanceBudget.run(original, () => ctx.captureWip(f.root, f.old, callbacks));
+    armed = true;
+    await ctx.withMaintenanceTransfer(async check => {
+      check();
+      const child = git.worktreeHead(f.root);
+      await spawned.promise;
+      now = 120_000;
+      assert.throws(() => original.check());
+      await child;
+      signalledBeforeReturn = signals.includes("SIGTERM");
+    });
+  })), refused);
+  assert.equal(signalledBeforeReturn, true, "original cancellation reaches the child before callback return");
+});
+
+test("a disposed capture timer can continue only within its original remaining bound", async t => {
+  const f = await fixture(t);
+  let now = 0;
+  const original = new MaintenanceBudget(120_000, () => now);
+  const longer = new MaintenanceBudget(600_000);
+  t.after(() => { original.dispose(); longer.dispose(); });
+  await f.run(() => f.boundary(async ctx => {
+    await MaintenanceBudget.run(original, () => ctx.captureWip(f.root, f.old, callbacks));
+    original.dispose();
+    now = 110_000;
+    await MaintenanceBudget.run(longer, () => ctx.withMaintenanceTransfer(async check => {
+      check();
+      assert.ok(MaintenanceBudget.current()!.remainingMs() <= 10_000);
+      assert.equal(original.deadline, 120_000);
+      assert.equal(await git.worktreeHead(f.root), f.old);
+    }));
+  }));
 });
 
 test("failed capture settlement never permits a transfer", async t => {

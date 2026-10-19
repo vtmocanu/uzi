@@ -3105,6 +3105,7 @@ export class RunRunner {
     };
     let capturedSource: string | undefined;
     let capturedSignal: AbortSignal | undefined;
+    let capturedBudget: MaintenanceBudget | undefined;
     let captureCompleted = false;
     let transferClaimed = false;
     let transferTask: Promise<unknown> | undefined;
@@ -3119,28 +3120,30 @@ export class RunRunner {
       const chargedSignal = capturedSignal;
       const phaseScope = new AbortController();
       transferScope = phaseScope;
-      let phaseActive = true;
-      let callbackActive = false;
-      const ambientSignal = MaintenanceBudget.current()?.signal;
-      const continuationSignal = AbortSignal.any([chargedSignal, this.shutdownSignal.signal,
-        ...(ambientSignal ? [ambientSignal] : []), ...(signal ? [signal] : [])]);
-      const ownerSignal = AbortSignal.any([phaseScope.signal, continuationSignal]);
-      const checkLocal = () => {
-        try {
-          if (!phaseActive || !open() || !clonePaths.includes(source) ||
-              this.dataVolume?.preflight() === "data_volume_full") throw refused();
-          MaintenanceBudget.current()?.check();
-          MaintenanceResources.check();
-          if (MaintenanceResources.signalIfActive() !== chargedSignal) throw refused();
-          continuationSignal.throwIfAborted();
-        } catch { throw refused(); }
-      };
-      const check = () => {
-        if (!callbackActive) throw refused();
-        checkLocal();
-        ownerSignal.throwIfAborted();
-      };
-      const task = (async () => {
+      // Re-arm only the original remaining bound, including a disposed timer's deadline.
+      // The producer clamp retains tighter current parents and the same slot counters.
+      const task = Promise.resolve().then(() => MaintenanceBudget.runProducer(async phaseBudget => {
+        let phaseActive = true;
+        let callbackActive = false;
+        const continuationSignal = AbortSignal.any([chargedSignal, phaseBudget.signal, this.shutdownSignal.signal,
+          ...(capturedBudget ? [capturedBudget.signal] : []), ...(signal ? [signal] : [])]);
+        const ownerSignal = AbortSignal.any([phaseScope.signal, continuationSignal]);
+        const checkLocal = () => {
+          try {
+            if (!phaseActive || !open() || !clonePaths.includes(source) ||
+                this.dataVolume?.preflight() === "data_volume_full") throw refused();
+            capturedBudget?.check();
+            phaseBudget.check();
+            MaintenanceResources.check();
+            if (MaintenanceResources.signalIfActive() !== chargedSignal) throw refused();
+            continuationSignal.throwIfAborted();
+          } catch { throw refused(); }
+        };
+        const check = () => {
+          if (!callbackActive) throw refused();
+          checkLocal();
+          ownerSignal.throwIfAborted();
+        };
         let owner: TickSpawner | undefined;
         let started = false;
         const proveAfterTransfer = async () => {
@@ -3181,7 +3184,13 @@ export class RunRunner {
             await proveAfterTransfer();
           } finally { phaseActive = false; }
         }
-      })();
+      }, { durationMs: Math.min(capturedBudget?.remainingMs() ?? 120_000, MaintenanceResources.remainingMsIfActive()),
+        signal: capturedBudget?.signal })).catch(error => {
+        phaseScope.abort();
+        if (error instanceof Error && error.message === "maintenance_wip_settlement_unconfirmed")
+          throw new Error("maintenance_wip_settlement_unconfirmed");
+        throw refused();
+      });
       transferTask = task;
       void task.catch(() => {});
       return task;
@@ -3207,7 +3216,8 @@ export class RunRunner {
           if (!chargedSignal) throw refused();
           capturedSignal = chargedSignal;
           capturedSource = clonePath;
-          const ambientSignal = MaintenanceBudget.current()?.signal;
+          capturedBudget = MaintenanceBudget.current();
+          const ambientSignal = capturedBudget?.signal;
           const ownerSignal = AbortSignal.any([scope.signal, chargedSignal, this.shutdownSignal.signal,
             ...(ambientSignal ? [ambientSignal] : []), ...(signal ? [signal] : [])]);
           ownerSignal.throwIfAborted();
