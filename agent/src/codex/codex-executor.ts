@@ -997,8 +997,11 @@ export function buildRunLaneReconcile(
     const cause = request.gracefulShutdownCheckpoint;
     const deadlineAt = Math.min(now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+    // Credential exchanges, like ownership mutations, must settle once sent.
+    // Cooperative checkpoint expiry is observed before a send and by safety
+    // after reconciliation; only hard/authority fences cancel the exchange.
     const signal = AbortSignal.any([boundarySignal,
-      ...[authoritySignal, request.checkpointStop?.signal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
+      ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const expired = () => signal.aborted || now() >= deadlineAt ||
       (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
@@ -1027,6 +1030,7 @@ export function buildRunLaneReconcile(
       return { kind: "blocked", errors, deferral: "vault_locked" };
     }
     if (expired()) return blocked(operationUncertain ? "refresh_unknown" : undefined);
+    if (cleanStop()) throw new CheckpointSoftDeadlineError();
     try {
       if (binding.authMode === "subscription") {
         if (committed.value === undefined) {

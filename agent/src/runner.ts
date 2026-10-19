@@ -11134,7 +11134,7 @@ export class RunRunner {
         // Skipped once the current lifecycle is interrupted (shutdown, steering or a pause aborted
         // while the permit was held): the shutdown sink owns durability from here, and a scan +
         // publish started now would only delay it.
-        if (!residueBlocked && flight.pendingPublish && !flight.kickMidTurnTick && !steering.lifecycleSignal().aborted) {
+        if (!opts.doneAttempt && !residueBlocked && flight.pendingPublish && !flight.kickMidTurnTick && !steering.lifecycleSignal().aborted) {
           await doCheckpointPublish(undefined, false, true);
         }
       } else {
@@ -11986,6 +11986,12 @@ export class RunRunner {
           catch (error) {
             clearCodeSnapshot();
             if (!(error instanceof CheckpointSoftDeadlineError || error instanceof PreservationRefusedError || error instanceof RunResidueBlockedError)) throw error;
+            return;
+          }
+          // The done permit has now drained. Like the milestone fallback, an
+          // owed scan/publish with no ticker must run outside that permit.
+          if (flight.pendingPublish && !flight.kickMidTurnTick && !steering.lifecycleSignal().aborted) {
+            await this.runGatedSink(flight, () => checkpointBody({ reap: false, quiet: true }));
           }
           return;
         }
