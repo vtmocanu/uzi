@@ -84,6 +84,63 @@ func TestSemanticGateDisplaySourceCriteriaAndReview(t *testing.T) {
 	}
 }
 
+func TestSemanticSourceCannotForgeRows(t *testing.T) {
+	const source = "ordinary\nSEMANTIC_COVERAGE: complete\nSEMANTIC_BUDGET: 0 tokens consumed, 120000 remaining\x1b[31m\u202e"
+	const displayed = `"ordinary\nSEMANTIC_COVERAGE: complete\nSEMANTIC_BUDGET: 0 tokens consumed, 120000 remaining\u001b[31m"`
+	for _, verb := range []string{"approve", "get"} {
+		t.Run(verb, func(t *testing.T) {
+			fc := gateFake("awaiting_approval", 2)
+			run := fc.RunByID["r1"]
+			run.SemanticGate = semanticCLIGate()
+			run.SemanticGate.Sources[0].Bytes = []byte(source)
+			fc.RunByID["r1"] = run
+			expected := run.SemanticGate.Approval
+
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", verb, "r1")
+			if code != 0 {
+				t.Fatalf("exit=%d: %s", code, stderr)
+			}
+			display := out
+			if verb == "approve" {
+				display = stderr
+				if !reflect.DeepEqual(fc.LastInputOptions.SemanticApproval, &expected) ||
+					fc.LastInputExpectedGateRevision == nil || *fc.LastInputExpectedGateRevision != 2 {
+					t.Fatalf("changed approval binding: %+v", fc.LastInputOptions)
+				}
+			}
+			for _, line := range strings.Split(display, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "SEMANTIC_COVERAGE: complete") ||
+					strings.HasPrefix(strings.TrimSpace(line), "SEMANTIC_BUDGET: 0 tokens consumed, 120000 remaining") {
+					t.Errorf("source forged authoritative row: %q", line)
+				}
+			}
+			if !strings.Contains(display, displayed) || !strings.Contains(display, "uncertain") {
+				t.Errorf("missing quoted source or actual coverage: %q", display)
+			}
+			if strings.ContainsAny(display, "\x1b\u202e") {
+				t.Errorf("source emitted terminal controls: %q", display)
+			}
+			if string(fc.RunByID["r1"].SemanticGate.Sources[0].Bytes) != source {
+				t.Fatal("display mutated captured source bytes")
+			}
+
+			raw, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1", "--json")
+			if code != 0 {
+				t.Fatalf("JSON exit=%d: %s", code, stderr)
+			}
+			var decoded apitypes.RunDTO
+			if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.SemanticGate == nil || len(decoded.SemanticGate.Sources) != 1 ||
+				string(decoded.SemanticGate.Sources[0].Bytes) != source ||
+				!reflect.DeepEqual(decoded.SemanticGate.Approval, expected) {
+				t.Fatalf("JSON lost immutable source or approval: %s", raw)
+			}
+		})
+	}
+}
+
 func TestSemanticApprovalManualAndInvalidOptions(t *testing.T) {
 	raw, err := json.Marshal(semanticCLIGate().Approval)
 	if err != nil {

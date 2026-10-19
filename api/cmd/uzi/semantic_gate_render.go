@@ -20,7 +20,9 @@ func semanticGateRows(run apitypes.RunDTO) [][]string {
 		rows = append(rows, []string{"SEMANTIC_SOURCE", sanitizeTTY(string(raw))})
 	}
 	for _, source := range gate.Sources {
-		rows = append(rows, []string{"SEMANTIC_SOURCE_TEXT", sanitizeTTY(string(source.Bytes))})
+		// Quote source newlines so resolveSemanticApproval cannot print forged rows.
+		raw, _ := json.Marshal(string(source.Bytes))
+		rows = append(rows, []string{"SEMANTIC_SOURCE_TEXT", sanitizeTTY(string(raw))})
 	}
 	for _, criterion := range gate.Presentation.Candidate.Criteria {
 		raw, _ := json.Marshal(criterion)
