@@ -507,3 +507,47 @@ test("#3031 U4a F1: only a NEW finalization of a live slot's own record defers; 
   await inPermit(false, fresh);
   assert.deepEqual(reached, [producer], "a dead permit defers nothing");
 });
+
+/** Every journal directory open advances the wall clock past the ten-second discovery cap. */
+function slowListings(t: test.TestContext, runDir: string) {
+  let offset = 0;
+  const now = Date.now.bind(Date);
+  t.mock.method(Date, "now", () => now() + offset);
+  const open = fs.opendir.bind(fs);
+  t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+    if (path.resolve(String(args[0])) === runDir) offset += 11_000;
+    return open(...args);
+  });
+}
+
+test("ordinary pin still writes its journal when the listing outlasts the discovery cap", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  slowListings(t, path.join(f.recoveryRoot, f.context.runId));
+  const pinned = await f.pin();
+  assert.ok(pinned, JSON.stringify(f.warnings));
+  assert.equal(pinned.generation, 7);
+  assert.notEqual(pinned.captureId, ordinary);
+  assert.ok((await f.coordinator.inspect(f.context.runId)).some(r => r.captureId === pinned.captureId));
+  assert.ok(!f.warnings.some(w => w.message === "recovery: reconstruction provenance incomplete; source retained"));
+});
+
+test("a slow listing inside a discovery scope still refuses new reconstruction", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  slowListings(t, path.join(f.recoveryRoot, f.context.runId));
+  const result = await MaintenanceResources.runDiscovery(() => f.freeze()).catch(() => undefined);
+  assert.equal(result, undefined);
+  assert.equal(f.calls.coverage, 0);
+  assert.ok(f.warnings.some(w => w.message === "recovery: reconstruction provenance incomplete; source retained"));
+});
+
+test("a slow ordinary listing still refuses over an unfinished producer origin", async t => {
+  const f = await fixture(t);
+  await f.seal(f.partial());
+  const before = await fs.readFile(f.file(producer));
+  slowListings(t, path.join(f.recoveryRoot, f.context.runId));
+  assert.equal(await f.pin(), undefined);
+  assert.deepEqual((await f.coordinator.inspect(f.context.runId)).map(r => r.captureId), [producer]);
+  assert.deepEqual(await fs.readFile(f.file(producer)), before);
+});

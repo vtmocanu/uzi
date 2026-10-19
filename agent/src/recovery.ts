@@ -4473,16 +4473,18 @@ export class RecoveryCoordinator {
     return false;
   }
 
-  /** One metadata-only pass, no retries. A fresh discovery scope permits 32 MiB,
-   * 4096 entries and ten seconds; existing scopes share counters and the attempt clock.
-   * Failure blocks new reconstruction only. Immutable replay and frozenCoverageProven
-   * retain their existing proof, including every authenticated source record. */
+  /** One metadata-only pass, no retries. Inside an active maintenance scope it shares that
+   * scope's counters and clock, plus a ten-second cap. Ordinary callers are not producer-charged:
+   * they keep only their own MaintenanceBudget, so a slow listing still writes the journal rather
+   * than retaining an unrecorded source. Failure blocks new reconstruction only. Immutable replay
+   * and frozenCoverageProven retain their existing proof, including every authenticated source record. */
   private async newReconstructionRecords(runId: string, generation?: number): Promise<RecoveryRecord[] | undefined> {
     if (this.savedEvidenceOnly.getStore()) return undefined;
+    const producer = M1MaintenanceResources.active();
     const read = async (): Promise<RecoveryRecord[] | undefined> => {
       const records = await this.checkedRecords(runId, {
         signal: MaintenanceBudget.signal() ?? new AbortController().signal,
-        deadline: Date.now() + Math.min(10_000, MaintenanceBudget.current()?.remainingMs() ?? Infinity,
+        deadline: Date.now() + Math.min(producer ? 10_000 : Infinity, MaintenanceBudget.current()?.remainingMs() ?? Infinity,
           M1MaintenanceResources.remainingMsIfActive()),
       }, true);
       for (const record of records) {
@@ -4493,7 +4495,7 @@ export class RecoveryCoordinator {
       return records;
     };
     try {
-      return await (M1MaintenanceResources.active() ? read() : M1MaintenanceResources.runDiscovery(read));
+      return await read();
     } catch {
       MaintenanceBudget.current()?.check();
       this.log.warn("recovery: reconstruction provenance incomplete; source retained");
