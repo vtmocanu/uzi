@@ -391,6 +391,36 @@ func (q *Queries) SetPolicyCandidateCrossCheckAssociation(ctx context.Context, a
 	return result.RowsAffected(), nil
 }
 
+const setPolicyRevisionSource = `-- name: SetPolicyRevisionSource :execrows
+UPDATE runs SET policy_revision_source = $1::jsonb
+WHERE id = $2::uuid AND worker_id = $3::uuid
+ AND claim_generation = $4::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status IN ('claimed','running','awaiting_approval')
+ AND harness='codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL
+`
+
+type SetPolicyRevisionSourceParams struct {
+	Source          []byte    `json:"source"`
+	RunID           uuid.UUID `json:"run_id"`
+	WorkerID        uuid.UUID `json:"worker_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Caller holds the worker/run claim transaction and authenticates finite coverage.
+func (q *Queries) SetPolicyRevisionSource(ctx context.Context, arg SetPolicyRevisionSourceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setPolicyRevisionSource,
+		arg.Source,
+		arg.RunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const settlePolicyStopCrossCheck = `-- name: SettlePolicyStopCrossCheck :execrows
 UPDATE cross_checks
 SET revision_disposition = 'superseded_by_stop', revision_settled_at = now(),

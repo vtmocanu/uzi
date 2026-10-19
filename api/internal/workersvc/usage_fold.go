@@ -12,6 +12,7 @@ import (
 	"slices"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -296,7 +297,7 @@ func (s *Service) NoteOversizeBatch(ctx context.Context, wkr store.Worker, runID
 // exists to prevent.
 func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64) (appendObservation, error) {
 	if s.txBeginner == nil {
-		return s.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, nil)
+		return s.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, nil, nil)
 	}
 	child, run, tx, err := s.beginClaimMutation(ctx, wkr, runID, claimGen)
 	if err != nil {
@@ -306,7 +307,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	child.bcast = nil
 	child.lifecycle = nil
 	var inserted []IncomingMessage
-	obs, err := child.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, &inserted)
+	obs, err := child.appendMessagesLocked(ctx, wkr, runID, msgs, claimGen, &inserted, tx)
 	if err != nil {
 		return obs, err
 	}
@@ -327,7 +328,7 @@ func (s *Service) appendMessages(ctx context.Context, wkr store.Worker, runID uu
 	return obs, nil
 }
 
-func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64, committedMessages *[]IncomingMessage) (appendObservation, error) {
+func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, runID uuid.UUID, msgs []IncomingMessage, claimGen *int64, committedMessages *[]IncomingMessage, claimTx pgx.Tx) (appendObservation, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return appendObservation{}, err
@@ -374,6 +375,11 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 		if stripped, _ := stripNUL(m.Kind); stripped == "" || stripped == "cross_check" {
 			return obs, ErrInvalidMessage
 		}
+	}
+	// Decode authority from the original wire bytes, before sanitation can change it.
+	revisionCarriers := make([]policyRevisionWire, len(msgs))
+	for i, m := range msgs {
+		revisionCarriers[i] = decodePolicyRevisionWire(m)
 	}
 	// SECOND pass for sanitation, separate from validation on purpose. The
 	// count-and-log requirement (PRD #108 Risk 3) exists so a future NUL-emitting
@@ -447,7 +453,9 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 	var maxStored int32
 	var insertErr error
 	inserted := make([]IncomingMessage, 0, len(msgs))
-	for _, m := range msgs {
+	var revisionFrame *policyRevisionWire
+	var revisionSeq int32
+	for i, m := range msgs {
 		res, err := s.q.InsertRunMessage(ctx, store.InsertRunMessageParams{
 			RunID:         runID,
 			Seq:           m.Seq,
@@ -500,6 +508,10 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 		// re-delivery, already stored. Only broadcast genuinely new messages so a retry never
 		// double-emits over WS.
 		if res.Inserted {
+			if m.Kind == "plan_revising" && m.Seq > revisionSeq {
+				wire := revisionCarriers[i]
+				revisionFrame, revisionSeq = &wire, m.Seq
+			}
 			inserted = append(inserted, m)
 		}
 	}
@@ -554,6 +566,11 @@ func (s *Service) appendMessagesLocked(ctx context.Context, wkr store.Worker, ru
 	}
 	if insertErr != nil {
 		return obs, insertErr
+	}
+	if claimTx != nil && revisionFrame != nil {
+		if err := s.writePolicyRevisionSource(ctx, claimTx, wkr, run, effectiveClaimGen, revisionSeq, *revisionFrame); err != nil {
+			return obs, err
+		}
 	}
 	// PRD #1247 M9 (D7): stamp the per-call fenced generation onto every frame before folding, so
 	// each leg is attributed to the epoch it was produced under (the join

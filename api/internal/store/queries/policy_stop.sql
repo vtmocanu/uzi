@@ -1,3 +1,12 @@
+-- name: SetPolicyRevisionSource :execrows
+-- Caller holds the worker/run claim transaction and authenticates finite coverage.
+UPDATE runs SET policy_revision_source = sqlc.narg(source)::jsonb
+WHERE id = sqlc.arg(run_id)::uuid AND worker_id = sqlc.arg(worker_id)::uuid
+ AND claim_generation = sqlc.arg(claim_generation)::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status IN ('claimed','running','awaiting_approval')
+ AND harness='codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL;
+
 -- name: ListPolicyStopRevisionInputs :many
 SELECT * FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'revise_plan'
