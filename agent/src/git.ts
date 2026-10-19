@@ -4697,7 +4697,8 @@ export class GitCache {
    * just positively verified coverage can pin THIS value — the run's own PRIVATE, single-writer head
    * — instead of rereading the shared, mutable `refs/uzi-runner/<branch>` (which a concurrent run on
    * the same bare+branch could have moved since the verify). Reading HEAD is a pure ref read (no
-   * checkout/diff), so no attacker-chosen filter driver fires. Best-effort: swallows to null.
+   * checkout/diff), so no attacker-chosen filter driver fires. Best-effort: an ordinary failure reads
+   * as null, but a hard boundary abort (#3132) propagates, since an aborted read is not an absent head.
    */
   async worktreeHead(worktreePath: string): Promise<string | null> {
     const sha = (
