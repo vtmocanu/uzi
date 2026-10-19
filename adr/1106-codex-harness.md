@@ -489,7 +489,8 @@ credential-bearing override. The strict GitCache builder policy matches the comp
 canonical environment's own keys and values, including exact indexed config order
 (reordering is refused). The command-identity launch binds the sandbox mode to the
 executor-selected `required`, `best-effort` or `off` mode, alongside the fixed
-wrapper, cwd, argv and environment transformation.
+wrapper, cwd, argv and environment transformation. The immutable original request
+and its sandbox-transformed request are both checked synchronously at launch.
 Only the builder supplies the empty helper/askpass pins; duplicate entries and caller
 helper/askpass argv overrides, even empty ones, are refused. The synchronous launch-request check
 scans credential/askpass, includes, config-env, `GIT_CONFIG_PARAMETERS`, Authorization
@@ -500,10 +501,22 @@ Trusted-worker bare Git keeps its worker identity;
 Credential presence is checked separately; free capture does not downgrade bare
 Git to the isolated clone identity. Blanket refusal of free capture was rejected:
 it leaves uncaptured work in an ephemeral clone instead of moving capturable work
-into the persistent worker bare. Local capture alone proves neither origin
-publication nor permission to dispose of the source. Worker-provided global Git
+into the persistent worker bare and regresses verified park/pause preservation.
+Local capture alone proves neither origin publication nor permission to dispose
+of the source. Worker-provided global Git
 config may configure drivers; ordinary seeding trust is unchanged. These
 configuration pins alone prove neither driver inertness nor process exclusion.
+
+Private `captureSynthesis` async-local state and `runSynthesisGit` bind dynamic
+worker author/committer identity, dates and private temporary index/worktree paths
+to the exact live Git invocation. The producers are `synthesizeWorkflowWrapper`
+(called by `buildWorkflowOverlay` and `buildCheckpointChain`), `bridgeToFloors`
+and `buildRecoveryCoverage`; `sizeAttrGit` receives no synthesis authority.
+Shape-valid paths, dates or a generic code/path exception cannot authorize synthesis.
+Canonical config order, the two empty helper/askpass pins and credential/config/env/URL
+refusals still apply; no PAT or username overlay is admitted. Outside executing-flight
+capture scopes, GitCache and maintenance keep their existing behavior.
+Refs #2852 (AI-synced 2026-10-18).
 
 Codex background JS dependency installation and Devbox `install` / `shellenv`
 use registered supervisor roots for fixed normal setup, with the existing runner

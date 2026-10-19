@@ -12,6 +12,7 @@ import { assertCaptureLaunch } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { credentialFreeGitFixture, latch } from "./credential-free-git-fixture.js";
 
 function scopedRequest(git: GitCache, context: CredentialFreeCaptureContext, request: BoundaryProcessRequest) {
@@ -31,17 +32,18 @@ function deferred<T>() {
 
 // The real GitCache, safety owner, registry, and production sandbox adapter run.
 // Only the OS supervisor is replaced: primary exit and ECHILD drain are distinct.
-function rig(options: { drain?: Promise<void>; primary?: Promise<void> } = {}) {
+function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?: (spec: CodexEffectLaunchSpec) => string; setup?: (spec: CodexEffectLaunchSpec) => Promise<void> } = {}) {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(2852));
   const specs: CodexEffectLaunchSpec[] = [];
   const primaryExited = deferred<void>();
   const reaping = deferred<void>();
   let disposed = 0;
   const launch = async (spec: CodexEffectLaunchSpec): Promise<CodexRootHandle> => {
+    await options.setup?.(spec);
     assertCaptureLaunch(spec);
     specs.push(spec);
     const stdout = new PassThrough();
-    stdout.end(spec.args.includes("status") ? " M capture-sentinel.txt\n" : "a".repeat(40) + "\n");
+    stdout.end(options.output?.(spec) ?? (spec.args.includes("status") ? " M capture-sentinel.txt\n" : "a".repeat(40) + "\n"));
     return {
       started: { event: "started", supervisorPid: 300, childPid: 301, subreaper: true,
         nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
@@ -540,6 +542,188 @@ describe("credential-free real Git producer positives", () => {
       if (changed.kind === "observed_empty") assert.equal(changed.value, null);
       assert.equal(r.requests.filter(request => request.argv[0] === process.execPath).length, 1,
         "changed clone content never reaches the helper launcher");
+    } finally { r.cleanup(); }
+  });
+});
+
+describe("credential-free private synthesis provenance", () => {
+  const uuid = "12345678-1234-4234-8234-123456789abc";
+  for (const [name, dynamic] of [
+    ["well-shaped index", { GIT_INDEX_FILE: path.join(os.tmpdir(), "uzi-ckpt-idx-" + uuid) }],
+    ["well-shaped work tree", { GIT_WORK_TREE: path.join(os.tmpdir(), "uzi-ckpt-work-" + uuid) }],
+    ["valid date", { GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z" }],
+  ] as const) it("rejects arbitrary " + name + " outside the private producer", async () => {
+    const r = rig();
+    await r.safety.withCredentialFreeCapture(10_000, async context => {
+      await assert.rejects(scopedRequest(r.git, context, {
+        argv: ["/usr/bin/git", "-C", "/capture/worker.git", "write-tree"],
+        cwd: "/", identity: "worker_pat", env: { ...gitEnv(), ...dynamic },
+      }), /credential-free capture launch refused/);
+    });
+    assert.equal(r.specs.length, 0, "shape alone cannot reach launcher admission");
+  });
+
+  for (const cell of ["argv", "index", "worktree", "date", "author", "identity", "cwd"] as const)
+    it("binds private synthesis " + cell + " before admission after async setup", async () => {
+      const r = rig({ output: spec => spec.args.includes("show")
+        ? "2000-01-01T00:00:00Z\n" : "a".repeat(40) + "\n" });
+      const internal = r.git as any;
+      const original = internal.execScoped.bind(r.git);
+      let attempted = false, rejected = false;
+      internal.execScoped = async (command: string, args: string[], opts: any, identity: any) => {
+        const target = cell === "date" || cell === "author" ? opts.env?.GIT_AUTHOR_DATE
+          : cell === "worktree" ? opts.env?.GIT_WORK_TREE : opts.env?.GIT_INDEX_FILE;
+        if (!target || attempted) return original(command, args, opts, identity);
+        attempted = true;
+        const before = r.specs.length;
+        // Cross a real async setup boundary, then substitute another shape-valid value.
+        await setImmediate();
+        const env = { ...opts.env };
+        if (cell === "index") env.GIT_INDEX_FILE = path.join(os.tmpdir(), "uzi-ckpt-idx-" + uuid);
+        if (cell === "worktree") env.GIT_WORK_TREE = path.join(os.tmpdir(), "uzi-ckpt-work-" + uuid);
+        if (cell === "date") env.GIT_AUTHOR_DATE = "2001-01-01T00:00:00Z";
+        if (cell === "author") env.GIT_AUTHOR_NAME = "another worker";
+        try {
+          return await original(command, cell === "argv" ? [...args, "--prefix=other"] : args,
+            { ...opts, env, ...(cell === "cwd" ? { cwd: "/capture/other" } : {}) },
+            cell === "identity" ? "command" : identity);
+        } catch (error) {
+          rejected = true;
+          assert.equal(r.specs.length, before, "substitution reached the actual launcher");
+          throw error;
+        }
+      };
+      await r.safety.withCredentialFreeCapture(10_000, context =>
+        r.git.withCredentialFreeCapture(context, async () => {
+          await assert.rejects(internal.synthesizeWorkflowWrapper("/capture/worker.git",
+            "a".repeat(40), "b".repeat(40), ["a".repeat(40)], "ckpt(overlay): test", true));
+        }));
+      assert.equal(attempted, true, "actual private producer reached the changed field");
+      assert.equal(rejected, true);
+    });
+
+  it("freezes private values through asynchronous launcher setup and refuses delayed ALS reuse", async () => {
+    let setups = 0;
+    const r = rig({
+      output: spec => spec.args.includes("show") ? "2000-01-01T00:00:00Z\n" : "a".repeat(40) + "\n",
+      setup: async spec => {
+        await setImmediate();
+        if (!spec.env.GIT_INDEX_FILE && !spec.env.GIT_AUTHOR_DATE) return;
+        setups++;
+        assert.equal(Reflect.set(spec.env, "GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z"), false);
+        assert.equal(Reflect.set(spec.args, 0, "substituted"), false);
+        assert.equal(Reflect.set(spec, "cwd", "/capture/other"), false);
+        assert.equal(Reflect.set(spec, "identity", "command"), false);
+        // rig checks assertCaptureLaunch immediately after this awaited setup.
+      },
+    });
+    const internal = r.git as any, original = internal.runGitWithEnv.bind(r.git);
+    const resume = latch();
+    let late: Promise<string> | undefined;
+    internal.runGitWithEnv = (cwd: string, args: readonly string[], env: NodeJS.ProcessEnv) => {
+      if (!late && env.GIT_INDEX_FILE) late = (async () => {
+        await resume.promise;
+        return original(cwd, [...args], { ...env });
+      })();
+      return original(cwd, args, env);
+    };
+    await r.safety.withCredentialFreeCapture(10_000, context =>
+      r.git.withCredentialFreeCapture(context, async () => {
+        try {
+          assert.equal(await internal.synthesizeWorkflowWrapper("/capture/worker.git",
+            "a".repeat(40), "b".repeat(40), ["a".repeat(40)], "ckpt(overlay): test", true), "a".repeat(40));
+          const before = r.specs.length;
+          assert.ok(late, "the asynchronous descendant retained the genuine private invocation");
+          resume.resolve();
+          await assert.rejects(late, /credential-free capture launch refused/);
+          assert.equal(r.specs.length, before, "revoked private ALS cannot issue a second launch");
+        } finally { resume.resolve(); await late?.catch(() => undefined); }
+      }));
+    assert.ok(setups >= 4, "dynamic commands reached asynchronous setup and the final launch check");
+  });
+
+  it("refuses actual launcher evidence after the private producer completes inside a live capture", async () => {
+    const r = rig({ output: spec => spec.args.includes("show")
+      ? "2000-01-01T00:00:00Z\n" : "a".repeat(40) + "\n" });
+    await r.safety.withCredentialFreeCapture(10_000, context =>
+      r.git.withCredentialFreeCapture(context, async () => {
+        assert.equal(await (r.git as any).synthesizeWorkflowWrapper("/capture/worker.git",
+          "a".repeat(40), "b".repeat(40), ["a".repeat(40)], "ckpt(overlay): test", true), "a".repeat(40));
+        const specs = r.specs.filter(s => s.env.GIT_INDEX_FILE || s.env.GIT_AUTHOR_DATE);
+        assert.ok(specs.length >= 4);
+        for (const spec of specs) assert.throws(() => assertCaptureLaunch(spec),
+          /credential-free capture launch refused/, "completed private invocation cannot authorize a delayed launch");
+      }));
+  });
+
+  it("does not lend synthesis authority to the size-attribute writer", async () => {
+    const r = rig();
+    await r.safety.withCredentialFreeCapture(10_000, context =>
+      r.git.withCredentialFreeCapture(context, async () => {
+        await assert.rejects((r.git as any).sizeAttrGit("/capture/worker.git", ["read-tree", "a".repeat(40)],
+          { indexFile: path.join(os.tmpdir(), "uzi-ckpt-idx-" + uuid) }), /credential-free capture launch refused/);
+      }));
+    assert.equal(r.specs.length, 0);
+  });
+
+  it("preserves workflow content, parents and identity through checkpoint-chain, bridge and coverage producers", async () => {
+    const r = await credentialFreeGitFixture();
+    try {
+      fs.mkdirSync(path.join(r.clone, ".github/workflows"), { recursive: true });
+      fs.writeFileSync(path.join(r.clone, ".github/workflows/check.yml"), "name: preserved\non: push\n");
+      r.gitIn(r.clone, ["add", ".github/workflows/check.yml"]);
+      const tree = r.gitIn(r.clone, ["write-tree"]);
+      const previous = r.gitIn(r.clone, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid",
+        "commit-tree", tree, "-p", r.base, "-m", "ckpt(overlay): fixture workflow"]);
+      r.gitIn(r.clone, ["reset", "--hard", r.base]);
+      fs.writeFileSync(path.join(r.clone, "capture.txt"), "new real content\n");
+      r.gitIn(r.clone, ["add", "capture.txt"]);
+      r.gitIn(r.clone, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "real work"]);
+      const real = r.gitIn(r.clone, ["rev-parse", "HEAD"]);
+      r.gitIn(r.bare, ["fetch", r.clone, r.branch]);
+      // The wrapper object remains in the clone after reset; fetch it by its literal OID.
+      r.gitIn(r.bare, ["fetch", r.clone, previous]);
+      let chain = "";
+      const result = await r.capture(async () => {
+        // Task-named synthesis seam: the shared fixture deliberately permits only
+        // closure streaming, so call the existing producer rather than widening it.
+        chain = await (r.git as any).buildCheckpointChain(r.bare, r.branch, real, [previous]);
+        assert.ok(chain);
+        assert.notEqual(chain, real, "the chain must actually synthesize a wrapper");
+        const dynamic = r.specs.filter(s => s.env.GIT_INDEX_FILE || s.env.GIT_AUTHOR_DATE);
+        assert.ok(dynamic.length >= 4, "read-tree, rm, write-tree and commit-tree ran");
+        for (const spec of dynamic) {
+          assert.equal(spec.identity, "worker_pat");
+          assert.equal(spec.command, "/usr/bin/git");
+        }
+      });
+      assert.equal(result.kind, "observed_empty");
+      assert.equal(r.gitIn(r.bare, ["show", chain + ":capture.txt"]), "new real content");
+      assert.equal(r.gitIn(r.bare, ["show", chain + ":.github/workflows/check.yml"]), "name: preserved\non: push");
+      assert.equal(r.gitIn(r.bare, ["show", "-s", "--format=%P", chain]), previous + " " + real);
+      const commit = r.requests.find(q => q.argv.includes("commit-tree"))!;
+      const date = r.gitIn(r.bare, ["show", "-s", "--format=%cI", real]);
+      assert.equal(commit.env.GIT_AUTHOR_DATE, date);
+      assert.equal(commit.env.GIT_COMMITTER_DATE, date);
+      assert.equal(commit.env.GIT_AUTHOR_NAME, "uzi-agent");
+      assert.equal(commit.env.GIT_COMMITTER_NAME, "uzi-agent");
+      assert.equal(commit.env.GIT_AUTHOR_EMAIL, "uzi-agent@uzi.local");
+      assert.equal(commit.env.GIT_COMMITTER_EMAIL, "uzi-agent@uzi.local");
+      const bridge = await r.capture(() => r.git.bridgeToFloors(r.bare, real, [previous]));
+      assert.equal(bridge.kind, "observed_empty");
+      if (bridge.kind === "observed_empty") {
+        assert.equal(bridge.value.kind, "built");
+        if (bridge.value.kind === "built")
+          assert.equal(r.gitIn(r.bare, ["rev-parse", bridge.value.sha + "^{tree}"]), r.gitIn(r.bare, ["rev-parse", real + "^{tree}"]));
+      }
+      const coverage = await r.capture(() => r.git.buildRecoveryCoverage(r.bare,
+        r.opts.context as Parameters<GitCache["buildRecoveryCoverage"]>[1], [previous], real));
+      assert.equal(coverage.kind, "observed_empty");
+      if (coverage.kind === "observed_empty") {
+        assert.equal(r.gitIn(r.bare, ["show", "-s", "--format=%P", coverage.value.sha]),
+          [real, previous].sort().join(" "));
+        assert.equal(r.gitIn(r.bare, ["rev-parse", coverage.value.sha + "^{tree}"]), r.gitIn(r.bare, ["rev-parse", real + "^{tree}"]));
+      }
     } finally { r.cleanup(); }
   });
 });

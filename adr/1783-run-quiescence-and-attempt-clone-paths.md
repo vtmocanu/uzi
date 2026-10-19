@@ -298,7 +298,9 @@ removes the tree.
   GitCache's capture request issuer is module-private and applies its full canonical
   policy. A recipient holding only the capture context cannot choose a validator or
   obtain a generic spawner. Shared pure policy validation cannot register requests;
-  the complete policy is checked synchronously again at actual launch.
+  the complete policy is checked synchronously again at actual launch. Private
+  synthesis bindings, including exact invocation and dynamic environment ownership,
+  are described in [ADR-1106](1106-codex-harness.md#process-root-ownership).
 
   For pending Codex memory capture, the same `executionTails` promise is installed
   synchronously before factory work and owns the original preservation operation
@@ -320,6 +322,14 @@ removes the tree.
   existing epoch path. Check newer cancellation, pause and vault-lock state before
   credentials or model execution; recreation-time vault lock takes
   [ADR-1766's deferral](1766-codex-vault-lock-park.md#d3-settle-before-capture-and-no-completion-authority-while-locked).
+  Keep the prior session generation until provider adoption. `settleForCapture`
+  intentionally poisons even a healthy registry; N1's non-poisoning alternative is
+  not adopted. An accepted owner pause reached through `OrdinaryOwnerPaused` or
+  `requestParkRun`'s `retainPause` continuation acquires a fresh `runFreeCapture`
+  scope for source HEAD, generation pin and guarded inventory after the earlier
+  scope expired. Refused fresh proof performs no source operations and retains the
+  exact parked clone, session, journal and custody; an uncertain ACK grants no
+  recapture or new pause attempt. Refs #2852 (AI-synced 2026-10-18).
   The approval path still skips persistence from the old drained HOME. This does
   not make an open approval gate parkable or change retained recovery's fresh
   path/session policy. Retained-source A coverage ends after `recordRecoveryCapture`;
@@ -343,7 +353,10 @@ removes the tree.
   deletion authority: #2746's custody SETTLE and physical CLEANUP stay separate.
   #3031 is independent, not a prerequisite; A changes no model-free coverage,
   producers, ledger, custody or settlement protocol. Whichever lands second
-  rebases for coexistence. A shutdown label alone grants no exception or capture
+  rebases for coexistence. #2969's live-predecessor policy and #2884's
+  plan-rejection producer/discard policy retain their ownership. A adds no runtime
+  maintenance-root/HMAC read, write or scan, IDs, classifier or budget.
+  A shutdown label alone grants no exception or capture
   authority; the existing typed graceful-shutdown authority remains separate
   from execution cancellation, as recorded under ADR-1766's #3101 amendment.
 

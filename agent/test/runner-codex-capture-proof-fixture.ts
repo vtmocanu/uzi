@@ -35,7 +35,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
       const child = spawn(bin, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
       const terminal = new Promise<{code:number}>((resolve, reject) => {
         child.once("error", reject);
-        child.once("exit", code => resolve({code: code ?? 1}));
+        child.once("close", code => resolve({code: code ?? 1}));
       });
       // Only the external execute controller can release protocol progress.
       await hold("launch");
@@ -75,7 +75,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
     },
     dispose: async () => {}
   });
-  const arm = () => { if (!armed) { armed = true; start = rig.processSpawns(); } };
+  const arm = () => { if (!armed) { armed = true; start = rig.processSpawns(); entries = 0; returns = 0; authDeltas.length = 0; } };
   const boundary = rig.safety.withBoundary.bind(rig.safety);
   rig.safety.withBoundary = async (req, action) => {
     try { return await boundary(req, action); }
@@ -122,7 +122,7 @@ export function observe(opts: { vault?: boolean; refusal?: boolean; sourcePath?:
   };
   const observations = () => ({entries, returns, source, holds, pubs, acks, authDeltas, spawns:rig.processSpawns()-start});
   return {
-    rig, capture, arm, recordSource, observations, isActive: () => active,
+    rig, capture, arm, recordSource, observations, hold, isActive: () => active,
     execute: async (operation: Promise<void>) => {
       // The test controller owns releases; the instrument never releases itself.
       const settled = operation.then(() => { done = true; }, error => { done = true; throw error; });

@@ -84,7 +84,11 @@ including credential-free recovery and retained-source capture. Setup, auth and
 executor-owned summary cleanup stay joined even after authority or summary delivery
 expires; unconfirmed cleanup blocks capture and credential continuation. Local
 capture moves capturable work from the ephemeral clone into the durable worker
-bare; it does not prove that latest work is archived or authorize source deletion.
+bare; blanket refusal would regress verified park/pause preservation. It does not
+prove that latest work is archived or authorize source deletion. After an accepted
+owner pause, later source checks require fresh capture authority. If that proof
+refuses, the exact parked source, session, journal and custody remain retained;
+an uncertain acknowledgment starts neither recapture nor another pause attempt.
 A bounded observation can return while memory capture or its cleanup remains
 unfinished. The worker keeps that run reserved and its local source held until
 the original capture and cleanup actually settle. A same-run duplicate on that
@@ -97,7 +101,12 @@ acknowledgments retain the existing isolation from a successor attempt.
 Retained-source capture ends at its durable capture record; creating a fresh
 successor from that bare pin follows outside the held capture, without reading
 old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened
-terminal proof (C) remain open; existing terminal executor disposal still applies.
+terminal proof (C) remain unshipped; existing terminal executor disposal still
+applies, with snapshot coverage still preceding strengthened writer-exclusion proof.
+Registered-root capture exclusion does not exclude daemon or sibling writers,
+accepted-but-invisible creates (#1860), or Claude terminal residuals; per-attempt
+cgroup proof (#1862) remains unshipped. Automatic reclaim remains disabled (#1858),
+and custody SETTLE and physical CLEANUP remain separate (#2746).
 Failed or uncertain capture keeps local source custody; there is no archive or
 latest-work guarantee, and loss of that worker's retained storage can lose
 uncaptured work. Confirmed drain, a resolved outcome and fresh usage below

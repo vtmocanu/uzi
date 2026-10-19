@@ -189,7 +189,10 @@ The worker's park sequence, in order: confirm the run is still `running` (a stal
 run does not re-park); stop Codex execution without any credential operation, then
 hold safety serialization, the epoch fence and closed admission through source reads,
 WIP commit, fetch-back, verification, authorized credential-free publication and full
-supervised-child settlement. The intentionally poisoned, successfully settled registry
+supervised-child settlement for this credential-free park scope. This does not
+extend authority to other shutdown-labelled sinks (#3109); the typed #3101
+shutdown authority and execution-cancellation separation below are unchanged.
+The intentionally poisoned, successfully settled registry
 admits this narrow capture lane, with no provider turn, normal callback, admission
 reopen, credential reconciliation, refresh or release, PAT, credential-bearing environment
 or overlay. Auth close joins raw refresh and direct-handler work, with synchronous
@@ -241,8 +244,11 @@ that may have drained it, continuing execution recreates a provider through the 
 epoch path from the saved session. Changed-milestone gate revision, human or automatic,
 likewise recreates before another provider turn. Newer cancellation, pause and vault-lock
 state are checked before credentials or model execution; a vault lock on recreation takes
-this ADR's credential-deferral park. The approval path still skips persistence from the
-old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
+this ADR's credential-deferral park. An accepted owner-pause continuation uses
+fresh held capture authority for source
+HEAD/pin and guarded inventory; refused proof leaves the exact parked source,
+session, existing journal and custody intact without another capture or pause attempt.
+The approval path still skips persistence from the old, drained HOME. This does not make an open `awaiting_approval` gate parkable or
 change fresh-path retained recovery. See [ADR-1783](1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
 for A's scope and the unshipped B/C gaps.
 

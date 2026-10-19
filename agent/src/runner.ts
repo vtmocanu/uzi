@@ -3864,10 +3864,7 @@ export class RunRunner {
         // run — the exact outcome the fetch-back exists to prevent.
       } else if (err instanceof OrdinaryOwnerPaused) {
         flight.parked = true;
-        await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
-          .catch((error) => runLog.warn("recovery: owner pause pin failed", { error: errMessage(error) }));
-        if (claim.inventory_guarded === true)
-          await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+        await this.retainAcceptedOwnerPause(claim, flight, "recovery: owner pause pin failed");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof PauseNowSignal) {
         // PRD #1190 M2: a `now` pause aborted a turn OUTSIDE the implement loop's own catch (e.g.
@@ -11108,6 +11105,7 @@ export class RunRunner {
     // Survives lifecycle interruptions after a completed pause attempt, including reconciliation.
     let parkContinuation: "attempt" | "reconcile" | "question" = "attempt";
     let parkOwnershipProbe: Promise<RunOwnershipResponse> | undefined;
+    let parkCaptureDeadlineAt: number | undefined;
     // Only the question helpers call this alias after a validated answer settles.
     const reportAnsweredState: typeof reportState = (body, ...args) => {
       if (body.status === "running" && flight.workerMemory) flight.workerMemory.resumeReady = true;
@@ -11954,12 +11952,8 @@ export class RunRunner {
           parkContinuation = "attempt";
           parkOwnershipProbe = undefined;
           flight.parked = true;
-          await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
-            .catch((error) => runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
-              run_id: runId, error: errMessage(error),
-            }));
-          if (claim.inventory_guarded === true)
-            await this.settleGuardedInventory(claim, flight, undefined, undefined, undefined, true);
+          await this.retainAcceptedOwnerPause(claim, flight,
+            "recovery: pause generation-evidence pin failed (custody retained)", parkCaptureDeadlineAt);
           return { kind: "paused" } as const;
         };
         const checkAck = (ack: StateAck): void => {
@@ -11991,7 +11985,8 @@ export class RunRunner {
             if (requested.status !== "running" && requested.status !== "paused")
               throw new TrustedExecutionRefusal("park run request refused");
             const parked = requested.applied && requested.status === "running" &&
-              await this.handlePausePark(claim, flight, pausedAt);
+              await this.handlePausePark(claim, flight, pausedAt,
+                parkCaptureDeadlineAt ??= Date.now() + this.codexBoundaryDeadlineMs);
             // Remember the completed false result before lifecycle reconciliation can interrupt.
             if (!parked) parkContinuation = "reconcile";
             if (steering.isCancelled()) return { kind: "cancel" };
@@ -12051,6 +12046,7 @@ export class RunRunner {
           // parkQuestion confirms running settlement before a consumed /park can authorize an attempt.
           parkContinuation = "attempt";
           parkOwnershipProbe = undefined;
+          parkCaptureDeadlineAt = undefined;
           if (!isParkAnswer(verdict)) return verdict;
         }
       },
@@ -16475,8 +16471,8 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     pausedAt: { completedCount: number; total?: number },
+    deadlineAt = Date.now() + this.codexBoundaryDeadlineMs,
   ): Promise<boolean> {
-    const deadlineAt = Date.now() + this.codexBoundaryDeadlineMs;
     return this.runGatedSink(flight, async () => {
       const { batcher } = flight;
       // Announce the park on the feed BEFORE the state report (same ordering as the limit park),
@@ -16498,6 +16494,54 @@ export class RunRunner {
       flight.preserveSession = true;
       return this.reportPauseCaptureFailed(flight, true, "unverified");
     });
+  }
+
+  /** An accepted owner pause can follow a failed capture or a question ACK.
+   * Neither outcome carries live source authority from handlePausePark. */
+  private async retainAcceptedOwnerPause(
+    claim: ClaimResponse, flight: RunFlight, pinFailureMessage: string, originalDeadlineAt?: number,
+  ): Promise<void> {
+    const settle = async (held?: HeldFreeCapture) => {
+      const check = () => { if (held) this.assertHeldFreeCapture(flight, held); };
+      check();
+      const head = await this.currentRestorePointHead(flight);
+      check();
+      await this.pinRecoveryGeneration(claim, flight, head)
+        .catch((error) => flight.runLog.warn(pinFailureMessage, {
+          run_id: flight.runId, error: errMessage(error),
+        }));
+      check();
+      if (claim.inventory_guarded === true)
+        await this.settleGuardedInventory(claim, flight, undefined, undefined, held?.signal, true);
+      check();
+    };
+    if (!this.requiresFreeCaptureScope(claim, flight)) return settle();
+    const retain = () => {
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      flight.keepGuardedInventoryOpen = true;
+    };
+    // Consume the current operation's remaining budget, when present; queueing
+    // and the whole continuation share the same absolute capture deadline.
+    const budget = MaintenanceBudget.current();
+    const now = Date.now();
+    const deadlineAt = Math.min(originalDeadlineAt ?? now + this.codexBoundaryDeadlineMs,
+      now + (budget?.remainingMs() ?? Infinity));
+    const signal = budget
+      ? AbortSignal.any([this.shutdownSignal.signal, budget.signal])
+      : this.shutdownSignal.signal;
+    try {
+      const result = await this.runFreeCapture(claim, flight, deadlineAt, signal, held =>
+        this.git.withRecoveryOperation(held.signal!, held.deadlineAt, () => settle(held)));
+      if (result.kind === "observed_empty") return;
+    } catch (error) {
+      flight.runLog.warn("recovery: owner pause continuation unverified (custody retained)", {
+        run_id: flight.runId, error: errMessage(error),
+      });
+    }
+    // Keep the acknowledged park even when fresh admission refuses. No recapture
+    // or new pause attempt follows, and cleanup must retain the exact source.
+    retain();
   }
 
   private async handlePauseParkHeld(

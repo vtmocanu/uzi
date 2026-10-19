@@ -20165,6 +20165,135 @@ describe("A capture lifecycle public run", () => {
       cleanup: () => fs.rm(dir, { recursive: true, force: true }) };
   }
 
+  // Real executor caller + capture primitive proof; runner publication/ACK is proved separately.
+  for (const route of ["immediate", "milestone", "pre-turn"] as const) {
+    for (const outcome of ["accepted", "declined", "withdrawn"] as const) {
+      it(`A2 production pause ${route} ${outcome} holds drained epoch`, async () => {
+        const turn = installerBarrier(), rootEntered = installerBarrier(), rootRelease = installerBarrier();
+        const sourceEntered = installerBarrier(), sourceRelease = installerBarrier();
+        const first = route === "immediate"
+          ? epochResponder(thread, "tn-held", () => turn.resolve())
+          : epochResponder(thread, "tn-checkpoint", (t, th, tn) => {
+            t.push(toolCall(902, "checkpoint", {}, th, tn, "a2-checkpoint")).push(turnCompleted("completed", th, tn));
+          });
+        let armed = false, rootClean = false, sourceReads = 0, callbacks = 0, refreshes = 0;
+        const fx = await fixture([first, done()], rig => {
+          const root = rig.epochs[0]!.root, reap = root.reap.bind(root);
+          root.reap = async ms => {
+            if (armed) { rootEntered.resolve(); await rootRelease.promise; }
+            const result = await reap(ms);
+            if (result.ok) rootClean = true;
+            return result;
+          };
+        });
+        fx.rig.client.refreshCodex = async () => { refreshes++; throw new Error("unexpected refresh in A2 capture"); };
+        let mode: "now" | "milestone" | null = null;
+        let interrupt: (() => void) | undefined;
+        let savedGeneration = "", savedContent = "";
+        let releasesAtCapture = 0, launchesAtCapture = 0;
+        const controller = new AbortController();
+        const { ctx } = makeCtx({ signal: controller.signal,
+          pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+          reportIteration: async iteration => {
+            if (route === "pre-turn" && iteration === 2) { mode = "now"; interrupt!(); }
+            return { pauseRequested: route === "milestone" && iteration === 2, completedCount: route === "milestone" ? 1 : 0 };
+          },
+          checkpoint: async () => undefined,
+          parkForPause: async at => {
+            callbacks++;
+            assert.equal(at.completedCount, route === "milestone" ? 1 : 0);
+            armed = true;
+            releasesAtCapture = fx.rig.client.releaseCalls.length;
+            launchesAtCapture = fx.rig.providerLaunches();
+            savedGeneration = await fx.generation(); savedContent = await fx.saved();
+            const capture = await fx.exec.withCredentialFreeCapture(1000, async () => {
+              sourceReads++;
+              assert.equal(rootClean, true, "source read requires completed full-root proof");
+              await assert.rejects(fs.access(fx.homes[0]!), { code: "ENOENT" });
+              assert.equal(await fx.generation(), savedGeneration, "drain retains session generation");
+              assert.equal(await fx.saved(), savedContent, "drain retains session bytes");
+              sourceEntered.resolve(); await sourceRelease.promise;
+              assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture, "held source region releases no credentials");
+              assert.equal(refreshes, 0, "held source region refreshes no credentials");
+              assert.equal(fx.rig.providerLaunches(), launchesAtCapture, "held source region admits no successor epoch");
+              if (outcome === "withdrawn") mode = null;
+              return outcome === "accepted";
+            });
+            assert.equal(capture.kind, "observed_empty");
+            return capture.kind === "observed_empty" && capture.value;
+          },
+        });
+        const run = fx.exec.run(ctx);
+        // Attach rejection handling before the controller awaits any latch.
+        void run.catch(() => undefined);
+        try {
+          if (route === "immediate") { await withTimeout(turn.promise, 3000, "A2 live turn"); mode = "now"; interrupt!(); }
+          await withTimeout(Promise.race([rootEntered.promise, run.then(() => { throw new Error("A2 run ended before root drain"); })]), 3000, "A2 root drain entered");
+          assert.equal(sourceReads, 0, "held full-root proof excludes source access");
+          assert.equal(fx.rig.providerLaunches(), launchesAtCapture);
+          assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture);
+          rootRelease.resolve();
+          await withTimeout(sourceEntered.promise, 3000, "A2 protected source entered");
+          assert.equal(callbacks, 1);
+          assert.equal(fx.rig.providerLaunches(), launchesAtCapture);
+          assert.equal(fx.rig.client.releaseCalls.length, releasesAtCapture);
+          sourceRelease.resolve();
+          const result = await withTimeout(run, 5000, "A2 pause route settled");
+          assert.equal(sourceReads, 1);
+          assert.equal(callbacks, 1, "spent pause generation never re-parks");
+          assert.equal(Boolean(result.pausedAt), outcome === "accepted");
+          assert.equal(fx.rig.providerLaunches(), outcome === "accepted" ? 1 : 2,
+            "declined or withdrawn post-drain route requires a fresh epoch");
+          assert.equal(fx.rig.client.releaseCalls.length, outcome === "accepted" ? releasesAtCapture : releasesAtCapture + 1);
+          assert.equal(refreshes, 0);
+          if (outcome !== "accepted") {
+            assert.match(fx.adopted[0]!, /epoch-1/, "fresh epoch adopts the captured session");
+            assert.equal(fx.rig.epochs[1]!.transport.turnStartCount, 1);
+          }
+          assert.deepEqual(fx.missing, [], "persist never reads a removed HOME");
+        } finally {
+          rootRelease.resolve(); sourceRelease.resolve(); controller.abort(new Error("A2 cleanup"));
+          await withTimeout(run.catch(() => undefined), 5000, "A2 cleanup");
+          await fx.cleanup();
+        }
+      });
+    }
+  }
+
+  for (const seeded of ["now", "milestone"] as const) {
+    it(`A2 production seeded ${seeded} zero-provider capture`, async () => {
+      const fx = await fixture([done()]);
+      const entered = installerBarrier(), release = installerBarrier();
+      let parks = 0, releasesAtEntry = 0, refreshes = 0;
+      fx.rig.client.refreshCodex = async () => { refreshes++; throw new Error("unexpected seeded capture refresh"); };
+      const { ctx } = makeCtx({ pauseModeRequested: () => seeded,
+        reportIteration: async () => ({ pauseRequested: false }),
+        parkForPause: async () => {
+          parks++; releasesAtEntry = fx.rig.client.releaseCalls.length;
+          const result = await fx.exec.withCredentialFreeCapture(1000, async () => {
+            entered.resolve(); await release.promise;
+            assert.equal(fx.rig.providerLaunches(), 0, "seeded first boundary launches no provider");
+            assert.equal(fx.rig.client.releaseCalls.length, releasesAtEntry, "seeded held capture releases no credential");
+            assert.equal(refreshes, 0, "seeded held capture refreshes no credential");
+            return true;
+          });
+          assert.equal(result.kind, "observed_empty");
+          return result.kind === "observed_empty" && result.value;
+        },
+      });
+      const run = fx.exec.run(ctx); void run.catch(() => undefined);
+      try {
+        await withTimeout(Promise.race([entered.promise, run.then(() => { throw new Error("seeded run ended before capture"); })]), 3000, "seeded capture entered");
+        assert.equal(fx.rig.providerLaunches(), 0);
+        assert.equal(fx.rig.client.releaseCalls.length, releasesAtEntry);
+        assert.equal(fx.rig.epochs[0]!.transport.turnStartCount, 0);
+        release.resolve();
+        assert.ok((await withTimeout(run, 5000, "seeded pause settled")).pausedAt);
+        assert.equal(parks, 1);
+      } finally { release.resolve(); await run.catch(() => undefined); await fx.cleanup(); }
+    });
+  }
+
   it("A lifecycle missing facade control selects the runner's legacy action", async () => {
     const boundaryHost = { git: { withBoundaryProcessSpawner: async (
       _spawn: unknown, _signal: AbortSignal, action: () => Promise<void>,

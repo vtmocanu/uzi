@@ -92,14 +92,15 @@ function acquisition(context: CredentialFreeCaptureContext): Acquisition {
 /** Bind privately inside GitCache; callers receive no spawner on the context. */
 function captureGitSpawner(
   context: CredentialFreeCaptureContext,
-  validate: (request: BoundaryProcessRequest) => void,
+  bindValidation: (request: BoundaryProcessRequest) => () => void,
 ): Spawner {
   acquisition(context);
   return (raw) => {
     acquisition(context);
     // Copy before the first await: no retained caller-owned array or env survives.
     const request = Object.freeze({ ...raw, argv: Object.freeze([...raw.argv]), env: Object.freeze({ ...raw.env }) });
-    const check = () => { acquisition(context); validate(request); };
+    const validate = bindValidation(request);
+    const check = () => { acquisition(context); validate(); };
     check();
     requests.set(request, { context, validate: check });
     return acquisition(context).spawn(request);
@@ -2053,6 +2054,9 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  private readonly captureSynthesis = new AsyncLocalStorage<{
+    argv: readonly string[]; env: NodeJS.ProcessEnv; live: () => boolean;
+  }>();
   private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
@@ -2232,11 +2236,17 @@ export class GitCache {
     }
     for (const env of environments) Object.freeze(env);
     const spawn = captureGitSpawner(context, request => {
-      // Dynamic object-DB synthesis values are produced by existing private GitCache
-      // helpers. Their values are checked independently; config pins remain canonical.
+      // Capture the private invocation at issuance, then retain it through the final
+      // launcher check. Shape-valid paths/dates alone grant no synthesis authority.
+      const synthesis = this.captureSynthesis.getStore();
       const dynamic = this.captureSynthesisEnvironment(request.env);
-      const candidates = Object.keys(dynamic).length ? environments.map(env => ({ ...env, ...dynamic })) : environments;
-      validateCaptureGitRequest(request, candidates, GIT_BIN, process.execPath, CANCEL_CONTENT_HELPER);
+      const hasDynamic = Object.keys(dynamic).length > 0;
+      const candidates = hasDynamic && synthesis ? environments.map(env => ({ ...env, ...synthesis.env })) : environments;
+      return () => {
+        if (hasDynamic && (!synthesis || !synthesis.live() || request.identity !== "worker_pat" || request.cwd !== "/" ||
+            request.argv.length !== synthesis.argv.length || request.argv.some((arg, i) => arg !== synthesis.argv[i]))) refuseCapture();
+        validateCaptureGitRequest(request, candidates, GIT_BIN, process.execPath, CANCEL_CONTENT_HELPER);
+      };
     });
     return this.boundaryProcesses.run({ capture: context, spawn, signal: context.signal }, action);
   }
@@ -9281,11 +9291,11 @@ export class GitCache {
     try {
       await fs.mkdir(tmpWork, { recursive: true });
       const idxEnv: NodeJS.ProcessEnv = { GIT_INDEX_FILE: tmpIdx };
-      await this.runGitWithEnv(barePath, ["read-tree", realTip], idxEnv);
+      await this.runSynthesisGit(barePath, ["read-tree", realTip], idxEnv);
       // `--ignore-unmatch` is load-bearing: against a temp index a `git rm --cached` with no
       // match exits non-zero, so this flag makes the no-`.github`/already-deleted edges no-ops
       // (the same flag `alignBranchWithDefault` carries).
-      await this.runGitWithEnv(
+      await this.runSynthesisGit(
         barePath,
         ["rm", "--cached", "-r", "--ignore-unmatch", ".github/workflows"],
         idxEnv,
@@ -9297,13 +9307,13 @@ export class GitCache {
         await this.runGit(barePath, ["ls-tree", workflowSource, "--", ".github/workflows"])
       ).trim();
       if (sourceWfTree.length > 0) {
-        await this.runGitWithEnv(
+        await this.runSynthesisGit(
           barePath,
           ["read-tree", "--prefix=.github/workflows", `${workflowSource}:.github/workflows`],
           { ...idxEnv, GIT_WORK_TREE: tmpWork },
         );
       }
-      const newRoot = (await this.runGitWithEnv(barePath, ["write-tree"], idxEnv)).trim();
+      const newRoot = (await this.runSynthesisGit(barePath, ["write-tree"], idxEnv)).trim();
       if (!/^[0-9a-f]{40}$/.test(newRoot)) return null;
       const realTipTree = (await this.runGit(barePath, ["rev-parse", `${realTip}^{tree}`])).trim();
       if (!keepTreeEqual && newRoot === realTipTree) return null;
@@ -9315,7 +9325,7 @@ export class GitCache {
       for (const p of parents) commitArgs.push("-p", p);
       commitArgs.push("-m", message);
       const sha = (
-        await this.runGitWithEnv(barePath, commitArgs, {
+        await this.runSynthesisGit(barePath, commitArgs, {
           ...idxEnv,
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
           GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
@@ -12027,7 +12037,7 @@ export class GitCache {
         `bridge: restore published tip ${floors[0]} as an ancestor of ${tip} (tree unchanged)`,
       );
       const sha = (
-        await this.runGitWithEnv(barePath, args, {
+        await this.runSynthesisGit(barePath, args, {
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
           GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
           GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name,
@@ -12426,6 +12436,22 @@ export class GitCache {
     }
   }
 
+  /** Bind values allocated/read by the private object-DB producers to this exact
+   * invocation. Revocation follows the awaited child; no sibling inherits authority. */
+  private async runSynthesisGit(cwd: string, args: string[], extraEnv: NodeJS.ProcessEnv): Promise<string> {
+    if (!this.boundaryProcesses.getStore()?.capture) return this.runGitWithEnv(cwd, args, extraEnv);
+    let live = true;
+    const env = Object.freeze({ ...extraEnv });
+    const invocationArgs = Object.freeze([...args]);
+    const argv = Object.freeze([GIT_BIN, ...withDir(cwd, [...invocationArgs])]);
+    try {
+      return await this.captureSynthesis.run({ argv, env, live: () => live },
+        () => this.runGitWithEnv(cwd, invocationArgs, env));
+    } finally {
+      live = false;
+    }
+  }
+
   /**
    * PRD #1062 M2 (#1036) — a worker-uid git that carries EXTRA environment on top of the base
    * `gitEnv()` (no PAT): `GIT_INDEX_FILE` for a temp-index synthesis, `GIT_WORK_TREE` for the
@@ -12436,14 +12462,14 @@ export class GitCache {
    */
   private async runGitWithEnv(
     cwd: string | undefined,
-    args: string[],
+    args: readonly string[],
     extraEnv: NodeJS.ProcessEnv,
   ): Promise<string> {
     this.assertCaptureDecoration(extraEnv);
     const env = { ...gitEnv(), ...extraEnv };
     this.log.debug("git (env)", { cwd, args });
     try {
-      const { stdout } = await this.execScoped("git", withDir(cwd, args), {
+      const { stdout } = await this.execScoped("git", withDir(cwd, [...args]), {
         env,
         timeout: GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
@@ -13732,7 +13758,7 @@ export class GitCache {
           const args = ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree];
           for (const parent of parents.slice(start, start + 32)) args.push("-p", parent);
           args.push("-m", `uzi recovery coverage ${fingerprint} round ${round} batch ${start / 32}`);
-          const sha = (await this.runGitWithEnv(barePath, args, {
+          const sha = (await this.runSynthesisGit(barePath, args, {
             GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: AGENT_GIT_IDENTITY.email,
             GIT_COMMITTER_NAME: AGENT_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: AGENT_GIT_IDENTITY.email,
             GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
