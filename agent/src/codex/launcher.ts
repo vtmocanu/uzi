@@ -1236,7 +1236,8 @@ async function launchRunnerSupervised(spec: RunnerSupervisedLaunch, deps: Launch
       // The caller could not record the root: nothing else will ever reap it.
       if (!killUnreapedSupervisor(child, { split })) {
         // An unreaped, unrecorded supervisor may now outlive this call: make that observable.
-        (deps.onKillFailed ?? defaultKillFailed)(error);
+        // A throwing report hook must never replace the original error.
+        try { (deps.onKillFailed ?? defaultKillFailed)(error); } catch { /* keep the original */ }
       }
       throw error;
     }

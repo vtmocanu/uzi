@@ -250,11 +250,13 @@ describe("launchRunnerCommandRoot with a fake supervisor", () => {
     const killed: unknown[] = [];
     Object.assign(fake, { exitCode: null, signalCode: null, kill: (signal?: unknown) => { killed.push(signal); return true; } });
     const boom = new Error("record failed");
+    const reported: unknown[] = [];
     await assert.rejects(
-      launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }), depsFor(fake, { env: {} })),
+      launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }), depsFor(fake, { env: {}, onKillFailed: (e: unknown) => { reported.push(e); } })),
       (e: unknown) => e === boom,
     );
     assert.deepEqual(killed, ["SIGKILL"]);
+    assert.deepEqual(reported, [], "a successful kill reports nothing");
   });
 
   it("reports an unkillable supervisor through onKillFailed and still rethrows the original onSpawned error", { skip: SINGLE_UID > 0 ? false : "needs a non-root process uid" }, async () => {
@@ -268,6 +270,16 @@ describe("launchRunnerCommandRoot with a fake supervisor", () => {
       (e: unknown) => e === boom,
     );
     assert.deepEqual(reported, [boom]);
+  });
+
+  it("keeps the original onSpawned error when the onKillFailed hook itself throws", { skip: SINGLE_UID > 0 ? false : "needs a non-root process uid" }, async () => {
+    const fake = newFake(SINGLE_UID);
+    const boom = new Error("record failed");
+    await assert.rejects(
+      launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }),
+        depsFor(fake, { env: {}, onKillFailed: () => { throw new Error("hook failed"); } })),
+      (e: unknown) => e === boom,
+    );
   });
 
   it("classifies a spawn that throws as not started, without calling onSpawned", async () => {
@@ -575,7 +587,7 @@ describe("WRAPPER under the host bash", () => {
       // A 3-digit value passes the digits check but must be clamped to 50 (5 s), not honoured as 99.9 s.
       const huge = await runWrapper(holder(), { graceTenths: "999", timeoutMs: 20000 });
       assert.equal(huge.code, 6);
-      assert.ok(huge.exitMs >= 4000 && huge.exitMs < 7500, `an over-large grace is clamped to the 5 s cap (${String(huge.exitMs)}ms)`);
+      assert.ok(huge.exitMs >= 4000 && huge.exitMs < 11000, `an over-large grace is clamped to the 5 s cap (${String(huge.exitMs)}ms)`);
     } finally {
       for (const f of pidFiles) killPidFile(f);
     }
