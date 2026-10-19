@@ -13396,8 +13396,11 @@ try {
       stderrBytes += chunk.length;
     };
     const outputDrains: Promise<void>[] = [];
+    const outputPipes: Readable[] = [];
+    let stdoutRejected = false;
     const joinOutput = (output: Readable): void => {
-      if (output.errored) outputFailed = true;
+      if (output.errored || (output.destroyed && !output.readableEnded)) outputFailed = true;
+      if (output.readableEnded || output.destroyed) return;
       outputDrains.push(new Promise<void>(resolve => {
         output.once("end", resolve);
         output.once("error", () => { outputFailed = true; resolve(); });
@@ -13407,22 +13410,41 @@ try {
     const drainOutput = (source: Readable | null, cancel: () => void, keep = false): void => {
       if (!source) return;
       const output = this.meteredGitOutput(source, "metadataBytes", cancel);
+      outputPipes.push(source, output);
       if (metered) joinOutput(output);
       if (keep) output.on("data", keepStderr);
       else output.resume();
+      // Stdout may have been refused before this sibling pipe was attached.
+      if (stdoutRejected) { source.destroy(); output.destroy(); }
     };
     const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
     let gated: ReturnType<typeof exitGatedStream> | undefined;
     const attachStdout = (source: Readable, cancel: () => void, supervised = false): void => {
       if (!opts.streamStdout) { drainOutput(source, cancel); return; }
       const cancelProducer = () => producerScope(cancel);
+      const consumed = source.readableDidRead || source.readableEnded || source.destroyed;
       const output = this.meteredGitOutput(source, "artifactBytes", cancelProducer);
+      outputPipes.push(source, output);
       joinOutput(output);
       gated = exitGatedStream(output, cancelProducer, supervised);
+      if (consumed) {
+        stdoutRejected = true;
+        outputFailed = true;
+        gated.exited(new Error("git stdout is not a fresh byte pipe"));
+        cancelProducer();
+        source.destroy();
+        output.destroy();
+      }
     };
     const gateExit = (result: { code: number; stderr: string }): void => {
       gated?.exited(result.code === 0 ? undefined
         : new Error(`git ${args.join(" ")} exited ${result.code}${result.stderr ? `: ${result.stderr}` : ""}`));
+    };
+    const failOutput = (result: { code: number; stderr: string }, cancel: () => void): void => {
+      if (!gated || result.code === 0) return;
+      gateExit(result);
+      producerScope(cancel);
+      for (const pipe of outputPipes) pipe.destroy();
     };
     const boundary = this.boundaryProcesses.getStore();
     const recovery = this.recoveryOperation();
@@ -13451,12 +13473,15 @@ try {
       drainOutput(process.stderr, abortRecovery, true);
       const exited = process.completed.then(
         async ({ code }) => {
+          failOutput({ code, stderr: stderrText() }, abortRecovery);
           if (metered || opts.streamStdout) await Promise.all(outputDrains);
-          return { code: completionCode(code), stderr: stderrText() };
+          return { code: opts.streamStdout && code !== 0 ? code : completionCode(code), stderr: stderrText() };
         },
         async (error: unknown) => {
+          const result = { code: -1, stderr: stderrText() || gitErrorMessage(error) };
+          failOutput(result, abortRecovery);
           if (metered || opts.streamStdout) await Promise.all(outputDrains);
-          return { code: -1, stderr: stderrText() || gitErrorMessage(error) };
+          return result;
         },
       ).finally(async () => { await cancellation; });
       void exited.then(gateExit);
@@ -13485,10 +13510,16 @@ try {
       let failure: unknown;
       child.once("error", (error) => {
         failure = error;
+        failOutput({ code: -1, stderr: stderrText() || gitErrorMessage(error) }, abortRecovery);
         if (!opts.streamStdout && !recovery?.budget && !metered) resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) });
       });
+      child.once("exit", (code) => {
+        failOutput({ code: code ?? -1, stderr: stderrText() }, abortRecovery);
+      });
       child.once("close", (code) => {
-        const finish = () => resolve({ code: completionCode(failure ? -1 : code ?? -1),
+        const terminalCode = failure ? -1 : code ?? -1;
+        failOutput({ code: terminalCode, stderr: stderrText() }, abortRecovery);
+        const finish = () => resolve({ code: opts.streamStdout && terminalCode !== 0 ? terminalCode : completionCode(terminalCode),
           stderr: stderrText() || (failure ? gitErrorMessage(failure) : "") });
         if (metered || opts.streamStdout) void Promise.all(outputDrains).then(finish);
         else finish();

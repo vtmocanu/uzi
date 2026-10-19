@@ -31,10 +31,11 @@ async function fixture(t: test.TestContext) {
   return { dir, run: <T>(action: () => T) => MaintenanceResources.run(admitted.value, action) };
 }
 
-function producer(t: test.TestContext, native: boolean) {
+function producer(t: test.TestContext, native: boolean, autoDestroy = true) {
   const git = new GitCache("/unused", nullLogger());
   let complete!: (result: { code: number }) => void;
-  const completed = new Promise<{ code: number }>(resolve => { complete = resolve; });
+  let rejectOwner!: (error: Error) => void;
+  const completed = new Promise<{ code: number }>((resolve, reject) => { complete = resolve; rejectOwner = reject; });
   let release!: () => void;
   const cancellation = new Promise<void>(resolve => { release = resolve; });
   let cancelled = 0;
@@ -42,7 +43,7 @@ function producer(t: test.TestContext, native: boolean) {
   const requests: BoundaryProcessRequest[] = [];
   const cancel = () => { cancelled++; cancelContexts.push(MaintenanceResources.active()); };
   const child = Object.assign(new EventEmitter(), {
-    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    stdin: new PassThrough(), stdout: new PassThrough({ autoDestroy }), stderr: new PassThrough(),
     exitCode: null, signalCode: null, kill: () => { cancel(); return true; },
   });
   if (native) {
@@ -63,7 +64,94 @@ function producer(t: test.TestContext, native: boolean) {
     child.stdout.end(); child.stderr.end(); child.stdin.end();
     settleOwner(code);
   };
-  return { child, start, close, settleOwner, release, requests, cancelContexts, cancelled: () => cancelled };
+  return { child, start, close, settleOwner, rejectOwner, release, requests, cancelContexts, cancelled: () => cancelled };
+}
+
+for (const native of [false, true]) {
+  for (const metered of [false, true]) {
+    for (const rejected of [false, true]) {
+      test(`${native ? "native" : "owned"} ${metered ? "metered" : "unmetered"} runner ${rejected ? "error" : "nonzero exit"} fails open stdout before settlement`, async t => {
+        const p = producer(t, native);
+        const start = () => p.start();
+        const result = await (metered ? (await fixture(t)).run(start) : start());
+        let readError: unknown, readerSettled = false, exitSettled = false;
+        const read = (async () => {
+          try { for await (const _ of result.stdout!) {} }
+          catch (error) { readError = error; }
+          finally { readerSettled = true; }
+        })();
+        const exited = result.exited.then(value => { exitSettled = true; return value; });
+        try {
+          if (!rejected) { p.child.stderr.write("diagnostic"); await tick(); }
+          if (rejected) {
+            if (native) p.child.emit("error", new Error("spawn evidence lost"));
+            else p.rejectOwner(new Error("owner evidence lost"));
+          } else if (native) p.child.emit("exit", 7);
+          else p.settleOwner(7);
+          // Bounded event-loop turns: no raw EOF is supplied to notify the reader.
+          for (let i = 0; i < 10; i++) await tick();
+          assert.equal(readerSettled, true);
+          assert.match(String(readError), rejected ? /evidence lost/ : /exited 7.*diagnostic/);
+          assert.equal(p.child.stdout.destroyed, true);
+          assert.ok(p.cancelled() > 0);
+          assert.equal(exitSettled, false, "notification must still join close or cancellation/reap");
+          if (native) p.settleOwner(rejected ? -1 : 7);
+          else p.release();
+          assert.notEqual((await exited).code, 0);
+        } finally {
+          result.abort();
+          p.close(-1);
+          p.release();
+          await read;
+          await exited;
+        }
+      });
+    }
+  }
+}
+
+for (const metered of [false, true]) {
+  for (const closed of [false, true]) {
+    test(`owned ${metered ? "metered" : "unmetered"} runner rejects already ${closed ? "closed" : "consumed"} stdout and joins cancellation`, async t => {
+      const p = producer(t, false, false);
+      if (closed) {
+        p.child.stdout.destroy();
+        await tick();
+      } else {
+        p.child.stdout.end("consumed PACK");
+        for await (const _ of p.child.stdout) {}
+        assert.equal(p.child.stdout.readableEnded, true);
+        assert.equal(p.child.stdout.destroyed, false);
+      }
+      const result = await (metered ? (await fixture(t)).run(() => p.start()) : p.start());
+      let readError: unknown, readerSettled = false, exitSettled = false;
+      const read = (async () => {
+        try { for await (const _ of result.stdout!) assert.fail("consumed artifact delivered"); }
+        catch (error) { readError = error; }
+        finally { readerSettled = true; }
+      })();
+      const exited = result.exited.then(value => { exitSettled = true; return value; });
+      try {
+        p.settleOwner();
+        for (let i = 0; i < 10; i++) await tick();
+        assert.equal(readerSettled, true);
+        assert.match(String(readError), /not a fresh byte pipe/);
+        assert.ok(p.cancelled() > 0);
+        assert.equal(exitSettled, false);
+        result.abort();
+        p.release();
+        for (let i = 0; i < 10; i++) await tick();
+        assert.equal(exitSettled, true, "refused input must settle after owner and cancellation without raw stderr EOF");
+        assert.notEqual((await exited).code, 0);
+      } finally {
+        result.abort();
+        p.close(-1);
+        p.release();
+        await read;
+        await exited;
+      }
+    });
+  }
 }
 
 for (const native of [false, true]) {
@@ -111,6 +199,7 @@ for (const native of [false, true]) {
     assert.equal(Buffer.concat(chunks).toString(), "PACK");
     p.child.stderr.write("diagnostic");
     p.close(7);
+    p.release();
     await failed;
     assert.deepEqual(await result.exited, { code: 7, stderr: "diagnostic" });
   });
