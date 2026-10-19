@@ -18935,13 +18935,27 @@ describe("2833 Codex inline summaries", () => {
     } finally { release.resolve(); }
   });
 
-  for (const phase of ["factory", "launch", "dispose"] as const) {
-    it(`A owned summary ${phase} remains joined through both grace races during capture`, async t => {
+  for (const phase of ["factory", "launch", "dispose"] as const) for (const expired of [false, true]) {
+    it(`A owned summary ${phase} remains joined during ${expired ? "expired" : "unexpired"} capture`, async t => {
       const entered = m1Barrier(), release = m1Barrier(), disposing = m1Barrier(), disposed = m1Barrier();
-      const grace: (() => void)[] = [];
+      const registryPolls: (() => void)[] = [];
+      const pollHandles = new Set<ReturnType<typeof setTimeout>>();
       const realTimeout = globalThis.setTimeout;
+      const realClearTimeout = globalThis.clearTimeout;
+      const now = Date.now.bind(Date);
+      let advance = 0;
+      t.mock.method(Date, "now", () => now() + advance);
       t.mock.method(globalThis, "setTimeout", (fn: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
-        if (ms === 500) { grace.push(fn); return realTimeout(() => {}, 60_000); }
+        if (expired && (ms ?? Infinity) <= 25 && new Error().stack?.includes("settleForCapture")) {
+          // Deliver registry polling explicitly, without spending wall time.
+          const handle = realTimeout(() => {}, 60_000);
+          handle.unref();
+          pollHandles.add(handle);
+          registryPolls.push(() => {
+            realClearTimeout(handle); pollHandles.delete(handle); fn(...args);
+          });
+          return handle;
+        }
         return realTimeout(() => fn(...args), ms);
       });
       let launches = 0, cleanups = 0, captured = false, callback = false;
@@ -18990,8 +19004,14 @@ describe("2833 Codex inline summaries", () => {
         await new Promise<void>(resolve => rig.transport.onFirstTurnStart(resolve));
         capture = executor.withCredentialFreeCapture(5_000, async () => { callback = true; });
         void capture.then(() => { captured = true; });
-        for (let i = 0; i < 4; i++) { await drain(); grace.splice(0).forEach(fire => fire()); }
-        assert.equal(captured, false, "grace expiry cannot finish owned summary custody");
+        for (let i = 0; i < 40; i++) await drain();
+        if (expired) {
+          advance = 6_000;
+          registryPolls.splice(0).forEach(fire => fire());
+        }
+        // Bound observation turns while every factory/start/disposal barrier stays held.
+        for (let i = 0; i < 40; i++) await drain();
+        assert.equal(captured, false, "capture deadline cannot detach held owned summary work");
         assert.equal(callback, false);
         if (phase === "factory") {
           release.resolve(); disposed.resolve();
@@ -19000,13 +19020,17 @@ describe("2833 Codex inline summaries", () => {
           assert.equal(captured, false, "child exit does not prove full root disposal");
           disposed.resolve();
         }
-        assert.equal((await capture).kind, "observed_empty");
+        assert.equal((await capture).kind, expired ? "incomplete" : "observed_empty");
+        if (expired) assert.equal(callback, false, "owned completion cannot renew an expired capture");
         assert.equal(launches, phase === "factory" ? 0 : 1, "capture fences a late factory's fresh spawn");
         assert.equal(cleanups, phase === "factory" ? 0 : 1, "full disposal has one owner");
         assert.deepEqual(intents, [], "aborted advice never delivers");
       } finally {
+        advance = 0;
         release.resolve(); disposed.resolve(); rig.transport.end();
-        await capture; await running;
+        registryPolls.splice(0).forEach(fire => fire());
+        try { await capture; await running; }
+        finally { for (const handle of pollHandles) realClearTimeout(handle); }
       }
     });
   }
