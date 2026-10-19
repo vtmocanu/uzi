@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 )
 
 // Public issue creation supplies birth coverage. Only admission/ownership and
@@ -17,6 +19,8 @@ func policyStopNoGateFixture(t *testing.T, seeded, checked, full bool) (codexTes
 	t.Helper()
 	e, f, old, candidate := acceptanceUnpublishedFixture(t)
 	f.svc.p.PolicyStopNegotiated = true
+	resetInterlockSetting(t, e)
+	f.svc.SetCompletionInterlockSettings(settings.New(e.q, time.Minute))
 	repo := uuid.UUID(mustRun(t, e, old).RepoID.Bytes)
 	seedEligibleIssue(t, e, repo, 9471)
 	var seed *SeededPlan
@@ -27,7 +31,7 @@ func policyStopNoGateFixture(t *testing.T, seeded, checked, full bool) (codexTes
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.exec("UPDATE runs SET worker_id=$2,status='claimed',claim_generation=1,auto_approve=true,plan_cross_check_required=$3 WHERE id=$1", r.ID, f.wkr.ID, checked)
+	e.exec("UPDATE runs SET worker_id=$2,status='claimed',claim_generation=1,auto_approve=$4,plan_cross_check_required=$3 WHERE id=$1", r.ID, f.wkr.ID, checked, !seeded)
 	ms := []Milestone{{ID: "m1", Title: "one"}, {ID: "m2", Title: "two"}}
 	req := StateRequest{State: "running", ClaimGeneration: i64(1), Milestones: &ms, SessionID: strPtr("no-gate-session")}
 	if !seeded {
@@ -57,8 +61,16 @@ func policyStopNoGateFixture(t *testing.T, seeded, checked, full bool) (codexTes
 	}
 	progress := autopilotRevisionReport(t, f, r.ID, StateRequest{State: "running", ClaimGeneration: i64(1), MilestonesCompleted: &completed})
 	frozen, err := DecodeMilestones(progress.MilestonesFrozen)
-	if err != nil || len(frozen) != 2 || !progress.CompletionContractVersion.Valid || !progress.ContractRevision.Valid {
-		t.Fatalf("public running report did not freeze the issue contract: %+v err=%v", progress, err)
+	if err != nil || len(frozen) != 2 {
+		t.Fatalf("public running report froze %d milestones: %v", len(frozen), err)
+	}
+	if seeded {
+		// Public seeded creation deliberately stays legacy with the setting ON.
+		if progress.CompletionContractVersion.Valid || progress.ContractRevision.Valid || len(progress.CompletionContract) != 0 {
+			t.Fatal("seeded running report manufactured an interlocked contract")
+		}
+	} else if !progress.CompletionContractVersion.Valid || !progress.ContractRevision.Valid || len(progress.CompletionContract) == 0 {
+		t.Fatalf("public unseeded contract not frozen: version=%+v revision=%+v bytes=%d", progress.CompletionContractVersion, progress.ContractRevision, len(progress.CompletionContract))
 	}
 	hold := policyRequest()
 	hold.Phase = strPtr("implementation")
