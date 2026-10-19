@@ -2,8 +2,8 @@
   "lockfile_version": "1",
   "packages": {
     "charm-freeze@0.2.2": {
-      "last_modified": "2026-08-27T07:16:00Z",
-      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#charm-freeze",
+      "last_modified": "2026-10-02T22:55:44Z",
+      "resolved": "github:NixOS/nixpkgs/55ba7f49ef2962b42cbd126522b7df5f95037679#charm-freeze",
       "source": "devbox-search",
       "version": "0.2.2",
       "systems": {
@@ -11,21 +11,21 @@
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/p51w5xfziqpvnhi0hvy6hky86wbk0jki-charm-freeze-0.2.2",
+              "path": "/nix/store/pm6xz76n1rjxmb3r7l4gcljmj7f7q7f6-charm-freeze-0.2.2",
               "default": true
             }
           ],
-          "store_path": "/nix/store/p51w5xfziqpvnhi0hvy6hky86wbk0jki-charm-freeze-0.2.2"
+          "store_path": "/nix/store/pm6xz76n1rjxmb3r7l4gcljmj7f7q7f6-charm-freeze-0.2.2"
         },
         "aarch64-linux": {
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/d9ff17b2lizpisf51f4v2c77cy4376h3-charm-freeze-0.2.2",
+              "path": "/nix/store/74p239k8m145r5vc7hifaqm900gxc752-charm-freeze-0.2.2",
               "default": true
             }
           ],
-          "store_path": "/nix/store/d9ff17b2lizpisf51f4v2c77cy4376h3-charm-freeze-0.2.2"
+          "store_path": "/nix/store/74p239k8m145r5vc7hifaqm900gxc752-charm-freeze-0.2.2"
         },
         "x86_64-darwin": {
           "outputs": [
@@ -41,17 +41,17 @@
           "outputs": [
             {
               "name": "out",
-              "path": "/nix/store/clvmvkr458cj3a9c2hqyg6az8qm0sij0-charm-freeze-0.2.2",
+              "path": "/nix/store/3yifnb3702d8dm61dvpgdfr85l78rc9a-charm-freeze-0.2.2",
               "default": true
             }
           ],
-          "store_path": "/nix/store/clvmvkr458cj3a9c2hqyg6az8qm0sij0-charm-freeze-0.2.2"
+          "store_path": "/nix/store/3yifnb3702d8dm61dvpgdfr85l78rc9a-charm-freeze-0.2.2"
         }
       }
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
-      "last_modified": "2026-10-08T19:21:32Z",
-      "resolved": "github:NixOS/nixpkgs/8edc0c72e3a38faf5434e40d1f19431125fe4b30?lastModified=1791487292"
+      "last_modified": "2026-10-16T02:15:57Z",
+      "resolved": "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4?lastModified=1792116957"
     }
   }
 }
