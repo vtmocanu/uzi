@@ -12,6 +12,23 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getSemanticCandidateByDigest = `-- name: GetSemanticCandidateByDigest :one
+SELECT candidate FROM semantic_candidate_history
+WHERE run_id=$1 AND candidate->>'digest'=$2::text
+`
+
+type GetSemanticCandidateByDigestParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	Column2 string    `json:"column_2"`
+}
+
+func (q *Queries) GetSemanticCandidateByDigest(ctx context.Context, arg GetSemanticCandidateByDigestParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getSemanticCandidateByDigest, arg.RunID, arg.Column2)
+	var candidate []byte
+	err := row.Scan(&candidate)
+	return candidate, err
+}
+
 const getSemanticPlanning = `-- name: GetSemanticPlanning :one
 SELECT enrollment, revision, fingerprint, candidate, review_state
 FROM semantic_planning WHERE run_id = $1
@@ -146,7 +163,7 @@ func (q *Queries) InsertSemanticSourceSnapshot(ctx context.Context, arg InsertSe
 }
 
 const updateSemanticPlanning = `-- name: UpdateSemanticPlanning :execrows
-UPDATE semantic_planning SET revision=$2, fingerprint=$3, candidate=$4, review_state=NULL
+UPDATE semantic_planning SET revision=$2, fingerprint=$3, candidate=$4
 WHERE run_id=$1
 `
 
@@ -168,4 +185,18 @@ func (q *Queries) UpdateSemanticPlanning(ctx context.Context, arg UpdateSemantic
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const updateSemanticReviewState = `-- name: UpdateSemanticReviewState :exec
+UPDATE semantic_planning SET review_state=$2 WHERE run_id=$1
+`
+
+type UpdateSemanticReviewStateParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	ReviewState []byte    `json:"review_state"`
+}
+
+func (q *Queries) UpdateSemanticReviewState(ctx context.Context, arg UpdateSemanticReviewStateParams) error {
+	_, err := q.db.Exec(ctx, updateSemanticReviewState, arg.RunID, arg.ReviewState)
+	return err
 }

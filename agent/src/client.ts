@@ -119,7 +119,13 @@ export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
   | "too_many_untracked" | "secret_detected" | "scan_failed" | "unsupported_entry";
+import { parseSemanticEnrollment, parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
+import { semanticCandidateResponseSchema, semanticCoverageStatusSchema, semanticReservationSchema,
+  type SemanticReserveRequest, type SemanticSettleRequest, type SemanticPublishRequest } from "./semantic-coverage-wire.js";
+
 export interface PlanCrossCheckCandidate {
+  candidate_identity_version?: "semantic_v1";
+  semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   plan_md: string;
   milestones: unknown[];
   required_capabilities: string[];
@@ -260,6 +266,14 @@ function decodePlanCrossCheckResponse(value: unknown, generation: number, round:
   // Canonical stored nil capability/tool slices serialize as null, unlike milestones.
   const list = (v: unknown): string[] | undefined =>
     v === null ? [] : Array.isArray(v) && v.length <= 64 && v.every((s) => crossCheckText(s, 256)) ? v : undefined;
+  if ("semantic_identity" in c) return invalid();
+  if (c.candidate_identity_version !== undefined || c.semantic_candidate !== undefined) {
+    if (c.candidate_identity_version !== "semantic_v1" ||
+        Buffer.byteLength(JSON.stringify(c.semantic_candidate) ?? "") > SEMANTIC_ENVELOPE_MAX_BYTES) return invalid();
+    try {
+      if (parseSemanticCandidate(c.semantic_candidate).digest !== wire.candidate_digest) return invalid();
+    } catch { return invalid(); }
+  }
   const caps = list(c.required_capabilities), tools = list(c.required_tools);
   if (!caps || !tools) return invalid();
   // The normalizer preserves extra milestone prose, bounded to depth 32 and total bytes.
@@ -1670,8 +1684,9 @@ export class WorkerClient {
       // Dedicated requests are bounded even without a marker; unmarked ordinary
       // claims keep their existing decoder.
       const claim = (dedicated || marker === "cross_check"
-        ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+        ? JSON.parse(await readCrossCheckText(res, CROSS_CHECK_RESPONSE_MAX_BYTES, deadline, "claim"))
         : await res.json()) as ClaimResponse;
+      if (claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
       if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
         throw new Error("cross-check claim marker and kind disagree");
       }
@@ -1894,15 +1909,59 @@ export class WorkerClient {
 
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
+    // Frozen enrollment selects server history; do not resend the canonical criteria.
+    const { semantic_candidate: _semantic, ...request } = candidate;
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
-      { ...candidate, stage: "plan", claim_generation: claimGeneration, round },
-      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES), claimGeneration, round);
+      { ...request, stage: "plan", claim_generation: claimGeneration, round },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES, false, { generation: claimGeneration, round }), claimGeneration, round);
+  }
+
+  private semanticRequestSignal(generation: number, signal?: AbortSignal): AbortSignal {
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid semantic claim generation");
+    return AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(this.httpTimeoutMs)]);
+  }
+
+  async submitSemanticCandidate(runId: string, generation: number,
+    structural: PlanCrossCheckCandidate, proposal: import("./semantic-plan.js").SemanticSubmission | undefined,
+    sources: readonly unknown[], signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCandidateResponseSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/candidate`,
+      { claim_generation: generation, structural, proposal, sources }, this.httpTimeoutMs, owned, SEMANTIC_ENVELOPE_MAX_BYTES, true));
+  }
+
+  async semanticCoverageStatus(runId: string, generation: number, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage?claim_generation=${generation}`,
+      undefined, 128 * 1024, owned));
+  }
+
+  async reserveSemanticCoverage(runId: string, generation: number, request: SemanticReserveRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticReservationSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/reserve`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, SEMANTIC_ENVELOPE_MAX_BYTES, true));
+  }
+
+  async settleSemanticCoverage(runId: string, generation: number, request: SemanticSettleRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/settle`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, 128 * 1024, true));
+  }
+
+  async publishSemanticCoverage(runId: string, generation: number, request: SemanticPublishRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticCoverageStatusSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/publish`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, 128 * 1024, true));
   }
 
   async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/plan/${round}?claim_generation=${claimGeneration}`,
-      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal), claimGeneration, round);
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal, { generation: claimGeneration, round }), claimGeneration, round);
   }
 
   async planCrossCheckLatest(runId: string, generation: number, signal?: AbortSignal): Promise<PlanCrossCheckLatestMetadata> {
@@ -3837,13 +3896,14 @@ export class WorkerClient {
     callerSignal?: AbortSignal,
     maxResponseBytes?: number,
     fenceResponseAbort = false,
+    semanticContext?: { generation: number; round: number },
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     MaintenanceBudget.current()?.check();
     if (res.status === 204) return undefined;
     const text = maxResponseBytes === undefined ? await readResponseText(res) :
-      await readBoundedText(res, maxResponseBytes, true, fenceResponseAbort ? callerSignal : undefined);
+      await readCrossCheckText(res, maxResponseBytes, fenceResponseAbort ? callerSignal : undefined, semanticContext);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
@@ -4033,7 +4093,8 @@ export class WorkerClient {
     return text ? JSON.parse(text) : undefined;
   }
 
-  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+  private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal,
+    semanticContext?: { generation: number; round: number }): Promise<unknown> {
     if (signal) signal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs ?? this.httpTimeoutMs)]);
     signal?.throwIfAborted();
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
@@ -4044,7 +4105,7 @@ export class WorkerClient {
       throw new RequestError("GET", path, res.status, text.slice(0, 4096),
         retryAfterMsOf(res.headers.get("Retry-After")), { complete: true, bytes: raw.length });
     }
-    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, signal);
+    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readCrossCheckText(res, maxResponseBytes, signal, semanticContext);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
@@ -4202,6 +4263,31 @@ const ERROR_BODY_MAX_BYTES = 4096;
  *  exceeding the remaining byte budget before retaining or decoding it. */
 async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<string> {
   return new TextDecoder().decode(await readBoundedBytes(res, maxBytes, rejectOverflow, signal));
+}
+
+/** Only plan replies and checker claims opt into the larger read. A worker flag
+ * cannot widen a structural reply: the complete server candidate must decode and
+ * its digest must match the enclosing server identity before the old cap lifts. */
+async function readCrossCheckText(res: Response, maxBytes: number, signal?: AbortSignal,
+  semanticContext?: { generation: number; round: number } | "claim"): Promise<string> {
+  const raw = await readBoundedBytes(res, semanticContext ? SEMANTIC_ENVELOPE_MAX_BYTES : maxBytes, true, signal);
+  const text = new TextDecoder().decode(raw);
+  if (semanticContext && raw.length > maxBytes) {
+    try {
+      const wire: unknown = JSON.parse(text);
+      let candidate: PlanCrossCheckCandidate | ReturnType<typeof decodeCrossCheckClaim> | undefined;
+      if (semanticContext === "claim") {
+        if (crossCheckRecord(wire) && wire.kind === "cross_check") candidate = decodeCrossCheckClaim(wire.cross_check);
+      } else {
+        const response = decodePlanCrossCheckResponse(wire, semanticContext.generation, semanticContext.round);
+        if (response.result === "candidate") candidate = response.candidate;
+      }
+      if (!candidate || candidate.candidate_identity_version !== "semantic_v1" || !candidate.semantic_candidate) {
+        throw new Error("missing semantic candidate");
+      }
+    } catch { throw new ResponseBodyOverflowError(maxBytes); }
+  }
+  return text;
 }
 
 /** The raw-byte core of {@link readBoundedText}; same bounds and failure behaviour. */

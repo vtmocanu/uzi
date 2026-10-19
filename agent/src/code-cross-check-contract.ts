@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
 import type { ClaimPlanCrossCheck, ClaimCodeCrossCheck } from "./protocol.js";
 
 /** Cap on the repository-instructions text carried through a code cross-check; the same 64 KiB
@@ -124,6 +125,14 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     || !bounded(v.candidate_digest, 128)
     || typeof v.deadline_at !== "string" || !Number.isFinite(Date.parse(v.deadline_at))
     || !bounded(v.plan_md, 256 * 1024)) return invalid();
+  if ("semantic_identity" in v) return invalid();
+  if (v.candidate_identity_version !== undefined || v.semantic_candidate !== undefined) {
+    if (v.stage !== "plan" || v.candidate_identity_version !== "semantic_v1" ||
+        Buffer.byteLength(JSON.stringify(v.semantic_candidate) ?? "") > SEMANTIC_ENVELOPE_MAX_BYTES) return invalid();
+    try {
+      if (parseSemanticCandidate(v.semantic_candidate).digest !== v.candidate_digest) return invalid();
+    } catch { return invalid(); }
+  }
   if (v.stage === "code") {
     if (v.repo_instructions_commit !== undefined && (typeof v.repo_instructions_commit !== "string"
       || v.repo_instructions_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.repo_instructions_commit))) return invalid();

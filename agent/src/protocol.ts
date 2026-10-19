@@ -1262,6 +1262,8 @@ export interface ClaimJob {
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
 export interface ClaimPlanCrossCheck {
+  candidate_identity_version?: "semantic_v1";
+  semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   /** Independent provenance from the captured server snapshot; absent on legacy claims. */
   model_source?: "pin" | "worker default";
   effort_source?: "pin" | "worker default";
@@ -1307,6 +1309,8 @@ export interface ClaimMemoryState {
 }
 
 export interface ClaimResponse extends ClaimMemoryState {
+  /** Server row only; no production enrollment writer in M2. */
+  semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
   park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */

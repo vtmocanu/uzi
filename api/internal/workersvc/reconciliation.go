@@ -38,12 +38,13 @@ type StateReportResult struct {
 // PlanCrossCheckStatusResult keeps the existing active candidate internal.
 // Parked responses have no candidate, raw run, findings, or presentation body.
 type PlanCrossCheckStatusResult struct {
-	CrossCheck     store.CrossCheck    `json:"-"`
-	LeadLastSeq    int32               `json:"-"`
-	Parked         bool                `json:"-"`
-	Verdict        string              `json:"-"`
-	ReasonClass    string              `json:"-"`
-	Reconciliation *LeadReconciliation `json:"-"`
+	Candidate      *PlanCrossCheckCandidate `json:"-"`
+	CrossCheck     store.CrossCheck         `json:"-"`
+	LeadLastSeq    int32                    `json:"-"`
+	Parked         bool                     `json:"-"`
+	Verdict        string                   `json:"-"`
+	ReasonClass    string                   `json:"-"`
+	Reconciliation *LeadReconciliation      `json:"-"`
 }
 
 type reconciliationReader interface {

@@ -27,11 +27,18 @@ func semanticSnapshotBlobs(planMd string, captures []apitypes.SemanticSourceCapt
 	return blobs
 }
 
-// submitSemanticCandidate has no production caller or route. The source capture
+// SubmitSemanticCandidate is the dormant trusted-worker compiler seam. Transport
+// must use existing worker authentication; no production route enrolls a run.
+func (s *Service) SubmitSemanticCandidate(ctx context.Context, workerID, runID uuid.UUID, generation int64, structural PlanCrossCheckCandidate, proposal []byte, captures []apitypes.SemanticSourceCapture) (apitypes.SemanticCandidate, error) {
+	return s.submitSemanticCandidate(ctx, workerID, runID, generation, structural, proposal, captures, true)
+}
+
+// submitSemanticCandidate also supports M1 compiler fixtures. Production callers
+// use SubmitSemanticCandidate, which requires frozen issue bytes. The source capture
 // argument is worker-owned, distinct from the strictly decoded lead proposal.
 // Every mutation requires a transaction and the run lock serializes all capacity,
 // revision, ownership and exact-current retry checks. No history is evicted.
-func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID uuid.UUID, generation int64, structural PlanCrossCheckCandidate, proposal []byte, captures []apitypes.SemanticSourceCapture) (apitypes.SemanticCandidate, error) {
+func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID uuid.UUID, generation int64, structural PlanCrossCheckCandidate, proposal []byte, captures []apitypes.SemanticSourceCapture, bindFrozenIssue ...bool) (apitypes.SemanticCandidate, error) {
 	var empty apitypes.SemanticCandidate
 	if s.txBeginner == nil {
 		return empty, fmt.Errorf("semantic candidate requires transaction")
@@ -74,6 +81,17 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 	if enrollment.Profile != "semantic" || enrollment.Policy.Version != 1 {
 		return empty, fmt.Errorf("semantic enrollment required")
 	}
+	if len(bindFrozenIssue) > 0 && bindFrozenIssue[0] {
+		captures, err = frozenIssueCaptures(run.IssueDescription, captures)
+		if err != nil {
+			return empty, err
+		}
+	}
+	structural, err = NormalizePlanCrossCheckCandidate(structural)
+	if err != nil {
+		return empty, err
+	}
+	structural.CandidateIdentityVersion, structural.SemanticCandidate = "", nil
 	candidate, fp, err := compileSemanticProposal(structural, proposal, captures)
 	if err != nil {
 		return empty, err

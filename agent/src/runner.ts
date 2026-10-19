@@ -43,6 +43,9 @@ import type {
 import { PlanRejectedError } from "./executor.js";
 import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "./plan-revision-retry.js";
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
+import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
+import { SemanticPlanningGate } from "./semantic-planning-gate.js";
+import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
@@ -2209,6 +2212,8 @@ export interface RunnerOptions {
   recoveryLiveTiming?: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs">;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
+  /** Explicit bounded fixture transport only; never wired by worker runtime. */
+  semanticCoverageTestTransport?: BoundedCoverageTestTransport;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
   teardownTestDeps?: TeardownTestDeps;
   queueTerminalRejectionReconciliation?: (runId: string, generation: number) => void;
@@ -2458,6 +2463,7 @@ export class RunRunner {
   /** issue #1597 M2: test-only seams (undefined in production). */
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
+  private readonly semanticCoverageTestTransport: BoundedCoverageTestTransport | undefined;
   private readonly recoveryRetryMs: number;
   private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
@@ -2662,6 +2668,7 @@ export class RunRunner {
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
     this.planCrossCheckTiming = opts.planCrossCheckTiming;
+    this.semanticCoverageTestTransport = opts.semanticCoverageTestTransport;
     this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
@@ -11070,7 +11077,11 @@ export class RunRunner {
       if (body.status === "running" && flight.workerMemory) flight.workerMemory.resumeReady = true;
       return reportState(body, ...args);
     };
+    const semanticPlanning = claim.semantic_planning === undefined ? undefined : parseSemanticEnrollment(claim.semantic_planning);
+    const semanticGate = semanticPlanning ? new SemanticPlanningGate(this.client, runId, flight.claimGeneration,
+      steering.lifecycleSignal(), this.semanticCoverageTestTransport) : undefined;
     const ctx: RunContext = {
+      semanticPlanning,
       runId,
       claimGeneration: claim.claim_generation,
       ...(flight.workerMemory ? { capturedMemory: () => this.captureWorkerMemory(flight) } : {}),
@@ -11319,13 +11330,35 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || !cause.providerOrigin || !revisionRecovery) throw cause;
         await revisionRecovery.retry(cause);
       },
-      gatePlan: async (planMd, milestones, onPlanPersisted, settles) => {
+      gatePlan: async (planMd, milestones, onPlanPersisted, settles, semanticSubmission) => {
         if (flight.workerMemory) flight.workerMemory.revisionContext = undefined;
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
         // unchanged. Non-ci_fix and code-plan ci_fix runs keep today's behavior exactly.
         const forceGate = claim.kind === "ci_fix" && isCIConfigPlan(planMd);
+        // Compile before checker selection from bare exact-base reads and the frozen issue.
+        // The lead proposal never supplies capture authority.
+        let semanticCompiled: Awaited<ReturnType<SemanticPlanningGate["compile"]>> | undefined;
+        let semanticSources: Awaited<ReturnType<typeof captureSemanticSources>> | undefined;
+        let semanticDiff: Awaited<ReturnType<RunRunner["captureCheckedPlanningDiff"]>> | undefined;
+        if (semanticGate) {
+          if (!barePath) throw new Error("semantic candidate: bare source unavailable");
+          semanticDiff = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+          if ("refusal" in semanticDiff) throw new Error(`semantic candidate: planning diff unavailable (${semanticDiff.refusal}: ${semanticDiff.diagnostic})`);
+          semanticSources = await captureSemanticSources(this.git, {
+            barePath, repo: claim.repo.id, headSha: runnerClone.baseCommit,
+            issue: { id: "issue:" + claim.issue_iid, bytes: Buffer.from(claim.issue_description) },
+            planBytes: Buffer.from(planMd), timeoutMs: 3000, signal: steering.lifecycleSignal(),
+          });
+          semanticCompiled = await semanticGate.compile({
+            plan_md: planMd, milestones: milestones ?? [],
+            required_capabilities: toolchainDetection?.required_capabilities ?? [],
+            required_tools: toolchainDetection?.required_tools ?? [],
+            size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
+            planning_diff: semanticDiff.diff,
+          }, semanticSubmission, semanticSources.sources);
+        }
         const eligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
           !seeded && !forceGate && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
         // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
@@ -11384,7 +11417,7 @@ export class RunRunner {
               checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "codex_lead_unsupported" };
               checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
             } else {
-              const captured = await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
+              const captured = semanticDiff ?? await this.captureCheckedPlanningDiff(runnerClone.path, runnerClone.baseCommit, steering.lifecycleSignal(), runLog);
               if ("refusal" in captured) {
                 crossCheckReason = `plan cross-check: planning diff refused (${captured.refusal}: ${captured.diagnostic})`;
                 checkedFields = { status: "awaiting_approval", plan_cross_check_gate_reason: "planning_diff_refused",
@@ -11392,7 +11425,10 @@ export class RunRunner {
                 checkedHuman = { phase: "publishinginitial", onApplied: () => releaseStateBarrier?.() };
               } else {
                 const decision = await checkPlan({ client: this.client, runId, generation: flight.claimGeneration,
-                  candidate: { plan_md: planMd, milestones: milestones ?? [],
+                  candidate: {
+                    ...(semanticCompiled ? { candidate_identity_version: "semantic_v1" as const,
+                      semantic_candidate: semanticCompiled.candidate } : {}),
+                    plan_md: planMd, milestones: milestones ?? [],
                     required_capabilities: toolchainDetection?.required_capabilities ?? [],
                     required_tools: toolchainDetection?.required_tools ?? [],
                     size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
@@ -11437,6 +11473,12 @@ export class RunRunner {
             return checkedFailure(new Error("plan cross-check: new presentation outside human revision"));
           checkedHuman.phase = "publishingrevised";
           checkedHuman.continueWait = undefined;
+        }
+        // Automatic checker REVISE returns above consume no coverage admission.
+        // M3/M4 own rendering, exact freeze and the server approval park; M2 supplies evidence.
+        if (semanticGate && semanticCompiled && semanticSources) {
+          const coverage = await semanticGate.review(semanticCompiled, planMd, semanticSources.sources);
+          batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage } });
         }
         const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate &&
           (!checkedHuman || checkedApproval !== undefined);

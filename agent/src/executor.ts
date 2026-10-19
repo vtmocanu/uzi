@@ -117,6 +117,7 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
@@ -386,6 +387,7 @@ export interface RunContext {
     milestones?: Milestone[],
     onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
+    semanticSubmission?: import("./semantic-plan.js").SemanticSubmission,
   ): Promise<PlanVerdict>;
   /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it

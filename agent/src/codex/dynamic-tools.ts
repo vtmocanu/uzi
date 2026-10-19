@@ -2,6 +2,8 @@
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 
+import { z } from "zod";
+import { semanticProposalSchema } from "../semantic-plan.js";
 import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
 import { GET_ISSUE_HELP } from "../forge-tool-help.js";
 import { CODEX_DELEGATE_TOOLS, codexDynamicToolWireName, type RunGrants } from "./broker.js";
@@ -111,6 +113,7 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
         description: "Submit the implementation plan for the worker's approval gate.",
         inputSchema: objectSchema({
           plan_md: STRING,
+          ...(grants.isRoot && grants.semanticPlanning ? { semantic_proposal: z.toJSONSchema(semanticProposalSchema, { unrepresentable: "any" }) } : {}),
           milestones: { type: "array", items: objectSchema({ id: STRING, title: STRING }, ["id", "title"], false) },
         }, ["plan_md"], false),
       };

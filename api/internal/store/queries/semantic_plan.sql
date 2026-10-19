@@ -28,5 +28,12 @@ ON CONFLICT DO NOTHING;
 INSERT INTO semantic_candidate_history(run_id, revision, candidate) VALUES ($1, $2, $3);
 
 -- name: UpdateSemanticPlanning :execrows
-UPDATE semantic_planning SET revision=$2, fingerprint=$3, candidate=$4, review_state=NULL
+UPDATE semantic_planning SET revision=$2, fingerprint=$3, candidate=$4
 WHERE run_id=$1;
+
+-- name: UpdateSemanticReviewState :exec
+UPDATE semantic_planning SET review_state=$2 WHERE run_id=$1;
+
+-- name: GetSemanticCandidateByDigest :one
+SELECT candidate FROM semantic_candidate_history
+WHERE run_id=$1 AND candidate->>'digest'=$2::text;

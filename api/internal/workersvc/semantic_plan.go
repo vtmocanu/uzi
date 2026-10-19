@@ -40,7 +40,13 @@ func buildSemanticCompletionContract(candidate apitypes.SemanticCandidate) ([]by
 
 // strictSemanticJSON rejects duplicate keys at every depth as well as unknown
 // fields. encoding/json alone accepts the last duplicate silently.
+// DecodeSemanticRequest applies the compiler JSON boundary to worker transport.
+func DecodeSemanticRequest(raw []byte, dst any) error { return strictSemanticJSON(raw, dst) }
+
 func strictSemanticJSON(raw []byte, dst any) error {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '{' && trimmed[0] != '[' {
+		return fmt.Errorf("object or array required")
+	}
 	if !utf8.Valid(raw) {
 		return fmt.Errorf("invalid UTF-8 JSON")
 	}
@@ -292,7 +298,18 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 		}
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].ID < refs[j].ID })
-	structuralDigest, err := structural.Digest()
+	// Checker submission and plan writes use this existing canonical boundary.
+	// Fingerprint the same structural values, while retaining the exact raw
+	// plan/source snapshots below. Copy slices: normalization must not mutate
+	// the trusted capture caller's input.
+	canonicalStructural := structural
+	canonicalStructural.RequiredCapabilities = append([]string(nil), structural.RequiredCapabilities...)
+	canonicalStructural.RequiredTools = append([]string(nil), structural.RequiredTools...)
+	canonicalStructural, err := NormalizePlanCrossCheckCandidate(canonicalStructural)
+	if err != nil {
+		return out, "", err
+	}
+	structuralDigest, err := canonicalStructural.Digest()
 	if err != nil {
 		return out, "", err
 	}

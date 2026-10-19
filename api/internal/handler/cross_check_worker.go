@@ -63,7 +63,7 @@ func (req *planCrossCheckRequest) UnmarshalJSON(raw []byte) error {
 			}
 		}
 	}
-	for _, key := range []string{"plan_md", "milestones", "planning_diff", "required_capabilities", "required_tools", "size_class"} {
+	for _, key := range []string{"plan_md", "milestones", "planning_diff", "required_capabilities", "required_tools", "size_class", "candidate_identity_version", "semantic_candidate"} {
 		if _, present := fields[key]; present {
 			req.planFields = true
 		}
@@ -248,6 +248,9 @@ func writeCrossCheckStatus(w http.ResponseWriter, status workersvc.PlanCrossChec
 		return
 	}
 	candidate := crossCheckResponse(status.CrossCheck, status.LeadLastSeq)
+	if status.Candidate != nil {
+		candidate.Candidate = *status.Candidate
+	}
 	candidate.leadReconciliationResponse = reconciliationResponse(status.LeadLastSeq, status.Reconciliation)
 	httpx.JSON(w, http.StatusOK, candidate)
 

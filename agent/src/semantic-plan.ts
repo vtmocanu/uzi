@@ -5,6 +5,10 @@ import { findSemanticPrdPaths, validatePrdPath } from "./prd-link.js";
 import type { BarePrdReader } from "./prd-link.js";
 
 const KiB = 1024;
+// Decoded field ceilings bound canonical criteria below 8 MiB; Go HTML/control
+// escaping can expand those bytes sixfold. The 64 MiB wire bound includes that
+// expansion and context; proposal input retains its separate 16 MiB cap.
+export const SEMANTIC_ENVELOPE_MAX_BYTES = 64 * 1024 * KiB;
 const limits = { issue: 64 * KiB, prd: 256 * KiB, plan: 256 * KiB, total: 576 * KiB };
 const validString = (s: string): boolean => Buffer.from(s).toString("utf8") === s;
 const text = (max: number) => z.string().refine(
@@ -67,9 +71,14 @@ function checkCounts(criteria: { milestone_id: string }[]): boolean {
   }
   return true;
 }
-const semanticProposalSchema = z.strictObject({
+export const semanticProposalSchema = z.strictObject({
   criteria: z.array(proposedCriterion).min(1).max(256).refine(checkCounts, "Too many criteria per milestone"),
 });
+
+/** A malformed proposal is carried whole as an explicit rejection, never narrowed. */
+export type SemanticSubmission = ReturnType<typeof parseSemanticProposal> | { invalid: true };
+/** Only a server-frozen enrollment may populate this field; no local policy flag. */
+export type SemanticPlanning = ReturnType<typeof parseSemanticEnrollment>;
 
 // Policy/coverage are DTO placeholders; M1 does not invent M2 policy ceilings or outcomes.
 const semanticEnrollmentSchema = z.strictObject({
@@ -113,10 +122,10 @@ const semanticCandidateSchema = z.strictObject({
  * validates syntax; the token walk checks decoded keys, including escaped aliases.
  * Input byte size and nesting bound both work and stack depth.
  */
-function wireValue(input: unknown): unknown {
+function wireValue(input: unknown, maxBytes = 16 * 1024 * KiB): unknown {
   if (typeof input !== "string" && !(input instanceof Uint8Array)) return input;
   const raw = typeof input === "string" ? input : new TextDecoder("utf-8", { fatal: true }).decode(input);
-  if (!validString(raw) || Buffer.byteLength(raw) > 16 * 1024 * KiB) throw new Error("Invalid wire JSON");
+  if (!validString(raw) || Buffer.byteLength(raw) > maxBytes) throw new Error("Invalid wire JSON");
   const value: unknown = JSON.parse(raw);
   const stack: ({ keys: Set<string>; expectingKey: boolean } | null)[] = [];
   // A syntax-aware walk below uses JSON tokens and separators, not object values.
@@ -169,7 +178,7 @@ export function parseSemanticProposal(input: unknown, context?: SourceContext) {
   return proposal;
 }
 export function parseSemanticCandidate(input: unknown, context?: SourceContext) {
-  const candidate = semanticCandidateSchema.parse(wireValue(input));
+  const candidate = semanticCandidateSchema.parse(wireValue(input, SEMANTIC_ENVELOPE_MAX_BYTES));
   if (context) checkContext(candidate.criteria, context);
   return candidate;
 }

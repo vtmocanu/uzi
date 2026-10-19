@@ -4613,6 +4613,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				if err := bindPlanCrossCheckWrite(&planParams, owned, &req); err != nil {
 					return store.Run{}, false, err
 				}
+				if txq, ok := q.(*store.Queries); ok {
+					if err := validateSemanticPlanWrite(ctx, txq, runID, planParams); err != nil {
+						return store.Run{}, false, err
+					}
+				}
 			}
 			planRows, err = q.SetRunAutopilotPlan(ctx, planParams)
 			if err != nil {
