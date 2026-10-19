@@ -15,8 +15,9 @@
 // compared, copied or substituted; a new claim constructs a NEW registry with a
 // NEW local execution epoch (PRD #1171 "Frozen boundaries", ADR-1106).
 
+import { assertClosedReaperRequest } from "../closed-reaper.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
-import type { ChildQuiescence, HarnessError, ProcessReap, ToolDisposal } from "../harness.js";
+import type { BoundaryProcessRequest, ChildQuiescence, HarnessError, ProcessReap, ToolDisposal } from "../harness.js";
 
 /** Issue #1864: a caught error's class name, as it may appear in a harness error message. That
  *  message reaches the boundary diagnostic and so a run's `failure_reason`, and an error's `name`
@@ -357,7 +358,7 @@ export class ExecutionRegistry {
   }
 
   /** Called only after observed_empty, while the safety owner's queue slot is held. */
-  beginCapture(observation: CaptureSettlement): { live: () => boolean; reserve: () => LaunchReservationResult; complete: () => object | undefined; close: () => void } {
+  beginCapture(observation: CaptureSettlement): { live: () => boolean; reserve: (request?: BoundaryProcessRequest) => LaunchReservationResult; complete: () => object | undefined; close: () => void } {
     if (this.captureObservations.get(observation) !== this.poisonRevision || this.currentState !== "poisoned" || this.tablesCleared || this.captureLane ||
         this.launches.size || this.inFlightCallbackCount() || this.roots.some(r => !r.reaped)) {
       throw new Error("capture lane requires observed empty poisoned registry");
@@ -370,7 +371,8 @@ export class ExecutionRegistry {
       !this.tablesCleared && this.poisonRevision === revision;
     return {
       live,
-      reserve: () => {
+      reserve: (request) => {
+        if (request) assertClosedReaperRequest(request);
         if (!live()) return { kind: "denied", reason: "admission_closed" };
         this.launchSeq += 1;
         const reservation: LaunchReservation = { id: `launch-${this.launchSeq}`, kind: "boundary_action" };
@@ -407,7 +409,8 @@ export class ExecutionRegistry {
 
   // --- launch reservations ----------------------------------------------------
 
-  reserveLaunch(kind: RootKind): LaunchReservationResult {
+  reserveLaunch(kind: RootKind, reaperRequest?: BoundaryProcessRequest): LaunchReservationResult {
+    if (reaperRequest) assertClosedReaperRequest(reaperRequest);
     // The trusted boundary-action lane: once admission has CLOSED (post-quiesce),
     // ordinary provider/command launches stay refused, but a permitted checkpoint/
     // git/finalize action may still reserve a `boundary_action` root. Poisoned and

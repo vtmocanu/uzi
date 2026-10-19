@@ -35,6 +35,9 @@
 // dispose) reports FAILURE / not-clean-disposal for exactly THIS owned root; we never
 // mint a run-level permit or `observed_empty`.
 
+import { PassThrough } from "node:stream";
+import type { BoundaryProcessRequest } from "../harness.js";
+import { assertClosedReaperRequest } from "../closed-reaper.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { lstatSync } from "node:fs";
@@ -1063,17 +1066,18 @@ export async function launchCodexInstallerRoot(
 }
 
 async function launchSetupRoot(
-  request: SupervisedInstallRequest | SupervisedProvisionRequest,
+  request: { readonly command: string; readonly args: readonly string[]; readonly cwd: string; readonly env: NodeJS.ProcessEnv },
   deps: LauncherDeps,
   validate: () => void,
   collect?: (child: SupervisorProcess) => void,
+  reaperInput?: string,
 ): Promise<CodexRootHandle> {
   try {
     validate();
     if (!uidSplitActive(deps.env ?? process.env)) {
       throw new CodexUnsupportedProfileError("Codex installer roots require the A1 uid split; refusing to launch");
     }
-    const uid = (deps.resolveRunnerUid ?? defaultResolveRunnerUid)();
+    const uid = reaperInput === undefined ? (deps.resolveRunnerUid ?? defaultResolveRunnerUid)() : RUNNER_UID;
     if (uid !== RUNNER_UID) {
       throw new TrustedExecutionRefusal("installer requires the fixed runner uid");
     }
@@ -1112,7 +1116,7 @@ async function launchSetupRoot(
       child.stderr?.resume();
     }
     child.stdin?.on("error", () => undefined);
-    child.stdin?.end();
+    child.stdin?.end(reaperInput);
     const unregister = registerWorkerRunnerRoot(child.pid, deps.rootStartTime);
     child.once("exit", () => unregister());
     child.once("error", () => unregister());
@@ -1124,6 +1128,88 @@ async function launchSetupRoot(
     launchClassifications.set(error, error.classification);
     throw error;
   }
+}
+
+/** Dedicated runner-identity reaper entry. Its private binding is checked again
+ * synchronously by launchSetupRoot immediately before the supervisor spawn. */
+export async function launchCodexReaperRoot(
+  request: BoundaryProcessRequest, deps: LauncherDeps = {},
+): Promise<CodexRootHandle> {
+  const input = assertClosedReaperRequest(request);
+  const [command, ...args] = request.argv;
+  if (!command) throw new TrustedExecutionRefusal("empty reaper operation");
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let overflow = false;
+  let root: CodexRootHandle | undefined;
+  let outputStop: ReturnType<CodexRootHandle["dispose"]> | undefined;
+  const stopForOutputFailure = () => {
+    if (!root || outputStop) return;
+    outputStop = root.dispose(Math.max(0, (deps.startupCleanup?.hardDeadlineAt ?? Date.now()) - Date.now()));
+    void outputStop.catch(() => undefined);
+  };
+  const collect = (child: SupervisorProcess) => {
+    for (const [source, target, cap] of [
+      [child.stdout, stdout, 1024 * 1024],
+      [child.stderr, stderr, 64 * 1024],
+    ] as const) {
+      let bytes = 0;
+      if (!source) { overflow = true; target.end(); continue; }
+      source.on("data", (chunk: Buffer | string) => {
+        bytes += Buffer.byteLength(chunk);
+        if (bytes > cap) {
+          overflow = true;
+          stopForOutputFailure();
+          return;
+        }
+        target.write(chunk);
+      });
+      source.on("end", () => target.end());
+      source.on("error", () => { overflow = true; target.end(); stopForOutputFailure(); });
+    }
+  };
+  // The setup implementation owns wrapping, worker root registration, startup failure
+  // disposal and createHandle's existing full-root evidence validation.
+  try {
+    root = await launchSetupRoot(
+      { command, args, cwd: request.cwd, env: request.env },
+      deps, () => { assertClosedReaperRequest(request); }, collect, input,
+    );
+  } catch (error) {
+    stdout.destroy();
+    stderr.destroy();
+    throw error;
+  }
+  const owned = root;
+  if (overflow) { stopForOutputFailure(); await outputStop; }
+  return { ...owned, transport: { ...owned.transport, stdout, stderr },
+    get failed() { return owned.failed; },
+    dispose: async deadline => {
+      // An overflow starts the same supervisor-owned disposal that normal completion
+      // must join, including overflow arriving after this wrapper was returned.
+      const outcome = await owned.dispose(deadline);
+      const stopped = await outputStop;
+      return stopped && !stopped.clean ? stopped : outcome;
+    },
+    waitChild: async deadline => {
+      let primary: unknown;
+      let failed = false;
+      let result: Awaited<ReturnType<CodexRootHandle["waitChild"]>> | undefined;
+      try {
+        result = await owned.waitChild(deadline);
+        if (overflow) throw new TrustedExecutionRefusal("reaper output overflow or channel failure");
+      } catch (error) {
+        primary = error;
+        failed = true;
+      }
+      try { await outputStop; }
+      catch (cleanup) {
+        throw new AggregateError(failed ? [primary, cleanup] : [cleanup], "reaper output disposal failed");
+      }
+      if (failed) throw primary;
+      return result!;
+    },
+  };
 }
 
 /** Devbox output is available only after this owner confirms whole-root disposal.

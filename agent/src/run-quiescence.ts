@@ -1,3 +1,127 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+
+interface Scope {
+  readonly attempt: SdkAttemptEnv | undefined;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+  readonly live: () => boolean;
+  readonly spawn: (request: BoundaryProcessRequest) => Promise<BoundaryProcessHandle>;
+  readonly track: (pending: Promise<unknown>) => void;
+  accepting: boolean;
+}
+type ReaperOperation = "create" | "scan" | "remove";
+interface ReaperTempOwner {
+  readonly base: string;
+  readonly scanPath: string;
+  created?: string;
+  removed: boolean;
+}
+
+const scopes = new AsyncLocalStorage<Scope>();
+const requests = new WeakMap<BoundaryProcessRequest, { scope: Scope; pipeline: { running: boolean }; input: string; deadlineAt: number; canonical: string; owner: ReaperTempOwner; kind: ReaperOperation; signal: AbortSignal }>();
+
+/** Safety owns activation and revocation; inherited stores remain refusal markers. */
+export function reaperCaptureScope(
+  options: Omit<Scope, "accepting">,
+): { run<T>(action: () => Promise<T>): Promise<T>; revoke(): void } {
+  const scope: Scope = { ...options, accepting: true };
+  return {
+    run: action => scopes.run(scope, action),
+    revoke: () => { scope.accepting = false; },
+  };
+}
+
+function hasReaperCaptureScope(): boolean { return scopes.getStore() !== undefined; }
+
+/** The reaper supplies only its privately constructed fixed operations. */
+function runClosedReaper<T>(
+  attempt: SdkAttemptEnv | undefined,
+  action: (lane: {
+    readonly signal: AbortSignal;
+    readonly deadlineAt: number;
+    spawn(request: BoundaryProcessRequest, input: string, deadlineAt: number, owner: ReaperTempOwner, kind: ReaperOperation, signal: AbortSignal): Promise<BoundaryProcessHandle>;
+  }) => Promise<T>,
+): Promise<T> {
+  const scope = scopes.getStore();
+  const checkScope = () => {
+    if (!scope || !scope.live() || scope.signal.aborted || Date.now() >= scope.deadlineAt) {
+      throw new TrustedExecutionRefusal("reaper capture scope unavailable");
+    }
+  };
+  checkScope();
+  if (!scope!.accepting || !attempt || !scope!.attempt ||
+      scope!.attempt.marker !== attempt.marker || scope!.attempt.cloneKey !== attempt.cloneKey ||
+      scope!.attempt.clonePath !== attempt.clonePath) {
+    throw new TrustedExecutionRefusal("reaper attempt does not belong to this capture");
+  }
+  const pipeline = { running: true };
+  // Register the full pipeline before invoking any code, including synchronous failures.
+  const pending = Promise.resolve().then(() => action({
+    signal: scope!.signal,
+    deadlineAt: scope!.deadlineAt,
+    spawn: (request, input, deadlineAt, owner, kind, signal) => {
+      checkScope();
+      if (!pipeline.running) throw new TrustedExecutionRefusal("reaper pipeline revoked");
+      if (!Number.isFinite(deadlineAt) || deadlineAt > scope!.deadlineAt || Date.now() >= deadlineAt) {
+        throw new TrustedExecutionRefusal("invalid reaper deadline");
+      }
+      requests.set(request, { scope: scope!, pipeline, input, deadlineAt, owner, kind, signal,
+        canonical: JSON.stringify(request) });
+      assertClosedReaperRequest(request);
+      return scope!.spawn(request);
+    },
+  })).finally(() => { pipeline.running = false; });
+  scope!.track(pending);
+  void pending.catch(() => undefined);
+  return pending;
+}
+
+export function closedReaperDeadline(request: BoundaryProcessRequest): number {
+  assertClosedReaperRequest(request);
+  return requests.get(request)!.deadlineAt;
+}
+
+export function isClosedReaperRequest(request: BoundaryProcessRequest): boolean {
+  return requests.has(request);
+}
+
+export function assertClosedReaperRequest(request: BoundaryProcessRequest, signal?: AbortSignal): string {
+  const bound = requests.get(request);
+  if (!bound || (signal && signal !== bound.scope.signal)) {
+    throw new TrustedExecutionRefusal("unbound reaper operation");
+  }
+  if (!bound.pipeline.running || !bound.scope.live() || bound.scope.signal.aborted ||
+      Date.now() >= bound.scope.deadlineAt) {
+    throw new TrustedExecutionRefusal("reaper capture scope unavailable");
+  }
+  bound.signal.throwIfAborted();
+  const argv = bound.kind === "create"
+    ? ["/bin/mktemp", "-d", path.join(bound.owner.base, "uzi-quiesce-XXXXXXXXXX")]
+    : bound.kind === "remove" ? ["/bin/rm", "-rf", "--", bound.owner.created!]
+    : [process.execPath, ...helperArgv()];
+  const env = workerSpawnEnv(bound.kind === "scan"
+    ? { PATH: bound.owner.scanPath, TMPDIR: bound.owner.created!, TSX_DISABLE_CACHE: "1" }
+    : { PATH: HELPER_PATH });
+  // Only the private fixed builder below can populate requests. Validate the actual
+  // complete launch envelope again at registry admission and immediately at spawn.
+  if (!Object.isFrozen(request) || !Object.isFrozen(request.argv) || !Object.isFrozen(request.env) ||
+      JSON.stringify(request) !== bound.canonical ||
+      JSON.stringify(request.argv) !== JSON.stringify(argv) ||
+      JSON.stringify(request.env) !== JSON.stringify(env) ||
+      (bound.kind !== "scan" && bound.input !== "") ||
+      !Number.isFinite(request.timeoutMs) || request.timeoutMs! <= 0 ||
+      request.cwd !== "/" || request.identity !== "command" ||
+      request.recoverableTimeout !== undefined || Date.now() >= bound.deadlineAt ||
+      (bound.kind !== "create" && (!bound.owner.created || bound.owner.removed)) ||
+      (bound.kind === "remove" && request.argv[3] !== bound.owner.created) ||
+      (bound.kind === "scan" && request.env.TMPDIR !== bound.owner.created)) {
+    throw new TrustedExecutionRefusal("noncanonical reaper operation");
+  }
+  return bound.input;
+}
+
 import { MaintenanceBudget } from "./maintenance-budget.js";
 // issue #1783 (R0/R3/R5 + Docker teardown) — prove a run's clone is QUIESCENT before the worker
 // parks it, retires it, or finalizes from it.
@@ -126,6 +250,8 @@ export interface RunAttempt extends SdkAttemptEnv {
   recordedRootPids: () => RecordedRoot[];
 }
 
+const workerAttempts = new WeakMap<RunAttempt, string>();
+
 /** Mint a fresh attempt id: the attempt's start time, its claim generation, 64 random bits. */
 export function mintAttemptId(claimGeneration: number | undefined, now: Date = new Date()): string {
   return formatAttemptId(now, claimGeneration, randomBytes(8).toString("hex"));
@@ -143,7 +269,7 @@ export function newRunAttempt(
   attemptId: string = mintAttemptId(claimGeneration, now),
 ): RunAttempt {
   if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("malformed attempt id");
-  return {
+  const attempt = {
     runId,
     attemptId,
     marker: `${runId}:${attemptId}`,
@@ -151,6 +277,8 @@ export function newRunAttempt(
     cloneKey: cloneKeyOf(clonePath).cloneKey,
     recordedRootPids,
   };
+  workerAttempts.set(attempt, JSON.stringify([attempt.marker, attempt.cloneKey, attempt.clonePath]));
+  return attempt;
 }
 
 /** True for a marker of newRunAttempt's shape, `<runId>:<attemptId>`: a non-empty run id, then
@@ -961,8 +1089,10 @@ export type HelperSpawn = (
   opts: { cwd: string; env: NodeJS.ProcessEnv },
 ) => import("node:child_process").ChildProcess;
 
-const defaultHelperSpawn: HelperSpawn = (command, args, opts) =>
-  spawn(command, args, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+const defaultHelperSpawn: HelperSpawn = (command, args, opts) => {
+  if (uidSplitActive() && hasReaperCaptureScope()) throw new Error("raw scoped helper refused");
+  return spawn(command, args, { cwd: opts.cwd, env: opts.env, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+};
 
 /** The helper's private TMPDIR: made fresh (mode 0700, owned by the uid the helper runs as)
  *  before every helper start and removed after it. Injectable for tests; either method may be
@@ -992,6 +1122,7 @@ function runFixedAsRunner(
   timeoutMs: number,
   budget?: { signal: AbortSignal; deadline: number },
 ): Promise<{ status: number | null; stdout: string }> {
+  if (uidSplitActive() && hasReaperCaptureScope()) return Promise.reject(new Error("raw scoped helper prelude refused"));
   const ambient = MaintenanceBudget.current();
   ambient?.check();
   const remaining = ambient?.cap(timeoutMs);
@@ -1171,6 +1302,9 @@ async function reapProcessesViaHelper(
   req: ScanRequest,
   opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
+  if (uidSplitActive() && hasReaperCaptureScope()) {
+    return { state: "unverified", processes: [], killed: [], detail: "raw scoped helper refused" };
+  }
   const ambient = MaintenanceBudget.current();
   const remaining = ambient?.cap(opts.timeoutMs ?? HELPER_TIMEOUT_MS);
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
@@ -1326,6 +1460,9 @@ function defaultTargetUid(): number {
 
 /** Reap in-process or through the helper (see {@link reapProcessesViaHelper}). */
 export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = {}): Promise<ProcessQuiescence> {
+  if (uidSplitActive() && hasReaperCaptureScope()) {
+    return { state: "unverified", processes: [], killed: [], detail: "scoped reaper requires worker attempt construction" };
+  }
   const viaHelper = opts.viaHelper ?? uidSplitActive();
   if (viaHelper) {
     return reapProcessesViaHelper(req, {
@@ -1586,6 +1723,124 @@ export interface QuiesceRunDeps {
   targetUid?: number;
 }
 
+/** Only quiesceRunAttempt's worker-owned construction enters this closed pipeline. */
+function reapScopedRunProcesses(
+  req: QuiesceRunRequest, scan: ScanRequest, deps: QuiesceRunDeps,
+): Promise<ProcessQuiescence> {
+  const attempt = req.attempt;
+  if (!attempt || workerAttempts.get(attempt) !== JSON.stringify([attempt.marker, attempt.cloneKey, attempt.clonePath]) ||
+      req.workerWide || req.cloneKey !== attempt.cloneKey ||
+      req.targetPaths.length === 0 || req.targetPaths.some(p => ![attempt.clonePath, cloneKeyOf(attempt.clonePath).canonicalPath].includes(path.resolve(p))) ||
+      testView !== undefined || Object.keys(deps).length !== 0) {
+    return Promise.resolve({ state: "unverified", processes: [], killed: [], detail: "scoped reaper construction unavailable" });
+  }
+  // Snapshot caller data before the first await. No production view or test override
+  // enters this request; its authority comes from the exact attempt and acquisition.
+  const frozen = Object.freeze({ ...scan,
+    targetPaths: Object.freeze([...scan.targetPaths]),
+    liveMarkers: Object.freeze([...scan.liveMarkers]),
+    liveRoots: Object.freeze(scan.liveRoots.map(root => Object.freeze({ ...root }))),
+  });
+  const reportBudget = req.reportBudget ? Object.freeze({ ...req.reportBudget }) : undefined;
+  const helperDeadline = Date.now() + HELPER_TIMEOUT_MS;
+  return runClosedReaper(attempt, async lane => {
+    const ambient = MaintenanceBudget.current();
+    const deadline = Math.min(lane.deadlineAt, reportBudget?.deadline ?? Infinity,
+      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity);
+    const signal = AbortSignal.any([lane.signal, ...(reportBudget ? [reportBudget.signal] : []),
+      ...(ambient ? [ambient.signal] : [])]);
+    const check = () => {
+      signal.throwIfAborted();
+      ambient?.check();
+      if (Date.now() >= deadline) throw new Error("scoped reaper deadline");
+    };
+    const input = JSON.stringify({ ...frozen, reportDeadline: deadline });
+    if (Buffer.byteLength(input) > HELPER_REQUEST_MAX) throw new Error("scoped reaper input overflow");
+    const base = runnerTmpdir() ?? os.tmpdir();
+    const owner: ReaperTempOwner = { base, scanPath: runnerPath() ?? HELPER_PATH, removed: false };
+    const execute = async (
+      kind: "create" | "scan" | "remove",
+    ): Promise<string> => {
+      check();
+      const dir = owner.created;
+      const argv = kind === "create" ? ["/bin/mktemp", "-d", path.join(base, "uzi-quiesce-XXXXXXXXXX")]
+        : kind === "remove" ? ["/bin/rm", "-rf", "--", dir!]
+        : [process.execPath, ...helperArgv()];
+      const env = Object.freeze(workerSpawnEnv(kind === "scan"
+        ? { PATH: owner.scanPath, TMPDIR: dir!, TSX_DISABLE_CACHE: "1" }
+        : { PATH: HELPER_PATH }));
+      const request: BoundaryProcessRequest = Object.freeze({
+        argv: Object.freeze(argv), cwd: "/", env, identity: "command",
+        timeoutMs: Math.max(1, deadline - Date.now()),
+      });
+      const stdin = kind === "scan" ? input : "";
+      const handle = await lane.spawn(request, stdin, deadline, owner, kind, signal);
+      // The launcher writes the immutable bounded stdin before startup can complete.
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let outputFailure = false;
+      let cancellation: Promise<void> | undefined;
+      const cancel = () => {
+        cancellation ??= handle.cancel();
+        void cancellation.catch(() => undefined);
+      };
+      const cap = kind === "scan" ? HELPER_STDOUT_MAX : 64 * 1024;
+      handle.stdout?.on("data", (chunk: Buffer | string) => {
+        const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+        bytes += buffer.length;
+        if (bytes > cap) {
+          outputFailure = true;
+          cancel();
+        } else chunks.push(buffer);
+      });
+      handle.stderr?.resume();
+      const abort = cancel;
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      let result: string | undefined;
+      let primary: unknown;
+      let failed = false;
+      try {
+        const terminal = await handle.completed;
+        check();
+        if (terminal.code !== 0 || outputFailure || !handle.stdout || !handle.stderr) throw new Error("scoped reaper operation failed");
+        result = Buffer.concat(chunks).toString("utf8");
+      } catch (error) {
+        primary = error;
+        failed = true;
+      } finally {
+        signal.removeEventListener("abort", abort);
+      }
+      try { await cancellation; }
+      catch (cleanup) {
+        throw new AggregateError(failed ? [primary, cleanup] : [cleanup], "reaper cancellation cleanup failed");
+      }
+      if (failed) throw primary;
+      return result!;
+    };
+    let verdict: ProcessQuiescence;
+    try {
+      const output = await execute("create");
+      const dir = output.trim();
+      if (!path.isAbsolute(dir) || !isWithinPath(dir, base) || path.resolve(dir) === path.resolve(base) ||
+          path.dirname(dir) !== path.resolve(base) || !/^uzi-quiesce-[A-Za-z0-9]+$/.test(path.basename(dir))) {
+        throw new Error("scoped reaper temp invalid");
+      }
+      owner.created = dir;
+      verdict = parseHelperVerdict(await execute("scan"));
+    } catch {
+      verdict = { state: "unverified", processes: [], killed: [], detail: "scoped reaper operation failed" };
+    }
+    // At most one exact-temp cleanup, under the same deadline. Expiry retains it;
+    // every operation already admitted still joins through the safety owner.
+    if (owner.created) {
+      try { await execute("remove"); owner.removed = true; }
+      catch { verdict = { ...verdict, state: "unverified", detail: `${verdict.detail ?? verdict.state}; scoped reaper private temp retained` }; }
+    }
+    return verdict;
+  });
+}
+
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
@@ -1615,7 +1870,13 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       ],
       workerNonce: workerSpawnNonce(),
     };
-    processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
+    if (uidSplitActive() && hasReaperCaptureScope()) {
+      try {
+        processResult = await reapScopedRunProcesses(req, scan, deps);
+      } catch {
+        processResult = { state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" };
+      }
+    } else processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
       req.reportBudget ? { ...deps.reap, reportBudget: req.reportBudget,
         deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : deps.reap);
   }

@@ -15,6 +15,8 @@
 // injected {@link SpawnRootSeam} (the real one lands in m4 behind the M3a
 // supervisor); everything here is unit-testable with fakes.
 
+import { reaperCaptureScope, isClosedReaperRequest, assertClosedReaperRequest, closedReaperDeadline } from "../closed-reaper.js";
+import type { SdkAttemptEnv } from "../sdk-env.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { assertCaptureRequest, createCaptureContext } from "../git.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
@@ -325,12 +327,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   private pendingActions: Promise<unknown>[] = [];
   private heldCapture: CredentialFreeCaptureContext | undefined;
   private lastCaptureCompletion: CompletedCredentialFreeCapture | undefined;
-  private captureReserve: (() => ReturnType<ExecutionRegistry["reserveLaunch"]>) | undefined;
+  private captureReserve: ((request?: BoundaryProcessRequest) => ReturnType<ExecutionRegistry["reserveLaunch"]>) | undefined;
 
   constructor(
     registry: ExecutionRegistry,
     seams: BoundarySeams,
     reconcileBeforeBoundary?: ReconcileBeforeBoundary,
+    private readonly reaperAttempt?: () => SdkAttemptEnv | undefined,
   ) {
     this.registry = registry;
     this.seams = seams;
@@ -443,19 +446,24 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.captureReserve = lane.reserve;
       this.currentDeadlineAt = captureDeadlineAt;
       this.pendingActions = [];
+      const reaper = reaperCaptureScope({ attempt: this.reaperAttempt?.(), signal: controller.signal,
+        deadlineAt: captureDeadlineAt, live: () => this.heldCapture === context && lane.live(),
+        spawn: request => this.spawnOwnedProcess(context, request),
+        track: pending => { this.pendingActions.push(pending); } });
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
         if (controller.signal.aborted || remaining() <= 0) {
           return { kind: "incomplete", errors: [{ category: "timeout", message: "codex capture expired before action" }] };
         }
         try {
-          outcome = { ok: true, value: await action(context) };
+          outcome = { ok: true, value: await reaper.run(() => action(context)) };
         } catch (error) {
           outcome = { ok: false, error };
         }
         // Expire the spawner before draining or releasing the serialization slot.
         // A delayed continuation can never add siblings during cleanup.
         active = false;
+        reaper.revoke();
         const errors: HarnessError[] = [];
         // A startup already in flight may append its completion across the await.
         // Each promise is visited once; no new request is admitted after expiry.
@@ -476,6 +484,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         if (!outcome.ok) throw outcome.error;
         return { kind: "observed_empty", value: outcome.value, proof: this.lastCaptureCompletion };
       } finally {
+        reaper.revoke();
         active = false;
         this.heldCapture = undefined;
         this.captureReserve = undefined;
@@ -609,12 +618,17 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     this.currentDeadlineAt = deadlineAt;
     this.pendingActions = [];
 
+    const reaper = reaperCaptureScope({ attempt: this.reaperAttempt?.(), signal: permit.signal,
+      deadlineAt, live: () => this.heldPermit === permit && this.registry.state() === "closed",
+      spawn: request => this.spawnOwnedProcess(permit, request),
+      track: pending => { this.pendingActions.push(pending); } });
     let outcome: { ok: true; value: T } | { ok: false; error: unknown };
     try {
-      outcome = { ok: true, value: await action(permit) };
+      outcome = { ok: true, value: await reaper.run(() => action(permit)) };
     } catch (e) {
       outcome = { ok: false, error: e };
     }
+    reaper.revoke();
     // Drain in batches until no action remains. Promise.allSettled snapshots an array
     // synchronously, so a single await would miss an action admitted while an earlier
     // batch was settling. There is no await between the empty check and clearing the
@@ -694,7 +708,8 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     request: BoundaryProcessRequest,
   ): Promise<BoundaryProcessHandle> {
     const capture = this.heldCapture === permit ? this.heldCapture : undefined;
-    if (capture) assertCaptureRequest(capture, request);
+    if (isClosedReaperRequest(request)) assertClosedReaperRequest(request, permit.signal);
+    else if (capture) assertCaptureRequest(capture, request);
     else if (this.heldPermit !== permit) throw new TrustedExecutionRefusal("codex boundary process refused: stale permit");
     if (permit.signal.aborted) throw new TrustedExecutionRefusal("codex boundary process refused: boundary deadline exceeded");
     if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
@@ -712,16 +727,18 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       if (this.registry.state() !== "closed") throw new TrustedExecutionRefusal("codex boundary process refused: admission not closed");
       if (this.registry.hasLiveCommandRoot()) throw new TrustedExecutionRefusal("codex boundary process refused: command roots live");
     }
-    const reservation = capture ? this.captureReserve!() : this.registry.reserveLaunch("boundary_action");
+    const reaperRequest = isClosedReaperRequest(request) ? request : undefined;
+    const ownedDeadlineAt = Math.min(this.currentDeadlineAt, reaperRequest ? closedReaperDeadline(request) : Infinity);
+    const reservation = capture ? this.captureReserve!(reaperRequest) : this.registry.reserveLaunch("boundary_action", reaperRequest);
     if (reservation.kind !== "reserved" || !this.seams.spawnProcess) {
       if (reservation.kind === "reserved") this.registry.cancelReservation(reservation.reservation);
       const error: HarnessError = { category: "protocol", message: "boundary process launch unavailable" };
       this.registry.poison(error);
       throw new TrustedExecutionRefusal(error.message);
     }
-    const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(this.currentDeadlineAt));
-    const startupCleanup: StartupCleanupAuthorization | undefined = capture || request.recoverableTimeout
-      ? Object.freeze({ hardDeadlineAt: this.currentDeadlineAt, attempt: Object.freeze({}) })
+    const childDeadlineAt = Date.now() + Math.min(request.timeoutMs ?? Infinity, remainingMs(ownedDeadlineAt));
+    const startupCleanup: StartupCleanupAuthorization | undefined = capture || isClosedReaperRequest(request) || request.recoverableTimeout
+      ? Object.freeze({ hardDeadlineAt: ownedDeadlineAt, attempt: Object.freeze({}) })
       : undefined;
     const verifiedStartupCleanup = watchStartupCleanup(startupCleanup);
     let launched: SpawnedBoundaryProcess;
@@ -749,7 +766,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     const registered = this.registry.registerRoot(reservation.reservation, launched.root);
     if (!registered.ok) {
       this.registry.retainRejectedRoot(reservation.reservation, launched.root);
-      await launched.root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => undefined);
+      await launched.root.dispose(remainingMs(ownedDeadlineAt)).catch(() => undefined);
       throw new TrustedExecutionRefusal("boundary process failed registry admission");
     }
     const cancellation = new AbortController();
@@ -787,14 +804,14 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         if (disposed) return;
         disposed = true;
         try {
-          await launched.root.dispose(remainingMs(this.currentDeadlineAt));
+          await launched.root.dispose(remainingMs(ownedDeadlineAt));
         } catch {
           disposalFailed = true;
           this.registry.poison({ category: "tool", message: "boundary process disposal failed" });
         }
       };
       if (softTimeout || cancellation.signal.aborted || permit.signal.aborted) await dispose();
-      const reap = this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
+      const reap = this.registry.reapRoot(launched.root, remainingMs(ownedDeadlineAt));
       // The completion owner alone disposes and reaps. A stop arriving during
       // natural-exit reap still stops the owned root, without starting a second reap.
       await Promise.race([reap, stopped]);
@@ -1015,6 +1032,7 @@ export function createCodexExecutionSafety(
   // Optional boundary-deadline trigger (see BoundarySeams.armDeadline); absent in
   // production, so the deadline is the default wall-clock timer.
   armDeadline?: ArmBoundaryDeadline,
+  internal?: { reaperAttempt: () => SdkAttemptEnv | undefined },
 ): CodexExecutionSafetyImpl {
   let terminalHookFailure: HarnessError | undefined;
   return new CodexExecutionSafetyImpl(
@@ -1057,5 +1075,6 @@ export function createCodexExecutionSafety(
       armDeadline,
     },
     reconcileBeforeBoundary,
+    internal?.reaperAttempt,
   );
 }

@@ -91,6 +91,8 @@ import {
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
+import { isClosedReaperRequest } from "../closed-reaper.js";
+import { launchCodexReaperRoot } from "./launcher.js";
 import { provisionTools, prepareSupervisedProvision } from "../provision.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { rmTeardownTree, rmRunnerTeardownTree } from "../rmtree.js";
@@ -2220,6 +2222,7 @@ export class CodexExecutor implements Executor {
   private captureMayHaveDrained?: () => boolean;
   private epochAdmission?: () => void;
   private captureLifecycleSignal?: AbortSignal;
+  private reaperAttempt?: RunContext["runAttempt"];
 
   private assertCaptureAdmission(revision = this.captureRevision): void {
     if (this.unstartedLegClosed || this.captureOwners || revision !== this.captureRevision) {
@@ -2362,7 +2365,8 @@ export class CodexExecutor implements Executor {
           async () => { throw new TrustedExecutionRefusal("capture-only reconcile lane"); },
           undefined,
           makeBoundaryProcessSpawner(this.deps.launchEffectRoot ?? productionEffectLaunch,
-            this.opts.commandSandbox ?? "required", this.log));
+            this.opts.commandSandbox ?? "required", this.log), undefined,
+          { reaperAttempt: () => this.reaperAttempt });
         this.unverifiedEpochRegistries.add(registry);
         if (!(safety instanceof CodexExecutionSafetyImpl)) return incomplete("codex capture: production safety unavailable");
         this.epochSafeties.set(registry, safety);
@@ -2776,6 +2780,7 @@ export class CodexExecutor implements Executor {
           baseUrl: this.deps.appServerAuthOpenAIBaseUrlForTest,
         };
     const worktreePath = ctx.worktreePath;
+    this.reaperAttempt = ctx.runAttempt ? Object.freeze({ ...ctx.runAttempt }) : undefined;
     const storeDir = path.join(this.homeRoot, "codex-session-store");
     const boundaryDeadlineMs = this.deps.boundaryDeadlineMs ?? DEFAULT_BOUNDARY_DEADLINE_MS;
     // PRD #1493 M3: the command-sandbox mode is the WORKER's Config value (never run/
@@ -4552,6 +4557,8 @@ export class CodexExecutor implements Executor {
       reconcile,
       (deadlineAt) => onTerminalDispose(deadlineAt),
       boundaryProcessSpawner,
+      undefined,
+      { reaperAttempt: () => this.reaperAttempt },
     );
 
     let harness: CodexHarness | undefined;
@@ -6478,6 +6485,12 @@ function makeBoundaryProcessSpawner(
   cache?: RunCommandCache,
 ): SpawnBoundaryProcessSeam {
   return async (request: BoundaryProcessRequest, deadlineMs: number, startupCleanup): Promise<SpawnedBoundaryProcess> => {
+    if (isClosedReaperRequest(request)) {
+      const handle = await launchCodexReaperRoot(request, { deadlines: { started: deadlineMs }, startupCleanup });
+      return { root: registeredRoot(handle, "boundary_action", log),
+        stdin: handle.transport.stdin, stdout: handle.transport.stdout, stderr: handle.transport.stderr,
+        waitChild: deadline => handle.waitChild(deadline) };
+    }
     const [command, ...args] = request.argv;
     if (!command) throw new Error("boundary process argv is empty");
     // Issue #1598: a command-identity boundary process (a post-run durability sink) uses the
