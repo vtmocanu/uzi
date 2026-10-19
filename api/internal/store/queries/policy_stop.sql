@@ -23,6 +23,40 @@ WHERE id = sqlc.arg(run_id)::uuid AND worker_id = sqlc.arg(worker_id)::uuid
  AND harness='codex' AND NOT interactive AND target_run_id IS NULL
  AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL;
 
+-- name: AcceptPolicyRevisionSource :execrows
+-- Caller holds the receipt run lock, validates finite source/history and pending
+-- revisions BEFORE stamping the batch, and supplies a newly APPLIED approval.
+-- Old APPLIED retries must never call this writer. Source and selection move together.
+UPDATE runs SET
+ policy_revision_source = sqlc.arg(source)::jsonb,
+ policy_candidate_cross_check_id = sqlc.narg(selected_cross_check_id)::uuid
+WHERE id = sqlc.arg(run_id)::uuid AND user_id = sqlc.arg(owner_id)::uuid
+ AND worker_id = sqlc.arg(worker_id)::uuid
+ AND claim_generation = sqlc.arg(claim_generation)::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status NOT IN ('queued','completed','failed','cancelled')
+ AND harness = 'codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL
+ AND policy_revision_source = sqlc.arg(previous_source)::jsonb
+ AND policy_candidate_cross_check_id IS NOT DISTINCT FROM sqlc.narg(previous_cross_check_id)::uuid
+ AND gate_revision = sqlc.arg(gate_revision)::bigint AND gate_revision > 0
+ AND gate_presentation_id = sqlc.arg(presentation_id)::uuid
+ AND gate_payload_digest = sqlc.arg(payload_digest)::bytea
+ AND gate_presented_payload = sqlc.arg(presented_payload)::jsonb
+ AND NOT (credential_switch_requested_at IS NOT NULL
+          AND credential_switch_generation IS NOT NULL
+          AND credential_switch_generation = claim_generation)
+ AND EXISTS (
+  SELECT 1 FROM run_user_inputs approval
+  WHERE approval.run_id = runs.id AND approval.id = sqlc.arg(approval_id)::bigint
+   AND approval.kind = 'approve_plan' AND approval.gate_binding = 'bound'
+   AND approval.gate_revision = runs.gate_revision
+   AND approval.consumed_worker_id = runs.worker_id
+   AND approval.consumed_claim_generation = runs.claim_generation
+   AND approval.consumed_at IS NOT NULL AND approval.applied_at IS NOT NULL
+   AND approval.disposition IS NULL AND approval.settled_at IS NULL
+   AND approval.superseded_by_stop_input_id IS NULL
+ );
+
 -- name: ListPolicyStopRevisionInputs :many
 SELECT * FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'revise_plan'

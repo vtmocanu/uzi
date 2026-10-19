@@ -232,6 +232,21 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		}
 		out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 	}
+	var acceptance *store.AcceptPolicyRevisionSourceParams
+	unapplied := int64(0)
+	if applied {
+		for _, row := range rows {
+			if !row.AppliedAt.Valid {
+				unapplied++
+			}
+		}
+		if active {
+			acceptance, err = preparePolicyRevisionAcceptance(ctx, tx, wkr, runID, generation, rows)
+			if err != nil {
+				return InputReceiptResult{}, err
+			}
+		}
+	}
 	if len(toAck) > 0 {
 		stamped, err := q.AckRunInputRows(ctx, store.AckRunInputRowsParams{RunID: runID, Ids: toAck, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID),
 			InclusionReported: slices.Contains(wkr.ProtocolCapabilities, capability.InputInclusionV1)})
@@ -252,9 +267,21 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 		}
 	}
 	if applied {
-		_, err = q.ApplyRunInputRows(ctx, store.ApplyRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
+		stamped, err := q.ApplyRunInputRows(ctx, store.ApplyRunInputRowsParams{RunID: runID, Ids: ids, ClaimGeneration: pgtype.Int8{Int64: generation, Valid: true}, WorkerID: pgconv.UUID(wkr.ID)})
 		if err != nil {
 			return InputReceiptResult{}, err
+		}
+		if acceptance != nil {
+			if stamped != unapplied {
+				return InputReceiptResult{}, fmt.Errorf("input apply changed concurrently")
+			}
+			accepted, err := q.AcceptPolicyRevisionSource(ctx, *acceptance)
+			if err != nil {
+				return InputReceiptResult{}, err
+			}
+			if accepted != 1 {
+				return InputReceiptResult{}, fmt.Errorf("policy revision acceptance changed concurrently")
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

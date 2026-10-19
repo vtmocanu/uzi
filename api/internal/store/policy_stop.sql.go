@@ -12,6 +12,79 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acceptPolicyRevisionSource = `-- name: AcceptPolicyRevisionSource :execrows
+UPDATE runs SET
+ policy_revision_source = $1::jsonb,
+ policy_candidate_cross_check_id = $2::uuid
+WHERE id = $3::uuid AND user_id = $4::uuid
+ AND worker_id = $5::uuid
+ AND claim_generation = $6::bigint AND claim_generation > 0
+ AND claim_released_at IS NULL AND status NOT IN ('queued','completed','failed','cancelled')
+ AND harness = 'codex' AND NOT interactive AND target_run_id IS NULL
+ AND kind IN ('issue','task','prompt','self_improve') AND policy_stop_resolution IS NULL
+ AND policy_revision_source = $7::jsonb
+ AND policy_candidate_cross_check_id IS NOT DISTINCT FROM $8::uuid
+ AND gate_revision = $9::bigint AND gate_revision > 0
+ AND gate_presentation_id = $10::uuid
+ AND gate_payload_digest = $11::bytea
+ AND gate_presented_payload = $12::jsonb
+ AND NOT (credential_switch_requested_at IS NOT NULL
+          AND credential_switch_generation IS NOT NULL
+          AND credential_switch_generation = claim_generation)
+ AND EXISTS (
+  SELECT 1 FROM run_user_inputs approval
+  WHERE approval.run_id = runs.id AND approval.id = $13::bigint
+   AND approval.kind = 'approve_plan' AND approval.gate_binding = 'bound'
+   AND approval.gate_revision = runs.gate_revision
+   AND approval.consumed_worker_id = runs.worker_id
+   AND approval.consumed_claim_generation = runs.claim_generation
+   AND approval.consumed_at IS NOT NULL AND approval.applied_at IS NOT NULL
+   AND approval.disposition IS NULL AND approval.settled_at IS NULL
+   AND approval.superseded_by_stop_input_id IS NULL
+ )
+`
+
+type AcceptPolicyRevisionSourceParams struct {
+	Source               []byte      `json:"source"`
+	SelectedCrossCheckID pgtype.UUID `json:"selected_cross_check_id"`
+	RunID                uuid.UUID   `json:"run_id"`
+	OwnerID              uuid.UUID   `json:"owner_id"`
+	WorkerID             uuid.UUID   `json:"worker_id"`
+	ClaimGeneration      int64       `json:"claim_generation"`
+	PreviousSource       []byte      `json:"previous_source"`
+	PreviousCrossCheckID pgtype.UUID `json:"previous_cross_check_id"`
+	GateRevision         int64       `json:"gate_revision"`
+	PresentationID       uuid.UUID   `json:"presentation_id"`
+	PayloadDigest        []byte      `json:"payload_digest"`
+	PresentedPayload     []byte      `json:"presented_payload"`
+	ApprovalID           int64       `json:"approval_id"`
+}
+
+// Caller holds the receipt run lock, validates finite source/history and pending
+// revisions BEFORE stamping the batch, and supplies a newly APPLIED approval.
+// Old APPLIED retries must never call this writer. Source and selection move together.
+func (q *Queries) AcceptPolicyRevisionSource(ctx context.Context, arg AcceptPolicyRevisionSourceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acceptPolicyRevisionSource,
+		arg.Source,
+		arg.SelectedCrossCheckID,
+		arg.RunID,
+		arg.OwnerID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.PreviousSource,
+		arg.PreviousCrossCheckID,
+		arg.GateRevision,
+		arg.PresentationID,
+		arg.PayloadDigest,
+		arg.PresentedPayload,
+		arg.ApprovalID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const acceptPolicyStopResolution = `-- name: AcceptPolicyStopResolution :one
 UPDATE runs SET policy_stop_resolution = $1::jsonb, updated_at = now()
 WHERE id = $2 AND user_id = $3
