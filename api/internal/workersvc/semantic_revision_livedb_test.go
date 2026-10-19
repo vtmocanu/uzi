@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -14,7 +15,21 @@ func newSemanticRevisionLive(t *testing.T) *coverageLiveFixture {
 	t.Helper()
 	f := newSemanticGateLive(t)
 	f.svc.p.PlanMaxRevisions = 10
+	if _, err := f.e.q.RegisterWorker(f.e.ctx, store.RegisterWorkerParams{
+		ID: f.worker, ProtocolCapabilities: []string{capability.InputReceiptsV1, capability.GateRevisionV1},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	return f
+}
+
+func semanticRevisionWorker(t *testing.T, f *coverageLiveFixture) store.Worker {
+	t.Helper()
+	worker, err := f.e.q.GetWorkerByID(f.e.ctx, f.worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker
 }
 
 func submitSemanticRevision(t *testing.T, f *coverageLiveFixture, gate *apitypes.SemanticGateDTO, body string, ack bool) int64 {
@@ -24,7 +39,7 @@ func submitSemanticRevision(t *testing.T, f *coverageLiveFixture, gate *apitypes
 		t.Fatalf("owner revision: %+v %v", input, err)
 	}
 	if ack {
-		receipt, err := f.svc.AckInputs(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, 7, []int64{input.ID})
+		receipt, err := f.svc.AckInputs(f.e.ctx, semanticRevisionWorker(t, f), f.run, 7, []int64{input.ID})
 		if err != nil || !receipt.Active {
 			t.Fatalf("ACK: %+v %v", receipt, err)
 		}
@@ -44,12 +59,12 @@ func semanticRevisionSnapshot(t *testing.T, f *coverageLiveFixture) []byte {
 	t.Helper()
 	var raw []byte
 	err := f.e.pool.QueryRow(f.e.ctx, `SELECT jsonb_build_object(
- 'run',to_jsonb(r),
- 'inputs',(SELECT jsonb_agg(i ORDER BY id) FROM run_user_inputs i WHERE run_id=r.id),
- 'planning',(SELECT to_jsonb(p) FROM semantic_planning p WHERE run_id=r.id),
- 'history',(SELECT jsonb_agg(h ORDER BY revision) FROM semantic_candidate_history h WHERE run_id=r.id),
- 'snapshots',(SELECT jsonb_agg(s ORDER BY hash) FROM semantic_snapshots s WHERE run_id=r.id),
- 'sources',(SELECT jsonb_agg(s ORDER BY identity_hash) FROM semantic_source_snapshots s WHERE run_id=r.id))
+ 'run',to_jsonb(r)||jsonb_build_object('_xmin',r.xmin::text,'_ctid',r.ctid::text),
+ 'inputs',(SELECT jsonb_agg(to_jsonb(i)||jsonb_build_object('_xmin',i.xmin::text,'_ctid',i.ctid::text) ORDER BY id) FROM run_user_inputs i WHERE run_id=r.id),
+ 'planning',(SELECT to_jsonb(p)||jsonb_build_object('_xmin',p.xmin::text,'_ctid',p.ctid::text) FROM semantic_planning p WHERE run_id=r.id),
+ 'history',(SELECT jsonb_agg(to_jsonb(h)||jsonb_build_object('_xmin',h.xmin::text,'_ctid',h.ctid::text) ORDER BY revision) FROM semantic_candidate_history h WHERE run_id=r.id),
+ 'snapshots',(SELECT jsonb_agg(to_jsonb(s)||jsonb_build_object('_xmin',s.xmin::text,'_ctid',s.ctid::text) ORDER BY hash) FROM semantic_snapshots s WHERE run_id=r.id),
+ 'sources',(SELECT jsonb_agg(to_jsonb(s)||jsonb_build_object('_xmin',s.xmin::text,'_ctid',s.ctid::text) ORDER BY identity_hash) FROM semantic_source_snapshots s WHERE run_id=r.id))
  FROM runs r WHERE id=$1`, f.run).Scan(&raw)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +158,7 @@ func TestSemanticRevisionFlowLiveDB(t *testing.T) {
 				}
 			}
 			if !bytes.Equal(before, semanticRevisionSnapshot(t, f)) {
-				t.Fatal("lost-ACK replay wrote state")
+				t.Fatal("lost-ACK replay changed persisted values or row versions")
 			}
 			f.proposal.Criteria[0].DoneWhen += " unauthorized"
 			if _, err := f.svc.SubmitSemanticCandidate(f.e.ctx, f.worker, f.run, 7, f.structural, semanticJSON(t, f.proposal), f.sources); err == nil {
@@ -163,7 +178,7 @@ func TestSemanticRevisionFlowLiveDB(t *testing.T) {
 				t.Fatal("old owner approval accepted")
 			}
 			if !bytes.Equal(before, semanticRevisionSnapshot(t, f)) {
-				t.Fatal("unauthorized mutation wrote state")
+				t.Fatal("unauthorized mutation changed persisted values or row versions")
 			}
 			if _, err := semanticGateApprove(f, f.e.userID, gateB, nil); err != nil {
 				t.Fatal(err)
@@ -182,7 +197,7 @@ func TestSemanticRevisionTransferredReceiptLiveDB(t *testing.T) {
 	submitSemanticRevision(t, f, gate, "revise later", false)
 	previousWorker := f.e.seedWorker(t, nil)
 	f.e.exec(t, "UPDATE run_user_inputs SET consumed_at=now(),consumed_worker_id=$2,consumed_claim_generation=6 WHERE id=$1", first, previousWorker)
-	receipt, err := f.svc.AckInputs(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, 7, []int64{first})
+	receipt, err := f.svc.AckInputs(f.e.ctx, semanticRevisionWorker(t, f), f.run, 7, []int64{first})
 	if err != nil || !receipt.Active {
 		t.Fatalf("transfer unapplied receipt: %+v %v", receipt, err)
 	}
@@ -207,7 +222,7 @@ func TestSemanticRevisionFreshRefusalLiveDB(t *testing.T) {
 				case "unicode empty":
 					f.e.exec(t, "UPDATE run_user_inputs SET body=$2 WHERE id=$1", id, "\u00A0\u2003\u2028\uFEFF")
 				case "applied":
-					_, err := f.svc.ApplyInputs(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, 7, []int64{id})
+					_, err := f.svc.ApplyInputs(f.e.ctx, semanticRevisionWorker(t, f), f.run, 7, []int64{id})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -237,7 +252,7 @@ func TestSemanticRevisionFreshRefusalLiveDB(t *testing.T) {
 				t.Fatal("unauthorized reservation")
 			}
 			if !bytes.Equal(before, semanticRevisionSnapshot(t, f)) {
-				t.Fatal("refusal wrote semantic/run/receipt state")
+				t.Fatal("refusal changed persisted semantic/run/receipt values or row versions")
 			}
 		})
 	}

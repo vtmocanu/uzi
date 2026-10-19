@@ -293,7 +293,7 @@ func TestSemanticClaimFenceLiveDB(t *testing.T) {
 		{"generation mismatch", "running", false, 8, ErrStaleClaim},
 		{"queued", "queued", false, 7, ErrInvalidState},
 		{"claimed", "claimed", false, 7, ErrInvalidState},
-		{"awaiting approval", "awaiting_approval", false, 7, ErrInvalidState},
+		{"awaiting approval", "awaiting_approval", false, 7, ErrStaleRevisionSource},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.status != "" {
@@ -305,8 +305,12 @@ func TestSemanticClaimFenceLiveDB(t *testing.T) {
 					attempt.PlanMd = "new plan from invalid claim"
 				}
 				_, err := svc.submitSemanticCandidate(e.ctx, worker, run, tc.generation, attempt, raw, captures)
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("new plan=%v: got %v want %v", newPlan, err, tc.want)
+				want := tc.want
+				if tc.status == "awaiting_approval" && !newPlan {
+					want = nil // Exact replay is a read, not fresh revision authority.
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("new plan=%v: got %v want %v", newPlan, err, want)
 				}
 				assertUnchanged(t)
 			}

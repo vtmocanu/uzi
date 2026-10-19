@@ -213,13 +213,20 @@ func TestSemanticCoverageCapsAndAdmissionLiveDB(t *testing.T) {
 	if got := f.status(t); got.Reviews != 3 || got.ChargedTokens != 120000 || got.RemainingTokens != 0 {
 		t.Fatalf("cap=%+v", got)
 	}
+	// Unsupported/read-only admission remains available at a human gate.
+	f.e.exec(t, "UPDATE runs SET status='awaiting_approval' WHERE id=$1", f.run)
+	if got, err := f.svc.ReserveSemanticCoverage(f.e.ctx, f.worker, f.run, 7, unsupported); err != nil || got.Outcome != "unavailable" {
+		t.Fatalf("unsupported human-gate admission: %+v %v", got, err)
+	}
+	if got := f.status(t); got.Reviews != 3 || got.ChargedTokens != 120000 || got.RemainingTokens != 0 {
+		t.Fatalf("human-gate read changed accounting: %+v", got)
+	}
 	for _, tc := range []struct {
 		status   string
 		released bool
 		want     error
 	}{
 		{"running", true, ErrStaleClaim},
-		{"awaiting_approval", false, ErrInvalidState},
 		{"completed", false, ErrRunTerminal},
 	} {
 		f.e.exec(t, `UPDATE runs SET status=$2,claim_released_at=CASE WHEN $3::boolean THEN now() ELSE NULL END WHERE id=$1`, f.run, tc.status, tc.released)
