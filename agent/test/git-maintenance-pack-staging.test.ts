@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import type { Stats } from "node:fs";
 import { PassThrough, Readable } from "node:stream";
 import { GitCache } from "../src/git.js";
 import { MaintenanceResources, RecoveryMaintenance } from "../src/recovery-maintenance.js";
@@ -16,11 +17,23 @@ const pack = (version = 2, count = 0, size = 32) => {
   bytes.writeUInt32BE(count, 8);
   return bytes;
 };
-async function fixture(t: test.TestContext, ancestorUid?: number) {
+async function fixture(t: test.TestContext, profile: number | {
+  uid?: number; gid?: number; split?: boolean; dataGid?: number; dataMode?: number;
+} = {}) {
+  const options = typeof profile === "number" ? {} : profile;
   const actualUid = process.getuid!();
-  const workerUid = actualUid === 0 ? 10001 : actualUid;
-  if (actualUid === 0) {
+  const workerUid = options.uid ?? (actualUid === 0 ? 10001 : actualUid);
+  if (actualUid !== workerUid)
     t.mock.method(process as NodeJS.Process & { getuid: () => number }, "getuid", () => workerUid);
+  if (options.gid !== undefined) t.mock.method(process as NodeJS.Process & { getgid: () => number }, "getgid", () => options.gid!);
+  if (options.split !== undefined) {
+    const saved = process.env.UZI_UID_SPLIT;
+    if (options.split) process.env.UZI_UID_SPLIT = "1";
+    else delete process.env.UZI_UID_SPLIT;
+    t.after(() => {
+      if (saved === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = saved;
+    });
   }
   const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/pack-stage-"));
   // The worker checkout has foreign/group-writable ancestors. Model a trusted
@@ -36,8 +49,11 @@ async function fixture(t: test.TestContext, ancestorUid?: number) {
   t.mock.method(fs, "lstat", async (p: Parameters<typeof fs.lstat>[0]) => {
     const stat = await lstat(p);
     if (typeof p === "string" && ancestors.has(p))
-      return Object.assign(stat, { uid: ancestorUid ?? workerUid, mode: stat.mode & ~0o022 });
-    if (actualUid === 0 && typeof p === "string" && (p === dir || p.startsWith(dir + path.sep)))
+      return Object.assign(stat, { uid: typeof profile === "number" ? profile : workerUid,
+        gid: p === path.dirname(dir) ? options.dataGid ?? stat.gid : stat.gid,
+        mode: p === path.dirname(dir) && options.dataMode !== undefined
+          ? (stat.mode & ~0o7777) | options.dataMode : stat.mode & ~0o022 });
+    if (actualUid !== workerUid && typeof p === "string" && (p === dir || p.startsWith(dir + path.sep)))
       stat.uid = workerUid;
     return stat;
   });
@@ -58,7 +74,7 @@ async function fixture(t: test.TestContext, ancestorUid?: number) {
     await fs.rm(dir, { recursive: true, force: true });
   });
   const out = path.join(git.recoveryRoot, "temp.pack");
-  if (actualUid === 0) {
+  if (actualUid !== workerUid) {
     // Project ownership only for this fixture output, including its fd stats.
     const open = fs.open.bind(fs);
     t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
@@ -73,6 +89,56 @@ async function fixture(t: test.TestContext, ancestorUid?: number) {
   const stage = (p: { stdout: Readable; exited: Promise<{ code: number; stderr: string }>; abort: () => void },
     limit = 32, before = async () => {}) => git["stageMaintenancePack"](p, out, limit, before);
   return { git, out, dir, run, stage, controller, rewind: () => { now--; } };
+}
+test("tiny pack stages with custody RPCs in the remaining original slot", async t => {
+  const f = await fixture(t);
+  f.run(() => MaintenanceResources.consume("rpcAttempts", 16));
+  assert.deepEqual(await f.run(() => f.stage(producer(), 32, async () => {
+    MaintenanceResources.consume("rpcAttempts", 2);
+  })), { path: f.out, byteSize: 32, objectCount: 0 });
+  assert.deepEqual(await fs.readFile(f.out), pack());
+});
+test("modeled split worker admits data ancestor 10001:10001 mode 2775 with private recovery output", async t => {
+  const f = await fixture(t, { uid: 10001, gid: 10001, split: true, dataGid: 10001, dataMode: 0o2775 });
+  // path.dirname(f.dir) models /data; this is not an actual root/PVC proof.
+  assert.deepEqual(await f.run(() => f.stage(producer())),
+    { path: f.out, byteSize: 32, objectCount: 0 });
+  assert.equal((await fs.lstat(f.git.recoveryRoot)).mode & 0o077, 0);
+  assert.equal((await fs.stat(f.out)).mode & 0o7777, 0o600);
+});
+for (const kind of ["world write", "foreign group", "runner group", "command group", "provider group",
+  "runner identity", "command identity", "non-worker uid with worker gid", "worker gid mismatch", "missing split",
+  "recovery root group write", "descendant group write", "changed parent at recheck",
+  "foreign owner", "symlink"] as const) {
+  test(`modeled split data ancestor refuses ${kind}`, async t => {
+    const uid = kind === "runner identity" || kind === "non-worker uid with worker gid" ? 10002
+      : kind === "command identity" ? 10003 : 10001;
+    const dataGid = kind === "foreign group" ? 12345 : kind === "runner group" ? 10002
+      : kind === "command group" ? 10003 : kind === "provider group" ? 10004
+      : kind === "non-worker uid with worker gid" ? 10001 : uid;
+    const f = await fixture(t, { uid, gid: kind === "worker gid mismatch" ? 10002
+      : kind === "non-worker uid with worker gid" ? 10001 : uid,
+      split: kind !== "missing split", dataGid, dataMode: kind === "world write" ? 0o2777 : 0o2775 });
+    const data = path.dirname(f.dir), lstat = fs.lstat.bind(fs);
+    let changed = false;
+    const child = path.join(f.git.recoveryRoot, "child");
+    if (kind === "descendant group write") await fs.mkdir(child, { mode: 0o700 });
+    t.mock.method(fs, "lstat", async (p: Parameters<typeof fs.lstat>[0]) => {
+      const stat = await lstat(p);
+      if ((p === f.git.recoveryRoot && kind === "recovery root group write") ||
+          (p === child && kind === "descendant group write")) stat.mode |= 0o020;
+      if (p === data) {
+        if (kind === "changed parent at recheck" && changed) stat.mode |= 0o002;
+        if (kind === "foreign owner") stat.uid = 12345;
+        if (kind === "symlink") stat.isSymbolicLink = () => true;
+      }
+      return stat;
+    });
+    const out = kind === "descendant group write" ? path.join(child, "temp.pack") : f.out;
+    await assert.rejects(f.run(() => f.git["stageMaintenancePack"](producer(), out, 32,
+      async () => { changed = true; })), { message: "maintenance_pack_staging_refused" });
+    await assert.rejects(fs.lstat(out), { code: "ENOENT" });
+  });
 }
 test("secure root-owned ancestors admit a worker-owned recovery root", async t => {
   const f = await fixture(t, 0);
@@ -190,14 +256,16 @@ for (const version of [2, 3]) {
 for (const kind of ["no scope", "discovery", "callback"] as const) {
   test(`${kind} refusal cancels and joins handed-off producer before return`, async t => {
     const f = await fixture(t);
-    let reap!: (v: { code: number; stderr: string }) => void;
+    let reap!: (v: { code: number; stderr: string }) => void, cancelling!: () => void;
+    const cancelled = new Promise<void>(r => { cancelling = r; });
     let aborted = 0, settled = false;
     const p = { stdout: new PassThrough(), exited: new Promise<{ code: number; stderr: string }>(r => { reap = r; }),
-      abort: () => { aborted++; } };
+      abort: () => { aborted++; cancelling(); } };
     const call = () => f.stage(p, 32, async () => { if (kind === "callback") throw Error("private evidence"); });
     const result = (kind === "no scope" ? call() : kind === "discovery"
       ? MaintenanceResources.runDiscovery(call) : f.run(call)).catch(error => { settled = true; return error; });
     try {
+      await Promise.race([cancelled, result.then(() => { throw Error("operation settled before cancellation"); })]);
       await tick();
       assert.ok(aborted > 0);
       assert.equal(settled, false);
@@ -406,30 +474,71 @@ test("used or competing stdout and missing callback are refused before creation"
   assert.deepEqual(await fs.readdir(f.git.recoveryRoot), []);
 });
 test("cancellation joins in-flight filesystem write before cleanup and return", async t => {
-  const f = await fixture(t), open = fs.open.bind(fs);
-  let release!: () => void, entered!: () => void, settled = false;
+  const f = await fixture(t), open = fs.open.bind(fs), lstat = fs.lstat.bind(fs), unlink = fs.unlink.bind(fs);
+  let release!: () => void, entered!: () => void, settled = false, pending = false;
+  let closeAttempts = 0, unlinkAttempts = 0;
+  let actualWrite: Promise<unknown> | undefined, realClose: (() => Promise<void>) | undefined;
+  const cached = new Map<string, Stats>();
+  const parents = new Set<string>();
+  for (let p = path.dirname(f.out);; p = path.dirname(p)) {
+    parents.add(p);
+    if (path.dirname(p) === p) break;
+  }
   const writing = new Promise<void>(r => { entered = r; });
   const blocked = new Promise<void>(r => { release = r; });
+  // Only staging paths use cached metadata during the probe. With no OS I/O in
+  // cleanup, one event-loop turn drains an abandoned write's cleanup microtasks.
+  t.mock.method(fs, "lstat", async (p: Parameters<typeof fs.lstat>[0]) => {
+    if (typeof p !== "string" || (!parents.has(p) && p !== f.out)) return lstat(p);
+    if (pending) {
+      assert.ok(cached.has(p));
+      return cached.get(p)!;
+    }
+    const stat = await lstat(p);
+    cached.set(p, stat);
+    return stat;
+  });
+  t.mock.method(fs, "unlink", async (p: Parameters<typeof fs.unlink>[0]) => {
+    if (p === f.out && pending) { unlinkAttempts++; return; }
+    return unlink(p);
+  });
   t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
     const file = await open(...args);
     if (args[0] !== f.out) return file;
+    cached.set(f.out, await file.stat());
     const write = file.write.bind(file);
-    t.mock.method(file, "write", async (buffer: Buffer, offset: number, length: number, position: number) => {
-      entered(); await blocked;
-      return write(buffer, offset, length, position);
+    realClose = file.close.bind(file);
+    t.mock.method(file, "close", async () => {
+      if (pending) { closeAttempts++; return; }
+      await realClose!();
+    });
+    t.mock.method(file, "write", (buffer: Buffer, offset: number, length: number, position: number) => {
+      pending = true;
+      const operation = blocked.then(() => write(buffer, offset, length, position)).finally(() => { pending = false; });
+      actualWrite = operation;
+      entered();
+      return operation;
     });
     return file;
   });
-  const result = f.run(() => f.stage(producer())).catch(error => { settled = true; return error; });
+  const result = f.run(() => f.stage(producer())).then(value => {
+    settled = true; return value;
+  }, error => { settled = true; return error; });
   try {
     await Promise.race([writing, result.then(() => { throw Error("operation settled before seam"); })]);
     f.controller.abort();
     await tick();
-    assert.equal(settled, false);
+    assert.equal(closeAttempts, 0, "close attempted before admitted write completed");
+    assert.equal(unlinkAttempts, 0, "unlink attempted before admitted write completed");
+    assert.equal(settled, false, "staging returned before admitted write completed");
     assert.equal((await fs.stat(f.out)).size, 0);
   } finally {
     release();
-    await result;
+    try { await actualWrite; } finally {
+      await result;
+      await realClose?.();
+      if (unlinkAttempts) await unlink(f.out);
+    }
   }
   assert.equal((await result).message, "maintenance_token_invalid");
   assert.deepEqual(await fs.readdir(f.git.recoveryRoot), []);
@@ -440,7 +549,7 @@ for (const fault of ["size", "mode", "uid", "nlink", "identity", "prefix"] as co
     t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
       const file = await open(...args);
       if (args[0] !== f.out) return file;
-    const stat = file.stat.bind(file), read = file.read.bind(file);
+      const stat = file.stat.bind(file), read = file.read.bind(file);
       let stats = 0;
       t.mock.method(file, "stat", async () => {
         const result = await stat();

@@ -17,7 +17,7 @@ import type { Logger } from "./log.js";
 import type { PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { CheckpointChildStartupTimeoutError } from "./harness.js";
-import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, WORKER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
 import { withForgeRetry } from "./forge-retry.js";
@@ -11708,12 +11708,16 @@ try {
       MaintenanceResources.consume("metadataBytes", 1024 + Buffer.byteLength(p));
     };
     const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino;
+    const strictAncestor = (p: string) => p !== path.resolve(this.recoveryRoot) &&
+      isWithinPath(path.resolve(this.recoveryRoot), p);
     const safeDirectory = (p: string, s: Stats) => s.isDirectory() && !s.isSymbolicLink() &&
-      (s.uid === process.getuid!() || (s.uid === 0 &&
-        !isWithinPath(p, path.resolve(this.recoveryRoot)))) && (s.mode & 0o022) === 0;
+      (s.uid === process.getuid!() || (s.uid === 0 && strictAncestor(p))) &&
+      (s.mode & 0o002) === 0 && ((s.mode & 0o020) === 0 ||
+        (strictAncestor(p) && uidSplitActive() && process.getuid!() === WORKER_UID &&
+          process.getgid!() === WORKER_UID && s.gid === WORKER_UID));
     const parentCheck = async () => {
       for (const parent of parents) {
-        await admit();
+        check();
         chargeStat(parent.path);
         const now = await fs.lstat(parent.path);
         check();
@@ -11743,7 +11747,7 @@ try {
       for (const p of [...hierarchy, outPath, outPath]) chargeStat(p);
       MaintenanceResources.consume("adminEntries", 1); // Potential cleanup unlink.
       for (const p of hierarchy.reverse()) {
-        await admit();
+        check();
         chargeStat(p);
         const stat = await fs.lstat(p);
         check();
@@ -11755,13 +11759,13 @@ try {
       file = await fs.open(outPath, fsConstants.O_EXCL | fsConstants.O_NOFOLLOW |
         fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
       // On refusal after open, cleanup recovers identity from this owned fd.
-      await effect();
+      await parentCheck();
       chargeStat(outPath);
       created = await file.stat();
       check();
       const write = async (bytes: Buffer) => {
         if (bytes.length > maxBytes - byteSize) throw refused();
-        await effect();
+        check();
         MaintenanceResources.consume("artifactBytes", bytes.length);
         for (let offset = 0; offset < bytes.length;) {
           await effect();
@@ -11803,24 +11807,24 @@ try {
       if (prefixSize !== 12 || byteSize < 32) throw refused();
       await effect();
       await file.sync();
-      await effect();
+      await parentCheck();
       chargeStat(outPath);
       const fdStat = await file.stat();
       check();
-      await effect();
+      await parentCheck();
       chargeStat(outPath);
       const pathStat = await fs.lstat(outPath);
       check();
       if (!same(created, fdStat) || !same(fdStat, pathStat) || !fdStat.isFile() ||
           fdStat.size !== byteSize || (fdStat.mode & 0o7777) !== 0o600 ||
           fdStat.uid !== process.getuid!() || fdStat.nlink !== 1) throw refused();
-      await effect();
+      await parentCheck();
       MaintenanceResources.consume("metadataBytes", 12);
       const readback = Buffer.alloc(12);
       const { bytesRead } = await file.read(readback, 0, 12, 0);
       check();
       if (bytesRead !== 12 || !readback.equals(prefix)) throw refused();
-      await effect();
+      await parentCheck();
       chargeStat(outPath);
       const finalPath = await fs.lstat(outPath);
       check();
