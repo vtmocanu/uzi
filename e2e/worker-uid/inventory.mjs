@@ -7,7 +7,9 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions', 'claude-command-launcher'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions', 'claude-command-launcher', 'claude-command-real'];
+const singleFile = 'single-uid-preflight';
+const e2eFiles = new Set(['memory-command-real', 'claude-command-real', singleFile]);
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',
@@ -20,6 +22,23 @@ const captureLeaves = new Set([
   'captures edits elsewhere next to unchanged tracked symlinks',
   'treats a symlinked .gitignore as absent while the path stays a candidate',
 ]);
+
+const claudeRealSuite = 'real Claude guarded command lane';
+const claudeRealLeaves = new Set([
+  'stops a detached command and its descendants through a guard-style cancel and confirms the drain',
+  'expires a short explicit deadline on a command with a detached descendant and drains the whole tree',
+  "cancelling the selected run's command leaves a sibling run's command alive until it completes",
+  "lets another attempt's capture scan skip the live command's recorded root while the owner's own reap still kills it",
+  'rejects a candidate observation whose root start time differs from the enrolled one and cancels nothing',
+  'never selects a larger unattributed process tree',
+  "returns the exact worker_memory_pressure result as the selected command's tool error",
+  'refuses a registration whose source is not one of the two model-command literals',
+  'never enrolls unminted, cloned or foreign-context metadata, yet the command still runs',
+  'gives a command that declares its own worker marks no protection and no special enrollment',
+  'poisons the lane and kills the exact supervisor when a stopped supervisor cannot confirm disposal',
+  'keeps native Bash when the guard is off',
+]);
+const singleLeaf = 'single-uid launcher preflight matches the container posture';
 
 const retainedLeaves = new Set([
   "recovers retained command-owned loose objects",
@@ -36,7 +55,8 @@ const retainedLeaves = new Set([
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
-  const command = file === 'memory-command-real';
+  const command = file === 'memory-command-real' || file === singleFile;
+  const claudeReal = file === 'claude-command-real';
   const retained = file === 'git-retained-permissions';
   const expected = [];
   const identities = new Set();
@@ -64,7 +84,7 @@ export function inventoryForSource(source, file) {
           const identity = JSON.stringify(names);
           if (identities.has(identity)) throw new Error(`duplicate source leaf identity: ${file}: ${identity}`);
           identities.add(identity);
-          expected.push({ file: command ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
+          expected.push({ file: command || claudeReal ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
           return;
         }
         const callback = node.arguments[node.arguments.length - 1];
@@ -86,6 +106,17 @@ export function inventoryForSource(source, file) {
       if (!expected.some(test => test.names.length === 2 && test.names[1] === leaf)) {
         throw new Error(`${file}: missing required literal retained recovery leaf: ${leaf}`);
       }
+    }
+  } else if (claudeReal) {
+    if (gates !== 1) throw new Error(`${file}: expected one UID gate, found ${gates}`);
+    for (const leaf of claudeRealLeaves) {
+      if (!expected.some(test => test.names.length === 2 && test.names[0] === claudeRealSuite && test.names[1] === leaf)) {
+        throw new Error(`${file}: missing required literal Claude command proof: ${leaf}`);
+      }
+    }
+  } else if (file === singleFile) {
+    if (!expected.some(test => test.names.length === 1 && test.names[0] === singleLeaf)) {
+      throw new Error(`${file}: missing required literal single-uid proof: ${singleLeaf}`);
     }
   } else if (command) {
     const titles = [
@@ -109,10 +140,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'e2e/worker-uid/tsconfig.json')] });
     const program = snapshot.getProjects()[0].program;
     const lane = process.argv[2] ?? 'worker';
-    if (!['worker', 'command'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
-    const selected = lane === 'command' ? ['memory-command-real'] : files;
+    if (!['worker', 'command', 'single'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
+    const selected = lane === 'command' ? ['memory-command-real'] : lane === 'single' ? [singleFile] : files;
     const expected = selected.flatMap(file => {
-      const filename = path.join(repo, file === 'memory-command-real'
+      const filename = path.join(repo, e2eFiles.has(file)
         ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);
       if (program.getSyntacticDiagnostics(filename).length) throw new Error(`invalid test syntax: ${file}`);
       const source = program.getSourceFile(filename);

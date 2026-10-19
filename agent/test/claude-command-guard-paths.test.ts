@@ -53,7 +53,7 @@ function fakeRoot(supervisorPid: number, rss: number) {
   const stdout = new PassThrough();
   const stderr = new PassThrough();
   let disposes = 0;
-  let clean = true;
+  let mode: "clean" | "unclean" | "reject" | "hang" = "clean";
   let exited = false;
   const evidence: ObservationOutcome = {
     event: "observe", id: 1, state: "complete", supervisor: { pid: supervisorPid, startTime: TICKS },
@@ -75,12 +75,16 @@ function fakeRoot(supervisorPid: number, rss: number) {
     dispose: async () => {
       disposes++;
       exitWith(137);
-      return clean ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
+      // reject and hang model an UNKNOWN disposal (neither confirmed nor a clean failure report).
+      if (mode === "reject") throw new Error("fixture dispose rejected");
+      if (mode === "hang") return new Promise<never>(() => {});
+      return mode === "clean" ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
         : { clean: false, reason: "fixture unconfirmed" };
     },
   };
   const child = { pid: supervisorPid, exitCode: null, signalCode: null, kill: () => true } as unknown as RunnerCommandChild;
-  return { handle, child, exitWith, disposes: () => disposes, unconfirmed: () => { clean = false; } };
+  return { handle, child, exitWith, disposes: () => disposes, unconfirmed: () => { mode = "unclean"; },
+    rejectDispose: () => { mode = "reject"; }, hangDispose: () => { mode = "hang"; } };
 }
 type Root = ReturnType<typeof fakeRoot>;
 
@@ -99,7 +103,7 @@ function rig(over: { maxInterventions?: number } = {}) {
     run_id: RUN_ID, worker_id: WORKER_ID, register_nonce: "nonce", claim_generation: 1, memory_episode: 1,
     flight, lifecycleRevision: 1, memory_policy: policy,
   });
-  const captured: CapturedMemoryContext = { commands, context, flight, lifecycleRevision: 1 };
+  let captured: CapturedMemoryContext = { commands, context, flight, lifecycleRevision: 1 };
   const trips: Error[] = [];
   const kills: RunnerCommandChild[] = [];
   const roots = new Map<string, Root>();
@@ -159,20 +163,20 @@ function rig(over: { maxInterventions?: number } = {}) {
   });
 
   /** Start a long-running guarded command named `id` (its root never exits on its own). */
-  const start = (id: string, treeRss: number) => {
+  const start = (id: string, treeRss: number, timeoutMs = 30_000) => {
     rss.set(id, treeRss);
-    const call = callTool(`sleep-${id}`, `toolu_${id}`);
+    const call = callTool(`sleep-${id}`, `toolu_${id}`, timeoutMs);
     const outcome: { settled: boolean } = { settled: false };
     void call.then(() => { outcome.settled = true; }, () => { outcome.settled = true; });
     return { id, call, outcome };
   };
-  async function callTool(command: string, toolUseId: string) {
+  async function callTool(command: string, toolUseId: string, timeoutMs = 30_000) {
     const hook = await lane.hook({
-      hook_event_name: "PreToolUse", tool_name: GUARDED_COMMAND_TOOL, tool_input: { command, timeout: 30_000 }, tool_use_id: toolUseId,
+      hook_event_name: "PreToolUse", tool_name: GUARDED_COMMAND_TOOL, tool_input: { command, timeout: timeoutMs }, tool_use_id: toolUseId,
       session_id: "s", transcript_path: "/t", cwd: WT,
     } as HookInput, toolUseId, { signal: new AbortController().signal });
     assert.deepEqual(hook, {}, "the hook admits the call");
-    return lane.handle({ command, timeout: 30_000 }, { _meta: { [META]: toolUseId } });
+    return lane.handle({ command, timeout: timeoutMs }, { _meta: { [META]: toolUseId } });
   }
   const text = (r: { content: { type: string; text?: string }[] }) => r.content.map((b) => b.text ?? "").join("");
   const grant = (index: number, remaining: number) => reserves[index]!.answer.resolve(ack(reserves[index]!.request, remaining));
@@ -185,7 +189,18 @@ function rig(over: { maxInterventions?: number } = {}) {
   return {
     commands, context, lane, monitor, trips, kills, roots, reserves, reports, feedback, preserved, preparedPreservation,
     start, callTool, text, grant, deny,
+    /** A new claim: retire nothing by hand, begin a fresh context (the old one is retired by begin) and capture it. */
+    rebegin: (claimGeneration: number) => {
+      const next = {};
+      const fresh = commands.begin({
+        run_id: RUN_ID, worker_id: WORKER_ID, register_nonce: "nonce", claim_generation: claimGeneration, memory_episode: 1,
+        flight: next, lifecycleRevision: 1, memory_policy: policy,
+      });
+      captured = { commands, context: fresh, flight: next, lifecycleRevision: 1 };
+      return fresh;
+    },
     setUsage: (n: number) => { usage = n; },
+    registryContext: () => captured.context,
     enrolled: (n: number) => until(() => commands.eligibleEntries()?.length === n, `${String(n)} enrolled commands`),
     entryFor: (toolId: string) => commands.eligibleEntries()!.find((e) => e.toolId === toolId)!,
   };
@@ -445,5 +460,130 @@ test("one victim's drain is not whole-run quiescence: the sibling stays live and
   const siblingResult = await sibling.call;
   assert.match(r.text(siblingResult), /cancelled/);
   assert.equal(r.lane.poisoned, false);
+  await r.monitor.stop();
+});
+
+for (const mode of ["rejects", "hangs"] as const) {
+  test(`unknown drain: a disposal that ${mode} fails closed like an unconfirmed one (preservation prepared, lane poisoned, turn tripped)`, { timeout: 20000 }, async () => {
+    const r = rig();
+    const victim = r.start("a", 500);
+    await r.enrolled(1);
+    if (mode === "rejects") r.roots.get("a")!.rejectDispose(); else r.roots.get("a")!.hangDispose();
+    r.monitor.tick();
+    await until(() => r.reserves.length === 1, "reservation request");
+    r.grant(0, 4);
+    const result = await victim.call;
+    await r.monitor.settle();
+    assert.equal(result.isError, true);
+    assert.match(r.text(result), /cleanup could not be confirmed/);
+    assert.equal(r.lane.poisoned, true);
+    assert.equal(r.trips.length >= 1 && r.trips[0] instanceof GuardedCommandUnconfirmedError, true);
+    assert.equal(r.kills.length >= 1, true, "the unreaped supervisor is killed");
+    assert.equal(r.feedback[0]?.outcome, "unknown");
+    assert.equal(r.feedback[0]?.cancellation_confirmed, false);
+    assert.deepEqual(r.preparedPreservation, [r.context]);
+    assert.equal(r.monitor.state.unconfirmedDrain, true, "no confirmed drain is ever recorded");
+    assert.equal(r.commands.hasConfirmedStop(r.entryFor("toolu_a")), false);
+    assert.equal(r.lane.recordedRoots().length, 0, "a poisoned lane drops the recorded roots it can no longer vouch for");
+    assert.match(r.text(await r.callTool("sleep-next", "toolu_next")), /Commands are unavailable/);
+    assert.equal(r.roots.has("next"), false);
+    await r.monitor.stop();
+  });
+}
+
+test("owner cancel repeats: each aborted turn stops its command, leaves the registry clean and the next turn is admitted", { timeout: 20000 }, async () => {
+  const r = rig();
+  for (let round = 0; round < 3; round++) {
+    const owner = new AbortController();
+    r.lane.beginTurn(owner.signal);
+    const id = `own${String(round)}`;
+    const call = r.start(id, 100);
+    await r.enrolled(1);
+    owner.abort(new Error("owner cancel"));
+    const result = await call.call;
+    assert.equal(result.isError, true);
+    assert.match(r.text(result), /was cancelled/);
+    assert.equal(r.roots.get(id)!.disposes(), 1, "the cancelled command's tree is disposed exactly once");
+    assert.equal(r.lane.liveCount, 0);
+    assert.deepEqual(r.lane.recordedRoots(), []);
+    assert.deepEqual(r.commands.eligibleEntries(), [], "the registry holds nothing for a cancelled command");
+    assert.equal(r.lane.poisoned, false);
+    // An already-cancelled turn launches nothing.
+    const launches = r.roots.size;
+    assert.match(r.text(await r.callTool("sleep-late", `toolu_late${String(round)}`)), /cancelled before it started/);
+    assert.equal(r.roots.size, launches);
+    await r.lane.quiesce(1000);
+  }
+  assert.equal(r.trips.length, 0, "an owner cancel is not a guard failure");
+  assert.equal(r.reserves.length, 0, "no intervention was ever requested");
+  r.lane.beginTurn();
+  const last = r.start("after", 100);
+  await r.enrolled(1);
+  await r.lane.quiesce(1000);
+  assert.match(r.text(await last.call), /cancelled/);
+  await r.monitor.stop();
+});
+
+test("claim-loss repeats: each lost authority trips the turn and stops its command; the next claim's turn is admitted again", { timeout: 20000 }, async () => {
+  const r = rig();
+  for (let round = 0; round < 3; round++) {
+    if (round > 0) { r.rebegin(round + 1); r.lane.beginTurn(); }
+    const id = `claim${String(round)}`;
+    const call = r.start(id, 100);
+    await r.enrolled(1);
+    const stop = new Error(`claim lost ${String(round)}`);
+    r.commands.retire(r.registryContext());
+    r.lane.onAuthorityLost(stop);
+    r.lane.onAuthorityLost(stop); // the runner may report the same loss twice
+    const result = await call.call;
+    assert.match(r.text(result), /was cancelled/);
+    assert.equal(r.trips[r.trips.length - 1], stop);
+    assert.equal(r.roots.get(id)!.disposes(), 1);
+    assert.equal(r.lane.liveCount, 0);
+    assert.deepEqual(r.lane.recordedRoots(), []);
+    assert.deepEqual(r.commands.eligibleEntries(), []);
+    assert.equal(r.lane.poisoned, false);
+    const launches = r.roots.size;
+    assert.match(r.text(await r.callTool("sleep-lost", `toolu_lost${String(round)}`)), /worker_memory_pressure/);
+    assert.equal(r.roots.size, launches, "nothing launches after the authority is lost");
+    await r.lane.quiesce(1000);
+  }
+  assert.equal(r.trips.length, 6);
+  assert.equal(r.reserves.length, 0);
+  // A fresh claim and turn is admitted: the loss left no latch behind.
+  r.rebegin(9);
+  r.lane.beginTurn();
+  const fresh = r.start("fresh", 100);
+  await r.enrolled(1);
+  await r.lane.quiesce(1000);
+  assert.match(r.text(await fresh.call), /cancelled/);
+  assert.equal(r.lane.poisoned, false);
+  await r.monitor.stop();
+});
+
+test("deadline repeats: more expiries than the intervention allowance neither consume it, park the run nor poison the lane", { timeout: 20000 }, async () => {
+  const r = rig({ maxInterventions: 2 });
+  for (let round = 0; round < 6; round++) {
+    const id = `dl${String(round)}`;
+    const result = await r.start(id, 100, 40).call;
+    assert.equal(result.isError, true);
+    assert.match(r.text(result), /timed out after 40 ms/);
+    assert.equal(r.roots.get(id)!.disposes(), 1);
+    assert.equal(r.lane.liveCount, 0);
+    assert.deepEqual(r.commands.eligibleEntries(), []);
+  }
+  assert.equal(r.lane.poisoned, false);
+  assert.equal(r.trips.length, 0);
+  assert.equal(r.reserves.length, 0, "deadlines are not memory interventions");
+  assert.deepEqual(r.preparedPreservation, []);
+  assert.equal(r.commands.admitsCommands(r.context), true);
+  // The full allowance is still available to the guard.
+  const victim = r.start("p", 500);
+  await r.enrolled(1);
+  r.monitor.tick();
+  await until(() => r.reserves.length === 1, "reservation after the deadlines");
+  assert.equal(r.reserves[0]!.request.policy.max_interventions, 2);
+  r.grant(0, 1);
+  assert.equal(JSON.parse(r.text(await victim.call)).outcome, "confirmed_drained");
   await r.monitor.stop();
 });

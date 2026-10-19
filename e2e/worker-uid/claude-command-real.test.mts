@@ -24,9 +24,13 @@ import { ClaudeCommandLane, GuardedCommandUnconfirmedError, type ClaudeCommandLa
 import type { CapturedMemoryContext } from "../../agent/src/codex/broker.js";
 import { SUPERVISOR_BIN, killUnreapedSupervisor, launchRunnerCommandRoot } from "../../agent/src/codex/launcher.js";
 import type { WorkerMemoryPressureResult } from "../../agent/src/protocol.js";
+import { LiveAttemptRegistry, newRunAttempt, quiesceRunAttempt, setQuiescenceViewForTests } from "../../agent/src/run-quiescence.js";
 import { runnerCommand } from "../../agent/src/runner-uid.js";
 import { workerSpawnEnv } from "../../agent/src/worker-spawn-mark.js";
 import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js";
+// The worker-proof run preloads the hermetic (empty) quiescence view into every test process;
+// the sibling-scan case clears it to scan the real procfs and puts it back afterwards.
+import { restoreHermeticView } from "../../agent/test/setup/hermetic-proc.js";
 
 // Required inventory must reject a skipped run: only the production worker with the split
 // runner identity and the image supervisor can supply this evidence.
@@ -202,6 +206,42 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
     } finally { await cleanRig(rig); }
   });
 
+  it("expires a short explicit deadline on a command with a detached descendant and drains the whole tree", { timeout: 60_000 }, async () => {
+    const rig = newRig();
+    try {
+      const commands = new WorkerMemoryCommands();
+      const { lane, trips } = newLane(rig, newContext(commands));
+      const startedAt = Date.now();
+      const { pending } = startCall(lane, rig, {
+        command: 'echo "main=$$"; setsid sleep 300 & echo "setsid=$!"; nohup sleep 300 >/dev/null 2>&1 & echo "nohup=$!"; touch ready; sleep 280',
+        timeout: 3000,
+      });
+      await ready(rig, "ready");
+      const [entry] = await enrolled(commands, 1);
+      const before = treePids(await observeFresh(entry!));
+      for (const pid of before) rig.pids.add(pid);
+      assert.ok(before.length >= 3, `the enrolled tree includes the foreground command and both detached sleeps: ${before.join(",")}`);
+
+      const result = await pending;
+      const elapsed = Date.now() - startedAt;
+      const output = textOf(result);
+      assert.equal(result.isError, true);
+      assert.match(output, /Command timed out after 3000 ms; it and all its descendants were stopped\./);
+      assert.ok(elapsed >= 2900, `the lane waited for its own deadline, not less: ${String(elapsed)} ms`);
+      assert.ok(elapsed < 3000 + 1000 + 5000 + 10_000, `the deadline was enforced within the lane's bound: ${String(elapsed)} ms`);
+      const detached = [/setsid=(\d+)/, /nohup=(\d+)/].map((pattern) => Number(pattern.exec(output)?.[1]));
+      for (const pid of detached) {
+        assert.ok(Number.isInteger(pid) && pid > 1, `the command echoed its detached pid: ${output}`);
+        assert.ok(before.includes(pid), `the detached pid ${String(pid)} was inside the enrolled supervisor tree`);
+      }
+      await untilGone([...before, ...detached], "every process of the timed-out tree");
+      assert.equal(lane.liveCount, 0);
+      assert.equal(lane.poisoned, false);
+      assert.deepEqual(trips, []);
+      assert.equal(commands.eligibleEntries()?.length, 0, "the deadline drain unregistered the command");
+    } finally { await cleanRig(rig); }
+  });
+
   it("cancelling the selected run's command leaves a sibling run's command alive until it completes", { timeout: 60_000 }, async () => {
     const rig = newRig();
     try {
@@ -239,6 +279,69 @@ describe("real Claude guarded command lane", { skip: INIT_SKIP }, () => {
       assert.match(textOf(resultB), /^Exit code: 0\n/);
       assert.match(textOf(resultB), /sibling-done/);
     } finally { await cleanRig(rig); }
+  });
+
+  it("lets another attempt's capture scan skip the live command's recorded root while the owner's own reap still kills it", { timeout: 90_000 }, async () => {
+    const rig = newRig();
+    const cloneB = path.join(fs.mkdtempSync(path.join("/tmp", "uzi-claude-real-b-")), "runner", "github.com+o+r", "issue-2");
+    fs.mkdirSync(cloneB, { recursive: true });
+    // The real runner-uid quiescence helper reads the real procfs: clear the hermetic empty view.
+    setQuiescenceViewForTests(undefined);
+    try {
+      const commands = new WorkerMemoryCommands();
+      const { lane } = newLane(rig, newContext(commands));
+      const { pending } = startCall(lane, rig, { command: "setsid sleep 300 & touch ready; sleep 280", timeout: 90_000 });
+      await ready(rig, "ready");
+      const [entry] = await enrolled(commands, 1);
+      const tree = treePids(await observeFresh(entry!));
+      for (const pid of tree) rig.pids.add(pid);
+      const supervisorPid = entry!.root.pid;
+      rig.pids.add(supervisorPid);
+      // The lane's recorded roots are what SdkExecutor.recordedRootPids() unions into its attempt.
+      assert.deepEqual(lane.recordedRoots().map((root) => root.pid), [supervisorPid]);
+      assert.ok(Number.isSafeInteger(lane.recordedRoots()[0]!.startTime));
+
+      const runA = randomUUID();
+      const attemptB = newRunAttempt(randomUUID(), 1, cloneB, () => []);
+      const sibling = async (recorded: () => ReturnType<ClaudeCommandLane["recordedRoots"]>) => {
+        const registry = new LiveAttemptRegistry();
+        registry.add(newRunAttempt(runA, 1, rig.dir, recorded));
+        registry.add(attemptB);
+        return quiesceRunAttempt({
+          mode: "capture", attempt: attemptB, cloneKey: attemptB.cloneKey, targetPaths: [attemptB.clonePath],
+          processes: true, dockerHost: undefined, registry, otherClaimInFlight: true,
+        });
+      };
+      // Control: with no recorded root the real scan does see the live supervisor and cannot attribute it.
+      const control = await sibling(() => []);
+      assert.equal(control.process?.state, "unverified", control.process?.detail);
+      assert.ok(control.process?.processes.some((p) => p.pid === supervisorPid && p.reason === "unreadable_unattributed"),
+        `the unrecorded supervisor is reported: ${JSON.stringify(control.process?.processes)}`);
+      assert.deepEqual(control.process?.killed, []);
+      // The lane's recorded root attributes it to the live sibling: the capture proof is clean and signals nothing.
+      const clean = await sibling(() => lane.recordedRoots());
+      assert.equal(clean.process?.state, "quiescent", clean.process?.detail);
+      assert.deepEqual(clean.process?.killed, []);
+      assert.ok(tree.every((pid) => alive(pid)), "the sibling scan did not touch the live command");
+      assert.equal(lane.liveCount, 1);
+
+      // The record exempts nothing from the owner's own reap: its teardown excludes its own roots and kills the tree.
+      const registryA = new LiveAttemptRegistry();
+      const attemptA = newRunAttempt(runA, 1, rig.dir, () => lane.recordedRoots());
+      registryA.add(attemptA);
+      const own = await quiesceRunAttempt({
+        mode: "own", attempt: attemptA, cloneKey: attemptA.cloneKey, targetPaths: [rig.dir],
+        processes: true, dockerHost: undefined, registry: registryA, otherClaimInFlight: false,
+      });
+      assert.equal(own.process?.state, "quiescent", own.process?.detail);
+      assert.ok(own.process?.killed.includes(supervisorPid), `the own reap killed the recorded supervisor: ${JSON.stringify(own.process)}`);
+      await untilGone([supervisorPid], "the supervisor killed by the own-run reap");
+      await pending;
+    } finally {
+      restoreHermeticView();
+      await cleanRig(rig);
+      fs.rmSync(path.dirname(path.dirname(path.dirname(cloneB))), { recursive: true, force: true });
+    }
   });
 
   it("rejects a candidate observation whose root start time differs from the enrolled one and cancels nothing", { timeout: 60_000 }, async () => {
