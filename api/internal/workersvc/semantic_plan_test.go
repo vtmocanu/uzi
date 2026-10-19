@@ -55,13 +55,13 @@ func TestSemanticUnknownSourceStorageInput(t *testing.T) {
 func TestSemanticProposalRawByteLimit(t *testing.T) {
 	c, p, captures := semanticFixture()
 	raw := semanticJSON(t, p)
-	const limit = 16 * 1024 * 1024
+	const limit = 48 * 1024 * 1024
 	atLimit := append(raw, bytes.Repeat([]byte(" "), limit-len(raw))...)
 	if _, _, err := compileSemanticProposal(c, atLimit, captures); err != nil {
-		t.Fatalf("exactly 16 MiB rejected: %v", err)
+		t.Fatalf("exactly 48 MiB rejected: %v", err)
 	}
 	if _, _, err := compileSemanticProposal(c, append(atLimit, ' '), captures); err == nil {
-		t.Fatal("proposal above 16 MiB accepted")
+		t.Fatal("proposal above 48 MiB accepted")
 	}
 }
 

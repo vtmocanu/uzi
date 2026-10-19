@@ -49,9 +49,10 @@ func (h *Handler) WorkerSemanticCandidate(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req semanticCandidateRequest
-	// The 16 MiB proposal cap plus escaped structural context and base64
-	// snapshots fit this finite envelope; the compiler enforces field limits.
-	if !readSemanticWorkerBody(w, r, 32<<20, &req) {
+	// The 48 MiB proposal plus <7 MiB of escaped bounded structural fields,
+	// <1 MiB of base64 source captures/metadata and wrapper fit within 64 MiB.
+	// The compiler independently enforces all decoded field and source limits.
+	if !readSemanticWorkerBody(w, r, 64<<20, &req) {
 		return
 	}
 	if req.ClaimGeneration == nil || *req.ClaimGeneration < 1 || req.Structural.CandidateIdentityVersion != "" || req.Structural.SemanticCandidate != nil {

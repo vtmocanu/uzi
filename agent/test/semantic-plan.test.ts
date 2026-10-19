@@ -68,6 +68,49 @@ test("API-shaped candidate and proposal round trip without renaming or losing fi
   assert.equal(parseSemanticCandidate({ ...wire, coverage: null }).coverage, null);
 });
 
+test("mandatory escaped proposals retain all fields through string and Uint8Array input", () => {
+  const fill = (prefix: string, length: number) => prefix + "\u0001".repeat(length - prefix.length);
+  const bytes = Buffer.from("requirement");
+  const id = '"'.repeat(512);
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  const source = { id, kind: "issue", provenance: "server:run-issue", completeness: "complete", bytes: bytes.toString("base64") };
+  const sources = [source];
+  const milestoneIds = Array.from({ length: 8 }, (_, i) => "m" + i);
+  const expected = { criteria: Array.from({ length: 256 }, (_, i) => ({
+    milestone_id: milestoneIds[Math.floor(i / 32)], kind: "maintainer",
+    text: fill(String(i).padStart(3, "0"), 2048), done_when: fill("", 2048),
+    citations: Array.from({ length: 8 }, (_, j) => ({ source_id: id, hash, start: 0, end: j + 1 })),
+    evidence_requirements: Array.from({ length: 8 }, (_, j) => ({ description: fill(String(j), 512), path: id })),
+    maintainer: { reason: fill("", 2048),
+      conditions: Array.from({ length: 8 }, (_, j) => fill(String(j), 512)),
+      verification_steps: Array.from({ length: 8 }, (_, j) => fill(String(j), 512)) },
+  })) };
+  const raw = JSON.stringify(expected);
+  assert.ok(Buffer.byteLength(raw) > 16 * 1024 * 1024);
+  for (const asBytes of [false, true]) {
+    const parsed = parseSemanticProposal(asBytes ? Buffer.from(raw) : raw, { sources, milestoneIds });
+    assert.deepEqual(parsed, expected);
+    assert.equal(new Set(parsed.criteria.map(c => c.text)).size, 256);
+    assert.equal(parsed.criteria.filter(c => c.milestone_id === "m7").length, 32);
+  }
+  assert.throws(() => parseSemanticProposal({ criteria: [...expected.criteria, expected.criteria[0]] }));
+  assert.throws(() => parseSemanticProposal({ criteria: expected.criteria.map(c => ({ ...c, milestone_id: "m0" })) }));
+  assert.deepEqual(Buffer.from(source.bytes, "base64"), bytes);
+});
+
+test("proposal wire ceiling is exactly 48 MiB and metadata keeps its smaller ceiling", () => {
+  const raw = JSON.stringify(proposal());
+  const atLimit = raw + " ".repeat(48 * 1024 * 1024 - Buffer.byteLength(raw));
+  for (const asBytes of [false, true]) {
+    assert.deepEqual(parseSemanticProposal(asBytes ? Buffer.from(atLimit) : atLimit), proposal());
+    assert.throws(() => parseSemanticProposal(asBytes ? Buffer.from(atLimit + " ") : atLimit + " "));
+  }
+  const enrollment = JSON.stringify({ profile: "semantic", policy: {
+    version: 1, model: "model", max_reviews: 3, max_invocations: 2, max_tokens: 120000, max_seconds: 900,
+  } });
+  assert.throws(() => parseSemanticEnrollment(enrollment + " ".repeat(16 * 1024 * 1024)));
+});
+
 test("enrollment policy placeholder mirrors all API field names", () => {
   const enrollment = {
     profile: "semantic", policy: { version: 1, model: "model", max_reviews: 3, max_invocations: 6, max_tokens: 120000, max_seconds: 900 },

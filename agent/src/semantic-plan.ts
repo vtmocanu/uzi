@@ -7,8 +7,11 @@ import type { BarePrdReader } from "./prd-link.js";
 const KiB = 1024;
 // Decoded field ceilings bound canonical criteria below 8 MiB; Go HTML/control
 // escaping can expand those bytes sixfold. The 64 MiB wire bound includes that
-// expansion and context; proposal input retains its separate 16 MiB cap.
+// expansion and context; proposal input has its separate derived 48 MiB cap.
 export const SEMANTIC_ENVELOPE_MAX_BYTES = 64 * 1024 * KiB;
+// 256 criteria * 27,210 decoded string bytes * sixfold JSON escaping is
+// 41,794,560 bytes; bounded keys, numbers and punctuation fit below 48 MiB.
+const SEMANTIC_PROPOSAL_MAX_BYTES = 48 * 1024 * KiB;
 const limits = { issue: 64 * KiB, prd: 256 * KiB, plan: 256 * KiB, total: 576 * KiB };
 const validString = (s: string): boolean => Buffer.from(s).toString("utf8") === s;
 const text = (max: number) => z.string().refine(
@@ -173,7 +176,7 @@ function checkContext(
   }
 }
 export function parseSemanticProposal(input: unknown, context?: SourceContext) {
-  const proposal = semanticProposalSchema.parse(wireValue(input));
+  const proposal = semanticProposalSchema.parse(wireValue(input, SEMANTIC_PROPOSAL_MAX_BYTES));
   if (context) checkContext(proposal.criteria, context);
   return proposal;
 }

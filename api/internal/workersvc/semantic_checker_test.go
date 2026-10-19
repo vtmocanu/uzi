@@ -52,7 +52,7 @@ func TestSemanticCheckerHighDensityEnvelope(t *testing.T) {
 		proposal.Criteria = append(proposal.Criteria, c)
 	}
 	rawProposal := semanticJSON(t, proposal)
-	if len(rawProposal) <= 6<<20 || len(rawProposal) >= 16<<20 {
+	if len(rawProposal) <= 6<<20 || len(rawProposal) >= semanticProposalMaxBytes {
 		t.Fatalf("high-density proposal size=%d", len(rawProposal))
 	}
 	candidate, _, err := compileSemanticProposal(structural, rawProposal, sources)
@@ -121,7 +121,7 @@ func TestSemanticCheckerHighDensityEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	expandedBytes := len(semanticJSON(t, expanded))
-	if compact.Len() >= 16<<20 || expandedBytes <= 20<<20 {
+	if compact.Len() >= semanticProposalMaxBytes || expandedBytes <= 20<<20 {
 		t.Fatalf("unexpected HTML expansion: proposal=%d canonical=%d", compact.Len(), expandedBytes)
 	}
 	expanded.Revision = 2

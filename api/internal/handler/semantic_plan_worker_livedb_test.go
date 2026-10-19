@@ -16,6 +16,93 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
+func TestSemanticWorkerMandatoryEscapedRoundTripLiveDB(t *testing.T) {
+	h, router, pool := cliLiveDB(t)
+	h.wsvc.SetTxBeginner(pool)
+	owner := cliSeedUser(t, pool, false)
+	repo := rmSeedRepo(t, pool, rmSeedConn(t, pool, owner), 1993, true)
+	run := rmSeedRun(t, pool, owner, repo, "running")
+	worker := uuid.New()
+	token := "semantic-worker-" + uuid.NewString()
+	tokenHash := sha256.Sum256([]byte(token))
+	cliMustExec(t, pool, `INSERT INTO workers(id,user_id,name,token_hash,status) VALUES($1,$2,'semantic',$3,'online')`, worker, owner, tokenHash[:])
+	body := semanticEscapedRequest(t)
+	cliMustExec(t, pool, `UPDATE runs SET worker_id=$2,claim_generation=1,completion_contract_version=1,issue_description=$3 WHERE id=$1`, run, worker, string(body.Sources[0].Bytes))
+	cliMustExec(t, pool, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"sonnet","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, run)
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 32<<20 || len(raw) >= 64<<20 {
+		t.Fatalf("regression envelope bytes=%d", len(raw))
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/"+run.String()+"/semantic/candidate", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	var compiled apitypes.SemanticCandidateResponse
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &compiled) != nil {
+		t.Fatalf("escaped candidate round trip: status=%d response_bytes=%d", rec.Code, rec.Body.Len())
+	}
+	var proposal apitypes.SemanticProposal
+	if err := json.Unmarshal(body.Proposal, &proposal); err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[string]apitypes.ProposedSemanticCriterion, len(proposal.Criteria))
+	for _, c := range proposal.Criteria {
+		expected[c.Text] = c
+	}
+	if len(compiled.Candidate.Criteria) != 256 {
+		t.Fatal("lost criteria")
+	}
+	ids := make(map[string]bool, 256)
+	counts := make(map[string]int, 8)
+	for _, c := range compiled.Candidate.Criteria {
+		if !reflect.DeepEqual(c.ProposedSemanticCriterion, expected[c.Text]) || c.ID == "" || ids[c.ID] {
+			t.Fatal("changed criterion fields or lost unique server identity")
+		}
+		ids[c.ID] = true
+		counts[c.MilestoneID]++
+	}
+	if len(counts) != 8 {
+		t.Fatal("lost milestones")
+	}
+	for _, count := range counts {
+		if count != 32 {
+			t.Fatal("lost per-milestone criteria")
+		}
+	}
+	sourceHash := sha256.Sum256(body.Sources[0].Bytes)
+	if len(compiled.Sources) != 1 || !bytes.Equal(compiled.Sources[0].Bytes, body.Sources[0].Bytes) ||
+		compiled.Candidate.Sources[0].Hash != hex.EncodeToString(sourceHash[:]) ||
+		!bytes.Equal(compiled.Plan, []byte(body.Structural.PlanMd)) {
+		t.Fatal("changed exact source/plan bytes or source hash")
+	}
+	var persisted []byte
+	if err := pool.QueryRow(t.Context(), `SELECT candidate FROM semantic_planning WHERE run_id=$1`, run).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	var stored apitypes.SemanticCandidate
+	if json.Unmarshal(persisted, &stored) != nil || !reflect.DeepEqual(stored, compiled.Candidate) {
+		t.Fatal("persisted candidate differs from response")
+	}
+	for _, hash := range []string{compiled.Candidate.Sources[0].Hash, compiled.Candidate.PlanHash} {
+		var snapshot []byte
+		if err := pool.QueryRow(t.Context(), `SELECT raw FROM semantic_snapshots WHERE run_id=$1 AND hash=$2`, run, hash).Scan(&snapshot); err != nil {
+			t.Fatal(err)
+		}
+		want := compiled.Plan
+		if hash == compiled.Candidate.Sources[0].Hash {
+			want = body.Sources[0].Bytes
+		}
+		if !bytes.Equal(snapshot, want) {
+			t.Fatal("persisted snapshot bytes changed")
+		}
+	}
+	t.Logf("escaped candidate HTTP/write/read: proposal=%d request=%d response=%d", len(body.Proposal), len(raw), rec.Body.Len())
+}
+
 func TestSemanticWorkerRoutesLiveDB(t *testing.T) {
 	h, router, pool := cliLiveDB(t)
 	h.wsvc.SetTxBeginner(pool)

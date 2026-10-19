@@ -156,6 +156,11 @@ func semanticHash(raw []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+// Each criterion has at most 27,210 decoded string bytes. For 256 criteria,
+// sixfold JSON escaping uses 41,794,560 bytes; bounded keys, numbers and syntax
+// fit below 48 MiB. This wire ceiling is separate from retained snapshot bytes.
+const semanticProposalMaxBytes = 48 * 1024 * 1024
+
 // compileSemanticProposal is a pure compiler. Captures must originate in the
 // trusted worker capture seam; the lead proposal can only reference them.
 func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, captures []apitypes.SemanticSourceCapture) (apitypes.SemanticCandidate, string, error) {
@@ -163,7 +168,7 @@ func compileSemanticProposal(structural PlanCrossCheckCandidate, raw []byte, cap
 	fail := func() (apitypes.SemanticCandidate, string, error) {
 		return out, "", fmt.Errorf("invalid semantic proposal or capture")
 	}
-	if len(raw) > 16*1024*1024 {
+	if len(raw) > semanticProposalMaxBytes {
 		return fail()
 	}
 	var proposal apitypes.SemanticProposal
