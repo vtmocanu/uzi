@@ -1761,6 +1761,19 @@ nothing, unlike a design where the socket itself is the only record. The
 socket is a live cache and reconnect-convenience layer, **never** the source
 of truth.
 
+The worker-only interrupted-call advisory is a separate direct `run_messages` reader
+(issue #3124): `GET /api/worker/runs/:id/interrupted-calls` observes current owner,
+worker registration nonce and unreleased claim generation in one SQL snapshot.
+It materializes the newest 256 records of any kind before choosing a prior tool-bearing
+generation and pairing exact persisted call/lane identities. It returns at most three
+unmatched shell invocations with complete bounded command/display sources; it does not
+return tool output or full identity keys. This read does not change message ingestion,
+health windows, user replay or future archive/rollup policy. Its optional evidence lives
+only in the claim's execution context and reaches the first ordinary owner implementation
+prompt inside fresh untrusted fences. Missing results in that window prove neither
+execution nor continued activity. Snapshot warnings are independent of this telemetry.
+See the [isolated acceptance procedure](docs/interrupted-call-acceptance.md).
+
 The `/api/ws` endpoint sits behind `RequireUser`, the same dual guard the run
 read routes use: a browser session cookie **or** a user-scoped CLI token
 (`uzc_`/`uza_`), so the headless `uzi` client can follow a run without a

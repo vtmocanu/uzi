@@ -307,8 +307,14 @@ removes the tree.
   and empty recorded roots. It never reuses the source `attemptId`. During the
   owned callback, Runner sets/restores `activeCaptureAttempt`; `quiesceRun` reads
   `activeCaptureAttempt ?? flight.attempt`. The same authenticated object supplies
-  the inside clone proof and post-runner-Git reproof; the initial predecessor
-  proof remains outside this binding. Mode `capture`, exact source targets,
+  the inside clone proof and post-runner-Git reproof. In `recoverRetainedClaim`,
+  the initial predecessor quiescence proof also acquires `runFreeCapture`, then
+  releases it before #3059's `normalizeRetainedSourceObjects`, which retains its
+  independent existing supervision outside A's Git-only scope. `ensureClone`
+  remains outside free capture. A later acquisition covers resumed-tip verification,
+  direct publication or capture through `recordRecoveryCapture`; this does not
+  expand the capture allowlist. (AI-synced 2026-10-18)
+  Mode `capture`, exact source targets,
   live-owner conflicts and clone proof/reproof remain required. The executor
   receives only its immutable marker/key/path tuple through the existing optional
   fifth capture argument; its acquisition lifetime is specified in

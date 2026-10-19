@@ -77,3 +77,60 @@ test("fixed reaper inventory pins all literal leaves under exactly one UID gate"
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+const retainedTitles = [
+  "recovers retained command-owned loose objects",
+  "recovers retained command-owned packed objects",
+  "normalizes before verifying an already captured restore tip",
+  "preserves worker-owned hardlinks while recovering command-owned loose objects",
+  "preserves worker-owned hardlinks while recovering command-owned packed objects",
+  "preserves runner-owned hardlinks while recovering command-owned loose objects",
+  "preserves runner-owned hardlinks while recovering command-owned packed objects",
+  "refuses command-owned multiply linked mutation candidates and keeps custody",
+  "keeps source and custody when retained object recovery fails"
+];
+test("retained recovery inventory requires every literal real-UID permission proof", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/retained-inventory."));
+  const api = new API({ cwd: scratch });
+  const retainedFile = "agent/test/git-retained-permissions.test.ts";
+  const suite = "retained recovery object permissions across real UIDs";
+  const declarations = retainedTitles.map(name => `it(${JSON.stringify(name)}, async () => {});`);
+  const wrap = (body: string, gate = true) =>
+    `describe(${JSON.stringify(suite)}, ${gate ? "{ skip: INIT_SKIP }, " : ""}() => { ${body} });`;
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: wrap(declarations.join("\n")) },
+      { name: "actual", source: readFileSync(path.join(repo, retainedFile), "utf8") },
+      { name: "duplicate", source: wrap([...declarations, declarations[0]!].join("\n")), error: /duplicate source leaf/ },
+      { name: "nested", source: wrap('describe("nested", () => {' + declarations.join("\n") + '});'), error: /missing required literal retained recovery/ },
+      { name: "ungated", source: wrap(declarations.join("\n"), false), error: /expected one UID gate/ },
+    ];
+    for (let index = 0; index < declarations.length; index++) {
+      for (const mutation of ["missing", "renamed", "nonliteral"] as const) {
+        const changed = [...declarations];
+        if (mutation === "missing") changed.splice(index, 1);
+        else changed[index] = `it(${JSON.stringify(retainedTitles[index]! + (mutation === "renamed" ? " changed" : ""))}${mutation === "nonliteral" ? ' + ""' : ""}, async () => {});`;
+        fixtures.push({ name: `${mutation}-${index}`, source: wrap(changed.join("\n")),
+          error: mutation === "nonliteral" ? /nonliteral targeted/ : /missing required literal retained recovery/ });
+      }
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = retainedTitles.map(name => ({ file: retainedFile, names: [suite, name] }));
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "git-retained-permissions");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const actual = JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs")], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(actual.filter((item: { file: string }) => item.file === retainedFile), wanted);
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

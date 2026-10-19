@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real', 'git-retained-permissions'];
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',
@@ -21,10 +21,23 @@ const captureLeaves = new Set([
   'treats a symlinked .gitignore as absent while the path stays a candidate',
 ]);
 
+const retainedLeaves = new Set([
+  "recovers retained command-owned loose objects",
+  "recovers retained command-owned packed objects",
+  "normalizes before verifying an already captured restore tip",
+  "preserves worker-owned hardlinks while recovering command-owned loose objects",
+  "preserves worker-owned hardlinks while recovering command-owned packed objects",
+  "preserves runner-owned hardlinks while recovering command-owned loose objects",
+  "preserves runner-owned hardlinks while recovering command-owned packed objects",
+  "refuses command-owned multiply linked mutation candidates and keeps custody",
+  "keeps source and custody when retained object recovery fails"
+]);
+
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
   const command = file === 'memory-command-real';
+  const retained = file === 'git-retained-permissions';
   const expected = [];
   const identities = new Set();
   let gates = 0;
@@ -66,6 +79,13 @@ export function inventoryForSource(source, file) {
     if (suites !== 1) throw new Error(`${file}: expected exactly one literal ${captureSuite} suite, found ${suites}`);
     for (const leaf of captureLeaves) {
       if (!expected.some(test => test.names[1] === leaf)) throw new Error(`${file}: missing required literal capture leaf: ${leaf}`);
+    }
+  } else if (retained) {
+    if (gates !== 1) throw new Error(`${file}: expected one UID gate, found ${gates}`);
+    for (const leaf of retainedLeaves) {
+      if (!expected.some(test => test.names.length === 2 && test.names[1] === leaf)) {
+        throw new Error(`${file}: missing required literal retained recovery leaf: ${leaf}`);
+      }
     }
   } else if (command) {
     const titles = [

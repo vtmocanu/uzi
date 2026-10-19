@@ -496,6 +496,14 @@ it does not impose a blanket capture ban. No helper JSON, flags, bootstrap,
 protocol, budget, component, model or credential authority changes.
 Refs #2852 (AI-synced 2026-10-18).
 
+In retained recovery, the initial predecessor quiescence proof acquires and releases
+`runFreeCapture` before #3059's independently supervised
+`normalizeRetainedSourceObjects`, outside A's Git-only scope. `ensureClone` also
+runs outside free capture. A later held callback covers resumed-tip verification,
+direct publication or capture through `recordRecoveryCapture`; successor creation
+follows outside that callback. This integration adds no capture allowlist exception.
+Refs #2852 (AI-synced 2026-10-18).
+
 The scoped reaper uses registered supervisor roots for fixed `mktemp`, the existing
 Node/tsx run-quiescence helper flag, and removal of the exact private temporary
 directory. Ordinary scans send legacy JSON without `reportDeadline` and retain

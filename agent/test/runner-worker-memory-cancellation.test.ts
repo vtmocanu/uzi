@@ -44,6 +44,7 @@ for (const generation of [7, undefined, 8]) {
       git,
       freeCaptureFlights: new WeakMap(),
       runFreeCapture: RunRunner.prototype["runFreeCapture"],
+      requiresFreeCaptureScope: RunRunner.prototype["requiresFreeCaptureScope"],
       runGatedSink: RunRunner.prototype["runGatedSink"],
       assertHeldFreeCapture: RunRunner.prototype["assertHeldFreeCapture"],
       awaitTickSurvivorsGone: RunRunner.prototype["awaitTickSurvivorsGone"],

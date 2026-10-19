@@ -1,3 +1,4 @@
+import { m3ReduceAndPersist } from "./m3-projection-fixture.js";
 import { describe, it } from "node:test";
 import { RunRunner } from "../src/runner.js";
 import { FakeApi } from "./fake-api.js";
@@ -5880,3 +5881,56 @@ for (const optedIn of [false, true]) {
     await resumed.harness.close();
   });
 }
+
+describe("M3 Codex producer projection compatibility", () => {
+  it("M3 actual adapter/reducer/batcher keeps canonical Bash and full child IDs through synthetic settlement", async () => {
+    let h!: CodexHarness;
+    let markBound!: () => void;
+    const bound = new Promise<void>(resolve => { markBound = resolve; });
+    const childCall = "child-" + "x".repeat(120);
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: "lead projection-private-value" };
+      h.registerChildSink("m3-child", { push() {} });
+      h.bindChildDispatch("m3-child", rt, "coder");
+      h.emitChildFrame("m3-child", [{
+        kind: "tool", phase: "started", id: childCall, name: "Bash",
+        input: { command: "printf projection-private-\u0000value" },
+      }]);
+      markBound();
+      return new Promise<CallbackResult>(() => {});
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    h = harness;
+    transport.push(threadStarted())
+      .push(toolCall(3131, "uzi_bash", { command: "printf projection-private-\u0000value" }, "th-1", "tn-1", "lead-call"))
+      .push(toolCall(3132, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "dispatch-" + "d".repeat(100)));
+    const turn = harness.startTurn(makeRequest());
+    const pending = collect(turn.events);
+    await withTimeout(bound, 2000, "M3 child bound");
+    turn.requestStop("cancel");
+    const events = await withTimeout(pending, 2000, "M3 projection settlement");
+    const sent = await m3ReduceAndPersist(events);
+    const starts = sent.filter(m => m.kind === "tool_use" && m.payload.name === "Bash");
+    assert.equal(starts.length, 2);
+    assert.equal(starts[0]!.agent, "lead");
+    assert.equal(starts[1]!.agent, "coder");
+    assert.ok(starts[1]!.agent_instance);
+    const childId = String(starts[1]!.payload.id);
+    assert.ok(Buffer.byteLength(childId) > 128);
+    assert.equal(childId, "cx-abcdef012345-t1-" + ("dispatch-" + "d".repeat(100)).slice(0, 64) + "/" + childCall.slice(0, 64));
+    for (const start of starts) {
+      const results = sent.filter(m => m.kind === "tool_result" && m.agent === start.agent &&
+        m.agent_instance === start.agent_instance && m.payload.tool_use_id === start.payload.id);
+      assert.equal(results.length, 1);
+      assert.deepEqual(Object.keys(start.payload), ["id", "name", "input"]);
+      assert.ok(Object.hasOwn(results[0]!.payload, "content"));
+      if (start.agent === "coder") {
+        assert.match(String(results[0]!.payload.content), /tool result not confirmed: delegation closed/);
+        assert.equal(results[0]!.payload.is_error, true);
+      }
+      assert.equal((start.payload.input as { command: string }).command, "printf ***REDACTED***");
+    }
+    assert.doesNotMatch(JSON.stringify(sent), /projection-private-value|\\u0000/);
+    await harness.close();
+  });
+});

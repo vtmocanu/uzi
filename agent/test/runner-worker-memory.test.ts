@@ -745,6 +745,8 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let captureContext: Parameters<Parameters<typeof rig.capture>[1]>[0] | undefined;
   let captureReturned = false, protectedScope: boolean | undefined, duplicateEntered = false;
   let queuedWork: Promise<void> | undefined;
+  const originalReadiness = git.normalizeRetainedSourceObjects;
+  let readiness = 0;
   let original: MemoryFlightProof | undefined;
   let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
   let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined;
@@ -839,7 +841,10 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     const next = { ...f.claim, secrets: { ...f.claim.secrets, codex: successorCredential },
       claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
     api.setOwnershipStatus(next.run_id, "running", 8);
-    const nextExecutor: Executor = { withCredentialFreeCapture: realCapture(), run: async ctx => {
+    // Host-only successor models the Codex sandbox profile with readiness already satisfied.
+    git.normalizeRetainedSourceObjects = async () => { readiness++; };
+    const nextExecutor: Executor = { sandboxesCommands: true, withCredentialFreeCapture: realCapture(), run: async ctx => {
+      assert.equal(readiness, 1, "retained readiness completed before successor admission");
       successor = ctx.capturedMemory!();
       await successorRelease.promise;
       throw new Error("successor proof complete");
@@ -855,6 +860,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     } catch {
       assert.fail("successor executor admission: " + JSON.stringify(api.states) + successorLog.join("\\n"));
     }
+    assert.equal(readiness, 1, "reclaim normalized the retained source once");
     assert.notEqual(successor!.flight, original);
     assert.equal(successor!.context.claim_generation, 8);
     assert.equal(successor!.context.memory_episode, 4);
@@ -897,6 +903,7 @@ test(`M3 late native park ACK stays owned after deadline and cannot mutate a rec
     await original?.workerMemory?.closing;
     await successorWork;
     await queuedWork;
+    git.normalizeRetainedSourceObjects = originalReadiness;
     await f.memory.stop(); await monitoring;
     await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
   }

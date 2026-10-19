@@ -1744,6 +1744,9 @@ for (const stage of ["newcapture", "captured", "adopting", "missing-capability"]
 
 it("capture-closing executor is replaced before actual resumed model execution", async () => {
   const { claim, bare, clone } = await seed();
+  // Host-only executor-lifecycle fixture; real UID readiness is proved separately.
+  let readiness = 0;
+  git.normalizeRetainedSourceObjects = async () => { readiness++; };
   let created = 0, models = 0, closed = false;
   const rigs: ReturnType<typeof codexRig>[] = [];
   const { gitlab } = fakeGitlab();
@@ -1770,6 +1773,7 @@ it("capture-closing executor is replaced before actual resumed model execution",
     } };
   };
   await runnerWith(make, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+  assert.ok(readiness > 0, "the readiness gate completed before executor replacement");
   assert.equal(created, 2);
   assert.notEqual(rigs[0]!.registry, rigs[1]!.registry);
   assert.ok(rigs[0]!.processSpawns() > 0, "capture children use the real registered spawner");
@@ -1780,6 +1784,9 @@ it("capture-closing executor is replaced before actual resumed model execution",
 for (const rejects of [false, true]) {
   it(`unclean predecessor disposal after adoption blocks both sources (rejects=${rejects})`, async () => {
     const { claim, bare, clone } = await seed();
+    // Host-only disposal fixture: readiness is a separate, explicitly completed phase.
+    let readiness = 0;
+    git.normalizeRetainedSourceObjects = async () => { readiness++; };
     let created = 0, models = 0, disposed = 0;
     const make: ExecutorFactory = runId => {
       created++;
@@ -1803,6 +1810,7 @@ for (const rejects of [false, true]) {
     const timers = process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
     await runnerWith(make, fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
     assert.ok(process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length <= timers);
+    assert.equal(readiness, 1, "the test reached predecessor disposal after readiness");
     assert.equal(created, 1);
     assert.equal(models, 0);
     assert.ok(disposed > 0);

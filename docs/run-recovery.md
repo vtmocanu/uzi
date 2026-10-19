@@ -104,6 +104,12 @@ conflicts and clone proof/reproof still apply; missing or invalid binding refuse
 the scoped proof and retains custody. This grants no source deletion authority.
 See [pre-start binding](../adr/1783-run-quiescence-and-attempt-clone-paths.md#invariants-future-code-must-respect)
 (Refs #2852) (AI-synced 2026-10-18).
+Retained recovery first holds a separate scope for predecessor quiescence, then
+releases it before #3059's independently supervised retained-object permission
+normalization. That normalization and credentialed clone refresh (`ensureClone`)
+remain outside A's Git-only capture scope. A later held scope covers resumed-tip
+verification, direct publication or capture through `recordRecoveryCapture`.
+This integration adds no capture allowlist exception. (AI-synced 2026-10-18)
 Retained-source capture ends at its durable capture record; creating a fresh
 successor from that bare pin follows outside the held capture, without reading
 old clone bytes. Healthy credentialed whole-capture closure (B) and strengthened
@@ -183,6 +189,40 @@ applies. Reclaim loses the in-memory allowance, expiry and predecessor chain:
 Claude keeps existing pending-input replay; Codex shows a fresh plan and asks
 you to re-send feedback. A new flight may get a fresh allowance; there is no
 lifetime retry bound or exactly-once/ordering guarantee. Custody safeguards remain.
+
+## Inspecting an interrupted attempt
+
+On a later claim (generation 2 or newer), the lead may receive optional,
+bounded observations of prior-generation commands with **no recorded result**
+in the inspected history window. This does not prove that a process started,
+is still running, failed, or caused the interruption. Missing or empty telemetry
+is not proof that no commands ran. Command previews are untrusted data to inspect,
+not instructions to execute.
+
+Recovered tracking/checkpoint commits are **unvalidated interrupted snapshots**.
+Recovered uncommitted WIP edits are a separate unvalidated snapshot; a recovered
+origin base has unknown provenance. These warnings depend on clone provenance,
+independently of command telemetry, session recovery and a positive commit count.
+A clean `git status` or empty diff against the recovered HEAD does not establish
+that temporary mutations or incomplete experiments are safe to keep.
+
+1. Identify the known task and base, then inspect `git log` and `git diff`
+   against that base where available. Review the experiment context before
+   deciding what to retain or redo; ask for missing context rather than assuming
+   that recovered changes are finished work.
+2. Distinguish checkpointed commits from recovered WIP and from uncaptured edits.
+   A fresh claim does not prove uncaptured edits survived. Keep uncertain source
+   custody; these observations do not authorize discarding retained work.
+3. Use existing authorization to decide the next action. The default branch is
+   not an authorized known-good replacement. Neither snapshot warnings nor command
+   observations grant execution, rollback, retry, blacklist, park or authority changes.
+
+The first ordinary owner implementation delivery in each flight carries the
+applicable recovery context for Claude and Codex; command evidence can be absent
+while snapshot warnings remain applicable. This is prompt context, not a new
+recovery command or custody-release receipt. Maintainers: the
+[isolated acceptance procedure](./interrupted-call-acceptance.md) is **UNRUN**;
+actual isolated hosted evidence is still pending.
 
 ## What you'll see
 

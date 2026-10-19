@@ -116,6 +116,13 @@ let predecessorHead = "";
 let resumedPath = "";
 let resumeObserved = false;
 let successfulBoundaries = 0;
+let afterReclaim = false;
+// This host lacks the worker/command UID split, so the real readiness helper cannot launch here.
+// Model only its permission readiness for this host-owned source; the real-UID lane is the proof.
+const readinessCalls: Array<{ bare: string; branch: string; runId: string; clonePath: string; afterReclaim: boolean; resumed: boolean }> = [];
+cache.normalizeRetainedSourceObjects = async (bare, branch, _key, source) => {
+  readinessCalls.push({ bare, branch, runId: source.runId, clonePath: source.clonePath, afterReclaim, resumed: resumeObserved });
+};
 const runner = new RunRunner(client, cache, (_runId, codex) => {
   flight++;
   assert.ok(codex);
@@ -157,6 +164,8 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
     dispose: inner.dispose.bind(inner),
   };
   const executor: Executor = {
+    // Production Codex executors always declare command sandboxing; retained recovery requires it.
+    sandboxesCommands: true,
     safety,
     withCredentialFreeCapture: (ms, action, _purpose, signal) => inner.withCredentialFreeCapture(ms, action, signal),
     settleForCredentialFreeCapture: (ms) => inner.settleForCredentialFreeCapture(ms),
@@ -277,8 +286,25 @@ try {
   assert.ok(resumed.secrets.codex && "generation" in resumed.secrets.codex);
   assert.equal(resumed.secrets.codex.generation, 1);
   assert.ok(resumed.secrets.codex.capability !== first.secrets.codex?.capability, "reclaim minted a fresh capability");
+  assert.deepEqual(readinessCalls, [], "no retained readiness before the reclaim");
+  afterReclaim = true;
   await runner.execute(resumed);
-  assert.ok(resumeObserved);
+  if (!resumeObserved) {
+    // Known fixed codes only: worker lines may carry transport text.
+    const known = new Set(["git_failed", "recovery_failed", "input_oversized", "formatter_failed", "capture_failed",
+      "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable",
+      "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"]);
+    const codes = lines.flatMap(line => {
+      const fields = (JSON.parse(line) as { fields?: Record<string, unknown> }).fields ?? {};
+      return [fields.diagnostic_code, fields.blocker].filter(value => value !== undefined).map(value =>
+        typeof value === "string" && (known.has(value) || /^retained_readiness_[a-z_]+$/.test(value)) ? value : "unrecognized");
+    });
+    throw new Error("resumed attempt never ran; retained recovery codes: " + JSON.stringify(codes));
+  }
+  assert.deepEqual(readinessCalls, [{
+    bare: cache.barePathFor("https://forge.example/fixture.git"), branch: sourceBranch, runId: cfg.run,
+    clonePath: predecessorPath, afterReclaim: true, resumed: false,
+  }], "exactly one retained readiness pass, on the attributed predecessor, after reclaim and before resume");
   if (Number(mrCreates) !== 1) {
     const diagnostics = lines.join("\n").replaceAll(cfg.token, "[redacted]").replaceAll(first.secrets.codex?.capability ?? "absent", "[redacted]").replace(/(?:access|refresh)-canary-\d+/g, "[redacted]");
     throw new Error("MR create missing; worker diagnostics: " + diagnostics);

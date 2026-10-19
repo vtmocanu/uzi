@@ -1,5 +1,6 @@
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { CodexLaunchError, launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
@@ -411,6 +412,72 @@ export class ScratchPublicationError extends Error {
   }
 }
 
+// Transport text is private and ephemeral. Only the safe formatter below reads it;
+// the public Error message and abort/residue classifications remain unchanged.
+const retainedGitDiagnostics = new WeakMap<Error, { stderr: string; context: string }>();
+const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
+
+/** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
+ * a long source path cannot hide Git's trailing failure explanation. Bounds count
+ * UTF-16 units, including the marker; iteration keeps surrogate pairs together. */
+function retainedDiagnosticText(text: string, max: number, redactText: (text: string) => string): string {
+  const redacted = redactText(text.replace(/[\u2028\u2029]/g, "\n"));
+  const safe = sanitizeForLog(redacted.trim(), Number.POSITIVE_INFINITY);
+  if (safe.length <= max) return safe;
+  const half = Math.floor((max - 3) / 2);
+  const points = Array.from(safe);
+  let prefix = "", suffix = "";
+  for (const point of points) {
+    if (prefix.length + point.length > half) break;
+    prefix += point;
+  }
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (suffix.length + points[i]!.length > max - 3 - half) break;
+    suffix = points[i]! + suffix;
+  }
+  return prefix + "..." + suffix;
+}
+
+/** The only reader of runGit's private stderr. Fixed stage/code fields plus at
+ * most 1024 cause and 256 context units leave room for the constant warning text
+ * within 1536 units. Oversized raw inputs are omitted whole, never prefix-cut. */
+export function formatRetainedRecoveryDiagnostic(
+  error: unknown, redactText: (text: string) => string,
+): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
+  let stage = "recovery";
+  try {
+    const transport = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!transport && message.startsWith("retained_readiness_")) {
+      const reason = message.slice("retained_readiness_".length);
+      const known = RETAINED_READINESS_REASONS.has(reason) || [
+        "operation_required", "cancelled", "attribution", "cleanup", "missing_pipe",
+        "pipe", "output_limit", "nonzero", "child", "launch", "malformed",
+        "journal_changed", "validation", "profile",
+      ].includes(reason);
+      return { diagnostic_stage: "readiness", diagnostic_code: known
+        ? "retained_readiness_" + reason : "retained_readiness_validation", cause: "" };
+    }
+    stage = transport ? "git" : "recovery";
+    const cause = transport?.stderr || message;
+    const context = transport?.context;
+    // Check the original unsplit text, including leading whitespace, in bytes as
+    // well as units before normalization or redaction. No secret fragment is kept.
+    if (cause.length > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        (context?.length ?? 0) > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        Buffer.byteLength(cause, "utf8") + Buffer.byteLength(context ?? "", "utf8") > RETAINED_DIAGNOSTIC_INPUT_MAX) {
+      return { diagnostic_stage: stage, diagnostic_code: "input_oversized", cause: "[omitted: redaction input limit]" };
+    }
+    return {
+      diagnostic_stage: stage, diagnostic_code: transport ? "git_failed" : "recovery_failed",
+      cause: retainedDiagnosticText(cause, 1024, redactText),
+      ...(context ? { context: retainedDiagnosticText(context, 256, redactText) } : {}),
+    };
+  } catch {
+    return { diagnostic_stage: stage, diagnostic_code: "formatter_failed", cause: "" };
+  }
+}
+
 const DETAIL_MAX = 200;
 /** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
@@ -737,6 +804,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Test-only supervised readiness root. Production always uses the immutable launcher. */
+  retainedReadinessLaunchForTest?: typeof launchCodexEffectRoot;
   /** Cumulative decoded object bytes per recovery operation. */
   recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
@@ -1302,6 +1371,11 @@ export class BareCacheIdentityError extends Error {
     super(`bare cache identity check failed: ${bareName}`);
     this.name = "BareCacheIdentityError";
   }
+}
+
+/** A supervised retained-readiness effect has no positive cleanup proof. */
+export class RetainedReadinessCleanupUnconfirmedError extends Error {
+  constructor() { super("retained_readiness_cleanup"); }
 }
 
 export class RetainedRecoveryBlockedError extends Error {
@@ -2081,6 +2155,7 @@ export class GitCache {
     budget?.signal.throwIfAborted();
     if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
   }
+  private readonly retainedReadinessLaunch: typeof launchCodexEffectRoot;
   readonly recoveryDecodedLimitBytes: number;
   private readonly recoveryOperations = new AsyncLocalStorage<{
     signal: AbortSignal; deadline: number; budget?: MaintenanceBudget; closureBudget: ClosureBudget;
@@ -2179,6 +2254,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
+    this.retainedReadinessLaunch = opts.retainedReadinessLaunchForTest ?? launchCodexEffectRoot;
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
@@ -5972,6 +6048,169 @@ export class GitCache {
     return journal;
   }
 
+  /**
+   * Recovery-only permission readiness. One locked pass, at most 30 seconds of work
+   * and a separate five-second disposal reserve. Failure retains custody; a prefix
+   * of object permissions may already have gained group readability.
+   */
+  async normalizeRetainedSourceObjects(
+    barePath: string, branch: string, key: string, expectedSource: RecoverySource,
+  ): Promise<void> {
+    const operation = this.recoveryOperations.getStore();
+    if (!operation) throw new Error("retained_readiness_operation_required");
+    // The lock may report an expired operation after its callback settles. Keep
+    // this operation-local cleanup fact so that cannot authorize another attempt.
+    let cleanupFailure: RetainedReadinessCleanupUnconfirmedError | undefined;
+    try {
+      await this.withLock(barePath, async () => {
+        const refuse = (code: string): never => { throw new Error("retained_readiness_" + code); };
+        const check = () => {
+          if (operation.signal.aborted) refuse("cancelled");
+          if (Date.now() >= operation.deadline) refuse("deadline");
+          operation.budget?.check();
+        };
+        check();
+        const attribution = async () => {
+          const journal = await this.checkedRecovery(barePath, branch, key, expectedSource);
+          const kind = await this.classifyOwnerClonePath(barePath, branch, key, expectedSource.runId, expectedSource.clonePath);
+          if (!kind || (kind === "attempt") !== (expectedSource.attemptId !== undefined)) refuse("attribution");
+          return JSON.stringify(journal);
+        };
+        const journalBefore = await attribution();
+        const roots = [expectedSource.clonePath, path.join(expectedSource.clonePath, ".git"),
+          path.join(expectedSource.clonePath, ".git", "objects"), barePath, path.join(barePath, "objects")];
+        const identities = async () => {
+          const result: Array<{ id: string; uid: number; gid: number; mode: number }> = [];
+          for (const root of roots) {
+            check();
+            const st = await fs.lstat(root, { bigint: true });
+            if (!st.isDirectory() || st.isSymbolicLink()) refuse("unsafe_root");
+            result.push({ id: String(st.dev) + ":" + String(st.ino), uid: Number(st.uid),
+              gid: Number(st.gid), mode: Number(st.mode) & 0o7777 });
+          }
+          return result;
+        };
+        // Only the worker validates the private alternate target. The command
+        // helper compares its exact text and never opens or traverses this target.
+        const alternateTarget = async () => {
+          for (const dir of [barePath, path.join(barePath, "objects"), path.join(barePath, "objects/info")]) {
+            check();
+            let st;
+            try { st = await fs.lstat(dir); }
+            catch (error) {
+              if (dir.endsWith("/objects/info") && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+              throw error;
+            }
+            if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
+                (st.mode & 0o002) !== 0 || ((st.mode & 0o020) !== 0 &&
+                  (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) refuse("alternates");
+          }
+          for (const name of ["alternates", "http-alternates"]) {
+            check();
+            try { await fs.lstat(path.join(barePath, "objects/info", name)); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+            refuse("alternates");
+          }
+        };
+        const before = await identities();
+        await alternateTarget();
+        const hardDeadline = Math.min(operation.deadline, Date.now() + 35000,
+          Date.now() + (operation.budget?.remainingMs() ?? Infinity));
+        const workDeadline = Math.min(Date.now() + 30000, hardDeadline - 5000);
+        if (workDeadline <= Date.now()) refuse("deadline");
+        let root: CodexRootHandle | undefined;
+        let error: string | undefined;
+        const unconfirmedCleanup = () => {
+          error = "cleanup";
+          cleanupFailure ??= new RetainedReadinessCleanupUnconfirmedError();
+        };
+        let child: Promise<void> | undefined;
+        let output = "", outBytes = 0, errBytes = 0;
+        const stopped = new AbortController();
+        const stop = (code: string) => { error ??= code; stopped.abort(); };
+        const cancelled = () => stop("cancelled");
+        const timer = setTimeout(() => stop("deadline"), Math.max(0, workDeadline - Date.now()));
+        operation.signal.addEventListener("abort", cancelled, { once: true });
+        try {
+          check();
+          root = await this.retainedReadinessLaunch({
+            identity: "command", command: process.execPath,
+            args: ["-e", RETAINED_READINESS_HELPER, JSON.stringify({ roots, identities: before.map(row => row.id), deadline: workDeadline })],
+            cwd: "/", env: { LANG: "C" }, supervisorBin: SUPERVISOR_BIN,
+          }, { startupCleanup: { attempt: {}, hardDeadlineAt: hardDeadline },
+            deadlines: { started: Math.max(1, workDeadline - Date.now()) } });
+          if (root.started.uid !== 10003 || !root.started.liveCapsZero || !root.started.noNewPrivs) stop("identity");
+          const { stdin, stdout, stderr } = root.transport;
+          if (!stdin || !stdout || !stderr) stop("missing_pipe");
+          const pipeEnds: Promise<void>[] = [];
+          for (const [stream, isError] of [[stdout, false], [stderr, true]] as const) {
+            if (stream) pipeEnds.push(new Promise<void>(resolve => {
+              if (stream.readableEnded) { resolve(); return; }
+              stream.once("end", resolve);
+              stream.once("close", () => { if (!stream.readableEnded) stop("pipe"); resolve(); });
+            }));
+            stream?.on("error", () => stop("pipe"));
+            stream?.on("data", (chunk: Buffer | string) => {
+              const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              if (isError) errBytes += b.length; else outBytes += b.length;
+              if (outBytes > 4096 || errBytes > 4096) {
+                stop("output_limit"); stdout?.destroy(); stderr?.destroy();
+              } else if (!isError) output += b.toString("utf8");
+            });
+          }
+          stdin?.on("error", () => stop("pipe"));
+          stdin?.end();
+          // Start the actual child join even on missing-pipe/identity refusal. A stop
+          // begins disposal immediately; the outstanding join is still awaited below.
+          child = root.waitChild(Math.max(1, workDeadline - Date.now()))
+            .then(ev => { if (ev.code !== 0) stop("nonzero"); }, () => stop("child"));
+          const abort = new Promise<void>(resolve => {
+            if (stopped.signal.aborted) resolve();
+            else stopped.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          await Promise.race([Promise.all([child, ...pipeEnds]), abort]);
+        } catch (cause) {
+          if (cause instanceof CodexLaunchError && cause.cleanupStatus === "unconfirmed") unconfirmedCleanup();
+          else error ??= "launch";
+        }
+        finally {
+          if (root) {
+            // Wiring failures must join the child too. Both waits are owned here;
+            // disposal starts without waiting for a cancelled child to exit first.
+            child ??= root.waitChild(Math.max(1, workDeadline - Date.now()))
+              .then(() => undefined, () => { error ??= "child"; });
+            try { if (!(await root.dispose(Math.max(1, hardDeadline - Date.now()))).clean) unconfirmedCleanup(); }
+            catch { unconfirmedCleanup(); }
+            await child;
+          }
+          clearTimeout(timer);
+          operation.signal.removeEventListener("abort", cancelled);
+        }
+        if (cleanupFailure) throw cleanupFailure;
+        if (error) refuse(error);
+        check();
+        const success = /^ok ([1-9][0-9]{0,6}) (0|[1-9][0-9]{0,6})\n(?![\s\S])/.exec(output);
+        if (!success || errBytes !== 0 || Number(success[1]) > 2000000 || Number(success[2]) > Number(success[1])) {
+          const reason = /^refused ([a-z_]+)\n(?![\s\S])/.exec(output)?.[1];
+          refuse(reason && RETAINED_READINESS_REASONS.has(reason) ? reason : "malformed");
+        }
+        const expected = before.map((row, index) => index === 2 && row.uid === 10003
+          ? { ...row, mode: row.mode | 0o050 } : row);
+        if (JSON.stringify(await identities()) !== JSON.stringify(expected)) refuse("displaced_root");
+        await alternateTarget();
+        if (await attribution() !== journalBefore) refuse("journal_changed");
+        check();
+      });
+    } catch (error) {
+      // Preserve cleanup uncertainty even if the operation deadline expired during
+      // disposal. The runner still gives actual lifecycle controls precedence.
+      if (cleanupFailure) throw cleanupFailure;
+      if (operation.signal.aborted) throw new Error("retained_readiness_cancelled");
+      if (error instanceof Error && /^retained_readiness_[a-z_]+(?![\s\S])/.test(error.message)) throw error;
+      throw new Error("retained_readiness_validation");
+    }
+  }
+
   /** Attribution only: indexing cannot repair legacy evidence or confer execution authority. */
   private async attributedRecovery(
     barePath: string, branch: string, key: string, expected: RecoverySource,
@@ -6355,7 +6594,7 @@ export class GitCache {
     reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
     guard?: () => void,
   ): Promise<void> {
-    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(reason)) throw new Error("invalid blocker");
+    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
@@ -12471,7 +12710,13 @@ export class GitCache {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const stderr = (err as { stderr?: unknown })?.stderr;
+      retainedGitDiagnostics.set(failure, {
+        stderr: typeof stderr === "string" ? stderr : "",
+        context: `${cwd ?? ""}: git ${args.join(" ")}`,
+      });
+      throw failure;
     }
   }
 
@@ -14013,6 +14258,181 @@ export class GitCache {
     return result;
   }
 }
+
+const RETAINED_READINESS_REASONS = new Set([
+  "deadline", "entry_limit", "depth_limit", "path_limit", "unsafe_root", "displaced_root",
+  "owner", "group", "access", "special_file", "special_mode", "world_write",
+  "hardlinked_mutation", "classification_drift", "alternates", "filesystem", "identity",
+]);
+
+// Fixed program: builtins only, no Git, shell, repository modules, or inherited env.
+// All traversal is descriptor-relative; only command-owned mutation candidates get fchmod.
+const RETAINED_READINESS_HELPER = String.raw`
+const fs = require("node:fs");
+const C = fs.constants, O_PATH = 0x200000;
+const { roots, identities, deadline } = JSON.parse(process.argv[1]);
+const ENTRY_LIMIT = 2000000, DEPTH_LIMIT = 64, PATH_LIMIT = 4096;
+const fds = new Set();
+let entries = 0, changed = 0;
+const links = [], rootMetadata = [];
+function refuse(reason) { const e = Error(); e.reason = reason; throw e; }
+function check() { if (Date.now() >= deadline) refuse("deadline"); }
+function fp(fd) { return "/proc/self/fd/" + fd; }
+function open(p, flags) { check(); const fd = fs.openSync(p, flags); fds.add(fd); return fd; }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function id(s) { return String(s.dev) + ":" + String(s.ino); }
+function absolute(p) {
+  if (!p.startsWith("/") || Buffer.byteLength(p) > PATH_LIMIT) refuse("unsafe_root");
+  let fd = open("/", O_PATH | C.O_NOFOLLOW | C.O_DIRECTORY);
+  try {
+    for (const part of p.slice(1).split("/")) {
+      if (!part || part === "." || part === "..") refuse("unsafe_root");
+      const next = open(fp(fd) + "/" + part, O_PATH | C.O_NOFOLLOW | C.O_DIRECTORY);
+      close(fd); fd = next;
+    }
+    return fd;
+  } catch (e) { close(fd); throw e; }
+}
+function signature(s) { return [id(s), s.uid, s.gid, s.mode, s.nlink, s.size, s.mtimeMs, s.ctimeMs].join(":"); }
+function classify(s) {
+  if (!s.isDirectory() && !s.isFile()) refuse("special_file");
+  const mode = s.mode & 4095, dir = s.isDirectory();
+  if (mode & 2) refuse("world_write");
+  if ((mode & 2048) || (!dir && (mode & 3584))) refuse("special_mode");
+  if (![10001,10002,10003].includes(s.uid)) refuse("owner");
+  if (s.uid === 10003 && s.gid !== 10002) refuse("group");
+  const ownerAccess = dir ? 320 : 256;
+  if ((mode & ownerAccess) !== ownerAccess) refuse("access");
+  if (s.uid !== 10003) {
+    if (s.gid !== 10002 && !(s.uid === 10001 && s.gid === 10001)) refuse("group");
+    const needed = dir ? 5 : 4;
+    if (((mode >> 3) & needed) !== needed || s.gid !== 10002) {
+      if ((mode & needed) !== needed) refuse("access");
+    }
+  }
+  return s.uid === 10003 ? mode | (dir ? 40 : 32) : mode;
+}
+function verifyRoots() {
+  for (let index = 0; index < 3; index++) {
+    const fd = absolute(roots[index]);
+    try {
+      const s = fs.fstatSync(fd), before = rootMetadata[index];
+      if (id(s) !== identities[index] || s.uid !== before.uid || s.gid !== before.gid || s.nlink !== before.nlink)
+        refuse("displaced_root");
+      const mode = s.mode & 4095, prior = before.mode & 4095;
+      if (mode !== prior && !(index === 2 && before.uid === 10003 && mode === (prior | 40))) refuse("classification_drift");
+      classify(s);
+    } finally { close(fd); }
+  }
+}
+function verifyLinks() {
+  for (const link of links) {
+    const named = fs.lstatSync(fp(link.parent) + "/" + link.name);
+    if (named.isSymbolicLink() || id(named) !== id(fs.fstatSync(link.fd))) refuse("displaced_root");
+  }
+}
+function normalize(fd) {
+  const s = fs.fstatSync(fd), proposed = classify(s), mode = s.mode & 4095;
+  if (proposed === mode) return s;
+  if (s.isFile() && s.nlink > 1) refuse("hardlinked_mutation");
+  verifyRoots(); verifyLinks();
+  const immediate = fs.fstatSync(fd);
+  if (signature(s) !== signature(immediate) || classify(immediate) !== proposed) refuse("classification_drift");
+  check();
+  fs.fchmodSync(fd, proposed);
+  const after = fs.fstatSync(fd);
+  if (id(after) !== id(s) || after.uid !== s.uid || after.gid !== s.gid ||
+      after.nlink !== s.nlink || after.size !== s.size || after.mtimeMs !== s.mtimeMs ||
+      after.mode !== ((s.mode & ~4095) | proposed) ||
+      classify(after) !== proposed) refuse("classification_drift");
+  verifyRoots(); verifyLinks();
+  changed++;
+  return after;
+}
+function alternates(fd) {
+  const before = fs.fstatSync(fd);
+  if (!before.isFile() || before.size > PATH_LIMIT + 1) refuse("alternates");
+  const buf = Buffer.alloc(PATH_LIMIT + 2);
+  const n = fs.readSync(fd, buf, 0, buf.length, 0);
+  if (!buf.subarray(0,n).equals(Buffer.from(roots[4] + "\n", "utf8")) ||
+      signature(before) !== signature(fs.fstatSync(fd))) refuse("alternates");
+}
+function walk(fd, relative, depth) {
+  check();
+  if (depth > DEPTH_LIMIT) refuse("depth_limit");
+  if (Buffer.byteLength(roots[2] + (relative ? "/" + relative : "")) > PATH_LIMIT) refuse("path_limit");
+  if (++entries > ENTRY_LIMIT) refuse("entry_limit");
+  const s = normalize(fd), stable = signature(s);
+  verifyLinks();
+  if (signature(fs.fstatSync(fd)) !== stable) refuse("classification_drift");
+  if (!s.isDirectory()) return;
+  const directory = fs.opendirSync(fp(fd) + "/.", { encoding: "buffer" });
+  try {
+    let ent;
+    while ((ent = directory.readSync()) !== null) {
+      check();
+      const rawName = ent.name, name = Buffer.isBuffer(rawName) ? rawName.toString("utf8") : rawName;
+      if (Buffer.isBuffer(rawName) && !Buffer.from(name, "utf8").equals(rawName)) refuse("unsafe_root");
+      const rel = relative ? relative + "/" + name : name;
+      if (Buffer.byteLength(roots[2] + "/" + rel) > PATH_LIMIT) refuse("path_limit");
+      if (depth + 1 > DEPTH_LIMIT) refuse("depth_limit");
+      if (rel === "info/http-alternates") refuse("alternates");
+      if (!name || name === "." || name === ".." || name.includes("/")) refuse("unsafe_root");
+      // Inspect a pinned O_PATH descriptor before opening any special device.
+      const pinned = open(fp(fd) + "/" + name, O_PATH | C.O_NOFOLLOW);
+      let child;
+      try {
+        const initial = fs.fstatSync(pinned);
+        classify(initial);
+        child = open(fp(fd) + "/" + name, C.O_RDONLY | C.O_NOFOLLOW |
+          (initial.isDirectory() ? C.O_DIRECTORY : C.O_NONBLOCK));
+        const readable = fs.fstatSync(child);
+        if (id(readable) !== id(initial)) refuse("displaced_root");
+        if (signature(readable) !== signature(initial)) refuse("classification_drift");
+      } catch (e) { if (child !== undefined) close(child); throw e; }
+      finally { close(pinned); }
+      links.push({ parent: fd, name, fd: child });
+      try {
+        if (rel === "info/alternates") {
+          classify(fs.fstatSync(child));
+          alternates(child);
+          normalize(child);
+          if (++entries > ENTRY_LIMIT) refuse("entry_limit");
+        } else walk(child, rel, depth + 1);
+      } finally { links.pop(); close(child); }
+    }
+  } finally { directory.closeSync(); }
+  verifyLinks();
+  if (signature(fs.fstatSync(fd)) !== stable) refuse("classification_drift");
+}
+let result;
+try {
+  if (process.platform !== "linux" || process.getuid() !== 10003 || !process.getgroups().includes(10002)) refuse("identity");
+  const clone = absolute(roots[0]);
+  const git = open(fp(clone) + "/.git", O_PATH | C.O_DIRECTORY | C.O_NOFOLLOW);
+  const objects = open(fp(git) + "/objects", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  for (const [fd,index] of [[clone,0],[git,1],[objects,2]]) {
+    if (id(fs.fstatSync(fd)) !== identities[index]) refuse("displaced_root");
+    const st = fs.fstatSync(fd);
+    classify(st);
+    rootMetadata[index] = st;
+  }
+  // A commondir would redirect subsequent Git reads outside this verified object root.
+  try {
+    const common = open(fp(git) + "/commondir", O_PATH | C.O_NOFOLLOW);
+    close(common); refuse("unsafe_root");
+  } catch (e) { if (e.code !== "ENOENT") throw e; }
+  walk(objects, "", 0);
+  verifyRoots();
+  check();
+  result = "ok " + entries + " " + changed + "\n";
+} catch (e) {
+  result = "refused " + (e.reason || "filesystem") + "\n";
+} finally {
+  for (const fd of fds) { try { fs.closeSync(fd); } catch {} }
+}
+process.stdout.write(result);
+`;
 
 // Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
 // bytes; no target traversal, Git, config, filters or writes. One failed path aborts

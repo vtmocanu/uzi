@@ -244,8 +244,9 @@ fi
 
 # (k) the other half of the cap: agent/package.json's test script must turn
 # UZI_AGENT_TEST_CONCURRENCY into --test-concurrency. The exact script string runs through
-# `sh -c` (as npm runs it) with a fake `node` first on PATH that prints its argv one per
-# line. UZI_AGENT_PACKAGE_JSON overrides the file, for mutation-testing this case only.
+# `sh -c` (as npm runs it). A test-only preload records the actual test-child argv
+# at spawn, then substitutes a completed child so the suite does not run here.
+# UZI_AGENT_PACKAGE_JSON overrides the file, for mutation-testing this case only.
 # node (to parse the JSON) is required, never skipped.
 PKG="${UZI_AGENT_PACKAGE_JSON:-$ROOT/agent/package.json}"
 if ! command -v node > /dev/null 2>&1; then
@@ -259,13 +260,38 @@ process.stdout.write(s);' -- "$PKG")"; then
   echo "FAIL: package.json concurrency expansion: cannot read scripts.test from $PKG"
   failures=$((failures + 1))
 else
-  FAKEBIN="$TMP/fake-node-bin"
-  mkdir -p "$FAKEBIN"
-  # shellcheck disable=SC2016 # the single-quoted line is the fake node's own script
-  printf '%s\n' '#!/bin/sh' 'for a in "$@"; do printf "%s\n" "$a"; done' > "$FAKEBIN/node"
-  chmod +x "$FAKEBIN/node"
+  PRELOAD="$TMP/package-child-argv.cjs"
+  cat > "$PRELOAD" <<'EOF'
+const cp = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const { EventEmitter } = require("node:events");
+const { syncBuiltinESMExports } = require("node:module");
+const record = (args) => writeFileSync(process.env.UZI_PACKAGE_CHILD_ARGV, args.join("\n") + "\n");
+// Also observe a mutation that puts --test directly back in the package script.
+if (process.execArgv.includes("--test")) {
+  record(process.execArgv);
+  process.exit(0);
+}
+const original = cp.spawn;
+cp.spawn = function(command, args, options) {
+  if (command === process.execPath && Array.isArray(args) && args.includes("--test")) {
+    record(args);
+    const child = new EventEmitter();
+    child.kill = () => true;
+    setImmediate(() => child.emit("close", 0, null));
+    return child;
+  }
+  return original(command, args, options);
+};
+syncBuiltinESMExports();
+EOF
+  # A file URL preserves spaces/quotes in TMPDIR through Node's option parser.
+  PRELOAD_URL="$(node -e 'process.stdout.write(require("node:url").pathToFileURL(process.argv[1]).href)' -- "$PRELOAD")"
   ARGV="$TMP/node-argv"
-  if env UZI_AGENT_TEST_CONCURRENCY=1 PATH="$FAKEBIN:$PATH" sh -c "$test_script" > "$ARGV" 2>&1 &&
+  : > "$ARGV"
+  if (cd "$ROOT/agent" && env UZI_PACKAGE_CHILD_ARGV="$ARGV" \
+    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
+    UZI_AGENT_TEST_CONCURRENCY=1 sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test-concurrency=1' "$ARGV"; then
     echo "PASS: package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 passes --test-concurrency=1"
   else
@@ -273,12 +299,15 @@ else
     sed 's/^/    /' "$ARGV"
     failures=$((failures + 1))
   fi
-  # `--test` present proves the fake node was reached with the real argv.
-  if env -u UZI_AGENT_TEST_CONCURRENCY PATH="$FAKEBIN:$PATH" sh -c "$test_script" > "$ARGV" 2>&1 &&
+  # --test proves the actual test-child boundary was reached.
+  : > "$ARGV"
+  if (cd "$ROOT/agent" && env -u UZI_AGENT_TEST_CONCURRENCY UZI_PACKAGE_CHILD_ARGV="$ARGV" \
+    NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PRELOAD_URL" \
+    sh -c "$test_script") > "$TMP/package-script-output" 2>&1 &&
     grep -qx -- '--test' "$ARGV" && ! grep -q -- '^--test-concurrency' "$ARGV"; then
     echo "PASS: package.json test script: unset UZI_AGENT_TEST_CONCURRENCY passes no --test-concurrency"
   else
-    echo "FAIL: package.json test script: with UZI_AGENT_TEST_CONCURRENCY unset, node was not reached or still got --test-concurrency ($PKG); argv:"
+    echo "FAIL: package.json test script: with UZI_AGENT_TEST_CONCURRENCY unset, test child was not reached or still got --test-concurrency ($PKG); argv:"
     sed 's/^/    /' "$ARGV"
     failures=$((failures + 1))
   fi

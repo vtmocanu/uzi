@@ -28,7 +28,12 @@ limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852) (AI-s
 credential-free GitCache capture and its supervised children, including retained-source
 capture, under closed admission and an epoch fence. This preservation boundary grants
 no disposal authority: stopped and parked sources remain retained under this ADR.
-The held scope ends after `recordRecoveryCapture`; fresh successor creation from the
+Initial predecessor quiescence acquires and releases `runFreeCapture` before
+#3059's independently supervised `normalizeRetainedSourceObjects`, outside A's
+Git-only scope; `ensureClone` also remains outside free capture. A later held scope
+covers resumed-tip verification, direct publication or capture through
+`recordRecoveryCapture`. (AI-synced 2026-10-18)
+That held scope ends after `recordRecoveryCapture`; fresh successor creation from the
 durable bare pin is outside capture and reads only predecessor lstat metadata, not
 old clone bytes. Ordinary seeding trust is unchanged. Refusing every credential-free
 capture would strand capturable work in the ephemeral clone rather than the durable

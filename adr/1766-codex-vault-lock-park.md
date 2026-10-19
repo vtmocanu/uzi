@@ -224,7 +224,9 @@ this enables an eligible predecessor proof without a provider start, credential
 reconciliation or changes to the normal run binding. Missing metadata retains
 pre-start scoped-reaper refusal. Refs #2852 (AI-synced 2026-10-18).
 That acquisition still needs its own settlement and deadline. New poison or unknown
-cleanup retains the outstanding registry and refuses capture.
+cleanup retains the outstanding registry and refuses capture; this is not a blanket
+command-cache retention rule. Cache settlement uses the exact C1 checks above.
+(AI-synced 2026-10-18)
 
 This mirrors the credential-free discipline the reconcile closure already keeps (D2): once the
 vault is known to be locked, nothing on the park path may assume it can still reach the credential,

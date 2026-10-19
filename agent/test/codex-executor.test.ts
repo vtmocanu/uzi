@@ -1,6 +1,7 @@
 import { summaryOwnership } from "../src/codex/summary-ownership.js";
 import { provisionNative } from "./codex-provision-fixture.js";
 import { nativeRootForTest, installerBarrier } from "./codex-installer-fixture.js";
+import { m3Calls } from "./m3-recovery-fixture.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
@@ -2019,6 +2020,9 @@ describe("#2493 initial credential release", () => {
       JSON.stringify({ type: "session_meta", payload: { id: thread } }) + "\n");
     await CodexSessionStore.persist(priorHome, path.join(homeDir, "codex-session-store"));
     const git = new GitCache(fx.dataDir, noopLog, undefined, testGitCacheOptions());
+    // Synthetic roots use host-owned files; UID readiness is an explicit fixture precondition.
+    let readiness = 0;
+    git.normalizeRetainedSourceObjects = async () => { readiness++; };
     const quiesceRun = async () => ({
       process: { state: "quiescent" as const, processes: [], killed: [], detail: "fixture roots reaped" },
       docker: { state: "not_wired" as const, removed: [], detail: "not wired" },
@@ -2051,6 +2055,7 @@ describe("#2493 initial credential release", () => {
       assert.equal(api.states.at(-1)?.body.status, "recovery_wait", diagnostics.lines.join("\n"));
       assert.equal(api.states.at(-1)?.body.session_id, thread);
       assert.equal(await CodexSessionStore.inspectSession(path.join(homeDir, "codex-session-store"), thread), "present");
+      assert.equal(readiness, 0, "initial execution does not normalize a retained source");
       const releasesBefore = api.codexRequests.filter(r => r.operation === "release").length;
       const secondFactory = () => {
         const second = configureRig(makeMultiEpochRig([epochResponder(freshThread, "tn-fresh", (t, th, tn) => {
@@ -2061,6 +2066,7 @@ describe("#2493 initial credential release", () => {
         const resumeRun = resumedExecutor.run.bind(resumedExecutor);
         resumedExecutor.run = async ctx => {
           successorPath = ctx.worktreePath;
+          assert.equal(readiness, 1, "retained readiness completed before successor execution");
           assert.equal(ctx.sessionId, undefined, "the retained-source successor starts a fresh session");
           assert.notEqual(successorPath, predecessorPath);
           assert.match(successorPath, /\.attempt-.*-g2-/);
@@ -2079,6 +2085,7 @@ describe("#2493 initial credential release", () => {
         .execute({ ...claim, claim_generation: claim.claim_generation! + 1, session_id: thread, last_seq: 1000 });
       assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
       assert.ok(api.codexRequests.filter(r => r.operation === "release").length > releasesBefore, "reclaim freshly authorizes");
+      assert.equal(readiness, 1, "reclaim normalized the retained source once");
       const second = secondRigs.at(-1)!;
       const requests = second.epochs[0]!.transport.requests;
       assert.equal(requests.some(r => r.method === "thread/resume"), false);
@@ -21602,4 +21609,188 @@ it("A normal run binding refuses foreign capture and restores omitted fallback a
     await exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
     await fs.rm(home, { recursive: true, force: true });
   }
+});
+
+describe("M3 Codex interrupted recovery delivery", () => {
+  const turnTexts = (transport: FakeTransport): string[] => transport.requests
+    .filter(r => r.method === "turn/start")
+    .map(r => (r.params as { input: { text: string }[] }).input[0]!.text);
+  const approve = { kind: "approve", selection: { status: "absent" } } as const;
+  const snapshot = { base: "interrupted", interruptedEdits: true, commits: 0 } as const;
+  it("M3 absent observations consume the latch across later provider epochs", async () => {
+    let gets = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-check", (t, th, tn) => {
+        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-done", done),
+    ]);
+    const { ctx } = makeCtx({
+      checkpoint: async () => undefined, interruptedSnapshot: snapshot,
+      getInterruptedCalls: () => ++gets === 1 ? undefined : m3Calls(),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 absent across epochs");
+    assert.equal(gets, 1);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 2);
+    assert.match(texts[0]!, /temporary mutations/);
+    assert.doesNotMatch(texts[1]!, /temporary mutations/);
+    texts.forEach(text => assert.doesNotMatch(text, /interrupted_calls_/));
+  });
+
+  it("M3 complete prechange Codex G1 fixtures stay byte stable", () => {
+    const { ctx } = makeCtx({ ...m1Context(), getInterruptedCalls: () => assert.fail("helper evaluated delivery getter") });
+    delete ctx.reviewComments;
+    for (const branch of m1Branches) assert.equal(m1IssueNormalize(m1Prompt(branch, ctx)), m1BaselinePrompts[branch]);
+  });
+
+  it("M3 completion rework stays a system turn across provider recreation", async () => {
+    let gets = 0, attempts = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-first", done),
+      c => {
+        if (c.method === "thread/resume") return { thread: { id: "th-m3" } };
+        if (c.method !== "turn/start") return {};
+        const tn = `tn-rework-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(agentMessage("completion rework", "th-m3"))
+          .push(turnCompleted("completed", "th-m3", tn));
+        else done(c.transport, "th-m3", tn);
+        return { turn: { id: tn } };
+      },
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 6 },
+      frozenMilestones: [{ id: "m1", title: "work" }], checkpoint: async () => undefined,
+      interruptedSnapshot: snapshot, getInterruptedCalls: () => { gets++; return m3Calls(); },
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 completion");
+    assert.equal(gets, 1);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 3);
+    assert.match(texts[1]!, /Completion check/);
+    texts.slice(1).forEach(text => assert.doesNotMatch(text, /interrupted_calls_|temporary mutations/));
+  });
+
+  it("M3 lifecycle failure from delivery getter aborts before turn delivery", async () => {
+    const rig = makeRig();
+    const lost = new Error("M3 claim superseded at delivery");
+    const { ctx } = makeCtx({ getInterruptedCalls: () => { throw lost; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), error => error === lost);
+    assert.equal(rig.transport.turnStartCount, 0);
+  });
+
+  const done = (t: FakeTransport, th: string, tn: string) => {
+    t.push(toolCall(3130, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+  };
+  it("M3 first ordinary owner latch survives planning, iterations and provider epochs", async () => {
+    let gets = 0, approved = false, installed = false;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(3131, "submit_plan", { plan_md: "plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-check", (t, th, tn) => {
+        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-done", done),
+    ]);
+    rig.deps = { ...rig.deps, installDeps: async () => { installed = true; return { results: [], truncated: false }; } };
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, interruptedSnapshot: snapshot,
+      checkpoint: async () => undefined,
+      gatePlan: async () => { assert.equal(gets, 0); approved = true; return approve; },
+      getInterruptedCalls: () => { assert.ok(approved && installed); gets++; return m3Calls(); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 epochs");
+    assert.equal(gets, 1);
+    assert.equal(rig.providerLaunches(), 3);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 3);
+    assert.doesNotMatch(texts[0]!, /interrupted_calls_/);
+    assert.match(texts[1]!, /interrupted_calls_|temporary mutations/);
+    assert.match(texts[1]!, /printf interrupted-observation/);
+    assert.doesNotMatch(texts[2]!, /interrupted_calls_|temporary mutations/);
+  });
+
+  it("M3 helper evaluations never call getter or consume first dispatch", async () => {
+    let gets = 0;
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", done) });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ interruptedSnapshot: snapshot, getInterruptedCalls: () => { gets++; return m3Calls(); } });
+    const helper = executor as unknown as { implementPrompt(ctx: RunContext): string; planPrompt(ctx: RunContext): string };
+    for (let i = 0; i < 2; i++) {
+      assert.doesNotMatch(helper.implementPrompt(ctx), /interrupted_calls_/);
+      assert.doesNotMatch(helper.planPrompt(ctx), /interrupted_calls_/);
+    }
+    assert.equal(gets, 0);
+    await executor.run(ctx);
+    assert.equal(gets, 1);
+    assert.match(turnTexts(rig.transport)[0]!, /printf interrupted-observation/);
+  });
+
+  for (const absent of [undefined, { ...m3Calls(), entries: [], unavailable: true, source_generation: null }]) {
+    it(`M3 independent snapshot warning with ${absent ? "unavailable" : "absent"} telemetry`, async () => {
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", done) });
+      const { ctx } = makeCtx({
+        sessionId: null, priorWork: undefined, interruptedSnapshot: { base: "generic", interruptedEdits: true, commits: null },
+        getInterruptedCalls: () => absent,
+      });
+      await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const prompt = turnTexts(rig.transport)[0]!;
+      assert.match(prompt, /origin base has unknown provenance/);
+      assert.match(prompt, /Separately, recovered uncommitted WIP edits/);
+      assert.doesNotMatch(prompt, /interrupted_calls_/);
+    });
+  }
+
+  it("M3 replan before implementation leaves evidence for first ordinary owner", async () => {
+    let gets = 0, gates = 0;
+    const plan: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-m3" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount, tn = `tn-plan-${n}`;
+      if (n === 1) c.transport.push(threadStarted("th-m3"));
+      c.transport.push(toolCall(3130 + n, "submit_plan", { plan_md: n === 1 ? "first" : "revised" },
+        "th-m3", tn, `plan-${n}`)).push(turnCompleted("completed", "th-m3", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeMultiEpochRig([plan, resumedEpochResponder("th-m3", "tn-done", done)]);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, interruptedSnapshot: snapshot,
+      gatePlan: async () => ++gates === 1 ? { kind: "revise", feedback: "revise" } : approve,
+      getInterruptedCalls: () => { assert.equal(gates, 2); gets++; return m3Calls(); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 replan");
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(gets, 1);
+    assert.equal(texts.length, 3);
+    assert.ok(texts.slice(0, 2).every(text => !text.includes("interrupted_calls_")));
+    assert.match(texts[2]!, /printf interrupted-observation/);
+  });
+
+  it("M3 clarification system turn and later owner do not replay first owner evidence", async () => {
+    let gets = 0;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount, tn = `tn-${n}`;
+      if (n === 1) c.transport.push(threadStarted());
+      if (n === 1) c.transport.push(toolCall(n, "ask_user", { questions: [{ question: "which?" }] }, "th-1", tn, "ask"));
+      else if (n === 3) c.transport.push(toolCall(n, "signal_done", {}, "th-1", tn, "done"));
+      else c.transport.push(agentMessage("answer processed", "th-1"));
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    } });
+    const { ctx } = makeCtx({
+      getInterruptedCalls: () => { gets++; return m3Calls(); }, interruptedSnapshot: snapshot,
+      askUser: async () => ({ kind: "answer", answers: ["SYSTEM-ANSWER"] }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 clarification");
+    assert.equal(gets, 1);
+    const texts = turnTexts(rig.transport);
+    assert.equal(texts.length, 3);
+    assert.match(texts[0]!, /interrupted_calls_/);
+    assert.match(texts[1]!, /SYSTEM-ANSWER/);
+    texts.slice(1).forEach(text => assert.doesNotMatch(text, /interrupted_calls_|temporary mutations/));
+  });
 });

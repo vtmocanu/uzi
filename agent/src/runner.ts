@@ -1,4 +1,5 @@
 import { prepareFrozenHeld, type FrozenHeldPolicy } from "./frozen-held.js";
+import { interruptedSnapshot, prepareInterruptedCalls } from "./interrupted-calls.js";
 import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
 import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
@@ -19,6 +20,8 @@ import { MaintenanceBudget } from "./maintenance-budget.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
+  RetainedReadinessCleanupUnconfirmedError,
+  formatRetainedRecoveryDiagnostic,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -10398,6 +10401,36 @@ export class RunRunner {
     // run. Only an mr_rework run injects the memo; the others just learn `enabled` (which
     // exposes the signal_done param). The body is never logged: only a fixed message plus
     // the error class and HTTP status.
+    const interruptedIdentity = this.client.interruptedCallsRegistration;
+    const interruptedLifecycle = flight.steering.lifecycleSignal();
+    const interruptedCancel = AbortSignal.any([
+      interruptedLifecycle, flight.steering.terminalLifecycleSignal(),
+      flight.cancel.signal, this.shutdownSignal.signal,
+    ]);
+    const getInterruptedCalls = await prepareInterruptedCalls({
+      kind: resolveRunKind(claim.kind), generation: flight.claimGeneration,
+      fetch: () => interruptedIdentity
+        ? this.client.getInterruptedCalls(runId, flight.claimGeneration, interruptedIdentity, interruptedCancel)
+        : Promise.resolve(undefined),
+      check: () => {
+        // Lifecycle failures propagate even when the optional read failed.
+        MaintenanceBudget.current()?.check();
+        const currentLifecycle = flight.steering.lifecycleSignal();
+        currentLifecycle.throwIfAborted();
+        flight.steering.terminalLifecycleSignal().throwIfAborted();
+        this.shutdownSignal.signal.throwIfAborted();
+        // rearmLifecycle retires handled pause/switch stops, including the shared cancel.
+        if (currentLifecycle !== interruptedLifecycle) return false;
+        interruptedCancel.throwIfAborted();
+        return interruptedIdentity !== undefined &&
+          this.client.interruptedCallsRegistration === interruptedIdentity &&
+          flight.active !== undefined && this.activeRuns.get(runId) === flight.active &&
+          !flight.active.shuttingDown && !this.shuttingDownGlobal &&
+          flight.steering.claimFence() === undefined && !flight.steering.isCancelled();
+      },
+      redact: flight.redactText,
+    });
+    const recoveredSnapshot = interruptedSnapshot(flight.claimGeneration, runnerClone);
     let decisionsMemoEnabled = false;
     let decisionsMemo: string | undefined;
     const claimKind = resolveRunKind(claim.kind);
@@ -11192,6 +11225,8 @@ export class RunRunner {
       // on this worker (issue #105).
       sessionId,
       priorWork,
+      interruptedSnapshot: recoveredSnapshot,
+      getInterruptedCalls,
       // issue #222: this run executed before (it reported a session), so this claim's
       // reseed rebuilt the tree (wiped it, or in attempt-path mode seeded a fresh attempt
       // path), so whatever an earlier attempt left uncaptured is not in it. Read the RAW
@@ -18410,7 +18445,8 @@ export class RunRunner {
       // report, not recovery authority. A new ownership GET could fail independently
       // of the fenced state endpoint and leave an exhausted claim cycling again.
       if (episode && episode.stage !== "blocked" && episode.claimGeneration === flight.claimGeneration &&
-          Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
+          Date.now() >= episode.deadline && blocker !== "decoded_history_limit" &&
+          blocker !== "readiness_cleanup_unconfirmed") blocker = "budget_exhausted";
       let persistence = "";
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -18424,7 +18460,7 @@ export class RunRunner {
       catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof CredentialSwitchSignal) throw error;
-        flight.runLog.warn("retained recovery blocker could not be persisted", { error: sanitizeForLog(errMessage(error)) });
+        flight.runLog.warn("retained recovery blocker could not be persisted", formatRetainedRecoveryDiagnostic(error, flight.redactText));
         persistence = "; blocker persistence unavailable";
       }
       this.retainedLifecycleGuard(flight);
@@ -18462,7 +18498,7 @@ export class RunRunner {
               // No renewed-window authority was established. Keep the predecessor untouched
               // and leave this flight nonterminal for bounded missing-flight requeue.
               flight.runLog.warn("retained recovery renewal ownership unavailable; stopping claim for retry", {
-                error: sanitizeForLog(errMessage(error)), claim_generation: flight.claimGeneration,
+                ...formatRetainedRecoveryDiagnostic(error, flight.redactText), claim_generation: flight.claimGeneration,
               });
               throw new RetainedRecoveryStop();
             }
@@ -18474,7 +18510,7 @@ export class RunRunner {
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
-        flight.runLog.warn("retained recovery reservation failed", { error: sanitizeForLog(message), blocker });
+        flight.runLog.warn("retained recovery reservation failed", { ...formatRetainedRecoveryDiagnostic(error, flight.redactText), blocker });
         await fail();
       }
       const iteration = reservation!;
@@ -18484,11 +18520,32 @@ export class RunRunner {
           const check = () => this.requireRetainedOwnership(flight, iteration.deadline, signal);
           await check();
           // Prove the predecessor quiescent before credentialed forge refresh or disk reclamation.
-          const proof = await this.quiesceRun(flight, flight.executor, {
-            mode: "capture", site: "predecessor_capture", targetPaths: [source.clonePath], propagateControl: true,
-          });
+          const quiescence = await this.runFreeCapture(claim, flight,
+            Math.min(iteration.deadline, Date.now() + this.codexBoundaryDeadlineMs), signal, async held => {
+              this.assertHeldFreeCapture(flight, held);
+              const proof = await this.quiesceRun(flight, flight.executor, {
+                mode: "capture", site: "predecessor_capture", targetPaths: [source.clonePath], propagateControl: true,
+              });
+              this.assertHeldFreeCapture(flight, held);
+              return proof;
+            });
           await check();
-          if (proof.blocked) { blocker = "quiescence_failed"; throw finalize; }
+          if (quiescence.kind !== "observed_empty" || quiescence.value.blocked) {
+            blocker = "quiescence_failed"; throw finalize;
+          }
+          this.retainedLifecycleGuard(flight);
+          // Command sandbox attribution precedes executor.run() and its safety facade.
+          // Only an explicit command sandbox requires readiness. Legacy executors may
+          // omit the declaration when no Codex credential is present; unknown values refuse.
+          if (flight.executor.sandboxesCommands === true) {
+            await check();
+            await this.git.normalizeRetainedSourceObjects(bare, branch, key, source);
+            this.retainedLifecycleGuard(flight);
+            await check();
+          } else if (claim.secrets.codex || (flight.executor.sandboxesCommands !== undefined &&
+              flight.executor.sandboxesCommands !== false)) {
+            throw new Error("retained_readiness_profile");
+          }
           // Retained forge/disk failures are charged to this reservation, never to a park.
           await this.preflightDataVolume(claim, flight, signal);
           await check();
@@ -18597,6 +18654,13 @@ export class RunRunner {
       } catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+        flight.runLog.warn("retained recovery iteration failed; reserved budget retained", {
+          iteration: iteration.attempts, ...formatRetainedRecoveryDiagnostic(error, flight.redactText),
+        });
+        if (error instanceof RetainedReadinessCleanupUnconfirmedError) {
+          blocker = "readiness_cleanup_unconfirmed";
+          await fail();
+        }
         if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }
         if (Date.now() >= iteration.deadline) { blocker = "budget_exhausted"; await fail(); }
         if (error === finalize || blocker === "quiescence_failed") await fail();
@@ -18615,9 +18679,6 @@ export class RunRunner {
           blocker = "budget_exhausted";
           await fail();
         }
-        flight.runLog.warn("retained recovery iteration failed; reserved budget retained", {
-          iteration: iteration.attempts, error: sanitizeForLog(errMessage(error)),
-        });
         await this.waitRecoveryRetry(flight, true, Math.min(iteration.backoffMs, Math.max(0, iteration.deadline - Date.now())));
         this.retainedLifecycleGuard(flight);
       }

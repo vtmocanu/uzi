@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from five test files through its root entrypoint, which drops to the worker UID with runner
+leaves from six test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
 anonymous volumes and its two named tool volumes after checking exact resource
@@ -88,8 +88,9 @@ tests must use literal titles and static `it` / `describe` declarations. The com
 inventory also recognizes explicit `test(...)` in the `.mts` fixture and requires
 its exact top-level proof title. Both inventories use this harness’s scoped
 `tsconfig.json`, which includes `.mts` files and future calibration fixtures
-without changing the agent project. The default inventory retains the five old
-files; `node e2e/worker-uid/inventory.mjs command` emits the separate command
+without changing the agent project. A sixth file, `agent/test/git-retained-permissions.test.ts`, adds nine required literal leaves for real-UID retained recovery: loose and packed objects, captured-tip ordering, the four mixed worker/runner hardlink variants, command-owned hardlink mutation refusal, and unsuccessful recovery retention. Its required titles cannot disappear, become nonliteral, move outside the UID gate, or be duplicated without failing inventory validation. Owner-only command objects and both existing hardlink names are checked under the real distinct UIDs. Root, single-UID execution and skipped results do not prove these cases. The command-owned hardlink refusal must reach `hardlinked_mutation`; a generic capture failure does not satisfy it. Both negative cases compare every original private object and directory snapshot plus exact source refs, allowing only the specified partial permission additions; both hardlink names remain exactly unchanged. The corrupt-source case must reach a blob-specific real fetch-integrity refusal after real readiness and clean runner status, rather than merely stop without adoption.
+
+The default inventory retains the five old files and adds the retained recovery file; `node e2e/worker-uid/inventory.mjs command` emits the separate command
 inventory. `expected.json` / `results.xml` and `command-expected.json` /
 `command-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -272,13 +273,15 @@ export interface RunContext {
    *  a resume locally, so passing an unresolvable id fails the whole run before the
    *  first turn instead of resuming anything. */
   sessionId?: string | null;
-  /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
-   *  already carries pushed work. Forwarded to the planning prompt so an amnesiac lead is
-   *  told to read the existing commits rather than redo them — the honest degradation must
-   *  not become silently duplicated work. PRD #209 (D7) adds a SECOND consumer: on the
-   *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
-   *  the IMPLEMENT prompt instead (first turn only). */
+  /** Best-effort positive branch commit count, independent of SDK session survival.
+   *  Planning and first implementation prompts consume it. On resumed snapshots,
+   *  interruptedSnapshot supersedes the legacy continuation wording even when this
+   *  count is absent or zero. */
   priorWork?: PriorWork;
+  /** M2 immutable clone provenance; independent of session survival and evidence availability. */
+  interruptedSnapshot?: InterruptedSnapshot;
+  /** M3 must call immediately before prompt delivery, after any planning wait. May throw lifecycle errors. */
+  getInterruptedCalls?(): InterruptedCalls | undefined;
   /** issue #222: this run was picked up again (a resume), so the runner clone was rebuilt
    *  on this claim (wiped and re-seeded; on a Docker-wired worker, issue #1783 M2, seeded at a
    *  fresh attempt path with the predecessor retained out of reach), so any uncaptured

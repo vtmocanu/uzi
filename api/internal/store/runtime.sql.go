@@ -7921,6 +7921,129 @@ func (q *Queries) InsertRunMessage(ctx context.Context, arg InsertRunMessagePara
 	return i, err
 }
 
+const interruptedCallsWindow = `-- name: InterruptedCallsWindow :many
+WITH authorized AS MATERIALIZED (
+    SELECT r.id FROM runs r JOIN workers w ON w.id = r.worker_id
+    WHERE r.id = $1::uuid AND w.id = $2::uuid
+      AND w.user_id = $3::uuid AND r.user_id = w.user_id
+      AND w.snapshot_register_nonce = $4::text
+      AND w.snapshot_register_nonce IS NOT NULL
+      AND $4::text <> '' AND $5::bigint >= 2
+      AND r.claim_generation = $5::bigint
+      AND r.claim_released_at IS NULL AND r.repo_id IS NOT NULL
+      AND r.status IN ('claimed', 'running')
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+), tail AS MATERIALIZED (
+    SELECT m.seq, m.kind, m.claim_generation, m.agent, m.agent_instance,
+           m.agent_label, m.payload
+    FROM run_messages m
+    WHERE m.run_id = $1::uuid AND EXISTS (SELECT 1 FROM authorized)
+    ORDER BY m.seq DESC LIMIT 256
+), source AS (
+    SELECT max(claim_generation)::bigint AS generation FROM tail
+    WHERE claim_generation > 0 AND claim_generation < $5::bigint
+      AND kind IN ('tool_use', 'tool_result')
+), selected AS (
+    SELECT t.seq, t.kind, t.claim_generation, t.agent, t.agent_instance, t.agent_label, t.payload FROM tail t, source s
+    WHERE t.claim_generation = s.generation AND t.kind IN ('tool_use', 'tool_result')
+)
+SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
+       COALESCE(source.generation, 0)::bigint AS source_generation,
+       s.seq, s.kind,
+       COALESCE(CASE WHEN char_length(s.agent) <= 128 THEN s.agent END, '')::text AS agent,
+       COALESCE(char_length(s.agent) > 128, false)::boolean AS agent_omitted,
+       (s.agent IS NOT DISTINCT FROM 'lead')::boolean AS explicit_lead,
+       (s.agent_instance IS NULL)::boolean AS null_lane,
+       COALESCE(CASE WHEN char_length(s.agent_instance) < 128
+                  AND octet_length(s.agent_instance) <= 1024
+            THEN s.agent_instance END, '')::text AS agent_instance,
+       COALESCE(CASE WHEN char_length(s.agent_label) <= 128 THEN s.agent_label END, '')::text AS agent_label,
+       COALESCE(char_length(s.agent_label) > 128, false)::boolean AS agent_label_omitted,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->'name') = 'string'
+                  AND char_length(s.payload->>'name') <= 128
+            THEN s.payload->>'name' END, '')::text AS tool_name,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)) = 'string'
+                  AND octet_length(s.payload->>(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)) <= 1024
+            THEN s.payload->>(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)
+            END, '')::text AS call_id,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->'input'->'command') = 'string'
+                  AND char_length(s.payload->'input'->>'command') <= 2048
+            THEN s.payload->'input'->>'command' END, '')::text AS command,
+       COALESCE((char_length(s.payload->'input'->>'command') > 2048), false)::boolean AS command_omitted
+FROM authorized CROSS JOIN source LEFT JOIN selected s ON true
+ORDER BY s.seq DESC NULLS LAST
+`
+
+type InterruptedCallsWindowParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	WorkerID        uuid.UUID `json:"worker_id"`
+	OwnerID         uuid.UUID `json:"owner_id"`
+	RegisterNonce   string    `json:"register_nonce"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+type InterruptedCallsWindowRow struct {
+	InspectedCount    int32       `json:"inspected_count"`
+	SourceGeneration  int64       `json:"source_generation"`
+	Seq               pgtype.Int4 `json:"seq"`
+	Kind              pgtype.Text `json:"kind"`
+	Agent             string      `json:"agent"`
+	AgentOmitted      bool        `json:"agent_omitted"`
+	ExplicitLead      bool        `json:"explicit_lead"`
+	NullLane          bool        `json:"null_lane"`
+	AgentInstance     string      `json:"agent_instance"`
+	AgentLabel        string      `json:"agent_label"`
+	AgentLabelOmitted bool        `json:"agent_label_omitted"`
+	ToolName          string      `json:"tool_name"`
+	CallID            string      `json:"call_id"`
+	Command           string      `json:"command"`
+	CommandOmitted    bool        `json:"command_omitted"`
+}
+
+// Identity and claim authorization share the history statement's MVCC snapshot.
+// The materialized ANY-KIND tail must precede every source-generation predicate.
+func (q *Queries) InterruptedCallsWindow(ctx context.Context, arg InterruptedCallsWindowParams) ([]InterruptedCallsWindowRow, error) {
+	rows, err := q.db.Query(ctx, interruptedCallsWindow,
+		arg.RunID,
+		arg.WorkerID,
+		arg.OwnerID,
+		arg.RegisterNonce,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []InterruptedCallsWindowRow{}
+	for rows.Next() {
+		var i InterruptedCallsWindowRow
+		if err := rows.Scan(
+			&i.InspectedCount,
+			&i.SourceGeneration,
+			&i.Seq,
+			&i.Kind,
+			&i.Agent,
+			&i.AgentOmitted,
+			&i.ExplicitLead,
+			&i.NullLane,
+			&i.AgentInstance,
+			&i.AgentLabel,
+			&i.AgentLabelOmitted,
+			&i.ToolName,
+			&i.CallID,
+			&i.Command,
+			&i.CommandOmitted,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const invalidatePriorCompletionPermits = `-- name: InvalidatePriorCompletionPermits :execrows
 UPDATE run_completion_permits SET consumed_at = now()
 WHERE run_id = $1 AND consumed_at IS NULL AND contract_revision < $2

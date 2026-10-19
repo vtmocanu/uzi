@@ -117,7 +117,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3015,6 +3015,9 @@ export class CodexExecutor implements Executor {
       installAbort,
       () => installerCleanupClean,
     );
+    // Execution lifetime: planning, helper prompt evaluation and provider-epoch
+    // recreation cannot consume or reset the first ordinary owner dispatch.
+    let interruptedOwnerDispatched = false;
     this.depsInstall = installState;
     const settleInstall = async (): Promise<void> => { await this.settleDepsInstall(undefined, undefined, installState); };
     const forwardInstallAbort = (): void => {
@@ -4103,7 +4106,14 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined, undefined,
+            systemFollowUp === undefined && round === 0 ? (prompt) => {
+              if (interruptedOwnerDispatched) return prompt;
+              const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
+              const snapshot = interruptedSnapshotNote(ctx.interruptedSnapshot);
+              interruptedOwnerDispatched = true;
+              return [prompt, snapshot, calls].filter(Boolean).join("\n\n");
+            } : undefined);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -4967,6 +4977,7 @@ export class CodexExecutor implements Executor {
     // Issue #1800: called when the turn first yields an event evidencing the model processed the
     // prompt (evidencesModelProcessing), not on lifecycle events such as the claim init.
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
@@ -5048,11 +5059,12 @@ export class CodexExecutor implements Executor {
     // signal, and the harness reads an abort of it as an owner stop (watchdog/cancel), not as a
     // clean end of the turn. A separate controller cancels only the delegations.
     const effectsAbort = new AbortController();
-    const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
+      if (beforeDispatch) prompt = beforeDispatch(prompt);
+      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -5263,6 +5275,7 @@ export class CodexExecutor implements Executor {
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -5296,7 +5309,7 @@ export class CodexExecutor implements Executor {
         }
         this.assertCaptureAdmission();
         const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
