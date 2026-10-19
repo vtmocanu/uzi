@@ -135,7 +135,11 @@ for (const binding of ["bound predecessor", "legacy"] as const) {
       cloneCoordinates: () => ({ branch: "branch" }),
       retainedLifecycleGuard: () => {},
       retainedLifecycleSignal: () => new AbortController().signal,
-      settleForCredentialCapture: async () => ({ kind: "unproven" }),
+      quiesceRun: async (_flight: unknown, _executor: unknown, opts: unknown) => {
+        assert.deepEqual(opts, { mode: "capture", site: "predecessor_capture",
+          targetPaths: [f.source.clonePath], propagateControl: true });
+        return { blocked: true };
+      },
       reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { reports = error.message; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
@@ -189,17 +193,17 @@ test("runner cannot rebase without positive matching claim ownership", async t =
     cloneCoordinates: () => ({ branch: "branch" }),
     retainedLifecycleGuard: () => {},
     retainedLifecycleSignal: () => new AbortController().signal,
-    settleForCredentialCapture: async () => { proof = true; return { kind: "unproven" }; },
+    quiesceRun: async () => { proof = true; return { blocked: true }; },
     reportGenericFailure: async () => {},
   });
   await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
     barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
   }, "key", f.read()));
+  assert.equal(proof, false, "no predecessor capture without matching ownership");
   assert.deepEqual(f.read(), before, "a lost claim must not block or mutate its predecessor episode");
   assert.equal(f.read().recovery?.claimGeneration, 1);
   assert.equal(f.read().recovery?.deadline, first.deadline);
   assert.equal(f.read().recovery?.attempts, 1);
-  assert.equal(proof, false);
 });
 
 test("first recovery window durably charges before ownership probes and preserves outage retries", async t => {
@@ -247,7 +251,7 @@ for (const fault of ["network", "503"] as const) {
       cloneCoordinates: () => ({ branch: "branch" }),
       retainedLifecycleGuard: () => {},
       retainedLifecycleSignal: () => new AbortController().signal,
-      settleForCredentialCapture: async () => { proofs++; return { kind: "unproven" }; },
+      quiesceRun: async () => { proofs++; return { blocked: true }; },
       reportGenericFailure: async () => { reports++; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
@@ -280,7 +284,7 @@ for (const outcome of ["typed 404", "terminal", "foreign generation"] as const) 
       cloneCoordinates: () => ({ branch: "branch" }),
       retainedLifecycleGuard: () => {},
       retainedLifecycleSignal: () => new AbortController().signal,
-      settleForCredentialCapture: async () => { proofs++; return { kind: "unproven" }; },
+      quiesceRun: async () => { proofs++; return { blocked: true }; },
       reportGenericFailure: async () => { reports++; },
     });
     await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {

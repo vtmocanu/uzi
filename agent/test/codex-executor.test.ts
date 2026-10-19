@@ -20113,7 +20113,7 @@ describe("A capture lifecycle public run", () => {
       .push(turnCompleted("completed", th, tn)));
 
   // Exercise the production store and actual epoch HOME removal, not a simulated generation counter.
-  async function fixture(responders: Responder[]) {
+  async function fixture(responders: Responder[], configure?: (rig: MultiRig) => void) {
     const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/a-lifecycle-"));
     const rig = makeMultiEpochRig(responders);
     const homes: string[] = [], persists: string[] = [], adopted: string[] = [], missing: string[] = [];
@@ -20157,6 +20157,7 @@ describe("A capture lifecycle public run", () => {
         } };
       },
     };
+    configure?.(rig);
     const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, homeRoot);
     const generation = () => fs.readFile(path.join(store, "current"), "utf8");
     const saved = async () => fs.readFile(path.join(store, "generations", (await generation()).trim(), "sessions", rolloutName), "utf8");
@@ -20344,6 +20345,105 @@ describe("A capture lifecycle public run", () => {
       }
     });
   }
+
+  it("A lifecycle incomplete pause capture refuses fresh credentials while old provider root is unclean", async t => {
+    const ready = installerBarrier();
+    let oldRegistry: ExecutionRegistry | undefined;
+    const providerRegistries = new Set<ExecutionRegistry>();
+    const register = ExecutionRegistry.prototype.registerRoot;
+    t.mock.method(ExecutionRegistry.prototype, "registerRoot", function (
+      this: ExecutionRegistry, ...args: Parameters<ExecutionRegistry["registerRoot"]>
+    ) {
+      const result = register.apply(this, args);
+      if (args[1].kind === "provider") providerRegistries.add(this);
+      return result;
+    });
+    let dirty = true, refusedReaps = 0, refusedDisposals = 0, cleanReaps = 0;
+    const fx = await fixture([epochResponder(thread, "tn-dirty", () => ready.resolve()), done()], rig => {
+      const old = rig.epochs[0]!.root;
+      const reap = old.reap.bind(old), dispose = old.dispose.bind(old);
+      old.reap = async ms => {
+        if (dirty) {
+          refusedReaps++;
+          return { ok: false, error: { category: "tool", message: "old provider full root remains unclean" } };
+        }
+        cleanReaps++;
+        return reap(ms);
+      };
+      old.dispose = async ms => {
+        if (dirty) { refusedDisposals++; throw new Error("old provider disposal unconfirmed"); }
+        await dispose(ms);
+      };
+      rig.deps = { ...rig.deps, deferRegistryTeardown: true };
+    });
+    let mode: "now" | null = null;
+    let interrupt: (() => void) | undefined;
+    let captures = 0, actions = 0;
+    let generation = "", content = "";
+    const releases: { state: string; roots: number; cleanReaps: number; generation: string; content: string; source: string }[] = [];
+    const release = fx.rig.client.releaseCodex.bind(fx.rig.client);
+    fx.rig.client.releaseCodex = async (...args) => {
+      if (captures) {
+        assert.ok(oldRegistry);
+        releases.push({ state: oldRegistry.state(), roots: oldRegistry.rootCount(), cleanReaps,
+          generation: await fx.generation(), content: await fx.saved(),
+          source: await fs.readFile(path.join(fx.homes[0]!, "sessions", rolloutName), "utf8") });
+      }
+      return release(...args);
+    };
+    const controller = new AbortController();
+    const { ctx } = makeCtx({ signal: controller.signal,
+      pauseModeRequested: () => mode, onPauseNow: cb => { interrupt = cb; },
+      parkForPause: async () => {
+        captures++;
+        const result = await fx.exec.withCredentialFreeCapture(1000, async () => { actions++; });
+        assert.equal(result.kind, "incomplete", "real registry cannot certify the dirty registered root");
+        if (result.kind === "incomplete") assert.match(JSON.stringify(result.errors), /root.*not cleanly reaped/);
+        assert.equal(actions, 0, "incomplete acquisition never enters the capture action");
+        assert.ok(oldRegistry);
+        assert.equal(oldRegistry.state(), "poisoned");
+        assert.equal(oldRegistry.rootCount(), 2, "provider and run-start environment probe remain registered");
+        assert.ok(refusedReaps > 0);
+        assert.equal(cleanReaps, 0);
+        generation = await fx.generation();
+        content = await fx.saved();
+        assert.match(content, /epoch-1/);
+        assert.equal(await fs.readFile(path.join(fx.homes[0]!, "sessions", rolloutName), "utf8"), content);
+        mode = null; // Failure ACK allows continuation, as in the runner's refused-pause context.
+        return false;
+      },
+    });
+    const run = fx.exec.run(ctx);
+    const settled = run.then(value => ({ value, error: undefined }), (error: unknown) => ({ value: undefined, error }));
+    try {
+      await withTimeout(ready.promise, 3000, "old provider turn before incomplete pause");
+      oldRegistry = providerRegistries.values().next().value;
+      mode = "now"; interrupt!();
+      const outcome = await withTimeout(settled, 5000, "dirty pause continuation");
+      t.diagnostic(JSON.stringify({ error: outcome.error instanceof Error ? { name: outcome.error.name, message: outcome.error.message } : outcome.error,
+        releases: fx.rig.client.releaseCalls.length, providers: fx.rig.providerLaunches(),
+        refusedReaps, refusedDisposals, cleanReaps, observations: releases }));
+      assert.equal(captures, 1);
+      assert.equal(cleanReaps, 0, "old root has no clean proof before fresh credential observation");
+      for (const observed of releases) {
+        assert.deepEqual(observed, { state: "poisoned", roots: 2, cleanReaps: 0,
+          generation, content, source: content }, "fresh release observes the exact retained old generation and source");
+      }
+      assert.deepEqual(fx.missing, [], "never persist a disposed HOME");
+      assert.equal(fx.rig.client.releaseCalls.length, 1,
+        "incomplete pause capture must refuse fresh credentials until the old provider root is clean");
+      assert.equal(fx.rig.providerLaunches(), 1, "no replacement provider before clean old-root evidence");
+      assert.equal(await fx.generation(), generation);
+      assert.equal(await fx.saved(), content);
+    } finally {
+      dirty = false; // Release the owned root seam before joining every operation.
+      controller.abort(new Error("fixture cleanup"));
+      await withTimeout(settled, 5000, "dirty pause cleanup");
+      await oldRegistry?.disposeTools(1000);
+      await fx.exec.safety?.dispose({ boundary: "terminal", deadlineMs: 1000 });
+      await fx.cleanup();
+    }
+  });
 
   for (const automatic of [false, true]) {
     it(`A lifecycle repeated ${automatic ? "automatic" : "human"} changed-milestone capture revises on fresh epochs`, async () => {

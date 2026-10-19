@@ -3502,11 +3502,16 @@ export class CodexExecutor implements Executor {
       const recreateEpochAfterReap = (): Promise<ProviderEpoch> => this.withCaptureOwnership(async () => {
         const old = epoch!;
         lastSessionId = old.harness.rootThreadId ?? lastSessionId;
+        // tearDownEpoch removes this exact registry only after verified teardown,
+        // including completed-capture evidence at its unchanged poison revision.
+        await old.dispose();
+        if (this.unverifiedEpochRegistries.has(old.registry)) {
+          throw new TrustedExecutionRefusal("prior Codex epoch cleanup unproven");
+        }
         epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
         beforeReapPersist = undefined;
-        await old.dispose();
         return epoch;
       });
 
@@ -3778,12 +3783,19 @@ export class CodexExecutor implements Executor {
           // Ordinary approval keeps plan advice alive during implementation. A
           // changed-milestone capture already saved and drained this HOME.
           if (beforeReapPersist) await beforeReapPersist;
-          if (!reapedSinceLastPersist) await old.persistSession();
+          const captured = reapedSinceLastPersist;
+          if (!captured) await old.persistSession();
+          else {
+            await old.dispose();
+            if (this.unverifiedEpochRegistries.has(old.registry)) {
+              throw new TrustedExecutionRefusal("prior Codex epoch cleanup unproven");
+            }
+          }
           epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex, { persistAfterLaunchOnly: true });
           this.safety = epoch.safety;
           reapedSinceLastPersist = false;
           beforeReapPersist = undefined;
-          await old.dispose();
+          if (!captured) await old.dispose();
         });
       }
 
