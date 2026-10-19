@@ -26,17 +26,26 @@ func acceptanceGateRequest() StateRequest {
 	return req
 }
 
-func acceptanceFixture(t *testing.T) (codexTestEnv, *gateFix, uuid.UUID) {
+func acceptanceUnpublishedFixture(t *testing.T) (codexTestEnv, *gateFix, uuid.UUID, PlanCrossCheckCandidate) {
 	t.Helper()
-	// revisionGateFixture creates the task publicly, including real birth coverage.
-	e, f, run := revisionGateFixture(t)
-	f.wkr.ProtocolCapabilities = append(f.wkr.ProtocolCapabilities, capability.InputReceiptsV1,
+	// Public creation supplies birth coverage; the checker is submitted before
+	// the first plan or gate is persisted, as production admission requires.
+	e, svc, w, run, candidate := revisionInventoryFixture(t)
+	f := &gateFix{t: t, ctx: e.ctx, pool: e.pool, q: e.q, svc: svc, wkr: w, userID: w.UserID}
+	f.wkr.ProtocolCapabilities = append(f.wkr.ProtocolCapabilities, capability.GateRevisionV1, capability.InputReceiptsV1,
 		capability.ProviderPolicyHoldV1, capability.CredentialSwitchV1,
 		"cross_check_v1", "cross_check_rounds_v1", "cross_check_codex_lead_v1")
 	e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.wkr.ID, f.wkr.ProtocolCapabilities)
 	f.svc.p.PolicyHoldNegotiated = true
 	f.svc.p.PolicyHoldSnapshotEnabled = true
 	f.svc.p.TerminalPendingLease = time.Minute
+	return e, f, run, candidate
+}
+
+func acceptanceFixture(t *testing.T) (codexTestEnv, *gateFix, uuid.UUID) {
+	t.Helper()
+	e, f, run, _ := acceptanceUnpublishedFixture(t)
+	e.exec("UPDATE runs SET plan_cross_check_required=false,auto_approve=false WHERE id=$1", run)
 	f.mustPublish(run, acceptanceGateRequest(), 1)
 	return e, f, run
 }
@@ -476,26 +485,25 @@ func TestPolicyRevisionAcceptanceRollbackLiveDB(t *testing.T) {
 }
 
 func TestPolicyRevisionAcceptanceLateVerdictInterleavingLiveDB(t *testing.T) {
-	e, f, run := acceptanceFixture(t)
-	e.exec("UPDATE runs SET status='running',auto_approve=true,plan_cross_check_required=true WHERE id=$1", run)
-	r := mustRun(t, e, run)
-	candidate := PlanCrossCheckCandidate{PlanMd: r.PlanMd.String, Milestones: r.MilestonesCandidate,
-		RequiredCapabilities: r.RequiredCapabilities, RequiredTools: r.RequiredTools, SizeClass: r.SizeClass,
-		BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
+	e, f, run, candidate := acceptanceUnpublishedFixture(t)
 	cc, err := f.svc.SubmitPlanCrossCheck(e.ctx, f.wkr, run, 1, candidate)
 	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.UUID(cc.CheckerRunID.Bytes)
+	e.exec("UPDATE runs SET status='running',worker_id=$2,claim_generation=1 WHERE id=$1", child, f.wkr.ID)
+	if _, err := f.svc.DecidePlanCrossCheck(e.ctx, f.wkr, child, 1, "revise", "revise", []byte(`{"summary":"revise","items":[]}`)); err != nil {
 		t.Fatal(err)
 	}
 	req := acceptanceGateRequest()
 	plan := "# Different human candidate"
 	req.PlanMd = &plan
-	f.mustPublish(run, req, 2)
+	f.mustPublish(run, req, 1)
 	// Publication normally settles the exited checker. Explicitly restore a
 	// historical pending witness to exercise the late writer's independent fence.
 	e.exec("UPDATE cross_checks SET verdict='pending',decided_at=NULL WHERE id=$1", cc.ID)
-	child := uuid.UUID(cc.CheckerRunID.Bytes)
 	e.exec("UPDATE runs SET status='running',worker_id=$2,claim_generation=1,claim_released_at=NULL WHERE id=$1", child, f.wkr.ID)
-	approval := acceptanceInput(t, e, run, "approve_plan", 2)
+	approval := acceptanceInput(t, e, run, "approve_plan", 1)
 	acceptanceAck(t, f, run, approval)
 	decider := New(e.q, e.box, f.svc.p)
 	decider.SetTxBeginner(e.pool)
@@ -526,12 +534,7 @@ func TestPolicyRevisionAcceptanceLateVerdictInterleavingLiveDB(t *testing.T) {
 func TestPolicyRevisionAcceptanceSubmitRecoveryLiveDB(t *testing.T) {
 	for _, creationRace := range []bool{false, true} {
 		t.Run(map[bool]string{false: "exact", true: "creation_race"}[creationRace], func(t *testing.T) {
-			e, f, run := acceptanceFixture(t)
-			e.exec("UPDATE runs SET status='running',auto_approve=true,plan_cross_check_required=true WHERE id=$1", run)
-			r := mustRun(t, e, run)
-			candidate := PlanCrossCheckCandidate{PlanMd: r.PlanMd.String, Milestones: r.MilestonesCandidate,
-				RequiredCapabilities: r.RequiredCapabilities, RequiredTools: r.RequiredTools, SizeClass: r.SizeClass,
-				BaseCommit: strings.Repeat("a", 40), PlanningDiff: "diff"}
+			e, f, run, candidate := acceptanceUnpublishedFixture(t)
 			var created store.CrossCheck
 			var baseline, history string
 			accept := func(ctx context.Context) error {
@@ -545,6 +548,7 @@ func TestPolicyRevisionAcceptanceSubmitRecoveryLiveDB(t *testing.T) {
 				if _, err := f.svc.DecidePlanCrossCheck(ctx, f.wkr, child, 1, "revise", "revise", []byte(`{"summary":"revise","items":[]}`)); err != nil {
 					return err
 				}
+				f.mustPublish(run, acceptanceGateRequest(), 1)
 				approval := acceptanceInput(t, e, run, "approve_plan", 1)
 				acceptanceAck(t, f, run, approval)
 				acceptanceApply(t, f, run, approval)
