@@ -62,6 +62,26 @@ func TestPolicyRevisionAutopilotActualPlanLiveDB(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionAutopilotMissingCheckRefusalLiveDB(t *testing.T) {
+	e, f, run, candidate := acceptanceUnpublishedFixture(t)
+	digest, err := candidate.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := StateRequest{State: "running", ClaimGeneration: i64(1), PlanMd: &candidate.PlanMd,
+		Milestones: &[]Milestone{}, RequiredCapabilities: &candidate.RequiredCapabilities,
+		RequiredTools: &candidate.RequiredTools, SizeClass: &candidate.SizeClass,
+		CandidateDigest: hex.EncodeToString(digest)}
+	before := policyOwnerStopSnapshot(t, e, run)
+	_, applied, _, err := f.svc.SetStateReport(e.ctx, f.wkr, run, req)
+	if applied || !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("missing checker approval applied=%v err=%v; want invalid-state refusal", applied, err)
+	}
+	if policyOwnerStopSnapshot(t, e, run) != before {
+		t.Fatal("missing checker refusal changed persisted state")
+	}
+}
+
 func TestPolicyRevisionSeededActualPlanLiveDB(t *testing.T) {
 	e, f, old, _ := autopilotRevisionFixture(t)
 	repo := uuid.UUID(mustRun(t, e, old).RepoID.Bytes)
@@ -166,12 +186,12 @@ func TestPolicyRevisionAutopilotHistoricalRevisionLiveDB(t *testing.T) {
 		Milestones: &[]Milestone{}, RequiredCapabilities: &c.RequiredCapabilities, RequiredTools: &c.RequiredTools,
 		SizeClass: &c.SizeClass, CandidateDigest: hex.EncodeToString(digest)}
 	autopilotRevisionReport(t, f, run, req)
-	assertAutopilotApproval(t, e, run, true)
 	accepted := acceptanceSource(t, e, run)
 	if accepted.PrimaryRevision != nil || len(accepted.AssociatedCrossChecks) != 1 ||
 		*accepted.AssociatedCrossChecks[0].CrossCheckID != second.ID.String() {
 		t.Fatal("wrong retained inventory")
 	}
+	assertAutopilotApproval(t, e, run, true)
 	if acceptanceHistory(t, e, run) != history {
 		t.Fatal("acceptance mutated immutable feedback history")
 	}

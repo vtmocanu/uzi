@@ -4632,7 +4632,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return store.Run{}, false, err
 			}
 			if autopilotAcceptance != nil && planRows != 1 {
-				return store.Run{}, false, fmt.Errorf("policy autopilot plan fence: affected %d rows", planRows)
+				return store.Run{}, false, fmt.Errorf("%w: policy autopilot plan fence: affected %d rows", ErrInvalidState, planRows)
 			}
 			if planRows == 0 {
 				// A concurrent cancel/park is a state refusal, not an invalid plan.
