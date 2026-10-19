@@ -1500,7 +1500,8 @@ web:
       # Input-file upload (PRD #1909, POST /api/v1/files): ingress-nginx defaults the request
       # body limit to 1m and would refuse any real upload before web nginx sees it. 26m = the
       # api's default per-file cap (25 MiB) plus multipart framing, matching web nginx's
-      # `location = /api/v1/files`; web nginx still limits every other /api/ path to 1m. Raise it
+      # `location = /api/v1/files`; owner run inputs allow 17m for exact semantic echoes,
+      # and other /api/ paths retain 1m. Raise the upload limit
       # together with UZI_JOB_INPUT_FILE_MAX_BYTES.
       nginx.ingress.kubernetes.io/proxy-body-size: "26m"
     # dev-cluster serves a *.example.com default wildcard cert at the
