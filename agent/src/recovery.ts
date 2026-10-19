@@ -3195,7 +3195,8 @@ export class RecoveryCoordinator {
       } finally { for (const budget of attempts.values()) budget.dispose(); }
       // Replay gets the first opportunity. A separate COMPLETE view below decides
       // whether a new origin is admissible; the advisory saved snapshot never does.
-      if (observation.originalContext) await this.admitTerminalOrigin(observation, passSignal);
+      if (observation.originalContext) await M1MaintenanceResources.runDiscoveryPass(
+        () => this.admitTerminalOrigin(observation, passSignal), { signal: passSignal });
     });
   }
 
@@ -3328,6 +3329,7 @@ export class RecoveryCoordinator {
         check();
         if (!current(chargedHold.token)) return refused("exact_hold_refused");
         stage = "history_refused";
+        M1MaintenanceResources.checkDiscoveryPass();
         const admitted = await ledger.admit(admission, { signal, newOrigin: true });
         if (!admitted.ok) return refused(admitted.reason);
         const slot = admitted.value;

@@ -609,15 +609,32 @@ function checked(token: MaintenanceSlot): Live {
 interface Discovery {
   deadline: number; monotonicDeadline: number; signal: AbortSignal; controller: AbortController;
   used: Partial<Record<MaintenanceResource | "candidates", number>>;
+  closed?: boolean;
 }
+interface DiscoveryPass {
+  state: { scope?: Discovery; signal?: AbortSignal };
+  closed: boolean;
+  parent?: DiscoveryPass;
+}
+const discoveryPass = new AsyncLocalStorage<DiscoveryPass>();
 const discovery = new AsyncLocalStorage<Discovery>();
 const discoveryLimits: Partial<Record<MaintenanceResource | "candidates", number>> = {
   metadataBytes: 32 * 1024 ** 2, adminEntries: 4096, rpcAttempts: 16, candidates: 4, launches: 512,
 };
+function checkPassLifetime(pass: DiscoveryPass): void {
+  // This finite ancestry is exactly the currently nested pass scopes.
+  for (let ancestor: DiscoveryPass | undefined = pass; ancestor; ancestor = ancestor.parent)
+    if (ancestor.closed) refuse("maintenance_resource_exhausted");
+  pass.state.signal?.throwIfAborted();
+}
 function checkDiscovery(scope: Discovery): void {
-  try { MaintenanceBudget.current()?.check(); }
+  try {
+    const pass = discoveryPass.getStore();
+    if (pass) checkPassLifetime(pass);
+    MaintenanceBudget.current()?.check();
+  }
   catch (error) { scope.controller.abort(error); throw error; }
-  if (scope.signal.aborted || Date.now() >= scope.deadline || performance.now() >= scope.monotonicDeadline) {
+  if (scope.closed || scope.signal.aborted || Date.now() >= scope.deadline || performance.now() >= scope.monotonicDeadline) {
     scope.controller.abort(new Error("maintenance_resource_exhausted"));
     refuse("maintenance_resource_exhausted");
   }
@@ -635,24 +652,63 @@ export class MaintenanceResources {
     if (!token) refuse("maintenance_token_invalid");
     checked(token);
   }
+  /** Own sequential discovery segments without activating discovery during charged work.
+   * The first segment starts the immutable clock. Closing revokes escaped continuations;
+   * there is deliberately no discovery elapsed check after charged production.
+   */
+  static async runDiscoveryPass<T>(action: () => Promise<T>, options: { signal?: AbortSignal } = {}): Promise<T> {
+    if (resources.getStore()) refuse("maintenance_token_invalid");
+    const parent = discoveryPass.getStore();
+    if (parent) this.checkDiscoveryPass();
+    options.signal?.throwIfAborted();
+    const state = parent?.state ?? {};
+    // A nested cancellation must constrain later sibling segments too.
+    if (options.signal) state.signal = AbortSignal.any([...(state.signal ? [state.signal] : []), options.signal]);
+    const pass: DiscoveryPass = { closed: false, state, parent };
+    try { return await discoveryPass.run(pass, action); }
+    finally {
+      pass.closed = true;
+      if (!parent) state.scope?.controller.abort(new Error("maintenance_resource_exhausted"));
+    }
+  }
+  /** Recheck the original discovery reservation immediately before charging production. */
+  static checkDiscoveryPass(): void {
+    const pass = discoveryPass.getStore();
+    if (!pass) refuse("maintenance_resource_exhausted");
+    checkPassLifetime(pass);
+    if (pass.state.scope) checkDiscovery(pass.state.scope);
+  }
   /** Metadata discovery never mints or accepts a producer token. Nested calls share all counters. */
   static async runDiscovery<T>(action: () => Promise<T>, options: { signal?: AbortSignal; deadline?: number } = {}): Promise<T> {
     if (resources.getStore()) refuse("maintenance_token_invalid");
+    const pass = discoveryPass.getStore();
+    if (pass) this.checkDiscoveryPass();
     const parent = discovery.getStore();
     if (parent) checkDiscovery(parent);
-    const duration = Math.max(0, Math.min(10_000, (options.deadline ?? Infinity) - Date.now(),
-      parent ? parent.deadline - Date.now() : Infinity));
+    let shared = parent ?? pass?.state.scope;
+    if (!shared) {
+      const duration = Math.max(0, Math.min(10_000, (options.deadline ?? Infinity) - Date.now(),
+        MaintenanceBudget.current()?.remainingMs() ?? Infinity));
+      const controller = new AbortController();
+      shared = { deadline: Date.now() + duration, monotonicDeadline: performance.now() + duration,
+        controller, used: {}, signal: AbortSignal.any([controller.signal,
+          ...[pass?.state.signal, options.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => !!s)]) };
+    }
+    if (pass && !pass.state.scope) pass.state.scope = shared;
+    checkDiscovery(shared);
+    const duration = Math.max(0, Math.min(shared.deadline - Date.now(),
+      shared.monotonicDeadline - performance.now(), (options.deadline ?? Infinity) - Date.now()));
+    const state = shared;
     return MaintenanceBudget.runProducer(async budget => {
-      const scope: Discovery = { deadline: Math.min(Date.now() + duration, parent?.deadline ?? Infinity),
-        monotonicDeadline: Math.min(performance.now() + duration, parent?.monotonicDeadline ?? Infinity),
-        signal: budget.signal, controller: parent?.controller ?? new AbortController(), used: parent?.used ?? {} };
-      scope.signal = AbortSignal.any([budget.signal, scope.controller.signal, ...(parent ? [parent.signal] : [])]);
-      return discovery.run(scope, async () => {
-        checkDiscovery(scope);
-        const value = await action();
-        checkDiscovery(scope);
-        return value;
-      });
+      const scope: Discovery = { ...state, signal: AbortSignal.any([state.signal, budget.signal]) };
+      try {
+        return await discovery.run(scope, async () => {
+          checkDiscovery(scope);
+          const value = await action();
+          checkDiscovery(scope);
+          return value;
+        });
+      } finally { scope.closed = true; }
     }, { durationMs: duration, signal: options.signal });
   }
   static active(): boolean { return !!resources.getStore() || !!discovery.getStore(); }
