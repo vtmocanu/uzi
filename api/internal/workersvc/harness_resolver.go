@@ -470,7 +470,10 @@ func (s *Service) resolveUsableCodexCredential(ctx context.Context, userID uuid.
 // existing cheap non-tx insert.
 var errCodexCreateRequiresTx = errors.New("codex run creation requires an atomic transaction (no tx beginner wired)")
 
-// createRunAtomic is the M5B atomic create seam (PRD #1429 M1, D1). It resolves the run's
+// createRunAtomic is the M5B atomic create seam (PRD #1429 M1, D1). The insert callback
+// MUST return a newly inserted row on success; an existing-row retry must return an
+// error/sentinel instead. SQL queued-state guards alone cannot prove fresh insertion.
+// It resolves the run's
 // harness via D11 and runs a caller-supplied, INSERT-shape-agnostic run INSERT, and — when the
 // resolved harness is Codex — freezes the run's Codex binding, ALL in ONE database transaction.
 // So runtime / judge / task / mr_rework / prompt / self-improve / ci-fix INSERT shapes all use

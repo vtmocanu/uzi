@@ -119,11 +119,14 @@ func TestPolicyRevisionInitialCreationLiveDB(t *testing.T) {
 						len(run.GatePayloadDigest) != 0 || len(run.GatePresentedPayload) != 0 || len(run.PolicyStopResolution) != 0 {
 						t.Fatalf("creation established policy/gate state: %+v", run)
 					}
-					// auto_approve on task/self_improve is an ordinary creation flag;
-					// the empty source itself grants no candidate approval.
-					if policyRevisionPlanApproved(e.ctx, e.q, run, false) {
-						t.Fatal("initial source granted approval")
-					}
+				}
+				// Component boundary: model a first refusal on the real created row.
+				// Legacy approval is deliberately true, so count-zero bypass cannot
+				// satisfy this assertion. This is not a hold/claim composition proof.
+				e.exec("UPDATE runs SET policy_refusal_count=1 WHERE id=$1", r.ID)
+				constrained := mustRun(t, e, r.ID)
+				if policyRevisionPlanApproved(e.ctx, e.q, constrained, true) {
+					t.Fatal("unbound initial coverage granted constrained approval")
 				}
 				assertRunHarness(t, e, r.ID, harness)
 			})
@@ -237,7 +240,7 @@ func TestPolicyRevisionUnsupportedInvalidationLiveDB(t *testing.T) {
 			case "credential_capability":
 				e.wkr.ProtocolCapabilities = slices.DeleteFunc(e.wkr.ProtocolCapabilities, func(c string) bool { return c == capability.CredentialSwitchV1 })
 			case "both_capabilities", "legacy_generation":
-				e.wkr.ProtocolCapabilities = nil
+				e.wkr.ProtocolCapabilities = []string{}
 				if mode == "legacy_generation" {
 					gen = nil
 				}
