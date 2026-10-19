@@ -138,6 +138,14 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.SettledAt.Valid }) {
 		return InputReceiptResult{}, &InputReceiptConflictError{Reason: ReceiptSettledByStop}
 	}
+	// Accepted policy Stop makes pending approvals inert. Preflight every ID before
+	// returning bodies or stamping siblings. Preserve an exact APPLIED retry of
+	// independently applied history; the ordinary receipt checks still fence it.
+	if !discarded && len(run.PolicyStopResolution) != 0 &&
+		slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind == "approve_plan" }) &&
+		!(applied && !slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return !row.AppliedAt.Valid })) {
+		return InputReceiptResult{}, &InputReceiptConflictError{Reason: dispositionSuperseded}
+	}
 	// Issue #1604: only an approve_plan can be discarded. Every other kind is either acted on
 	// (APPLIED) or replayed to the next claim; settling it without acting would drop it.
 	if discarded && slices.ContainsFunc(rows, func(row store.ListInputReceiptRowsRow) bool { return row.Kind != "approve_plan" }) {

@@ -9137,6 +9137,7 @@ WITH pending AS (
     WHERE p.run_id = @run_id AND p.applied_at IS NULL AND p.settled_at IS NULL AND p.disposition IS DISTINCT FROM 'superseded'
       AND NOT (p.kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=p.run_id AND p.id<=a.stop_cutoff))
       AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+      AND NOT (p.kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = p.run_id AND r.policy_stop_resolution IS NOT NULL))
     ORDER BY p.id ASC
     LIMIT 1000
     FOR UPDATE SKIP LOCKED
@@ -9144,6 +9145,7 @@ WITH pending AS (
 consumed AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM pending WHERE u.id = pending.id AND u.settled_at IS NULL
+      AND NOT (u.kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = u.run_id AND r.policy_stop_resolution IS NOT NULL))
     RETURNING u.id, u.kind, u.body, u.created_at, u.gate_binding, u.gate_revision
 )
 SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption,
@@ -9155,6 +9157,7 @@ SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inp
 WHERE run_user_inputs.run_id = @run_id AND applied_at IS NULL AND settled_at IS NULL AND disposition IS DISTINCT FROM 'superseded'
   AND NOT (kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=run_user_inputs.run_id AND run_user_inputs.id<=a.stop_cutoff))
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+  AND NOT (kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_user_inputs.run_id AND r.policy_stop_resolution IS NOT NULL))
 ORDER BY id ASC
 LIMIT 1000;
 
@@ -9187,7 +9190,7 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 SELECT runs.id, runs.kind, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
-       runs.credential_switch_generation, runs.egress_profile_id
+       runs.credential_switch_generation, runs.egress_profile_id, runs.policy_stop_resolution
 FROM runs WHERE runs.id = @run_id
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 FOR UPDATE OF runs;
@@ -9200,6 +9203,8 @@ FROM run_user_inputs WHERE run_id = @run_id AND id = ANY(@ids::bigint[])
 ORDER BY id ASC;
 
 -- name: AckRunInputRows :many
+-- Accepted policy Stop fences the entire requested batch when it contains an
+-- approval, including siblings that would otherwise be stamped independently.
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
     consumed_worker_id = @worker_id,
     -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
@@ -9208,6 +9213,9 @@ UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_
 WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint[]) AND applied_at IS NULL AND settled_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = @run_id
     AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs approval JOIN runs r ON r.id = approval.run_id
+    WHERE approval.run_id = @run_id AND approval.id = ANY(@ids::bigint[])
+      AND approval.kind = 'approve_plan' AND r.policy_stop_resolution IS NOT NULL)
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: IncludeRunInputRows :many
@@ -9224,12 +9232,16 @@ WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
+-- Keep the same whole-batch accepted-Stop fence as AckRunInputRows.
 UPDATE run_user_inputs SET applied_at = now()
 WHERE run_user_inputs.run_id = @run_id AND run_user_inputs.id = ANY(@ids::bigint[])
   AND run_user_inputs.consumed_claim_generation = @claim_generation AND run_user_inputs.consumed_worker_id = @worker_id
   AND run_user_inputs.consumed_at IS NOT NULL AND run_user_inputs.applied_at IS NULL AND run_user_inputs.settled_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = @run_id
-    AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL);
+    AND settled.id = ANY(@ids::bigint[]) AND settled.settled_at IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs approval JOIN runs r ON r.id = approval.run_id
+    WHERE approval.run_id = @run_id AND approval.id = ANY(@ids::bigint[])
+      AND approval.kind = 'approve_plan' AND r.policy_stop_resolution IS NOT NULL);
 
 -- name: DiscardRunInputRows :execrows
 -- Issue #1604: settle approve_plan rows the worker DISCARDED as stale (a replayed verdict sent

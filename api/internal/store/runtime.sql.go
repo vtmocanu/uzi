@@ -21,6 +21,9 @@ UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_
 WHERE run_user_inputs.run_id = $4 AND run_user_inputs.id = ANY($5::bigint[]) AND applied_at IS NULL AND settled_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = $4
     AND settled.id = ANY($5::bigint[]) AND settled.settled_at IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs approval JOIN runs r ON r.id = approval.run_id
+    WHERE approval.run_id = $4 AND approval.id = ANY($5::bigint[])
+      AND approval.kind = 'approve_plan' AND r.policy_stop_resolution IS NOT NULL)
 RETURNING id, kind, body, created_at, gate_binding, gate_revision
 `
 
@@ -41,6 +44,8 @@ type AckRunInputRowsRow struct {
 	GateRevision pgtype.Int8        `json:"gate_revision"`
 }
 
+// Accepted policy Stop fences the entire requested batch when it contains an
+// approval, including siblings that would otherwise be stamped independently.
 func (q *Queries) AckRunInputRows(ctx context.Context, arg AckRunInputRowsParams) ([]AckRunInputRowsRow, error) {
 	rows, err := q.db.Query(ctx, ackRunInputRows,
 		arg.ClaimGeneration,
@@ -539,6 +544,9 @@ WHERE run_user_inputs.run_id = $1 AND run_user_inputs.id = ANY($2::bigint[])
   AND run_user_inputs.consumed_at IS NOT NULL AND run_user_inputs.applied_at IS NULL AND run_user_inputs.settled_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM run_user_inputs settled WHERE settled.run_id = $1
     AND settled.id = ANY($2::bigint[]) AND settled.settled_at IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM run_user_inputs approval JOIN runs r ON r.id = approval.run_id
+    WHERE approval.run_id = $1 AND approval.id = ANY($2::bigint[])
+      AND approval.kind = 'approve_plan' AND r.policy_stop_resolution IS NOT NULL)
 `
 
 type ApplyRunInputRowsParams struct {
@@ -548,6 +556,7 @@ type ApplyRunInputRowsParams struct {
 	WorkerID        pgtype.UUID `json:"worker_id"`
 }
 
+// Keep the same whole-batch accepted-Stop fence as AckRunInputRows.
 func (q *Queries) ApplyRunInputRows(ctx context.Context, arg ApplyRunInputRowsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, applyRunInputRows,
 		arg.RunID,
@@ -2122,6 +2131,7 @@ WITH pending AS (
     WHERE p.run_id = $1 AND p.applied_at IS NULL AND p.settled_at IS NULL AND p.disposition IS DISTINCT FROM 'superseded'
       AND NOT (p.kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=p.run_id AND p.id<=a.stop_cutoff))
       AND p.kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+      AND NOT (p.kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = p.run_id AND r.policy_stop_resolution IS NOT NULL))
     ORDER BY p.id ASC
     LIMIT 1000
     FOR UPDATE SKIP LOCKED
@@ -2129,6 +2139,7 @@ WITH pending AS (
 consumed AS (
     UPDATE run_user_inputs u SET consumed_at = COALESCE(u.consumed_at, now()), applied_at = now()
     FROM pending WHERE u.id = pending.id AND u.settled_at IS NULL
+      AND NOT (u.kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = u.run_id AND r.policy_stop_resolution IS NOT NULL))
     RETURNING u.id, u.kind, u.body, u.created_at, u.gate_binding, u.gate_revision
 )
 SELECT consumed.id, consumed.kind, consumed.body, consumed.created_at, pending.first_consumption,
@@ -9710,6 +9721,7 @@ SELECT id, kind, body, created_at, gate_binding, gate_revision FROM run_user_inp
 WHERE run_user_inputs.run_id = $1 AND applied_at IS NULL AND settled_at IS NULL AND disposition IS DISTINCT FROM 'superseded'
   AND NOT (kind IN ('stop','cancel','reject_plan') AND EXISTS (SELECT 1 FROM run_milestone_reconciliations a WHERE a.run_id=run_user_inputs.run_id AND run_user_inputs.id<=a.stop_cutoff))
   AND kind NOT IN ('scope', 'resume', 'completion_decision', 'extend')
+  AND NOT (kind = 'approve_plan' AND EXISTS (SELECT 1 FROM runs r WHERE r.id = run_user_inputs.run_id AND r.policy_stop_resolution IS NOT NULL))
 ORDER BY id ASC
 LIMIT 1000
 `
@@ -12799,7 +12811,7 @@ WITH candidates AS MATERIALIZED (
     WHERE (mapping.parent_id IS NULL OR mapping.parent_id = ANY(locks.ids))
 )
 SELECT runs.id, runs.kind, runs.status, runs.worker_id, runs.claim_generation, runs.claim_released_at, runs.credential_switch_requested_at,
-       runs.credential_switch_generation, runs.egress_profile_id
+       runs.credential_switch_generation, runs.egress_profile_id, runs.policy_stop_resolution
 FROM runs WHERE runs.id = $1
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
 FOR UPDATE OF runs
@@ -12815,6 +12827,7 @@ type LockRunForInputReceiptRow struct {
 	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
 	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
 	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
+	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 }
 
 // egress_profile_id rides this lock (PRD #1906 M5, Decision D-D) so inputReceipt applies the
@@ -12832,6 +12845,7 @@ func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (
 		&i.CredentialSwitchRequestedAt,
 		&i.CredentialSwitchGeneration,
 		&i.EgressProfileID,
+		&i.PolicyStopResolution,
 	)
 	return i, err
 }
