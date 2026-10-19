@@ -1295,6 +1295,7 @@ describe("M3 park_run admission", () => {
         const admitted = origin === "root" && Object.keys(overrides).length === 0;
         assert.equal(r.ok, admitted);
         if (admitted && r.ok) assert.deepEqual(r.output, { parkRun: true });
+        if (!admitted && "phase" in overrides && origin === "root") assertDenied(r, "park_run_denied");
         assert.equal(h.spawn.calls.length, 0);
       });
     }

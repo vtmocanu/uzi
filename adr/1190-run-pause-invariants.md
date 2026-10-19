@@ -83,6 +83,9 @@ actionable work, or call `park_run` and end the turn when implementation must wa
 dependency and no actionable work remains. The Claude hook and Codex broker
 restrict the tool to the root lead in implementation; planning, subagents,
 interactive runs and other kinds have no authority.
+Because the pinned Codex `thread/resume` restores the tool vocabulary registered at
+`thread/start`, the Codex root advertises `park_run` from planning for an eligible
+run, and the broker alone withholds authority until implementation (#3138).
 
 Capability negotiation requires an API implementing this protocol and a
 worker advertising `park_run_v1`; the claim's `park_run_supported` is true

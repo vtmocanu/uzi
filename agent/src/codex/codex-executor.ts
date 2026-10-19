@@ -4888,7 +4888,9 @@ export class CodexExecutor implements Executor {
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
-      nonInteractiveIssue: parkRunEligible(ctx, phase),
+      // Phase-independent: the root vocabulary is registered once at thread/start and survives
+      // the approval thread/resume; the broker gates the phase.
+      nonInteractiveIssue: (ctx.kind ?? "issue") === "issue" && !ctx.interactive,
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,
