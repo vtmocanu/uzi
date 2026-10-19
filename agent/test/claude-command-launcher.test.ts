@@ -275,11 +275,13 @@ describe("launchRunnerCommandRoot with a fake supervisor", () => {
   it("keeps the original onSpawned error when the onKillFailed hook itself throws", { skip: SINGLE_UID > 0 ? false : "needs a non-root process uid" }, async () => {
     const fake = newFake(SINGLE_UID);
     const boom = new Error("record failed");
+    let hookCalls = 0;
     await assert.rejects(
       launchRunnerCommandRoot(spec({ onSpawned: () => { throw boom; } }),
-        depsFor(fake, { env: {}, onKillFailed: () => { throw new Error("hook failed"); } })),
+        depsFor(fake, { env: {}, onKillFailed: () => { hookCalls++; throw new Error("hook failed"); } })),
       (e: unknown) => e === boom,
     );
+    assert.equal(hookCalls, 1, "the throwing hook was actually reached");
   });
 
   it("classifies a spawn that throws as not started, without calling onSpawned", async () => {
@@ -587,7 +589,9 @@ describe("WRAPPER under the host bash", () => {
       // A 3-digit value passes the digits check but must be clamped to 50 (5 s), not honoured as 99.9 s.
       const huge = await runWrapper(holder(), { graceTenths: "999", timeoutMs: 20000 });
       assert.equal(huge.code, 6);
-      assert.ok(huge.exitMs >= 4000 && huge.exitMs < 11000, `an over-large grace is clamped to the 5 s cap (${String(huge.exitMs)}ms)`);
+      // Compare with the invalid-value run (the 5 s default): a cap drift would move this by seconds.
+      assert.ok(Math.abs(huge.exitMs - bad.exitMs) < 2000,
+        `an over-large grace is clamped to the 5 s cap (${String(huge.exitMs)}ms vs ${String(bad.exitMs)}ms)`);
     } finally {
       for (const f of pidFiles) killPidFile(f);
     }

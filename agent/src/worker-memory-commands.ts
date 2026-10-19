@@ -3,6 +3,7 @@ import type { MemoryPolicy, WorkerMemoryPressureResult } from "./protocol.js";
 import { makeTextRedactor } from "./redact.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 
+type ModelCommandSource = "codex-model-command" | "claude-model-command";
 type Root = Readonly<{ pid: number; startTime: string }>;
 type ContextInput = {
   run_id: string;
@@ -30,7 +31,7 @@ type Budget = Readonly<{ remainingMs: number; signal: AbortSignal }>;
 type Entry = Readonly<{
   identity: string;
   context: Context;
-  source: "codex-model-command";
+  source: ModelCommandSource;
   toolId: string;
   attemptId: string;
   commandId: string;
@@ -220,7 +221,7 @@ export class WorkerMemoryCommands {
   register(context: Context, input: Omit<Entry, "identity" | "context" | "command" | "root" | "commandId"> & {
     command: string; root: Root;
   }, commandId?: string): Entry {
-    if (!this.admitsCommands(context) || (commandId !== undefined && !uuid(commandId)) || input.source !== "codex-model-command"
+    if (!this.admitsCommands(context) || (commandId !== undefined && !uuid(commandId)) || (input.source !== "codex-model-command" && input.source !== "claude-model-command")
       || !rootValid(input.root) || (input.primary !== undefined && !rootValid(input.primary)) || ![input.toolId, input.attemptId].every((id) => typeof id === "string" && id.length > 0
         && Buffer.byteLength(id) <= 256 && !/[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u.test(id))
       || typeof input.observe !== "function" || typeof input.cancel !== "function"

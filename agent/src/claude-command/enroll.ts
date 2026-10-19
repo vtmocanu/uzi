@@ -1,0 +1,174 @@
+// Memory-guard enrollment for a guarded Claude model command (issue #2471, M2). Mirrors
+// `enrollMemoryCommand` in codex/memory-command.ts over the Claude command root: the supervisor
+// is the enrolled root and the bash wrapper (`started.childPid`) is the primary.
+//
+// Authority. Only metadata minted by the command lane (`mintClaudeCommandMetadata`) can enroll,
+// and only into the captured context it was minted for ({commands, context, flight,
+// lifecycleRevision}), exactly like `isBrokerModelCommand`. A forged, cloned or unminted object
+// is never enrolled; the command it describes still runs, bounded by its own deadline.
+//
+// Disposal. `disposeRootOnce` is the single-flight whole-tree disposal of one supervisor
+// handle. The lane's own D7 sequence and the guard's cancel/drain call it, so a root is disposed
+// by one in-flight operation however many parties ask.
+
+import type { CapturedMemoryContext } from "../codex/broker.js";
+import { boundedCommandWait } from "../codex/memory-command.js";
+import type { CodexRootHandle } from "../codex/launcher.js";
+import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
+
+type Entry = ReturnType<WorkerMemoryCommands["register"]>;
+type Observation = Awaited<ReturnType<Entry["observe"]>>;
+
+export interface ClaudeCommandMetadata {
+  /** The handler's tool_use id (verified against a PreToolUse record by the lane). */
+  readonly toolId: string;
+  readonly attemptId: string;
+  readonly commandId: string;
+  /** The model command text; the registry redacts and bounds it. */
+  readonly command: string;
+}
+
+const minted = new WeakMap<ClaudeCommandMetadata, CapturedMemoryContext>();
+
+/** Mint enrollment metadata bound to the captured context. Called only by the command lane. */
+export function mintClaudeCommandMetadata(captured: CapturedMemoryContext, fields: ClaudeCommandMetadata): ClaudeCommandMetadata {
+  const metadata = Object.freeze({
+    toolId: fields.toolId, attemptId: fields.attemptId, commandId: fields.commandId, command: fields.command,
+  });
+  minted.set(metadata, Object.freeze({ ...captured }));
+  return metadata;
+}
+
+/** Identity membership: true only for the exact object `mintClaudeCommandMetadata` returned,
+ *  and, when `captured` is given, only for the context it was minted for. */
+export function isMintedClaudeCommand(value: ClaudeCommandMetadata | undefined, captured?: CapturedMemoryContext): value is ClaudeCommandMetadata {
+  if (value === undefined || typeof value !== "object" || value === null) return false;
+  const bound = minted.get(value);
+  if (bound === undefined) return false;
+  if (!captured) return true;
+  return bound.commands === captured.commands && bound.context === captured.context
+    && bound.flight === captured.flight && bound.lifecycleRevision === captured.lifecycleRevision;
+}
+
+const disposals = new WeakMap<CodexRootHandle, Promise<boolean>>();
+
+/**
+ * Dispose one supervisor root at most once and share the result. Resolves true only for a
+ * clean, drained disposal; a rejection or an unclean outcome is false. The first caller's
+ * `timeoutMs` bounds the underlying disposal; later callers join the same promise.
+ */
+export function disposeRootOnce(handle: CodexRootHandle, timeoutMs: number): Promise<boolean> {
+  let flight = disposals.get(handle);
+  if (!flight) {
+    flight = handle.dispose(timeoutMs).then((outcome) => outcome.clean, () => false);
+    disposals.set(handle, flight);
+  }
+  return flight;
+}
+
+export interface ClaudeCommandEnrollment {
+  readonly entry: Entry;
+  /** Resolves when the guard resolves a pressure outcome for this entry (watch only). */
+  readonly outcome: ReturnType<WorkerMemoryCommands["watchOutcome"]>;
+  /** Single-flight disposal; records a confirmed drain and unregisters on success. */
+  readonly reap: (budgetMs?: number) => Promise<{ ok: boolean }>;
+  /** The guard's prepared outcome for this entry, when it prepared one. */
+  readonly preparedOutcome: () => ReturnType<WorkerMemoryCommands["outcome"]>;
+  readonly recordDisposal: (confirmed: boolean) => void;
+  readonly unregister: () => void;
+}
+
+/**
+ * Enroll a lane-minted command into the captured memory context. Returns undefined (the command
+ * runs unenrolled) for unminted metadata, an uncertain initial observation, or a primary that
+ * already exited with nothing adopted. Throws when the captured admission closed while enrolling.
+ */
+export async function enrollClaudeCommand(
+  captured: CapturedMemoryContext | undefined,
+  metadata: ClaudeCommandMetadata | undefined,
+  handle: CodexRootHandle,
+  deadlineMs: number,
+  signal?: AbortSignal,
+): Promise<ClaudeCommandEnrollment | undefined> {
+  if (!captured || !isMintedClaudeCommand(metadata, captured)) return undefined;
+  const { commands, context, flight, lifecycleRevision } = captured;
+  const current = () => commands.isCurrent(context, flight, lifecycleRevision);
+  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
+  const startedAtMs = performance.now();
+  const initial = await boundedCommandWait(handle.observe(deadlineMs), deadlineMs);
+  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
+  // Read-only uncertainty prevents memory intervention, not ordinary execution.
+  if (initial.state !== "complete") return undefined;
+  if (initial.supervisor.pid !== handle.supervisorPid
+    || initial.supervisor.pid !== handle.started.supervisorPid || initial.root.pid !== handle.started.childPid) {
+    throw new Error("memory enrollment evidence unavailable");
+  }
+  const supervisor = Object.freeze({ ...initial.supervisor });
+  const primary = Object.freeze({ ...initial.root });
+  const same = (a: typeof supervisor, b: typeof supervisor) => a.pid === b.pid && a.startTime === b.startTime;
+  const convert = (evidence: Awaited<ReturnType<CodexRootHandle["observe"]>>, startedAt: number): Observation => {
+    const completedAtMs = performance.now();
+    if (evidence.state !== "complete" || !same(evidence.supervisor, supervisor) || !same(evidence.root, primary)) {
+      return { available: false, complete: false, startedAtMs: startedAt, completedAtMs, rows: [] };
+    }
+    return { available: true, complete: true, startedAtMs: startedAt, completedAtMs,
+      supervisor, primary, rows: evidence.processes.map(({ pid, startTime, rss }) => ({ pid, startTime, rssBytes: rss })) };
+  };
+  // A primary that has already exited with no adopted children needs no enrollment.
+  if (convert(initial, startedAtMs).rows.length === 0) return undefined;
+  let entry!: Entry;
+  const reap = async (budgetMs = deadlineMs): Promise<{ ok: boolean }> => {
+    const budget = Math.min(deadlineMs, budgetMs);
+    const completion = disposeRootOnce(handle, budget).then((ok) => {
+      if (ok) {
+        commands.recordDrain(entry, { confirmed: true });
+        commands.unregister(entry);
+      }
+      return { ok };
+    });
+    try { return await boundedCommandWait(completion, budget); }
+    catch { return { ok: false }; }
+  };
+  const authorizedReap = async (authority: Parameters<Entry["cancel"]>[0]) => {
+    const end = performance.now() + authority.remainingMs;
+    if (!current() || authority.signal.aborted || !authority.authorized()) throw new Error("stale memory cancellation");
+    // Refresh exact supervisor and original primary attestation before disposal.
+    const observation = await entry.observe(authority);
+    const selection = commands.select([{ entry, observation }], performance.now(), authority.remainingMs);
+    if (!selection || !current() || authority.signal.aborted || !authority.authorized()
+      || performance.now() >= end || !commands.checkBeforeCancel(selection, observation, performance.now(), authority.remainingMs)) {
+      throw new Error("stale memory cancellation");
+    }
+    return reap(end - performance.now());
+  };
+  entry = commands.register(context, {
+    source: "claude-model-command", toolId: metadata.toolId, attemptId: metadata.attemptId,
+    command: metadata.command, root: supervisor, primary,
+    observe: async (budget) => {
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: performance.now(), completedAtMs: performance.now(), rows: [] };
+      const started = performance.now();
+      const evidence = await boundedCommandWait(handle.observe(budget?.remainingMs ?? deadlineMs), budget?.remainingMs ?? deadlineMs);
+      if (!current() || budget?.signal.aborted) return { available: false, complete: false, startedAtMs: started, completedAtMs: performance.now(), rows: [] };
+      return convert(evidence, started);
+    },
+    cancel: async (authority) => {
+      const result = await authorizedReap(authority);
+      commands.recordDrain(entry, { confirmed: result.ok, detail: result.ok ? undefined : "supervisor disposal unconfirmed" });
+    },
+    drain: async (budget) => {
+      if (!budget || budget.signal.aborted || !budget.authorized() || !current()) return { confirmed: false, detail: "stale memory drain" };
+      const result = await authorizedReap(budget);
+      return { confirmed: result.ok, detail: result.ok ? undefined : "supervisor disposal unconfirmed" };
+    },
+  }, metadata.commandId);
+  return {
+    entry,
+    outcome: commands.watchOutcome(entry),
+    reap,
+    preparedOutcome: () => commands.outcome(entry),
+    recordDisposal: (confirmed: boolean) => {
+      commands.recordDrain(entry, { confirmed, detail: confirmed ? undefined : "supervisor disposal unconfirmed" });
+    },
+    unregister: () => { commands.unregister(entry); },
+  };
+}
