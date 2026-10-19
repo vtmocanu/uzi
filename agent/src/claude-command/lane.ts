@@ -543,7 +543,9 @@ export class ClaudeCommandLane {
     const rendered = output.render();
     const notes: string[] = [];
     if (rendered.truncated) {
-      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; the text above is a preview (start and end). A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`);
+      notes.push(`Output exceeded ${String(INLINE_CAP_CHARS)} characters; ${rendered.previewOmitted
+        ? "no inline preview is shown, because a configured secret is too long to redact safely across the cut"
+        : "the text above is a preview (start and end)"}. A copy of the output is written to ${spillRel} on a best-effort basis (it may be absent or truncated), readable with the Read tool when present.`);
       if (output.totalBytes > this.spillCapBytes) {
         notes.push(`The spill file is truncated at ${sizeLabel(this.spillCapBytes)}; it is bounded and not the full output.`);
       }

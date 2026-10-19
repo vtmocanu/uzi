@@ -57,6 +57,8 @@ export interface RenderedOutput {
   readonly text: string;
   /** True when the middle of the output was omitted (the inline text is a preview). */
   readonly truncated: boolean;
+  /** True when no inline preview is shown at all (a secret too long to redact across the cut). */
+  readonly previewOmitted?: boolean;
 }
 
 export class BoundedOutput {
@@ -124,7 +126,7 @@ export class BoundedOutput {
    *  window ends or starts at a retention edge (so the margin must be dropped when it is short). */
   private cut(headWindow: string, tailWindow: string, windowsAreEdges: boolean): RenderedOutput {
     if (this.previewUnsafe) {
-      return { text: `\n[... output preview omitted: ${String(this.bytes)} bytes in total ...]\n`, truncated: true };
+      return { text: `\n[... output preview omitted: ${String(this.bytes)} bytes in total ...]\n`, truncated: true, previewOmitted: true };
     }
     const marker = `\n[... output truncated: ${String(this.bytes)} bytes in total; the middle is omitted ...]\n`;
     const available = INLINE_CAP_CHARS - marker.length;

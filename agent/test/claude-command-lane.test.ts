@@ -490,6 +490,16 @@ test("secrets are redacted from the inline output and the command text is never 
   assert.match(body, /token=\*\*\*REDACTED\*\*\* end/);
 });
 
+test("a cut output whose preview is omitted says so instead of claiming a start/end preview", { timeout: 20000 }, async () => {
+  const huge = "Q9Z7W4X2-".repeat(8000).slice(0, 70_000);
+  const h = harness({ secrets: [huge] });
+  h.script.current = (root) => { root.stdout.write(`${"a".repeat(40_000)}\n`); setImmediate(() => root.exitWith(0)); };
+  const body = text(await h.call({ command: "big" }));
+  assert.match(body, /preview omitted/);
+  assert.match(body, /no inline preview is shown/);
+  assert.doesNotMatch(body, /the text above is a preview/);
+});
+
 test("output still held open by a descendant after the grace is reported as possibly incomplete", { timeout: 10000 }, async () => {
   const h = harness();
   h.script.current = (root) => { root.holdOutput(); root.stdout.write("visible\n"); setImmediate(() => root.exitWith(5)); };

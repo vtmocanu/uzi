@@ -80,7 +80,8 @@ async function observeVerdict(handle: CodexRootHandle, budgetMs: number): Promis
     return `supervisor lacks observe: ${failureReason(error)}`;
   }
   if (outcome.state === "complete") return undefined;
-  if (outcome.reason === "unreadable" || outcome.reason === "busy") return undefined;
+  // "busy" is local (an observation already in flight) and proves nothing about the protocol.
+  if (outcome.reason === "unreadable") return undefined;
   return `supervisor lacks observe: unavailable (${outcome.reason})`;
 }
 

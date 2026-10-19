@@ -154,8 +154,17 @@ describe("memoryLauncherPreflight", () => {
     assert.deepEqual(rejected, { ok: false, reason: "supervisor lacks observe: unknown control op" });
   });
 
+  it("refuses a locally busy observation, which proves nothing about observe support", async () => {
+    const result = await memoryLauncherPreflight({
+      launch: async () => fakeRoot(async () => drained, true,
+        async () => ({ event: "observe", id: 1, state: "unavailable", reason: "busy" }) as ObservationOutcome),
+      killUnreaped: () => true,
+    });
+    assert.equal(result.ok, false);
+  });
+
   it("accepts an unavailable observation that says nothing about the control protocol", async () => {
-    for (const reason of ["unreadable", "busy"] as const) {
+    for (const reason of ["unreadable"] as const) {
       const result = await memoryLauncherPreflight({
         launch: async () => fakeRoot(async () => drained, true,
           async () => ({ event: "observe", id: 1, state: "unavailable", reason }) as ObservationOutcome),
