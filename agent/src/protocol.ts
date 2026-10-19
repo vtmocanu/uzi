@@ -2795,6 +2795,9 @@ export interface StateAck {
   workerIdentityMatches?: boolean;
   /** The actual request generation, after feature and strict-decode fallback selection. */
   sentClaimGeneration?: number;
+  /** Exact server presentation; malformed presence never becomes legacy absence. */
+  semanticGate?: import("./semantic-gate-wire.js").SemanticGateAck;
+  semanticGateMalformed?: true;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

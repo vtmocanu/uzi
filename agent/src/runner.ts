@@ -1876,7 +1876,7 @@ interface RunFlight {
   readonly reportState: (
     body: Parameters<WorkerClient["reportState"]>[1],
     signal?: AbortSignal,
-    checked?: boolean,
+    checked?: boolean | "semantic",
   ) => ReturnType<WorkerClient["reportState"]>;
   checkedStateBarrier?: Promise<void>;
   stateSenders?: Set<Promise<StateAck>>;
@@ -8945,9 +8945,17 @@ export class RunRunner {
       // id-less gate) with the presented requirements. The confirmed revision is seeded from the
       // claim, so a pending reject or revise bound to that gate acts before it is re-presented
       // (takeResumedGateEvent); a taken revise clears it and marks the run gated (a fresh id then).
+      // Worker claims carry no persisted semantic binding. Text equality cannot
+      // certify sources, criteria, coverage or generation, so refresh this gate.
+      if (claim.semantic_planning !== undefined) this.gatedRuns.add(runId);
       const resumeRevision = claim.resume_gate_revision;
+      // Queued owner revisions still target the persisted gate before refresh.
+      // gatePlan clears this revision before publishing the new presentation.
+      if (claim.semantic_planning !== undefined && typeof resumeRevision === "number" &&
+          Number.isSafeInteger(resumeRevision) && resumeRevision > 0)
+        steering.setGateRevision(resumeRevision);
       if (
-        !this.gatedRuns.has(runId) &&
+        claim.semantic_planning === undefined && !this.gatedRuns.has(runId) &&
         typeof resumeRevision === "number" && Number.isSafeInteger(resumeRevision) && resumeRevision > 0
       ) {
         const id = claim.resume_gate_presentation_id;
@@ -9114,8 +9122,9 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
-        const transport = () => checked
-          ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
+        const transport = () => checked === "semantic"
+          ? this.client.reportSemanticPlanGateState(runId, stamped, signal)
+          : checked ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : this.client.reportState(runId, stamped, signal);
         // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
         const sending = body.status === "failed" || body.status === "completed"
@@ -11489,13 +11498,25 @@ export class RunRunner {
         // delivered (an SDK claim already awaited it in takeResumedGateEvent).
         if (claim.plan_approved !== true && !!claim.plan_md?.trim() && !effectiveAutoApprove)
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, checkedHuman ? steering.lifecycleSignal() : cancel.signal);
+        const semanticReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
+        const reportSemanticState = (body: StateRequest): Promise<StateAck> => {
+          let frozen = semanticReports.get(body);
+          if (!frozen) {
+            frozen = JSON.parse(JSON.stringify({ ...body,
+              candidate_digest: semanticCompiled!.candidate.digest, claim_generation: flight.claimGeneration,
+              ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
+            })) as PlanCrossCheckStateRequest;
+            semanticReports.set(body, frozen);
+          }
+          return flight.reportState(frozen, steering.lifecycleSignal(), "semantic");
+        };
         const verdict = await this.gatePlan(
           runId,
           planMd,
           milestones,
           batcher,
           steering,
-          checkedHuman || checkedApproval ? reportCheckedState : reportState,
+          semanticCompiled ? reportSemanticState : checkedHuman || checkedApproval ? reportCheckedState : reportState,
           runLog,
           effectiveAutoApprove,
           crossCheckReason,

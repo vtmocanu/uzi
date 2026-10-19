@@ -68,6 +68,15 @@ test("API-shaped candidate and proposal round trip without renaming or losing fi
   assert.equal(parseSemanticCandidate({ ...wire, coverage: null }).coverage, null);
 });
 
+test("semantic candidate preserves optional plan fields digest and historical absence", () => {
+  const historical = parseSemanticCandidate(candidate());
+  assert.equal(Object.hasOwn(historical, "plan_fields_digest"), false);
+  const current = { ...candidate(), plan_fields_digest: digest };
+  assert.deepEqual(parseSemanticCandidate(current), current);
+  for (const invalid of [null, "", "f".repeat(63), 42])
+    assert.throws(() => parseSemanticCandidate({ ...candidate(), plan_fields_digest: invalid }));
+});
+
 test("mandatory escaped proposals retain all fields through string and Uint8Array input", () => {
   const fill = (prefix: string, length: number) => prefix + "\u0001".repeat(length - prefix.length);
   const bytes = Buffer.from("requirement");
