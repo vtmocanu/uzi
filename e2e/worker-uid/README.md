@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from seven test files through its root entrypoint, which drops to the worker UID with runner
+leaves from eight test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
 anonymous volumes and its two named tool volumes after checking exact resource
@@ -92,9 +92,11 @@ without changing the agent project. A sixth file, `agent/test/git-retained-permi
 
 A seventh file, `agent/test/claude-command-launcher.test.ts`, contributes its three literal leaves under the single `INIT_SKIP`-gated suite `real runner-uid command launcher` (issue #2471): the image supervisor launched at runner UID 10002 through the guarded-command wrapper, the memory-guard launcher preflight, and the image bash version. Its fake-supervisor and host-bash wrapper tests run in the normal host shards, not in this lane.
 
-The default inventory retains the five old files and adds the retained recovery file and the claude-command-launcher file (its three literal leaves above); `node e2e/worker-uid/inventory.mjs command` emits the separate command
-inventory. `expected.json` / `results.xml` and `command-expected.json` /
-`command-results.xml` are checked separately. The JUnit
+An eighth file, `e2e/worker-uid/claude-command-real.test.mts`, contributes twelve required literal `it` leaves under the single `INIT_SKIP`-gated suite `real Claude guarded command lane` (issue #2471, M4). It runs in the same root-start worker-proof container (worker UID 10001, `UZI_UID_SPLIT=1`, runner UID 10002) and drives the real `ClaudeCommandLane` with the real launcher, image supervisor and `WorkerMemoryCommands`, entering each call through `lane.hook` then `lane.handle` as the SDK does. It proves: guard-style cancel and short-deadline expiry drain a detached command and its descendants; cancelling one run's command leaves a sibling run's command alive; another attempt's capture scan skips a live command's recorded root while the owner's reap still kills it; a candidate whose root start time differs from the enrolled one cancels nothing; a larger unattributed tree is never selected; the exact `worker_memory_pressure` result becomes the selected command's tool error; registrations from other sources, and unminted, cloned or foreign-context metadata, are never enrolled yet the command still runs; a command declaring its own worker marks gets no protection; a stopped supervisor that cannot confirm disposal poisons the lane and kills exactly that supervisor; and native Bash is kept when the guard is off. The image ships no python3, C compiler or prctl helper and node has no prctl binding, so the non-dumpable runner-UID descendant case cannot be built; a SIGSTOPped supervisor stands in for it. The inventory requires exactly one UID gate and all twelve literals under that suite; a missing, renamed, nonliteral, nested, duplicate or ungated leaf fails closed.
+
+The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above) and the claude-command-real file (its twelve); `node e2e/worker-uid/inventory.mjs command` emits the separate command
+inventory and `node e2e/worker-uid/inventory.mjs single` the single-uid inventory. `expected.json` / `results.xml`, `command-expected.json` /
+`command-results.xml` and `single-expected.json` / `single-<n>-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and
 rejects skip, failure, error and missing results. Node and container failures,
 including exit 77 and watchdog timeouts, also fail the target even when the checker
@@ -119,6 +121,21 @@ or inherited skip, failure or error with its originating suite or testcase.
 JUnit messages, types, text and stacks are preserved; empty diagnostics say
 `no reason supplied`. Node 24 JUnit includes assertion and cancellation reasons,
 so no additional reporter is needed.
+
+After the command proof, a single-uid phase runs `e2e/worker-uid/single-uid-preflight.test.mts` in three more
+containers, each started directly as UID/GID 10001 with all capabilities dropped, no root entrypoint and
+no UID split (the Kubernetes `runAsUser` posture), from the base image so its supervisor is used. They
+differ only in the posture under test, named by `UZI_SINGLE_UID_EXPECT`, and each asserts from the process
+status file that it really has that posture before calling the real `memoryLauncherPreflight()`:
+
+- `ok`: `no-new-privileges`, empty bounding set; the preflight must return `{ ok: true }`.
+- `profile:noNewPrivs`: started without `no-new-privileges`; the preflight must refuse with that reason.
+- `profile:capBnd`: `no-new-privileges` plus one retained capability (`CHOWN`), so the bounding set is
+  nonzero while the effective set stays empty; the preflight must refuse with that reason.
+
+Each container gets a 65-second watchdog plus five-second kill grace (70 seconds), 60 seconds per leaf, and
+its own `single-<n>-results.xml` checked against `single-expected.json`; any container or checker failure
+fails the run. Worst case is 210 seconds on top of the other phases.
 
 `task test:worker-uid-harness` runs the Docker-free checker, shell wrapper and
 required-check regression tests. The wrapper tests stub Node inventory/pattern,

@@ -102,6 +102,24 @@ elif args[0] == "rm":
     print("wrong" if mode == "remove-ack" else args[-1])
 elif args[0] == "start":
     item = next(v for v in state.values() if v.get("Id") == args[-1])
+    name = next(k for k, v in state.items() if v is item or v == item)
+    if "-diag-" in name:
+        workload = name.split("-diag-")[1].rsplit("-", 1)[0]
+        if mode == "diag-garbage": print("not a diagnostic"); sys.exit(0)
+        if mode == "diag-two-lines":
+            print("UZI_NODE_DIAGNOSTIC_BEGIN\n{}\n{}\nUZI_NODE_DIAGNOSTIC_END"); sys.exit(0)
+        child = {"exitCode": 0, "signal": None, "timedOut": False, "wallMs": 700,
+                 "reported": {"outcome": "assertion", "messageBytes": 12345, "mismatches": None, "maxRssKb": 1, "ms": 5}}
+        cgroup = {"memoryPeakBytes": 4096, "oomKill": 0}
+        if mode == "diag-oom":
+            child.update(exitCode=None, signal="SIGKILL", reported=None); cgroup["oomKill"] = 1
+        if mode == "diag-timeout":
+            child.update(exitCode=None, signal="SIGKILL", timedOut=True, reported=None)
+        print("UZI_NODE_DIAGNOSTIC_BEGIN")
+        print(json.dumps({"schemaVersion": 1, "workload": workload, "nodeVersion": "v24.0.0", "pairs": 1,
+                          "childDeadlineMs": 1, "child": child, "cgroup": cgroup}))
+        print("UZI_NODE_DIAGNOSTIC_END")
+        sys.exit(0 if mode != "diag-nonzero" else 3)
     if item["Config"]["Labels"].get("io.uzi.memory.fixture") is None:
         sys.exit(23 if mode == "layout-collision" else 0)
     assert args[1] == "--attach"
@@ -390,6 +408,94 @@ class RunnerTest(unittest.TestCase):
         retained = check.reports((directory / "reports.stdout").read_bytes())
         self.assertEqual(retained[0]["status"], "FAILED")
         self.assertIn("producer supplied", retained[0]["reasons"][0])
+
+    def diagnostic_host(self, mode):
+        manifest = calibration.create_manifest("local", "local", "1", "a" * 40)
+        manifest["imageId"] = "sha256:" + "c" * 64
+        directory = self.root / "diagnostic-evidence"
+        directory.mkdir(exist_ok=True)
+        (self.root / "calls").write_text("")
+        env = {"PATH": str(self.root / "bin") + os.pathsep + os.defpath, "FAKE_ROOT": str(self.root), "FAKE_MODE": mode}
+        return calibration.Host(manifest, directory, "unused"), directory, patch.dict(os.environ, env)
+
+    def test_diagnostics_measure_six_owned_isolated_containers_and_clean_all(self):
+        host, directory, env = self.diagnostic_host("")
+        with env, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            results = host.measure_diagnostics()
+        self.assertEqual([(r["limitBytes"], r["workload"]) for r in results],
+                         [(size, w) for size in calibration.DIAG_SIZES for w in calibration.DIAG_WORKLOADS])
+        self.assertEqual(json.loads((directory / "node-diagnostic.json").read_text()), results)
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        creates = [c for c in calls if c[:2] == ["docker", "create"]]
+        self.assertEqual(len(creates), 6)
+        for command in creates:
+            self.assertEqual(command[command.index("--network") + 1], "none")
+            self.assertEqual(command[command.index("--user") + 1], "10003:10003")
+            self.assertEqual(command[command.index("--cap-drop") + 1], "ALL")
+            self.assertEqual(command[command.index("--memory") + 1], command[command.index("--memory-swap") + 1])
+            self.assertEqual(command[command.index("--pids-limit") + 1], "128")
+            self.assertEqual(command[command.index("--cgroupns") + 1], "private")
+            self.assertTrue(command[-2].endswith("calibration-diagnostic.mts"))
+        self.assertEqual(len([c for c in calls if c[0] == "timeout" and c[3:5] == ["docker", "start"]]), 6)
+        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "rm"]]), 6)
+        self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+        self.assertEqual(host.requests, [])
+        self.assertEqual(stderr.getvalue().count("node diagnostic "), 6)
+        journal = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
+        self.assertEqual(len(journal), 6)
+
+    def test_diagnostic_oom_or_timeout_is_a_recorded_measurement_not_failure(self):
+        for mode in ("diag-oom", "diag-timeout"):
+            with self.subTest(mode=mode):
+                host, directory, env = self.diagnostic_host(mode)
+                with env, contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    results = host.measure_diagnostics()
+                self.assertEqual(len(results), 6)
+                self.assertIn("oom_killed" if mode == "diag-oom" else "timed_out", stderr.getvalue())
+                self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+
+    def test_diagnostic_nonzero_host_exit_is_recorded(self):
+        host, _, env = self.diagnostic_host("diag-nonzero")
+        with env, contextlib.redirect_stderr(io.StringIO()):
+            results = host.measure_diagnostics()
+        self.assertTrue(all(r["hostExit"] == 3 for r in results))
+
+    def test_unparseable_diagnostic_fails_after_owned_cleanup(self):
+        for mode in ("diag-garbage", "diag-two-lines"):
+            with self.subTest(mode=mode):
+                (self.root / "state.json").write_text("{}")
+                host, directory, env = self.diagnostic_host(mode)
+                with env, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(ValueError):
+                    host.measure_diagnostics()
+                calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "create"]]), 1)
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "rm"]]), 1)
+                self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+                self.assertTrue((directory / "node-diagnostic.json").exists())
+
+    def test_diagnostic_ownership_failure_cleans_nothing_foreign_and_fails(self):
+        host, _, env = self.diagnostic_host("ownership")
+        with env, contextlib.redirect_stderr(io.StringIO()), self.assertRaises(ValueError):
+            host.measure_diagnostics()
+        calls = [json.loads(line) for line in (self.root / "calls").read_text().splitlines()]
+        self.assertEqual([c for c in calls if c[:2] == ["docker", "rm"]], [])
+        self.assertFalse(any(c[:2] == ["docker", "start"] for c in calls))
+
+    def test_diagnostic_failure_does_not_change_published_reports_but_fails_the_run(self):
+        events = []
+        class FakeHost:
+            def __init__(self, manifest, directory, image):
+                self.manifest, self.directory = manifest, directory
+            def run(self): events.append("run")
+            def measure_diagnostics(self): events.append("measure"); raise ValueError("diagnostic harness broke")
+            def finish(self): events.append("finish")
+            def publish(self, error=None): events.append(("publish", error))
+        argv = ["calibration.py", "--image", "x", "--mode", "local", "--run-id", "r", "--attempt", "1"]
+        with patch.object(calibration, "Host", FakeHost), patch.object(calibration, "SCRATCH", self.root / "scratch"), \
+                patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, "node diagnostic: diagnostic harness broke"):
+                calibration.main()
+        self.assertEqual(events, ["run", "measure", "finish", ("publish", None)])
 
 
 if __name__ == "__main__":

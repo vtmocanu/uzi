@@ -19,6 +19,14 @@ SCRATCH = ROOT / ".uzi/scratch"
 PROOF = "/app/uzi-worker-uid-proof"
 LAYOUT_PROBE = 'const fs = require("node:fs"); try { fs.lstatSync("/app/uzi-worker-uid-proof"); throw new Error("proof directory already exists in image"); } catch (e) { if (e.code !== "ENOENT") throw e; } if (!require.resolve("tsx").startsWith("/app/node_modules/")) throw new Error("image-native tsx unavailable");'
 LABEL = bounded.LABEL
+# Node assert diagnostic calibration (measurement only; no thresholds). Markers differ from the report markers.
+DIAG_BEGIN = "UZI_NODE_DIAGNOSTIC_BEGIN"
+DIAG_END = "UZI_NODE_DIAGNOSTIC_END"
+DIAG_WORKLOADS = ("many-mismatch", "equivalent", "bounded-diagnostic")
+DIAG_SIZES = (1024 ** 3, 2 * 1024 ** 3)
+# Six containers: each start is bounded by DIAG_SECONDS, so the step adds at most ~3 minutes.
+DIAG_SECONDS = 30
+DIAG_OUTPUT_BYTES = 64 * 1024
 
 
 def diagnostic(message):
@@ -46,6 +54,36 @@ class DiagnosticParser(argparse.ArgumentParser):
                 diagnostic(message)
         else:
             super()._print_message(message, file)
+
+
+def parse_diagnostic(raw, workload):
+    """Exact, bounded parse of one diagnostic JSON line between the dedicated markers."""
+    check.require(len(raw) <= DIAG_OUTPUT_BYTES, "oversized node diagnostic output")
+    lines = raw.decode("utf8", errors="strict").splitlines()
+    check.require(lines.count(DIAG_BEGIN) == 1 and lines.count(DIAG_END) == 1, "node diagnostic markers")
+    begin, end = lines.index(DIAG_BEGIN), lines.index(DIAG_END)
+    check.require(end == begin + 2, "node diagnostic payload must be exactly one line")
+    value = check.exact_json(lines[begin + 1])
+    check.require(isinstance(value, dict) and value.get("schemaVersion") == 1 and value.get("workload") == workload,
+                  "node diagnostic identity")
+    child, cgroup = value.get("child"), value.get("cgroup")
+    check.require(isinstance(child, dict) and isinstance(cgroup, dict) and isinstance(value.get("nodeVersion"), str),
+                  "node diagnostic shape")
+    check.require(isinstance(child.get("timedOut"), bool) and type(child.get("wallMs")) is int, "node diagnostic child")
+    for key in ("memoryPeakBytes", "oomKill"):
+        check.require(cgroup.get(key) is None or type(cgroup[key]) is int, "node diagnostic cgroup")
+    return value
+
+
+def diagnostic_summary(result):
+    child, cgroup = result["child"], result["cgroup"]
+    reported = child.get("reported") or {}
+    outcome = ("timed_out" if child["timedOut"] else "oom_killed" if cgroup.get("oomKill") else
+               reported.get("outcome", "no_report"))
+    return (f"node diagnostic {result['workload']} {result['limitBytes'] >> 20}MiB: {outcome} "
+            f"node={result['nodeVersion']} peak={cgroup.get('memoryPeakBytes')} oom_kill={cgroup.get('oomKill')} "
+            f"wall_ms={child['wallMs']} exit={child.get('exitCode')} signal={child.get('signal')} "
+            f"message_bytes={reported.get('messageBytes')}")
 
 
 def uuid4():
@@ -266,6 +304,64 @@ class Host:
                     break
         check.require(not failures, "; ".join(failures))
 
+    def diagnostic_create(self, name, size, workload):
+        token = self.manifest["invocation"]
+        self.journal("container", name)
+        args = ["create", "--pull", "never", "--network", "none", "--cgroupns", "private",
+                "--name", name, "--label", LABEL + "=" + token,
+                "--user", "10003:10003", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                "--memory", str(size), "--memory-swap", str(size),
+                "--pids-limit", "128", "--workdir", "/proof",
+                "--tmpfs", "/data", "--tmpfs", "/nix",
+                "--tmpfs", "/proof/.uzi/scratch:exec,uid=10003,gid=10003,mode=0700,size=256m",
+                "--tmpfs", "/tmp:exec,uid=10003,gid=10003,mode=0700,size=32m",
+                "--env", "HOME=/proof/.uzi/scratch", "--env", "TMPDIR=/proof/.uzi/scratch",
+                "--mount", "type=bind,src=" + str(ROOT / "e2e/worker-uid") + ",dst=" + PROOF + "/e2e/worker-uid,readonly",
+                "--entrypoint", "/usr/local/bin/node", self.manifest["imageId"], "--import",
+                "/app/node_modules/tsx/dist/loader.mjs",
+                PROOF + "/e2e/worker-uid/calibration-diagnostic.mts", workload]
+        receipt = self.docker(args).decode().strip()
+        item = self.inspect(name)
+        check.require(receipt == item["Id"] and item["Image"] == self.manifest["imageId"],
+                      "diagnostic create ACK/image binding")
+        host = item["HostConfig"]
+        check.require(host["NetworkMode"] == "none" and host["CgroupnsMode"] == "private" and
+                      host["Memory"] == size and host["MemorySwap"] == size and
+                      item["Config"]["User"] == "10003:10003" and host["CapDrop"] == ["ALL"] and
+                      not host.get("CapAdd") and "no-new-privileges" in host["SecurityOpt"],
+                      "diagnostic Docker isolation config")
+        return item["Id"]
+
+    def measure_diagnostic(self, size, workload):
+        name = "mem2396-" + self.manifest["invocation"] + "-diag-" + workload + "-" + str(size)
+        cid = self.diagnostic_create(name, size, workload)
+        started = time.monotonic()
+        output = self.directory / ("diagnostic-" + workload + "-" + str(size) + ".stdout")
+        rc = bounded.capture(["timeout", "--kill-after=5s", str(DIAG_SECONDS) + "s", "docker", "start", "--attach", cid],
+                             output, DIAG_SECONDS + 5, DIAG_OUTPUT_BYTES)
+        wall = time.monotonic() - started
+        raw = output.read_bytes()
+        (self.directory / (output.stem + ".status")).write_text(f"EXIT={rc}\n")
+        # The owned container is always removed before its output is judged.
+        self.cleanup_container(name, deadline=time.monotonic() + 29, expected_cid=cid)
+        result = parse_diagnostic(raw, workload)
+        # Host-side facts; a workload OOM kill, timeout or assertion is a recorded outcome, not a failure.
+        return {"limitBytes": size, "hostExit": rc, "hostWallSeconds": round(wall, 3), **result}
+
+    def measure_diagnostics(self):
+        """Serial measurement-only step; workload outcomes never fail calibration."""
+        check.require("imageId" in self.manifest, "diagnostics require provisioned image")
+        results = []
+        try:
+            for size in DIAG_SIZES:
+                for workload in DIAG_WORKLOADS:
+                    results.append(self.measure_diagnostic(size, workload))
+        finally:
+            (self.directory / "node-diagnostic.json").write_text(json.dumps(results, indent=1) + "\n")
+        for result in results:
+            diagnostic(diagnostic_summary(result))
+        return results
+
     def aborted(self, fixture, reason):
         # Missing evidence is explicit null, never a zero-duration measurement.
         return {"schemaVersion": 1, **self.manifest["identity"], **fixture,
@@ -348,9 +444,14 @@ def main():
     directory = SCRATCH / ("memory-calibration-" + manifest["invocation"])
     directory.mkdir()
     host = Host(manifest, directory, args.image)
-    error = None
+    error = diagnostic_error = None
     try:
         host.run()
+        try:
+            host.measure_diagnostics()
+        except Exception as exc:
+            # Harness failure only; kept apart so the two calibration reports publish unchanged.
+            diagnostic_error = exc
     except Exception as exc:
         # Ordinary implementation/shape errors still require owned cleanup and
         # two explicit failure reports. Interrupts retain their normal semantics.
@@ -364,6 +465,8 @@ def main():
     diagnostic("calibration host evidence: " + str(directory))
     if error is not None:
         raise ValueError(str(error))
+    if diagnostic_error is not None:
+        raise ValueError("node diagnostic: " + str(diagnostic_error))
 
 
 if __name__ == "__main__":
