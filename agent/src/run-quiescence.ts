@@ -1745,8 +1745,9 @@ function reapScopedRunProcesses(
   const helperDeadline = Date.now() + HELPER_TIMEOUT_MS;
   return runClosedReaper(attempt, async lane => {
     const ambient = MaintenanceBudget.current();
-    const deadline = Math.min(lane.deadlineAt, reportBudget?.deadline ?? Infinity,
-      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity);
+    const deadline = Math.floor(Math.min(lane.deadlineAt, reportBudget?.deadline ?? Infinity,
+      helperDeadline, ambient ? Date.now() + ambient.remainingMs() : Infinity));
+    if (!Number.isSafeInteger(deadline) || deadline <= Date.now()) throw new Error("scoped reaper deadline");
     const signal = AbortSignal.any([lane.signal, ...(reportBudget ? [reportBudget.signal] : []),
       ...(ambient ? [ambient.signal] : [])]);
     const check = () => {

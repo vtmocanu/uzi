@@ -50,3 +50,28 @@ test("command inventory requires explicit literal test declarations from the sco
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+test("fixed reaper inventory pins both literal leaves under exactly one UID gate", () => {
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/reaper-inventory."));
+  const api = new API({ cwd: scratch });
+  try {
+    const source = readFileSync(path.join(repo, "agent/test/codex-capture-reaper-real.test.ts"), "utf8");
+    const fixtures = [
+      { name: "actual", source },
+      { name: "missing", source: source.replace("fixed capture reaper: descendant settlement precedes verdict", "changed"), error: /required literal fixed reaper/ },
+      { name: "ungated", source: source.replace("skip: GROUP_B_SKIP", "skip: false"), error: /required literal fixed reaper/ },
+      { name: "duplicate-gate", source: source + '\ndescribe("extra", { skip: GROUP_B_SKIP }, () => {});', error: /required literal fixed reaper/ },
+    ];
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    for (const fixture of fixtures) {
+      const collect = () => inventoryForSource(program.getSourceFile(path.join(scratch, fixture.name + ".mts")), "codex-capture-reaper-real");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.equal(collect().length, 2);
+    }
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

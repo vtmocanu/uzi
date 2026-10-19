@@ -77,7 +77,8 @@ phase worker-proof capture "$REPORT_DIR/results.xml" "$((${WORKER_UID_TIMEOUT:-6
   --test-name-pattern "$PATTERN" \
   /app/uzi-worker-uid-proof/agent/test/codex-launcher.test.ts /app/uzi-worker-uid-proof/agent/test/codex-executor.test.ts \
   /app/uzi-worker-uid-proof/agent/test/codex-shared-dir.test.ts /app/uzi-worker-uid-proof/agent/test/entrypoint-migration.test.ts \
-  /app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts
+  /app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts \
+  /app/uzi-worker-uid-proof/agent/test/codex-capture-reaper-real.test.ts
 rc=$?
 set -e
 printf 'worker UID reports: %s\n' "$REPORT_DIR"

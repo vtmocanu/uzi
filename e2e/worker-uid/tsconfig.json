@@ -6,6 +6,7 @@
     ]
   },
   "include": [
+    "../../agent/test/codex-capture-reaper-real.test.ts",
     "../../agent/test/codex-launcher.test.ts",
     "../../agent/test/codex-executor.test.ts",
     "../../agent/test/codex-shared-dir.test.ts",

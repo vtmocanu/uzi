@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'codex-capture-reaper-real'];
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',
@@ -76,6 +76,15 @@ export function inventoryForSource(source, file) {
       if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
         throw new Error(`${file}: missing required literal command proof: ${title}`);
       }
+    }
+  } else if (file === 'codex-capture-reaper-real') {
+    const required = [
+      'fixed capture reaper: real runner procfs and signal compatibility',
+      'fixed capture reaper: descendant settlement precedes verdict',
+    ];
+    if (gates !== 1 || expected.length !== 2 || required.some(title =>
+      !expected.some(test => test.names.length === 2 && test.names[0] === 'fixed capture reaper: real worker profile' && test.names[1] === title))) {
+      throw new Error(`${file}: expected one UID gate and both required literal fixed reaper leaves`);
     }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);
