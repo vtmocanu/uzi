@@ -122,7 +122,7 @@ wait_status "$CX_RUN" awaiting_approval
   || fail "uzi run get --field harness disagrees with the API at the plan gate (CLI/API parity, D4)"
 CX_GATE_JSON="$(uzi_cli run get "$CX_RUN" --json)" || fail "could not read Codex CLI gate"
 printf '%s\n' "$CX_GATE_JSON" | jq -e --arg run "$CX_RUN" \
-  '.id == $run and .harness == "codex" and .status == "awaiting_approval" and (has("semantic_gate") | not)' >/dev/null \
+  '.id == $run and .harness == "codex" and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
   || fail "production Codex gate was inconsistent or exposed dormant semantic data"
 pass "codex run $CX_RUN reached the plan gate (awaiting_approval); CLI and API agree harness=codex"
 

@@ -187,6 +187,10 @@ func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
 func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	pending, pendingErr := CompletionPending(run)
+	if pendingErr != nil {
+		return nil, pendingErr
+	}
 	if run.Kind == runkind.CrossCheck {
 		if err := validateCrossCheckContext(run.IssueTitle, run.IssueDescription); err != nil {
 			return nil, err
@@ -884,8 +888,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// decisions (deferred milestone ids+titles+reasons, accepted id+text+reason). nil for a
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
-			CompletionScope: CompletionScopeClaim(run.CompletionContract),
-			NonClosing:      completionNonClosingClaim(run),
+			CompletionScope:   CompletionScopeClaim(run.CompletionContract, run.MilestonesFrozen),
+			CompletionPending: pending,
+			NonClosing:        completionNonClosingClaim(run),
 		},
 	}
 

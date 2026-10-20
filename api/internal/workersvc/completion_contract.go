@@ -39,11 +39,12 @@ const (
 // across revisions — an owner decision never rewrites a criterion, it only defers a milestone
 // (scope.out) or accepts a criterion id (accepted).
 type completionContract struct {
-	SemanticApproval     *apitypes.SemanticGateApproval     `json:"semantic_approval,omitempty"`
-	SemanticPresentation *apitypes.SemanticGatePresentation `json:"semantic_presentation,omitempty"`
-	Profile              string                             `json:"profile"`
-	Revision             int                                `json:"revision"`
-	Criteria             []completionCriterion              `json:"criteria"`
+	MaintainerAuthorizations []maintainerAuthorization          `json:"maintainer_authorizations,omitempty"`
+	SemanticApproval         *apitypes.SemanticGateApproval     `json:"semantic_approval,omitempty"`
+	SemanticPresentation     *apitypes.SemanticGatePresentation `json:"semantic_presentation,omitempty"`
+	Profile                  string                             `json:"profile"`
+	Revision                 int                                `json:"revision"`
+	Criteria                 []completionCriterion              `json:"criteria"`
 	// Scope is the owner-reduced scope on a #1227 `partial` revision: the milestone ids still
 	// in scope (`in`) and the owner-deferred ones (`out`). nil on a revision-1 contract.
 	Scope *scopeBlock `json:"scope,omitempty"`
@@ -147,6 +148,11 @@ func parseCompletionContract(b []byte) (completionContract, error) {
 	if err := json.Unmarshal(b, &c); err != nil {
 		return completionContract{}, fmt.Errorf("decode completion contract: %w", err)
 	}
+	if c.Profile == "semantic" {
+		if len(b) > 3*semanticProposalMaxBytes || strictSemanticJSON(b, &c) != nil {
+			return completionContract{}, ErrSemanticCompletionAuthority
+		}
+	}
 	return c, nil
 }
 
@@ -200,7 +206,16 @@ func buildRevisedContract(prior []byte, dec CompletionDecisionInput, frozenMs []
 		sort.Strings(in)
 		sort.Slice(out, func(i, j int) bool { return out[i].MilestoneID < out[j].MilestoneID })
 		c.Scope = &scopeBlock{In: in, Out: out}
+	case "authorize_maintainer":
+		if err := authorizeMaintainers(&c, dec, newRev); err != nil {
+			return nil, err
+		}
 	case "accept":
+		if c.Profile == "semantic" {
+			// Serialization carries semantic fields without manufacturing satisfaction.
+			// validateDecision refuses semantic accept at the public decision boundary.
+			break
+		}
 		already := make(map[string]bool, len(c.Accepted))
 		for _, a := range c.Accepted {
 			already[a.ID] = true
@@ -277,8 +292,9 @@ func CompletionScopeView(contract []byte) (deferred []apitypes.CompletionDeferre
 }
 
 // CompletionScopeClaim projects a run's frozen completion_contract into the WORKER-ONLY claim seam
-// (PRD #1227 M2): the deferred (out-of-scope) milestones — each with its TITLE looked up from the
-// matching criterion's text — and the owner-accepted criteria. Unlike CompletionScopeView (which
+// (PRD #1227 M2): deferred milestones, with titles sourced from the
+// structural criterion's text or the semantic frozen milestones — and owner-accepted criteria.
+// Unlike CompletionScopeView (which
 // returns the owner-facing apitypes DTOs WITHOUT titles), this carries the milestone title the
 // worker needs to render the partial-delivery PR.
 //
@@ -287,7 +303,7 @@ func CompletionScopeView(contract []byte) (deferred []apitypes.CompletionDeferre
 // non-interlocked, or revision-1 run, keeping that run's claim byte-identical to today's. A
 // non-nil result leaves an absent half as a nil slice (omitempty), so a `partial`-only revision
 // carries only `deferred` and an `accept`-only revision only `accepted`.
-func CompletionScopeClaim(contract []byte) *CompletionScopeConfig {
+func CompletionScopeClaim(contract []byte, frozen ...[]byte) *CompletionScopeConfig {
 	c, err := parseCompletionContract(contract)
 	if err != nil {
 		return nil
@@ -307,6 +323,15 @@ func CompletionScopeClaim(contract []byte) *CompletionScopeConfig {
 		for _, cr := range c.Criteria {
 			if _, ok := titleByMilestone[cr.MilestoneID]; !ok {
 				titleByMilestone[cr.MilestoneID] = cr.Text
+			}
+		}
+		if c.Profile == "semantic" {
+			titleByMilestone = map[string]string{}
+			if len(frozen) == 1 {
+				ms, _ := DecodeMilestones(frozen[0])
+				for _, m := range ms {
+					titleByMilestone[m.ID] = m.Title
+				}
 			}
 		}
 		out.Deferred = make([]CompletionScopeDeferred, 0, len(c.Scope.Out))

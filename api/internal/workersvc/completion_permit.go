@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -142,7 +143,8 @@ type CompletionPermitDTO struct {
 	IssuedAt         time.Time `json:"issued_at"`
 	FindingIDs       []string  `json:"finding_ids"`
 	// CompletionScope is always present; {} means no owner-deferred or accepted work.
-	CompletionScope *CompletionScopeConfig `json:"completion_scope"`
+	CompletionScope   *CompletionScopeConfig         `json:"completion_scope"`
+	CompletionPending *apitypes.CompletionPendingDTO `json:"completion_pending,omitempty"`
 }
 
 // CompletionPermitResult is the permit endpoint's decision (PRD #1226 M2). Granted true carries
@@ -190,6 +192,12 @@ func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 	var c completionContract
 	if err := json.Unmarshal(run.CompletionContract, &c); err != nil {
 		// A corrupt contract column is the same fail-closed hazard.
+		return frozenMilestoneIDs(run), false
+	}
+	if c.Profile == "semantic" {
+		return semanticUnmetMilestones(run, c)
+	}
+	if hasSemanticCompletionFields(c) {
 		return frozenMilestoneIDs(run), false
 	}
 	if c.Criteria == nil {
@@ -243,6 +251,9 @@ func computeUnmetCriteria(run store.Run) (unmet []string, verifiable bool) {
 // scopeCapEligibility verifies the immutable structural list before authorizing a partial
 // delivery. Only distinct persisted completed members count; owner decisions do not.
 func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
+	if c, err := parseCompletionContract(run.CompletionContract); err == nil && c.Profile == "semantic" {
+		return semanticScopeCapEligibility(run)
+	}
 	ms, err := DecodeMilestones(run.MilestonesFrozen)
 	if err != nil || len(ms) == 0 {
 		return false, false
@@ -331,6 +342,9 @@ func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
 
 // headlessCompletedUnion validates full structural delivery independently of scope eligibility.
 func headlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
+	if c, err := parseCompletionContract(run.CompletionContract); err == nil && c.Profile == "semantic" {
+		return semanticHeadlessCompletedUnion(run, req)
+	}
 	ms, err := DecodeMilestones(run.MilestonesFrozen)
 	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(run.MilestonesFrozen)), "[") {
 		return nil, false
@@ -592,8 +606,14 @@ func (s *Service) requestCompletionPermitLocked(ctx context.Context, wkr store.W
 		return CompletionPermitResult{}, err
 	}
 	// Bind scope to the same locked run whose revision authorized this permit.
-	scope := CompletionScopeClaim(run.CompletionContract)
-	return CompletionPermitResult{Granted: true, Permit: permitToDTO(permit, scope)}, nil
+	scope := CompletionScopeClaim(run.CompletionContract, run.MilestonesFrozen)
+	pending, err := CompletionPending(run)
+	if err != nil {
+		return CompletionPermitResult{}, err
+	}
+	dto := permitToDTO(permit, scope)
+	dto.CompletionPending = pending
+	return CompletionPermitResult{Granted: true, Permit: dto}, nil
 }
 
 // RecordCompletionAttempt is the same-lead nudge endpoint (M3) (PRD #1226 M2/M3, D4). It applies
@@ -1029,7 +1049,7 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		}
 		completedParams.MilestonesCompleted = completed
 		completedParams.StopKind = pgconv.TextOrNull("")
-		if contractHasDeferrals(run.CompletionContract) {
+		if contractHasDeferrals(run.CompletionContract) || completionHasPending(run) {
 			completedParams.StopKind = pgconv.TextOrNull("scope_reduced")
 		}
 		rows, err = qtx.SetRunCompleted(ctx, completedParams)
@@ -1078,7 +1098,7 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		if !verifiable || len(unmet) != 0 {
 			return 0, false, lease, nil
 		}
-		if contractHasDeferrals(run.CompletionContract) {
+		if contractHasDeferrals(run.CompletionContract) || completionHasPending(run) {
 			completedParams.StopKind = pgconv.TextOrNull("scope_reduced")
 		}
 	}

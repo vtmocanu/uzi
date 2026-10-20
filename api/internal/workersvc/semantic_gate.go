@@ -206,6 +206,9 @@ func validateSemanticApproval(run store.Run, snapshot gatePresentedPayload) erro
 }
 
 func semanticGateContract(p *apitypes.SemanticGatePresentation, approval *apitypes.SemanticGateApproval) ([]byte, error) {
+	if p == nil {
+		return nil, ErrSemanticCompletionAuthority
+	}
 	raw, err := buildSemanticCompletionContract(p.Candidate)
 	if err != nil {
 		return nil, err
@@ -216,6 +219,12 @@ func semanticGateContract(p *apitypes.SemanticGatePresentation, approval *apityp
 	}
 	contract.SemanticApproval = approval
 	contract.SemanticPresentation = p
+	if err := freezeMaintainerAuthorization(&contract); err != nil {
+		return nil, err
+	}
+	if err := validateSemanticCompletion(contract); err != nil {
+		return nil, err
+	}
 	return json.Marshal(contract)
 }
 
