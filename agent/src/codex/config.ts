@@ -16,7 +16,7 @@
 //     it fixes the built-in OpenAI provider and accepts no endpoint/env-key injection.
 //
 // ADR-1106 requires the canonical project be
-// provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: pinned
+// provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: characterized
 // 0.160.1 `thread_processor.rs` (unchanged since 0.160.0) promotes trust when
 // `trust_level.is_none()` (and, since 0.156, the
 // config is not projectless), so an

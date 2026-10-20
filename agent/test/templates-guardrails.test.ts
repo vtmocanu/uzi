@@ -14,6 +14,10 @@ import { fileURLToPath } from "node:url";
 // an enforced invariant, cheaply (text parse, no docker), before more variants land.
 
 const templatesDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../templates");
+const codexVersion = fs.readFileSync(new URL("../codex/codex-package.lock", import.meta.url), "utf8")
+  .match(/^CODEX_VERSION=(\d+\.\d+\.\d+)$/m)?.[1];
+assert.ok(codexVersion, "the Codex lock must declare its version");
+const codexVersionPattern = new RegExp(`codex-cli ${codexVersion.replaceAll(".", "\\.")}\\b`);
 
 type ShellQuote = "'" | '"';
 
@@ -565,7 +569,7 @@ describe("worker template Dockerfiles keep guardrail layers", () => {
         `${name}/Dockerfile must RUN the Codex runner-uid build guard`,
       );
       assert.match(text, /setpriv --reuid runner\b/, `${name}/Dockerfile must document the runner-uid setpriv guard`);
-      assert.match(text, /codex-cli 0\.160\.1\b/, `${name}/Dockerfile must document the exact pinned Codex version`);
+      assert.match(text, codexVersionPattern, `${name}/Dockerfile must document the exact pinned Codex version`);
       assert.match(text, /fake-GNU-ldd\b/, `${name}/Dockerfile must document the fake-GNU-ldd PATH case`);
       // ...and the SHARED guard script must carry that substance, not merely the comment: the
       // setpriv --reuid to the runner uid, the `codex --version` exec, the expected `codex-cli`
