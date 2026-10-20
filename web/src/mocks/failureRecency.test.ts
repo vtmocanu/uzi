@@ -52,9 +52,9 @@ it("demo users partition every factory metric in both windows", async () => {
     expect(sum(admin.users.map((u) => u.usage[field]))).toBeCloseTo(admin.factory.lifetime[field], 8);
     expect(sum(admin.users.map((u) => u.last_7_days![field]))).toBeCloseTo(admin.factory.last_7_days[field], 8);
   }
-  for (const field of ["finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing"] as const) {
-    expect(sum(admin.users.map((u) => u.outcomes[field]))).toBe(admin.factory.outcomes.lifetime[field]);
-    expect(sum(admin.users.map((u) => u.last7_outcomes![field]))).toBe(admin.factory.outcomes.last_7_days[field]);
+  for (const field of ["finished", "completed", "cancelled", "plan_rejected", "base_diverged", "failed", "needs_landing"] as const) {
+    expect(sum(admin.users.map((u) => u.outcomes[field] ?? 0))).toBe(admin.factory.outcomes.lifetime[field]);
+    expect(sum(admin.users.map((u) => u.last7_outcomes![field] ?? 0))).toBe(admin.factory.outcomes.last_7_days[field]);
   }
   expect(sum(admin.users.map((u) => u.run_count))).toBe(admin.factory.run_count);
   expect(sum(admin.users.map((u) => u.subscription_run_count))).toBe(admin.factory.lifetime_subscription_run_count);
@@ -67,7 +67,7 @@ it("demo users partition every factory metric in both windows", async () => {
     expect(u.last7_run_count).toBeGreaterThanOrEqual(u.last7_subscription_run_count! + u.last7_unreported_run_count!);
     expect(u.last7_run_count).toBeLessThanOrEqual(u.run_count);
     const o = u.last7_outcomes!;
-    expect(o.finished).toBe(o.completed + o.cancelled + o.plan_rejected + o.failed);
+    expect(o.finished).toBe(o.completed + o.cancelled + o.plan_rejected + (o.base_diverged ?? 0) + o.failed);
     expect(sum(Object.values(o.fail_origins))).toBe(o.failed);
     for (const [origin, count] of Object.entries(o.fail_origins)) origins[origin] = (origins[origin] ?? 0) + count;
     for (const [origin, count] of Object.entries(u.outcomes.fail_origins)) lifetimeOrigins[origin] = (lifetimeOrigins[origin] ?? 0) + count;

@@ -1165,7 +1165,7 @@ describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
   // stop), plus every shape that must NOT count: success, cancel, and a plan rejection
   // (status failed, but a deliberate human stop).
   const mixed = [
-    past("f1", "Parser gate went red", { status: "failed" }, 50),
+    past("f1", "Parser gate went red", { status: "failed", fail_origin: "agent_failure" }, 50),
     past("f2", "Exporter auto-stopped", { status: "failed", stop_kind: "auto_stopped" }, 40),
     past("ok", "Parser shipped fine", { status: "completed" }, 30),
     past("cx", "Cancelled by owner", { status: "cancelled", stop_kind: "cancelled" }, 20),
@@ -1192,10 +1192,11 @@ describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
   const params = () => new URLSearchParams(screen.getByTestId("loc").textContent ?? "");
 
   it("labels the chip with the genuine-failure count and shows only those runs when on", async () => {
-    mockApi.listRuns.mockResolvedValue({ runs: mixed });
+    mockApi.listRuns.mockResolvedValue({ runs: [...mixed, past("bd", "Base changed rejection", { status: "failed", fail_origin: "base_diverged" }, 5)] });
     renderHistory("/runs/history");
 
     await waitFor(() => expect(screen.getByText("Plan was rejected")).toBeTruthy());
+    expect(screen.getByText("Base changed rejection")).toBeTruthy();
     const chip = screen.getByRole("button", { name: "Failed · 2" });
     expect(chip.getAttribute("aria-pressed")).toBe("false");
 
@@ -1205,6 +1206,7 @@ describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
     // The two genuine failures remain...
     expect(screen.getByText("Parser gate went red")).toBeTruthy();
     expect(screen.getByText("Exporter auto-stopped")).toBeTruthy();
+    expect(screen.queryByText("Base changed rejection")).toBeNull();
     // ...and success, cancel and plan rejection are gone.
     expect(screen.queryByText("Parser shipped fine")).toBeNull();
     expect(screen.queryByText("Cancelled by owner")).toBeNull();
@@ -2092,5 +2094,16 @@ describe("RunsList — summary run projection (#2661)", () => {
     expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
     for (const call of mockApi.adminListRuns.mock.calls) expect((call as unknown[])[0]).toEqual({ view: "summary" });
     for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
+});
+
+describe("RunRow rejection presentation", () => {
+  it.each([
+    ["base_diverged", null, "rejected", "neutral"],
+    ["base_diverged", "plan_rejected", "stopped", "neutral"],
+    ["agent_failure", null, "needs landing", "danger"],
+  ] as const)("renders %s / %s before landing", (fail_origin, stop_kind, label, tone) => {
+    render(<MemoryRouter><ul><RunRow run={aRun({ status: "failed", fail_origin, stop_kind, landing_state: "needs_landing" })} now={Date.now()} /></ul></MemoryRouter>);
+    expect(screen.getByText(label).classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
   });
 });

@@ -89,7 +89,7 @@ function FailedRunsBlock({ outcomes, personal }: { outcomes: RunOutcomes; person
   const segments = [
     { label: "completed", count: outcomes.completed, background: "rgb(var(--ok))" },
     { label: "cancelled", count: outcomes.cancelled, background: "rgb(var(--edge-strong))" },
-    { label: "plan rejected", count: outcomes.plan_rejected, background: "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)" },
+    { label: "rejected", count: outcomes.plan_rejected + (outcomes.base_diverged ?? 0), background: "repeating-linear-gradient(135deg, rgb(var(--edge-strong)) 0 2px, rgb(var(--surface)) 2px 4px)" },
     { label: "failed", count: outcomes.failed, background: "rgb(var(--danger))" },
   ].filter((s) => s.count > 0);
   return (

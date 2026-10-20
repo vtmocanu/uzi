@@ -30,6 +30,7 @@ import {
   effectiveRunStatus,
   firstInProgressMilestoneId,
   isStoppedRun,
+  isRejectedRun,
   milestoneBadge,
   milestoneBadgeText,
   mrChipState,
@@ -286,9 +287,11 @@ export function RunRow({
   // rides completed/cancelled or a HUMAN stop_kind, never the failed+needs_landing shape.
   const pillStatus = isStoppedRun(run.status, run.stop_kind)
     ? "stopped"
-    : run.status === "failed" && run.landing_state === "needs_landing"
-      ? "needs_landing"
-      : effectiveRunStatus(run);
+    : isRejectedRun(run.status, run.fail_origin)
+      ? "rejected"
+      : run.status === "failed" && run.landing_state === "needs_landing"
+        ? "needs_landing"
+        : effectiveRunStatus(run);
   // PRD #1167 M4: Shadow's per-row surface signal, rendered as data-live/data-attention
   // on the row's card-chrome <div> (the carded surface, not the bare <li>), so a live
   // row is a solid dark --surface card. Inert on every other theme; computed once.
@@ -778,9 +781,9 @@ export function RunsList() {
 
 // isGenuineFailure (PRD #1650 D7): the Failed filter's membership. A failed run that a
 // human deliberately stopped (plan rejected) is not a failure, and a cancelled run never
-// is; isStoppedRun owns that line, so the filter and the row's pill agree.
+// is. Base divergence is a rejection too; both helpers keep the filter and pill aligned.
 function isGenuineFailure(r: RunSummaryItem): boolean {
-  return r.status === "failed" && !isStoppedRun(r.status, r.stop_kind);
+  return r.status === "failed" && !isStoppedRun(r.status, r.stop_kind) && !isRejectedRun(r.status, r.fail_origin);
 }
 
 // The archive: every finished run, searchable, filterable to failures, date-grouped,

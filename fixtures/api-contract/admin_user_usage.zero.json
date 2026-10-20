@@ -11,6 +11,7 @@
     "completed": 0,
     "cancelled": 0,
     "plan_rejected": 0,
+    "base_diverged": 0,
     "failed": 0,
     "needs_landing": 0,
     "fail_origins": null
@@ -38,6 +39,7 @@
     "completed": 0,
     "cancelled": 0,
     "plan_rejected": 0,
+    "base_diverged": 0,
     "failed": 0,
     "needs_landing": 0,
     "fail_origins": null

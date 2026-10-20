@@ -44,8 +44,17 @@ If you planned against a specific commit and want to know if `main` moved
 before the worker gets there, note that commit's SHA. `--planned-commit`
 records it; the worker compares it to the clone's own base once it checks
 out and warns in the run feed on a mismatch. Add `--require-base` to make a
-mismatch fail the run instead of warning — useful when the plan describes
-exact line ranges that a moved base would invalidate.
+mismatch reject the run before implementation instead of warning — useful when
+the plan describes exact line ranges that a moved base would invalidate. The raw
+status remains `failed`, with `fail_origin = base_diverged`; web and CLI
+show **rejected**, and the cause label is **rejected: base changed**. This
+outcome is never judged and is counted separately from execution failures in
+[usage](./run-cost.md#rejected-runs-and-failure-accounting).
+
+Review the plan against the new base, then create a new run with the updated
+`--planned-commit`. A warning without `--require-base` still lets the run proceed.
+See [rollout compatibility](./run-activity.md#when-a-required-base-has-changed)
+for mixed API/worker versions and historical runs.
 
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
 non-hex value is a usage error (exit 2). The safe answer is always the full

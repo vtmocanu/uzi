@@ -2,8 +2,12 @@
 # changelog-union.sh — resolve a CHANGELOG.md rebase conflict by keeping BOTH sides, the
 # answer for a shared append-only list where every PR adds a bullet under the same heading.
 #
-# Usage: changelog-union.sh [--collapse] [--base FILE] [FILE] (default: CHANGELOG.md)
+# Usage: changelog-union.sh [--collapse] [--base FILE] [--merge-stages] [FILE] (default: CHANGELOG.md)
 # --base: preserve that base's headings and ordered content; collapse only added subsections.
+# --merge-stages: FILE's conflict comes from merging the base INTO the branch, so its index
+#   stage 2 is the branch and stage 3 the base (a rebase has them the other way round). The
+#   release fold maps them when reading; the index is never rewritten. The markers in FILE
+#   must still put the base side first (land-prep regenerates them that way).
 #
 # Every conflict block keeps its first side, then its second; a diff3 base section
 # (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when a bullet, a continuation line or a
@@ -52,15 +56,17 @@ set -uo pipefail
 
 MODE=union
 BASE_FILE=""
+MERGE_STAGES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --collapse) MODE=collapse; shift ;;
     --base) BASE_FILE="${2:?--base needs a file}"; shift 2 ;;
+    --merge-stages) MERGE_STAGES=1; shift ;;
     *) break ;;
   esac
 done
 FILE="${1:-CHANGELOG.md}"
-[ $# -le 1 ] || { echo "usage: changelog-union.sh [--collapse] [--base FILE] [FILE]" >&2; exit 2; }
+[ $# -le 1 ] || { echo "usage: changelog-union.sh [--collapse] [--base FILE] [--merge-stages] [FILE]" >&2; exit 2; }
 [ -f "$FILE" ] && [ -r "$FILE" ] || { echo "changelog-union: cannot read $FILE" >&2; exit 2; }
 [ -z "$BASE_FILE" ] || { [ -f "$BASE_FILE" ] && [ -r "$BASE_FILE" ]; } \
   || { echo "changelog-union: cannot read base $BASE_FILE" >&2; exit 2; }
@@ -128,7 +134,7 @@ SENTINEL='<!-- changelog-union:join -->'
 # released, a branch change outside [Unreleased], an addition already present anywhere in
 # ours or repeated, or a verification miss.
 fold_resolve() {
-  local dir base stages s sha
+  local dir base stages s sha to
   dir=$(dirname "$FILE"); base=$(basename "$FILE")
   stages=$(git -C "$dir" ls-files -u -- "$base" 2>/dev/null) || stages=""
   for s in 1 2 3; do
@@ -136,7 +142,10 @@ fold_resolve() {
     if [ -z "$sha" ]; then
       echo "changelog-union: release fold not applicable: $base lacks index stage $s" >&2; return 1
     fi
-    git -C "$dir" cat-file blob "$sha" > "$tmpd/stage$s" 2>/dev/null || { echo "changelog-union: cannot read index stage $s of $base" >&2; return 1; }
+    # stageN below always means rebase orientation (2 = the base, 3 = the branch).
+    to=$s
+    if [ "$MERGE_STAGES" -eq 1 ] && [ "$s" -ne 1 ]; then to=$((5 - s)); fi
+    git -C "$dir" cat-file blob "$sha" > "$tmpd/stage$to" 2>/dev/null || { echo "changelog-union: cannot read index stage $s of $base" >&2; return 1; }
   done
   awk -v out="$tmpd/fold.out" '
     BEGIN { K = "\034" }

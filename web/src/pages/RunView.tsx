@@ -40,6 +40,7 @@ import {
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
+  isRejectedRun,
   milestoneBadge,
   mrChipState,
   mrChipSuffix,
@@ -2169,6 +2170,7 @@ export function RunView() {
   // the header pill and the terminal banner both go neutral so they agree with
   // the board/RunsList treatment (isStoppedRun).
   const stopped = isStoppedRun(run.status, run.stop_kind);
+  const rejected = isRejectedRun(run.status, run.fail_origin);
   // issue #1418: a `failed` run whose committed work is human-landable (server-derived
   // landing_state === "needs_landing") reads "needs landing" on the header pill instead of
   // "failed" — still danger-toned, distinct label. Stopped precedence wins first (a stopped
@@ -2176,9 +2178,11 @@ export function RunView() {
   // matching the RunsList row derivation so one run reads one word on both surfaces.
   const pillStatus = stopped
     ? "stopped"
-    : run.status === "failed" && run.landing_state === "needs_landing"
-      ? "needs_landing"
-      : effectiveRunStatus(run);
+    : rejected
+      ? "rejected"
+      : run.status === "failed" && run.landing_state === "needs_landing"
+        ? "needs_landing"
+        : effectiveRunStatus(run);
   // MR state (PRD #33): a per-run frozen hint. It appends "merged"/"closed" to the
   // MR affordance and (for closed) drops the ok tone; open is unchanged.
   const mrState = mrChipState(run.mr_state);
@@ -2773,13 +2777,13 @@ export function RunView() {
         <div
           className={cx(
             "rounded-xl border p-4",
-            stopped ? "border-edge bg-raised/50" : "border-danger/40 bg-danger/10",
+            stopped || rejected ? "border-edge bg-raised/50" : "border-danger/40 bg-danger/10",
           )}
         >
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className={cx("text-sm font-semibold", stopped ? "text-fg" : "text-danger")}>
-                Run {stopped ? "stopped" : "failed"}
+              <p className={cx("text-sm font-semibold", stopped || rejected ? "text-fg" : "text-danger")}>
+                Run {stopped ? "stopped" : rejected ? "rejected" : "failed"}
               </p>
               <RunFailureReason run={run} stopped={stopped} />
               <RunStopReason run={run} />
@@ -3080,7 +3084,7 @@ export function RunView() {
 export function RunFailureReason({ run, stopped }: { run: Run; stopped?: boolean }) {
   if (!run.failure_reason) return null;
   return (
-    <p className={cx("mt-0.5 text-xs", stopped ? "text-muted" : "text-danger/80")}>
+    <p className={cx("mt-0.5 text-xs", stopped || isRejectedRun(run.status, run.fail_origin) ? "text-muted" : "text-danger/80")}>
       {stripUnsafeChars(run.failure_reason)}
     </p>
   );

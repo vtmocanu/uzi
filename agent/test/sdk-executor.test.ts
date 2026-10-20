@@ -31,6 +31,9 @@ import {
   SUBAGENT_SAFETY_APPEND,
   CLAUDE_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
+  GATE_APPROVED_FRESH_SESSION_GUIDANCE,
+  CURRENT_EXECUTION_STATE_GUIDANCE,
+  REVIEWED_RESUME_APPROVAL_GUIDANCE,
 } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
 import type {
@@ -4461,6 +4464,25 @@ describe("embedSeededPlan — the seeded-plan-body gate (PRD #209 M2)", () => {
       false,
     );
   });
+
+  // Issue #3178: a plan approved at the gate with no session to carry it.
+  it("#3178: embeds for a gate-approved plan with no session, without preApproved", () => {
+    assert.equal(
+      embedSeededPlan({ preApproved: false, seeded: false, gateApprovedWithoutSession: true, hasSession: false }),
+      true,
+    );
+  });
+  it("#3178: does NOT embed a gate-approved plan when a session exists", () => {
+    assert.equal(
+      embedSeededPlan({ preApproved: false, seeded: false, gateApprovedWithoutSession: true, hasSession: true }),
+      false,
+    );
+  });
+  it("#3178: an absent or false term leaves the existing truth table unchanged", () => {
+    assert.equal(embedSeededPlan({ preApproved: false, seeded: false, gateApprovedWithoutSession: false, hasSession: false }), false);
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: false, gateApprovedWithoutSession: false, hasSession: false }), false);
+    assert.equal(embedSeededPlan({ preApproved: true, seeded: true, gateApprovedWithoutSession: false, hasSession: false }), true);
+  });
 });
 
 // --- Plan-turn write-tool subtraction (#203) ----------------------------------
@@ -8172,5 +8194,132 @@ describe("issue #3174 in-place restart session continuity", () => {
       assert.equal(count(turns[i]!.promptText, "temporary mutations"), expected, `snapshot note on turn ${i}`);
       assert.equal(count(turns[i]!.promptText, "printf interrupted-observation"), expected, `calls note on turn ${i}`);
     }
+  });
+});
+
+describe("issue #3178 gate-approved plan reaches a session-less first implement turn", () => {
+  const SENTINEL = ["zqx", "3178", "sentinel plan body"].join("-");
+  const PLAN_B = "revised-plan-B-3178";
+  const count = (text: string | undefined, needle: string) => (text ?? "").split(needle).length - 1;
+  const base = (extra: Partial<RunContext> = {}): Partial<RunContext> => ({
+    sessionId: null, planApproved: false, approvedPlan: SENTINEL, resumePhase: "awaiting_approval", priorWork: { commits: 2 }, ...extra,
+  });
+  const exec = (queryFn: SdkQueryFn, ctx: RunContext) => new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+  const checkedBundle = {
+    plan: "# Canonical 3178 plan",
+    milestones: [{ id: "server-id", title: "Server title" }],
+    candidate_digest: "a".repeat(64),
+    claimGeneration: 7,
+  };
+
+  it("embeds the stored plan once, with gate-approved framing, on the first turn only", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx(base());
+    await exec(queryFn, probe.ctx);
+    assert.deepEqual(probe.gated, [SENTINEL], "the stored plan was re-presented");
+    assert.ok(turns.length >= 2);
+    const first = turns[0]!;
+    assert.equal(first.options.resume, undefined);
+    const prompt = first.promptText ?? "";
+    assert.equal(count(prompt, SENTINEL), 1);
+    assert.match(prompt, new RegExp(`<plan>\\n${SENTINEL}\\n</plan>`));
+    assert.ok(prompt.includes("approved at the plan gate for this run"));
+    assert.ok(prompt.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+    assert.ok(prompt.includes(CURRENT_EXECUTION_STATE_GUIDANCE));
+    assert.ok(prompt.includes("already carries 2 commits"), "prior-work note rides the first turn");
+    assert.ok(!prompt.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+    assert.ok(!prompt.includes("you supplied"));
+    const later = turns[1]!.promptText ?? "";
+    for (const needle of [SENTINEL, GATE_APPROVED_FRESH_SESSION_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, "already carries 2 commits"]) {
+      assert.equal(count(later, needle), 0, `a later turn does not carry ${needle}`);
+    }
+  });
+
+  for (const how of ["gate", "resumed-event"] as const) {
+    it(`guard: a session-less revise (${how}) leaves a session, so implement resumes it with no plan body`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan(PLAN_B, "S"), resultSuccess("S")],
+        [signalDone("S"), resultSuccess("S")],
+      ]);
+      const probe = how === "gate"
+        ? makeCtx(base(), [{ kind: "revise", feedback: "FEEDBACK-3178" }, { kind: "approve", selection: { status: "absent" } }])
+        : makeCtx(base({ takeResumedGateEvent: async () => ({ kind: "revise", feedback: "FEEDBACK-3178" }) }));
+      await exec(queryFn, probe.ctx);
+      const rev = turns[0]!.promptText ?? "";
+      assert.equal(count(rev, SENTINEL), 1, "the revision prompt carries plan A");
+      assert.ok(rev.includes("FEEDBACK-3178"));
+      const impl = turns[1]!;
+      assert.equal(impl.options.resume, "S");
+      const prompt = impl.promptText ?? "";
+      assert.doesNotMatch(prompt, /<plan>/);
+      assert.equal(count(prompt, SENTINEL), 0);
+      assert.equal(count(prompt, PLAN_B), 0);
+      assert.ok(!prompt.includes("already carries 2 commits"));
+      assert.ok(!prompt.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+    });
+  }
+
+  it("guard: reject and cancel run no implement turn", async () => {
+    for (const verdict of [{ kind: "reject", reason: "no" } as PlanVerdict, { kind: "cancel" } as PlanVerdict]) {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx(base(), verdict);
+      await assert.rejects(exec(queryFn, probe.ctx));
+      assert.equal(turns.length, 0);
+    }
+  });
+
+  it("guard: a cross_check approval carries the canonical contract once and no local <plan> body", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const verdict = { kind: "approve", approval: "cross_check", selection: { status: "absent" }, canonical: checkedBundle } as PlanVerdict;
+    const probe = makeCtx(base({ claimGeneration: 7, reportProgress: async () => {} }), verdict);
+    await exec(queryFn, probe.ctx);
+    const prompt = turns[0]!.promptText ?? "";
+    assert.equal(count(prompt, checkedBundle.plan), 1);
+    assert.equal(count(prompt, SENTINEL), 0, "the canonical plan overrides the local one");
+    assert.doesNotMatch(prompt, /<plan>/);
+    assert.ok(!prompt.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+  });
+
+  it("guard: a resolvable session is resumed with no plan body or new guidance", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone("S0"), resultSuccess("S0")]]);
+    const probe = makeCtx(base({ sessionId: "S0" }));
+    await exec(queryFn, probe.ctx);
+    assert.equal(turns[0]!.options.resume, "S0");
+    const prompt = turns[0]!.promptText ?? "";
+    assert.doesNotMatch(prompt, /<plan>/);
+    assert.equal(count(prompt, SENTINEL), 0);
+    assert.ok(!prompt.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+  });
+
+  it("guard: the M4 reviewed-resume first prompt keeps its own guidance and not the new one", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, reviewedPlanResume: true, seeded: false, sessionId: null, approvedPlan: SENTINEL });
+    await exec(queryFn, probe.ctx);
+    const prompt = turns[0]!.promptText ?? "";
+    assert.ok(prompt.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+    assert.ok(!prompt.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+    assert.equal(count(prompt, SENTINEL), 1);
+  });
+
+  it("composes with #3174: a first turn aborted before model evidence restarts with the plan exactly once", async () => {
+    const abort: Script = () => (async function* () {
+      yield* [] as SDKMessage[];
+      throw new PauseNowSignal();
+    })();
+    const { queryFn, turns } = fakeTurns([
+      abort,
+      [assistantText("working", "S"), resultSuccess("S")],
+      [signalDone("S"), resultSuccess("S")],
+    ]);
+    const probe = makeCtx(base({ parkForPause: async () => false }));
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, emptyTurnBackoffBaseMs: 0 }).run(probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.equal(turns[1]!.options.resume, undefined);
+    assert.equal(count(turns[0]!.promptText, SENTINEL), 1);
+    assert.equal(count(turns[1]!.promptText, SENTINEL), 1, "the restart carries the plan once");
+    assert.equal(count(turns[2]!.promptText, SENTINEL), 0);
   });
 });

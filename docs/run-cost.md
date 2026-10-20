@@ -47,6 +47,29 @@ and the measured under-count it replaced, and
 [ADR-1562](../adr/1562-run-usage-session-cumulative-basis.md) for the
 session-cumulative fold and what it does not backfill.
 
+## Rejected runs and failure accounting
+
+Usage outcomes count finished run rows, including runs with no usage. A failed
+run with `fail_origin = base_diverged` has its own count, as does
+`plan_rejected`; neither contributes to the `failed` count, `fail_origins`
+map or lifetime failure recency. These definitions apply to personal, factory
+and per-user usage in both lifetime and last-seven-day windows:
+
+```text
+finished == completed + cancelled + plan_rejected + base_diverged + failed
+sum(fail_origins) == failed
+failure rate == failed / finished
+```
+
+The API emits numeric partition counts, including zero. The usage bar's
+**rejected** segment is `plan_rejected + base_diverged`; plan rejections keep
+their **stopped** run badge, while required-base rejections show **rejected**.
+These remain raw `status = failed` rows. `provider_policy_refusal` remains an
+execution failure, counted in `failed` and eligible for judging under the
+[existing rules](./judge.md#which-runs-are-judged).
+See [required-base rollout compatibility](./run-activity.md#when-a-required-base-has-changed)
+for older APIs/workers, optional web fields and the no-backfill boundary.
+
 ## Metered, subscription, and unreported cost
 
 Not every run's cost is a real dollar figure. Each run's folded `run_usage`

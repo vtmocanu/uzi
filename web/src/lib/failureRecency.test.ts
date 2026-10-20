@@ -3,7 +3,7 @@ import { failureRecency } from "./failureRecency";
 import type { RunOutcomes } from "./apiTypes";
 
 const empty: RunOutcomes = {
-  finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0,
+  finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0,
   needs_landing: 0, fail_origins: {}, last_failed_at: null,
   last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null,
   completed_since_last_failure: null,

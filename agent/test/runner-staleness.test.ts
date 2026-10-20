@@ -210,12 +210,12 @@ describe("RunRunner — base-commit staleness guard (PRD #209 M4)", () => {
       (s) => s.runId === claim.run_id && s.body.status === "failed",
     );
     assert.equal(failed.length, 1, "the run failed exactly once");
+    assert.equal(failed[0]!.body.fail_origin, "base_diverged");
     const reason = failed[0]!.body.failure_reason ?? "";
-    assert.ok(reason.includes(planned), "the failure_reason names the planned commit");
-    assert.ok(reason.includes(base), "the failure_reason names the clone's base commit");
-    assert.ok(
-      reason.includes("--require-base"),
-      "the failure_reason explains why (the --require-base flag)",
+    assert.equal(
+      reason,
+      `the seeded plan was written against commit ${planned}, but this clone's ` +
+        `base commit is ${base}; --require-base is set, so this run will not implement against a diverged base`,
     );
   });
 });

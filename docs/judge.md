@@ -189,8 +189,13 @@ When the reviewed run **failed**, the judge is also handed a trusted
 **failure class** — a single closed-vocabulary label for *why* the run failed
 (for example `provisioning_failed`, `credential_unavailable`,
 `guardrail_blocked`, `agent_failure`, `provider_policy_refusal`, `run_timeout`).
-It is derived from the run's own structured state at the moment it failed, never by reading the
-free-text failure reason, so the judge weighs a fact rather than a string. The
+`base_diverged` is also a structured origin, but it rejects a required-base
+mismatch before implementation and is excluded from judging, so it is not a
+failure class handed to a judge.
+
+The judged failure class is derived from the run's own structured state at the
+moment it failed, never by reading the free-text failure reason, so the judge
+weighs a fact rather than a string. The
 practical effect: a network timeout or connection error is **not** treated as
 automatically transient, and a policy- or config-denied failure does not draw a
 "just retry / add backoff" recommendation — that class of block stays until the
@@ -399,6 +404,11 @@ did nothing, so the judge is skipped. **The failed-run Slack DM still lands** �
 the skip drops only the retrospective, never the "your run failed" alert. (A run
 that started and then crashed early is *not* in this set; it carries agent
 behaviour and is still judged.)
+
+A failed run with `fail_origin = base_diverged` is never judged, including on
+resume and regardless of its iteration count. This is a required-base rejection,
+not an execution failure to retrospect on. See
+[required-base changes](./run-activity.md#when-a-required-base-has-changed).
 
 A run with `fail_origin = provider_policy_refusal` has the same eligibility
 as `agent_failure`, including a resumed run. The judge may review substantial

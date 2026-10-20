@@ -41,17 +41,21 @@ var preStartInfraFailOrigins = map[string]bool{
 
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
 // iteration_count (PRD #1392 M1, SC3). Its members are origins that are never a real agent
-// defect, so there is nothing to retrospect however far the run got. All but two are
-// SERVER-DERIVED. Its first member is forge_unreachable: it is stamped ONLY inside SetState's
+// defect, so there is nothing to retrospect however far the run got. All but three are
+// SERVER-DERIVED. forge_unreachable is stamped ONLY inside SetState's
 // forge-park transaction (a forge that stayed unreachable at clone past the park cap), never by
 // a worker report (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker
 // forging it), so an untrusted report can never steer its skip. worker_residue_blocked (issue
-// #1783) and skills_plugin_load_failed (issue #1888) are the WORKER-REPORTABLE members; the agent
-// can induce the former (see its entry below), and the latter's skip is not a security boundary
-// either. Unlike preStartInfraFailOrigins it is NOT gated on iteration_count == 0, because a
+// #1783), skills_plugin_load_failed (issue #1888), and base_diverged are the WORKER-REPORTABLE
+// members. The agent can induce worker_residue_blocked (see its entry below); skipping
+// the judge for any of these three is a spend/accuracy trade-off, not a security boundary.
+// Unlike preStartInfraFailOrigins it is NOT gated on iteration_count == 0, because a
 // resumed run's forge cap-fail carries iteration_count > 0 (see preStartInfraFailOrigins). A
 // strict subset of failorigin.go's vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
 var neverJudgeFailOrigins = map[string]bool{
+	// A divergent base is a worker refusal regardless of the number of agent iterations.
+	// Worker-reportable: its judge skip is a spend/accuracy trade-off, not a security boundary.
+	"base_diverged":     true,
 	"forge_unreachable": true,
 	// issue #1367: an undispatched handoff terminalized by SweepTaskNeverDispatched was never
 	// claimed (no worker, no agent attempt or trace), so there is nothing to retrospect — it
@@ -98,8 +102,8 @@ var neverJudgeFailOrigins = map[string]bool{
 // after all work, so a resumed run carries iteration_count > 0 and an == 0 gate would wrongly
 // judge it). TestEnvPublishFailOriginsExact pins the exact set.
 //
-// DELIBERATELY WORKER-REPORTABLE (all three members, whereas neverJudgeFailOrigins has only
-// worker_residue_blocked and skills_plugin_load_failed); what distinguishes this set is that its members are PUBLISH failures
+// DELIBERATELY WORKER-REPORTABLE (all three members, as are neverJudgeFailOrigins'
+// worker_residue_blocked, skills_plugin_load_failed, and base_diverged); what distinguishes this set is that its members are PUBLISH failures
 // at finalize. A worker forging one of these could at worst decline to spend judge tokens
 // retrospecting its OWN publish failure — a spend/accuracy footgun, NOT a security boundary (contrast guardrail_blocked,
 // which gates a security classification, and forge_unreachable, which is server-derived). These
@@ -209,7 +213,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
 	// the skip is gated on iteration_count:
 	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/gate_presentation_refused/
-	//     data_volume_full/worker_residue_blocked/skills_plugin_load_failed):
+	//     data_volume_full/worker_residue_blocked/skills_plugin_load_failed/base_diverged):
 	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A forge cap-fail on
 	//     a RESUMED run carries iteration_count > 0 (iteration_count is only ever advanced, never
 	//     reset), so gating it on == 0 would wrongly judge it — SC3 requires "no judge run"
@@ -218,7 +222,8 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	//     run's own retrospective), accepted like push_secret_blocked's agent-caused skip below:
 	//     judge skipping is a spend/accuracy tradeoff, not a security boundary.
 	//     skills_plugin_load_failed (issue #1888) is worker-reportable too, and its skip rests on
-	//     that same trade-off, not on the agent being unable to cause it.
+	//     that same trade-off, not on the agent being unable to cause it. base_diverged is
+	//     also worker-reportable; its worker skip is not a security boundary.
 	//   - envPublishFailOrigins (finalize_base_align_conflict/workflow_scope_missing/
 	//     push_secret_blocked): environment-caused publish failures (issue #1418) — the run did all
 	//     its work, the environment refused the push. No agent behaviour to review, so skipped
@@ -238,7 +243,8 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// The judge is a REPLACEMENT for these runs, not an addition, so the failure must still
 	// surface. Every path that reaches this gate — the worker-reported SetState terminal
 	// transition for the three pre-start infra origins, the three env-publish origins and the
-	// worker-reported infra origins worker_residue_blocked and skills_plugin_load_failed, AND
+	// worker-reported infra origins worker_residue_blocked, skills_plugin_load_failed,
+	// and base_diverged, AND
 	// SetState's own forge-park transaction for forge_unreachable — fires
 	// s.bcast.PublishState(runID,"failed") BEFORE calling maybeEnqueueJudge. On that SAME
 	// transition the slacksvc failed-run DM (slacksvc/notifier_state.go) reaches Slack-linked

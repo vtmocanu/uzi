@@ -74,6 +74,7 @@ func TestFailureRecencyLiveDB(t *testing.T) {
 		target       any
 	}{
 		{"cancelled", "issue", nil, nil}, {"failed", "issue", "plan_rejected", nil},
+		{"failed", "issue", "base_diverged", nil},
 		{"failed", "chat", "agent_failure", nil}, {"failed", "judge", "agent_failure", lower},
 		{"completed", "chat", nil, nil}, {"completed", "judge", nil, lower},
 	} {

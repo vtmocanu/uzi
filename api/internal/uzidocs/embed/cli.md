@@ -207,7 +207,11 @@ A few worth knowing:
   in both windows, showing minutes, hours or days since the last failed run.
   A scope with lifetime finished runs but no failures shows `no failures`;
   one with no lifetime finished runs shows `-`. These are the same definitions
-  as Overview: chat, judge, and rejected plans do not count as failures.
+  as Overview: chat, judge, rejected plans and `base_diverged` required-base
+  rejections do not count as failures. Required-base rejections remain in the
+  finished-run denominator and have a separate numeric `base_diverged` count
+  in usage JSON. See [usage accounting](./run-cost.md#rejected-runs-and-failure-accounting)
+  for the partition identity and the web bar's combined **rejected** segment.
 
 - **`--harness` picks the run's execution engine; omit it to let the server
   resolve one.** `run create --harness claude|codex` and `schedule create
@@ -2981,18 +2985,24 @@ TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
 
-Human-facing STATUS labels also distinguish a human stop from a failure:
+Human-facing STATUS labels distinguish human stops and required-base rejections
+from execution failures:
 
-| Raw `status` | `stop_kind` | Full CLI label |
-|---|---|---|
-| `cancelled` | Any value, missing or conflicting | `stopped (cancelled)` |
-| `failed` | `cancelled` | `stopped (cancelled)` |
-| `failed` | `plan_rejected` | `stopped (plan rejected)` |
+| Raw `status` | `stop_kind` | `fail_origin` | Full CLI label |
+|---|---|---|---|
+| `cancelled` | Any value, missing or conflicting | Any | `stopped (cancelled)` |
+| `failed` | `cancelled` | Any | `stopped (cancelled)` |
+| `failed` | `plan_rejected` | Any | `stopped (plan rejected)` |
+| `failed` | No human stop | `base_diverged` | `rejected` |
 
 `run get` and `run list` use these full labels. The `admin runs` renderer
 uses the same labels, but its endpoint lists active runs only; terminal
 runs are not reachable through that listing. Human stops take precedence
-over `needs landing`, even when the run carries recoverable work. Genuine
+over `needs landing`, even when the run carries recoverable work. When no human
+stop applies, a raw `failed` run with `fail_origin: base_diverged` reads `rejected`,
+before any `needs landing` presentation. On the web, its cause label is
+`rejected: base changed`; the CLI origin field remains raw `base_diverged`. A plan rejection
+keeps its `stopped (plan rejected)` label. Genuine
 failures, including `stop_kind: auto_stopped`, keep their existing failure
 or `needs landing` presentation.
 
@@ -3003,7 +3013,9 @@ failed run with `stop_kind: plan_rejected`.
 
 These are presentation labels: raw JSON, scalar fields and status
 transitions stay unchanged. Filtering raw `status: failed` in JSON still
-includes failed-path cancellations and plan rejections. Neither `run list`
+includes failed-path cancellations, plan rejections and required-base
+rejections. See [required-base changes](./run-activity.md#when-a-required-base-has-changed)
+for rollout order and older payloads. Neither `run list`
 nor `admin runs` exposes a `--status` flag.
 
 ### Provider outage recovery and owner hold

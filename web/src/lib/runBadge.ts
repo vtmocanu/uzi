@@ -120,6 +120,10 @@ export function isStoppedRun(
   return false;
 }
 
+export function isRejectedRun(status: string, failOrigin: string | null | undefined): boolean {
+  return status === "failed" && failOrigin === "base_diverged";
+}
+
 // isPlanningRun reports whether a run is in its pre-approval PLANNING phase (issue
 // #321). It trusts the server-computed is_planning boolean and only treats it as
 // planning while the run is still `running` (is_planning is meaningful only then;
@@ -312,6 +316,7 @@ export function priorityBadge(
 export function runStatusTone(
   status: string,
   stopKind: StopKind | null | undefined,
+  failOrigin?: string | null,
 ): BadgeTone {
   if (status === "planning") return "plan";
   // issue #750: a run re-planning after a revise. Calm INFO tone (like claimed/running
@@ -348,7 +353,7 @@ export function runStatusTone(
   // (D11): a pause is a chosen hold, not something blocking the run. Kept in step with
   // RUN_STATUS_TONES.paused (the runBadge.test.ts tone-agreement loop asserts it).
   if (status === "paused") return "info";
-  if (isStoppedRun(status, stopKind)) return "neutral";
+  if (isStoppedRun(status, stopKind) || isRejectedRun(status, failOrigin)) return "neutral";
   if (status === "failed") return "danger";
   if (status === "completed") return "ok";
   if (status === "claimed" || status === "running") return "info";
@@ -521,6 +526,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
   // never renders as breakage.
   if (isStoppedRun(run.status, run.stop_kind)) {
     return { kind: "badge", label: "stopped", tone: "neutral", pulse: false };
+  }
+  if (isRejectedRun(run.status, run.fail_origin)) {
+    return { kind: "badge", label: "rejected", tone: "neutral", pulse: false };
   }
   const eff = effectiveRunStatus(run);
   // A health flag overrides the normal status label while the run is alive but looks
