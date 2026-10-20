@@ -10430,7 +10430,10 @@ export class GitCache {
         count: retained.length,
         skippedRecent,
         incomplete,
-        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(p, 157)),
+        // Names relative to the runner root: a long root would otherwise truncate away the
+        // distinguishing leaf.
+        root: sanitizeForLog(root, 157),
+        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
         removedEmpty: removed,
       });
     }

@@ -27,7 +27,7 @@ beforeEach(() => {
 });
 afterEach(() => { mock.restoreAll(); fx.cleanup(); });
 
-type Diag = { count: number; paths: string[]; skippedRecent: number; incomplete: boolean };
+type Diag = { count: number; root: string; paths: string[]; skippedRecent: number; incomplete: boolean };
 const warnings = (): Diag[] => lines.filter((l) => (l as { msg?: string }).msg === WARNING) as Diag[];
 
 describe("inspectRetireScratchAtStartup (#3153)", () => {
@@ -55,7 +55,8 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     const w = warnings();
     assert.equal(w.length, 1, "exactly one warning");
     assert.equal(w[0]!.count, 2);
-    assert.deepEqual([...w[0]!.paths].sort(), [full, full2].sort());
+    assert.deepEqual([...w[0]!.paths].sort(), [".retire-full", ".retire-full2"]);
+    assert.ok(path.resolve(root).startsWith(w[0]!.root.replace(/\.\.\.$/, "")), "root names the inspected runner root");
   });
 
   it("skips a parent whose mtime is at or after process start, empty or not", async () => {
