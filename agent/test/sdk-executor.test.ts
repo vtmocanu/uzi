@@ -7786,10 +7786,52 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     assert.ok(!included.some((id) => id === 3 || id === 4 || id === 5), "history ids get no inclusion receipt");
   });
 
-  it("a session-resumed or non-reviewed run places no history", async () => {
+  it("a non-reviewed seeded run places no history", async () => {
     const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
     const probe = reviewedResume({ reviewedPlanResume: false, seeded: true, priorOwnerFollowUps: [{ id: 1, body: "HIST-X" }] });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-X/);
+  });
+
+  it("a session-resumed reviewed run places no history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = reviewedResume({ sessionId: "sess-resumed", priorOwnerFollowUps: [{ id: 1, body: "HIST-S" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-S/);
+  });
+
+  it("a first turn aborted before any model event re-composes the history on the restarted turn, and a turn after an evidenced one does not", async () => {
+    const { queryFn, turns } = fakeTurns([
+      () => (async function* () {
+        yield* [];
+        throw new CredentialSwitchSignal();
+      })(),
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-RESTART" }],
+      attemptCredentialSwitch: async () => "gave_up" as const,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.match(turns[1]!.promptText ?? "", /HIST-RESTART/, "the restarted turn carries the history");
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-RESTART/, "a later turn does not");
+  });
+
+  it("a clarification answer turn does not carry history again", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [askUserTurn("which config?"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-CLARIFY" }],
+      askUser: async () => ({ kind: "answer", answers: ["the default"] }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 2);
+    assert.match(turns[0]!.promptText ?? "", /HIST-CLARIFY/);
+    assert.match(turns[1]!.promptText ?? "", /the default/);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-CLARIFY/);
   });
 });

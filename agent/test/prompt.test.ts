@@ -2793,6 +2793,12 @@ describe("buildImplementPrompt — reviewed-plan resume framing and earlier owne
     assert.ok(!p.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
   });
 
+  it("a seeded run that is also flagged reviewed keeps the user-supplied wording and lacks the guidance", () => {
+    const p = buildImplementPrompt({ ...reviewed, seeded: true, seededPlan: "SEEDED-BODY" });
+    assert.match(p, /you supplied/);
+    assert.ok(!p.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+  });
+
   it("an ordinary first turn lacks the guidance", () => {
     assert.ok(!buildImplementPrompt(base).includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
   });

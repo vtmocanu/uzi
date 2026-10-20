@@ -3139,7 +3139,7 @@ export class SdkExecutor implements Executor {
         completionRework = undefined;
         if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
         const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
-        const onFirstEvent = ownerRides
+        const ownerFirstEvent = ownerRides
           ? () => {
               if (ownerBatch !== ownerRides) return;
               ownerBatch = undefined;
@@ -3183,6 +3183,7 @@ export class SdkExecutor implements Executor {
         // once. Ids the lead receives live this turn or on this claim are dropped by id. No inclusion
         // receipt is ever issued for a history id.
         let priorOwnerFollowUps: string[] | undefined;
+        let historyRides = false;
         if (
           !priorOwnerHistoryPlaced &&
           ctx.reviewedPlanResume === true &&
@@ -3195,8 +3196,17 @@ export class SdkExecutor implements Executor {
             ctx.priorOwnerFollowUps,
             (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false),
           );
-          priorOwnerHistoryPlaced = true;
+          historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
         }
+        // The history latch is spent only when the turn reaches its first model event, so a turn
+        // that aborts before any event (credential switch, pause-now, wall refusal) and restarts
+        // composes the history again.
+        const onFirstEvent = ownerFirstEvent || historyRides
+          ? () => {
+              ownerFirstEvent?.();
+              if (historyRides) priorOwnerHistoryPlaced = true;
+            }
+          : undefined;
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
