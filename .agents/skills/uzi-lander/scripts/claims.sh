@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# claims.sh — which session is landing which PR, so several landers on one repo (Claude or
-# Codex, via the session-peers registry) can see each other, avoid double-driving a PR,
+# claims.sh — which session is landing which PR, so several landers on one repo (Claude,
+# Codex or OpenCode, via the session-peers registry) can avoid double-driving a PR,
 # sequence their CodeRabbit consumption, and clean up after themselves.
 #
 # One JSON per key under <state dir>/claims/ (see lib/state.sh for where that is: the
 # repo's shared .git/uzi-lander by default, never tracked). A claim records the owner's
-# name and durable session uuid, kind (claude|codex), claimed_at, last_seen (bumped by
+# name and durable session uuid, kind (claude|codex|opencode), claimed_at, last_seen (bumped by
 # every trail.sh append), the PR's size (files, lines), a priority, depends_on, a note,
 # and the last trail state.
 #
@@ -41,7 +41,9 @@
 # Exit codes:
 #   0  ok
 #   2  usage
-#   3  error (state dir, jq, gh)
+#   3  error (state dir, jq, gh), or ambiguous/unverifiable native OpenCode identity
+#      (whoami, claim, release --if-mine). Explicit SESSION_PEERS_NAME/UUID/KIND
+#      overrides select an owner without automatic identity discovery.
 #   4  claim: held by ANOTHER LIVE session (its name/uuid printed: message it, do not steal;
 #      --force takes it anyway, say why in the trail); release --if-mine: not ours, kept
 set -uo pipefail
@@ -99,7 +101,8 @@ key_lock() {
 
 case "$verb" in
   whoami)
-    self_identity | awk -F'\t' '{printf "SESSION_NAME=%s\nSESSION_UUID=%s\nSESSION_KIND=%s\n",$1,$2,$3}'; exit 0;;
+    me=$(self_identity) || exit 3
+    printf '%s\n' "$me" | awk -F'\t' '{printf "SESSION_NAME=%s\nSESSION_UUID=%s\nSESSION_KIND=%s\n",$1,$2,$3}'; exit 0;;
 
   claim)
     key=${1:-}; key_check "$key"; shift
@@ -114,7 +117,8 @@ case "$verb" in
         *) echo "unknown arg: $1" >&2; usage;;
       esac
     done
-    me=$(self_identity "$as" "$uuid" "$kind"); my_name=$(printf '%s' "$me" | cut -f1); my_uuid=$(printf '%s' "$me" | cut -f2); my_kind=$(printf '%s' "$me" | cut -f3)
+    me=$(self_identity "$as" "$uuid" "$kind") || exit 3
+    my_name=$(printf '%s' "$me" | cut -f1); my_uuid=$(printf '%s' "$me" | cut -f2); my_kind=$(printf '%s' "$me" | cut -f3)
     f="$CL/$key.json"
     # Acquisition is serialised per key: two fresh claims cannot both succeed, the
     # check-then-write below runs under the key's lock.
@@ -151,7 +155,8 @@ case "$verb" in
     if [ "${1:-}" = "--if-mine" ]; then
       key_lock "$key"
       f="$CL/$key.json"; [ -f "$f" ] || { echo "RELEASED=$key (absent)"; exit 0; }
-      my_uuid=$(self_identity | cut -f2)
+      me=$(self_identity) || exit 3
+      my_uuid=$(printf '%s' "$me" | cut -f2)
       claim_ok "$f" || { echo "unreadable claim $f" >&2; exit 3; }
       o_uuid=$(jq -r '.owner_uuid' "$f")
       if [ "$o_uuid" != "$my_uuid" ]; then echo "KEPT=$key (held by $(jq -r '.owner // ""' "$f"))"; exit 4; fi

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
@@ -8,6 +9,13 @@ import type { ResidueQuarantineState } from "./residue-quarantine.js";
 import type { UsageWireRequest } from "./usage-recorder.js";
 import {
   WORKER_API_PREFIX,
+  type MemoryBinding,
+  type MemoryPolicy,
+  type MemoryOutcome,
+  type MemoryReservationRequest,
+  type MemoryOutcomeRequest,
+  type MemoryReservation,
+  type MemoryIncarnation,
   type TerminalRejectionsRequest,
   type TerminalRejectionsResponse,
   type TerminalRejectionCustodyResponse,
@@ -900,6 +908,8 @@ export interface ClientOptions {
   /** Codex external-auth worker→API slice. Kept below app-server's fixed 10s callback
    *  deadline; the API finishes within 7.5s, leaving response-delivery margin. */
   codexHTTPTimeoutMs?: number;
+  /** #3124: combined headers+body bound for the optional interrupted-calls read. Injected by tests. */
+  interruptedCallsTimeoutMs?: number;
 }
 
 export type CodexReleaseExpectation =
@@ -1105,6 +1115,69 @@ function validDindSample(sample: DindMeterSample | null | undefined): sample is 
     sample.inodesTotal > 0 && sample.inodesUsed <= sample.inodesTotal;
 }
 
+function memoryError(): Error { return new Error("memory intervention unavailable or invalid"); }
+function memoryObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw memoryError();
+  return value as Record<string, unknown>;
+}
+function memoryUUID(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+    && value !== "00000000-0000-0000-0000-000000000000";
+}
+function memoryNonce(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= 128;
+}
+function memoryNatural(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+function memoryBinding(value: unknown): MemoryBinding {
+  const b = memoryObject(value);
+  if (!memoryUUID(b.run_id) || !memoryUUID(b.worker_id) || !memoryUUID(b.intervention_id)
+    || !memoryNonce(b.register_nonce) || !memoryNatural(b.claim_generation) || b.claim_generation === 0
+    || !memoryNatural(b.memory_episode)) throw memoryError();
+  return { run_id: b.run_id, worker_id: b.worker_id, intervention_id: b.intervention_id,
+    register_nonce: b.register_nonce, claim_generation: b.claim_generation, memory_episode: b.memory_episode };
+}
+function memoryPolicy(value: unknown): MemoryPolicy {
+  const p = memoryObject(value);
+  if (p.version !== 1 || !memoryNatural(p.max_interventions) || p.max_interventions < 1 || p.max_interventions > 9999) throw memoryError();
+  return { version: 1, max_interventions: p.max_interventions };
+}
+function validateClaimMemory(value: unknown): void {
+  if (!isRecord(value) || !["memory_episode", "memory_intervention_count", "memory_policy"].some((field) => field in value)) return;
+  if (!memoryNatural(value.memory_episode) || !memoryNatural(value.memory_intervention_count)
+    || value.memory_intervention_count > 9999) throw memoryError();
+  if (value.memory_policy !== null) {
+    const policy = memoryPolicy(value.memory_policy);
+    if (value.memory_intervention_count > policy.max_interventions) throw memoryError();
+    value.memory_policy = policy;
+  }
+}
+
+function memoryOutcome(value: unknown): value is MemoryOutcome {
+  return value === "no_signal" || value === "unknown" || value === "confirmed_drained";
+}
+function decodeMemoryReservation(value: unknown, request: MemoryReservationRequest | MemoryOutcomeRequest): MemoryReservation {
+  const obj = memoryObject(value);
+  const binding = memoryBinding(obj);
+  for (const field of ["run_id", "worker_id", "intervention_id", "register_nonce", "claim_generation", "memory_episode"] as const) {
+    if (binding[field] !== request[field]) throw memoryError();
+  }
+  const policy = memoryPolicy(obj.policy);
+  if ("policy" in request && (policy.version !== request.policy.version || policy.max_interventions !== request.policy.max_interventions)) throw memoryError();
+  const allowance = memoryObject(obj.allowance);
+  const { limit, used, remaining } = allowance;
+  if (!memoryNatural(limit) || limit !== policy.max_interventions || !memoryNatural(used) || used > limit
+    || !memoryNatural(remaining) || remaining !== limit - used
+    || typeof obj.admitted !== "boolean" || typeof obj.authorizing !== "boolean"
+    || (obj.outcome !== undefined && !memoryOutcome(obj.outcome))
+    || (obj.admitted && used === 0) || (!obj.admitted && used !== limit)
+    || (obj.authorizing && (!obj.admitted || obj.outcome !== undefined))
+    || ("outcome" in request && (obj.outcome !== request.outcome || obj.authorizing))) throw memoryError();
+  return { ...binding, policy, allowance: { limit, used, remaining }, admitted: obj.admitted,
+    authorizing: obj.authorizing, ...(obj.outcome === undefined ? {} : { outcome: obj.outcome }) };
+}
+
 const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
 const COMPLETION_HOLDS_MAX_ITEMS = 1024;
 const COMPLETION_BINDINGS_MAX = 4096;
@@ -1125,6 +1198,32 @@ export class WorkerClient {
   private completionIncarnation = 0;
   // Input observations are invalidated at registration entry, including same-ID failures.
   private inputObservationEpoch = 0;
+  private interruptedEpoch = 0;
+  private interruptedIdentity: InterruptedRegistration | undefined;
+
+  get interruptedCallsRegistration(): InterruptedRegistration | undefined { return this.interruptedIdentity; }
+
+  revokeInterruptedCallsAuthority(): void {
+    ++this.interruptedEpoch;
+    this.interruptedIdentity = undefined;
+  }
+
+  async getInterruptedCalls(runId: string, generation: number, identity: InterruptedRegistration, signal: AbortSignal): Promise<InterruptedCalls | undefined> {
+    if (this.interruptedIdentity !== identity) return;
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(this.interruptedCallsTimeoutMs)]);
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/interrupted-calls?claim_generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.interruptedCallsTimeoutMs, deadline, { "X-Worker-Register-Nonce": identity.nonce });
+    if (res.status !== 200) {
+      void res.body?.cancel().catch(() => undefined);
+      return;
+    }
+    const bytes = await readBoundedBytes(res, 16 * 1024, true, deadline);
+    const raw: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    MaintenanceBudget.current()?.check();
+    deadline.throwIfAborted();
+    if (this.interruptedIdentity !== identity) return;
+    return decodeInterruptedCalls(raw, runId, generation, identity);
+  }
   private completionRetirementIncarnation: Readonly<object> = {};
   // Live and temporarily retired identities each reserve both provenance slots.
   private readonly completionReservations = new Map<string, CompletionReservation>();
@@ -1156,6 +1255,7 @@ export class WorkerClient {
   private readonly now: () => number;
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
+  private readonly interruptedCallsTimeoutMs: number;
   /**
    * API-supported FEATURES, distinct from the image's implemented capabilities.
    * Register replaces this cache; complete readable heartbeat responses up to 1 MiB
@@ -1163,6 +1263,59 @@ export class WorkerClient {
    * A stripped rollback success clears it; later ordinary ticks can rediscover it.
    */
   private serverFeatures = new Set<string>();
+  private memoryRegistrationRevision = 0;
+  private memoryIncarnationValue: MemoryIncarnation | undefined;
+  private memoryInvalidationListener: (() => void) | undefined;
+
+  get memoryIncarnation(): MemoryIncarnation | undefined { return this.memoryIncarnationValue; }
+
+  /** One worker guard owns this subscription; unsubscribe on guard disposal. */
+  subscribeMemoryInvalidation(listener: () => void): () => void {
+    if (this.memoryInvalidationListener) throw new Error("memory listener already installed");
+    this.memoryInvalidationListener = listener;
+    return () => {
+      if (this.memoryInvalidationListener === listener) this.memoryInvalidationListener = undefined;
+    };
+  }
+
+  /** Fence pending registration completions as well as already captured permits. */
+  revokeMemoryAuthority(): void {
+    this.revokeInterruptedCallsAuthority();
+    this.revokeMemoryOnlyAuthority();
+  }
+
+  private revokeMemoryOnlyAuthority(): void {
+    ++this.memoryRegistrationRevision;
+    this.invalidateMemoryIncarnation();
+  }
+
+  private invalidateMemoryIncarnation(): void {
+    this.memoryIncarnationValue = undefined;
+    this.memoryInvalidationListener?.();
+  }
+
+  async reserveMemoryIntervention(request: MemoryReservationRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<MemoryReservation> {
+    const binding = memoryBinding(request);
+    const policy = memoryPolicy(request.policy);
+    return this.memoryRequest("reserve", { ...binding, policy }, signal, timeoutMs);
+  }
+
+  async reportMemoryInterventionOutcome(request: MemoryOutcomeRequest, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<MemoryReservation> {
+    const binding = memoryBinding(request);
+    if (!memoryOutcome(request.outcome)) throw memoryError();
+    return this.memoryRequest("outcome", { ...binding, outcome: request.outcome }, signal, timeoutMs);
+  }
+
+  private async memoryRequest(kind: "reserve" | "outcome", body: MemoryReservationRequest | MemoryOutcomeRequest, signal: AbortSignal | undefined, timeoutMs: number): Promise<MemoryReservation> {
+    if (!this.hasFeature("worker_memory_pressure_v1") || !Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw memoryError();
+    try {
+      const raw = await this.postJSON(`${WORKER_API_PREFIX}/runs/${body.run_id}/memory/${kind}`, body, timeoutMs, signal, 64 * 1024);
+      return decodeMemoryReservation(raw, body);
+    } catch {
+      // Neither server error bodies nor malformed response text escape this seam.
+      throw memoryError();
+    }
+  }
 
   /**
    * Whether this image advertised the `credential_switch_v1` protocol capability at
@@ -1237,7 +1390,12 @@ export class WorkerClient {
     return [...this.serverFeatures];
   }
   set protocolFeatures(v: string[]) {
-    this.serverFeatures = new Set(v);
+    this.replaceServerFeatures(v);
+  }
+
+  private replaceServerFeatures(features: readonly string[]): void {
+    this.serverFeatures = new Set(features);
+    if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryOnlyAuthority();
   }
 
   constructor(
@@ -1254,6 +1412,7 @@ export class WorkerClient {
     this.now = opts.now ?? (() => performance.now());
     this.httpTimeoutMs = opts.httpTimeoutMs ?? 30_000;
     this.codexHTTPTimeoutMs = opts.codexHTTPTimeoutMs ?? 8_000;
+    this.interruptedCallsTimeoutMs = opts.interruptedCallsTimeoutMs ?? 2_000;
   }
 
   async register(
@@ -1265,6 +1424,10 @@ export class WorkerClient {
     initialSnapshot?: ActiveSnapshot,
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
+    this.revokeInterruptedCallsAuthority();
+    const interruptedEpoch = this.interruptedEpoch;
+    const memoryRevision = ++this.memoryRegistrationRevision;
+    this.invalidateMemoryIncarnation();
     this.inputObservationEpoch++;
     this.registeredWorkerId = undefined;
     this.hasExactHoldCapability = false;
@@ -1303,6 +1466,15 @@ export class WorkerClient {
     // exists); an ordinary worker passes undefined and the register wire stays byte-identical.
     if (initialSnapshot !== undefined) body.active_snapshot = initialSnapshot;
     const res = (await this.postJSON(`${WORKER_API_PREFIX}/register`, body)) as RegisterResponse;
+    if (interruptedEpoch !== this.interruptedEpoch) return res;
+    this.interruptedIdentity = interruptedRegistration(res.worker_id, res.register_nonce, interruptedEpoch);
+    if (memoryRevision !== this.memoryRegistrationRevision) return res;
+    if (Array.isArray(res.protocol_features) && res.protocol_features.includes("worker_memory_pressure_v1")
+      && memoryUUID(res.worker_id) && memoryNonce(res.register_nonce)) {
+      this.memoryIncarnationValue = Object.freeze({
+        worker_id: res.worker_id, register_nonce: res.register_nonce, revision: memoryRevision,
+      });
+    }
     // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
     // from this register's advertisement so a re-register after a rollout reflects the
     // server's current features. Filter to strings (defensive), and treat an absent field
@@ -1372,6 +1544,7 @@ export class WorkerClient {
    *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
     this.serverFeatures.clear();
+    this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
   }
 
@@ -1380,6 +1553,7 @@ export class WorkerClient {
    *  closes and every other negotiated extension stays on. */
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
+    if (f === "worker_memory_pressure_v1") this.revokeMemoryOnlyAuthority();
   }
 
   async heartbeat(
@@ -1514,7 +1688,7 @@ export class WorkerClient {
     if (applyAdverts) {
       const adverts = decoded as { protocol_features?: unknown; worker_outbox_max_pending?: unknown };
       if (Array.isArray(adverts.protocol_features) && adverts.protocol_features.every((f) => typeof f === "string")) {
-        this.serverFeatures = new Set(adverts.protocol_features);
+        this.replaceServerFeatures(adverts.protocol_features);
       }
       const quota = adverts.worker_outbox_max_pending;
       if (typeof quota === "number" && Number.isInteger(quota) && quota >= 0) {
@@ -1584,6 +1758,7 @@ export class WorkerClient {
         throw new Error("cross-check claim marker and kind disagree");
       }
       deadline.throwIfAborted();
+      validateClaimMemory(claim);
       if (isRecord(claim) && claim.inventory_guarded !== undefined &&
           (typeof claim.inventory_guarded !== "boolean" ||
            (claim.inventory_guarded === true &&
@@ -1661,7 +1836,9 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", path, {});
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", path, res);
-    return (await res.json()) as ChatClaimResponse;
+    const claim = (await res.json()) as ChatClaimResponse;
+    validateClaimMemory(claim);
+    return claim;
   }
 
   /**
@@ -1861,6 +2038,23 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.recovery_cause === "worker_memory_pressure") {
+      // Snapshot once: caller mutation and transport retries cannot rebind this request.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));
+      const incarnation = this.memoryIncarnationValue;
+      if (!this.hasFeature("worker_memory_pressure_v1") || !incarnation || !memoryUUID(runId) ||
+          outbound.status !== "recovery_wait" || outbound.recovery_cause !== "worker_memory_pressure" ||
+          outbound.require_running === true ||
+          !memoryNonce(outbound.register_nonce) || outbound.register_nonce !== incarnation.register_nonce ||
+          !memoryNatural(outbound.claim_generation) || outbound.claim_generation === 0 ||
+          !memoryNatural(outbound.memory_episode)) throw memoryError();
+      const binding = Object.freeze({ run_id: runId, worker_id: incarnation.worker_id,
+        register_nonce: outbound.register_nonce, claim_generation: outbound.claim_generation,
+        memory_episode: outbound.memory_episode });
+      // No generation send gate or strict-decode downgrade: this park requires every fence.
+      return this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES,
+        undefined, { incarnation, binding });
+    }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
     if (hasRevisionSourceFields(body))
@@ -1908,9 +2102,9 @@ export class WorkerClient {
         path,
         includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined, expected_gate_revision: undefined, revision_input_id: undefined, superseded_revision_input_ids: undefined },
         signal,
-        // Terminal ACKs carry the full RunDTO, as strict gate ACKs do, not a small
-        // maintenance envelope. Keep their shared operational response cap.
-        b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
+        // Running and terminal ACKs carry the full RunDTO, as strict gate ACKs do.
+        // Enforce the shared response cap on actual streamed bytes.
+        b.status === "running" || b.status === "failed" || b.status === "completed" ? CROSS_CHECK_RESPONSE_MAX_BYTES : undefined,
         evidence,
       );
     try {
@@ -2006,7 +2200,10 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
+    incarnation: MemoryIncarnation;
+    binding: NonNullable<StateAck["memoryParkAccepted"]>;
+  }): Promise<StateAck> {
     // Field presence carries the source-fence intent through feature shrink and
     // durable terminal replay. Absence of support cannot authorize an ordinary write.
     if (hasRevisionSourceFields(body) && (!this.hasFeature("plan_revision_retry_v1") ||
@@ -2033,6 +2230,31 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
           };
+          // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
+          // match and no decline/switch disposition is present. Generation/nonce stay in the
+          // captured request: the public RunDTO intentionally exposes neither as a receipt.
+          if (memoryPark && this.hasFeature("worker_memory_pressure_v1") &&
+              this.memoryIncarnationValue === memoryPark.incarnation &&
+              this.memoryRegistrationRevision === memoryPark.incarnation.revision &&
+              fields.memoryParkUndisposed === true && fields.runId === memoryPark.binding.run_id &&
+              fields.workerId === memoryPark.binding.worker_id && fields.status === "recovery_wait" &&
+              fields.recoveryCause === "worker_memory_pressure" &&
+              fields.memoryEpisode === memoryPark.binding.memory_episode) {
+            Object.defineProperty(ack, "memoryParkAccepted", { value: memoryPark.binding, enumerable: true });
+          }
+          if (typeof fields.runId === "string" && fields.runId.trim().length > 0)
+            ack.runId = fields.runId;
+          if (typeof fields.workerId === "string" && fields.workerId.trim().length > 0) {
+            ack.workerId = fields.workerId;
+            if (this.registeredWorkerId)
+              ack.workerIdentityMatches = fields.workerId === this.registeredWorkerId;
+          }
+          if (body.claim_generation !== undefined)
+            ack.sentClaimGeneration = body.claim_generation;
+          if (fields.completionProjection !== undefined)
+            ack.completionProjection = fields.completionProjection;
+          if (fields.completionAttempts !== undefined)
+            ack.completionAttempts = fields.completionAttempts;
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
               ack.completedPublicationReason = "unsupported_feature";
@@ -3107,10 +3329,12 @@ export class WorkerClient {
     runId: string,
     args: {
       milestonesCompleted: string[];
+      nonClosing?: { reason: string };
       head: string | null;
       worktreeFingerprint: string | null;
       claimGeneration?: number;
     },
+    signal?: AbortSignal,
   ): Promise<{ unmet: string[]; attemptCount: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/attempt`;
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
@@ -3126,14 +3350,18 @@ export class WorkerClient {
     // non-capability worker clears them (sticky, as today). A genuine business 400 (e.g. "not
     // interlocked") is NOT a strict-decode 400 and propagates unchanged — no strip, no retry.
     const included = this.includeClaimGeneration(args.claimGeneration);
+    // Snapshot negotiation before the generation fallback can clear features. Both sends
+    // retain the intent; a server rejecting it must fail rather than silently close.
+    const nonClosing = this.serverFeatures.has("completion_non_closing_v1") ? args.nonClosing : undefined;
     const res = (await this.withGenerationFallback(included, (includeField) => {
       const body: CompletionAttemptRequest = {
         milestones_completed: args.milestonesCompleted,
         head: args.head,
         worktree_fingerprint: args.worktreeFingerprint,
+        ...(nonClosing !== undefined ? { non_closing: nonClosing } : {}),
       };
       if (includeField) body.claim_generation = args.claimGeneration;
-      return this.postJSON(path, body);
+      return this.postJSON(path, body, this.httpTimeoutMs, signal);
     })) as CompletionAttemptResponse;
     return { unmet: res.unmet ?? [], attemptCount: res.attempt_count ?? 0 };
   }
@@ -3248,6 +3476,7 @@ export class WorkerClient {
   async requestCompletionHold(
     runId: string,
     args: { head: string; claimGeneration?: number },
+    signal?: AbortSignal,
   ): Promise<{ status: string }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/completion/hold`;
     // PRD #1247 fix round: stamp the claim-lane generation through the shared send-gate so a
@@ -3268,7 +3497,7 @@ export class WorkerClient {
     return this.withGenerationFallback(included, async (includeField) => {
       const body: { head: string; claim_generation?: number } = { head: args.head };
       if (includeField) body.claim_generation = args.claimGeneration;
-      const res = await this.fetchRaw("POST", path, body);
+      const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
         return { status: fields.status ?? "" };
@@ -3980,10 +4209,12 @@ export class WorkerClient {
     body: unknown,
     timeoutMs = this.httpTimeoutMs,
     callerSignal?: AbortSignal,
+    requestHeaders?: Readonly<Record<string, string>>,
   ): Promise<Response> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
       "X-Client-Version": this.version,
+      ...requestHeaders,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     // `body` is SET CONDITIONALLY rather than passed as `body: undefined` (PRD #103
@@ -4190,11 +4421,16 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
   workerId?: unknown;
+  recoveryCause?: string;
+  memoryEpisode?: number;
+  memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
   budgetWallSeconds?: number;
   contractRevision?: number;
+  completionProjection?: StateAck["completionProjection"];
+  completionAttempts?: number;
   budgetTotalSeconds?: number;
   budgetUsedSeconds?: number;
   scopeCeiling?: number;
@@ -4228,6 +4464,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         id?: unknown;
         worker_id?: unknown;
         status?: unknown;
+        recovery_wait_cause?: unknown;
+        memory_hold?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
@@ -4235,6 +4473,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         budget_wall_seconds?: unknown;
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
         completion_revision?: unknown;
+        completion_deferred?: unknown;
+        completion_attempts?: unknown;
         budget_total_seconds?: unknown;
         budget_used_seconds?: unknown;
         scope_ceiling?: unknown;
@@ -4260,11 +4500,16 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
       workerId?: unknown;
+      recoveryCause?: string;
+      memoryEpisode?: number;
+      memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
       budgetMaxIterations?: number;
       budgetWallSeconds?: number;
       contractRevision?: number;
+      completionProjection?: StateAck["completionProjection"];
+      completionAttempts?: number;
       budgetTotalSeconds?: number;
       budgetUsedSeconds?: number;
       scopeCeiling?: number;
@@ -4290,6 +4535,13 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (run?.id !== undefined) out.runId = run.id;
     if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
+    if (typeof run?.recovery_wait_cause === "string") out.recoveryCause = run.recovery_wait_cause;
+    if (isRecord(run?.memory_hold) && memoryNatural(run.memory_hold.episode))
+      out.memoryEpisode = run.memory_hold.episode;
+    // Presence, even malformed/null, blocks authority rather than degrading to absence.
+    if (isRecord(parsed) && !Object.hasOwn(parsed, "reason") &&
+        !Object.hasOwn(parsed, "disposition") && !Object.hasOwn(parsed, "credential_switch"))
+      out.memoryParkUndisposed = true;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
@@ -4304,8 +4556,18 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // server) or any other shape leaves it undefined, which the finalize reads as "fall back to
     // the claim's contract_revision" (and holds fail-closed when that is absent too).
     const rev = run?.completion_revision;
-    if (typeof rev === "number" && Number.isInteger(rev) && rev >= 1)
+    if (typeof rev === "number" && Number.isSafeInteger(rev) && rev >= 1)
       out.contractRevision = rev;
+    const deferred = run?.completion_deferred;
+    if (out.contractRevision !== undefined && Array.isArray(deferred) && deferred.every(entry =>
+      isRecord(entry) && typeof entry.milestone_id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(entry.milestone_id))) {
+      out.completionProjection = {
+        revision: out.contractRevision,
+        deferredIds: [...new Set(deferred.map(entry => (entry as { milestone_id: string }).milestone_id))].sort(),
+      };
+    }
+    if (typeof run?.completion_attempts === "number" && Number.isSafeInteger(run.completion_attempts) && run.completion_attempts >= 0)
+      out.completionAttempts = run.completion_attempts;
     // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no
     // wall deadline) or absent (older server) leaves it undefined, and the sdk-executor falls
     // back to budgetWallSeconds.

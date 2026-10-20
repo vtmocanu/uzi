@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Poll a uzi run's status until it reaches a stop-set state, printing each
-# transition with a timestamp. Designed to be launched with Claude Code's
-# run_in_background so the harness re-invokes the model when it exits.
+# transition with a timestamp. Launch with a verified native completion callback
+# or an explicitly delegated observer; background execution alone is not coverage.
 #
-# WHY a script and not `uzi run wait`: this harness reaps long-lived background
-# processes, so a backgrounded `uzi run wait` gets killed mid-run and you never
-# learn the outcome. A short poll loop that exits on the stop set survives,
-# because each exit is a clean notification and a killed poll simply re-fires.
+# Foreground tool calls have finite limits, not multi-hour coverage. This bounded
+# poller emits stop/expiry evidence for an explicitly owned completion route;
+# no process-lifetime guarantee follows from running in the background.
+# Restarting a killed or expired poll is the owner's responsibility. This
+# script neither notifies a session nor re-arms itself.
 #
 # uzi's benign "CLI is behind server" line goes to stderr and is discarded here.
 #
@@ -48,7 +49,8 @@
 # `<health>@<health_since>` episodes whose health signal is ignored (a run that stays stalled in
 # the SAME episode, e.g. a long test suite, then stops only on the stop set, a NEW non-ok episode,
 # or a stale heartbeat, which is never acked).
-# Exit codes: 0 stop-set state or ELAPSED (unchanged), 4 needs_attention.
+# Exit codes: 0 stop-set state (not necessarily success), 3 coverage elapsed,
+# 4 needs_attention. The final RESULT line distinguishes these outcomes.
 set -u
 RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq]}"
 STOP="${2:-completed,failed,cancelled,awaiting_approval,awaiting_input}"
@@ -130,9 +132,11 @@ while [ "$i" -lt "$MAX" ]; do
           continue
         fi
         printf 'STOP=%s (revised plan seq=%s > %s)\n' "$s" "$cur" "$MIN_PLAN_SEQ"
+        printf 'RESULT=stop:%s\n' "$s"
         exit 0
       fi
       printf 'STOP=%s\n' "$s"
+      printf 'RESULT=stop:%s\n' "$s"
       exit 0
       ;;
   esac
@@ -150,6 +154,7 @@ while [ "$i" -lt "$MAX" ]; do
           printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q\n' \
             "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
           printf 'NOTE coverage ended: after investigating, run the REARM line in the background (a stale heartbeat is never acked and stops again)\n'
+          printf 'RESULT=attention\n'
           exit 4
         fi
       else
@@ -161,3 +166,5 @@ while [ "$i" -lt "$MAX" ]; do
   sleep "$INT"
 done
 printf 'ELAPSED last=%s (raise max-polls or re-launch)\n' "$last"
+printf 'RESULT=elapsed\n'
+exit 3

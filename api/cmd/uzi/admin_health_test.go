@@ -358,26 +358,31 @@ func TestAdminHealthIsRegistered(t *testing.T) {
 }
 
 func TestAdminHealthOwnerDangerRemainsExitEightWithoutInstanceBlocking(t *testing.T) {
-	check := queueWarnCheck()
-	check.Severity = "danger"
-	doc := healthDoc("danger", check)
-	fc := &uzicli.FakeClient{AdminHealthDoc: doc}
-	out, _, code := runCLI(t, fakeEnv(fc), "admin", "health")
-	if code != uzicli.ExitHealthDanger {
-		t.Fatalf("owner danger exit = %d, want 8", code)
-	}
-	for _, want := range []string{"blocking: false (instance-wide)", "status: DANGER", "1 danger", "queue.waiting"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("owner report missing %q: %s", want, out)
-		}
-	}
-	out, _, code = runCLI(t, fakeEnv(fc), "admin", "health", "--json")
-	var got apitypes.HealthDocDTO
-	if err := json.Unmarshal([]byte(out), &got); err != nil {
-		t.Fatal(err)
-	}
-	if code != uzicli.ExitHealthDanger || got.Blocking || len(got.Checks) != 1 || got.Checks[0].Scope != "owner" {
-		t.Fatalf("owner JSON scope/blocking/exit changed: exit=%d doc=%+v", code, got)
+	for _, checkID := range []string{"queue.waiting", "fleet.capacity"} {
+		t.Run(checkID, func(t *testing.T) {
+			check := queueWarnCheck()
+			check.ID = checkID
+			check.Severity = "danger"
+			doc := healthDoc("danger", check)
+			fc := &uzicli.FakeClient{AdminHealthDoc: doc}
+			out, _, code := runCLI(t, fakeEnv(fc), "admin", "health")
+			if code != uzicli.ExitHealthDanger {
+				t.Fatalf("owner danger exit = %d, want 8", code)
+			}
+			for _, want := range []string{"blocking: false (instance-wide)", "status: DANGER", "1 danger", checkID} {
+				if !strings.Contains(out, want) {
+					t.Errorf("owner report missing %q: %s", want, out)
+				}
+			}
+			out, _, code = runCLI(t, fakeEnv(fc), "admin", "health", "--json")
+			var got apitypes.HealthDocDTO
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatal(err)
+			}
+			if code != uzicli.ExitHealthDanger || got.Blocking || len(got.Checks) != 1 || got.Checks[0].Scope != "owner" {
+				t.Fatalf("owner JSON scope/blocking/exit changed: exit=%d doc=%+v", code, got)
+			}
+		})
 	}
 }
 

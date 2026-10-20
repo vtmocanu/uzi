@@ -391,6 +391,8 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
     if (waiter) { const resolve = waiter; waiter = undefined; resolve({ value: note, done: false }); }
     else queue.push(note);
   };
+  const originalReadiness = git.normalizeRetainedSourceObjects;
+  let readiness = 0;
   const originalStatus = git.worktreeStatus;
   const originalVerify = git.verifyRunnerTrackingCovers;
   const originalPack = git.checkpointPack;
@@ -464,6 +466,8 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
     assert.equal(fs.existsSync(store), true, "held per-run HOME keeps the persisted session");
     assert.equal(await CodexSessionStore.inspectSession(store, sid), "present");
 
+    // Synthetic launch roots use host-owned files; complete readiness before testing adoption.
+    git.normalizeRetainedSourceObjects = async () => { readiness++; };
     const canonical = worktreeDirFor(1627);
     fs.writeFileSync(path.join(canonical, "retained.txt"), "held local work\n");
     const bare = git.barePathFor(fx.originPath);
@@ -504,6 +508,7 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
             supervisorPid: 200,
             transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
             snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+            observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
             waitChild: async () => ({ event: "child_exit", code: 0 }),
             dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
             failed: undefined, whenFailed: new Promise<Error>(() => undefined),
@@ -513,7 +518,8 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
           provisionRunTools: async () => ({ toolEnv: {} }),
           idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
         });
-        return { run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        return { sandboxesCommands: codexExecutor.sandboxesCommands, run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          assert.equal(readiness, 1, "retained readiness completed before session adoption");
           assert.equal(seenContext, undefined, "one successor claim reaches the actual executor once");
           seenContext = ctx;
           assert.equal(ctx.sessionId, undefined, "retained recovery drops claimed session lineage");
@@ -539,6 +545,7 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
     const events = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => m.payload.event);
     assert.equal(events.includes(RESUME_CONTINUED_EVENT), false, "fresh checkout does not continue the old lineage");
     assert.ok(seenContext, "the actual Codex executor received the recovered context");
+    assert.equal(readiness, 1, "reclaim normalized the retained source once");
     assert.equal(artifactAtLaunch, true, `session artifact missing at launch; requests=${JSON.stringify(requests.map((r) => r.method))} messages=${JSON.stringify(api.messages(claim.run_id).map((m) => [m.kind, m.payload.event, m.payload.text]))}`);
     const resume = requests.find((r) => r.method === "thread/resume");
     const turn = requests.find((r) => r.method === "turn/start");
@@ -559,6 +566,7 @@ it("a retained Codex runner turn adopts the session artifact but starts a fresh 
     assert.ok(!api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), `fresh retained hold did not fail: ${JSON.stringify(api.states.filter(s => s.runId === claim.run_id))} messages=${JSON.stringify(api.messages(claim.run_id))}`);
     assert.equal(api.completionHoldRequests.length, 2, "both completion holds were acknowledged");
   } finally {
+    git.normalizeRetainedSourceObjects = originalReadiness;
     git.worktreeStatus = originalStatus;
     git.verifyRunnerTrackingCovers = originalVerify;
     git.checkpointPack = originalPack;

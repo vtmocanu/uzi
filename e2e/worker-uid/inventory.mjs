@@ -7,7 +7,7 @@ const repo = fileURLToPath(new URL('../../', import.meta.url));
 const require = createRequire(path.join(repo, 'agent/package.json'));
 const { API } = await import(pathToFileURL(require.resolve('typescript/unstable/sync')));
 const { SyntaxKind } = await import(pathToFileURL(require.resolve('typescript/unstable/ast')));
-const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff'];
+const files = ['codex-launcher', 'codex-executor', 'codex-shared-dir', 'entrypoint-migration', 'git-planning-diff', 'git-retained-permissions'];
 const captureSuite = 'Unit2 runner source capture';
 const captureLeaves = new Set([
   'cancels while the object-store snapshot streams and leaves no temp tree',
@@ -21,15 +21,29 @@ const captureLeaves = new Set([
   'treats a symlinked .gitignore as absent while the path stays a candidate',
 ]);
 
+const retainedLeaves = new Set([
+  "recovers retained command-owned loose objects",
+  "recovers retained command-owned packed objects",
+  "normalizes before verifying an already captured restore tip",
+  "preserves worker-owned hardlinks while recovering command-owned loose objects",
+  "preserves worker-owned hardlinks while recovering command-owned packed objects",
+  "preserves runner-owned hardlinks while recovering command-owned loose objects",
+  "preserves runner-owned hardlinks while recovering command-owned packed objects",
+  "refuses command-owned multiply linked mutation candidates and keeps custody",
+  "keeps source and custody when retained object recovery fails"
+]);
+
 // The source AST seam lets regressions share one small parser project.
 export function inventoryForSource(source, file) {
   const planning = file === 'git-planning-diff';
+  const command = file === 'memory-command-real';
+  const retained = file === 'git-retained-permissions';
   const expected = [];
   const identities = new Set();
   let gates = 0;
   let suites = 0;
   const visit = (node, ancestors = [], targeted = false) => {
-    if (node.kind === SyntaxKind.CallExpression && ['it', 'describe'].includes(node.expression.text)) {
+    if (node.kind === SyntaxKind.CallExpression && ['it', 'test', 'describe'].includes(node.expression.text)) {
       const name = node.arguments[0];
       const options = node.arguments.length === 3 ? node.arguments[1] : undefined;
       const gate = !planning && options?.properties?.some(p => p.name?.text === 'skip' && (
@@ -37,7 +51,7 @@ export function inventoryForSource(source, file) {
         (file === 'codex-launcher' && source.text.slice(p.pos, p.end).includes('WORKER_UID'))
       ));
       if (gate) gates++;
-      const active = targeted || gate;
+      const active = targeted || gate || command;
       if (name?.kind !== SyntaxKind.StringLiteral) {
         if (active) throw new Error(`nonliteral targeted test title: ${file}`);
         // Unknown planning ancestry cannot establish an exact capture identity.
@@ -46,11 +60,11 @@ export function inventoryForSource(source, file) {
         const names = [...ancestors, name.text];
         if (planning && node.expression.text === 'describe' && ancestors.length === 0 && name.text === captureSuite) suites++;
         const capture = planning && ancestors.length === 1 && ancestors[0] === captureSuite && captureLeaves.has(name.text);
-        if (node.expression.text === 'it' && (active || capture)) {
+        if (['it', 'test'].includes(node.expression.text) && (active || capture)) {
           const identity = JSON.stringify(names);
           if (identities.has(identity)) throw new Error(`duplicate source leaf identity: ${file}: ${identity}`);
           identities.add(identity);
-          expected.push({ file: `agent/test/${file}.test.ts`, names });
+          expected.push({ file: command ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`, names });
           return;
         }
         const callback = node.arguments[node.arguments.length - 1];
@@ -66,6 +80,23 @@ export function inventoryForSource(source, file) {
     for (const leaf of captureLeaves) {
       if (!expected.some(test => test.names[1] === leaf)) throw new Error(`${file}: missing required literal capture leaf: ${leaf}`);
     }
+  } else if (retained) {
+    if (gates !== 1) throw new Error(`${file}: expected one UID gate, found ${gates}`);
+    for (const leaf of retainedLeaves) {
+      if (!expected.some(test => test.names.length === 2 && test.names[1] === leaf)) {
+        throw new Error(`${file}: missing required literal retained recovery leaf: ${leaf}`);
+      }
+    }
+  } else if (command) {
+    const titles = [
+      'real adopted detached tree: eligibility, identity refusal, concurrent cleanup and exact pressure failure',
+      'real supervisor observation fixtures execute under the command UID',
+    ];
+    for (const title of titles) {
+      if (!expected.some(test => test.names.length === 1 && test.names[0] === title)) {
+        throw new Error(`${file}: missing required literal command proof: ${title}`);
+      }
+    }
   } else if (gates !== 1 || !expected.length) {
     throw new Error(`${file}: expected one UID gate with nonempty leaf inventory, found ${gates}`);
   }
@@ -75,10 +106,14 @@ export function inventoryForSource(source, file) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const api = new API({ cwd: path.join(repo, 'agent') });
   try {
-    const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'agent/tsconfig.json')] });
+    const snapshot = api.updateSnapshot({ openProjects: [path.join(repo, 'e2e/worker-uid/tsconfig.json')] });
     const program = snapshot.getProjects()[0].program;
-    const expected = files.flatMap(file => {
-      const filename = path.join(repo, `agent/test/${file}.test.ts`);
+    const lane = process.argv[2] ?? 'worker';
+    if (!['worker', 'command'].includes(lane)) throw new Error(`unknown lane: ${lane}`);
+    const selected = lane === 'command' ? ['memory-command-real'] : files;
+    const expected = selected.flatMap(file => {
+      const filename = path.join(repo, file === 'memory-command-real'
+        ? `e2e/worker-uid/${file}.test.mts` : `agent/test/${file}.test.ts`);
       if (program.getSyntacticDiagnostics(filename).length) throw new Error(`invalid test syntax: ${file}`);
       const source = program.getSourceFile(filename);
       if (!source) throw new Error(`missing source: ${file}`);

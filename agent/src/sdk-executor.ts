@@ -35,6 +35,7 @@ import type {
   SDKMessage,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
@@ -69,6 +70,7 @@ import {
 import {
   buildCIFixPlanPrompt,
   buildImplementPrompt,
+  interruptedCallsNote,
   buildLeadSystemPrompt,
   buildPlanPrompt,
   buildRepoInstructionsContext,
@@ -1276,6 +1278,7 @@ export class SdkExecutor implements Executor {
     }
 
     await fs.mkdir(this.homeDir, { recursive: true });
+    ctx.ciEvidence = await ctx.prepareCIEvidence?.();
     // The shared provisioning HOME lives elsewhere on the data volume; ensure it
     // exists before the install subprocess sets HOME to it (a no-op when it equals
     // the per-run homeDir, e.g. tests that don't split them).
@@ -1560,6 +1563,7 @@ export class SdkExecutor implements Executor {
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
     };
+    if (ctx.ciEvidence) mcpServers[CI_EVIDENCE_SERVER] = buildCIEvidenceServer(ctx.ciEvidence);
     const enableImplementationSignals = (): void => {
       signalParkRun = parkRunEnabled(ctx, "implement");
       mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
@@ -2046,9 +2050,10 @@ export class SdkExecutor implements Executor {
             // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
-            // Issue #105: only set when a dropped resume left this turn amnesiac on a
-            // branch that already carries pushed work.
+            // Best-effort existing branch commit count, independent of SDK session
+            // recovery; interruptedSnapshot supersedes legacy continuation wording.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // Judge rec (run 51757591): the commit this branch was cut from, so the lead
             // does not infer the parent from the clone's freshly-fetched default branch.
             baseCommit: ctx.baseCommit,
@@ -2078,8 +2083,9 @@ export class SdkExecutor implements Executor {
             openSelfImproveMRs: ctx.openSelfImproveMRs,
             // PRD #686 M4: uzi-vs-generic directive selection (absent ⇒ generic).
             selfImproveDogfood: ctx.selfImproveDogfood,
-            // Issue #105: see above — the fixed self_improve branch's prior cycles.
+            // Best-effort existing commits, including prior cycles and interrupted experiments.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // See above. The fixed self_improve branch is routinely seeded off a previous
             // cycle's tip, so its base is the least guessable of the three kinds.
             baseCommit: ctx.baseCommit,
@@ -2111,8 +2117,9 @@ export class SdkExecutor implements Executor {
             // Issue #2083: the earlier run's private decisions memo (mr_rework only; the
             // runner sets it only then), fenced as UNTRUSTED. Absent injects nothing.
             decisionsMemo: ctx.decisionsMemo,
-            // Issue #105: see above — prior pushed work on this issue's branch.
+            // Best-effort existing branch commits; SDK session recovery does not gate the count.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
@@ -2695,6 +2702,9 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
+      // Execution lifetime, independent of iteration resets and system/rework turns.
+      // Consumed at harness dispatch after refreshCodeCrossCheckTools has settled.
+      let interruptedOwnerDispatched = false;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2917,6 +2927,7 @@ export class SdkExecutor implements Executor {
         // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
         // carried it. The "injected" line is emitted only when the block is placed.
         const firstImplementTurn = iteration === 1 && !hasParked;
+        const firstOrdinaryOwner = !interruptedOwnerDispatched && followUp === undefined && !reworkForTurn;
         const priorDecisionsMemo =
           firstImplementTurn &&
           !ctx.sessionId &&
@@ -2990,11 +3001,12 @@ export class SdkExecutor implements Executor {
             // present (drained fresh each turn, not first-turn-only). Rendered as worker guidance
             // ahead of any <follow_up> block. Absent ⇒ no block.
             safetySteer,
-            // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
-            // implement COLD — no plan turn carried the prior-work note. Threaded on the
-            // pre-approved path ONLY, so an ordinary gated run's implement prompt is
-            // byte-identical to before (it never carried this). First turn only.
-            priorWork: preApproved ? ctx.priorWork : undefined,
+            // PRD #209 (D7): carry existing branch commits on preapproved implementation.
+            // Preserve legacy first-turn rendering without a snapshot; with a snapshot,
+            // only the first ordinary owner receives this context, including when a
+            // clarification reuses iteration 1.
+            priorWork: preApproved && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
+            interruptedSnapshot: firstOrdinaryOwner ? ctx.interruptedSnapshot : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
             // can see the boundaries and checkpoint at each one. A pre-approved resume
             // uses the claim's frozen list; no approved breakdown adds no note.
@@ -3018,6 +3030,12 @@ export class SdkExecutor implements Executor {
           idleMs,
           onProgress,
           onFirstEvent,
+          firstOrdinaryOwner ? (prompt) => {
+            if (interruptedOwnerDispatched) return prompt;
+            const note = interruptedCallsNote(ctx.getInterruptedCalls?.());
+            interruptedOwnerDispatched = true;
+            return note ? `${prompt}\n\n${note}` : prompt;
+          } : undefined,
         );
         // PRD #1190 M2: await the turn through a catch for a `now` pause abort. driveTurn is an
         // async function, so even a synchronous trip check surfaces as a REJECTED promise here
@@ -3502,6 +3520,7 @@ export class SdkExecutor implements Executor {
             if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const { unmet } = await ctx.recordCompletionAttempt({
               declared: turn.milestonesCompleted ?? [],
+              ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
               head,
               worktreeFingerprint,
             });
@@ -4271,6 +4290,7 @@ export class SdkExecutor implements Executor {
     // the prompt (evidencesModelProcessing), NOT on init or other lifecycle frames. A re-drive of
     // the same turn (driveTurnWithEmptyRecovery) calls it again, so the handler must be idempotent.
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     this.throwIfTerminal(ctx);
     // A trip may already be pending (e.g. a cancel that landed during the gate).
@@ -4333,7 +4353,8 @@ export class SdkExecutor implements Executor {
       // the current-child sink; the adapter assembles the SdkOptions and finalizes
       // resume/abort/spawn per turn.
       if (phase === "implement") await state.refreshCodeCrossCheckTools?.();
-      this.harness.prepareTurn(turnConfig, state.currentChild);
+      this.harness.prepareTurn({ ...turnConfig, agents: withCIEvidenceAgents(turnConfig.agents ?? {}, ctx.ciEvidence) }, state.currentChild);
+      prompt += ciEvidencePrompt(ctx.ciEvidence);
       if (parkRunEnabled(ctx, phase)) {
         // buildImplementPrompt's later-turn opening must also allow dependency waiting.
         prompt = prompt.replace(
@@ -4342,6 +4363,7 @@ export class SdkExecutor implements Executor {
         );
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
+      if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request: RunTurnRequest = {
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
@@ -4543,6 +4565,7 @@ export class SdkExecutor implements Executor {
     idleMs: number,
     onProgress?: (progress: MilestoneProgress) => void,
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
     // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
@@ -4567,6 +4590,7 @@ export class SdkExecutor implements Executor {
             idleMs,
             onProgress,
             onFirstEvent,
+            beforeDispatch,
           );
           lastProviderErr = undefined;
           return;

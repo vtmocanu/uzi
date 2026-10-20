@@ -7,7 +7,7 @@ import (
 )
 
 // TestRegisterAdvertisesProtocolFeatures pins the register response's protocol_features to
-// EXACTLY the union of the tokens the landed PRDs ship — #1392 M1's recovery pair, #1391 Run
+// EXACTLY the union, including worker_memory_pressure_v1, of the tokens the landed PRDs ship — #1392 M1's recovery pair, #1391 Run
 // A's heartbeat_outbox, issue #2213's worker_residue_quarantine, #1247's claim_generation_fence (this api implements the fence, so it
 // advertises server support), #1391 Run B M3c's terminal_fence (the api now fences a terminal
 // transition on messages_through_seq contiguity), issue #1766 M2's recovery_cause_vault_locked
@@ -26,7 +26,7 @@ import (
 // recovery_archive_redundancy_v1 right after it (the api accepts the archive redundancy claim).
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
+	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "active_run_snapshot", "provider_policy_hold", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true, true) = %v, want exactly %v", got, want)
 	}
@@ -42,7 +42,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // feature while the other landed tokens stay exactly as they were.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false, true, time.Hour)
-	want := []string{"heartbeat_protocol_refresh_v1", "dind_maintenance_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "recovery_held_publication_v1", "recovery_held_publication_v2"}
+	want := []string{"heartbeat_protocol_refresh_v1", "completion_non_closing_v1", "dind_maintenance_v1", "worker_memory_pressure_v1", "recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1", "heartbeat_outbox", "worker_residue_quarantine", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable", "gate_revision_v1", "milestone_reconciliation_v1", "plan_revision_retry_v1", "recovery_cause_data_volume_full", "recovery_cause_provider_outage", "provider_progress_on_recovery_park_v1", "run_checkpoint_durability", "repo_agent_folder", "terminal_rejection_report", "recovery_held_publication_v1", "recovery_held_publication_v2"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false, true) = %v, want exactly %v", got, want)
 	}

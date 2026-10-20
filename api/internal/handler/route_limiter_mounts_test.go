@@ -584,6 +584,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
 	{"GET", "/api/worker/runs/{id}/decisions-memo", noLimiter},
+	{"GET", "/api/worker/runs/{id}/interrupted-calls", noLimiter},
 	{"GET", "/api/worker/runs/{id}/message-gaps", noLimiter},
 	{"GET", "/api/worker/runs/{id}/orphan-classification", noLimiter},
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
@@ -837,6 +838,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #1171 M1: the Codex credential release/refresh bridge. Bearer-only, scoped to
 	// the worker's own run; the coordinated refresher bounds contention itself and neither
 	// touches the forge → noLimiter, matching the other worker /runs/{id}/... writes.
+	// Worker-only transactional reservation/history writes; no forge or token spend.
+	{"POST", "/api/worker/runs/{id}/memory/reserve", noLimiter},
+	{"POST", "/api/worker/runs/{id}/memory/outcome", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/refresh", noLimiter},
 	{"POST", "/api/worker/runs/{id}/codex/release", noLimiter},
 	// PRD #1226 M2: the completion-interlock permit-issue and same-lead attempt endpoints.

@@ -658,14 +658,18 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
 
 ## Amendment 2026-10-08 — #2445 exhaustion attention
 
-OPEN custody for `recovery_wait` / `worker_requeue_exhausted` takes precedence over
-archive readiness and in-flight capture states: failed latest capture yields
+As extended by the approved #2396 contract on 2026-10-15, OPEN custody at
+`recovery_wait` for either `worker_requeue_exhausted` or `worker_memory_pressure`
+takes precedence over archive readiness and in-flight capture states, after
+discarded/released precedence: failed latest capture yields
 `needs_action`, otherwise `source_only`. Availability remains independent and permits
 export of an existing archive without promising full or latest-work coverage. Owner
 Resume/Cancel remains required; neither a download nor capture progress implicitly
 releases custody. This narrowly qualifies the earlier archive-ready/no-archive
-expectations for exhaustion, including D4 and the procedure above. Inventory-guarded
-warnings and release safeguards are unchanged.
+expectations for exhaustion, including D4 and the procedure above, and applies
+the same bounded attention rule to memory-pressure holds. Other classifier
+decisions, inventory-guarded warnings and release safeguards are unchanged.
+See [ADR-2396](2396-worker-memory-guard.md).
 
 ## Amendment 2026-10-07 — #2394 owner-resumed recovery episodes
 

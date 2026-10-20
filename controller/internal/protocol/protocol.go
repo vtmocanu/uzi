@@ -65,16 +65,17 @@ type DesiredWorker struct {
 	// hostedsvc.DesiredWorker.Isolated; the shared golden pins the two in lockstep.
 	Isolated bool `json:"isolated"`
 	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3).
-	// The controller defers a deliberate roll of a busy worker (cordon-then-roll-when-idle,
-	// M4). Mirrors the api's hostedsvc.DesiredWorker.Busy; the shared golden pins the two
+	// Queued, paused and all waits/gates count when assigned; worker reported_runs
+	// is not authoritative. Drift waits indefinitely for idle unless global ForceRoll.
+	// Mirrors the api's hostedsvc.DesiredWorker.Busy; the shared golden pins the two
 	// in lockstep.
 	Busy bool `json:"busy"`
 	// DrainingSince is WHEN the worker was cordoned (PRD #422 Decision 7), or nil when it
 	// is not draining (nil == not draining). A cordoned worker keeps heartbeating and
-	// finishing its in-flight runs but claims nothing new. This side reads it to enforce
-	// the bounded drain deadline — the reconcile loop is stateless, so `now - draining_since`
-	// is the only elapsed-time signal it has (M5) — and to avoid re-cordoning a worker
-	// already draining (M4). Replaces M3's `draining` bool; mirrors the api's
+	// finishing its own pinned continuations/checkers; unrelated new roots, unassigned
+	// children and judge intake are refused. This timestamp supports independent
+	// NONDRIFTED maintenance timing, not busy drift replacement or timer-based release
+	// (#3103). It also avoids repeat cordons. Replaces M3's bool; mirrors the api's
 	// hostedsvc.DesiredWorker.DrainingSince, and the shared golden pins the two in lockstep.
 	DrainingSince *time.Time `json:"draining_since"`
 	Generation    int64      `json:"generation"`
@@ -96,7 +97,7 @@ type DesiredWorker struct {
 	// recovery custody hold (PRD #1296 M1, D3/D9): a distinct signal, INDEPENDENT of Busy
 	// and DrainingSince, that this side must honor on every teardown / data-PVC recycle path
 	// (ordinary roll, drain deadline, ForceRoll, disk pressure) so a held PVC is never
-	// discarded (the real reconcile wiring lands in M4). Mirrors the api's
+	// discarded, even with zero assigned blockers. Mirrors the api's
 	// hostedsvc.DesiredWorker.CustodyHeld; the shared golden pins the two in lockstep.
 	CustodyHeld bool `json:"custody_held"`
 	// JoinToken is the plaintext, present only until a pod proves it holds it (by

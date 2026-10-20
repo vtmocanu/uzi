@@ -203,7 +203,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)

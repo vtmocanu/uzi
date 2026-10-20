@@ -6,9 +6,10 @@
 # usage: scripts/assert-drain-knobs-render.sh [chart-dir]
 #   e.g. scripts/assert-drain-knobs-render.sh deploy/chart
 #
-# 🔴 WHY THIS EXISTS. M5 adds a bounded drain deadline and an operator force-roll
-# override to the controller's defer-roll logic. The controller reads them from two
-# envs the chart injects (workers.drainDeadline -> UZI_WORKER_DRAIN_DEADLINE,
+# 🔴 WHY THIS EXISTS. The compatible deadline now bounds only independent NONDRIFTED
+# maintenance; busy image/template drift waits indefinitely for idle (#3103).
+# Force-roll is a GLOBAL emergency override, not targeted recovery. The controller
+# reads them from two envs the chart injects (workers.drainDeadline -> UZI_WORKER_DRAIN_DEADLINE,
 # workers.forceRoll -> UZI_WORKER_FORCE_ROLL). A template edit that dropped or
 # misnamed either env would silently fall the controller back to its built-in
 # defaults (24h / false) with nothing red — so this harness renders the chart and
@@ -123,7 +124,7 @@ else
   echo "OK (b): --set workers.forceRoll=true renders UZI_WORKER_FORCE_ROLL='$got_force_override'"
 fi
 
-# --- (c) --set workers.drainDeadline=1h changes the rendered env -----------------------
+# --- (c) 1h maintenance override still renders; it cannot force busy image upgrades ---
 got_deadline_override=$(render_env "$CHART" "UZI_WORKER_DRAIN_DEADLINE" --set workers.drainDeadline="$OVERRIDE_DEADLINE")
 if [ -z "$got_deadline_override" ]; then
   echo "BROKEN: UZI_WORKER_DRAIN_DEADLINE was absent from the deadline override render" >&2
@@ -133,7 +134,7 @@ if [ "$got_deadline_override" != "$OVERRIDE_DEADLINE" ]; then
   echo "FAIL (c): --set workers.drainDeadline=$OVERRIDE_DEADLINE rendered '$got_deadline_override' -- the override did not take" >&2
   fail=1
 else
-  echo "OK (c): --set workers.drainDeadline override renders '$got_deadline_override'"
+  echo "OK (c): independent maintenance workers.drainDeadline override renders '$got_deadline_override'"
 fi
 
 # (d) issue #1815: workers.ephemeralWorkerDataSize renders its 40Gi default, and an

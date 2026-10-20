@@ -116,12 +116,10 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   const attemptId = mintAttemptId(generation);
   const clone = await git.runnerCloneForBranch(bare, branch, "issue-2433", {
     isLive: () => false,
-    quiescent: async () => true,
     beforeFree: async () => { throw new Error("attempt seed must not free a canonical clone"); },
   }, claim.run_id, false, undefined, {
     attemptId, isLive: () => false,
     beforeSeed: async paths => assert.deepEqual(paths, []),
-    quiescent: async () => true,
   });
   const head = commit(clone.path, "durable-completed.txt");
   const context: PositiveOwedCandidateContext = {

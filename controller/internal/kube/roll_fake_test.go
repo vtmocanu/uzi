@@ -128,16 +128,6 @@ func (f *fakeCordoner) RequestDrainWithReason(ctx context.Context, id string, re
 func (f *fakeCordoner) ClearDrainWithReason(ctx context.Context, id string, reason ...string) error {
 	return f.ClearDrain(ctx, id)
 }
-func (f *fakeCordoner) ConfirmImageRollDrain(ctx context.Context, id string) (protocol.DesiredWorker, error) {
-	if err := f.RequestDrainWithReason(ctx, id, "image_roll"); err != nil {
-		return protocol.DesiredWorker{}, err
-	}
-	w, ok := f.confirmWorkers[id]
-	if !ok {
-		return protocol.DesiredWorker{}, fmt.Errorf("fresh API state not configured")
-	}
-	return w, nil
-}
 func templatePatches(c *fake.Clientset) []string {
 	ids := []string{}
 	for _, a := range c.Actions() {

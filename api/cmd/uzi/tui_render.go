@@ -286,6 +286,9 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 		// two apart at a glance.
 		return "~", "pool wait"
 	case statusRecoveryWait:
+		if len(cause) > 0 && cause[0] == workerMemoryPressureCause {
+			return "!", "memory hold"
+		}
 		if len(cause) > 0 && cause[0] == workerRequeueExhaustedCause {
 			return "~", "requeue limit"
 		}

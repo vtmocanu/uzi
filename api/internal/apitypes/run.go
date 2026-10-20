@@ -193,6 +193,16 @@ type WorkerRecoveryDTO struct {
 	Evidence              *WorkerRecoveryEvidenceDTO `json:"evidence"`
 }
 
+// MemoryHoldDTO is the owner's memory intervention allowance for a held episode.
+// Max and Remaining are null when the frozen policy is absent or unsupported.
+// This allowance is independent of WorkerRecoveryDTO's requeue budget.
+type MemoryHoldDTO struct {
+	Episode   int64  `json:"episode"`
+	Used      int32  `json:"used"`
+	Max       *int32 `json:"max"`
+	Remaining *int32 `json:"remaining"`
+}
+
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
 	PolicyRefusal                                  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
@@ -200,6 +210,7 @@ type RunDTO struct {
 	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
 	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
 	WorkerRecovery                                 *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+	MemoryHold                                     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1044,6 +1055,7 @@ type CredentialEpochDTO struct {
 type RunSummaryItemDTO struct {
 	PolicyRefusal  *PolicyRefusalDTO  `json:"policy_refusal,omitempty"`
 	WorkerRecovery *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
+	MemoryHold     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -1821,6 +1833,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 	return RunSummaryItemDTO{
 		PolicyRefusal:               item.PolicyRefusal,
 		WorkerRecovery:              item.WorkerRecovery,
+		MemoryHold:                  item.MemoryHold,
 		ID:                          item.ID,
 		RepoID:                      item.RepoID,
 		ForgeType:                   item.ForgeType,
@@ -1985,6 +1998,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 		RunDTO: RunDTO{
 			PolicyRefusal:               s.PolicyRefusal,
 			WorkerRecovery:              s.WorkerRecovery,
+			MemoryHold:                  s.MemoryHold,
 			ID:                          s.ID,
 			RepoID:                      s.RepoID,
 			ForgeType:                   s.ForgeType,

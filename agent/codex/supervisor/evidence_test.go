@@ -96,7 +96,7 @@ func TestDisposeEvidenceDrained(t *testing.T) {
 }
 
 func TestDisposeEvidenceUnconfirmed(t *testing.T) {
-	d := drainResult{State: stateUnconfirmed, Reason: reasonDeadline, Killed: []int{11}, Reaped: nil, Children: []int{11}}
+	d := drainResult{State: stateUnconfirmed, Reason: reasonDeadline, Killed: []int{11}, Reaped: nil, Children: []processIdentity{{Pid: 11, StartTime: "123"}}}
 	m := decode(t, disposeEvidence(5, d))
 	if m["state"] != stateUnconfirmed || m["reason"] != reasonDeadline {
 		t.Errorf("state/reason = %v/%v", m["state"], m["reason"])

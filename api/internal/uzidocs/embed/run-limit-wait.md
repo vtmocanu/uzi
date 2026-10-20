@@ -101,18 +101,50 @@ moment.
 
 - **On by default** — the same **Settings → Usage limits** card as
   the pause toggle above has its own checkbox, *"Alert me when my 7-day limit
-  resets early"*. It's independent of whether waiting on limits is turned on.
+  resets early"*. This existing setting covers Anthropic tokens and Codex
+  subscription accounts, independently of whether waiting on limits is turned on.
 - **A Slack DM, loud on purpose, and Slack-only** — a `🚨 7-DAY RATE LIMIT
   RESET EARLY` message naming the expected reset time, when it was actually
-  observed, and how many hours you got back. It needs a linked Slack account
-  to reach you (see [Slack notifications](slack.md)); with no Slack linked,
-  you don't get this alert at all — the reset still shows up on the
+  observed, and how many hours you got back. Codex uses `🚨 CODEX WEEKLY LIMIT
+  RESET EARLY` with the same timing facts. It needs a linked, confirmed Slack
+  account with notifications enabled to reach you (see [Slack notifications](slack.md));
+  with no Slack linked, you don't get this alert at all — the reset still shows up on the
   rate-limit meters, just without the push.
 - **The 8-hour threshold is fixed**, not a setting you can tune.
 - **It only tells you** — it does not resume a paused run early or otherwise
   act on your behalf. A run parked with [wait on limit](#on-by-default) still
   resumes on the schedule described above; this alert just lets you know
   sooner that the account itself has room again.
+
+### Codex subscription accounts
+
+Codex early-reset alerts compare successful account usage polls, even with no
+active or previously blocked run. Saved aliases of the same subscription account
+share one comparison basis and alert; they do not each generate a separate alert.
+OpenAI API keys are outside this behavior.
+
+Detection uses the main `codex` bucket (with no display name), with exactly one
+weekly window whose reported duration is **604800 seconds**. It ignores extra
+buckets, non-weekly windows and ambiguous main or weekly windows. The previous
+successful reading must have had a reset still pending when that reading was
+recorded, and the new observation must be **strictly more than 8 hours** before
+that expected reset. Then either of these signals qualifies:
+
+- The advertised reset advances by **strictly more than 1 hour**.
+- The reset stays identical and usage falls from **at least 5%** to **at most
+  1%**, with both percentages present, finite and within 0–100%.
+
+A missing or invalid comparison basis stays silent, including missing or invalid
+reset times. The percentage signal also stays silent when either percentage is
+absent or invalid; the advancing-reset signal does not require percentages.
+
+Delivery is **persist-first and best effort**: uzi accepts the new meter reading
+before creating the notification row, and persists that row before queuing the
+Slack DM. Account authority and enabled aliases are checked again before the
+post. Failed notification creation or delivery is not retried, and this alert has
+no durable redelivery. A crash or dropped DM can therefore lose an alert; API
+replicas observing the same change can send duplicates. This is notification
+only: it does not promote a parked run, switch accounts or change a resume time.
 
 ## Not the same as waiting for a pooled token or an empty model turn
 

@@ -8,9 +8,11 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -75,6 +77,7 @@ const (
 // permit endpoint returns those same reasons as a structured result instead). The handler maps
 // these to HTTP status codes.
 var (
+	ErrInvalidNonClosing = errors.New("completion: non_closing requires an issue run and a reason of 1–500 Unicode codepoints")
 	// ErrCompletionStaleClaim → 409: the run is not this worker's live claimed run.
 	ErrCompletionStaleClaim = errors.New("completion: run is not in a live claimed state for this worker")
 	// ErrCompletionNotInterlocked → 400: the run is legacy and never permit-gates.
@@ -99,6 +102,11 @@ type CompletionPermitRequest struct {
 	ClaimGeneration *int64
 }
 
+// CompletionNonClosing is worker intent only; it grants no completion or scope authority.
+type CompletionNonClosing struct {
+	Reason string `json:"reason"`
+}
+
 // CompletionAttemptRequest is the same-lead nudge (M3) request (PRD #1226 M2/M3, D4): the worker
 // reports the lead's declared milestones_completed plus the current head and worktree fingerprint.
 // The SERVER union-merges the declaration into runs.milestones_completed, recomputes the unmet set
@@ -108,6 +116,7 @@ type CompletionPermitRequest struct {
 // run.ContractRevision, never on a worker-supplied revision (only the permit endpoint checks a
 // requested revision, for revision_drift).
 type CompletionAttemptRequest struct {
+	NonClosing *CompletionNonClosing
 	// MilestonesCompleted is the lead's signal_done declaration (frozen milestone ids). The
 	// server subset-validates it against the run's frozen list (progressParams) and UNIONs it
 	// into runs.milestones_completed before recomputing unmet. nil ⇒ nothing declared this
@@ -535,7 +544,7 @@ func (s *Service) requestCompletionPermitLocked(ctx context.Context, wkr store.W
 		// A gated attempt with missing milestones: record it (bounded) and deny non-terminally.
 		// A recompute race that reclaimed the run (ErrNoRows from the write) leaves the denial
 		// intact — the recompute was valid at load; only an infra error propagates.
-		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, "", nil, req.ClaimGeneration); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
+		if _, aerr := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, "", nil, nil, req.ClaimGeneration); aerr != nil && !errors.Is(aerr, pgx.ErrNoRows) {
 			return CompletionPermitResult{}, aerr
 		}
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
@@ -596,6 +605,14 @@ func (s *Service) requestCompletionPermitLocked(ctx context.Context, wkr store.W
 // attempt" ordering hazard. It returns the server-authoritative unmet set and the new attempt
 // count. Claim-fence denials come back as sentinel errors the handler maps to status codes.
 func (s *Service) RecordCompletionAttempt(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CompletionAttemptRequest) (CompletionAttemptResult, error) {
+	if req.NonClosing != nil {
+		clean, _ := stripNUL(req.NonClosing.Reason)
+		clean = strings.TrimSpace(clean)
+		if n := utf8.RuneCountInString(clean); n < 1 || n > 500 {
+			return CompletionAttemptResult{}, ErrInvalidNonClosing
+		}
+		req.NonClosing = &CompletionNonClosing{Reason: clean}
+	}
 	locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 	if err != nil {
 		return CompletionAttemptResult{}, err
@@ -634,6 +651,9 @@ func (s *Service) recordCompletionAttemptLocked(ctx context.Context, wkr store.W
 	if req.ClaimGeneration == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return CompletionAttemptResult{}, ErrMissingClaimGeneration
 	}
+	if req.NonClosing != nil && run.Kind != "issue" {
+		return CompletionAttemptResult{}, ErrInvalidNonClosing
+	}
 	// PRD #1226 M3: subset-validate the lead's declaration against the frozen list — the SAME
 	// kind/membership gate SetRunRunning/SetRunCompleted apply (progressParams). declaredJSON is
 	// the jsonb the RecordCompletionAttempt statement UNIONs into milestones_completed; nil when
@@ -649,7 +669,7 @@ func (s *Service) recordCompletionAttemptLocked(ctx context.Context, wkr store.W
 	merged := run
 	merged.MilestonesCompleted = unionMilestoneIDs(run.MilestonesCompleted, declaredJSON)
 	unmet, _ := computeUnmetCriteria(merged)
-	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint, declaredJSON, req.ClaimGeneration)
+	count, err := s.persistCompletionAttempt(ctx, wkr, run, unmet, req.Head, req.WorktreeFingerprint, declaredJSON, req.NonClosing, req.ClaimGeneration)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The run was reclaimed between the load and the write — the fence no longer holds.
@@ -752,7 +772,11 @@ func (s *Service) setRunCompletionHoldLocked(ctx context.Context, wkr store.Work
 // (milestonesCompletedJSON) to union-merge, while the permit path passes nil (it carries no
 // declaration, so the union CASE leaves milestones_completed untouched). pgx.ErrNoRows means the
 // guard (owned + interlocked) failed at write time — a raced reclaim — which each caller interprets.
-func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string, milestonesCompletedJSON []byte, claimGen *int64) (int32, error) {
+func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker, run store.Run, unmet []string, head, worktreeFingerprint string, milestonesCompletedJSON []byte, nonClosing *CompletionNonClosing, claimGen *int64) (int32, error) {
+	var nonClosingReason pgtype.Text
+	if nonClosing != nil {
+		nonClosingReason = pgconv.TextOrNull(nonClosing.Reason)
+	}
 	unmetJSON, err := encodeJSONArray(unmet)
 	if err != nil {
 		return 0, err
@@ -769,13 +793,14 @@ func (s *Service) persistCompletionAttempt(ctx context.Context, wkr store.Worker
 	cleanHead, _ := stripNUL(head)
 	cleanFingerprint, _ := stripNUL(worktreeFingerprint)
 	return s.q.RecordCompletionAttempt(ctx, store.RecordCompletionAttemptParams{
-		MilestonesCompleted: milestonesCompletedJSON,
-		Unmet:               unmetJSON,
-		Head:                pgconv.TextOrNull(strings.TrimSpace(cleanHead)),
-		WorktreeFingerprint: pgconv.TextOrNull(strings.TrimSpace(cleanFingerprint)),
-		RunID:               run.ID,
-		WorkerID:            pgconv.UUID(wkr.ID),
-		ContractRevision:    run.ContractRevision,
+		CompletionNonClosingReason: nonClosingReason,
+		MilestonesCompleted:        milestonesCompletedJSON,
+		Unmet:                      unmetJSON,
+		Head:                       pgconv.TextOrNull(strings.TrimSpace(cleanHead)),
+		WorktreeFingerprint:        pgconv.TextOrNull(strings.TrimSpace(cleanFingerprint)),
+		RunID:                      run.ID,
+		WorkerID:                   pgconv.UUID(wkr.ID),
+		ContractRevision:           run.ContractRevision,
 		// PRD #1247 M5: a present generation records only on its current unreleased claim.
 		// The outer claim guard permits nil only for unreconciled legacy runs.
 		ClaimGeneration: pgconv.Int8Ptr(claimGen),

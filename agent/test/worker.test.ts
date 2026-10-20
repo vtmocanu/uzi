@@ -991,6 +991,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     assert.ok(caps?.includes("cross_check_pins_v1"), "cross-check pins are advertised independently of Codex availability");
     assert.ok(caps?.includes("cross_check_codex_lead_v1"), "the Claude checker capability is advertised independently of Codex availability");
     assert.ok(caps?.includes("ci_config_guard_v1"), "ci_config_guard_v1 (issue #2865) is advertised unconditionally, even when Codex is unavailable");
+    assert.equal(caps?.includes("ci_artifacts_v1"), process.platform === "linux", "artifact capability requires the descriptor-backed consumer");
   });
 });
 
@@ -1034,6 +1035,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "cross_check_pins_v1",
     "cross_check_codex_lead_v1",
     "ci_config_guard_v1",
+    ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.

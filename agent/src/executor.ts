@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
+import type { InterruptedCalls, InterruptedSnapshot } from "./interrupted-calls.js";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
@@ -116,6 +118,9 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  /** Called after harness-specific home preparation, before any model invocation. */
+  prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
+  ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
@@ -231,6 +236,11 @@ export interface RunContext {
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
   memory?: MemoryEntry[];
+  /** Trusted runner capability, separate from advisory memory. Read once per Codex
+   * provider epoch; never include this accessor or its result in model/provider payloads.
+   * An explicit accessor returning undefined refuses epoch startup, even when the
+   * executor has a static capturedMemory option. */
+  capturedMemory?(): CapturedMemoryContext | undefined;
   /** Issue #2083: whether the server enabled the private decisions memo for this run (claim-
    *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
   decisionsMemoEnabled?: boolean;
@@ -270,13 +280,15 @@ export interface RunContext {
   policyHoldSupported?: boolean;
   policyHoldResume?: boolean;
   policyHoldFreshSession?: boolean;
-  /** Issue #105: set ONLY when a resume was dropped for that reason AND the branch
-   *  already carries pushed work. Forwarded to the planning prompt so an amnesiac lead is
-   *  told to read the existing commits rather than redo them — the honest degradation must
-   *  not become silently duplicated work. PRD #209 (D7) adds a SECOND consumer: on the
-   *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
-   *  the IMPLEMENT prompt instead (first turn only). */
+  /** Best-effort positive branch commit count, independent of SDK session survival.
+   *  Planning and first implementation prompts consume it. On resumed snapshots,
+   *  interruptedSnapshot supersedes the legacy continuation wording even when this
+   *  count is absent or zero. */
   priorWork?: PriorWork;
+  /** M2 immutable clone provenance; independent of session survival and evidence availability. */
+  interruptedSnapshot?: InterruptedSnapshot;
+  /** M3 must call immediately before prompt delivery, after any planning wait. May throw lifecycle errors. */
+  getInterruptedCalls?(): InterruptedCalls | undefined;
   /** issue #222: this run was picked up again (a resume), so the runner clone was rebuilt
    *  on this claim (wiped and re-seeded; on a Docker-wired worker, issue #1783 M2, seeded at a
    *  fresh attempt path with the predecessor retained out of reach), so any uncaptured
@@ -702,6 +714,7 @@ export interface RunContext {
    *  through to the legacy finalize). */
   recordCompletionAttempt?(args: {
     declared: string[];
+    nonClosing?: { reason: string };
     head: string | null;
     worktreeFingerprint: string | null;
   }): Promise<{ unmet: string[]; attemptCount: number }>;

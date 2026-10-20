@@ -115,8 +115,11 @@ func renderCIEvidence(ev ciEvidence, tailCap, jobsShown int) string {
 // composeCIRepairDescription returns prefix + FenceBlock(evidence) within the description cap,
 // reducing the evidence as needed. tooLarge is true when the trusted prefix leaves no room for
 // even the smallest evidence block.
-func composeCIRepairDescription(base, guidance string, ev ciEvidence, maxJobs int) (desc string, tooLarge bool) {
-	const limit = workersvc.MaxIssueDescriptionBytes
+func composeCIRepairDescription(base, guidance string, ev ciEvidence, maxJobs int, reserve ...int) (desc string, tooLarge bool) {
+	limit := workersvc.MaxIssueDescriptionBytes
+	if len(reserve) > 0 {
+		limit -= reserve[0]
+	}
 	prefix := composeRunDescriptionWithSections(base, guidance) + ciUntrustedHeading
 	if maxJobs > 0 && len(ev.Jobs) > maxJobs {
 		ev.Jobs = ev.Jobs[:maxJobs]

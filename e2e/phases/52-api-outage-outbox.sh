@@ -56,9 +56,9 @@
 #   Cases 3-5 create their runs with the admin Completion check OFF: an interlocked run cannot
 #   reach `completed` before a live api issues its permit, so it never journals a terminal inside
 #   the outage these cases need.
-#   6. INTERLOCKED-FINISH-DURING-OUTAGE (Completion check back ON): the run retries its completion
-#      permit through the outage instead of failing (`fetch failed` used to fail it, and the journal
-#      replayed that `failed`), then completes at its original generation once the api is back.
+#   6. INTERLOCKED-FINISH-DURING-OUTAGE (Completion check back ON): after durable finalize,
+#      the run retries its fresh publication-running ACK through the outage. Restore the api
+#      on the first retry, then obtain the completion permit and complete at the original generation.
 #
 # WHY the M5 outages are SPILL-GATED rather than fixed-length: the spill trip fires only
 # inside a failed flush, and a failed flush costs a connect timeout whose length is a
@@ -245,18 +245,26 @@ wait_terminal_lost() {
   done
   return 1
 }
-# wait_permit_retrying RUN [TIMEOUT] — block until run RUN, finishing while the api is down, is
-# RETRYING its completion-permit request ("completion permit request failed, retrying", client.ts)
-# rather than failing. An interlocked run cannot journal `completed` before it holds a permit, so it
-# never reaches wait_terminal_lost's journaled terminal during an outage: this is its CASE 6 gate.
-# Same contract as the other wait_*: 0 once observed, 1 on timeout, never `fail`s (the api is down).
-wait_permit_retrying() {
-  local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-permit.log"
+# wait_publication_retrying RUN [TIMEOUT] — after durable finalize, wait for the fresh
+# publication-running ACK to fail its first ordinary send (client.ts). This ACK precedes push
+# and the completion permit, so restore promptly rather than spending its bounded retry budget
+# waiting for a permit request that cannot yet happen. The SAME run must log durable finalize
+# BEFORE a retry line carrying JSON status "running"; terminal and permit retries do not count.
+# Reads to EOF to avoid SIGPIPE. Returns 0 once observed, 1 on timeout, never `fail`s while
+# the api is down; the caller restores the api before judging either result.
+wait_publication_retrying() {
+  local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-publication.log"
   local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$deadline" ]; do
     "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
-    if awk -v r="$run" 'index($0, r) && index($0, "completion permit request failed, retrying") { hit = 1 } END { exit(hit ? 0 : 1) }' "$f"; then
-      pass "run $run is retrying its completion permit against the down api $((SECONDS - start))s in"
+    if awk -v r="$run" '
+        $0 ~ ("\"run_id\"[[:space:]]*:[[:space:]]*\"" r "\"") {
+          if (index($0, "finalize record durable")) { durable = 1; next }
+          if (durable && index($0, "state report failed, retrying") &&
+              $0 ~ /"status"[[:space:]]*:[[:space:]]*"running"/) { hit = 1 }
+        }
+        END { exit(hit ? 0 : 1) }' "$f"; then
+      pass "run $run is retrying its publication-running ACK after durable finalize against the down api $((SECONDS - start))s in"
       return 0
     fi
     sleep 1
@@ -471,7 +479,7 @@ fi
 # contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel but with the SHORT e2e-only stream
 # (UZI_STUB_OUTBOX_TICKS) so the run reaches its terminal INSIDE a bounded outage that still stays
 # under the 300s heartbeat-stale window raised above — the worker stays leased across the outage.
-say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked permit wait)"
+say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked publication ACK retry, then permit after recovery)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
 recreate_outbox_agent
@@ -629,24 +637,24 @@ pass "case 5: the carve-out run's lost terminal landed on replay -> completed at
 # =============================================================================
 # Cases 3-8 hold stub completion until the cut. Cases 7-8 require a durable
 # finalize hand-off AFTER the cut, then interrupt it before terminal completion.
-# CASE 6 — an INTERLOCKED run finishing during the outage WAITS for the api to issue its completion
-# permit, then completes. Regression: its one-shot permit request used to throw `fetch failed` into
-# the generic catch, and the run was journaled and replayed as `failed` (#1644 made every issue run
-# interlocked by default, which is when this phase started failing).
-say "CASE 6: an interlocked run finishing during the outage waits for its completion permit, then completes"
+# CASE 6 — an INTERLOCKED run reaches durable finalize during the outage, then retries its
+# fresh publication-running ACK before push/permit. Restore on that first ordinary retry so its
+# bounded send budget remains available. Completion then exercises the permit after recovery;
+# this case proves publication ACK retry/recovery, not permit transport retry during the outage.
+say "CASE 6: an interlocked run retries its publication-running ACK during the outage, then gets its permit and completes"
 set_interlock true
 make_outbox_run cut_barrier
 RUN_B4="$OUTBOX_RUN"
 GEN_B4="$(rb_run_field "$RUN_B4" claim_generation)"
 [ -n "$(rb_run_field "$RUN_B4" completion_contract_version)" ] \
   || fail "case 6: run $RUN_B4 was not stamped for the completion interlock (completion_contract_version is NULL), so it cannot prove the permit path"
-say "cutting the api so run $RUN_B4 reaches its completion permit while it is down"
+say "cutting the api so run $RUN_B4 reaches durable finalize and retries its publication-running ACK while it is down"
 api_cut
 release_outbox_cut_barrier "$RUN_B4"
-permit_retrying_b4=0; if wait_permit_retrying "$RUN_B4"; then permit_retrying_b4=1; fi
+publication_retrying_b4=0; if wait_publication_retrying "$RUN_B4"; then publication_retrying_b4=1; fi
 api_back
-[ "$permit_retrying_b4" = 1 ] \
-  || fail "case 6: run $RUN_B4 never retried its completion permit while the api was down (it failed, or never reached finalize during the outage)"
+[ "$publication_retrying_b4" = 1 ] \
+  || fail "case 6: run $RUN_B4 never retried its publication-running ACK after durable finalize while the api was down (it failed, or never reached finalize during the outage)"
 wait_status "$RUN_B4" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 wait_drained "$RUN_B4"
 assert_contiguous "$RUN_B4"
@@ -655,7 +663,7 @@ RB4_FR="$(apiget "/api/runs/$RUN_B4" | jq -r '.run.failure_reason // ""')"
   || fail "case 6: the interlocked run carried a failure_reason after the outage: $RB4_FR"
 [ "$(rb_run_field "$RUN_B4" claim_generation)" = "$GEN_B4" ] \
   || fail "case 6: generation advanced — the run was re-executed instead of waiting out the outage (gen $GEN_B4 -> $(rb_run_field "$RUN_B4" claim_generation))"
-pass "case 6: the interlocked run waited out the outage for its permit -> completed at gen $GEN_B4, no false failed"
+pass "case 6: the interlocked run retried its publication-running ACK during the outage, then got its permit after recovery -> completed at gen $GEN_B4, no false failed"
 
 # =============================================================================
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart

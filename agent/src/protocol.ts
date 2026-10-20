@@ -399,6 +399,42 @@ export interface RegisterRequest {
   active_snapshot?: ActiveSnapshot;
 }
 
+export interface MemoryBinding {
+  run_id: string;
+  worker_id: string;
+  register_nonce: string;
+  claim_generation: number;
+  memory_episode: number;
+  intervention_id: string;
+}
+export interface MemoryPolicy { version: 1; max_interventions: number }
+export interface MemoryReservationRequest extends MemoryBinding { policy: MemoryPolicy }
+export interface MemoryOutcomeRequest extends MemoryBinding { outcome: MemoryOutcome }
+export type MemoryOutcome = "no_signal" | "unknown" | "confirmed_drained";
+export interface MemoryReservation extends MemoryBinding {
+  admitted: boolean;
+  authorizing: boolean;
+  allowance: { limit: number; used: number; remaining: number };
+  policy: MemoryPolicy;
+  outcome?: MemoryOutcome;
+}
+export interface WorkerMemoryPressureResult extends Omit<MemoryBinding, "register_nonce"> {
+  attempt_id: string;
+  code: "worker_memory_pressure";
+  command_id: string;
+  tool_id: string;
+  command: string;
+  observed_total_bytes: number;
+  limit_bytes: number;
+  tree_rss_bytes_approx: number;
+  cancellation_confirmed: boolean;
+  outcome: MemoryOutcome;
+  retry_blocked: true;
+  guidance: "Use smaller or serial commands after recovery.";
+}
+
+export type MemoryIncarnation = Readonly<{ worker_id: string; register_nonce: string; revision: number }>;
+
 export interface RegisterResponse {
   // The worker is identified by its Bearer token on every subsequent call
   // (heartbeat/claim carry no worker id in the path), so this is not strictly
@@ -972,6 +1008,8 @@ export interface ClaimConfig {
    *  WORKER-ONLY claim config — deliberately NOT on the web RunDTO. Absent (a legacy,
    *  seeded or switch-off run) ⇒ the worker runs the legacy path, byte-identical to today. */
   completion_contract_version?: number;
+  /** Persisted declaration only; never changes the frozen completion scope. */
+  non_closing?: { reason: string };
   /** PRD #1226 M4 (D5): the FROZEN structural completion-contract revision, read straight off
    *  runs.contract_revision. The worker echoes it VERBATIM in its completion permit request so
    *  the server can reject a revision drift. WORKER-ONLY claim config (NOT the web RunDTO).
@@ -1288,7 +1326,70 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
   planning_diff?: string;
 }
 
-export interface ClaimResponse {
+/** CI repair evidence wire types mirror workersvc.ClaimCIRepair and ciartifacts. */
+export interface CIArtifactExecution {
+  run_id: number;
+  repository_id: number;
+  head_repository_id?: number;
+  workflow_key: string;
+  workflow?: string;
+  sha: string;
+  branch: string;
+  updated_at: string;
+  attempt?: number | null;
+}
+
+export interface CIArtifactEntry {
+  artifact_name?: string;
+  path?: string;
+  compressed_size?: number;
+  uncompressed_size?: number;
+  summary?: boolean;
+  artifact_id: string;
+  entry_ordinal: number;
+  label: string;
+  shortened?: boolean;
+  status: "kept" | "skipped";
+  reason?: string;
+  manifest_id?: string;
+  name?: string;
+  size?: number;
+  sha256?: string;
+}
+
+export interface CIArtifactManifest {
+  execution?: CIArtifactExecution | null;
+  reasons?: string[] | null;
+  omitted_kept_aliases?: number;
+  entries: CIArtifactEntry[];
+  omitted?: number | null;
+  uninspected?: boolean;
+}
+
+export interface ClaimCIRepairFile {
+  /** Canonical job_file UUID; aliases in manifest.entries share this ID. */
+  manifest_id: string;
+  name: string;
+  size: number;
+  sha256: string;
+}
+
+export interface ClaimCIRepair {
+  manifest: CIArtifactManifest;
+  input_files: ClaimCIRepairFile[];
+}
+
+/** Episode state carried by current APIs; absent on legacy claims. A null policy
+ *  means the episode has not frozen an opt-in policy yet, never authorization. */
+export interface ClaimMemoryState {
+  memory_episode?: number;
+  memory_intervention_count?: number;
+  memory_policy?: MemoryPolicy | null;
+}
+
+export interface ClaimResponse extends ClaimMemoryState {
+  /** Guarded prompt repair inputs; metadata is untrusted. */
+  ci_repair?: ClaimCIRepair;
   /** Nonterminal refusal-count constraint and server-derived exact-claim fresh grant. */
   policy_hold_resume?: boolean;
   policy_hold_fresh_session?: boolean;
@@ -1761,7 +1862,7 @@ export interface TaskReviewRequest {
  * input path, uniform with every later turn. A Continue run (Decision 11) carries
  * `resume_of_run_id` and no seeded input (it parks awaiting the next message).
  */
-export interface ChatClaimResponse {
+export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
   kind: "chat";
@@ -1884,6 +1985,7 @@ export interface CreateProposalRequest {
  *  records a bounded attempt — all in one call. Everything is SERVER-authoritative; the worker
  *  reworks against the returned unmet set, never its own belief. */
 export interface CompletionAttemptRequest {
+  non_closing?: { reason: string };
   milestones_completed: string[];
   head: string | null;
   worktree_fingerprint: string | null;
@@ -2405,6 +2507,10 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Memory-pressure park fence, bound to the current registration. */
+  register_nonce?: string;
+  /** Memory-pressure episode; zero is the first episode. */
+  memory_episode?: number;
   /** Source gate and receipts for negotiated plan_revision_retry_v1 writes. */
   expected_gate_revision?: number;
   revision_input_id?: number;
@@ -2754,6 +2860,23 @@ export type CompletedPublicationReason =
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Local acceptance proof from the memory park RPC, never a serialized API receipt.
+   *  Only this binding authorizes marking a memory park; status/applied alone do not. */
+  readonly memoryParkAccepted?: Readonly<{
+    run_id: string;
+    worker_id: string;
+    register_nonce: string;
+    claim_generation: number;
+    memory_episode: number;
+  }>;
+  /** Request-local guard projection; completion permit and frozen contract authority remain unchanged. */
+  completionProjection?: { revision: number; deferredIds: string[] };
+  completionAttempts?: number;
+  runId?: unknown;
+  workerId?: unknown;
+  workerIdentityMatches?: boolean;
+  /** The actual request generation, after feature and strict-decode fallback selection. */
+  sentClaimGeneration?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

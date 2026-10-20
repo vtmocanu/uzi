@@ -14,7 +14,7 @@ import { realpathSync } from "node:fs";
 
 const scratch = realpathSync(os.tmpdir());
 const run = "11111111-1111-4111-8111-111111111111";
-test("bad MAC retains attempts above the limit, every ledger state, and terminal clone; control deletes", async () => {
+test("bad MAC retains attempts above the diagnostic limit, every ledger state, and terminal clone; automatic sweep retains controls", async () => {
   const root = makeScratchRoot("terminal-retention-", scratch);
   const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
   const cmd = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, ...args], { env, encoding: "utf8", stdio: "pipe" });
@@ -58,16 +58,19 @@ test("bad MAC retains attempts above the limit, every ledger state, and terminal
       cmd(bare, "config", "--add", ledgerKey, JSON.stringify({ attemptId: id, runId: run, clonePath: `${canonical}.attempt-${id}`, state }));
     }
     const seeded = await git.runnerCloneForBranch(bare, branch, "issue-7", noProofReseed, "new-run", false, undefined, {
-      attemptId: mintAttemptId(9), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
+      attemptId: mintAttemptId(9), isLive: () => false, beforeSeed: async () => {},
     });
     for (const p of retained) assert.ok(fs.existsSync(p), p);
     const entries = cmd(bare, "config", "--get-all", ledgerKey).trim().split("\n").map((v) => JSON.parse(v));
     assert.equal(entries.filter((e) => e.runId === run).length, 8);
-    const retiredControl = entries.find((e) => e.runId.startsWith("control-") && e.state === "retired");
-    assert.ok(retiredControl, "control deletion ran");
-    assert.equal(fs.existsSync(retiredControl.clonePath), false);
-    assert.equal(fs.existsSync(path.join(path.dirname(retiredControl.clonePath),
-      `.uzi-skills-${path.basename(retiredControl.clonePath)}`)), false);
+    const controls = entries.filter((e) => e.runId.startsWith("control-"));
+    assert.equal(controls.length, 4, "automatic sweep keeps every control ledger entry");
+    for (const control of controls) {
+      assert.equal(control.state, "abandoned", "no automatic retirement authority");
+      assert.equal(fs.readFileSync(path.join(control.clonePath, "WORK"), "utf8"), "last copy");
+      assert.equal(fs.existsSync(path.join(path.dirname(control.clonePath),
+        `.uzi-skills-${path.basename(control.clonePath)}`)), true);
+    }
     await git.markRecoveryCapture(bare, seeded.path, branch, run);
     await assert.rejects(git.retireRunnerClone(bare, seeded.path, branch, run, { discard: true }), /terminal record custody/);
     assert.ok(fs.existsSync(seeded.path));

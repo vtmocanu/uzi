@@ -61,6 +61,32 @@ Maintainer-provided provenance reports PR2358 reviewer/tester/auditor validation
 
 The lander retains the capable-host confinement merge gate against the PR head. Hosted acceptance remains maintainer-owned in acceptance issue 2152. Automatic checker revision, the Codex-lead direction, dedicated checker slots, checker model/effort pins and code cross-check were outside the original #2149 implementation; #2150 extends automatic revisions below. The other exclusions remain. Observed at documentation commit `ba73044a`: `task docs:sync` completed; `task gate:web` PASS (5641 unit tests and 8 Chromium tests, including `check-docs:web`), `npm --prefix web run build` PASS, `task gate:repo` PASS and `task gate:api` PASS, including the embedded-docs package. Secrets scanning reported zero tracked-file findings and detected both canaries; SAST reported zero findings and detected its canary. The read-only docs reviewer reported no mandatory or optional findings. These are component-gate results from that #2149 documentation pass, not a replay of prior LiveDB or capable-host confinement proof. No runtime source or confinement harness changed.
 
+## Amendment 2026-10-19 — #3123: existing advisory code-snapshot retry
+
+This amendment concerns the existing advisory code cross-check completion path,
+not plan-check rounds. If the initial done checkpoint leaves no usable snapshot,
+its existing snapshot request can freshly quiesce and reimport once. It retains
+the exact pre-import head, or, if that was unreadable, the head supplied by a
+successfully settled normal completion-record callback. A null or moved candidate
+gives `snapshot_failed`; a fresh current head cannot substitute for it. Before
+pinning, the reimport must prove the full producing context, claim generation and
+committed tracking receipt. Ordinary snapshot failure and a clean soft stop
+produce SHA-free incomplete evidence.
+
+The explicit reaped Codex path with `executor.safety` gives the initial done
+checkpoint and this existing fresh request independent absolute 60 s soft /
+90 s hard allowances. Their combined duration may approach 180 s, without
+resetting the clock per command. This adds no model turn, completion attempt,
+checker invocation or repair rerun: one advisory check and one repair remain
+the policy. Finalize independently imports authoritative work under its own
+guards and unchanged 50-minute boundary; it is not this snapshot retry.
+
+Hard Codex boundary errors, Git hard aborts and unsafe cleanup propagate through
+both the import helper and the snapshot advisory catch. Shutdown/lifecycle abort
+prevents fresh admission. See [ADR-1597's safe points and residuals](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+Source and local test evidence do not establish hosted acceptance or resolution
+of the reported production timings.
+
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
 Capture budgets are split: the object-store snapshot copy has its own 128 MiB budget, streamed in 16 KiB chunks that yield on a roughly 20 ms clock so SIGTERM cleanup runs inside the 2 s kill grace, and the source reads (worktree compares and verified object reads) keep a separate 128 MiB budget. Measured once during #2410 on a clone of this repository at 24f28b1d through a real TickSpawner: snapshot 74.3 MiB, source 99.7 MiB (about 78% of its budget, the tighter headroom), peak temporary tree near 74.3 MiB, wall 6.6 s against the 28 s deadline.

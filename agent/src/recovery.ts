@@ -520,6 +520,14 @@ export const PERMANENT_UPLOAD_REASONS: ReadonlySet<string> = new Set([
   "local_bundle_mismatch",
 ]);
 
+/** Bounded server reconciliation reasons that retain custody for owner attention. */
+const INVENTORY_RECONCILE_ATTENTION_REASONS: ReadonlySet<string> = new Set([
+  "hold_released_without_final_receipt", "hold_not_open", "hold_not_original_worker",
+  "capture_not_replaceable", "capture_manifest_integrity_mismatch", "available_capture_manifest_unbound",
+  "capture_manifest_invalid", "capture_failure_requires_attention", "available_capture_expiry_invalid",
+  "capture_state_unknown",
+]);
+
 /** The `needs_action` reasons a live pass may retry (all need a journaled bundle). */
 const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
@@ -527,6 +535,9 @@ const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "upload_transient",
   "storage_quota_exceeded",
   "credential_rejected",
+  "final_retry_refused",
+  "final_retry_unknown",
+  "inventory_hold_settled",
   "inventory_source_not_quiescent",
   "inventory_source_not_quiescent:inventory_read_not_verified",
   ...INVENTORY_SOURCE_CHECKS.filter(check => check !== "inventory_read_not_verified")
@@ -871,6 +882,88 @@ export class RecoveryCoordinator {
   /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
   private credentialBlockedAt: number | undefined;
   private readonly lastAttemptAt = new Map<string, number>();
+  /** Automatic saved-FINAL retries remain eligible indefinitely, paced independently of peers.
+   * Process-local only: restart permits one fresh attempt. Counts saturate at the delay cap. */
+  private readonly finalRetry = new Map<string, { identity: string; failures: number; nextAt: number }>();
+  /** Latest transition per fixed retainFinal predicate; bounded to four entries per capture. */
+  private readonly finalRefusalLogged = new Map<string, { identity: string; transitions: Map<string, string> }>();
+
+  private finalRetryIdentity(record: RecoveryRecord): string | undefined {
+    return record.inventoryGuarded && record.finalRequest && !record.finalAcknowledged && !record.completionReceipt
+      ? canonicalJson([record.runId, record.generation, record.captureId, record.serverCaptureId, record.exactHoldBinding, record.finalRequest])
+      : undefined;
+  }
+
+  private finalRetryReady(record: RecoveryRecord): boolean {
+    const identity = this.finalRetryIdentity(record);
+    const retry = this.finalRetry.get(record.captureId);
+    if (retry && retry.identity !== identity) this.finalRetry.delete(record.captureId);
+    if (this.finalRefusalLogged.get(record.captureId)?.identity !== identity) this.finalRefusalLogged.delete(record.captureId);
+    return !identity || retry?.identity !== identity || retry.nextAt <= this.now();
+  }
+
+  private pruneFinalRetries(records: RecoveryRecord[]): void {
+    const seen = new Set(records.map(record => record.captureId));
+    for (const record of records) this.finalRetryReady(record);
+    for (const id of this.finalRetry.keys()) if (!seen.has(id)) this.finalRetry.delete(id);
+    for (const id of this.finalRefusalLogged.keys()) if (!seen.has(id)) this.finalRefusalLogged.delete(id);
+  }
+
+  private async retainFinal(record: RecoveryRecord, reason: "final_retry_refused" | "final_retry_unknown" | "inventory_hold_settled" | "credential_rejected", err?: unknown, persist = true): Promise<void> {
+    const identity = this.finalRetryIdentity(record);
+    if (!identity || residueQuarantine() !== undefined) return;
+    const current = persist ? await this.writeExistingRecord(record, cur =>
+      this.finalRetryIdentity(cur) === identity && cur.reason !== reason && !["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(cur.reason ?? "")
+        && !INVENTORY_RECONCILE_ATTENTION_REASONS.has(cur.reason ?? "")
+        ? { ...cur, reason } : undefined) : await this.requireRecord(record);
+    if (this.finalRetryIdentity(current) !== identity) return;
+    // Only known protocol reasons can enter diagnostics; RequestError text/body is untrusted.
+    const known = new Set(["not_authorized", "ambiguous_generation", "capture_not_found", "not_available",
+      "manifest_conflict", "bad_request", "oversize", "integrity", "quota", "busy", "internal"]);
+    const parsed = err instanceof RequestError ? errorReason(err) : undefined;
+    const code = parsed && known.has(parsed) ? parsed : "unknown";
+    const status = err instanceof RequestError && Number.isInteger(err.status) && err.status >= 100 && err.status <= 599
+      ? err.status : undefined;
+    const transition = canonicalJson([reason, code, status]);
+    const prior = this.finalRefusalLogged.get(record.captureId);
+    const transitions = prior?.identity === identity ? prior.transitions : new Map<string, string>();
+    if (transitions.get(reason) === transition || (err === undefined && transitions.has(reason))) return;
+    transitions.set(reason, transition);
+    this.finalRefusalLogged.set(record.captureId, { identity, transitions });
+    this.log.warn("recovery: FINAL retry retained", {
+      run_id: current.runId.slice(0, 160), generation: current.generation,
+      capture_id: current.captureId.slice(0, 160),
+      ...(current.exactHoldBinding ? { hold_id: current.exactHoldBinding.holdId } : {}),
+      reason: code, refusal_code: status ?? "unknown", refusing_predicate: reason,
+      disposition: current.holdSettlement?.state ?? "unknown",
+    });
+  }
+
+  private async paceFinalRetry(record: RecoveryRecord, outcome: RecoveryOutcome | void): Promise<void> {
+    if (residueQuarantine() !== undefined || !outcome?.reason ||
+        (!["upload_transient", "storage_quota_exceeded", "final_retry_refused", "final_retry_unknown",
+          "stale_ownership", "upload_rejected"].includes(outcome.reason) &&
+          !INVENTORY_RECONCILE_ATTENTION_REASONS.has(outcome.reason))) return;
+    const latest = await this.readLatest(record);
+    if (latest.kind !== "ok" || this.finalRetryIdentity(latest.record) !== this.finalRetryIdentity(record) ||
+        !this.finalRetryIdentity(latest.record)) {
+      this.finalRetry.delete(record.captureId);
+      this.finalRefusalLogged.delete(record.captureId);
+      return;
+    }
+    if (["inventory_snapshot_changed", "inventory_quiescence_breach"].includes(latest.record.reason ?? "")) return;
+    if (latest.record.reason === "credential_rejected") return;
+    if (latest.record.holdSettlement && !await this.finalHoldAllowsReplay(latest.record, "settled")) return;
+    const identity = this.finalRetryIdentity(latest.record)!;
+    const previous = this.finalRetry.get(record.captureId);
+    const maxFailures = Math.max(1, Math.ceil(Math.log2(this.liveBackoffCapMs / this.liveBackoffBaseMs)));
+    const failures = Math.min((previous?.identity === identity ? previous.failures : 0) + 1, maxFailures);
+    this.finalRetry.set(record.captureId, { identity, failures,
+      nextAt: this.now() + Math.min(this.liveBackoffBaseMs * 2 ** failures, this.liveBackoffCapMs) });
+    if (outcome.reason === "final_retry_unknown" && latest.record.reason !== "final_retry_refused" && latest.record.reason !== "final_retry_unknown") {
+      await this.retainFinal(latest.record, "final_retry_unknown");
+    }
+  }
   /** Per-capture exponential backoff of the live archived-pin cleanup (pruned like lastAttemptAt). */
   private readonly pinCleanupBackoff = new Map<string, { failures: number; nextAt: number }>();
   /** One diagnostic per retained ACK; pruned with the live journal snapshot. */
@@ -1257,7 +1350,10 @@ export class RecoveryCoordinator {
       (current.finalRequest.evidence === undefined || current.finalRequest.evidence === settled.release_evidence);
   }
 
-  private heldStopped(record: RecoveryRecord, state: "settled" | "unknown"): RecoveryOutcome {
+  private async heldStopped(record: RecoveryRecord, state: "settled" | "unknown"): Promise<RecoveryOutcome> {
+    if (record.finalRequest && !record.finalAcknowledged) {
+      await this.retainFinal(record, state === "settled" ? "inventory_hold_settled" : "final_retry_unknown");
+    }
     return { state: record.state, captureId: record.captureId,
       reason: state === "settled" ? "inventory_hold_settled" : "inventory_hold_unknown",
       held: state === "settled" ? "settled" : "kept" };
@@ -1329,6 +1425,12 @@ export class RecoveryCoordinator {
 
   private async finalizeInventoryInAttempt(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
     if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
+    // Exact closure can refuse work before mutable health/source probes. It grants no ACK or cleanup.
+    const current = await this.requireRecord(snapshot);
+    if (current.finalRequest && !current.finalAcknowledged && current.exactHoldBinding) {
+      const hold = await this.heldOperationState(current);
+      if (hold === "settled" && !await this.finalHoldAllowsReplay(current, hold)) return this.heldStopped(current, hold);
+    }
     let outcome: RecoveryOutcome | void = undefined;
     let sourceVerified = true;
     const diagnostics = this.inventorySourceDiagnostics({ ...snapshot.coverageContext, generation: snapshot.generation }, snapshot.captureId);
@@ -1759,11 +1861,17 @@ export class RecoveryCoordinator {
       await this.forgetGenerationWithinCycle(record.runId, record.generation!);
       return { state: "uploaded", captureId: record.captureId };
     } catch (err) { MaintenanceBudget.current()?.check();
-      this.log.warn("recovery: final inventory ACK pending; exact request retained", { run_id: record.runId, generation: record.generation, error: errText(err) });
       const cls = await classifyUploadFailure(err, record);
+      await this.retainFinal(record, cls.kind === "credential" ? "credential_rejected" :
+        err instanceof RequestError && [403, 409].includes(err.status) ? "final_retry_refused" : "final_retry_unknown", err,
+        cls.kind === "credential" || (err instanceof RequestError && [403, 409].includes(err.status)));
       if (cls.kind === "credential") this.credentialBlockedAt = this.now();
-      const reconciled = await this.reconcileInventory(record, prove, observedStatus);
-      if (reconciled) return reconciled;
+      // retainFinal changed the authenticated journal. Reconciliation's guarded reason
+      // write must compare against that snapshot, while keeping the same saved FINAL.
+      const latest = await this.readLatest(record);
+      const reconciled = latest.kind === "ok" && this.finalRetryIdentity(latest.record) === this.finalRetryIdentity(record)
+        ? await this.reconcileInventory(latest.record, prove, observedStatus) : undefined;
+      if (reconciled && reconciled.reason !== "final_retry_unknown") return reconciled;
       return { state: record.state, captureId: record.captureId,
         reason: cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason };
     }
@@ -1852,9 +1960,10 @@ export class RecoveryCoordinator {
       // 400 is the strict-decode refusal of an api that rolled back past this kind. Everything else
       // (transport, timeout, 5xx, the typed client-side feature absence) proves nothing: keep.
       if (err instanceof RequestError && err.status === 400) return await clearHeld("held_publication_downgrade_400");
-      this.log.warn("recovery: held publication final ACK pending; exact request retained", {
-        run_id: record.runId, generation: record.generation, error: errText(err) });
       const cls = await classifyUploadFailure(err, record);
+      await this.retainFinal(record, cls.kind === "credential" ? "credential_rejected" :
+        err instanceof RequestError && [403, 409].includes(err.status) ? "final_retry_refused" : "final_retry_unknown", err,
+        cls.kind === "credential" || (err instanceof RequestError && [403, 409].includes(err.status)));
       if (cls.kind === "credential") this.credentialBlockedAt = this.now();
       return kept(cls.kind === "transient" ? cls.reason ?? "upload_transient" : cls.reason);
     }
@@ -1921,17 +2030,20 @@ export class RecoveryCoordinator {
   /** One atomic reconciliation attempt; failures keep custody and every saved identity. */
   private async reconcileInventory(record: RecoveryRecord, prove: () => Promise<boolean>, status?: RecoveryCaptureStatusResponse): Promise<RecoveryOutcome | void> {
     if (!record.serverCaptureId || !record.coverageDigest || !record.generation ||
-        !hasJournaledBundle(record) || !this.client.reconcileRecoveryCapture ||
-        !this.client.hasFeature?.("recovery_inventory_v1")) return;
+        !hasJournaledBundle(record) || !this.client.hasFeature?.("recovery_inventory_v1")) return;
+    const unknown = (): RecoveryOutcome | void => record.finalRequest
+      ? { state: record.state, captureId: record.captureId, reason: "final_retry_unknown" } : undefined;
     try {
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
+      if (!this.client.reconcileRecoveryCapture) return unknown();
       const response = await recoveryRPC(() => this.client.reconcileRecoveryCapture!(record.runId, record.serverCaptureId!, {
         generation: record.generation!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
         checksum: record.checksum!, byte_size: record.byteSize!,
       }));
+      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       if (!response || typeof response !== "object" || Array.isArray(response) ||
-          residueQuarantine() !== undefined || response.run_id !== record.runId ||
-          response.generation !== record.generation || response.capture_id !== record.serverCaptureId!) return;
+          response.run_id !== record.runId || response.generation !== record.generation ||
+          response.capture_id !== record.serverCaptureId!) return unknown();
       if (response.outcome === "accepted") {
         const receipt = response.final_receipt;
         const saved = record.finalRequest;
@@ -1948,7 +2060,7 @@ export class RecoveryCoordinator {
               typeof receipt.source_sha !== "string" || !/^[0-9a-f]{40}$/.test(receipt.source_sha))) ||
             canonicalJson(receipt) !== canonicalJson(saved.disposition) ||
             response.release_evidence !== saved.evidence ||
-            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return;
+            (receipt.kind !== "archive" && receipt.kind !== "settled" && receipt.kind !== "held_publication")) return unknown();
         if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
@@ -1960,27 +2072,23 @@ export class RecoveryCoordinator {
       }
       if (response.outcome === "retained") {
         // api/internal/recovery/reconcile.go emits only these bounded protocol reasons.
-        const reasons = new Set(["hold_released_without_final_receipt", "hold_not_open",
-          "hold_not_original_worker", "generation_not_ended", "capture_not_replaceable",
-          "capture_manifest_integrity_mismatch", "available_capture_manifest_unbound",
-          "capture_manifest_invalid", "capture_failure_requires_attention",
-          "available_capture_expiry_invalid", "capture_available", "capture_state_unknown"]);
         if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
-            typeof response.reason !== "string" || !reasons.has(response.reason)) return;
+            typeof response.reason !== "string" || (!INVENTORY_RECONCILE_ATTENTION_REASONS.has(response.reason) &&
+              response.reason !== "capture_available" && response.reason !== "generation_not_ended")) return unknown();
         const reason = response.reason;
-        if (reason === "capture_available" || reason === "generation_not_ended") return;
+        if (reason === "capture_available" || reason === "generation_not_ended") return unknown();
         const current = await this.writeExistingRecord(record, cur =>
           residueQuarantine() === undefined && !cur.finalAcknowledged &&
-          canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
+          cur.reason !== reason && canonicalJson(cur) === canonicalJson(record) ? { ...cur, reason } : undefined);
         if (current.reason !== reason) return;
-        this.log.warn("recovery: inventory requires owner attention", {
+        if (record.reason !== reason) this.log.warn("recovery: inventory requires owner attention", {
           run_id: current.runId, generation: current.generation, reason,
         });
         return { state: current.state, captureId: current.captureId, reason };
       }
       if (response.final_receipt !== undefined || response.release_evidence !== undefined ||
           response.outcome !== "replaceable" || response.reason !== undefined ||
-          !status || !replaceableInventoryStatus(status, record, this.now())) return;
+          !status || !replaceableInventoryStatus(status, record, this.now())) return unknown();
       if (!await this.openInventoryHold(record) || !await prove() ||
           !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
       await this.writeExistingRecord(record, cur => {
@@ -2001,7 +2109,9 @@ export class RecoveryCoordinator {
         return next;
       });
     } catch (err) { MaintenanceBudget.current()?.check();
-      this.log.warn("recovery: capture reconciliation pending; custody retained", { run_id: record.runId, error: errText(err) });
+      if (record.finalRequest) await this.retainFinal(record, "final_retry_unknown", err);
+      else this.log.warn("recovery: capture reconciliation pending; custody retained", { run_id: record.runId, error: errText(err) });
+      return unknown();
     }
   }
 
@@ -2034,7 +2144,12 @@ export class RecoveryCoordinator {
         }
         if (!MaintenanceBudget.current()) {
           try {
-            if (trusted.exactHoldBinding) {
+            if (trusted.finalRequest && trusted.holdSettlement &&
+                !await this.finalHoldAllowsReplay(trusted, "settled")) {
+              // Refusal-only work needs neither a fresh exact probe nor a cancellation budget.
+            } else if (trusted.finalRequest && trusted.exactHoldBinding && !trusted.holdSettlement) {
+              await this.heldOperationState(trusted);
+            } else if (trusted.exactHoldBinding) {
               const binding = trusted.exactHoldBinding;
               const exact = await recoveryRPC(() => this.client.getExactRecoveryHold?.(trusted.runId, trusted.generation!, binding));
               if (exact && exact.run_id === trusted.runId && exact.generation === trusted.generation &&
@@ -2267,17 +2382,22 @@ export class RecoveryCoordinator {
       return;
     }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged ||
-        !(await this.inactiveInventory(record))) return;
+        !this.finalRetryReady(record)) return;
+    if (record.finalRequest && record.holdSettlement && !await this.finalHoldAllowsReplay(record, "settled")) {
+      return this.heldStopped(record, "settled");
+    }
     // A saved FINAL replays before resolving inputs needed only for a new capture.
     // In particular, a verified empty inventory has no bundle or bare to rebuild.
     let archiveFallback = false;
     if (record.finalRequest) {
       const outcome = await this.finalizeInventory(record);
+      await this.paceFinalRetry(record, outcome);
       const latest = await this.readLatest(record);
       if (latest.kind !== "ok" || latest.record.finalRequest || latest.record.finalAcknowledged) return outcome;
       archiveFallback = outcome?.held === "fallback";
       record = latest.record;
     }
+    if (!await this.inactiveInventory(record)) return;
     const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
     if (!barePath) return;
     const input = { record, barePath, defaultBranch: record.defaultBranch ?? "main", signal };
@@ -3044,11 +3164,13 @@ export class RecoveryCoordinator {
           this.log.warn("recovery: boot materialization failed; independent journals still retried", { error: errText(err) });
         }
       }
+      if (!snapshot) this.pruneFinalRetries(records);
       const cleanups: RecoveryRecord[] = [];
       let failure: unknown;
       // Visit each snapshot once; a failed generation retains custody while siblings continue.
       for (const snap of records) {
         if (signal?.aborted) break;
+        if (!this.finalRetryReady(snap)) continue;
         if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
         try {
           await this.withCancellationAttempt(snap, async () =>
@@ -3098,7 +3220,7 @@ export class RecoveryCoordinator {
   private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal): Promise<void> {
     // Re-read the current, authenticated state of exactly this snapshotted record.
     const record = await this.readRecord(this.recordPath(snap));
-    if (!record) return;
+    if (!record || !this.finalRetryReady(record)) return;
 
     const done = (outcome: string, reason?: string): void => {
       this.log.info("recovery restart sweep", {
@@ -3313,6 +3435,7 @@ export class RecoveryCoordinator {
         await this.materializeBootInventory(opts.signal, opts.isExecuting, attempts);
       }
       const all = await this.snapshotBootRecords();
+      this.pruneFinalRetries(all);
       // Forget the attempt stamps of captures no longer in the journal listing (bounded map).
       const seen = new Set(all.map((r) => r.captureId));
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
@@ -3321,7 +3444,7 @@ export class RecoveryCoordinator {
       // Executing runs and ACKs whose reports still need them are filtered BEFORE
       // the cap. Deferred local cleanup must not displace a fresh upload or FINAL.
       const candidates = all
-        .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
+        .filter((r) => isLiveCandidate(r) && this.finalRetryReady(r) && !opts.isExecuting(r.runId) &&
           !(r.inventoryGuarded && r.finalAcknowledged && typeof r.generation === "number" &&
             this.pendingGenerationReport?.(r.runId, r.generation)) &&
           (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
@@ -3420,7 +3543,7 @@ export class RecoveryCoordinator {
     }
     const record = res.record;
     // Re-checked inside the lock: the record may have moved on, or the run started executing.
-    if (!isLiveCandidate(record) || opts.isExecuting(record.runId) ||
+    if (!isLiveCandidate(record) || !this.finalRetryReady(record) || opts.isExecuting(record.runId) ||
         (!(record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) && this.credentialBlockedAt !== undefined &&
          opts.authenticatedAtMs <= this.credentialBlockedAt)) return "ok";
     this.lastAttemptAt.set(record.captureId, this.now());
@@ -3431,7 +3554,8 @@ export class RecoveryCoordinator {
       if (!out) return "ok";
       log(out.state, out.reason);
       if (out.reason === "credential_rejected") return "credential";
-      if (out.reason && LIVE_RETRY_REASONS.has(out.reason)) return "transient";
+      if (out.reason && LIVE_RETRY_REASONS.has(out.reason) &&
+          !["final_retry_refused", "final_retry_unknown", "inventory_hold_settled"].includes(out.reason)) return "transient";
       return "ok";
     } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError) {

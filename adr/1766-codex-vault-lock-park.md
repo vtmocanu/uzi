@@ -192,7 +192,8 @@ resume past the lock.
 
 This mirrors the credential-free discipline the reconcile closure already keeps (D2): once the
 vault is known to be locked, nothing on the park path may assume it can still reach the credential,
-even to clean up.
+even to clean up. The #3101 actual graceful-shutdown exception below applies to a separate
+credentialed durability sink; it does not change this credential-free settle.
 
 Issue #1770 also routes the internal `refresh_unknown` deferral through this credential-free
 hold. It reports untyped `recovery_wait` with neutral notices: no vault classification, token,
@@ -208,7 +209,57 @@ A blocked proof retains the clone, session and custody with capped waits and no 
 blocked-capture cap for these three deferrals; it does not permit a park or completion without the
 proof. Noncredential recovery keeps its existing terminal blocked-proof cap. Cancellation,
 shutdown and claim loss take precedence and retain their existing exit and stale-claim cleanup
-semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`).
+semantics (`handleRecoveryExhausted`, `agent/src/runner.ts`), subject to the narrow actual
+graceful-shutdown durability exception below.
+
+### Amendment #3101: actual graceful-shutdown durability
+
+The actual `execute()` graceful-shutdown durability sink carries a typed shutdown cause;
+it may reconcile despite the execution lifecycle's shutdown abort. Execution remains aborted.
+This admits one logical bounded release/refresh (including #1770's same-operation retry),
+using only the original absolute shutdown grace's remaining time for admission, reconciliation,
+proof, capture, publication and unwind. It starts no control-observation loop or polling during
+grace. Other reconciliation sinks labelled `shutdown` keep their lifecycle checks; the label alone
+grants no exception. Disposal semantics are unchanged.
+
+Already-delivered terminal stops, a claim fence or a credential switch block admission. An
+owner `stop` that requests normal finish does not abort execution or revoke shutdown capture. Effective
+revocation, ownership, unreleased claim, generation, credential authorization and deadlines
+remain enforced. Only a late **remote** owner cancellation after successful reconciliation may
+still allow bounded broker publication for the still-bound same claim generation through
+[PRD #1810's terminal route](../prds/1810-retain-failed-run-checkpoint-ref.md), consistent with
+#3030. Terminal cancellation still refuses credential release/refresh on the server; a pending
+queued cancellation is not itself that terminal credential refusal. No local stop, effective
+revocation, claim loss, switch or expired deadline gains a publication waiver.
+
+This is a credentialed path, with no credential-free fallback or revival of a poisoned registry.
+D3's credential-free settle after a typed deferral remains unchanged and attempts no refresh or
+release. Quiescence and completion proofs, secret/remediation and workflow guards, and
+missing-source refusal remain required. The [#1036 workflow overlay](1036-checkpoint-workflow-overlay.md)
+still runs after reap. Best-effort WIP capture can include dirty and untracked work; it does not
+guarantee ignored files, bytes written after proof/capture or work from late writers. The separate
+episode-journal terminal failure remains unsolved. This exception changes no retention, deletion, drain, recovery
+framework or episode journal.
+
+### Amendment 2026-10-19 — #3123: done-checkpoint stopping
+
+A proven clean cooperative done-checkpoint stop can avoid registry poisoning;
+it grants no credential authority. Credential or lifecycle failures,
+`refresh_unknown`, uncertain refresh operations, hard expiry and unsafe cleanup
+retain their existing fail-closed handling. Git hard aborts keep their internal
+hard discriminator despite the historical `AbortError` name.
+
+Worker shutdown stops active and queued done attempts, including sibling runs,
+and prevents admission of a fresh advisory snapshot. This leaves #3101's typed
+actual-shutdown credential exception above intact, sharing the original absolute
+15 s default grace. The genuine installer-before-credential reconciliation
+established by #3109 remains required; cancellation must settle the installer,
+not bypass reconciliation with a fabricated ready result. Storage settlement
+cannot be interrupted by the soft allowance and unsafe cleanup can consume the
+grace; source and custody remain retained on a fail-closed result. Local tests
+with promptly settled predecessors verify receiver content within the original
+grace, not a guarantee for stalled storage or hosted/shared-worker acceptance.
+See [ADR-1597](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
 
 ## D4: explicit unlock promotion with the ordinary recovery timer as backstop
 
@@ -272,8 +323,10 @@ An ambiguous response or a contended reply permits one retry. A validated succes
 credential and clears the frozen operation; a typed vault refusal defers. A generic unavailable
 409 after ambiguity, or a remaining ambiguous 500, holds as `refresh_unknown`. A first definite
 refusal keeps its prior behavior. Unknown does not become a vault cause, a working credential,
-a ready reconcile, a boundary/completion permit or an MR. Lifecycle cancellation and claim-loss
-checks still win.
+a ready reconcile, a boundary/completion permit or an MR. Claim-loss checks still win. Lifecycle
+cancellation also wins, except that the actual typed graceful-shutdown durability sink may
+reconcile after worker shutdown under the narrow #3101 exception in D3. Its execution stays aborted; the exception grants no
+credential-free fallback and changes neither the deferral nor the credential-free settle.
 
 ### First-response compatibility
 

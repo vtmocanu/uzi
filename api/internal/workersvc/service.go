@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -1801,7 +1802,8 @@ type Service struct {
 	p   Params
 	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
 	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
-	jobFiles *JobFiles
+	jobFiles         *JobFiles
+	ciArtifactLimits ciartifacts.Limits
 	// genMu guards genRuns (the runs with a generated-output storage in flight, each with at most
 	// one pending behind it) and genClosed (set by DrainGeneratedOutputs); genWG tracks the detached
 	// generated-output storages (startJobResultOutputs); genTimeout, genReplyBound and genMax
@@ -3674,12 +3676,15 @@ const (
 	// prose. Like maxKindRunes, the column is bare `text`, so this is policy.
 	maxQuestionIDRunes = 128
 
-	// maxAnswerBodyRunes bounds a user's answer to a clarification question (PRD #88
-	// M1, D-G). Slack's inbound path already caps replies at maxReplyRunes; the web
-	// and CLI paths had no bound at all, and #88 is the feature that turns "the user
-	// types free text at the agent" from an occasional follow_up into a prompted
-	// round-trip, so the cap moves to SubmitInput where every surface inherits it.
-	maxAnswerBodyRunes = 4000
+	// maxAnswerTotalRunes bounds the combined rune count of all answers in one
+	// submission, measured after stripNUL and secretscrub.Scrub (the values stored);
+	// it also bounds each single answer. Worst case equals the old
+	// maxAnswerCount x 4000 per-answer cap, so any submission previously stored
+	// untruncated stays accepted. Over it the submission is REJECTED
+	// (ErrInvalidAnswer), never truncated, because a silent cut resumed the agent on
+	// incomplete owner input (#3136). Slack's inbound path caps replies lower
+	// (slacksvc maxReplyRunes).
+	maxAnswerTotalRunes = 40000
 
 	// maxAnswerCount bounds how many answers one submission may carry (PRD #88,
 	// auditor LOW-2). It mirrors the question-side cap in agent/src/signals.ts
@@ -3827,6 +3832,8 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	RegisterNonce              string                          `json:"register_nonce,omitempty"`
+	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
 	GateCheckpointWitness      *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
 	ExpectedGateRevision       *int64                          `json:"expected_gate_revision,omitempty"`
 	RevisionInputID            *int64                          `json:"revision_input_id,omitempty"`
@@ -4254,6 +4261,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	if err := validateCompletedPublicationReport(wkr, req); err != nil {
 		return store.Run{}, false, err
+	}
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseWorkerMemoryPressure {
+		return s.parkWorkerMemoryPressure(ctx, wkr, runID, req)
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
 		return store.Run{}, false, err

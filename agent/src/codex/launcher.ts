@@ -14,8 +14,12 @@
 //
 // WIRE PROTOCOL (the Go supervisor emits/consumes exactly this — we implement the
 // launcher side to match; we invent no fields):
-//   control  → fd3 (we WRITE): {"op":"snapshot","id"} / {"op":"dispose","id","timeoutMs"}
-//   evidence ← fd4 (we READ):  started / snapshot / dispose(drained|unconfirmed) / abnormal
+//   control  → fd3 (we WRITE): snapshot / observe / dispose (request id, bounded timeout)
+//   evidence ← fd4 (we READ):  started / snapshot / observe(complete|unavailable) / dispose / abnormal
+// Observe is read-only, identity-bearing RSS evidence with one pending request.
+// Its 64 KiB records and 256 rows are bounded independently of lifecycle lines;
+// unavailable/late samples do not drain or poison the root. Legacy snapshot
+// errors retain the destructive abnormal drain path. Observe proves no disposal.
 //            (a drained dispose, or an abnormal whose cleanup drained, may carry an
 //             optional, strictly validated tmpCleanup; on any other event it is a breach)
 //   argv: <supervisor> --expect-uid <N> [--cleanup-token <uuid>] -- <child> <argv...>
@@ -35,8 +39,7 @@ import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import { createInterface } from "node:readline";
-import { Transform, type Readable, type Writable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 
 import {
   CODEX_SESSION_GID,
@@ -250,6 +253,137 @@ export interface SnapshotEvidence {
   readonly id: number;
   readonly processes: ReadonlyArray<{ readonly pid: number; readonly ppid: number; readonly pgid: number; readonly comm: string }>;
 }
+export interface ObservationIdentity {
+  readonly pid: number;
+  /** Exact decimal kernel ticks, never rounded through a JS number. */
+  readonly startTime: string;
+}
+export type ObservationReason = "unreadable" | "oversize" | "stale" | "timeout" | "busy" | "transport";
+export type ObservationOutcome =
+  | {
+    readonly event: "observe";
+    readonly id: number;
+    readonly state: "complete";
+    readonly supervisor: ObservationIdentity;
+    readonly root: ObservationIdentity;
+    readonly processes: ReadonlyArray<ObservationIdentity & { readonly ppid: number; readonly rss: number }>;
+  }
+  | { readonly event: "observe"; readonly id: number; readonly state: "unavailable"; readonly reason: ObservationReason };
+
+/** Scan bounded evidence without constructing process rows. The scan is linear in
+ * the retained line (at most MAX_EVIDENCE_LINE_BYTES); excess entries/depth flag
+ * oversize while scanning continues to find reordered headers. Partial prefixes
+ * retain only headers already read, never a guessed request ID. */
+function preflightObservation(line: string): { event?: string; id?: number; valid: boolean; oversize: boolean } {
+  const result: { event?: string; id?: number; valid: boolean; oversize: boolean } = { valid: false, oversize: false };
+  type Frame = { object: boolean; state: "first" | "key" | "colon" | "value" | "after"; processes: boolean; key?: string };
+  const stack: Frame[] = [];
+  // JSON strings exclude unescaped U+0000 through U+001F by grammar.
+  // oxlint-disable-next-line no-control-regex
+  const token = /"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}[\],:]/y;
+  let offset = 0;
+  let started = false;
+  let entries = 0;
+  // Each token consumes input; syntax failure ends this scan, not sibling records.
+  while (offset < line.length) {
+    while (/[ \t\r\n]/.test(line[offset] ?? "") && offset < line.length) offset++;
+    if (offset === line.length) break;
+    token.lastIndex = offset;
+    const match = token.exec(line);
+    if (!match) return result;
+    const word = match[0];
+    offset = token.lastIndex;
+    const frame = stack.at(-1);
+    if (!frame) {
+      if (started || word !== "{") return result;
+      started = true;
+      stack.push({ object: true, state: "first", processes: false });
+      continue;
+    }
+    const closing = frame.object ? "}" : "]";
+    if (word === closing && (frame.state === "first" || frame.state === "after")) {
+      stack.pop();
+      continue;
+    }
+    if (frame.state === "after") {
+      if (word !== ",") return result;
+      frame.state = frame.object ? "key" : "value";
+      continue;
+    }
+    if (frame.object && (frame.state === "first" || frame.state === "key")) {
+      if (!word.startsWith('"')) return result;
+      // Decode only top-level keys, including escaped event/id/processes keys.
+      if (stack.length === 1) frame.key = JSON.parse(word) as string;
+      frame.state = "colon";
+      continue;
+    }
+    if (frame.state === "colon") {
+      if (word !== ":") return result;
+      frame.state = "value";
+      continue;
+    }
+    if (frame.state !== "value" && !(frame.state === "first" && !frame.object)) return result;
+    if (word === "," || word === ":" || word === "}" || word === "]") return result;
+    if (frame.processes && !frame.object && ++entries > 256) result.oversize = true;
+    const top = stack.length === 1;
+    if (top && frame.key === "event") {
+      result.event = word.startsWith('"') ? JSON.parse(word) as string : undefined;
+    }
+    if (top && frame.key === "id") {
+      const id = Number(word);
+      result.id = Number.isSafeInteger(id) && id > 0 && /^[ \t\r\n,}]/.test(line[offset] ?? "") ? id : undefined;
+    }
+    frame.state = "after";
+    if (word === "{" || word === "[") {
+      const processes = frame.processes || (top && frame.key === "processes");
+      stack.push({ object: word === "{", state: "first", processes });
+      if (stack.length > 32) result.oversize = true;
+    }
+  }
+  result.valid = started && stack.length === 0;
+  return result;
+}
+
+function validObservation(value: Record<string, unknown>, started: StartedEvidence): ObservationOutcome | undefined {
+  const identity = (v: unknown): v is ObservationIdentity => {
+    if (typeof v !== "object" || v === null) return false;
+    const r = v as Record<string, unknown>;
+    return Number.isSafeInteger(r.pid) && Number(r.pid) > 0
+      && typeof r.startTime === "string" && /^[1-9][0-9]{0,19}$/.test(r.startTime)
+      && BigInt(r.startTime) <= 18446744073709551615n;
+  };
+  if (!Number.isSafeInteger(value.id) || Number(value.id) <= 0) return undefined;
+  if (value.state === "unavailable") {
+    if (!["unreadable", "oversize", "stale", "timeout"].includes(String(value.reason))) return undefined;
+    return { event: "observe", id: Number(value.id), state: "unavailable", reason: value.reason as ObservationReason };
+  }
+  if (value.state !== "complete" || !identity(value.supervisor) || !identity(value.root)
+    || value.supervisor.pid !== started.supervisorPid || value.root.pid !== started.childPid
+    || !Array.isArray(value.processes) || value.processes.length > 256 || "reason" in value) return undefined;
+  const rows = new Map<number, ObservationIdentity & { ppid: number; rss: number }>();
+  for (const candidate of value.processes) {
+    if (!identity(candidate)) return undefined;
+    const row = candidate as ObservationIdentity & { ppid: number; rss: number };
+    if (!Number.isSafeInteger(row.ppid) || row.ppid <= 0
+      || !Number.isSafeInteger(row.rss) || row.rss < 0 || rows.has(row.pid) || row.pid === value.supervisor.pid) return undefined;
+    rows.set(row.pid, row);
+  }
+  const primary = rows.get(value.root.pid);
+  if (primary && primary.startTime !== value.root.startTime) return undefined;
+  for (const row of rows.values()) {
+    let parent = row.ppid;
+    const visited = new Set<number>([row.pid]);
+    while (parent !== value.supervisor.pid) {
+      if (visited.has(parent)) return undefined;
+      visited.add(parent);
+      const link = rows.get(parent);
+      if (!link) return undefined;
+      parent = link.ppid;
+    }
+  }
+  return value as unknown as ObservationOutcome;
+}
+
 export interface ChildExitEvidence {
   readonly event: "child_exit";
   readonly code: number;
@@ -262,7 +396,9 @@ export interface DisposeEvidence {
   readonly reason?: string;
   readonly killed?: readonly number[];
   readonly reaped?: readonly number[];
-  readonly children?: readonly number[];
+  readonly children?: readonly ObservationIdentity[];
+  /** Diagnostic IDs were capped; disposal authority still requires ECHILD. */
+  readonly evidenceTruncated?: boolean;
   /** Present only for a root launched with a cleanup token: the outcome of the
    *  supervisor removing `/tmp/uzi-codex-command-<token>` after a confirmed drain.
    *  `reason` is "" when removed, otherwise one of the fixed words mismatch, owner,
@@ -330,6 +466,8 @@ export interface CodexRootHandle {
   /** The app-server TRANSPORT (fds 0/1/2) — a caller speaks app-server JSONL RPC here. */
   readonly transport: { readonly stdin: Writable | null; readonly stdout: Readable | null; readonly stderr: Readable | null };
   snapshot(timeoutMs?: number): Promise<SnapshotEvidence>;
+  /** Read-only, bounded RSS sample; unavailable never attests disposal. */
+  observe(timeoutMs?: number): Promise<ObservationOutcome>;
   /** Await the supervised primary child's normalized terminal status. */
   waitChild(timeoutMs?: number): Promise<ChildExitEvidence>;
   dispose(timeoutMs?: number): Promise<DisposeOutcome>;
@@ -526,6 +664,7 @@ function withOwnedTreeCleanup(
     supervisorPid: handle.supervisorPid,
     transport: handle.transport,
     snapshot: (timeoutMs) => handle.snapshot(timeoutMs),
+    observe: (timeoutMs) => handle.observe(timeoutMs),
     waitChild: (timeoutMs) => handle.waitChild(timeoutMs),
     dispose: async (timeoutMs) => {
       const outcome = await handle.dispose(timeoutMs);
@@ -1005,6 +1144,8 @@ async function createHandle(
   let exited = false;
   let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   let disposeInFlight = false;
+  let disposeRequestId: number | undefined;
+  let providerExitDuringDispose = false;
   let disposalOperation: Promise<DisposeOutcome> | undefined;
   let cleanDisposed = false;
   let lastDrained: DisposeEvidence | undefined;
@@ -1043,77 +1184,68 @@ async function createHandle(
     }
     for (const p of pending.values()) p.reject(failure);
     pending.clear();
+    if (observation) settleObservation(unavailable(observation.id, "transport"));
     // Closing the trusted control endpoint makes the real supervisor take its abnormal
     // controller-loss path and perform a bounded best-effort drain. The evidence channel
     // is already untrusted/unavailable on these paths, so no clean result is inferred.
     try { if (!control.destroyed && !control.writableEnded) control.end(); } catch { /* primary failure already recorded */ }
   }
 
-  let currentLineBytes = 0;
-  let oversizedTermination = false;
-  let guardReleased = false;
-  const guardedEvidence = new Transform({
-    transform(chunk: Buffer, _encoding, callback) {
-      for (const byte of chunk) {
-        if (byte === 0x0a || byte === 0x0d) currentLineBytes = 0;
-        else if (++currentLineBytes > MAX_EVIDENCE_LINE_BYTES) {
-          oversizedTermination = true;
-          fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`));
-          evidence.destroy();
-          lines.close();
-          releaseGuard();
-          // Teardown may occur during a write; still settle its callback exactly once.
-          callback();
-          return;
-        }
+  let observation: { id: number; resolve: (outcome: ObservationOutcome) => void; timer: ReturnType<typeof setTimeout>; timedOut?: boolean } | undefined;
+  let observationIdentity: { supervisor: string; root: string } | undefined;
+  const unavailable = (id: number, reason: ObservationReason): ObservationOutcome => ({ event: "observe", id, state: "unavailable", reason });
+  function settleObservation(outcome: ObservationOutcome): void {
+    if (!observation || observation.id !== outcome.id) return;
+    const current = observation;
+    observation = undefined;
+    clearTimeout(current.timer);
+    current.resolve(outcome);
+  }
+  const stopLines = readBoundedRecords(evidence, MAX_EVIDENCE_LINE_BYTES, (line) => {
+    const header = preflightObservation(line);
+    if (header.event === "observe" && (!header.valid || header.oversize)) {
+      if (observation && header.id === observation.id) {
+        settleObservation(unavailable(observation.id, header.oversize ? "oversize" : "stale"));
       }
-      this.push(chunk);
-      callback();
-    },
-  });
-  const lines = createInterface({ input: guardedEvidence });
-  function releaseGuard(): void {
-    if (guardReleased) return;
-    guardReleased = true;
-    evidence.unpipe(guardedEvidence);
-    evidence.off("close", onEvidenceClose);
-    guardedEvidence.destroy();
-  }
-  function onEvidenceClose(): void {
-    // A close without end must not manufacture EOF for disposal proof.
-    lines.close();
-    releaseGuard();
-  }
-  function onEvidenceError(err: Error): void {
-    fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err }));
-    lines.close();
-    releaseGuard();
-  }
-  evidence.on("error", onEvidenceError);
-  evidence.on("close", onEvidenceClose);
-  guardedEvidence.on("error", onEvidenceError);
-  lines.on("line", (line) => {
-    if (oversizedTermination) return;
-    lineCount += 1;
-    if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); lines.close(); return; }
-    if (Buffer.byteLength(line) > MAX_EVIDENCE_LINE_BYTES) { fail(new TrustedExecutionRefusal(`oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`)); return; }
+      return;
+    }
     let value: unknown;
     try { value = JSON.parse(line); } catch { fail(new TrustedExecutionRefusal("malformed evidence line (not JSON)")); return; }
+    const record = typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+    if (record?.event !== "observe") {
+      lineCount += 1;
+      if (lineCount > MAX_EVIDENCE_LINES) { fail(new TrustedExecutionRefusal(`evidence line budget exceeded (> ${MAX_EVIDENCE_LINES})`)); stopLines(); return; }
+    }
     dispatch(value);
-  });
-  lines.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`evidence stream error: ${err.message}`, { cause: err })));
-  lines.on("close", () => {
-    releaseGuard();
+  }, (why, prefix) => {
+    // Oversized observation records are discarded through the next newline.
+    // Only the bounded prefix is inspected; no oversized text is materialized.
+    const header = why === "oversized line" ? preflightObservation(prefix) : undefined;
+    if (header?.event === "observe") {
+      if (observation && header.id === observation.id) {
+        settleObservation(unavailable(observation.id, "oversize"));
+      }
+      return;
+    }
+    fail(new TrustedExecutionRefusal(why === "oversized line" ? `oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`
+      : why === "stream error" ? `evidence stream error: ${prefix}` : `evidence ${why}`));
+    stopLines();
+    if (why === "oversized line") evidence.destroy();
+  }, true);
+  const onEvidenceClosed = (): void => {
     resolveEvidenceEnd();
     if (failure || cleanDisposed || exited || abandoningStartup) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
-  });
+  };
+  evidence.on("end", onEvidenceClosed);
+  // Close settles channel joining; readableEnded still gates actual EOF proof.
+  evidence.on("close", onEvidenceClosed);
   control.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`control stream error: ${err.message}`, { cause: err })));
 
   function dispatch(value: unknown): void {
     if (typeof value !== "object" || value === null) { fail(new TrustedExecutionRefusal("evidence line is not a JSON object")); return; }
     const record = value as Record<string, unknown>;
-    if ("tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
+    if (record.event !== "observe" && "tmpCleanup" in record && (!tmpCleanupAllowed(record) || !isValidTmpCleanup(record.tmpCleanup))) {
       fail(new TrustedExecutionRefusal("malformed tmpCleanup evidence"));
       return;
     }
@@ -1141,19 +1273,52 @@ async function createHandle(
         resolveStarted(ev);
         return;
       }
+      case "observe": {
+        // A timeout settles the caller but retains the single wire-request fence.
+        // Only its matching reply releases it; other IDs cannot settle a new caller.
+        if (!observation || record.id !== observation.id) return;
+        if (observation.timedOut) { settleObservation(unavailable(observation.id, "timeout")); return; }
+        const outcome = startedEvent && !("tmpCleanup" in record) ? validObservation(record, startedEvent) : undefined;
+        if (!outcome) { settleObservation(unavailable(observation.id, "stale")); return; }
+        if (outcome.state === "complete") {
+          if (observationIdentity && (observationIdentity.supervisor !== outcome.supervisor.startTime
+            || observationIdentity.root !== outcome.root.startTime)) {
+            settleObservation(unavailable(observation.id, "stale")); return;
+          }
+          observationIdentity = { supervisor: outcome.supervisor.startTime, root: outcome.root.startTime };
+        }
+        settleObservation(outcome);
+        return;
+      }
       case "snapshot":
       case "dispose": {
         if (record.event === "dispose") {
           const pids = (v: unknown): boolean => Array.isArray(v) && v.length <= 65536 &&
             v.every((pid) => Number.isSafeInteger(pid) && pid > 0);
-          const allowed = ["event", "id", "state", "authority", "reason", "killed", "reaped", "children", "tmpCleanup"];
+          const identities = (v: unknown): boolean => {
+            if (!Array.isArray(v) || v.length > 65536) return false;
+            const seen = new Set<number>();
+            return v.every((child: unknown) => {
+              if (typeof child !== "object" || child === null || Array.isArray(child)) return false;
+              const identity = child as Record<string, unknown>;
+              if (Object.keys(identity).length !== 2 || !Number.isSafeInteger(identity.pid) ||
+                Number(identity.pid) <= 0 || seen.has(Number(identity.pid)) ||
+                typeof identity.startTime !== "string" || !/^[1-9][0-9]{0,19}$/.test(identity.startTime) ||
+                BigInt(identity.startTime) > 18446744073709551615n) return false;
+              seen.add(Number(identity.pid));
+              return true;
+            });
+          };
+          const allowed = ["event", "id", "state", "authority", "reason", "killed", "reaped", "children", "tmpCleanup", "evidenceTruncated"];
           if (!Number.isSafeInteger(record.id) || Number(record.id) <= 0 ||
             !pids(record.killed) || !pids(record.reaped) ||
+            ("evidenceTruncated" in record && typeof record.evidenceTruncated !== "boolean") ||
             Object.keys(record).some((key) => !allowed.includes(key)) ||
             (record.state === "drained"
               ? record.authority !== "ECHILD+__WALL" || "reason" in record || "children" in record
-              : record.state !== "unconfirmed" || !pids(record.children) ||
-                (record.reason !== "deadline" && record.reason !== "echild-contradicted") || "authority" in record)) {
+              : record.state !== "unconfirmed" || !identities(record.children) ||
+                (record.reason !== "deadline" && record.reason !== "echild-contradicted" && record.reason !== "enumeration" && record.reason !== "oversize") ||
+                ((record.reason === "enumeration" || record.reason === "oversize") && (record.children as unknown[]).length !== 0) || "authority" in record)) {
             fail(new TrustedExecutionRefusal("malformed dispose evidence or missing required authority"));
             return;
           }
@@ -1175,11 +1340,23 @@ async function createHandle(
         childExitEvent = ev;
         resolveChildExit(ev);
         if (kind === "provider") {
-          fail(new TrustedExecutionRefusal(`supervised provider child exited unexpectedly (code=${ev.code})`));
+          // A requested drain kills the primary too. Its actual wait status is
+          // terminal evidence, never cleanup authority. Accept it only while
+          // this handle's exact dispose request is still unanswered.
+          if (disposeInFlight && disposeRequestId !== undefined && pending.has(disposeRequestId)) {
+            providerExitDuringDispose = true;
+          } else {
+            fail(new TrustedExecutionRefusal(`supervised provider child exited unexpectedly (code=${ev.code})`));
+          }
         }
         return;
       }
       case "abnormal": {
+        if (typeof record.cleanup === "object" && record.cleanup !== null && !Array.isArray(record.cleanup)
+          && "evidenceTruncated" in record.cleanup && typeof record.cleanup.evidenceTruncated !== "boolean") {
+          fail(new TrustedExecutionRefusal("malformed cleanup evidence"));
+          return;
+        }
         // Validated above: record it so the unclean dispose outcome still reports it.
         if ("tmpCleanup" in record) abnormalTmpCleanup = record.tmpCleanup as TmpCleanupEvidence;
         fail(new TrustedExecutionRefusal(`supervisor abnormal: ${String(record.reason ?? "unknown")}`));
@@ -1220,6 +1397,23 @@ async function createHandle(
       if (failure) { reject(failure); return; }
       pending.set(id, { resolve, reject });
       if (!writeControl(frame)) { pending.delete(id); reject(new TrustedExecutionRefusal("control write failure (channel unavailable)")); }
+    });
+  }
+
+  function observe(timeoutMs = deadlines.snapshot): Promise<ObservationOutcome> {
+    if (observation) return Promise.resolve(unavailable(observation.id, "busy"));
+    const id = nextId++;
+    if (failure || exited || control.destroyed || control.writableEnded) return Promise.resolve(unavailable(id, "transport"));
+    if (control.writableNeedDrain) return Promise.resolve(unavailable(id, "busy"));
+    const budget = Number.isFinite(timeoutMs) ? Math.max(0, Math.min(10000, timeoutMs)) : 0;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!observation || observation.id !== id) return;
+        observation.timedOut = true;
+        resolve(unavailable(id, "timeout"));
+      }, budget);
+      observation = { id, resolve, timer };
+      if (!writeControl({ op: "observe", id, timeoutMs: Math.floor(budget) })) settleObservation(unavailable(id, "transport"));
     });
   }
 
@@ -1280,6 +1474,7 @@ async function createHandle(
       const exitReserve = Math.min(deadlines.exit, Math.max(1, Math.floor(remaining() / 5)));
       const drainBudget = Math.max(0, remaining() - exitReserve);
       let ev: SnapshotEvidence | DisposeEvidence;
+      disposeRequestId = id;
       try {
         ev = await withDeadline(
           sendAndWait(id, { op: "dispose", id, timeoutMs: drainBudget }),
@@ -1288,6 +1483,8 @@ async function createHandle(
         );
       } catch (error) {
         return { clean: false, reason: error instanceof Error ? error.message : String(error) };
+      } finally {
+        disposeRequestId = undefined;
       }
       if (ev.event !== "dispose") return { clean: false, reason: `expected dispose evidence, got ${String(ev.event)}` };
       const disposeEv = ev;
@@ -1321,12 +1518,17 @@ async function createHandle(
       lastDrained = disposeEv;
       return { clean: true, event: disposeEv };
     } finally {
+      disposeRequestId = undefined;
       disposeInFlight = false;
+      if (kind === "provider" && providerExitDuringDispose && !cleanDisposed) {
+        // An unconfirmed drain still leaves a dead provider unusable. Preserve
+        // the first failure and retained-tree rule; no status implies drainage.
+        fail(new TrustedExecutionRefusal("provider exited during unconfirmed disposal"));
+      }
     }
   }
 
   // All consumers and lifecycle handlers must be ready before prebuffered evidence flows.
-  evidence.pipe(guardedEvidence);
 
   // Await `started` (bounded). A pre-started failure/exit rejects the launch; we end
   // the control channel so the supervisor runs its own bounded abnormal cleanup — we
@@ -1380,7 +1582,7 @@ async function createHandle(
       abandoningStartup = true;
       child.stdout?.destroy();
       child.stderr?.destroy();
-      lines.close();
+      stopLines();
     }
     const rejected = new CodexLaunchError(failure ? classifyCodexLaunchFailure(failure) : classification,
       verified ? "verified" : "unconfirmed", error, failure !== error ? failure ?? cleanupFailure : undefined);
@@ -1395,6 +1597,7 @@ async function createHandle(
     supervisorPid: child.pid,
     transport: { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr },
     snapshot,
+    observe,
     waitChild,
     dispose,
     get failed() { return failure; },
@@ -1505,6 +1708,61 @@ function spawnStandaloneMode(
   });
 }
 
+/** Frame bytes before decoding or JSON parsing. The retained fragment is at
+ * most limit bytes even for one huge chunk or an unterminated record. After
+ * overflow, discard through newline, then resume at the next bounded record. */
+function readBoundedRecords(
+  stream: Readable, limit: number, onLine: (line: string) => void,
+  onBreach: (why: string, prefix: string) => void,
+  acceptCR = false,
+): () => void {
+  let pending = Buffer.alloc(0);
+  let dropping = false;
+  let stopped = false;
+  let skipLF = false;
+  const stop = (): void => { stopped = true; pending = Buffer.alloc(0); stream.off("data", data); };
+  const data = (chunk: Buffer | string): void => {
+    if (stopped) return;
+    const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    let offset = 0;
+    while (offset < bytes.length && !stopped) {
+      if (skipLF) {
+        skipLF = false;
+        if (bytes[offset] === 0x0a) { offset++; continue; }
+      }
+      const lf = bytes.indexOf(0x0a, offset);
+      const cr = acceptCR ? bytes.indexOf(0x0d, offset) : -1;
+      const nl = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+      const end = nl < 0 ? bytes.length : nl;
+      if (!dropping) {
+        const size = end - offset;
+        if (size > limit - pending.length) {
+          const room = limit - pending.length;
+          const prefix = Buffer.concat([pending, bytes.subarray(offset, offset + room)]).toString("utf8");
+          pending = Buffer.alloc(0);
+          dropping = true;
+          onBreach("oversized line", prefix);
+        } else {
+          pending = Buffer.concat([pending, bytes.subarray(offset, end)]);
+          if (nl >= 0) { const line = pending.toString("utf8"); pending = Buffer.alloc(0); onLine(line); }
+        }
+      }
+      if (nl < 0) break;
+      dropping = false;
+      skipLF = acceptCR && bytes[nl] === 0x0d;
+      offset = nl + 1;
+    }
+  };
+  stream.on("data", data);
+  stream.on("end", () => {
+    if (!stopped && (pending.length > 0 || dropping)) onBreach("truncated line", "");
+    stop();
+  });
+  stream.on("close", stop);
+  stream.on("error", (error: Error) => { if (!stopped) onBreach("stream error", error.message); stop(); });
+  return stop;
+}
+
 /** Split a mode's stdout into bounded lines. Any breach (an over-long line, more lines
  *  than the mode may print, a trailing partial line, a stream error) is reported once and
  *  every later byte is ignored, so garbage can never be half-believed. */
@@ -1514,7 +1772,6 @@ function readModeLines(
   onLine: (line: string) => void,
   onBreach: (why: string) => void,
 ): void {
-  let pending = Buffer.alloc(0);
   let lines = 0;
   let broken = false;
   const breach = (why: string): void => {
@@ -1522,24 +1779,12 @@ function readModeLines(
     broken = true;
     onBreach(why);
   };
-  stream.on("data", (chunk: Buffer | string) => {
+  readBoundedRecords(stream, MAX_MODE_LINE_BYTES, (line) => {
     if (broken) return;
-    pending = Buffer.concat([pending, typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk]);
-    for (;;) {
-      const nl = pending.indexOf(0x0a);
-      if (nl < 0) break;
-      const line = pending.subarray(0, nl);
-      pending = pending.subarray(nl + 1);
-      if (line.length > MAX_MODE_LINE_BYTES) { breach("oversized line"); return; }
-      lines += 1;
-      if (lines > maxLines) { breach("too many lines"); return; }
-      onLine(line.toString("utf8"));
-      if (broken) return;
-    }
-    if (pending.length > MAX_MODE_LINE_BYTES) breach("oversized line");
-  });
-  stream.on("end", () => { if (pending.length > 0) breach("truncated line"); });
-  stream.on("error", () => breach("stream error"));
+    lines += 1;
+    if (lines > maxLines) { breach("too many lines"); return; }
+    onLine(line);
+  }, breach);
 }
 
 /** Parse one line as a JSON object with EXACTLY `keys`; undefined on anything else. */

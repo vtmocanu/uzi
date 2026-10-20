@@ -175,6 +175,13 @@ func resumePhaseFor(run store.Run, planApproved bool) string {
 	}
 }
 
+func completionNonClosingClaim(run store.Run) *CompletionNonClosing {
+	if !run.CompletionNonClosingReason.Valid {
+		return nil
+	}
+	return &CompletionNonClosing{Reason: run.CompletionNonClosingReason.String}
+}
+
 // assembleClaim builds the claim payload for an already-claimed run. It takes the
 // CLAIMING worker, not just the run, because since PRD #104 M3 the credential a
 // run spends can depend on which worker picked it up.
@@ -665,7 +672,16 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	ciRepair, err := s.assembleCIRepair(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	frozenMemoryPolicy, err := optionalMemoryPolicy(run.MemoryPolicy)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
+		CIRepair:               ciRepair,
 		InventoryGuarded:       inventoryGuarded,
 		PolicyHoldResume:       run.PolicyRefusalCount > 0,
 		PolicyHoldFreshSession: run.PolicyRefusalCount > 0 && run.PolicyFreshClaimGeneration.Valid && run.PolicyFreshClaimGeneration.Int64 == run.ClaimGeneration,
@@ -695,6 +711,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #1296 M1 (D2): the claim-lane counter the ClaimRun CTE just incremented, read
 		// straight off the returned run row and returned in the claim payload.
 		ClaimGeneration:          run.ClaimGeneration,
+		MemoryEpisode:            run.MemoryEpisode,
+		MemoryInterventionCount:  run.MemoryInterventionCount,
+		MemoryPolicy:             frozenMemoryPolicy,
 		PlanMd:                   textPtr(run.PlanMd),
 		AutoApprove:              run.AutoApprove,
 		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
@@ -873,6 +892,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// contract with neither a deferred nor an accepted set (legacy / non-interlocked /
 			// revision-1), so omitempty keeps such a claim byte-identical to today's.
 			CompletionScope: CompletionScopeClaim(run.CompletionContract),
+			NonClosing:      completionNonClosingClaim(run),
 		},
 	}
 

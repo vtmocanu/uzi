@@ -145,6 +145,25 @@ function has(post: Post): boolean {
 
 // ── recordCompletionAttempt ──────────────────────────────────────────────────────────
 describe("recordCompletionAttempt send-gate (PRD #1247 fix round)", () => {
+  for (const features of [[], ["completion_non_closing_v1"], ["completion_non_closing_v1", "claim_generation_fence"]]) {
+    it("M2 non_closing negotiation and generation fallback " + features.join(","), async () => {
+      const srv = await completionServer({ worker_id: "w1", protocol_features: features }, (_endpoint, body) =>
+        body.claim_generation !== undefined ? STRICT_DECODE_400 : { status: 200, body: { unmet: [], attempt_count: 1 } });
+      try {
+        const client = await bareClient(srv.url);
+        const nonClosing = { reason: "Human acceptance remains" };
+        await client.recordCompletionAttempt("run-1", { ...ATTEMPT_ARGS(3), nonClosing });
+        assert.equal(srv.posts.length, features.includes("claim_generation_fence") ? 2 : 1);
+        for (const post of srv.posts) {
+          assert.deepEqual(post.body.non_closing, features.includes("completion_non_closing_v1") ? nonClosing : undefined);
+        }
+        assert.equal(srv.posts.at(-1)!.status, 200);
+      } finally {
+        await srv.close();
+      }
+    });
+  }
+
   it("a credential_switch_v1 worker (no cached feature) STAMPS a gen>0 attempt; a fenced api records it once", async () => {
     const srv = await completionServer({ worker_id: "w1" }, () => ({
       status: 200,

@@ -402,7 +402,6 @@ function attemptOpts(claimGeneration: number): AttemptSeedOptions {
     attemptId: mintAttemptId(claimGeneration),
     isLive: () => false,
     beforeSeed: async () => {},
-    quiescent: async () => true,
   };
 }
 

@@ -367,7 +367,7 @@ export function ScheduleListRow({
             {isDefault && s.customized && (
               <button
                 type="button"
-                title={RESET_TOOLTIP}
+                title={s.target === "ci_watch" ? `${RESET_TOOLTIP} Also clears artifact selectors (fetch none) and workflow selectors (watch all).` : RESET_TOOLTIP}
                 aria-label={`Reset ${on} to catalog defaults`}
                 disabled={busy}
                 onClick={onReset}

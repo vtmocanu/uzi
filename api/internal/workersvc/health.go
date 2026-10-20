@@ -1248,6 +1248,18 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			return reasonNoCIConfigGuardCapableWorker
 		}
 	}
+	if r.Kind == "prompt" && r.CiConfigGuard && r.CiArtifactsAttached {
+		if q, ok := s.q.(interface {
+			CountOnlineWorkersSatisfyingCIArtifacts(context.Context, uuid.UUID) (int64, error)
+		}); ok {
+			n, err := q.CountOnlineWorkersSatisfyingCIArtifacts(ctx, r.UserID)
+			if err != nil {
+				slog.Error("health: count CI artifact capable workers", "error", err)
+			} else if n == 0 {
+				return "no online worker supports CI artifact inputs (ci_artifacts_v1); provision a capable worker"
+			}
+		}
+	}
 	// PRD #1332 M5A (D3): a CODEX-INDICATING run whose owner has NO online worker advertising the
 	// codex_harness_v1 protocol capability is genuinely UNPLACEABLE — the run's non-bypassable Codex
 	// claim clause (ClaimRun's 'codex_harness_v1' = ANY(worker_protocol_caps)) can never be

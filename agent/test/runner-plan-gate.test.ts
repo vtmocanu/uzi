@@ -258,6 +258,7 @@ function codexSummaryDeps(plans: string[], onTurn?: (index: number) => Promise<v
       supervisorPid: 200,
       transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
       waitChild: async () => ({ event: "child_exit", code: 0 }),
       dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
       failed: undefined, whenFailed: new Promise<Error>(() => {}),

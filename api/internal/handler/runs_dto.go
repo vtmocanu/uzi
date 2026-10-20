@@ -226,6 +226,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		Status:         r.Status,
 		RequeueCount:   r.RequeueCount,
 		WorkerRecovery: workerRecoveryDTO(r, automaticRequeueLimit),
+		MemoryHold:     memoryHoldDTO(r),
 		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
@@ -836,6 +837,21 @@ func policyRefusalDTO(r store.Run) *apitypes.PolicyRefusalDTO {
 	// Action availability remains separate from this precondition.
 	if workersvc.PolicyOwnerConstrained(r) {
 		dto.ActionIfMatch = workersvc.PolicyHoldActionToken(r)
+	}
+	return dto
+}
+
+// memoryHoldDTO projects persisted episode accounting only for an owner memory hold.
+func memoryHoldDTO(r store.Run) *apitypes.MemoryHoldDTO {
+	if r.Status != "recovery_wait" || !r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_memory_pressure" {
+		return nil
+	}
+	dto := &apitypes.MemoryHoldDTO{Episode: r.MemoryEpisode, Used: r.MemoryInterventionCount}
+	var policy workersvc.MemoryPolicy
+	if json.Unmarshal(r.MemoryPolicy, &policy) == nil && policy.Version == 1 && policy.MaxInterventions > 0 && policy.MaxInterventions <= 9999 {
+		limit := policy.MaxInterventions
+		remaining := max(int32(0), limit-r.MemoryInterventionCount)
+		dto.Max, dto.Remaining = &limit, &remaining
 	}
 	return dto
 }

@@ -130,7 +130,7 @@ SELECT EXISTS (
 -- reconciler passes the per-hold class ListReleasableCustodyHolds now computes ('publication'
 -- for a completed-run backstop, 'archive' for a ready capture). CHECK-constrained to the five
 -- classes (migration 00232).
--- Worker retry exhaustion requires an owner decision even with an available archive.
+-- Worker retry exhaustion and memory pressure require an owner decision even with an available archive.
 -- Lock the run before updating its hold, matching the lifecycle's run-before-hold order.
 -- Read status from the locked tuple: if exhaustion commits while this statement waits,
 -- locked_run observes it and the delayed reconciler candidate moves zero rows.
@@ -149,7 +149,7 @@ WHERE target.id = @id AND target.state = 'open' AND NOT target.inventory_guarded
   AND NOT EXISTS (
       SELECT 1 FROM locked_run r
       WHERE r.status = 'recovery_wait'
-        AND r.recovery_wait_cause = 'worker_requeue_exhausted'
+        AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure')
   );
 
 -- name: DiscardCaptureForOwner :one
@@ -267,12 +267,12 @@ SELECT h.*,
     END::text AS reason
 FROM recovery_custody_holds h
 WHERE h.state = 'open' AND NOT h.inventory_guarded
-  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion decision,
+  -- Archive readiness cannot implicitly resolve an owner retry-exhaustion or memory-pressure decision,
   -- including an older available capture alongside a newer upload for this hold.
   AND NOT EXISTS (SELECT 1 FROM runs r
                     WHERE r.id = h.run_id
                       AND r.status = 'recovery_wait'
-                      AND r.recovery_wait_cause = 'worker_requeue_exhausted')
+                      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'))
   AND (
       EXISTS (SELECT 1 FROM runs r
                 WHERE r.id = h.run_id
@@ -354,6 +354,12 @@ RETURNING *;
 -- the forge pre-clone park passes 'no_adopted_source' (a generation that never adopted a
 -- source has nothing to prove against the forge). CHECK-constrained to the five classes
 -- (migration 00232).
+-- Recheck owner holds under the run lock before any legacy worker release.
+WITH locked_run AS MATERIALIZED (
+    SELECT r.id, r.status, r.recovery_wait_cause
+    FROM runs r WHERE r.id = @run_id
+    FOR UPDATE OF r
+)
 UPDATE recovery_custody_holds
 SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
     release_evidence = @release_evidence,
@@ -361,7 +367,9 @@ SET live_worker_id = NULL, live_run_id = NULL, state = 'released',
 WHERE run_id = @run_id
   AND generation = @generation
   AND live_worker_id = @worker_id::uuid
-  AND state = 'open' AND NOT inventory_guarded;
+  AND state = 'open' AND NOT inventory_guarded
+  AND NOT EXISTS (SELECT 1 FROM locked_run r WHERE r.status = 'recovery_wait'
+      AND r.recovery_wait_cause IN ('worker_requeue_exhausted', 'worker_memory_pressure'));
 
 -- name: GetCustodyHoldForSettle :one
 -- Issue #1582 M1: the exact hold the predecessor-settle endpoint names, scoped to its run so a

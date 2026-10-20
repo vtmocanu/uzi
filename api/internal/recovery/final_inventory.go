@@ -103,9 +103,9 @@ func (s *Service) releaseFinalInventory(ctx context.Context, wkr store.Worker, r
 		uuid.UUID(hold.LiveWorkerID.Bytes) != wkr.ID {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
-	// Requeue exhaustion releases the claim but leaves custody an owner-only decision
+	// Requeue exhaustion and memory pressure release the claim but leave custody an owner-only decision
 	// (Resume/Cancel); a worker's archive or settled proof must not end it implicitly.
-	if status == "recovery_wait" && parkCause.Valid && parkCause.String == "worker_requeue_exhausted" {
+	if status == "recovery_wait" && parkCause.Valid && (parkCause.String == "worker_requeue_exhausted" || parkCause.String == "worker_memory_pressure") {
 		return apitypes.RecoveryReleaseResponse{}, ErrNotAuthorized
 	}
 	// A forge_unreachable park is a pre-clone park of a generation that may have adopted nothing:

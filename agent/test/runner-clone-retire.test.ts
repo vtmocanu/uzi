@@ -682,7 +682,7 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
   }
 
   function attemptOptions(attemptId: string): AttemptSeedOptions {
-    return { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+    return { attemptId, isLive: () => false, beforeSeed: async () => {} };
   }
 
   function ledger(bare: string): { attemptId: string; clonePath: string; runId: string; state: string }[] {
@@ -832,13 +832,14 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
         if (row.attempt) {
           assert.equal(ledger(s.bare).filter((item) => item.attemptId === s.attemptId).at(-1)?.state, "reclaimed");
           const canonical = git.runnerClonePath(s.bare, slug);
-          // Four newer abandoned entries force a real retention deletion on the next seed.
+          // Four newer abandoned entries exceed the diagnostic threshold; a later seed keeps their bytes.
           const abandoned: string[] = [];
           for (let i = 1; i <= 4; i++) {
             const id = formatAttemptId(new Date(`2026-02-0${i}T00:00:00Z`), 1, `000000000000000${i}`);
             const clonePath = `${canonical}.attempt-${id}`;
             abandoned.push(clonePath);
             fs.mkdirSync(clonePath);
+            fs.writeFileSync(path.join(clonePath, marker), untracked);
             localGit(s.bare, "config", "--local", "--add", `uzi-attempts.${branch}.entry`,
               JSON.stringify({ attemptId: id, runId: randomUUID(), clonePath, state: "abandoned" }));
           }
@@ -846,8 +847,11 @@ describe("1848 M1: moved terminal mr_rework custody", () => {
             attemptOptions(formatAttemptId(new Date("2026-03-01T00:00:00Z"), 1, "fedcba9876543210")));
           assertBytes(s.clonePath, s);
           assert.equal(ledger(s.bare).find((item) => item.attemptId === s.attemptId)?.state, "reclaimed");
-          assert.equal(fs.existsSync(abandoned[0]!), false, "retention deleted the oldest disposable attempt");
-          assert.equal(fs.existsSync(abandoned.at(-1)!), true, "retention kept a newer disposable attempt");
+          for (const clonePath of abandoned) {
+            assert.equal(fs.readFileSync(path.join(clonePath, marker), "utf8"), untracked,
+              "disabled automatic retention preserves every abandoned attempt");
+            assert.equal(ledger(s.bare).filter((item) => item.clonePath === clonePath).at(-1)?.state, "abandoned");
+          }
         }
       } finally { t.mock.restoreAll(); }
     });

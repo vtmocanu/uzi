@@ -671,8 +671,8 @@ export function RunDefaults() {
         </label>
 
         {/* PRD #1020: the early-limit-reset Slack alert opt-in. On the SAME usage-limits
-            surface because it is the other thing that happens around your Anthropic
-            window. Default ON — a field-absent user renders CHECKED, matching the DB
+            surface because it is the other thing that happens around your Anthropic or
+            Codex weekly window. Default ON — a field-absent user renders CHECKED, matching the DB
             default rather than assuming OFF. Independent write from the pause default
             above, so its own busy/error pair. */}
         {earlyResetError && <Alert message={earlyResetError} />}
@@ -688,8 +688,8 @@ export function RunDefaults() {
           <span className="text-fg">Alert me when my 7-day limit resets early</span>
         </label>
         <p className="text-sm text-faint">
-          Sends a Slack DM when your weekly Anthropic limit reopens more than 8 hours before
-          its expected reset. On by default; needs a linked Slack account to reach you.
+          Sends a Slack DM when your weekly Anthropic or Codex limit reopens more than 8 hours
+          before its expected reset. On by default; needs a linked Slack account to reach you.
         </p>
       </Card>
 

@@ -1927,7 +1927,7 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 	// it lives on the fuller run-get notice and the web panel). issue #1088 widened the
 	// non-forge cause to any transient interruption (a transient empty turn or provider outage).
 	recoveringSuffix := " (run recovering from a transient interruption)"
-	if len(recoveryCause) > 0 && recoveryCause[0] == workerRequeueExhaustedCause {
+	if len(recoveryCause) > 0 && (recoveryCause[0] == workerRequeueExhaustedCause || recoveryCause[0] == workerMemoryPressureCause) {
 		recoveringSuffix = " (owner Resume/Cancel)"
 	}
 	if len(recoveryCause) > 0 && recoveryCause[0] == forgeUnreachableCause {
@@ -2111,7 +2111,7 @@ var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: 
 // reported it; it is shown only while the run is parked. "" when the run is not parked or the
 // worker did not report it.
 func checkpointDurabilityLine(r apitypes.RunDTO) string {
-	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isWorkerRecoveryExhausted(r) {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] || isOwnerRequiredWorkerHold(r) {
 		return ""
 	}
 	if *r.CheckpointContainsLatest {
@@ -2272,7 +2272,7 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""))
-	if isWorkerRecoveryExhausted(r.RunDTO) {
+	if isOwnerRequiredWorkerHold(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
 	if short := codexAccountActionShort(r.RunDTO); short != "" {

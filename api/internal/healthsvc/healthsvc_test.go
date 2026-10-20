@@ -32,6 +32,9 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
+	blockerRows            []store.ListWorkerUpgradeBlockersRow
+	blockerErr             error
+	blockerQueries         [][]uuid.UUID
 	storageRows            []store.RecoveryStorageHealthRow
 	storageErr             error
 	storageRead            func(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error)
@@ -43,6 +46,7 @@ type fakeStore struct {
 	enabledErr             error
 	workers                []store.ListAllWorkersRow
 	workersErr             error
+	workerQueries          atomic.Int32
 	capacityRows           []store.ListOwnersWaitingNoCapacityRow
 	capacityErr            error
 	capacityQueries        atomic.Int32
@@ -82,7 +86,13 @@ func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
 	return f.enabledIDs, f.enabledErr
 }
 
+func (f *fakeStore) ListWorkerUpgradeBlockers(_ context.Context, ids []uuid.UUID) ([]store.ListWorkerUpgradeBlockersRow, error) {
+	f.blockerQueries = append(f.blockerQueries, append([]uuid.UUID(nil), ids...))
+	return f.blockerRows, f.blockerErr
+}
+
 func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
+	f.workerQueries.Add(1)
 	return f.workers, f.workersErr
 }
 func (f *fakeStore) ListOwnersWaitingNoCapacity(context.Context, store.ListOwnersWaitingNoCapacityParams) ([]store.ListOwnersWaitingNoCapacityRow, error) {

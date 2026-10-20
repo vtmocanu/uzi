@@ -79,6 +79,7 @@ const waitingEvidenceLimit = 5
 // the first unknown age if it appears after the cap. Stored reasons cannot affect retention.
 type waitEvidence struct {
 	rows            []apitypes.HealthEvidenceDTO
+	owners          []uuid.UUID
 	unknownRetained bool
 	total           int
 }
@@ -91,7 +92,9 @@ func (e *waitEvidence) append(id, owner uuid.UUID, reason pgtype.Text, since pgt
 			return
 		}
 		e.rows = e.rows[:waitingEvidenceLimit-1]
+		e.owners = e.owners[:waitingEvidenceLimit-1]
 	}
+	e.owners = append(e.owners, owner)
 	e.unknownRetained = e.unknownRetained || unknown
 	age := "unavailable"
 	if validWaitTime(since, now) {

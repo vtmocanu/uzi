@@ -1,4 +1,7 @@
 {
+  "memory_episode": 0,
+  "memory_intervention_count": 0,
+  "memory_policy": null,
   "run_id": "33333333-3333-3333-3333-333333333333",
   "kind": "ci_fix",
   "issue_iid": null,

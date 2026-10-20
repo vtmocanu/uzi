@@ -2037,6 +2037,28 @@ export const mockRuns: Run[] = [
 // hold_reason set), resumed by the promoter on Enable, never by a plain Resume. Derived
 // from the owner-paused fixture above so every other field stays realistic.
 const pausedBase = mockRuns.find((r) => r.id === "run-paused")!;
+// Memory owner holds: open /runs/run-memory-hold (or the unknown/source-only sibling).
+// ?mock=memory-hold-nonowner makes owner controls unavailable for these fixtures.
+for (const [id, max, sourceOnly] of [
+  ["run-memory-hold", 2, false],
+  ["run-memory-hold-unknown", null, false],
+  ["run-memory-hold-source-only", 2, true],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, status: "recovery_wait", hold_reason: null,
+    recovery_wait_cause: "worker_memory_pressure", recovery_retry_not_before: null,
+    memory_hold: { episode: 4, used: 2, max, remaining: max === null ? null : 0 },
+    checkpoint_contains_latest: true, requeue_count: 9,
+    worker_recovery: {
+      episode: 7, automatic_requeue_limit: 3, episode_used: 1, episode_remaining: 2,
+      evidence: {
+        checkpoint_tip: sourceOnly ? null : "abc123", available_capture: !sourceOnly,
+        publication_uncertain: sourceOnly, capture_uncertain: sourceOnly,
+        custody_uncertain: sourceOnly, unknown: sourceOnly, recorded_at: minsAgo(30),
+      },
+    },
+  });
+}
 mockRuns.push(
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),

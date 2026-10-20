@@ -38,6 +38,8 @@ const workerStateFixtureDir = "../../../fixtures/worker-state-request"
 // after #1795 by design (TestWorkerStateDecodeMirrorInLockstep fails until they are mirrored
 // here), so it is not a frozen snapshot of the pre-#1795 struct.
 type stateRequestMinusGateRevision struct {
+	RegisterNonce              string                          `json:"register_nonce,omitempty"`
+	MemoryEpisode              *int64                          `json:"memory_episode,omitempty"`
 	GateCheckpointWitness      *apitypes.GateCheckpointWitness `json:"gate_checkpoint_witness,omitempty"`
 	ExpectedGateRevision       *int64                          `json:"expected_gate_revision,omitempty"`
 	RevisionInputID            *int64                          `json:"revision_input_id,omitempty"`

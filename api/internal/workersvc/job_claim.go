@@ -186,22 +186,29 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		cfg.JobInputsMaxFiles = l.InputsMaxFiles
 		cfg.JobInputsMaxBytes = l.InputsMaxBytes
 	}
+	frozenMemoryPolicy, policyErr := optionalMemoryPolicy(run.MemoryPolicy)
+	if policyErr != nil {
+		return nil, policyErr
+	}
 	return &ClaimPayload{
-		RunID:             run.ID.String(),
-		Kind:              run.Kind,
-		ClaimGeneration:   run.ClaimGeneration,
-		IssueTitle:        run.IssueTitle,
-		IssueDescription:  run.IssueDescription,
-		Status:            run.Status,
-		Job:               job,
-		BudgetWallSeconds: &wall32,
-		LastSeq:           run.LastSeq,
-		IterationCount:    run.IterationCount,
-		RequeueCount:      run.RequeueCount,
-		Secrets:           ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
-		Agents:            []ClaimAgent{},
-		Skills:            skills,
-		SkillsDropped:     skillDrops,
-		Config:            cfg,
+		MemoryEpisode:           run.MemoryEpisode,
+		MemoryInterventionCount: run.MemoryInterventionCount,
+		MemoryPolicy:            frozenMemoryPolicy,
+		RunID:                   run.ID.String(),
+		Kind:                    run.Kind,
+		ClaimGeneration:         run.ClaimGeneration,
+		IssueTitle:              run.IssueTitle,
+		IssueDescription:        run.IssueDescription,
+		Status:                  run.Status,
+		Job:                     job,
+		BudgetWallSeconds:       &wall32,
+		LastSeq:                 run.LastSeq,
+		IterationCount:          run.IterationCount,
+		RequeueCount:            run.RequeueCount,
+		Secrets:                 ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
+		Agents:                  []ClaimAgent{},
+		Skills:                  skills,
+		SkillsDropped:           skillDrops,
+		Config:                  cfg,
 	}, nil
 }

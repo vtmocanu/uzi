@@ -53,6 +53,9 @@ type github struct {
 	// (BranchHead / CompareAncestry, issue #1582 M1). Unlike logClient these requests
 	// DO carry the PAT, set per request by githubGetBounded. See ancestryClient.
 	ancClient *http.Client
+
+	artifactAPI   *http.Client
+	artifactHooks artifactTestHooks
 	// allowInsecureLogHost relaxes fetchJobLog's https-only + private-host SSRF
 	// guard. It is false in production and set true ONLY by the test harness, whose
 	// blob "host" is an httptest server on loopback http. Never settable through
@@ -117,13 +120,23 @@ func newGitHub(baseURL, token string, timeout time.Duration) (*github, error) {
 		Timeout:       timeoutClient(timeout).Timeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+	artifactPin := redirectguard.NewOriginPin(forgeTransport())
+	if err := artifactPin.Allow(c.BaseURL()); err != nil {
+		return nil, errors.New("artifact: invalid API origin")
+	}
+	artifactAPI := &http.Client{
+		Transport:     artifactPin,
+		Timeout:       httpClient.Timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	return &github{
-		token:     token,
-		client:    c,
-		redact:    redact,
-		logClient: logClient,
-		ancClient: ancestryClient(timeout),
-		slugs:     map[int64]repoSlug{},
+		artifactAPI: artifactAPI,
+		token:       token,
+		client:      c,
+		redact:      redact,
+		logClient:   logClient,
+		ancClient:   ancestryClient(timeout),
+		slugs:       map[int64]repoSlug{},
 	}, nil
 }
 

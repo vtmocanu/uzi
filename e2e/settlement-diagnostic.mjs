@@ -13,7 +13,8 @@ const integer = v => Number.isSafeInteger(v) && v >= 0 ? v : null;
 const safe = (v, pattern) => typeof v === 'string' && pattern.test(v) ? v : null;
 const reason = v => enumValue(v, ['inventory_source_not_quiescent:execution_tail_present',
   'inventory_source_not_quiescent:non_linux_host', 'inventory_snapshot_changed',
-  'inventory_quiescence_breach', 'upload_transient', 'early_pin_only_after_restart']);
+  'inventory_quiescence_breach', 'upload_transient', 'early_pin_only_after_restart',
+  'final_retry_refused', 'final_retry_unknown', 'inventory_hold_settled']);
 async function names(dir) {
   if (remaining <= 0 || Date.now() >= deadline) return [];
   try { const s = await fs.lstat(dir); if (!s.isDirectory() || s.isSymbolicLink()) return []; return (await fs.readdir(dir)).sort().slice(0, 256); }

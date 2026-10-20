@@ -1104,6 +1104,56 @@ treated as untrusted:
 
 Exceeding a byte or job-discovery limit records `ci_evidence_limited`.
 
+### Artifact repair evidence
+
+In the CI-watch dialog, **Artifact names or globs (optional)** takes one
+artifact name or glob per line, up to **20**. Default `ci-repair` entries and
+user-created CI-watch schedules use the same field. Leave it blank to fetch
+**no artifacts**; this differs from a blank workflow selector, which watches
+all workflows in the listed window. Names match artifact names, not paths
+inside an archive. Entries are trimmed, unique, valid UTF-8, 1–200 bytes,
+without control or format characters; globs use Go `path.Match` syntax
+(for example `e2e-rundir-*`).
+
+The CLI uses repeatable `--artifact` on `schedule create --ci-watch` or
+`schedule edit`. Editing with `--clear-artifacts` fetches none and leaves
+the workflow selector unchanged; it is mutually exclusive with `--artifact`.
+Omitting both preserves the saved artifacts. For API edits, omitted
+`ci_artifacts` preserves the value; `null` or `[]` clears it.
+
+**GitHub is the implemented artifact provider.** GitLab and Forgejo repairs
+remain logs-only; their artifact support is deferred (M2). Collection binds
+evidence to the observed execution, repository, workflow, commit and branch,
+then revalidates that execution before creating the run. GitHub's run-scoped
+artifact API cannot prove which attempt produced an artifact after a rerun:
+an unknown attempt or any attempt other than the first stays logs-only.
+
+The api downloads and extracts selected archives, admitting **UTF-8 text
+only**, up to **50 files / 16 MiB per repair run / 4 MiB per file**.
+Administrators can lower the run limits in
+[Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909).
+Archive paths, links, inflated bytes and download work are bounded before
+worker delivery. Content is scrubbed **before hashing and storage**.
+The bounded, untrusted manifest identifies kept files and refusal reasons;
+it does not promise a row for each archive member. Omission counts are
+reported when known, and stay unknown when content was not inspected.
+Missing, expired, unsupported or budget-refused evidence leaves the repair
+able to proceed with log tails; if some files were admitted, the manifest
+records the partial evidence.
+
+Inputs reuse sealed job-file storage and its per-owner, instance and shared
+stored-files quotas. They expire `UZI_JOB_FILES_RETENTION` after the repair
+run ends (default **168h**). On the worker, evidence stays outside the clone
+in a private worker-owned **0700** directory with **0400** files. Both
+harnesses receive read-only access through mediated evidence tools, including
+on resume; workers receive neither artifact URLs nor forge tokens for
+collection.
+
+This describes the source at M1's dispatched head, not completed release
+acceptance. Required final gates, real-database composition, worker-UID/runtime
+and maintainer packaged proof remain pending; see
+[PRD #2866](../prds/2866-ci-artifacts-repair-evidence.md#dispatched-progress-and-evidence).
+
 ### The CI-config guard
 
 A repair run **never pushes a change to CI configuration**. The guard is
@@ -1169,9 +1219,15 @@ worker capability, `ci_config_guard_v1`:
 - **Workers first also works:** a new worker reports the capability, an older
   api ignores it, and nothing changes until the api ships.
 
+File-bearing repair runs also require `ci_artifacts_v1` **in addition to**
+`ci_config_guard_v1`. Roll out workers advertising both before expecting
+those runs to claim. Repairs without artifact files retain the guard
+capability requirement.
+
 ### Not covered
 
-- Only job **log tails** are used as evidence; CI artifacts are not read.
+- Artifact fetching on GitLab and Forgejo is deferred; those repairs use
+  job log tails. MR-branch `ci_fix` runs do not receive these artifact inputs.
 - A fire reads one page; a workflow outside the window is reported, not
   paged to.
 - One red execution is enough to start a repair, and the attempt cap is the

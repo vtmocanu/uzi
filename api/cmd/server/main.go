@@ -413,6 +413,7 @@ func run() error {
 		RequestDeadline:        cfg.RecoveryRequestDeadline,
 	}), nil)
 	wsvc.SetJobFiles(jobFiles)
+	wsvc.SetCIArtifactLimits(cfg.CIArtifactMaxFiles, cfg.CIArtifactMaxBytes)
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
@@ -1026,7 +1027,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
-		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths})
+		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
 		// (SCHEDULER_CHECK_INTERVAL=0) is left OUT of the loops evidence entirely rather than
@@ -1337,6 +1338,7 @@ func run() error {
 		codexReconciler := workersvc.NewCodexReconciler(q, vlt, box,
 			codexauth.NewClient(codexauth.WithPerRequestTimeout(codexProviderRequestTimeout)), pool)
 		codexUsageEngine = codexusagepoller.New(q, wsvc, codexReconciler, cfg.CodexUsagePollInterval, slog.Default())
+		codexUsageEngine.SetNotifier(notifier)
 		bgWG.Add(1)
 		go func() {
 			defer bgWG.Done()

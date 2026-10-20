@@ -1,3 +1,4 @@
+{{- $_ := include "uzi.workerMemoryGuardEnabled" . -}}
 {{- if .Values.workers.enabled }}
 {{- /*
   THIS TEMPLATE RENDERS NOTHING, ON PURPOSE. It exists to evaluate the hosted-worker

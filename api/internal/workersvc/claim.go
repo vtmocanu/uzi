@@ -24,10 +24,13 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	PolicyHoldResume       bool                 `json:"policy_hold_resume,omitempty"`
-	PolicyHoldFreshSession bool                 `json:"policy_hold_fresh_session,omitempty"`
-	CrossCheck             *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
-	RunID                  string               `json:"run_id"`
+	PolicyHoldResume        bool                 `json:"policy_hold_resume,omitempty"`
+	PolicyHoldFreshSession  bool                 `json:"policy_hold_fresh_session,omitempty"`
+	MemoryEpisode           int64                `json:"memory_episode"`
+	MemoryInterventionCount int32                `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
+	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
+	RunID                   string               `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -368,7 +371,8 @@ type ClaimPayload struct {
 	// Job is the job block of a kind='job' claim (PRD #1908): the caller's job type, title,
 	// prompt and named inputs. nil (key omitted) for every other kind. A job claim carries no
 	// repo, PAT, memory, skills or forge fields.
-	Job *ClaimJob `json:"job,omitempty"`
+	Job      *ClaimJob      `json:"job,omitempty"`
+	CIRepair *ClaimCIRepair `json:"ci_repair,omitempty"`
 	// BudgetWallSeconds is the job's wall-clock budget in seconds (PRD #1908): the job runner
 	// aborts and reports failed at this bound. Set only on a job claim, omitted otherwise.
 	BudgetWallSeconds *int32       `json:"budget_wall_seconds,omitempty"`
@@ -705,6 +709,7 @@ type ClaimConfig struct {
 	// CompletionScopeClaim; it carries milestone TITLES (looked up from the contract's criteria),
 	// which the owner-facing CompletionScopeView DTO does not.
 	CompletionScope *CompletionScopeConfig `json:"completion_scope,omitempty"`
+	NonClosing      *CompletionNonClosing  `json:"non_closing,omitempty"`
 	// JobInputFileMaxBytes, JobInputsMaxFiles and JobInputsMaxBytes are the server's job-input
 	// limits (PRD #1909 D1: one file, files per job, total bytes per job), delivered on a JOB
 	// claim only so the worker can refuse an oversized manifest before it downloads anything. The

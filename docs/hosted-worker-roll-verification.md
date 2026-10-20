@@ -62,10 +62,14 @@ set; two partial workers cannot provide that set by union.
    pin or a source-chart deployment. Do not downgrade an active paced roll. A new
    controller with an old API must hold for missing proof, without unpaced fallback.
 
-`workers.drainDeadline` bounds only an admitted busy image turn. For a disposable
-test, choose a short positive duration that still permits clear observations.
-It does not expire a canary hold or waiting siblings' admission. Independent
-maintenance deadlines keep their existing meaning.
+Under #3103, `workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains default
+`24h` and positive-only parsing, narrowed to independent **nondrifted** pressure/
+nix-size maintenance. Choose a short positive override in the disposable test to
+prove it no longer forces image upgrades. Busy actual spec-hash/generation drift
+(image pin, template or size) and associated recycle wait indefinitely for genuine
+idle, including run-bound workers outside pacing, plain drains and calls with no
+pacing entry. No timer uncordons workers or expires a pool hold. No knob is added.
+Indefinite waits can delay capacity turnover and security fixes.
 
 ## Capture proof without credentials
 
@@ -163,10 +167,23 @@ reservation state or optimistic preconditions.
   temporarily mirrored on retained /data only for that necessary gap, and survives
   restart without a second journal. An identical marker confirmed by a complete
   fresh PVC list need not advance resourceVersion; changed/cancelled markers must.
-- Clear/re-cordon an admitted busy image turn in the controlled fixture after an
-  old deadline expired. Record the bounded fresh confirmation using the **new**
-  drain timestamp; mutation must wait until that timestamp actually expires.
-  Independent maintenance fences/deadlines must remain intact.
+- Hold an admitted busy image turn past both the old and a reset drain deadline.
+  Clear/re-cordon in the controlled fixture and verify neither timestamp authorizes
+  replacement, drift-associated recycle or timer-based uncordon. Repeat for
+  same-image template/size/generation drift, plain drain provenance, no pacing entry
+  and run-bound workers outside pacing. Queued, paused and all assigned nonterminal
+  waits/gates must block. Own pinned continuations/checkers may finish; unrelated
+  new roots, unassigned children and new judge intake must remain closed; an
+  already-claimed judge may finish under its existing budget. Then let the assigned
+  runs genuinely finish and verify the guarded automatic roll proceeds.
+- Record the busy drainer consuming pool concurrency (default one), supplying no
+  replacement coverage, canary proof or post-promotion proof, and holding further admission
+  indefinitely. Unadmitted peers stay uncordoned/claimable; legacy recycle cannot
+  evade that policy. Test separately fenced DinD maintenance independently.
+- Exercise independent nondrifted pressure/nix-size maintenance past its shortened
+  deadline: busy deferral may expire and unheld /data may be deleted. Repeat with
+  custody-held data preserved, including with no assigned blockers. Preserve idle
+  guards and the guarded busy restore of an unchanged retained zero-replica Deployment.
 
 ## Missing evidence and explicit recovery
 
@@ -179,19 +196,21 @@ hold rather than infer a mapping or truncate to success.
 
 Recover a wrong expected version by applying the independently verified stamp
 and observing fresh proof. If the supported proof cannot be supplied, recovery
-requires an explicit operator force-roll decision: set `workers.forceRoll: true`
-through the managed deployment configuration, accept bypass of hold, pacing,
-evidence and busy waits plus possible loss of remaining capacity, then restore
-`false` after the emergency. Custody and independent maintenance still protect
-their resources. Force-roll acts on drift; it does not invent a replacement for
-an unchanged template. In a same-version legacy recovery, explicitly supply a
+may require an explicit **global emergency** force-roll decision: set
+`workers.forceRoll: true` through the managed deployment configuration. Accept
+bypass of hold, pacing, incarnation proof and busy deferral for drift, plus busy
+deferral for independent maintenance, with interrupted runs and possible loss of
+all capacity; then restore `false`. This is neither targeted nor a recovery
+guarantee. Custody-held data and independent DinD readiness/identity/pod-absence
+guards stay authoritative; DinD has no deadline or ForceRoll bypass. Force-roll
+does not invent template drift. In a same-version legacy recovery, explicitly supply a
 managed template/image change when replacement is needed, then verify the new
 incarnation. Returning to a known-good pin is an operator action, not automatic
 rollback, and still requires reconciliation of the active cohort's evidence.
 
 ## Diagnostic checks
 
-Once the API package work lands, verify authoritative `Kind: fleet` pacing and
+Verify authoritative `Kind: fleet` pacing and
 partial `Kind: readiness` receipts do not erase each other. Verify API receipt
 TTL independent of pod phase and preserved actual stuck reasons/podless rows.
 In-app diagnosis remains read-only and the API holds no kube credentials;
@@ -203,6 +222,19 @@ stale. Preserve the exact stored `workersvc.ReasonWorkersUpgrading` drain-only
 wait exemption with finite nonzero nonfuture eligible wait/drain timestamps.
 Held/offline new waits are genuine queue waits; pacing state is not exemption.
 Record these results separately from M2 controller and hosted claim tests.
+
+Verify existing `upgrade_detail` and health evidence use API assignments, not
+worker `reported_runs`. Worker detail must retain full UUID/status/kind/actions
+for up to five owner-safe blockers plus omissions; distinguish unavailable evidence
+from no assigned blockers and keep custody clearance separate. Health retains up
+to five waiting rows, each with one bounded blocker plus omissions. Check queued,
+paused and each wait/gate, without adding an instance alarm or changing the existing
+24h owner wait/drain-overlap danger or CLI danger exit `8`.
+
+For `pool_wait`, verify the explanation names a spendable credential in the owner's
+Anthropic token pool: "a pooled token becomes spendable, or the owner adds or selects a usable token / runs `uzi run resume-now`".
+This enables continuation, not upgrade release; release requires terminal status
+or unassignment. No worker-capacity event releases this credential wait.
 
 ## Envelope smoke and result record
 

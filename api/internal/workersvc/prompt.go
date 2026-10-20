@@ -66,7 +66,7 @@ type promptRunInput struct {
 type promptRunGuard struct {
 	ciConfigPaths []string
 	before        func(ctx context.Context, q Store) error
-	after         func(ctx context.Context, q Store, run store.Run) error
+	after         func(ctx context.Context, q Store, run *store.Run) error
 }
 
 // createPromptRunShared is the body CreatePromptRun and CreateCIRepairRun share: ownership,
@@ -134,7 +134,7 @@ func (s *Service) createPromptRunShared(ctx context.Context, in promptRunInput, 
 			return store.Run{}, err
 		}
 		if g != nil {
-			if err := g.after(ctx, q, run); err != nil {
+			if err := g.after(ctx, q, &run); err != nil {
 				return store.Run{}, err
 			}
 		}

@@ -623,8 +623,11 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
 }
 
 function BlockingCell({ worker: w }: { worker: AdminWorker }) {
+  const detail = w.kind === "hosted" && w.draining_since && w.upgrade_detail
+    ? <div className="text-fg">{stripUnsafeChars(w.upgrade_detail)}</div>
+    : null;
   if (!workerFailed(w) || !w.upgrade_blocking_reason) {
-    return <span className="text-faint">none</span>;
+    return detail ?? <span className="text-faint">none</span>;
   }
   const container = stripUnsafeChars(w.upgrade_blocking_container ?? "");
   const reason = stripUnsafeChars(w.upgrade_blocking_reason);
@@ -634,8 +637,11 @@ function BlockingCell({ worker: w }: { worker: AdminWorker }) {
   // container:reason — the untrusted value never reaches the attribute unstripped.
   const cause = workerFailureCause(w);
   return (
-    <span className="font-mono text-danger" title={cause ?? text}>
-      {text}
-    </span>
+    <>
+      <span className="font-mono text-danger" title={cause ?? text}>
+        {text}
+      </span>
+      {detail}
+    </>
   );
 }

@@ -13,12 +13,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// OpenJobInputFile is the worker download of one job input (PRD #1909 D8): it returns the file's
+// OpenJobInputFile downloads a job input or a guarded CI-repair input (PRD #2866): it returns the file's
 // metadata and a reader over its verified plaintext. The guard mirrors CheckJobResultTarget and
 // SubmitJobResult's fence, for a read:
 //
 //   - the run is held by wkr (ErrRunNotFound otherwise, so a foreign worker learns nothing);
-//   - the run is kind='job' (ErrNotJobRun);
+//   - the run is kind='job', or kind='prompt' with ci_config_guard (ErrNotJobRun otherwise);
 //   - claimGeneration is the run's CURRENT generation and the claim is not released
 //     (ErrStaleClaim), and the run is not terminal (ErrRunTerminal);
 //   - the job-file store is configured (ErrJobFilesUnavailable), checked only after the fence;
@@ -36,7 +36,7 @@ func (s *Service) OpenJobInputFile(ctx context.Context, wkr store.Worker, runID,
 		}
 		return store.JobFile{}, nil, err
 	}
-	if run.Kind != runkind.Job {
+	if run.Kind != runkind.Job && (run.Kind != "prompt" || !run.CiConfigGuard) {
 		return store.JobFile{}, nil, ErrNotJobRun
 	}
 	if run.ClaimGeneration != claimGeneration || run.ClaimReleasedAt.Valid {

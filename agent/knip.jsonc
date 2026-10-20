@@ -53,6 +53,18 @@
   // issue #1786), never imported, so it is an entry.
   "entry": ["test/cross-check-confinement-packaged.probe.ts", "src/pr-description-eval-cli.ts", "src/ops/retained-source.mjs"],
 
+  // The Node plugin inferred these entries when scripts.test contained --test.
+  // Runtime discovery removes that trigger; retain the identical plugin entries
+  // (not root entries, which change export checking) and all existing severities.
+  "node": {
+    "entry": [
+      "**/*{.,-,_}test.{cjs,mjs,js,cts,mts,ts}",
+      "**/test-*.{cjs,mjs,js,cts,mts,ts}",
+      "**/test.{cjs,mjs,js,cts,mts,ts}",
+      "**/test/**/*.{cjs,mjs,js,cts,mts,ts}"
+    ]
+  },
+
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts
   // worker/api wire DTOs are exported so a reader finds the shape even though one

@@ -26,6 +26,7 @@ import { defaultQueryFn } from "./sdk-messages.js";
 import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
+import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
@@ -442,6 +443,9 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
+  const memory = config.memoryGuard?.enabled
+    ? new WorkerMemoryRuntime(config.memoryGuard, client, log, { secrets: [config.workerToken] })
+    : undefined;
   const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
@@ -587,6 +591,7 @@ async function main(): Promise<void> {
   // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
   let notifyRetained: (() => void) | undefined;
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    memoryRuntime: memory,
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),
@@ -881,6 +886,7 @@ async function main(): Promise<void> {
     // worker, DinD or not.
     dindGate,
     retainedSource,
+    memory,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
@@ -900,6 +906,8 @@ async function main(): Promise<void> {
       // the unwinding execute()s, which the claim-loop drain — gated by `worker.run`
       // below — waits for within the container's termination grace. controller.abort()
       // then unblocks the loops as today.
+      // Revoke memory authority before any cancellation can begin or await IO.
+      void worker.shutdownMemory();
       runner.shutdown();
       // PRD #1906 M4: abort any in-flight isolated research session too; each reports its
       // run failed as it unwinds, so the drain does not wait out the run's timeout.

@@ -12,9 +12,9 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// WorkerJobInputFile streams one job input file to the worker holding the run (PRD #1909 D8):
+// WorkerJobInputFile streams one job or guarded CI-repair input to the worker holding the run:
 // GET /worker/runs/{id}/files/{fileID}?claim_generation=N. The service enforces the fence (held by
-// this worker, kind job, current claim generation, not terminal) and that the file is an attached
+// this worker, kind job or guarded prompt, current claim generation, not terminal) and an attached
 // input of THIS run; every other file reads as 404.
 //
 //	400 malformed id or claim_generation

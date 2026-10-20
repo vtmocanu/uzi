@@ -21,7 +21,8 @@
 #   --max-ticks    give up after N polls (default 40, or 80 with --sha -> ~80 min either way).
 #   --repo         OWNER/REPO (default: inferred by gh from the checkout).
 #
-# Run it in the BACKGROUND (the harness re-invokes you when it exits); do not block a
+# Use a verified native callback or consented completion adapter; background execution
+# alone does not establish owner re-entry. Do not block a
 # foreground turn on it. Polling the whole-run `status` and reacting only at `completed`
 # is the bug this replaces: a long job (test-api-store-it) keeps the run in_progress for
 # minutes after a fast job (validate-api) has already gone red. Each pending tick prints

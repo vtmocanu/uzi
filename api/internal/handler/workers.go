@@ -672,11 +672,19 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		ids = append(ids, row.ID)
 	}
+	blockerIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		if row.Kind == "hosted" && row.DrainingSince.Valid {
+			blockerIDs = append(blockerIDs, row.ID)
+		}
+	}
+	blockers := h.upgradeBlockersByWorker(r.Context(), blockerIDs)
 	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		appendUpgradeBlockers(&dto, blockers, row.ID)
 		if count, ok := decisions[row.ID]; ok {
 			dto.CustodyDecisionsNeeded = &count
 		}
@@ -703,11 +711,19 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		ids = append(ids, row.Worker.ID)
 	}
+	blockerIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		if row.Worker.Kind == "hosted" && row.Worker.DrainingSince.Valid {
+			blockerIDs = append(blockerIDs, row.Worker.ID)
+		}
+	}
+	blockers := h.upgradeBlockersByWorker(r.Context(), blockerIDs)
 	decisions := h.custodyDecisionsByWorker(r.Context(), ids)
 	reported := h.reportedRunsByWorker(r.Context(), ids)
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := adminWorkerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt, h.cfg.WorkerHeartbeatStale)
+		appendUpgradeBlockers(&dto.WorkerDTO, blockers, row.Worker.ID)
 		if count, ok := decisions[row.Worker.ID]; ok {
 			dto.CustodyDecisionsNeeded = &count
 		}
@@ -718,6 +734,41 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
+}
+
+// upgradeBlockersByWorker reads only authorized draining hosted response IDs.
+func (h *Handler) upgradeBlockersByWorker(ctx context.Context, ids []uuid.UUID) map[uuid.UUID]workersvc.UpgradeBlockers {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make(map[uuid.UUID]workersvc.UpgradeBlockers, len(ids))
+	for _, id := range ids {
+		out[id] = workersvc.UpgradeBlockers{Unavailable: true}
+	}
+	if h.q == nil {
+		return out
+	}
+	rows, err := h.q.ListWorkerUpgradeBlockers(ctx, ids)
+	if err != nil {
+		slog.Warn("worker upgrade blockers unavailable", "error", err)
+		return out
+	}
+	for id, b := range workersvc.GroupUpgradeBlockers(rows) {
+		out[id] = b
+	}
+	return out
+}
+
+func appendUpgradeBlockers(dto *apitypes.WorkerDTO, blockers map[uuid.UUID]workersvc.UpgradeBlockers, id uuid.UUID) {
+	b, ok := blockers[id]
+	if !ok {
+		return
+	}
+	detail := b.Summary()
+	if dto.UpgradeDetail != nil && *dto.UpgradeDetail != "" {
+		detail = *dto.UpgradeDetail + "; " + detail
+	}
+	dto.UpgradeDetail = &detail
 }
 
 // DeleteWorker revokes a worker owned by the current user.

@@ -526,23 +526,23 @@ workers:
 
   # --- the drain policy (PRD #422 M5) ---------------------------------------------
   #
-  # How the controller resolves a deliberate image roll (advancing workers.image.tag)
-  # of a worker that is BUSY. Only an admitted worker is cordoned; workers waiting
-  # for their turn keep claiming. An admitted busy worker defers until idle or the
-  # deadline, while pacing, capacity and hold gates remain authoritative.
+  # Busy spec-hash/generation drift (image pin, template or size) waits indefinitely
+  # for genuine idle (#3103), including run-bound workers outside pacing. Only an
+  # admitted paced worker is cordoned; waiting peers keep claiming. An admitted busy
+  # drainer consumes a slot without replacement coverage, canary proof or post-promotion proof.
   #
-  # drainDeadline: how long an admitted, roll-cordoned busy worker delays replacement
-  #   before its in-flight run requeues (Decision 4). It never bypasses admission,
-  #   capacity or a stalled-pool hold. An ordinary Go
-  #   duration ("24h", "1h", "30m"). The reconcile loop is stateless, so the elapsed time
-  #   is measured from the api-supplied draining_since, not from any controller memory.
+  # drainDeadline: busy deferral for independent NONDRIFTED pressure/nix-size
+  #   maintenance only; it may interrupt runs and delete /data unless custody-held.
+  #   No elapsed timer authorizes busy drift replacement, associated recycle or
+  #   automatic uncordon, even with no pacing entry/plain drain. Ordinary Go duration
+  #   ("24h", "1h", "30m"); default and positive-only parsing are unchanged. Age is
+  #   measured from API draining_since. A shorter deadline cannot force image upgrades.
   drainDeadline: "24h"
-  # forceRoll: the EMERGENCY override — roll every drifted worker immediately regardless
-  #   of busy, accepting the in-flight requeue (e.g. a CVE that must not wait on a drain).
-  #   Explicitly bypasses pacing, hold and promotion evidence, and can remove all
-  #   remaining capacity; custody and independent maintenance protection still apply.
-  #   It only accelerates a PENDING roll (a drifted worker); it never invents one. Leave
-  #   false in normal operation and flip it true only for the duration of the emergency.
+  # forceRoll: GLOBAL emergency bypass of pacing, hold, incarnation proof and busy
+  #   deferral for drift, plus busy deferral for independent maintenance. May interrupt
+  #   runs and lose ALL capacity; neither targeted nor a recovery guarantee. Custody-held
+  #   data and independent DinD readiness/identity/pod-absence guards remain authoritative;
+  #   DinD has no deadline or ForceRoll bypass. Leave false outside the emergency.
   forceRoll: false
   # Replacements admitted concurrently AFTER canary promotion. Positive integer.
   rollConcurrency: 1
@@ -614,7 +614,7 @@ workers:
     # so the fleet rolls as its workers finish their runs. It must be concrete: the
     # controller-deployment template wraps it in `required`, so a blank tag fails the
     # render loudly rather than shipping an empty image reference.
-    tag: "0.86.0-rc.18"
+    tag: "0.86.0-rc.19"
   # The Harbor pull secret IN THE WORKER NAMESPACE. It cannot be the release
   # namespace's copy: a ServiceAccount's imagePullSecrets can only name a Secret in
   # its OWN namespace. Empty = no pull secret (the KinD smoke, where the agent image
@@ -679,6 +679,17 @@ workers:
   # it for burst capacity on one worker no longer risks piling two simultaneously
   # queued runs onto whichever worker happens to poll first while a sibling sits idle.
   maxConcurrentRuns: 1
+  # Explicit opt-in; supply all six positive decimal settings when enabled.
+  # No calibrated production settings are supplied. The worker checks thresholds
+  # against its actual finite cgroup limit; the controller has no live limit.
+  memoryGuard:
+    enabled: false
+    reserveBytes: ""
+    sampleMs: ""
+    hysteresisBytes: ""
+    rearmMs: ""
+    responseBudgetMs: ""
+    maxInterventions: ""
   # Dedicated cross-check lane slots; 0 disables the lane. Accepted range [0, 16].
   # Relayed through UZI_WORKER_CROSS_CHECK_SLOTS to WORKER_CROSS_CHECK_SLOTS.
   crossCheckSlots: 1
@@ -1397,7 +1408,7 @@ workers:
       # by a live pull (issue #285):
       #   ghcr.io                              -> manifest + anonymous pull token
       #   pkg-containers.githubusercontent.com -> 307 target for the blob layers
-      #                                           (config + the cluster-0.6.1.tgz)
+      #                                           (config + the cluster-<version>.tgz)
       # BOTH are needed — a manifest-only reachability check against ghcr.io alone passes
       # while the actual layer pull still fails at the blob host.
       #
@@ -1687,8 +1698,8 @@ database:
 #
 # Postgres image: the per-cluster values pin a specific tag from a private registry
 # mirror (cloudnative-pg). dev-cluster standardizes on 16.x (fleet-consistent
-# + confirmed mirrored); do NOT copy example-app's PG18 image here. (dev-cluster's CNPG
-# operator 1.23.5 supports up to PG17, so 16.x is a fleet-convention choice, not an
+# + confirmed mirrored); do NOT copy example-app's PG18 image here. (The fleet's CNPG
+# operator 1.30.1 supports newer majors, so 16.x is a fleet-convention choice, not an
 # operator-imposed ceiling.)
 postgres:
   enabled: false

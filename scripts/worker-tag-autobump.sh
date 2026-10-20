@@ -188,4 +188,4 @@ fi
 apply_bump "$VERSION"
 
 echo "worker-tag-autobump: agent runtime surface changed since $PREV_TAG (${CHANGED}...); bumped workers.image.tag $OLD -> $VERSION (+ PINNED_TAG in the decouple assert)."
-echo "  The hosted fleet WILL roll to $VERSION on deploy, draining in-flight runs first (force-roll off, ${PREV_TAG} drain deadline bounds it)."
+echo "  The hosted fleet will begin its roll to $VERSION on deploy, waiting indefinitely for assigned nonterminal runs to finish (force-roll off; drain deadline applies only to independent nondrifted maintenance)."

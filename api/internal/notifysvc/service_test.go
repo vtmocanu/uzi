@@ -19,6 +19,9 @@ import (
 // fakeStore records the calls Notify makes so the persist-first ordering, the
 // prune cap, and the payload marshaling are all observable without a database.
 type fakeStore struct {
+	codexCurrent bool
+	codexErr     error
+	codexAsked   []store.IsCodexEarlyResetCurrentParams
 	order        []string
 	inserted     store.InsertNotificationParams
 	pruned       store.PruneNotificationsForUserParams

@@ -111,10 +111,14 @@ DM because it is not a status transition; its reason is in the activity feed.
   weren't finished yet** — the ones already done stay done, from the plan
   you already approved.
 
-`uzi run resume-now` also resumes a paused run (it's the same endpoint that
-already resumes a run held for a pooled token). A run with prior policy-refusal
-context follows the stricter consent rule below, even after another hold or
-a successful continuation.
+A `completion_blocked` hold refuses plain `uzi run resume` and
+`uzi run resume-now`. Use `uzi run decide` or an eligible `uzi run set-token`
+switch; see [Completion holds](run-completion-hold.md).
+
+`uzi run resume-now` also resumes an ordinary owner-paused run (it's the same endpoint that
+already resumes a run held for a pooled token).
+A run with prior policy-refusal context follows the stricter consent rule below,
+even after another hold or a successful continuation.
 
 ## The clock stops
 
@@ -187,8 +191,9 @@ Web/TUI/Slack choices remain pending M3. See the
 
 A `paused` run is not always a pause **you** asked for. A run with the
 [structural completion interlock](run-completion-hold.md) turned on can also
-land in `paused` on its own, after it repeatedly can't finish a milestone its
-plan was approved with — a **completion hold**, not an owner pause. The two
+land in `paused` on its own for unmet milestones, a closing-commit refusal
+or an unknown completion projection — a **completion hold**, not an owner
+pause. The two
 look alike (both a parked `paused` run) but resolve differently: an owner
 pause only ever resumes when you ask (this page), while a completion hold
 resumes through `uzi run decide <id> --continue`. The run page tells the two

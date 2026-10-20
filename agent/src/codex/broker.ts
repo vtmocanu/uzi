@@ -39,7 +39,9 @@
 
 import path from "node:path";
 import { CODE_DISPOSITIONS_TOOL, authorizeCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
+import type { WorkerMemoryPressureResult } from "../protocol.js";
 import {
   validatePolicyRefusal,
   policyRefusalMessage,
@@ -98,6 +100,7 @@ const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
   ["Bash", "uzi_bash"],
   ["apply_patch", "uzi_apply_patch"],
   ["Read", "uzi_read"],
+  ["mcp__ci_evidence__read", "uzi_ci_evidence_read"],
   ["Search", "uzi_search"],
   ["Skill", "uzi_skill"],
   ["mcp__forge__get_issue", "uzi_forge_get_issue"],
@@ -236,7 +239,7 @@ export type CallbackOrigin = "root" | "child" | "unknown";
  *  or transport frame. */
 export type CallbackResult =
   | { readonly ok: true; readonly output: unknown }
-  | { readonly ok: false; readonly code: string; readonly message: string; readonly policyRefusal?: PolicyRefusalPayload };
+  | { readonly ok: false; readonly code: string; readonly message: string; readonly policyRefusal?: PolicyRefusalPayload; readonly memoryPressure?: WorkerMemoryPressureResult };
 
 /** One fileop request, mapped to the NDJSON op protocol
  *  (agent/codex/supervisor/fileop). `path`/`newPath` are worktree-RELATIVE (the
@@ -275,10 +278,44 @@ export interface FileopClient {
 }
 
 /** Result of running a shell effect as the command identity. */
+/** Captured by the worker for one flight; M3 owns begin/retire lifecycle wiring. */
+export interface CapturedMemoryContext {
+  readonly commands: WorkerMemoryCommands;
+  readonly context: ReturnType<WorkerMemoryCommands["begin"]>;
+  readonly flight: object;
+  readonly lifecycleRevision: number;
+}
+
+interface ModelCommandMetadata extends CallbackRuntimeId {
+  readonly toolName: string;
+  readonly toolId: string;
+  readonly attemptId: string;
+  readonly commandId: string;
+  readonly command: string;
+}
+const modelCommands = new WeakMap<ModelCommandMetadata, CapturedMemoryContext | undefined>();
+const memoryCallbackIds = new WeakMap<ModelCommandMetadata, { toolId: string; attemptId: string }>();
+
+/** Bind display identifiers to the original worker-minted callback before redaction reaches its result. */
+export function bindMemoryCallback(metadata: ModelCommandMetadata, ids: { toolId: string; attemptId: string }): void {
+  if (!isBrokerModelCommand(metadata) || memoryCallbackIds.has(metadata)) throw new Error("invalid memory callback binding");
+  memoryCallbackIds.set(metadata, Object.freeze({ toolId: ids.toolId, attemptId: ids.attemptId }));
+}
+
+/** Identity membership is minted only by dispatchShell after screening. */
+export function isBrokerModelCommand(value: ModelCommandMetadata | undefined, captured?: CapturedMemoryContext): value is ModelCommandMetadata {
+  if (value === undefined || !modelCommands.has(value)) return false;
+  if (!captured) return true;
+  const bound = modelCommands.get(value);
+  return bound !== undefined && bound.commands === captured.commands && bound.context === captured.context
+    && bound.flight === captured.flight && bound.lifecycleRevision === captured.lifecycleRevision;
+}
+
 export interface SpawnCommandResult {
   readonly code: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly memoryPressure?: WorkerMemoryPressureResult;
 }
 
 /** Options for a shell effect spawn: the working directory (the broker guarantees it is
@@ -287,6 +324,7 @@ export interface SpawnCommandResult {
  *  seam records the exact env command spawns use; the default seam falls back to its
  *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
+  readonly modelCommand?: ModelCommandMetadata;
   readonly long_running?: boolean;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
@@ -372,6 +410,8 @@ export interface RunGrants {
 /** Everything the broker is constructed with: the registry, the injected seams, the
  *  immutable grants, and optional routing/screening config. */
 export interface CodexCallbackBrokerOptions {
+  readonly capturedMemory?: CapturedMemoryContext;
+  readonly scrubToolResult?: (result: WorkerMemoryPressureResult) => WorkerMemoryPressureResult;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly scrubPolicyRole?: (role: string) => string;
   readonly registry: ExecutionRegistry;
@@ -690,7 +730,7 @@ export class CodexCallbackBroker {
 
     switch (cap) {
       case "shell":
-        return this.dispatchShell(args, origin);
+        return this.dispatchShell(rt, canonical, args, origin);
       case "file_write":
         return this.dispatchFileWrite(args);
       case "file_read":
@@ -709,7 +749,7 @@ export class CodexCallbackBroker {
 
   // --- shell ------------------------------------------------------------------
 
-  private async dispatchShell(args: unknown, origin: CallbackOrigin): Promise<CallbackResult> {
+  private async dispatchShell(rt: CallbackRuntimeId, toolName: string, args: unknown, origin: CallbackOrigin): Promise<CallbackResult> {
     const command = strField(args, "command");
     if (command === undefined) {
       return deny("bad_args", "Bash requires a non-empty string 'command'");
@@ -740,12 +780,35 @@ export class CodexCallbackBroker {
       return deny("denied_tool", "Bash long_running:true is available only to the root lead");
     }
 
+    const captured = this.opts.capturedMemory;
+    if (captured && (!captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
+      || !captured.commands.admitsCommands(captured.context))) {
+      return deny("worker_memory_pressure", "Shell admission is held or its captured flight has retired.");
+    }
+    const metadata: ModelCommandMetadata = Object.freeze({
+      threadId: rt.threadId, turnId: rt.turnId, callId: rt.callId, toolName,
+      toolId: rt.callId, attemptId: randomUUID(), commandId: randomUUID(), command,
+    });
+    modelCommands.set(metadata, captured ? Object.freeze({ ...captured }) : undefined);
     let spawned: SpawnCommandResult;
     try {
-      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
     } catch (err) {
       if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
       throw err;
+    }
+    if (spawned.memoryPressure) {
+      const result = spawned.memoryPressure;
+      const callbackIds = memoryCallbackIds.get(metadata) ?? metadata;
+      if (result.tool_id !== callbackIds.toolId || result.attempt_id !== callbackIds.attemptId
+        || result.command_id !== metadata.commandId || !captured
+        || result.run_id !== captured.context.run_id || result.worker_id !== captured.context.worker_id
+        || result.claim_generation !== captured.context.claim_generation
+        || result.memory_episode !== captured.context.memory_episode) {
+        return deny("memory_result_mismatch", "Memory result does not belong to this shell callback.");
+      }
+      const scrubbed = this.opts.scrubToolResult?.(result) ?? result;
+      return { ok: false, code: result.code, memoryPressure: scrubbed, message: scrubbed.guidance };
     }
     return {
       ok: true,

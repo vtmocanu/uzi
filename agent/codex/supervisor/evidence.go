@@ -20,17 +20,19 @@ const (
 // drainResult is the outcome of one drain/dispose attempt, shared by the dispose
 // evidence event and the cleanup object embedded in an abnormal event.
 type drainResult struct {
-	State     string
-	Authority string
-	Reason    string
-	Killed    []int
-	Reaped    []int
-	Children  []int
+	State             string
+	Authority         string
+	Reason            string
+	Killed            []int
+	Reaped            []int
+	Children          []processIdentity
+	EvidenceTruncated bool
 }
 
 // fields renders the drain result to the exact wire shape. killed/reaped are
-// always present (as [] when empty, never null); reaped lists only waits done
-// during this drain, excluding earlier periodic waits. Authority appears only
+// always present (as [] when empty, never null); reaped retains a bounded prefix
+// of waits done during this drain, excluding earlier periodic waits. Omitted
+// diagnostic IDs set evidenceTruncated. Authority appears only
 // for a drained result; reason and children appear only for an unconfirmed one.
 func (d drainResult) fields() map[string]any {
 	m := map[string]any{
@@ -38,12 +40,18 @@ func (d drainResult) fields() map[string]any {
 		"killed": intSlice(d.Killed),
 		"reaped": intSlice(d.Reaped),
 	}
+	if d.EvidenceTruncated {
+		m["evidenceTruncated"] = true
+	}
 	if d.Authority != "" {
 		m["authority"] = d.Authority
 	}
 	if d.State == stateUnconfirmed {
 		m["reason"] = d.Reason
-		m["children"] = intSlice(d.Children)
+		m["children"] = d.Children
+		if d.Children == nil {
+			m["children"] = []processIdentity{}
+		}
 	}
 	return m
 }
@@ -147,4 +155,29 @@ func intSlice(v []int) []int {
 		return []int{}
 	}
 	return v
+}
+
+// writeObservation has a per-response budget; observations never spend the
+// lifecycle line allowance. The bounded walker caps all input rows first.
+func (e *evidence) writeObservation(v observationEvidence) error {
+	if len(v.Processes) > observationItems {
+		v.State = "unavailable"
+		v.Reason = "oversize"
+		v.Processes = []observationRow{}
+	}
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if len(payload)+1 > observationBytes {
+		v.State = "unavailable"
+		v.Reason = "oversize"
+		v.Processes = []observationRow{}
+		payload, err = json.Marshal(v)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = e.w.Write(append(payload, '\n'))
+	return err
 }

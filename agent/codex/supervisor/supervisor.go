@@ -12,7 +12,7 @@ import (
 // substitute fakes to drive the loop without root or fork.
 type seams struct {
 	supervisorPid  int
-	directChildren childLister
+	directChildren childVisitor
 	kill           childKiller
 	reap           childReaper
 	childReady     <-chan error
@@ -20,6 +20,7 @@ type seams struct {
 	reapAdopted    func(pid int) (int, error)
 	reapChild      func(pid int) (code int, err error)
 	snapshot       func() ([]procRow, error)
+	observe        func(time.Time) observationEvidence
 	now            func() time.Time
 	sleep          func()
 	// tmpCleanup removes the command tmp, giving up at deadline, and reports
@@ -35,6 +36,18 @@ type supervisor struct {
 	seams   seams
 	// tmpCleaned records that tmpCleanup already ran, so it runs at most once.
 	tmpCleaned bool
+	// The launched primary cannot be PID-reused before its terminal Wait4 is
+	// consumed. Latch that consumption before another reap or readiness event.
+	primaryPid          int
+	primaryExitReported bool
+}
+
+func (s *supervisor) reportPrimaryExit(waited childWaitResult) {
+	if waited.pid <= 0 || waited.pid != s.primaryPid || s.primaryExitReported {
+		return
+	}
+	s.primaryExitReported = true
+	_ = s.ev.writeJSON(childExitEvidence{Event: "child_exit", Code: waited.code})
 }
 
 // maxCleanupMargin caps the part of an op's budget kept back from the tmp
@@ -50,7 +63,14 @@ func (s *supervisor) drainWith(timeoutMs int) (drainResult, time.Time) {
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 	deadline := s.seams.now().Add(timeout)
 	cleanupDeadline := deadline.Add(-min(maxCleanupMargin, timeout/10))
-	return drain(deadline, s.seams.now, s.seams.sleep, s.seams.directChildren, s.seams.kill, s.seams.reap), cleanupDeadline
+	reap := func() (childWaitResult, error) {
+		waited, err := s.seams.reap()
+		if err == nil && waited.pid > 0 {
+			s.reportPrimaryExit(waited)
+		}
+		return waited, err
+	}
+	return drain(deadline, s.seams.now, s.seams.sleep, s.seams.directChildren, s.seams.kill, reap), cleanupDeadline
 }
 
 // runWatched watches the primary child through watch and then runs the control
@@ -70,6 +90,8 @@ func (s *supervisor) runWatched(childPid int, st procStatus, watch func(pid int)
 // There is NO fixed lifetime: the loop lives on the control channel, bounded
 // only by per-op deadlines.
 func (s *supervisor) run(childPid int, st procStatus) int {
+	s.primaryPid = childPid
+	s.primaryExitReported = false
 	_ = s.ev.writeJSON(startedEvidence{
 		Event:          "started",
 		SupervisorPid:  s.seams.supervisorPid,
@@ -98,7 +120,6 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 	}()
 
 	childReady := s.seams.childReady
-	primaryPending := true
 	var ticks <-chan time.Time
 	if s.seams.adoptedTick != nil {
 		var stop func()
@@ -108,6 +129,10 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 	for {
 		select {
 		case readyErr := <-childReady:
+			if s.primaryExitReported {
+				childReady = nil
+				continue
+			}
 			if readyErr != nil {
 				return s.abnormal("child watch failed")
 			}
@@ -115,26 +140,33 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			if err != nil {
 				return s.abnormal("child wait failed")
 			}
-			primaryPending = false
-			_ = s.ev.writeJSON(childExitEvidence{Event: "child_exit", Code: code})
+			s.reportPrimaryExit(childWaitResult{pid: childPid, code: code})
 			// A nil channel disables this select arm. The root remains alive on fd3
 			// so the controller can drain any remaining descendants explicitly.
 			childReady = nil
 		case <-ticks:
-			for _, pid := range s.seams.directChildren() {
-				if primaryPending && pid == childPid {
-					continue
+			waitFailure := ""
+			_ = s.seams.directChildren(s.seams.now().Add(time.Second), func(child observationRow) error {
+				pid := child.Pid
+				if !s.primaryExitReported && pid == childPid {
+					return nil
 				}
 				got, err := s.seams.reapAdopted(pid)
 				if err != nil {
 					if errors.Is(err, syscall.ECHILD) || errors.Is(err, syscall.EINTR) {
-						continue
+						return nil
 					}
-					return s.abnormal("adopted child wait failed")
+					waitFailure = "adopted child wait failed"
+					return err
 				}
 				if got != 0 && got != pid {
-					return s.abnormal("adopted child wait returned unexpected pid")
+					waitFailure = "adopted child wait returned unexpected pid"
+					return errors.New("adopted child wait returned unexpected pid")
 				}
+				return nil
+			})
+			if waitFailure != "" {
+				return s.abnormal(waitFailure)
 			}
 		case result := <-controls:
 			line, err := result.line, result.err
@@ -154,6 +186,13 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 			}
 
 			switch op.Op {
+			case opObserve:
+				result := observationEvidence{Event: opObserve, State: "unavailable", Reason: "unreadable", Processes: []observationRow{}}
+				if s.seams.observe != nil {
+					result = s.seams.observe(s.seams.now().Add(time.Duration(op.TimeoutMs) * time.Millisecond))
+				}
+				result.ID = op.ID
+				_ = s.ev.writeObservation(result)
 			case opSnapshot:
 				rows, serr := s.seams.snapshot()
 				if serr != nil {
@@ -162,6 +201,9 @@ func (s *supervisor) run(childPid int, st procStatus) int {
 				_ = s.ev.writeJSON(snapshotEvidence{Event: opSnapshot, ID: op.ID, Processes: rows})
 			case opDispose:
 				drained, cleanupDeadline := s.drainWith(op.TimeoutMs)
+				if s.primaryExitReported {
+					childReady = nil
+				}
 				m := disposeEvidence(op.ID, drained)
 				if drained.State == stateDrained {
 					// Remove the tmp BEFORE reporting, so the dispose line carries

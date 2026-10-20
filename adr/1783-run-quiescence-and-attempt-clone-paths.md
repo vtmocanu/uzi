@@ -90,6 +90,28 @@ removes the tree.
    matrix as a negative probe, proving a sidecar container cannot read worker
    secrets through it.
 
+### Amendment 2026-10-19 — #3123: done-checkpoint settlement
+
+The reaped Codex done-checkpoint path with `executor.safety` starts its absolute
+60 s soft / 90 s hard allowance before gate admission and carries the remaining
+time through queue admission, reconciliation, quiescence and action. The existing
+fresh advisory snapshot request has an independent allowance. Neither a soft
+stop nor a forfeited queued callback proves quiescence or ownership. Owned work
+must settle before a sibling sink proceeds, and the Runner still requires exact
+positive producing-context, generation and committed-receipt proof.
+
+Shutdown stops active and queued done attempts across runs and blocks fresh
+snapshot admission. The actual shutdown sink retains
+[#3101's typed credential exception](1766-codex-vault-lock-park.md#amendment-3101-actual-graceful-shutdown-durability)
+and #3109's genuine installer-before-credential reconciliation within the original
+absolute grace (15 s default). Local content tests cover promptly settled
+predecessors and verify the latest receiver content within that grace. They are
+not hosted/shared-worker acceptance. Awaited storage settlement is unbounded,
+and unsafe cleanup may consume the grace and fail closed with source/custody
+retained. This changes no process proof, clone retirement or deletion authority;
+one private stage may remain per soft-stopped attempt without sweep or adoption
+authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+
 ### M2 — attempt-unique clone paths on Docker-wired workers
 
 8. **Each execution attempt seeds a fresh path**,
@@ -97,7 +119,7 @@ removes the tree.
    (`agent/src/attempt-path.ts`), and an exposed attempt path is never reused by a
    later attempt. **This is the isolation guarantee itself** — a later attempt
    never inherits an earlier attempt's residue, escaped process, or bind-mounted
-   container, because it never touches that path at all. M1's sweep and M3's
+   container, because it never touches that path at all. M1's process sweep and M3's
    quarantine are recovery for what is left behind, not what makes isolation hold.
 9. **The `.attempt-` separator**, not `@` or another delimiter: `git
    check-ref-format` accepts `.attempt-` inside a ref, so the choice is not about
@@ -114,23 +136,24 @@ removes the tree.
 10. A bare-config ledger, `uzi-attempts.<branch>.entry`, records every attempt's
     state: `live`, `abandoned`, `retired`, or `reclaimed`. `reclaimed` (a foreign
     attempt released without capture) is never disposable — it is not eligible for
-    the retention sweep's delete.
+    the former retention sweep's delete. Since #1858, automatic retention
+    deletion is disabled for disposable-kind attempts too.
 11. The recovery journal carries the attempt id, so a journal entry and a ledger
     entry can be cross-checked for the same attempt.
 12. Journal cases are classified by identity (C'/B'/A'), and a C' capture proves
     predecessor-scoped quiescence before releasing the predecessor's path in
     place — the predecessor is never removed out from under a proof that has not
     run.
-13. **Retention is bounded where the sweep runs**: 3 abandoned attempts per key,
-    and 5 quarantined residue entries per key (`agent/src/git.ts`,
-    `RETAINED_ABANDONED_PER_KEY` / `RETAINED_RESIDUE_PER_KEY`) — see the disclosed
-    scope reduction below: the sweep that enforces these caps runs only on
-    Docker-wired workers. Deletes run as the
-    **runner uid**, never a worker-uid recursive removal over a tree the runner
-    (and, transitively, the agent) can write to. Reclaimed-but-uncaptured attempts
-    are excluded from deletion regardless of age or count.
-14. The ledger is compacted per seed, so it does not grow without bound across the
-    life of a branch.
+13. **Automatic retention reclaim is disabled on every worker (Refs #1858).**
+    Disposable-kind attempts (abandoned and crash-window live orphans), shared
+    own-key residue from canonical and attempt entries, and orphaned skills are
+    retained. The former 3-attempt / 5-residue caps and any-orphan cleanup trigger
+    are diagnostic thresholds only; they grant no deletion authority. The original
+    Docker-only sweep and #1859 shared residue sweep are superseded history below.
+14. The ledger is compacted per seed, but identities for present paths remain.
+    Compaction is not a bound on identity metadata or retained bytes. As inventory
+    grows, existing per-seed process/teardown scope over non-live paths and ledger
+    compaction work also grow; no cap skips safety checks.
 
 ### Option A — the accepted resume trade-off
 
@@ -202,10 +225,9 @@ removes the tree.
     the worker restarts, because an `rm` that may still be walking the tree must
     never be handed a fresh clone or a quarantine rename underneath it. From the
     operator's side this shows up as the same key repeatedly failing with
-    `worker_residue_blocked`, not as one isolated failure. The retention sweep
-    honours the same record: a sweep target at or under an unsettled path is
-    refused and kept with a warning (the sweep does not fail the run), and the
-    worker log records the path entering (`runner-uid delete recorded as
+    `worker_residue_blocked`, not as one isolated failure. The former retention sweep
+    also honoured this record; #1858 disables that sweep's deletions entirely.
+    The worker log records the path entering (`runner-uid delete recorded as
     unsettled`) and leaving (`left the unsettled record`) the record.
 
 ## Disclosed scope reductions
@@ -223,17 +245,15 @@ removes the tree.
   returns `undefined` when the worker has no Docker endpoint, so
   `runnerCloneForBranch` takes the canonical (non-attempt) path, and that path
   always reseeds through the M3 quarantine, not just on Docker-wired workers.
-  What is genuinely Docker-only is the retention SWEEP (`sweepRetainedArtifacts`)
-  that bounds decision 13's caps and reclaims old residue — it is called only
-  from `attemptCloneForBranch`, which itself only runs when the worker is
-  Docker-wired. So an unwired worker quarantines residue exactly as a
-  Docker-wired one does, but nothing ever caps or sweeps what accumulates there:
-  a `.uzi-residue-*` entry on an unwired worker is retained forever. This is an
-  accepted gap, not a design intent; treat unbounded residue growth on unwired
-  workers as a known follow-up.
+  **Historical retention scope, superseded:** the original
+  `sweepRetainedArtifacts` ran only from Docker-wired attempt seeding, leaving
+  unwired residue unswept. #1859 then shared own-key residue reclamation between
+  canonical and attempt seeding. #1858 stops automatic retention deletion from
+  both entries on every worker, including attempts and orphaned skills. Unbounded
+  accumulation is now the explicit retention policy, not an unwired-only gap.
 - The ledger rewrite (decision 10/14) needs hard links on the data volume; a
   volume that does not support them is a deployment constraint on this design,
-  not a design gap. The compaction that bounds the ledger's size
+  not a design gap. The compaction that removes obsolete ledger entries
   (`compactAttemptLedger`) is itself best-effort: it catches its own failure,
   logs "attempt ledger compaction failed; the ledger is left as it was", and
   leaves the ledger uncompacted rather than failing the run. A volume without
@@ -305,14 +325,15 @@ removes the tree.
   (`cloneKeyOf`, `parseAttemptPath`, `formatResidueName`) and mint attempt ids
   only through `mintAttemptId` (`agent/src/run-quiescence.ts`) — they are the
   single source of truth for every in-process consumer, including the reaper and
-  the retention sweep. `uzi-watcher`'s recovery shell scripts
+  retention diagnostics. `uzi-watcher`'s recovery shell scripts
   (`.agents/skills/uzi-watcher/scripts/backup-runs.sh`) are outside that
   boundary: they cannot import TypeScript, so they parse the same
   `<stem>.attempt-<id>` grammar themselves (`ATTEMPT_RE`, basename matching) — a
   second, necessarily duplicated implementation. Keep it byte-for-byte in sync
   with `attempt-path.ts`'s grammar when either changes.
-- Never delete a `reclaimed` ledger entry's clone via the retention sweep, and
-  never delete anything as the worker uid when the runner uid can do it instead.
+- Automatic retention deletion is disabled, including for `reclaimed` clones.
+  For unchanged cleanup paths, never delete anything as the worker uid when the
+  runner uid can do it instead.
 - Never follow a symlink or non-directory found at a canonical clone path during
   reseed; quarantine it unopened.
 - Keep the two quarantine directories semantically distinct: journaled retirees
@@ -591,7 +612,7 @@ fail on zombies.
 
 ## Follow-ups and accepted risks
 
-These are not filed yet; listed here for the maintainer to file after merge.
+The original follow-ups are recorded below with their later disposition where known.
 
 - **Behaviour change: a resume or re-claim on a Docker-wired worker starts a
   new model session** (Option A above). This is an accepted, disclosed
@@ -607,14 +628,17 @@ These are not filed yet; listed here for the maintainer to file after merge.
   reviewers named but did not build a proxy that would prove zero container
   exposure across an attempt boundary and so restore safe in-place session
   resume without losing conversational continuity (decision 16). This remains
-  open work.
-- **Follow-up 3 — the retention sweep can delete an older attempt or residue
-  path after a process-only check, even when the Docker teardown was
-  unconfirmed.** Raised in a bot security review: since a Docker result never
-  gates the sweep's deletions (only the process proof does), a sweep-triggered
-  delete can remove a path whose Docker containers were never confirmed torn
-  down. A follow-up could require a fresh, successful Docker-use check before
-  deleting a retained path, rather than relying on the process proof alone.
+  open work, tracked separately as #1860.
+- **Follow-up 3 — unsafe automatic retention deletion disabled (Refs #1858).**
+  The former sweep could delete an older attempt or residue after process-only
+  proof despite unconfirmed Docker teardown. Disabling it removes that deletion
+  path; it does not establish writer exclusion or provide safe automatic reclaim.
+  #1860 separately owns daemon mediation. The unchanged `beforeFree` /
+  `freeCanonicalClonePath` and quarantine flow still has a **process-proof /
+  daemon pending-create residual**: a create already accepted by the daemon can
+  complete after the process proof and clean listings. #2852's terminal/Docker
+  writer-exclusion remainder is not fixed. Currently unwired status is not durable
+  proof that a path was never exposed to a daemon.
 - **Follow-up 4 — on a Codex run, several sinks have a process-proof gap,
   though not all the same gap.** `handlePausePark` and terminal retire call
   `quiesceRun` directly and get no boundary anywhere: no process proof runs
@@ -731,8 +755,9 @@ or both records for a bounded, idempotent retry. Malformed, duplicate,
 conflicting or unattributed evidence refuses detachment and inventory.
 
 Protected records preserve custody evidence, source paths and recovery pins;
-they grant no seed, discovery or executor authority. Inventory, retention sweep
-and ledger compaction include their sources. Backup validates the exact run's
+they grant no seed, discovery or executor authority. Inventory and ledger
+compaction include their sources; the former retention sweep also protected them.
+#1858 disables automatic retention deletion. Backup validates the exact run's
 full protected descriptor and ledger identities before selecting its current
 clone or a retained predecessor, even after a newer run owns the active slot;
 completed and cancelled runs with protected sources remain eligible. Inconclusive
@@ -778,60 +803,100 @@ review on 2026-10-09 (#2512).
 
 ## Amendment 2026-10-14 — #1859: shared per-key residue retention
 
-The Docker-only sweep and unwired accepted-gap paragraph in *Disclosed scope
-reductions* records the original implementation. Current code closes that
-residue-reclamation gap without changing ordinary unwired canonical continuity
-or the recovery-enabled fresh-attempt behavior recorded above.
+**Historical implementation record — superseded by #1858 below.** The entire
+quoted description records #1859's delivered sweep, not current deletion policy.
 
-In `agent/src/git.ts`, `runnerCloneForBranch` calls the shared `sweepResidue`
-under the bare lock **after successful canonical free and before the new seed**.
-The attempt path calls the same helper after seed/live registration.
-Abandoned-attempt and orphaned-skills cleanup remains exclusive to the attempt
-path; canonical reseeding adds residue cleanup, not those phases.
+> The Docker-only sweep and unwired accepted-gap paragraph in *Disclosed scope
+> reductions* records the original implementation. Current code closes that
+> residue-reclamation gap without changing ordinary unwired canonical continuity
+> or the recovery-enabled fresh-attempt behavior recorded above.
+>
+> In `agent/src/git.ts`, `runnerCloneForBranch` calls the shared `sweepResidue`
+> under the bare lock **after successful canonical free and before the new seed**.
+> The attempt path calls the same helper after seed/live registration.
+> Abandoned-attempt and orphaned-skills cleanup remains exclusive to the attempt
+> path; canonical reseeding adds residue cleanup, not those phases.
+>
+> The helper considers direct siblings of the same clone key that match the exact
+> parser grammar `.uzi-residue-<key>.residue-<uuid>` (`<uuid>` is a lowercase v4
+> UUID). Five entries is a best-effort retention target, not a disk bound. It sorts
+> the original candidates by their own lstat mtime, then basename, and considers
+> only the original oldest excess slice. A refused excess entry stays; no newer
+> entry is substituted to compensate. Parent validation and complete enumeration
+> precede reclamation. A private fixed 4096-direct-entry budget bounds this
+> enumeration, not storage; overflow skips all residue reclamation for that sweep.
+> The budget is not a setting. With no excess, the helper returns without a
+> redundant journal discovery.
+>
+> Expensive residue candidate processing is separately capped at 16 attempts per
+> sweep, counting refusals. A per-clone-key in-process cursor rotates through the
+> original oldest excess slice, so a persistently refused prefix cannot starve
+> later excess. The cursor records ordering position only, never safety evidence;
+> every attempt repeats the fresh checks below. The newest five remain outside
+> the candidate slice. Cursor storage is a 128-key LRU, cleared when no excess
+> remains. Process restart or LRU eviction starts that key from the oldest again.
+> This is a work-count bound, not a hard elapsed-time bound: a started operation
+> still settles under its existing safety/deletion deadlines before returning.
+>
+> Before deletion, fresh readable journal discovery protects a candidate or any
+> descendant named by recovery evidence, and the live registry protects live paths.
+> Deletion requires an affirmative scoped seed-process verdict, with journal,
+> live and quarantine checks repeated around the proof and before deletion.
+> An active or newly latched unreadable-unattributed worker quarantine keeps all
+> residue entries. False, absent or unverified proof and generic thrown proof keep
+> the candidate with bounded diagnostics; classified control/recovery
+> interruptions propagate. Fresh-attempt seeding's unreadable-process relaxation
+> never authorizes retention deletion. Off Linux, an absent process verdict keeps
+> entries rather than inventing proof. See [ADR-2213](2213-worker-residue-quarantine.md#amendment-2026-10-14--1859-residue-retention-veto).
+>
+> Canonical retention in `agent/src/runner.ts` forwards the existing configured
+> best-effort Docker handling. Unwired workers gain no daemon obligation.
+> Attempt retention preserves its existing `processOnly: true` posture.
+> **Follow-up 3 remains an inherited risk**: this change introduces no confirmed
+> container verdict and does not redesign Docker teardown. Existing runner-uid,
+> path/name validation and deletion deadlines remain in place. A possibly alive
+> rm stops further cleanup; a file or symlink residue entry is unlinked itself,
+> without following its target or recursively deleting through it.
+>
+> Safety can leave more than five entries. This adds no hard disk bound,
+> background timer or custody change. At delivery, the Linux
+> `task test:clone-quiescence` image build timed out before actual cases; real
+> procfs/uid verification from that leg remains incomplete, pending maintainer
+> verification.
 
-The helper considers direct siblings of the same clone key that match the exact
-parser grammar `.uzi-residue-<key>.residue-<uuid>` (`<uuid>` is a lowercase v4
-UUID). Five entries is a best-effort retention target, not a disk bound. It sorts
-the original candidates by their own lstat mtime, then basename, and considers
-only the original oldest excess slice. A refused excess entry stays; no newer
-entry is substituted to compensate. Parent validation and complete enumeration
-precede reclamation. A private fixed 4096-direct-entry budget bounds this
-enumeration, not storage; overflow skips all residue reclamation for that sweep.
-The budget is not a setting. With no excess, the helper returns without a
-redundant journal discovery.
+## Amendment 2026-10-18 — #1858: retain artifacts, diagnose accumulation
 
-Expensive residue candidate processing is separately capped at 16 attempts per
-sweep, counting refusals. A per-clone-key in-process cursor rotates through the
-original oldest excess slice, so a persistently refused prefix cannot starve
-later excess. The cursor records ordering position only, never safety evidence;
-every attempt repeats the fresh checks below. The newest five remain outside
-the candidate slice. Cursor storage is a 128-key LRU, cleared when no excess
-remains. Process restart or LRU eviction starts that key from the oldest again.
-This is a work-count bound, not a hard elapsed-time bound: a started operation
-still settles under its existing safety/deletion deadlines before returning.
+Refs #1858: retention-only, non-closing delivery. `diagnoseRetainedArtifacts`
+replaces automatic sweep deletion of disposable-kind attempts (abandoned and
+crash-window live orphans), shared own-key residue at both canonical and attempt
+entries, and orphaned skills on every worker. All those artifacts remain; there
+is no safe automatic reclaim mechanism. No process scan, daemon listing (including
+repeated clean listings), time, age, count or disk pressure authorizes retention
+deletion. Current unwired status does not prove absence of prior daemon exposure.
 
-Before deletion, fresh readable journal discovery protects a candidate or any
-descendant named by recovery evidence, and the live registry protects live paths.
-Deletion requires an affirmative scoped seed-process verdict, with journal,
-live and quarantine checks repeated around the proof and before deletion.
-An active or newly latched unreadable-unattributed worker quarantine keeps all
-residue entries. False, absent or unverified proof and generic thrown proof keep
-the candidate with bounded diagnostics; classified control/recovery
-interruptions propagate. Fresh-attempt seeding's unreadable-process relaxation
-never authorizes retention deletion. Off Linux, an absent process verdict keeps
-entries rather than inventing proof. See [ADR-2213](2213-worker-residue-quarantine.md#amendment-2026-10-14--1859-residue-retention-veto).
+The read-only helper validates the direct parent and observes at most 4096 direct
+siblings, without a recursive byte walk. Observed counts are lower bounds with
+completeness; overflow or read failure gives partial/unknown evidence, never zero
+by inference. Existing predicates fail closed. A true `custodyHeld` result means
+protected-or-unreadable, so attempt classification is partial without a second
+probe. There is no retention proof, deletion, rename or retired-ledger append.
 
-Canonical retention in `agent/src/runner.ts` forwards the existing configured
-best-effort Docker handling. Unwired workers gain no daemon obligation.
-Attempt retention preserves its existing `processOnly: true` posture.
-**Follow-up 3 remains an inherited risk**: this change introduces no confirmed
-container verdict and does not redesign Docker teardown. Existing runner-uid,
-path/name validation and deletion deadlines remain in place. A possibly alive
-rm stops further cleanup; a file or symlink residue entry is unlinked itself,
-without following its target or recursively deleting through it.
+Known excess alone (>3 attempts, >5 residue, or >0 orphaned skills) can emit
+`runner clone retention: automatic reclaim disabled`, with a sanitized, truncated
+key and observed counts/completeness. Warnings are limited to one per hour per full
+canonical key in a bounded 128-key LRU; restart or eviction may warn again.
+Diagnostic memory and enumeration are bounded; retained bytes, identity metadata
+and the safety inventory are not. Ledger compaction keeps identities for present
+paths. Existing process/teardown scope over non-live paths and compaction work
+grow with inventory; no cap skips safety checks.
 
-Safety can leave more than five entries. This adds no hard disk bound,
-background timer or custody change. At delivery, the Linux
-`task test:clone-quiescence` image build timed out before actual cases; real
-procfs/uid verification from that leg remains incomplete, pending maintainer
-verification.
+Normal cleanup, `beforeFree` / `freeCanonicalClonePath`, quarantine, capture and
+operator discard contracts remain unchanged. The process-proof / daemon
+pending-create residual remains; #1860 is separate daemon mediation, and #2852's
+terminal/Docker writer-exclusion remainder is not fixed. This delivers no proxy,
+marker, ledger, API, schema, configuration flag or new infrastructure.
+
+Attributed attempts and paired skills may use the existing guarded
+[retained-source discard](../docs/run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
+Shared residue and orphaned skills have no supported generic reclaim route.
+Server custody discard alone is not local writer-exclusion proof.

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ClaimResponse } from "../src/protocol.js";
+import { validateCIRepairClaim } from "../src/ci-evidence.js";
 import { DEFAULT_CI_CONFIG_PATHS, flagCIConfigPathsRaw } from "../src/ci-config-guard.js";
 
 // Issue #2865 cross-side contract: the default-branch CI repair claim. The worker parses the SAME
@@ -31,4 +32,19 @@ test("ci repair claim wire contract: the worker reads config.ci_config_guard and
 test("ci repair claim wire contract: the Go producer's json tag is exactly ci_config_guard", () => {
   const claimGo = readFileSync(join(apiDir, "claim.go"), "utf8");
   assert.match(claimGo, /CIConfigGuard bool `json:"ci_config_guard,omitempty"`/);
+});
+
+test("artifact-bearing Go claim preserves canonical aliases and unknown remainder", () => {
+  const claim = JSON.parse(readFileSync(join(apiDir, "testdata", "claim_ci_artifacts_wire.json"), "utf8")) as ClaimResponse;
+  validateCIRepairClaim({ ...claim, config: claim.config ?? undefined }, claim.claim_generation);
+  assert.equal(claim.repo.forge_type, "github");
+  assert.equal(claim.config?.ci_config_guard, true);
+  assert.equal(claim.job, undefined);
+  const repair = claim.ci_repair!;
+  assert.equal(repair.input_files.length, 1);
+  const kept = repair.manifest.entries.filter(e => e.status === "kept");
+  assert.equal(kept.length, 2);
+  for (const entry of kept) assert.equal(entry.manifest_id, repair.input_files[0]!.manifest_id);
+  assert.equal(repair.manifest.uninspected, true);
+  assert.equal(repair.manifest.omitted, undefined);
 });

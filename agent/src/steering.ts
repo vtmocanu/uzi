@@ -46,6 +46,7 @@
 
 import { RequestError, type InputReceipt, type PlanCrossCheckFindings, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
+import type { GracefulShutdownCheckpoint } from "./harness.js";
 import { InclusionReporter } from "./inclusion-reporter.js";
 import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse, type Milestone, type UserInput } from "./protocol.js";
@@ -672,6 +673,7 @@ export class SteeringChannel {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
     this.fence = reason;
+    this.shutdownStop.abort(signal);
     this.flightEnded = signal;
     this.ready = undefined;
     this.releaseHeld();
@@ -1401,7 +1403,36 @@ export class SteeringChannel {
     return this.terminalLifecycle.signal;
   }
 
+  private readonly shutdownStop = new AbortController();
+
+  /** Revocation fence also fires for disk/switch delivery after a cooperative pause. */
+  checkpointAuthoritySignal(): AbortSignal {
+    return this.shutdownStop.signal;
+  }
+
+  private shutdownCheckpoint?: GracefulShutdownCheckpoint;
+
+  workerShutdownCheckpoint(): GracefulShutdownCheckpoint | undefined {
+    return this.shutdownCheckpoint;
+  }
+
+  /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
+  workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
+    if (this.shutdownCheckpoint) return this.shutdownCheckpoint;
+    if (this.lifecycleEnded || this.terminalLifecycle.signal.aborted || this.cancelled ||
+        this.flightEnded || this.pendingSwitchGeneration !== undefined || this.pauseMode === "disk" ||
+        (this.cancel.signal.aborted &&
+          !(this.cancel.signal.reason instanceof PauseNowSignal))) this.shutdownStop.abort();
+    this.shutdownCheckpoint = Object.freeze({ stopSignal: this.shutdownStop.signal, deadlineAt });
+    this.cancel.abort();
+    this.terminalLifecycle.abort();
+    this.lifecycleEnded = true;
+    this.lifecycle.abort();
+    return this.shutdownCheckpoint;
+  }
+
   abortLifecycle(reason?: unknown, terminal = true): void {
+    if (terminal || reason instanceof CredentialSwitchSignal) this.shutdownStop.abort(reason);
     if (terminal && !(reason instanceof PauseNowSignal)) this.terminalLifecycle.abort(reason);
     if (terminal) this.lifecycleEnded = true;
     if (!this.lifecycle.signal.aborted) this.lifecycle.abort(reason);
@@ -1557,6 +1588,7 @@ export class SteeringChannel {
   requestDiskStop(): void {
     if (this.pauseMode === "disk") return;
     this.pauseMode = "disk";
+    this.shutdownStop.abort();
     const signal = new PauseNowSignal();
     if (!this.cancel.signal.aborted) this.cancel.abort(signal);
     this.abortLifecycle(signal);
@@ -1585,6 +1617,7 @@ export class SteeringChannel {
    * The runner installs its maintenance budget before aborting model/lifecycle listeners. */
   markCancelled(): void {
     this.cancelled = true;
+    this.shutdownStop.abort();
   }
 
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
@@ -2247,6 +2280,7 @@ export class SteeringChannel {
    */
   private maybeTripCredentialSwitch(generation: number): void {
     if (generation !== this.claimGeneration) return; // a stale signal for a superseded claim
+    this.shutdownStop.abort();
     // PRD #1247 M5b (MAJOR-6): inside a defer window (a plan-revision planning turn), DEFER — do NOT
     // set pendingSwitchGeneration and do NOT abort. The signal rides every poll, so it trips at the
     // next poll after the window closes (the gate wait), by which point the revised plan is persisted.
@@ -2361,7 +2395,7 @@ export class SteeringChannel {
       case "cancel":
         // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
         // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
-        this.cancelled = true;
+        this.markCancelled();
         try { this.onCancel?.(); }
         finally {
           try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
@@ -2528,6 +2562,9 @@ export class SteeringChannel {
       }
       try {
         if (!this.held && !this.stopped) {
+          // Shutdown must not restart observation when an already-running sleep ends.
+          // Leave pending receipt settlement on its existing path above.
+          if (this.shutdownCheckpoint) break;
           this.requestStage = "get";
           const { inputs: read, staleObservation, terminalCancelled, credentialSwitch, receipts, nowSummary } = await this.client.getInputs(this.runId, this.claimGeneration);
           if (this.fence !== undefined || this.terminalLifecycle.signal.aborted) break;

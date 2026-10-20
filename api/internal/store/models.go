@@ -561,6 +561,22 @@ type JobResult struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type MemoryIntervention struct {
+	InterventionID  uuid.UUID          `json:"intervention_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RegisterNonce   string             `json:"register_nonce"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	MemoryEpisode   int64              `json:"memory_episode"`
+	Admitted        bool               `json:"admitted"`
+	AllowanceUsed   int32              `json:"allowance_used"`
+	Policy          []byte             `json:"policy"`
+	Outcome         pgtype.Text        `json:"outcome"`
+	ReservedAt      pgtype.Timestamptz `json:"reserved_at"`
+	OutcomeAt       pgtype.Timestamptz `json:"outcome_at"`
+}
+
 type MrReviewAuthorQueue struct {
 	RepoID        uuid.UUID          `json:"repo_id"`
 	Ref           string             `json:"ref"`
@@ -1075,8 +1091,13 @@ type Run struct {
 	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
 	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
 	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
+	MemoryEpisode               int64              `json:"memory_episode"`
+	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
+	MemoryPolicy                []byte             `json:"memory_policy"`
+	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
+	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
 }
 
@@ -1298,6 +1319,7 @@ type RunSchedule struct {
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
+	CiArtifacts                []byte             `json:"ci_artifacts"`
 }
 
 type RunUsage struct {

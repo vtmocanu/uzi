@@ -1450,6 +1450,20 @@ chain in the diagram above, with no intervening `running`.
   branch that *modifies* a workflow file. See
   [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism, its
   2026-08-23 overlay amendment, and why merge precedes rebase.
+- **Proactive worker memory guard** (#2396): off by default, with six explicit
+  numeric settings and no calibrated production thresholds. One worker-wide
+  cgroup monitor ranks enrolled Codex model command trees by approximate RSS
+  and acts through exact registered supervisor identities. It adds no process
+  authority or concurrency change. The API persists frozen episode allowance;
+  uncertain/exhausted intervention takes the capture/owner-only memory-hold
+  path, retaining source when disposition is unconfirmed. Register establishes
+  authority; heartbeat growth cannot create it, and shrink revokes further
+  reservation/signalling without erasing original settlement obligations.
+  Claude enrollment is deferred to #2471; separately accounted DinD, sudden
+  bursts, stalled sampling and node pressure remain limitations. Rollout,
+  destructive schema rollback versus operational disable, and command deadline
+  boundaries are recorded in [ADR-2396](adr/2396-worker-memory-guard.md);
+  operator settings live in [configuration](docs/configuration.md#worker-memory-guard).
 - **Durable recovery of unpublished work at the finalization boundary** (PRD
   #1296): before any of the finalization failures above (a secret/workflow
   preflight, a rejected push, or exhausted base alignment) can leave a run's
@@ -1463,7 +1477,14 @@ chain in the diagram above, with no intervening `running`.
   H-free, opened in the same `ClaimRun` transaction) protects unpublished work
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
-  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  total custody remains protected. After discarded/released precedence, an OPEN
+  hold at `recovery_wait` for `worker_requeue_exhausted` or
+  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  otherwise `source_only`, before available unguarded archives or capture
+  progress. Archive availability remains independent of attention and does not
+  release owner-held custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
+  [ADR-2396](adr/2396-worker-memory-guard.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**
@@ -1784,6 +1805,19 @@ then continues on the live socket — so a dropped WebSocket connection loses
 nothing, unlike a design where the socket itself is the only record. The
 socket is a live cache and reconnect-convenience layer, **never** the source
 of truth.
+
+The worker-only interrupted-call advisory is a separate direct `run_messages` reader
+(issue #3124): `GET /api/worker/runs/:id/interrupted-calls` observes current owner,
+worker registration nonce and unreleased claim generation in one SQL snapshot.
+It materializes the newest 256 records of any kind before choosing a prior tool-bearing
+generation and pairing exact persisted call/lane identities. It returns at most three
+unmatched shell invocations with complete bounded command/display sources; it does not
+return tool output or full identity keys. This read does not change message ingestion,
+health windows, user replay or future archive/rollup policy. Its optional evidence lives
+only in the claim's execution context and reaches the first ordinary owner implementation
+prompt inside fresh untrusted fences. Missing results in that window prove neither
+execution nor continued activity. Snapshot warnings are independent of this telemetry.
+See the [isolated acceptance procedure](docs/interrupted-call-acceptance.md).
 
 The `/api/ws` endpoint sits behind `RequireUser`, the same dual guard the run
 read routes use: a browser session cookie **or** a user-scoped CLI token
@@ -2416,16 +2450,34 @@ rather than falling back to unpaced replacement.
 Only admitted image turns receive a roll-owned cordon over the authenticated
 `POST /api/controller/workers/{id}/drain` control-write channel. The API's
 `draining_since` and reason remain separate from heartbeat-derived status.
-`workers.drainDeadline` (default `24h`) bounds that admitted busy turn; a bounded
-fresh re-cordon/poll must confirm the **current** expired timestamp and fences.
-An old expired timestamp cannot authorize a newly reset drain. Independent
-pressure/maintenance deadlines retain their meaning. An unresolved stuck
-participant holds the rest of its pool. Release clears only roll-owned drains
-on healthy retained old workers or proven current replacements; independent
-maintenance, pressure and custody fences remain. `workers.forceRoll` explicitly
-bypasses pacing, holds, evidence and busy waits and can remove remaining capacity,
-while preserving custody and independent maintenance protection. No timer
-forces admission and no automatic rollback is added.
+Under #3103, actual spec-hash/generation drift (image pin, template or size) and
+associated recycle wait indefinitely for genuine idle, including run-bound
+workers outside pacing and calls with no pacing entry or a plain drain reason.
+Any assigned nonterminal run blocks, including queued, paused and all waits/gates;
+API assignments are authoritative, not worker `reported_runs`. Own pinned
+continuations/checkers may finish; unrelated new roots, unassigned children and
+judge intake are refused. An admitted busy drainer consumes concurrency (default
+one), supplies no replacement coverage, canary proof or post-promotion proof, and can
+hold its pool indefinitely. Unadmitted healthy peers stay uncordoned and claimable,
+without a legacy-recycle escape; separately fenced DinD remains independent.
+Idle guards and custody still apply, even with no assigned blockers. Restoring
+an unchanged retained zero-replica Deployment while busy keeps its existing guard.
+
+`workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains default `24h` and
+positive-only parsing, narrowed to independent **nondrifted** pressure/nix-size
+maintenance. That maintenance can interrupt busy runs and delete /data unless
+custody-held. Shortening it no longer forces image upgrades; no knob is added.
+Indefinite drift waits can delay capacity turnover and security fixes indefinitely.
+Release clears only roll-owned drains on healthy retained old workers or proven
+current replacements; independent maintenance, pressure and custody fences remain.
+No timer automatically uncordons a worker.
+
+`workers.forceRoll` is **global**: it bypasses pacing, holds, incarnation proof and
+busy deferral for drift, plus busy deferral for independent maintenance. It may
+interrupt runs and lose all capacity; it is neither targeted nor a recovery
+guarantee. Custody-held data and independent DinD readiness/identity/pod-absence
+guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic
+rollback is added. See ADR-1470 D6 and ADR-422 D4 for the supersession.
 
 Deploy API first, then the singleton controller/chart with the worker pin steady,
 verify evidence/report support, then change the pin. An old controller with a new
@@ -2446,7 +2498,8 @@ long-lived workers pick it up on their next roll), deliberately bounding
 superseded-ReplicaSet retention below the k8s default of 10: an init-wedged pod
 left behind on a scaled-to-0 old RS is otherwise never garbage-collected and
 holds its tier's ResourceQuota indefinitely (issue #360). The requeue-then-manual-vault-unlock fallback (a run that does get
-rolled — past the drain deadline, on force-roll, or by an uncontrolled pod loss)
+interrupted — by independent nondrifted maintenance expiry, global force-roll,
+or an uncontrolled pod loss)
 is unchanged by this PRD. Full rationale, the Decision Log, and what remains
 open (a CLI drain verb, live-cluster validation) are in
 [adr/0422-decouple-worker-version.md](adr/0422-decouple-worker-version.md).
@@ -2477,7 +2530,8 @@ The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.
 DinD is scratch, including named volumes; replacing the Deployment also loses
 run-workdir. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
-runs legacy first, DinD on a later tick; standalone legacy overrides are unchanged.
+runs legacy first, DinD on a later tick; legacy busy deadlines now apply only to
+independent nondrifted maintenance, while global ForceRoll retains custody guards.
 Admins see cleanup pending; ephemeral and unsupported workers report pressure only.
 See [ADR-1759](adr/1759-dind-data-metering-and-prune.md) for the safe gate,
 Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.

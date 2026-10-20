@@ -187,6 +187,25 @@ export class FakeApi {
   // approval / the autopilot plan report); the worker reads it off the same body (readRunAck) and
   // binds its completion permit to it when the claim carried no contract_revision.
   private readonly stateAckCompletionRevision = new Map<string, unknown>();
+  private registeredWorkerId?: string;
+  private readonly publicationState = new Map<string, { deferred: unknown; attempts: number }>();
+  private readonly admittedAttempts = new Map<string, number>();
+  /** Opt in to the real hold admission rule; only successful attempts increment it. */
+  requireCompletionAttempt(runId: string, prior = 0): void {
+    this.admittedAttempts.set(runId, prior);
+    const state = this.publicationState.get(runId);
+    if (state) state.attempts = prior;
+  }
+  setPublicationState(runId: string, deferred: unknown = [], revision: unknown = 1, attempts?: number): void {
+    this.setStateAckCompletionRevision(runId, revision);
+    const count = attempts ?? this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0;
+    if (this.admittedAttempts.has(runId)) this.admittedAttempts.set(runId, count);
+    this.publicationState.set(runId, { deferred, attempts: count });
+  }
+  stateAckWire?: (body: StateRequest, run: Record<string, unknown>) => { status: number; body: unknown } | undefined;
+  completionAttemptHttpStatus = 200;
+  completionAttemptDropReplies = 0;
+  completionAttemptFailTimes = Infinity;
   // Issue #1514: the operator scope ceiling + completed ids the /state ACK's RunDTO carries.
   private readonly stateAckScope = new Map<string, { scope_ceiling: number; milestones_completed: string[] }>();
   private readonly stateRawOverride = new Map<
@@ -227,6 +246,9 @@ export class FakeApi {
   // 404 not-owned, or a transient 5xx.
   /** Opt-in M2 fixtures; legacy tests retain their original wire shape. */
   parkRunGeneration: number | undefined;
+  /** Opt-in memory contract fixture; other registrations keep their legacy shape. */
+  memoryRegisterNonce: string | undefined;
+  private memoryWorkerId: string | undefined;
   readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
   parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
   /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
@@ -415,6 +437,8 @@ export class FakeApi {
    *  that predates the feature); `postStatus` is the POST status (204 = saved). Every call is
    *  recorded so a test can assert exactly what the worker read and saved. */
   decisionsMemo: { get?: { status: number; body: unknown }; postStatus: number } = { postStatus: 204 };
+  interruptedCallsResponse?: { status: number; body: unknown };
+  readonly interruptedCallsGets: Array<{ runId: string; generation: string | null; nonce: string | undefined }> = [];
   readonly decisionsMemoGets: Array<{ runId: string; claimGeneration: string | null }> = [];
   readonly decisionsMemoPosts: Array<{ runId: string; body: { claim_generation?: number; body?: string } }> = [];
 
@@ -1042,7 +1066,12 @@ export class FakeApi {
       this.registers.push(rec);
       // PRD #1392 M2 (D7): the api advertises its protocol features here. Omit the field unless a
       // test configured one, so an unconfigured register wire stays byte-identical to an older api.
-      const registerBody: Record<string, unknown> = { worker_id: randomUUID() };
+      this.registeredWorkerId = randomUUID();
+      const registerBody: Record<string, unknown> = { worker_id: this.registeredWorkerId };
+      if (this.memoryRegisterNonce) {
+        this.memoryWorkerId = registerBody.worker_id as string;
+        registerBody.register_nonce = this.memoryRegisterNonce;
+      }
       if (this.registerProtocolFeatures !== undefined)
         registerBody.protocol_features = this.registerProtocolFeatures;
       if (this.registerNonce !== undefined) registerBody.register_nonce = this.registerNonce;
@@ -1452,6 +1481,16 @@ export class FakeApi {
       return send(res, 200, o.identity);
     }
 
+    const interruptedMatch = /^\/api\/worker\/runs\/([^/]+)\/interrupted-calls$/.exec(p);
+    if (req.method === "GET" && interruptedMatch) {
+      this.interruptedCallsGets.push({
+        runId: interruptedMatch[1]!, generation: url.searchParams.get("claim_generation"),
+        nonce: req.headers["x-worker-register-nonce"] as string | undefined,
+      });
+      const response = this.interruptedCallsResponse;
+      return send(res, response?.status ?? 404, response?.body ?? {});
+    }
+
     // Issue #2083: the decisions-memo routes.
     const decisionsMatch = /^\/api\/worker\/runs\/([^/]+)\/decisions-memo$/.exec(p);
     if (decisionsMatch) {
@@ -1481,9 +1520,22 @@ export class FakeApi {
     // configured decision. A non-200 httpStatus models a transport/HTTP error (the client throws);
     // otherwise {granted} rides a 200, with deny_reason on a denial.
     const attemptMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/attempt$/.exec(p);
-    if (req.method === "POST" && attemptMatch && this.completionAttemptWire) {
+    if (req.method === "POST" && attemptMatch) {
+      const runId = attemptMatch[1]!;
       this.completionAttemptRequests.push(json);
-      return send(res, 200, this.completionAttemptWire(json));
+      if (this.completionAttemptRequests.length <= this.completionAttemptFailTimes && this.completionAttemptHttpStatus !== 200)
+        return send(res, this.completionAttemptHttpStatus, { error: this.completionAttemptHttpStatus === 409 ? "run is not in a live claimed state for this worker" : "injected attempt failure" });
+      const count = (this.admittedAttempts.get(runId) ?? this.publicationState.get(runId)?.attempts ?? 0) + 1;
+      const reply = this.completionAttemptWire?.(json) ?? { unmet: [], attempt_count: count };
+      this.admittedAttempts.set(runId, count);
+      const state = this.publicationState.get(runId);
+      if (state) state.attempts = count;
+      if (this.completionAttemptDropReplies > 0) {
+        this.completionAttemptDropReplies--;
+        res.destroy();
+        return;
+      }
+      return send(res, 200, reply);
     }
 
     const permitMatch = /^\/api\/worker\/runs\/([^/]+)\/completion\/permit$/.exec(p);
@@ -1515,6 +1567,8 @@ export class FakeApi {
     if (req.method === "POST" && holdMatch) {
       const runId = holdMatch[1] as string;
       this.completionHoldRequests.push({ runId, body: json });
+      if (this.admittedAttempts.has(runId) && this.admittedAttempts.get(runId)! < 1)
+        return send(res, 409, { run: { id: runId, status: "running" } });
       const wire = this.completionHoldWire.get(runId);
       if (wire) return wire(res);
       return send(res, this.completionHoldHttpStatus, {
@@ -1834,6 +1888,14 @@ export class FakeApi {
       }
       await after.action;
     }
+    if (this.stateAckWire) {
+      const state = this.publicationState.get(runId);
+      const answer = this.stateAckWire(body, {
+        id: runId, worker_id: this.registeredWorkerId, status: body.status,
+        ...(state ? { completion_revision: this.stateAckCompletionRevision.get(runId), completion_deferred: state.deferred, completion_attempts: state.attempts } : {}),
+      });
+      if (answer) return send(res, answer.status, answer.body);
+    }
     send(res, 200, {
       ...(this.checkedTransport && body.status === "awaiting_approval" ? {
         claim_generation: body.claim_generation, plan_cross_check_settled: true,
@@ -1850,6 +1912,16 @@ export class FakeApi {
       } : {}),
       run: {
         id: runId,
+        worker_id: this.registeredWorkerId,
+        ...(body.recovery_cause === "worker_memory_pressure" && this.memoryWorkerId &&
+            body.register_nonce === this.memoryRegisterNonce ? {
+          worker_id: this.memoryWorkerId, recovery_wait_cause: body.recovery_cause,
+          memory_hold: { episode: body.memory_episode },
+        } : {}),
+        ...(this.publicationState.has(runId) ? {
+          completion_deferred: this.publicationState.get(runId)!.deferred,
+          completion_attempts: this.publicationState.get(runId)!.attempts,
+        } : {}),
         // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves
         // StateAck.status undefined — the client cannot branch on it and falls through to ownership.
         ...(this.omitStateAckStatusRuns.has(runId)

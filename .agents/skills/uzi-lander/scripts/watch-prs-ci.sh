@@ -22,7 +22,8 @@
 #   --wait-cr       also wait for each PR's CodeRabbit check to reach a terminal
 #                   state (by default CI-only; CodeRabbit is assessed separately).
 #
-# Run it in the BACKGROUND (the harness re-invokes you when it exits); do not block
+# Use a verified native callback or consented completion adapter; background execution
+# alone does not establish owner re-entry. Do not block
 # a foreground turn on it.
 #
 # Exit codes (aggregated over the PR set):

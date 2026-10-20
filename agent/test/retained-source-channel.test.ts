@@ -95,7 +95,7 @@ async function retainedAttempt(runId: string, n: number, iid = 2512): Promise<At
   const key = `issue-${iid}`;
   const attemptId = attemptIdAt(n);
   const clone = await git.runnerCloneForBranch(bare, branch, key, noProofReseed, runId, false, undefined,
-    { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true });
+    { attemptId, isLive: () => false, beforeSeed: async () => {} });
   await git.markRecoveryCapture(bare, clone.path, branch, runId, attemptId);
   fs.writeFileSync(path.join(clone.path, "unpreserved.txt"), "retained bytes\n");
   const a: Attempt = { branch, key, runId, attemptId, path: clone.path, clonePath: clone.path };

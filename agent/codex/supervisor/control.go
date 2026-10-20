@@ -43,6 +43,12 @@ func parseControlLine(line []byte) (controlOp, error) {
 		return controlOp{}, errMalformedControl
 	}
 	switch raw.Op {
+	case opObserve:
+		t := 1000
+		if raw.TimeoutMs != nil {
+			t = clampTimeout(*raw.TimeoutMs)
+		}
+		return controlOp{Op: opObserve, ID: raw.ID, TimeoutMs: t}, nil
 	case opSnapshot:
 		return controlOp{Op: opSnapshot, ID: raw.ID}, nil
 	case opDispose:

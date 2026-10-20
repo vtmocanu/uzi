@@ -45,56 +45,62 @@ func sanitizeComm(raw string) string {
 	return c
 }
 
-// childrenOf reads the direct children of pid via /proc/<pid>/task/*/children.
-func childrenOf(pid int) []int {
+// walkDescendants reports the legacy best-effort snapshot. These rows are not
+// intervention evidence: strict identity/consistency budgets live in observation.
+func walkDescendants(rootPid int) ([]procRow, error) {
+	return walkDescendantsFrom("/proc", rootPid)
+}
+
+// snapshotChildrenOf retains the reporting lane's thread-child deduplication.
+// Unlike observation, legacy snapshots have no aggregate thread/byte budget.
+func snapshotChildrenOf(procRoot string, pid int) []int {
 	set := map[int]bool{}
-	taskDir := "/proc/" + strconv.Itoa(pid) + "/task"
+	taskDir := procRoot + "/" + strconv.Itoa(pid) + "/task"
 	entries, err := os.ReadDir(taskDir)
 	if err != nil {
 		return nil
 	}
-	for _, e := range entries {
-		data, err := os.ReadFile(taskDir + "/" + e.Name() + "/children")
+	for _, entry := range entries {
+		data, err := os.ReadFile(taskDir + "/" + entry.Name() + "/children")
 		if err != nil {
 			continue
 		}
-		for _, f := range strings.Fields(string(data)) {
-			if n, err := strconv.Atoi(f); err == nil {
-				set[n] = true
+		for _, field := range strings.Fields(string(data)) {
+			if child, err := strconv.Atoi(field); err == nil {
+				set[child] = true
 			}
 		}
 	}
-	out := make([]int, 0, len(set))
-	for k := range set {
-		out = append(out, k)
+	children := make([]int, 0, len(set))
+	for child := range set {
+		children = append(children, child)
 	}
-	sort.Ints(out)
-	return out
+	sort.Ints(children)
+	return children
 }
 
-// readProcRow builds one sanitized snapshot row from /proc. ppid/pgid come from
-// stat; comm comes from the dedicated comm file. A row is dropped (ok=false) if
-// the process vanished mid-walk.
-func readProcRow(pid int) (procRow, bool) {
-	statData, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+// readSnapshotProcRow drops vanished/unreadable/malformed rows and tolerates a
+// missing comm, as the reporting contract did before memory observation existed.
+func readSnapshotProcRow(procRoot string, pid int) (procRow, bool) {
+	dir := procRoot + "/" + strconv.Itoa(pid)
+	stat, err := os.ReadFile(dir + "/stat")
 	if err != nil {
 		return procRow{}, false
 	}
-	ppid, pgid, err := parseStatPPidPgid(string(statData))
+	ppid, pgid, err := parseStatPPidPgid(string(stat))
 	if err != nil {
 		return procRow{}, false
 	}
 	comm := ""
-	if commData, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/comm"); err == nil {
-		comm = sanitizeComm(string(commData))
+	if data, err := os.ReadFile(dir + "/comm"); err == nil {
+		comm = sanitizeComm(string(data))
 	}
 	return procRow{Pid: pid, PPid: ppid, Pgid: pgid, Comm: comm}, true
 }
 
-// walkDescendants returns the sanitized snapshot of every descendant of rootPid,
-// bounded at maxSnapshotDescendants to reject a hostile/large tree.
-func walkDescendants(rootPid int) ([]procRow, error) {
-	pending := childrenOf(rootPid)
+// walkDescendantsFrom is a package-only proc-root seam for deterministic tests.
+func walkDescendantsFrom(procRoot string, rootPid int) ([]procRow, error) {
+	pending := snapshotChildrenOf(procRoot, rootPid)
 	visited := map[int]bool{}
 	rows := []procRow{}
 	for len(pending) > 0 {
@@ -107,12 +113,12 @@ func walkDescendants(rootPid int) ([]procRow, error) {
 		if len(visited) > maxSnapshotDescendants {
 			return nil, errSnapshotTooLarge
 		}
-		row, ok := readProcRow(pid)
+		row, ok := readSnapshotProcRow(procRoot, pid)
 		if !ok {
 			continue
 		}
 		rows = append(rows, row)
-		pending = append(pending, childrenOf(pid)...)
+		pending = append(pending, snapshotChildrenOf(procRoot, pid)...)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Pid < rows[j].Pid })
 	return rows, nil

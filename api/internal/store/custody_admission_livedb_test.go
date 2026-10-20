@@ -606,6 +606,56 @@ func TestCustodyAdmissionStatementSnapshotLiveDB(t *testing.T) {
 }
 
 // Each case pins (counted, reason) per hold; counted must also sum to the canonical count.
+// Memory holds remain owner decisions even with a downloadable archive. The
+// per-hold explanation must agree with the canonical admission count and listings.
+func TestMemoryHoldAdmissionMembershipParityLiveDB(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		for _, latestFailed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("guarded=%v/latestFailed=%v", guarded, latestFailed), func(t *testing.T) {
+				f := newAdmissionFixture(t, 1) // A live sibling stays admission-exempt.
+				run := f.run("running", f.worker, 1)
+				hold := f.holdWithInventory(run, 1, guarded)
+				f.capture(hold, run, f.owner, "available")
+				f.exec("UPDATE recovery_captures SET created_at=now()-interval '1 minute' WHERE hold_id=$1 AND user_id=$2", hold, f.owner)
+				wantAttention := "source_only"
+				if latestFailed {
+					f.capture(hold, run, f.owner, "needs_action")
+					wantAttention = "needs_action"
+				}
+				f.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_memory_pressure', claim_released_at=now() WHERE id=$1", run)
+				members := f.members(f.cutoff)
+				memory, ok := members[hold]
+				if !ok || !memory.Counted || memory.Reason != "decision_needed" {
+					t.Fatalf("memory hold membership=%+v present=%v", memory, ok)
+				}
+				live, ok := members[f.holds[0]]
+				if !ok || live.Counted || live.Reason != "live_claim" {
+					t.Fatalf("live sibling membership=%+v present=%v", live, ok)
+				}
+				listed, err := f.q.ListCustodyHoldsForOwner(f.ctx, store.ListCustodyHoldsForOwnerParams{UserID: f.owner})
+				if err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				for _, row := range listed {
+					if row.ID == hold {
+						found = true
+						if row.Attention != wantAttention || !row.DecisionNeeded || row.RecoveryWaitCause != "worker_memory_pressure" {
+							t.Fatalf("memory attention=%+v want %s with owner decision", row, wantAttention)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("memory hold missing from owner listing")
+				}
+				// This executes canonical count, per-hold parity, DTO aggregate and
+				// the other admission readers against the same fixture cutoff.
+				f.mirrors(f.cutoff, 8, 2, 1, false)
+			})
+		}
+	}
+}
+
 func TestCustodyAdmissionMembershipReasonsLiveDB(t *testing.T) {
 	type want struct {
 		counted bool

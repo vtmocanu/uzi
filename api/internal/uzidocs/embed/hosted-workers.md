@@ -121,10 +121,35 @@ image. A stuck replacement holds further replacements in that pool; it does
 not trigger an automatic rollback. Size and worker type do not divide pools.
 
 When a busy worker is admitted for replacement, the cluster **cordons** (drains)
-it: it keeps finishing its existing runs but stops claiming new ones. It
-restarts once idle, or after the admitted turn's drain deadline. An operator
-can explicitly force a roll, accepting interrupted runs and possible loss of
-remaining capacity. A pool with one worker can have an outage during its roll.
+it. It may finish its own pinned continuations and checkers, but refuses unrelated
+new roots, unassigned children and new judge intake. An already-claimed judge
+finishes under its existing budget. Actual spec-hash/generation drift
+(image pin, template or size) and associated recycle wait **indefinitely for genuine
+idle**, including run-bound workers outside pacing and calls with no pacing entry
+or a plain drain reason. Any assigned nonterminal run blocks, including queued,
+paused and all waits/gates. Idle guards still apply; custody remains separate even
+when there are no assigned blockers.
+
+An admitted busy drainer occupies pool concurrency (default one), supplies no
+replacement coverage, canary proof or post-promotion proof, and can hold the pool
+indefinitely. Healthy peers waiting for admission stay uncordoned and claimable;
+legacy recycle cannot evade that policy. Separately fenced DinD maintenance remains
+independent. A pool with one worker can have an outage during its roll. Waiting
+indefinitely can delay capacity turnover and security fixes indefinitely.
+
+`workers.drainDeadline` / `UZI_WORKER_DRAIN_DEADLINE` retains its `24h` default and
+positive-only parsing, now only for independent **nondrifted** pressure/nix-size
+maintenance. That maintenance can interrupt busy runs and delete /data unless
+custody-held. Shortening the deadline no longer forces image upgrades; no knob is
+added. An unchanged retained zero-replica Deployment can still be restored while
+busy under its existing guard.
+
+An operator can set `workers.forceRoll: true` as a **global emergency override**.
+It bypasses pacing, holds, incarnation proof and busy deferral for drift, plus busy
+deferral for independent maintenance. It may interrupt runs and lose all capacity;
+it is neither targeted nor a recovery guarantee. Custody-held data and independent
+DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline
+or ForceRoll bypass. Restore `false` after the emergency.
 
 A cordoned worker shows a dashed **draining** or **cordoned** pill next to its
 status in the Workers list — **draining** while it's still finishing runs,
@@ -136,9 +161,26 @@ This is what explains an otherwise confusing moment: a worker that's online
 and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming when the roll-owned drain can safely be released. Independent
-maintenance or recovery fences can keep it cordoned. There is no user-facing
+maintenance or recovery fences can keep it cordoned. No timer automatically
+uncordons it. There is no user-facing
 manual cordon action; the cluster drives this process. Operators can follow the
 [hosted roll verification runbook](./hosted-worker-roll-verification.md).
+
+### See which assigned runs block an upgrade
+
+Existing worker `upgrade_detail` and health evidence use API assignments, not the
+worker's `reported_runs`. Worker detail shows up to five owner-safe assigned
+nonterminal blockers with full run UUID, status, kind and continuation actions,
+plus omissions. **Unavailable** evidence differs from **no assigned blockers**;
+neither establishes custody clearance. Health retains at most five waiting-run
+rows, each with one bounded blocker and omission information. These are read-only
+diagnostics, not a new instance alarm. The existing owner wait/drain overlap reaches
+danger at 24h; CLI danger exit `8` is unchanged and does not authorize replacement.
+
+For a `pool_wait` blocker, the wait is for a spendable credential in the owner's
+Anthropic token pool. The release wording is: "a pooled token becomes spendable, or the owner adds or selects a usable token / runs `uzi run resume-now`".
+This action enables continuation; upgrade release still requires the assigned run to become terminal
+or be unassigned. See [Run recovery](./run-recovery.md) for custody held separately.
 
 The Workers page's **Ephemeral workers → Docker-capable** preference adds
 Docker when auto-provisioning for repositories your admin allows; see
@@ -269,8 +311,10 @@ work while letting this worker's own parked runs and pinned plan checkers
 finish; maintenance fencing still closes claims. It then fences claims and
 requires fresh custody clearance and zero local activity before gated
 anonymous-volume pruning or stop. No timer, forced park, or force-roll
-override bypasses this DinD gate. The legacy `/nix`+ `/data` recycle and
-ordinary rolls retain their current drain-deadline/force override behavior.
+override bypasses this DinD gate. Legacy `/nix` + `/data` recycle associated with
+spec-hash/generation drift also waits indefinitely for idle. Only independent
+nondrifted pressure/nix-size maintenance retains the compatible deadline; global
+ForceRoll can bypass its busy deferral, while custody-held data remains protected.
 
 If legacy and DinD pressure coincide, the legacy recycle goes first; the
 pending DinD intent resumes on a later tick before another legacy recycle.

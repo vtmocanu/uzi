@@ -613,7 +613,7 @@ func New(pool *pgxpool.Pool, q *store.Queries, cfg config.Config, box *secretbox
 	// too (PRD #590 M1): the run-now scheduler is nil-safe on the vault (treated as always
 	// unlocked), so a manual self_improve run-now never skips on a vault it cannot see here.
 	scheduler := schedsvc.New(q, wsvc, svc, set, nil, nil, 0, slog.Default())
-	scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths})
+	scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths, ArtifactMaxFiles: cfg.CIArtifactMaxFiles, ArtifactMaxBytes: cfg.CIArtifactMaxBytes})
 	return &Handler{pool: pool, q: q, cfg: cfg, box: box, svc: svc, wsvc: wsvc, pcheck: pcheck, hub: h, settings: set, scheduler: scheduler, forgeMemo: forgememo.New(forgeMemoEntries, forgeMemoMaxBytes), forgeBudget: newForgeBudget(cfg.ForgeInteractiveRateMax, time.Now), version: "dev", now: time.Now, startedAt: time.Now()}
 }
 
@@ -1196,6 +1196,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// NOT lane-allowlisted: an isolated-lane run is not a Claude run-lane flight that posts it.
 		r.Post("/runs/{id}/usage", h.WorkerRunUsage)
 		r.Post("/runs/{id}/state", h.WorkerRunState)
+		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
+		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		r.Post("/runs/{id}/cross-checks", h.WorkerSubmitPlanCrossCheck)
 		r.Get("/runs/{id}/cross-checks/code/latest", h.WorkerCodeCrossCheckStatus)
 		r.Post("/runs/{id}/cross-checks/code/dispositions", h.WorkerCodeCrossCheckDispositions)
@@ -1289,6 +1291,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// lineage. Both are gated by the decisions_memo_enabled admin setting, failing closed.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/decisions-memo", h.WorkerSaveDecisionsMemo)
 		r.With(h.refuseJobRuns).Get("/runs/{id}/decisions-memo", h.WorkerGetDecisionsMemo)
+		r.With(interruptedCallsDeadline, h.refuseJobRuns).Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ
 		// ONLY. Every route derives the (repo, connection, project id) from the OWNED

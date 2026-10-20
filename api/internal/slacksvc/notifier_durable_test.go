@@ -100,6 +100,10 @@ func (m *sqlMirror) PruneNotificationsForUser(context.Context, store.PruneNotifi
 	return 0, nil
 }
 
+func (m *sqlMirror) IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error) {
+	return false, pgx.ErrNoRows
+}
+
 func (m *sqlMirror) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {
 	return store.GetSecretEnablementRow{}, pgx.ErrNoRows
 }

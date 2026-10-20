@@ -1,25 +1,36 @@
 import { followSuccessfulPush } from "./publication-fixture.js";
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import {
   api,
+  client,
   fakeGitlab as rawFakeGitlab,
   git,
-  gitlabClaim,
+  gitlabClaim as rawClaim,
   installHarness,
   runner,
   runnerWith,
 } from "./runner-harness.js";
 
 installHarness();
+beforeEach(async () => {
+  api.setRegisterProtocolFeatures(["claim_generation_fence"]);
+  await client.register("revision-ack");
+});
+function gitlabClaim(...args: Parameters<typeof rawClaim>) {
+  const claim = rawClaim(...args);
+  claim.claim_generation ??= 7;
+  api.setPublicationState(claim.run_id, [], claim.config?.contract_revision);
+  return claim;
+}
 
 // Issue #1626: a FRESH interlocked run's claim is assembled BEFORE its completion contract freezes
 // (plan approval / the autopilot plan report), so `config.contract_revision` is absent, and the
 // worker stays in-process across the plan gate with no re-claim. The /state ACK's
 // RunDTO.completion_revision is the channel that brings the frozen revision in: the runner keeps
-// the latest one any ACK carried and binds the finalize permit to it, ahead of the claim's value.
+// the monotone revision for other paths, while publication binds only its own fresh ACK.
 // Driven end-to-end through the REAL RunRunner.execute(), like runner-completion-permit.test.ts.
 
 function fakeGitlab(opts: Parameters<typeof rawFakeGitlab>[0] = {}) {
@@ -65,7 +76,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
     assert.strictEqual(api.completionPermitRequests[0]!.body.contract_revision, 2, "the ACK's newer revision is echoed");
   });
 
-  it("the bound revision is MONOTONE: a later ACK carrying an OLDER revision never rolls it back", async () => {
+  it("publication binds its own ACK even when an earlier ACK raised the monotone cache", async () => {
     const { gitlab } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1629, { config: { completion_contract_version: 1 } });
     // The first ACK carries revision 2; every later one carries a stale 1 (a late/reordered ACK).
@@ -82,8 +93,8 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
     assert.strictEqual(api.completionPermitRequests.length, 1);
     assert.strictEqual(
       api.completionPermitRequests[0]!.body.contract_revision,
-      2,
-      "the highest revision seen is kept; a later ACK's older revision does not roll it back",
+      1,
+      "publication uses its own projection, not the highest cached revision",
     );
   });
 
@@ -134,6 +145,7 @@ describe("RunRunner — completion revision off the /state ACK (issue #1626)", (
   it("no revision on the claim NOR any ACK → still holds fail-closed (completion identity unresolvable)", async () => {
     const { gitlab, calls } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1628, { config: { completion_contract_version: 1 } });
+    api.setStateAckCompletionRevision(claim.run_id, undefined);
     api.setCompletionPermitResponse(true); // armed, but must never be reached
 
 

@@ -5,7 +5,7 @@
 #
 # Launch it outside the agent session so it outlives the launching shell:
 #   Linux:  setsid bash backup-loop.sh <RUN_ID>... </dev/null >>/tmp/uzi-backups/loop.log 2>&1 &
-#   macOS:  use a launchd LaunchAgent. This agent harness reaps nohup children.
+#   macOS:  use a launchd LaunchAgent. The Claude Code harness reaps nohup children.
 #           Keep launchd stdout/stderr under /tmp even when UZI_BACKUP_DIR is
 #           Downloads; a Downloads log path failed before the job could start.
 #           Set WorkingDirectory to the repo checkout (or UZI_REPO_SLUG in

@@ -12,7 +12,7 @@ import { CapturePathMismatchError, GitCache, type AttemptSeedOptions, type Recov
 import { LimitReachedError } from "../src/limit.js";
 import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
-import { formatAttemptId, parseAttemptPath } from "../src/attempt-path.js";
+import { formatAttemptId, formatResidueName, parseAttemptPath } from "../src/attempt-path.js";
 import { InvalidRecoveryClonePathError } from "../src/recovery-progress.js";
 import {
   LiveAttemptRegistry,
@@ -76,6 +76,7 @@ interface FakeDaemon {
   containers: Map<string, { Id: string; Mounts: Array<{ Type: string; Source: string; Destination: string }> }>;
   /** When set, the NEXT create waits for this promise before it mkdirs its bind and commits. */
   hold: Promise<void> | undefined;
+  accepted?: () => void;
   close: () => Promise<void>;
 }
 
@@ -98,6 +99,7 @@ async function startFakeDaemon(): Promise<FakeDaemon> {
           const held = daemon.hold;
           daemon.hold = undefined;
           const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as { HostConfig?: { Binds?: string[] } };
+          daemon.accepted?.();
           if (held) await held;
           const mounts = (body.HostConfig?.Binds ?? []).map((b) => {
             const [src, dst] = b.split(":");
@@ -378,7 +380,7 @@ function treeHash(root: string): string {
 
 /** AttemptSeedOptions for seeding a fixture directly through the git layer (no sweep). */
 function fixtureSeed(attemptId: string): AttemptSeedOptions {
-  return { attemptId, isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+  return { attemptId, isLive: () => false, beforeSeed: async () => {} };
 }
 
 /** A predecessor attempt as a worker that died mid-run leaves it: an attempt clone with
@@ -520,6 +522,88 @@ describe("issue #1783 M2 P-seed: a wired worker seeds <key>.attempt-<id>, an unw
     assert.equal(seen?.journalRaw, JSON.stringify({ runId: claim.run_id, clonePath: canonicalFor(iid) }));
     assert.deepEqual(seen?.ledger, []);
   });
+});
+
+describe("#1858 automatic retention with an accepted invisible create", () => {
+  for (const caller of ["attempt", "canonical"] as const) {
+  it(`${caller}: unwired after restart preserves sentinel bytes before and after held completion`, async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const key = "issue-21858";
+    const branch = "agent/issue-21858";
+    const canonical = git.runnerClonePath(bare, key);
+    const retained: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, i)), 1, i.toString(16).padStart(16, "0"));
+      const dir = `${canonical}.attempt-${id}`;
+      for (const p of [dir, skillsPluginDir(dir)]) {
+        fs.mkdirSync(p, { recursive: true });
+        fs.writeFileSync(path.join(p, "sentinel"), `original-${i}`);
+        retained.push(p);
+      }
+      execFileSync("git", ["-C", bare, "config", "--add", `uzi-attempts.${branch}.entry`,
+        JSON.stringify({ attemptId: id, runId: `old-${i}`, clonePath: dir, state: i % 2 ? "live" : "abandoned" })], { env: GIT_ENV });
+    }
+    const orphan = path.join(path.dirname(canonical), `.uzi-skills-${key}.attempt-${mintAttemptId(1)}`);
+    fs.mkdirSync(orphan);
+    fs.writeFileSync(path.join(orphan, "sentinel"), "orphan skills");
+    retained.push(orphan);
+    for (let i = 0; i < 7; i++) {
+      const p = path.join(path.dirname(canonical), formatResidueName(key, `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
+      fs.mkdirSync(p);
+      fs.writeFileSync(path.join(p, "sentinel"), `residue-${i}`);
+      retained.push(p);
+    }
+    let release!: () => void;
+    const accepted = new Promise<void>(resolve => { daemon.accepted = resolve; });
+    daemon.hold = new Promise<void>(resolve => { release = resolve; });
+    const oldestResidue = retained[13]!; // Twelve paired-attempt paths and one orphan precede the residues.
+    const completion = createContainer(daemon.socket, caller === "attempt" ? retained[0]! : oldestResidue);
+    await accepted;
+    const snapshots = retained.map(p => fs.readFileSync(path.join(p, "sentinel"), "utf8"));
+    try {
+      const listed = await new Promise<unknown>((resolve, reject) => {
+        const req = http.get({ socketPath: daemon.socket, path: "/containers/json" }, res => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("error", reject);
+          res.on("end", () => {
+            try {
+              assert.equal(res.statusCode, 200);
+              resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            } catch (err) { reject(err); }
+          });
+        });
+        req.on("error", reject);
+      });
+      assert.deepEqual(listed, [], "accepted pending create is invisible through GET /containers/json");
+      // The daemon has earlier exposure, while the restarted unwired worker has no daemon
+      // obligation or live registry. An empty process proof cannot settle the pending create.
+      await withQuiescenceView(HERMETIC_VIEW, async () => {
+        const out = await fastQuiesce({ mode: "seed", attempt: undefined,
+          cloneKey: newRunAttempt("new", 2, canonical, () => []).cloneKey,
+          targetPaths: retained, processes: true, dockerHost: undefined, registry: new LiveAttemptRegistry(), site: "attempt_seed" });
+        assert.equal(out.process?.state, "quiescent");
+      }, FILE_VIEW);
+      const restarted = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      let proofs = 0;
+      // This legacy callback is a RED-base tripwire; the new options interface has no such member.
+      const legacy = { quiescent: async () => { proofs++; return true; } };
+      const opts = { ...fixtureSeed(mintAttemptId(2)), ...legacy };
+      const clone = await restarted.runnerCloneForBranch(bare, branch, key, { ...noProofReseed, ...legacy },
+        "new", false, undefined, caller === "attempt" ? opts : undefined);
+      assert.ok(fs.existsSync(path.join(clone.path, ".git")), "fresh seed succeeds");
+      assert.equal(clone.path === canonical, caller === "canonical");
+      for (let i = 0; i < retained.length; i++)
+        assert.equal(fs.readFileSync(path.join(retained[i]!, "sentinel"), "utf8"), snapshots[i], "original sentinel before completion");
+      assert.equal(proofs, 0, "no retention proof requests");
+    } finally {
+      release();
+      await completion;
+    }
+    for (let i = 0; i < retained.length; i++)
+      assert.equal(fs.readFileSync(path.join(retained[i]!, "sentinel"), "utf8"), snapshots[i], "original sentinel after completion");
+  });
+  }
 });
 
 // ─── P-resume-after-park + P-late-create ───────────────────────────────────────────────────
@@ -956,9 +1040,8 @@ describe("issue #1783 M2 P-worker-restart / P-foreign: the terminal-orphan recla
     terminalOwner(owner, iid);
     await restartedWorker(transientFactory().factory).runner.execute(gitlabClaim(iid));
     assert.equal(readLedger(iid).get(pred.attemptId!)?.state, "reclaimed");
-    // Three NEWER abandoned attempts of the same key, then another seed: were the reclaimed
-    // attempt counted as abandoned it would be the oldest of four and deleted (the probe printed
-    // OWNER_DIR_EXISTS=false STATE=retired).
+    // Three newer abandoned attempts of the same key, then another seed. Reclaimed identity
+    // and original bytes survive alongside the abandoned inventory; automatic reclaim is disabled.
     for (let i = 1; i <= 3; i++) await plantAbandoned(iid, formatAttemptId(new Date(Date.now() + i * 60_000), 1, `00000000000000${i}${i}`));
     const next = transientFactory();
     await wired(next.factory).execute(gitlabClaim(iid));
@@ -1341,7 +1424,7 @@ describe("issue #1783 M2 review (N6): seed availability under an unattributable 
         : { process: { state: "quiescent", processes: [], killed: [], detail: "scripted" }, docker: { state: "not_wired", removed: [], detail: "" } };
   }
 
-  it("seed: seeds the fresh path, logs, and vetoes every retention deletion of that seed", async () => {
+  it("seed: seeds the fresh path, logs unreadable scope, and retains every predecessor", async () => {
     const iid = 2101;
     const planted: string[] = [];
     for (const i of [1, 2, 3, 4, 5]) planted.push(await plantAbandoned(iid, formatAttemptId(new Date(Date.UTC(2026, 0, 1, 0, 0, i)), 1, `000000000000000${i}`)));
@@ -1350,7 +1433,7 @@ describe("issue #1783 M2 review (N6): seed availability under an unattributable 
     await wired(factory, { quiesceRun: scriptedAt("attempt_seed", [unreadable]) }, logger).execute(gitlabClaim(iid));
     assert.equal(started(), 1, "the fresh seed is not blocked");
     assert.ok(lines.some((l) => ((l as { msg?: string }).msg ?? "").includes("unattributable unreadable")), "logged");
-    for (const p of planted) assert.equal(fs.existsSync(p), true, `retention deletion vetoed: ${p}`);
+    for (const p of planted) assert.equal(fs.existsSync(p), true, `automatic retention keeps predecessor: ${p}`);
   });
 
   it("seed: a positively in-scope survivor alongside it still blocks", async () => {

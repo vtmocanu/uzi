@@ -14,6 +14,44 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
+// safeDetailLines sanitizes before wrapping, retaining every word and the tail.
+// Work is bounded by the input length; each iteration consumes a word or 200 runes.
+func safeDetailLines(text string) []string {
+	words := strings.Fields(uzicli.CellText(text))
+	lines := []string{""}
+	for _, word := range words {
+		runes := []rune(word)
+		for len(runes) > 200 {
+			if lines[len(lines)-1] != "" {
+				lines = append(lines, "")
+			}
+			lines[len(lines)-1] = string(runes[:200])
+			lines = append(lines, "")
+			runes = runes[200:]
+		}
+		word = string(runes)
+		last := len(lines) - 1
+		if lines[last] == "" {
+			lines[last] = word
+		} else if len([]rune(lines[last]))+1+len(runes) <= 200 {
+			lines[last] += " " + word
+		} else {
+			lines = append(lines, word)
+		}
+	}
+	return lines
+}
+
+func printWorkerDrainDetail(p *uzicli.Printer, w apitypes.WorkerDTO) {
+	if w.Kind != "hosted" || w.DrainingSince == nil || w.UpgradeDetail == nil || strings.TrimSpace(*w.UpgradeDetail) == "" {
+		return
+	}
+	p.Printf("\nDraining worker %s:\n", strings.Join(strings.Fields(uzicli.CellText(w.ID)), " "))
+	for _, line := range safeDetailLines(*w.UpgradeDetail) {
+		p.Printf("  %s\n", line)
+	}
+}
+
 // newWorkerCmd — `uzi worker`. list and rm are both wired. There is no
 // `create`: minting a join token is a webui action (it returns a credential
 // that reads decrypted secrets), so it stays cookie-only (Decision 18).
@@ -100,7 +138,13 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
 			// run growing toward filling the data volume is visible before it does. "-" when the
 			// worker reports no run sizes; also before OUTBOX.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
+			if err := p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows); err != nil {
+				return err
+			}
+			for _, w := range workers {
+				printWorkerDrainDetail(p, w)
+			}
+			return nil
 		},
 	}
 

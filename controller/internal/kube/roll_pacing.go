@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -845,62 +844,29 @@ func (m *Materializer) requestWorkerDrain(ctx context.Context, w protocol.Desire
 	}
 	return m.cordoner.RequestDrain(ctx, w.ID)
 }
-func (m *Materializer) rollDespiteBusy(ctx context.Context, w protocol.DesiredWorker) bool {
+
+// maintenanceDespiteBusy preserves force-roll and otherwise permits only an
+// independent maintenance deadline. Render the desired hash here as direct
+// callers may have no pacing entry.
+func (m *Materializer) maintenanceDespiteBusy(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) bool {
 	if m.drain.ForceRoll {
 		return true
 	}
-	if e := rollFrom(ctx, w.ID); e != nil && (e.drift || (e.marker != nil && !e.marker.Completed) || imageRollDrain(w)) {
-		return e.admitted && e.marker != nil && imageRollDrain(w) && m.drain.Deadline > 0 && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline
+	if w.DrainingReason != nil && *w.DrainingReason == "image_roll" {
+		return false
 	}
-	// Independent pressure recycling retains its own drain policy.
-	return w.DrainingSince != nil && m.drain.Deadline > 0 && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline
-}
-
-type imageRollDrainConfirmer interface {
-	ConfirmImageRollDrain(context.Context, string) (protocol.DesiredWorker, error)
-}
-
-// confirmExpiredImageDrain permits a busy image turn only after a bounded
-// re-cordon/Poll exchange. One failed exchange stops this pool for the tick.
-func (m *Materializer) confirmExpiredImageDrain(ctx context.Context, w protocol.DesiredWorker) (bool, error) {
-	e := rollFrom(ctx, w.ID)
-	if m.drain.ForceRoll || e == nil || (!e.drift && (e.marker == nil || e.marker.Completed) && !imageRollDrain(w)) {
-		return true, nil
+	if e := rollFrom(ctx, w.ID); e != nil && (e.drift || (e.marker != nil && !e.marker.Completed) || (e.rawReservation && e.marker == nil)) {
+		return false
 	}
-	c, ok := m.cordoner.(imageRollDrainConfirmer)
-	if !ok {
-		return false, fmt.Errorf("image-roll deadline confirmation unavailable; explicit recovery required")
-	}
-	start := m.now()
-	fresh, err := c.ConfirmImageRollDrain(ctx, w.ID)
+	spec, err := m.resolver.Resolve(w.Template, w.Size)
 	if err != nil {
-		return false, fmt.Errorf("image-roll deadline confirmation unconfirmed; re-poll required: %w", err)
+		return false
 	}
-	if !reflect.DeepEqual(drainShape(w), drainShape(fresh)) {
-		return false, fmt.Errorf("image-roll deadline desired state changed; re-poll required")
+	dep := RenderDeployment(m.cfg, w, spec)
+	if obs.Generation != w.Generation || obs.SpecHash != dep.Spec.Template.Annotations[AnnotationSpecHash] {
+		return false
 	}
-	p := fresh.RollEvidence
-	// Ordinary API liveness confirms the old process's drain, independently of
-	// the stronger incarnation heartbeat required to promote its replacement.
-	if !imageRollDrain(fresh) || p == nil || p.LivenessValidUntil == nil ||
-		!freshUntil(m.now(), start, p.EvaluatedAt, *p.LivenessValidUntil) ||
-		fresh.DrainingSince.After(p.EvaluatedAt) {
-		return false, fmt.Errorf("image-roll deadline evidence unconfirmed; re-poll required")
-	}
-	return p.EvaluatedAt.Sub(*fresh.DrainingSince) >= m.drain.Deadline, nil
-}
-
-// Compare the desired identity and every independent fence without interpreting
-// credentials. Poll evaluation and heartbeat times normally advance between reads.
-func drainShape(w protocol.DesiredWorker) protocol.DesiredWorker {
-	w.DrainingSince, w.DrainingReason = nil, nil
-	if w.RollEvidence != nil {
-		p := *w.RollEvidence
-		p.EvaluatedAt, p.ValidUntil = time.Time{}, time.Time{}
-		p.HeartbeatAt, p.LivenessValidUntil = nil, nil
-		w.RollEvidence = &p
-	}
-	return w
+	return w.DrainingSince != nil && m.drain.Deadline > 0 && m.now().Sub(*w.DrainingSince) >= m.drain.Deadline
 }
 
 func (m *Materializer) retainRollReservation(ctx context.Context, e *rollEntry) error {

@@ -150,6 +150,40 @@ describe("useRunStream mount load", () => {
   });
 });
 
+describe("memory hold REST and socket projection", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+  it("retains nullable allowance on REST and re-reads it after a socket state frame without acting", async () => {
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    let run: Run = { ...fakeRun(), status: "recovery_wait",
+      recovery_wait_cause: "worker_memory_pressure",
+      memory_hold: { episode: 4, used: 2, max: null, remaining: null } };
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(init?.method).toBe("GET");
+      const data = url === "/api/runs/run-1" ? { run }
+        : url.includes("/inputs") ? { inputs: [] } : { messages: [] };
+      return new Response(JSON.stringify(data), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const resume = vi.spyOn(api, "resumeRun");
+    const input = vi.spyOn(api, "submitRunInput");
+    const { result, unmount } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.memory_hold)
+      .toEqual({ episode: 4, used: 2, max: null, remaining: null }));
+    await waitFor(() => expect(result.current.confirmedOwner).toBe(true));
+    run = { ...run, memory_hold: { episode: 5, used: 3, max: 3, remaining: 0 } };
+    act(() => LiveSocket.last!.deliver({ type: "state", status: "recovery_wait" }));
+    await waitFor(() => expect(result.current.run?.memory_hold)
+      .toEqual({ episode: 5, used: 3, max: 3, remaining: 0 }));
+    expect(result.current.run?.recovery_wait_cause).toBe("worker_memory_pressure");
+    expect(resume).not.toHaveBeenCalled();
+    expect(input).not.toHaveBeenCalled();
+    unmount();
+  });
+});
+
 // PRD #95 M3: the steer queue's live path — optimistic send + reconcile (S2), and
 // the REST refetch triggers that make a dropped `input` frame self-heal (S1).
 describe("useRunStream steer queue (PRD #95 M3)", () => {

@@ -574,6 +574,22 @@ for kind in protected ordinary; do
       || fail "claimGeneration $kind/$generation: retained dirty bytes missing"
     echo "PASS claimGeneration $kind/$generation"
   done
+  if [ "$kind" = protected ]; then
+    for blocker in readiness_cleanup_unconfirmed unknown_cleanup_blocker; do
+      value="$(printf '%s' "$progress_journal" | jq --arg blocker "$blocker" '.recovery.blocker=$blocker | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+      rc="$(backup_rc "$dest" "$rid")"
+      if [ "$blocker" = readiness_cleanup_unconfirmed ]; then
+        [ "$rc" -eq 0 ] || fail "cleanup blocker: valid protected descriptor rejected"
+        tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+          || fail "cleanup blocker: retained dirty bytes missing"
+      else
+        [ "$rc" -ne 0 ] || fail "cleanup blocker: unknown blocker accepted"
+        [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "cleanup blocker: invalid descriptor attributed source"
+      fi
+      echo "PASS protected blocker $blocker"
+    done
+  fi
   for generation in 0 -1 1.5 9007199254740992 '"1"' null true; do
     value="$(printf '%s' "$progress_journal" | jq --argjson gen "$generation" '.recovery.claimGeneration=$gen')"
     if [ "$kind" = protected ]; then

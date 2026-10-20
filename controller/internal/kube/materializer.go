@@ -58,16 +58,18 @@ type Cordoner interface {
 	ClearDrain(ctx context.Context, workerID string) error
 }
 
-// DrainPolicy carries the two controller-side overrides that let a BUSY drifted worker
-// roll despite the M4 cordon-then-defer default (PRD #422 M5). Both are controller config
-// (a chart value + a controller env), not wire data, per Decision 4:
+// DrainPolicy carries independent maintenance timing and the global emergency override
+// (#3103 supersedes PRD #422 M5's busy-image deadline). Both are controller config
+// (a chart value + a controller env), not wire data:
 //
-//   - Deadline bounds busy deferral only after admission. An elapsed image-roll
-//     drain may requeue an in-flight run, but never bypasses pacing, coverage or hold.
-//     Independent maintenance retains its own fences and deadline policy.
-//   - ForceRoll explicitly bypasses pacing, hold, incarnation proof and busy
-//     deferral, accepting lost capacity and in-flight requeue. Existing custody
-//     and independent maintenance protections still apply.
+//   - Deadline bounds busy deferral for independent NONDRIFTED pressure/nix-size
+//     maintenance only. Busy spec-hash/generation drift and associated recycle wait
+//     indefinitely for idle, even with plain drain provenance or no pacing entry.
+//   - ForceRoll is GLOBAL: it bypasses pacing, hold, incarnation proof and busy
+//     deferral for drift, plus busy deferral for independent maintenance. It may
+//     interrupt runs and lose all capacity; it is not a targeted recovery guarantee.
+//     Custody-held data and independent DinD readiness/identity/pod-absence guards
+//     remain authoritative; DinD has no deadline or ForceRoll bypass.
 type DrainPolicy struct {
 	Deadline  time.Duration
 	ForceRoll bool
@@ -105,7 +107,8 @@ type Materializer struct {
 	// cordoner is the api cordon-write channel (PRD #422 M4). Nil disables cordoning;
 	// see Cordoner. Injected the same way as resolver, so tests can drive it.
 	cordoner Cordoner
-	// drain is the bounded-deadline + force-roll policy (PRD #422 M5). See DrainPolicy.
+	// drain is the independent maintenance deadline + global force-roll policy.
+	// See DrainPolicy for #3103's supersession of the original image timeout.
 	drain DrainPolicy
 	// recycle is the disk self-heal toggle + cooldown (PRD #837 M4). See RecyclePolicy.
 	recycle RecyclePolicy
@@ -119,7 +122,7 @@ type Materializer struct {
 
 // New builds a Materializer. cordoner may be nil, which disables cordoning (a busy
 // drifted worker is then deferred rather than rolled — still fail-safe); see Cordoner.
-// drain carries the M5 bounded-deadline + force-roll policy (see DrainPolicy).
+// drain carries the independent maintenance deadline + global force-roll policy (see DrainPolicy).
 // recycle carries the M4 disk self-heal toggle + cooldown (see RecyclePolicy).
 func New(client kubernetes.Interface, cfg RenderConfig, resolver preset.Resolver, cordoner Cordoner, drain DrainPolicy, recycle RecyclePolicy, log *slog.Logger) *Materializer {
 	return &Materializer{client: client, cfg: cfg, resolver: resolver, cordoner: cordoner, drain: drain, recycle: recycle, log: log, now: time.Now}
@@ -693,9 +696,10 @@ type recycleVolumes struct {
 // a LATER tick, once Observe has seen the volumes gone — the fake clientset removes a
 // deleted object immediately, which is what makes that two-tick property testable.
 //
-//   - Phase 0 reuses reconcileWorker's EXACT busy-guard: a busy worker with no roll
-//     override is cordoned (if not already draining) and the recycle DEFERRED — nothing
-//     is deleted this tick. Fail-safe on every cordoner outcome, exactly as the roll path.
+//   - Phase 0 defers busy drift-associated recycle until idle or global ForceRoll.
+//     Only independent NONDRIFTED maintenance may also use its elapsed deadline,
+//     even for callers without a pacing entry or a plain drain. Otherwise request
+//     a cordon if needed and defer deletion regardless of the cordoner outcome.
 //   - Phase 1 retains reserved Deployment metadata at replicas zero, then waits for
 //     fresh pod absence. Unreserved force overrides use conditioned deletion.
 //   - Phase 2 deletes each selected, LIVE PVC. A nil NixPVCSize means the nix PVC is
@@ -706,19 +710,9 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	if vols.DinD {
 		return nil
 	}
-	// Phase 0: drain-if-busy. Identical guard to reconcileWorker's roll path — a busy
-	// worker is cordoned + deferred rather than having its volumes torn out from under a
-	// live run, unless an override (force-roll, or the elapsed drain deadline) says roll.
-	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
-	if w.Busy && rollDespiteBusy {
-		allowed, err := m.confirmExpiredImageDrain(ctx, w)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-	}
+	// Phase 0: busy drift waits for idle or force-roll. Independent maintenance
+	// may also proceed after its own drain deadline.
+	rollDespiteBusy := m.maintenanceDespiteBusy(ctx, w, obs)
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			if m.cordoner != nil {
@@ -1045,21 +1039,9 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// No-drift alone proves neither API health nor ownership of a drain.
 		return nil
 	}
-	// Drift. PRD #422 M5: a busy worker is normally cordoned + deferred (M4), BUT two
-	// overrides roll it anyway (accepting today's requeue-resume): an operator force-roll
-	// (emergency, e.g. a CVE), and the bounded drain deadline (a worker parked at an
-	// approval gate must not hold the old image forever). Both measured/flagged controller-
-	// side; the deadline elapses from the api-supplied draining_since (this loop is stateless).
-	rollDespiteBusy := m.rollDespiteBusy(ctx, w)
-	if w.Busy && rollDespiteBusy {
-		allowed, err := m.confirmExpiredImageDrain(ctx, w)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return nil
-		}
-	}
+	// Busy template drift waits for idle; only an operator force-roll bypasses it.
+	// An unchanged retained deployment may resume after the paused guards above.
+	rollDespiteBusy := m.drain.ForceRoll || (paused && obs.Generation == w.Generation && obs.SpecHash == wantHash)
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			// not yet cordoned — request the cordon (fail-safe: any failure still defers)
@@ -1080,16 +1062,11 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		}
 		return nil
 	}
-	if w.Busy {
-		// rolling a busy worker: its in-flight run(s) will requeue (Decision 4 fallback).
-		reason := "drain deadline exceeded"
-		if m.drain.ForceRoll {
-			reason = "operator force-roll"
-		}
-		m.log.Warn("rolling a BUSY hosted worker anyway; its in-flight run will requeue", "worker_id", w.ID, "reason", reason)
+	if w.Busy && m.drain.ForceRoll {
+		m.log.Warn("rolling a BUSY hosted worker anyway; its in-flight run will requeue", "worker_id", w.ID, "reason", "operator force-roll")
 	}
-	// Idle (or an override fired): safe to roll now (whether or not it was ever draining —
-	// a cordoned worker that has since gone idle rolls on this tick).
+	// Busy deferral is satisfied (idle, global force-roll, or unchanged retained
+	// Deployment restore); the other guards above remain authoritative.
 	m.log.Info("hosted worker drifted; rolling",
 		"worker_id", w.ID,
 		"generation_observed", obs.Generation, "generation_desired", w.Generation,

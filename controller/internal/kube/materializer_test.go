@@ -894,11 +894,10 @@ func keysOf(m map[string]bool) []string {
 // ClearDrain (uncordon), and can force either write to fail, so a test can prove
 // the fail-safe defer path and the no-drift uncordon-and-retry path.
 type fakeCordoner struct {
-	confirmWorkers map[string]protocol.DesiredWorker
-	calls          []string
-	err            error
-	clearCalls     []string
-	clearErr       error
+	calls      []string
+	err        error
+	clearCalls []string
+	clearErr   error
 }
 
 func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
@@ -940,9 +939,8 @@ func newMatWithRecycle(t *testing.T, c Cordoner, drain DrainPolicy, recycle Recy
 }
 
 // newMatWithCordoner builds a Materializer wired to a fake cordoner (nil disables
-// cordoning, exercising the no-channel path). It uses a GENEROUS 24h deadline and no
-// force-roll, so the M4 defer tests below keep their meaning: a recently cordoned
-// worker never trips the deadline, and only the dedicated M5 tests exercise a roll.
+// cordoning, exercising the no-channel path). Force-roll is disabled, so busy
+// template drift stays deferred regardless of elapsed drain time.
 func newMatWithCordoner(t *testing.T, c Cordoner, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
 	return newMatWithDrain(t, c, DrainPolicy{Deadline: 24 * time.Hour}, objs...)
@@ -1182,11 +1180,10 @@ func TestNoDriftDrainingClearErrorSelfHeals(t *testing.T) {
 	}
 }
 
-// --- bounded drain deadline + force-roll override (PRD #422 M5) -------------
+// --- busy drift never expires; force-roll remains an explicit override -----
 
-// drift + busy + draining RECENTLY (now - since < Deadline) + ForceRoll=false ⇒ the
-// deadline has not elapsed, so the worker is still deferred: no roll, and no re-cordon
-// (it is already draining).
+// Busy template drift stays deferred even with a recent drain timestamp.
+// The existing drain also avoids a redundant cordon.
 func TestDriftBusyWithinDeadlineDefers(t *testing.T) {
 	c := &fakeCordoner{}
 	w, obs, dep := driftedWorker(t, true, recentDrain()) // one minute ago
@@ -1202,48 +1199,28 @@ func TestDriftBusyWithinDeadlineDefers(t *testing.T) {
 	}
 }
 
-// drift + busy + draining LONGER than the deadline (now - since >= Deadline) ⇒ the
-// controller rolls it anyway (its run requeues), and issues NO new cordon (already
-// draining).
-func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
+// Elapsed drain time never permits replacing a busy worker's drifted template.
+func TestDriftBusyDeadlineExceededDefers(t *testing.T) {
 	c := &fakeCordoner{}
-	since := m5Now.Add(-2 * time.Hour) // draining for 2h ...
+	since := m5Now.Add(-2 * time.Hour)
 	w, obs, dep := driftedWorker(t, true, &since)
-	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
-	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, dep) // ... against a 1h deadline
+	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if !wasPatched(client) {
-		t.Fatal("a busy worker past its drain deadline was not rolled; the deadline must force the roll")
-	}
-	if len(c.calls) != 1 || c.calls[0] != "w1" {
-		t.Fatalf("RequestDrain calls = %v, want one provenance cordon confirmation before deadline destruction", c.calls)
-	}
+	assertBusyDriftUnchanged(t, client, dep)
 }
 
-// drift + busy + draining EXACTLY the deadline (now - since == Deadline) + ForceRoll=false
-// ⇒ the boundary rolls: the comparison is >=, so a worker parked exactly AT the deadline
-// rolls (its run requeues) rather than deferring one more tick, and issues NO new cordon
-// (already draining). This pins the boundary the "well within" and "well past" cases leave
-// open: flip the production >= to > and this case goes RED while both of those stay green.
-func TestDriftBusyDeadlineExactlyReachedRolls(t *testing.T) {
+func TestDriftBusyDeadlineExactlyReachedDefers(t *testing.T) {
 	c := &fakeCordoner{}
 	deadline := time.Hour
-	since := m5Now.Add(-deadline) // now - since == Deadline, exactly
+	since := m5Now.Add(-deadline)
 	w, obs, dep := driftedWorker(t, true, &since)
-	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
 	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: deadline}, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if !wasPatched(client) {
-		t.Fatal("a busy worker exactly AT its drain deadline was not rolled; the boundary is >= " +
-			"(now - draining_since >= Deadline), so the deadline must force the roll at equality")
-	}
-	if len(c.calls) != 1 || c.calls[0] != "w1" {
-		t.Fatalf("RequestDrain calls = %v, want one provenance cordon confirmation before deadline destruction", c.calls)
-	}
+	assertBusyDriftUnchanged(t, client, dep)
 }
 
 // drift + busy + ForceRoll=true (DrainingSince nil, never cordoned) ⇒ rolled immediately,
@@ -1886,8 +1863,8 @@ func TestOrdinaryDriftRollPreservesDataAndCustodyDoesNotBlockThePodRoll(t *testi
 	})
 }
 
-// #1296-T2: an ELAPSED drain deadline overrides the busy-defer so a BUSY worker's recycle
-// proceeds (rollDespiteBusy). Custody is INDEPENDENT of that override: the custody-held
+// #1296-T2: an elapsed independent maintenance deadline permits a busy worker's
+// recycle when its template is unchanged. Custody is independent: the custody-held
 // worker's /data PVC is preserved even though the deadline elapsed, while a non-custody
 // worker's /data is recycled. The held sub-test asserts BOTH that the recycle actually ran
 // (Deployment + /nix deleted — proof the override fired, so /data survival is the custody
@@ -1899,7 +1876,7 @@ func TestOrdinaryDriftRollPreservesDataAndCustodyDoesNotBlockThePodRoll(t *testi
 func TestElapsedDrainDeadlineDoesNotRecycleCustodyHeldData(t *testing.T) {
 	ns := testConfig().Namespace
 	deadline := time.Hour
-	elapsed := m5Now.Add(-2 * time.Hour) // draining_since 2h ago > 1h deadline ⇒ rollDespiteBusy
+	elapsed := m5Now.Add(-2 * time.Hour) // Independent maintenance deadline elapsed.
 
 	recycle := func(t *testing.T, custody bool) map[string]bool {
 		ctx := context.Background()

@@ -229,10 +229,11 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 							// holds get their own guidance below; ordinary transient causes
 							// keep the interruption wording (issues #1197 and #1088).
 							if line := workerExhaustionLine(run); line != "" {
-								_, _ = fmt.Fprintf(env.Stderr, "run %s %s; still following\n", args[0], line)
+								_, _ = fmt.Fprintf(env.Stderr, "run %s %s\n", cellText(args[0]), line)
 								for _, evidence := range workerExhaustionEvidence(run) {
 									_, _ = fmt.Fprintln(env.Stderr, evidence)
 								}
+								return drain()
 							} else if line := codexAccountActionLine(run); line != "" {
 								// PRD #1590: a Codex account hold has no retry clock; it
 								// says what the account needs and does not promise a resume.

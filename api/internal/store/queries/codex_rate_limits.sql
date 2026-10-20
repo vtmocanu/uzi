@@ -390,3 +390,55 @@ WHERE a.user_id = @user_id
             AND us.disabled_at IS NULL
     )
 ORDER BY a.id;
+
+-- name: GetCodexEarlyResetBaseline :one
+-- Strict comparison provenance, separate from the relaxed public meter read.
+-- Historical observation counters may precede a validated same-identity refresh.
+SELECT rl.user_id, rl.provider_account_id, rl.buckets, rl.last_success_at,
+       rl.enablement_sig, u.notify_early_limit_reset
+FROM codex_account_rate_limits rl
+JOIN codex_provider_account a ON a.user_id = rl.user_id AND a.id = rl.provider_account_id
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = @user_id AND a.id = @provider_account_id
+    AND u.notify_early_limit_reset
+    AND rl.buckets IS NOT NULL AND rl.buckets <> 'null'::jsonb
+    AND rl.last_success_at IS NOT NULL
+    AND rl.enablement_sig = @enablement_sig::text
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND @enablement_sig::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = @enablement_sig::text;
+
+-- name: IsCodexEarlyResetCurrent :one
+-- No row refuses delivery. Gauge writes do not invalidate this authority fence.
+SELECT true::boolean AS is_current
+FROM codex_provider_account a
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = @user_id AND a.id = @provider_account_id
+    AND a.generation = @observed_generation::bigint
+    AND a.credential_revision = @observed_credential_revision::bigint
+    AND u.notify_early_limit_reset
+    AND a.coord_state IN ('idle', 'committed')
+    AND NOT a.reauth_required AND a.recovery_sealed IS NULL
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND @enablement_sig::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = @enablement_sig::text;

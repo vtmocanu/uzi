@@ -248,7 +248,7 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			Docker: row.DockerEnabled.Bool,
 			// PRD #1906 M5: the server-set lane marker (workers.isolated_lane), mapped straight through.
 			Isolated: row.IsolatedLane,
-			// busy/draining_since feed the controller's cordon/defer-roll/deadline decision
+			// busy/draining_since feed indefinite busy-drift deferral and independent maintenance timing
 			// (PRD #422 M3/M4/M5). Busy is a SQL boolean; draining_since is the raw nullable
 			// cordon timestamp, mapped from pgtype.Timestamptz to *time.Time below (nil == not
 			// draining) so the stateless controller can compute how long it has been draining.
@@ -311,7 +311,7 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 // endpoint rather than being folded into the display-only status report.
 //
 // Idempotent: CordonHostedWorker COALESCEs draining_since, so a repeat cordon does
-// not reset the drain-deadline clock. Returns found=false (no error) when no hosted
+// not reset independent maintenance timing; drift has no elapsed-time override. Returns found=false (no error) when no hosted
 // worker has that id — the handler answers 404 — so a controller cordoning a worker
 // the api has since dropped gets a clean, actionable negative rather than a 500.
 func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID, reason ...string) (bool, error) {

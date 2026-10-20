@@ -161,15 +161,33 @@ spec:
             # (workers.maxConcurrentRuns: 1), so the controller always receives it and
             # the default (1) is explicit in the rendered pod rather than implied by the
             # env being absent. The controller rejects a non-integer or a value < 1.
+            {{- $memoryGuardEnabled := include "uzi.workerMemoryGuardEnabled" . }}
+            - name: UZI_WORKER_MEMORY_GUARD_ENABLED
+              value: {{ $memoryGuardEnabled | quote }}
+            {{- if eq $memoryGuardEnabled "true" }}
+            - name: UZI_WORKER_MEMORY_GUARD_RESERVE_BYTES
+              value: {{ .Values.workers.memoryGuard.reserveBytes | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_SAMPLE_MS
+              value: {{ .Values.workers.memoryGuard.sampleMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_HYSTERESIS_BYTES
+              value: {{ .Values.workers.memoryGuard.hysteresisBytes | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_REARM_MS
+              value: {{ .Values.workers.memoryGuard.rearmMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS
+              value: {{ .Values.workers.memoryGuard.responseBudgetMs | toString | trim | quote }}
+            - name: UZI_WORKER_MEMORY_GUARD_MAX_INTERVENTIONS
+              value: {{ .Values.workers.memoryGuard.maxInterventions | toString | trim | quote }}
+            {{- end }}
             - name: UZI_WORKER_MAX_CONCURRENT_RUNS
               value: {{ .Values.workers.maxConcurrentRuns | quote }}
             # Unconditional: Helm treats 0 as empty, but it disables this lane.
             - name: UZI_WORKER_CROSS_CHECK_SLOTS
               value: {{ .Values.workers.crossCheckSlots | quote }}
-            # PRD #422 M5 drain knobs. The deadline bounds how long a cordoned BUSY worker
-            # delays a deliberate roll before the controller rolls it anyway (its run
-            # requeues); force-roll is the emergency override that rolls every drifted
-            # worker regardless of busy. The deadline is with-gated (empty leaves the
+            # Drain knobs (#3103). Deadline bounds independent NONDRIFTED pressure/nix-size
+            # maintenance only; busy drift waits indefinitely for idle. GLOBAL force-roll
+            # bypasses pacing/hold/incarnation proof/busy deferral, risking all capacity
+            # and runs. Custody and independent DinD guards remain authoritative.
+            # The deadline is with-gated (empty leaves the
             # controller's built-in 24h default); force-roll is unconditional so the
             # rendered pod carries the explicit false rather than an implied one.
             {{- with .Values.workers.drainDeadline }}
@@ -178,7 +196,7 @@ spec:
             {{- end }}
             - name: UZI_WORKER_FORCE_ROLL
               value: {{ .Values.workers.forceRoll | default false | quote }}
-            # Admission is canary-first; the deadline only applies on an admitted turn.
+            # Admission is canary-first; a busy drainer occupies a slot indefinitely.
             - name: UZI_WORKER_ROLL_CONCURRENCY
               value: {{ .Values.workers.rollConcurrency | quote }}
             {{- with .Values.workers.rollTargetVersion }}

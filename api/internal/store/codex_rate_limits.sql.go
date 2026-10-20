@@ -128,6 +128,110 @@ func (q *Queries) GetCodexAccountRateLimitsForUser(ctx context.Context, userID u
 	return items, nil
 }
 
+const getCodexEarlyResetBaseline = `-- name: GetCodexEarlyResetBaseline :one
+SELECT rl.user_id, rl.provider_account_id, rl.buckets, rl.last_success_at,
+       rl.enablement_sig, u.notify_early_limit_reset
+FROM codex_account_rate_limits rl
+JOIN codex_provider_account a ON a.user_id = rl.user_id AND a.id = rl.provider_account_id
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = $1 AND a.id = $2
+    AND u.notify_early_limit_reset
+    AND rl.buckets IS NOT NULL AND rl.buckets <> 'null'::jsonb
+    AND rl.last_success_at IS NOT NULL
+    AND rl.enablement_sig = $3::text
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND $3::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = $3::text
+`
+
+type GetCodexEarlyResetBaselineParams struct {
+	UserID            uuid.UUID `json:"user_id"`
+	ProviderAccountID uuid.UUID `json:"provider_account_id"`
+	EnablementSig     string    `json:"enablement_sig"`
+}
+
+type GetCodexEarlyResetBaselineRow struct {
+	UserID                uuid.UUID          `json:"user_id"`
+	ProviderAccountID     uuid.UUID          `json:"provider_account_id"`
+	Buckets               []byte             `json:"buckets"`
+	LastSuccessAt         pgtype.Timestamptz `json:"last_success_at"`
+	EnablementSig         pgtype.Text        `json:"enablement_sig"`
+	NotifyEarlyLimitReset bool               `json:"notify_early_limit_reset"`
+}
+
+// Strict comparison provenance, separate from the relaxed public meter read.
+// Historical observation counters may precede a validated same-identity refresh.
+func (q *Queries) GetCodexEarlyResetBaseline(ctx context.Context, arg GetCodexEarlyResetBaselineParams) (GetCodexEarlyResetBaselineRow, error) {
+	row := q.db.QueryRow(ctx, getCodexEarlyResetBaseline, arg.UserID, arg.ProviderAccountID, arg.EnablementSig)
+	var i GetCodexEarlyResetBaselineRow
+	err := row.Scan(
+		&i.UserID,
+		&i.ProviderAccountID,
+		&i.Buckets,
+		&i.LastSuccessAt,
+		&i.EnablementSig,
+		&i.NotifyEarlyLimitReset,
+	)
+	return i, err
+}
+
+const isCodexEarlyResetCurrent = `-- name: IsCodexEarlyResetCurrent :one
+SELECT true::boolean AS is_current
+FROM codex_provider_account a
+JOIN users u ON u.id = a.user_id
+WHERE a.user_id = $1 AND a.id = $2
+    AND a.generation = $3::bigint
+    AND a.credential_revision = $4::bigint
+    AND u.notify_early_limit_reset
+    AND a.coord_state IN ('idle', 'committed')
+    AND NOT a.reauth_required AND a.recovery_sealed IS NULL
+    AND EXISTS (
+        SELECT 1 FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+            AND us.disabled_at IS NULL
+    )
+    AND $5::text <> ''
+    AND (
+        SELECT COALESCE(string_agg(us.id::text || ':' || us.enablement_rev::text, ',' ORDER BY us.id), '')
+        FROM codex_credential_state s
+        JOIN user_secrets us ON us.id = s.user_secret_id AND us.user_id = s.user_id
+        WHERE s.user_id = a.user_id AND s.provider_account_id = a.id AND s.status = 'linked'
+    )::text = $5::text
+`
+
+type IsCodexEarlyResetCurrentParams struct {
+	UserID                     uuid.UUID `json:"user_id"`
+	ProviderAccountID          uuid.UUID `json:"provider_account_id"`
+	ObservedGeneration         int64     `json:"observed_generation"`
+	ObservedCredentialRevision int64     `json:"observed_credential_revision"`
+	EnablementSig              string    `json:"enablement_sig"`
+}
+
+// No row refuses delivery. Gauge writes do not invalidate this authority fence.
+func (q *Queries) IsCodexEarlyResetCurrent(ctx context.Context, arg IsCodexEarlyResetCurrentParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isCodexEarlyResetCurrent,
+		arg.UserID,
+		arg.ProviderAccountID,
+		arg.ObservedGeneration,
+		arg.ObservedCredentialRevision,
+		arg.EnablementSig,
+	)
+	var is_current bool
+	err := row.Scan(&is_current)
+	return is_current, err
+}
+
 const listCodexAccountRateLimits = `-- name: ListCodexAccountRateLimits :many
 SELECT
     u.id                         AS user_id,

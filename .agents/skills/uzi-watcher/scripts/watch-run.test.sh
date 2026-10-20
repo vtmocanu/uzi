@@ -2,7 +2,7 @@
 # Hermetic regression: watch-run.sh's attention stop. A dead run can read `running`, so a
 # persistent non-ok health or a stale worker heartbeat must stop the poll with exit 4 and
 # the evidence, while a transient single poll, a healthy run, `slow`, and the existing stop
-# statuses keep their old behaviour (exit 0).
+# statuses keep their old behaviour (exit 0); coverage expiry is exit 3.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -50,7 +50,8 @@ case "$out" in *"does not prove the run is dead"*) ;; *) fail "wording missing: 
 # 2. a single stalled poll amid ok polls does not fire
 reset running "$(printf 'ok\nstalled\nok\nok\nok\nok')" "" '[]'
 rc=0; out=$(run) || rc=$?
-[ "$rc" -eq 0 ] || fail "transient stalled: want exit 0, got $rc: $out"
+[ "$rc" -eq 3 ] || fail "transient stalled: want coverage-expired exit 3, got $rc: $out"
+case "$out" in *"RESULT=elapsed") ;; *) fail "expiry result missing: $out";; esac
 case "$out" in *needs_attention*) fail "transient poll fired: $out";; esac
 
 # 3. stale worker heartbeat on a running run -> exit 4, worker evidence
@@ -59,32 +60,33 @@ rc=0; out=$(run) || rc=$?
 [ "$rc" -eq 4 ] || fail "stale heartbeat: want exit 4, got $rc: $out"
 case "$out" in *"worker=w1"*"heartbeat_age_secs="[0-9]*) ;; *) fail "heartbeat evidence missing: $out";; esac
 
-# 4. fresh heartbeat -> no stop (ELAPSED, exit 0)
+# 4. fresh heartbeat -> no stop (ELAPSED, exit 3)
 reset running ok w1 "[{\"id\":\"w1\",\"status\":\"online\",\"last_heartbeat_at\":\"$fresh\"}]"
 rc=0; out=$(run) || rc=$?
-[ "$rc" -eq 0 ] || fail "fresh heartbeat: want exit 0, got $rc: $out"
+[ "$rc" -eq 3 ] || fail "fresh heartbeat: want exit 3, got $rc: $out"
 case "$out" in *ELAPSED*) ;; *) fail "fresh heartbeat should poll to ELAPSED: $out";; esac
 
 # 5. unreadable worker list is no signal
 reset running ok w1 'not json'
 rc=0; out=$(run) || rc=$?
-[ "$rc" -eq 0 ] || fail "unreadable worker list fired: $rc: $out"
+[ "$rc" -eq 3 ] || fail "unreadable worker list should expire: $rc: $out"
 
 # 6. slow health is ignored by default
 reset running slow "" '[]'
 rc=0; out=$(run) || rc=$?
-[ "$rc" -eq 0 ] || fail "slow health fired: $rc: $out"
+[ "$rc" -eq 3 ] || fail "slow health should expire: $rc: $out"
 
 # 7. WATCH_ATTENTION_POLLS=0 disables
 reset running stalled "" '[]'
 rc=0; out=$(WATCH_ATTENTION_POLLS=0 run) || rc=$?
-[ "$rc" -eq 0 ] || fail "disabled check fired: $rc: $out"
+[ "$rc" -eq 3 ] || fail "disabled check should expire: $rc: $out"
 
 # 8. existing stop status still exits 0 with STOP=<status>
 reset "$(printf 'running\ncompleted')" ok "" '[]'
 rc=0; out=$(run) || rc=$?
 [ "$rc" -eq 0 ] || fail "completed stop: want exit 0, got $rc: $out"
 case "$out" in *"STOP=completed"*) ;; *) fail "completed stop line missing: $out";; esac
+case "$out" in *"RESULT=stop:completed") ;; *) fail "completed result missing: $out";; esac
 
 # 9. exit 4 prints a REARM line acking the observed episode, reusing the same watch arguments
 reset running stalled "" '[]'
@@ -98,7 +100,7 @@ case "$rearm" in "WATCH_ATTENTION_ACK=stalled@2026-10-09T05:03:06Z WATCH_ATTENTI
 reset running stalled "" '[]'
 echo "2026-10-09T05:03:06Z" > "$WORK/since"
 rc=0; out=$(WATCH_ATTENTION_ACK=stalled@2026-10-09T05:03:06Z run) || rc=$?
-[ "$rc" -eq 0 ] || fail "acked episode fired: $rc: $out"
+[ "$rc" -eq 3 ] || fail "acked episode should expire: $rc: $out"
 case "$out" in *ELAPSED*) ;; *) fail "acked episode should poll to ELAPSED: $out";; esac
 echo "2026-10-09T06:00:00Z" > "$WORK/since"
 rc=0; out=$(WATCH_ATTENTION_ACK=stalled@2026-10-09T05:03:06Z run) || rc=$?
@@ -124,5 +126,12 @@ reset running ok w1 "[{\"id\":\"w1\",\"status\":\"online\",\"last_heartbeat_at\"
 rc=0; out=$(WATCH_ATTENTION_ACK=stalled@x run) || rc=$?
 [ "$rc" -eq 4 ] || fail "stale heartbeat under ack: want exit 4, got $rc: $out"
 case "$out" in *"REARM=WATCH_ATTENTION_ACK=stalled@x "*) ;; *) fail "heartbeat REARM must keep only prior acks: $out";; esac
+case "$out" in *"RESULT=attention") ;; *) fail "attention result missing: $out";; esac
+
+# Unreadable status is not a terminal stop, even when the stop set is defaulted.
+reset "" ok "" '[]'
+rc=0; out=$(PATH="$WORK/bin:$PATH" WATCH_ATTENTION_POLLS=0 bash "$SCRIPT" rid "" 0 1) || rc=$?
+[ "$rc" -eq 3 ] || fail "unreadable status must expire, got $rc: $out"
+case "$out" in *"RESULT=elapsed") ;; *) fail "unknown status expiry missing: $out";; esac
 
 echo "PASS: watch-run attention stop"

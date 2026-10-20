@@ -226,7 +226,7 @@ func (q *Queries) LockRepoForCIWatch(ctx context.Context, id uuid.UUID) (pgtype.
 }
 
 const lockRunScheduleForUser = `-- name: LockRunScheduleForUser :one
-SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch, recent_fires, ci_workflows FROM run_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE
+SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch, recent_fires, ci_workflows, ci_artifacts FROM run_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE
 `
 
 type LockRunScheduleForUserParams struct {
@@ -276,6 +276,7 @@ func (q *Queries) LockRunScheduleForUser(ctx context.Context, arg LockRunSchedul
 		&i.RemoveLabelOnDispatch,
 		&i.RecentFires,
 		&i.CiWorkflows,
+		&i.CiArtifacts,
 	)
 	return i, err
 }
