@@ -16,8 +16,12 @@ function fixture(defaultBranch?: string) {
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
   const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "task" }) } }),
     nullLogger(), 1, undefined, { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
+  const claim = { repo: { default_branch: defaultBranch }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
+  const initialized = runner["buildFlight"](claim, "test", { run: async () => ({ branch: "task" }) }, undefined, "", []);
+  assert.equal(initialized.owedDefaultBranch, defaultBranch?.trim() || undefined, "custody keeps existing semantics");
   const flight = {
-    runId: "test", runKind: "issue", barePath: "bare", owedDefaultBranch: defaultBranch,
+    ...initialized,
+    runId: "test", runKind: "issue", barePath: "bare",
     checkpointChainForge: false, runLog: nullLogger(), reportedPublishOutcomes: new Set<string>(),
     batcher: { emit() {} },
   } as unknown as Parameters<RunRunner["publishCheckpointOutcome"]>[0];
@@ -29,7 +33,7 @@ function fixture(defaultBranch?: string) {
   return { git, runner, flight };
 }
 
-for (const name of ["開発/server", undefined]) {
+for (const name of ["開発/server", "開発/custom\u00a0", " 開発/custom ", undefined]) {
   for (const overlay of [false, true]) for (const pinned of [false, true]) {
     it(`shared tick/park/pause publication: server=${name ?? "absent"} overlay=${overlay} pinned=${pinned}`, async () => {
       const { git, runner, flight } = fixture(name);

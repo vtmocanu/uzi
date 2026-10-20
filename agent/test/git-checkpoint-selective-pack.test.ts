@@ -8,6 +8,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { GitCache, type GitCacheOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
+import { RunRunner } from "../src/runner.js";
+import { WorkerClient } from "../src/client.js";
 
 const scratch = path.resolve("../.uzi/scratch");
 function fixture(bounds?: GitCacheOptions["checkpointPackBounds"], rawPath?: Buffer) {
@@ -166,6 +168,30 @@ for (const mode of ["absent", "invalid", "missing", "mirror", "conflict", "valid
         undefined, undefined, undefined, undefined, { defaultBranch: name });
       assert.ok(packed);
       assert.deepEqual(await f.inventory(packed), mode === "valid" ? f.optimized : f.legacy);
+    } finally { f.cleanup(); }
+  });
+}
+
+for (const name of ["開発/custom\u00a0", " 開発/custom "]) {
+  it(`actual flight preserves exact default authority in inventory: ${JSON.stringify(name)}`, async () => {
+    const f = fixture();
+    try {
+      if (name.endsWith("\u00a0")) f.git(["update-ref", `refs/remotes/origin/${name}`, f.floor]);
+      const client = new WorkerClient("http://unused", "test", "test", nullLogger());
+      const runner = new RunRunner(client, f.cache, () => ({ executor: { run: async () => ({ branch: f.branch }) } }),
+        nullLogger(), 1);
+      const claim = { repo: { default_branch: name }, secrets: {}, last_seq: 0, kind: "issue" } as Parameters<RunRunner["buildFlight"]>[0];
+      const flight = runner["buildFlight"](claim, "test", { run: async () => ({ branch: f.branch }) }, undefined, "", []);
+      const owner = supervised(f);
+      const packed = await f.cache.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
+        () => f.cache.checkpointPack(f.bare, f.branch, undefined, undefined, undefined, undefined,
+          undefined, undefined, { defaultBranch: flight.checkpointDefaultBranch }));
+      assert.ok(packed);
+      assert.deepEqual(await f.inventory(packed), f.legacy, "trimmed-ref-only shared blob must stay in the pack");
+      const producer = owner.calls.find(call => call.args.includes("pack-objects"))!;
+      assert.equal(producer.args.includes("--revs"), !name.endsWith("\u00a0"),
+        "valid exact Unicode authority selects optimization; ASCII-spaced authority stays legacy");
+      assert.equal(owner.calls.some(call => call.args.includes("cat-file")), name.endsWith("\u00a0"));
     } finally { f.cleanup(); }
   });
 }

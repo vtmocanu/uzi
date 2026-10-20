@@ -123,7 +123,7 @@ for (const stop of ["signal", "clock"] as const) {
     const git = cache(), soft = new AbortController();
     let now = 0, preparations = 0, launches = 0;
     Object.assign(git, {
-      prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\\n"); },
+      prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\n"); },
       spawnGit: async () => {
         launches++;
         return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
@@ -219,6 +219,89 @@ it("soft interruption cannot hide unverified preparation cleanup", async () => {
     assert.equal(owner.live, 0);
   } finally { owner.release.resolve(); await rejected; }
 });
+
+for (const stage of ["row", "classification"] as const) {
+  it(`a genuine ${stage} failure survives a cap expiring during deferred disposal`, async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const git = cache(), owner = controlled(stage === "row" ? 0 : 3);
+    const pending = git.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
+      () => git.checkpointPack("bare", "task"));
+    const observed = pending.then(value => ({ value }), error => ({ error }));
+    try {
+      await owner.entered.promise;
+      owner.pipes.at(-3)!.write(stage === "row" ? "invalid row\n" : "invalid classification\n");
+      await owner.cancelled.promise;
+      t.mock.timers.tick(5000);
+      owner.release.resolve();
+      const result = await observed;
+      assert.ok("error" in result, "a metadata failure must forbid legacy fallback");
+      assert.match(String(result.error), stage === "row" ? /invalid checkpoint object row/ : /invalid checkpoint classification/);
+      assert.equal(owner.calls.some(args => args.includes("pack-objects")), false);
+      assert.equal(owner.live, 0);
+    } finally { owner.release.resolve(); await observed; }
+  });
+}
+
+for (const pinned of [false, true]) for (const replay of [false, true]) {
+  for (const stop of ["abort", "expiry", "unsafe"] as const) {
+    it(`producer handoff joins verified disposal: pinned=${pinned} replay=${replay} stop=${stop}`, async t => {
+      const timers = trackTimers(t);
+      let now = 1000, launches = 0, returned = false;
+      t.mock.method(Date, "now", () => now);
+      const git = cache(), parent = new AbortController(), owner = controlled(replay ? 1 : 0);
+      Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
+      const spawn = git["spawnGit"].bind(git);
+      const signals: AbortSignal[] = [];
+      Object.assign(git, { spawnGit: async (...args: Parameters<typeof spawn>) => {
+        const child = await spawn(...args);
+        signals.push(git["recoveryOperation"]()!.signal);
+        if (++launches === (replay ? 2 : 1)) {
+          if (stop === "expiry") now = 61000;
+          else parent.abort();
+        }
+        return child;
+      } });
+      const spawner: BoundaryProcessSpawner = async request => {
+        const child = await owner.spawner(request);
+        return { ...child, cancel: async () => {
+          await child.cancel();
+          if (stop === "unsafe") throw new Error("unverified handoff cancellation");
+        } };
+      };
+      const pending = git.withBoundaryProcessSpawner(spawner, new AbortController().signal, async () => {
+        const packed = await git.checkpointPack("bare", "task", undefined,
+          pinned ? { tipSha: TIP, excludeSha: FLOOR, defaultBlobSha: DEFAULT } : undefined,
+          undefined, undefined, undefined, undefined, { signal: parent.signal, deadline: 61000 });
+        if (replay) {
+          assert.ok(packed);
+          for await (const _chunk of packed.pack) { /* drain initial producer */ }
+          assert.equal(await packed.exited, 0);
+          return packed.replay();
+        }
+        return packed;
+      });
+      const observed = pending.then(value => ({ value }), error => ({ error })).finally(() => { returned = true; });
+      try {
+        await owner.entered.promise;
+        assert.equal(await Promise.race([
+          owner.cancelled.promise.then(() => "cancelled"), observed.then(() => "returned"),
+        ]), "cancelled", "a handoff failure must cancel its producer before returning");
+        await tick();
+        assert.equal(returned, false, "handoff rejection must wait for verified disposal and reap");
+        owner.release.resolve();
+        const result = await observed;
+        assert.ok("error" in result);
+        if (stop === "unsafe") assert.ok(result.error instanceof CheckpointUnsafeCleanupError);
+        else assert.match(String(result.error), /abort|deadline/i);
+        assert.equal(owner.live, 0);
+        assert.equal(timers.size, 0);
+        assert.ok(signals.every(signal => getEventListeners(signal, "abort").length === 0));
+        assert.equal(getEventListeners(parent.signal, "abort").length, 0);
+        assert.ok(owner.pipes.every(pipe => pipe.destroyed || pipe.readableEnded));
+      } finally { owner.release.resolve(); await observed; }
+    });
+  }
+}
 
 const stages = ["commits", "all objects", "private objects", "classification", "selection"] as const;
 for (const stage of stages) for (const stop of ["cancel", "deadline"] as const) {
@@ -353,7 +436,7 @@ for (const stop of ["cancel", "deadline"] as const) {
     t.mock.method(Date, "now", () => now);
     const git = cache(), parent = new AbortController();
     Object.assign(git, {
-      prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\\n"); },
+      prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\n"); },
       spawnGit: async () => {
         launches++;
         return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };

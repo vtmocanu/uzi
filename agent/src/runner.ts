@@ -1901,6 +1901,8 @@ interface RunFlight {
    *  and retries ONCE. Server-side NOT NULL DEFAULT 0. */
   readonly claimGeneration: number;
   readonly owedDefaultBranch: string | undefined;
+  /** Exact server name used only to authorize checkpoint blob omission. */
+  readonly checkpointDefaultBranch: string | undefined;
   owedContext: Promise<OwedCandidateContext> | undefined;
   /** `pending` names the terminal about to be sent, so a held-eligible failure can defer its archive
    *  capture (issue #2545); omitted, the pass freezes and captures as before. */
@@ -9445,6 +9447,7 @@ export class RunRunner {
       claimGeneration,
       planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
+      checkpointDefaultBranch: claim.repo.default_branch ?? undefined,
       owedContext: undefined,
       owedFeedClosed: false,
       owedLimitStop: undefined,
@@ -14304,7 +14307,7 @@ export class RunRunner {
       // Scan floors: the default branch, the last confirmed checkpoint ref tip, and confirmed
       // published real tips beneath overlays (already public). Local-only checkpointFloor is excluded.
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
-        defaultBranch: flight.owedDefaultBranch,
+        defaultBranch: flight.checkpointDefaultBranch,
         confirmedTip: flight.lastCheckpointRefTip,
         extraFloors: flight.publishedRealTips,
       });
@@ -14394,7 +14397,7 @@ export class RunRunner {
       flight.lastCheckpointRefTip,
     ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
     const range = await this.git.resolveCheckpointRange(barePath, branch, {
-      defaultBranch: flight.owedDefaultBranch,
+      defaultBranch: flight.checkpointDefaultBranch,
       confirmedTip: flight.lastCheckpointRefTip,
       extraFloors: floorCandidates,
     });
@@ -15073,7 +15076,7 @@ export class RunRunner {
         flight.checkpointChainForge === true
           ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
           : undefined,
-        { defaultBranch: flight.owedDefaultBranch, signal });
+        { defaultBranch: flight.checkpointDefaultBranch, signal });
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
