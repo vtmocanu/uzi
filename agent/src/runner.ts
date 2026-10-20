@@ -16,7 +16,7 @@ import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
-import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
+import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -4539,6 +4539,12 @@ export class RunRunner {
           "e2e drop-execution seam: ending flight with no terminal report (run left running for the missing-run requeue)",
         );
         await batcher.close().catch(() => undefined);
+      } else if (err instanceof BaseAttestationMissingError) {
+        // issue #3194: the --require-base guard refused retained work no checkpoint attests, before
+        // the executor ran. Caught BEFORE the generic terminal path: this run is held for its owner,
+        // never failed, so it reports NO terminal state and keeps its clone and custody on every
+        // outcome of the hold request (enterBaseAttestationHold).
+        await this.enterBaseAttestationHold(claim, flight, err, runLog);
       } else if (codexDeferralOf(err) !== undefined) {
         // Codex credentials were deferred by a vault lock, an unknown boundary refresh,
         // or exhausted epoch-start release retries. Vault locks also arise mid-turn.
@@ -17917,6 +17923,66 @@ export class RunRunner {
       head,
     });
     return true;
+  }
+
+  /**
+   * issue #3194: hold a `--require-base` run whose preflight guard threw BaseAttestationMissingError.
+   * The executor never ran, so there is nothing to reap or capture: the adopted source is already
+   * the clone's HEAD. Retain-and-stop, like the ServerWallParkedError arm: the clone, the session
+   * HOME and the guarded inventory are kept on EVERY outcome, no terminal state is reported, and the
+   * request is never retried inside this flight. Only the server's positive ACK (`held`) lets the
+   * feed say the run is held; a fence refusal (`stale`) or an unproven answer (`unknown`: transport,
+   * 5xx, an older server's 404/400) ends the flight non-terminal with everything kept, for the
+   * server's own reclaim or the owner's recovery.
+   */
+  private async enterBaseAttestationHold(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    refusal: BaseAttestationMissingError,
+    runLog: Logger,
+  ): Promise<void> {
+    const { batcher } = flight;
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    const runId = flight.runId;
+    // The client classifies every answer and never throws; the catch keeps a defect there from
+    // escaping into the dispatcher, which would skip the retain-and-stop below.
+    const ack = await this.client.requestBaseAttestationHold(runId, {
+      head: flight.runnerClone?.adoptedSource ?? "",
+      claimGeneration: flight.claimGeneration,
+    }).catch((e: unknown): BaseAttestationHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
+    if (ack.outcome === "held") {
+      flight.parked = true;
+      flight.holdOrWallParkConfirmed = true;
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `${refusal.message}. The agent did not start and this worker keeps the work. ` +
+            `Inspect it with \`uzi run recovery ${runId}\`, recover it with ` +
+            `\`uzi run export ${runId} --output <path>\`, or start a successor run.`,
+        },
+      });
+      runLog.info("run held on base_attestation_missing; clone, HOME and custody retained", { run_id: runId });
+    } else {
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: "--require-base: the adopted work is not attested against the planned base, so the agent " +
+            "did not start. The hold could not be confirmed; this worker keeps the work.",
+        },
+      });
+      runLog.warn("base attestation hold not confirmed; ending the flight non-terminal with clone and custody retained", {
+        run_id: runId,
+        claim_generation: claim.claim_generation,
+        outcome: ack.outcome,
+        refusal: refusal.message,
+        ...(ack.outcome === "unknown" ? { detail: ack.detail } : { server_status: ack.status }),
+      });
+    }
+    await batcher.close().catch(() => undefined);
   }
 
   /**

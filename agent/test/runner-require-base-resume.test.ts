@@ -183,8 +183,9 @@ describe("--require-base on a same-run continuation (issue #3194)", () => {
   it("a reclaim adopting its own work WITHOUT an attestation does not implement", async () => {
     const { legs, failed } = await twoLegs(31032, false);
     assert.equal(legs.length, 1, "leg 2 never reached the executor");
+    // M4: the refusal is an owner hold (runner-base-attestation-hold.test.ts), never a failed run.
     const reasons = failed.map((f) => f.body.failure_reason ?? "");
-    assert.ok(reasons.some((r) => r.includes("no checkpoint attests")), `held for missing attestation: ${reasons.join(" | ")}`);
+    assert.ok(!reasons.some((r) => r.includes("no checkpoint attests")), `held, not failed: ${reasons.join(" | ")}`);
   });
 });
 
@@ -256,6 +257,7 @@ describe("--require-base wall park -> extend -> reclaim (issue #3194)", () => {
           planned_base_commit: planned, require_base_match: true, claim_generation: 1,
         });
         const broker = brokerStub(branch);
+        let freshData: string | undefined;
         try {
           await runnerWith(factory, gitlab).execute(claim);
           assert.equal(parked[0], "parked", "leg 1 parked at the wall");
@@ -267,14 +269,16 @@ describe("--require-base wall park -> extend -> reclaim (issue #3194)", () => {
           });
           // `uzi run extend` resumes the paused run; the server's ownership now names the new claim.
           api.setOwnershipStatus(claim.run_id, "running", 2);
+          if (where === "fresh worker") freshData = fs.mkdtempSync(path.join(os.tmpdir(), "cdr-3194-"));
           const leg2Runner = where === "same worker"
             ? runnerWith(factory, gitlab)
-            : new RunRunner(client, new GitCache(fs.mkdtempSync(path.join(os.tmpdir(), "cdr-3194-")), nullLogger(),
+            : new RunRunner(client, new GitCache(freshData!, nullLogger(),
               undefined, testGitCacheOptions()), factory, nullLogger(), 20, undefined,
               { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab });
           await leg2Runner.execute(resumed);
         } finally {
           broker.restore();
+          if (freshData) fs.rmSync(freshData, { recursive: true, force: true });
         }
         assert.equal(legs.length, 2, "leg 2 reached the executor");
         const refusals = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed")
