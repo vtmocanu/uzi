@@ -267,6 +267,16 @@ func TestSemanticParkAfterParkedRefusalLiveDB(t *testing.T) {
 	if _, applied, _, err := f.svc.SetStateReport(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, req); err != nil || !applied {
 		t.Fatalf("park: applied=%v err=%v", applied, err)
 	}
+	// Re-presenting the parked gate without its reason keeps the stored, still-expected one.
+	omitted := autopilotParkRequest(t, f, nil)
+	if _, applied, _, err := f.svc.SetStateReport(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, omitted); err != nil || !applied {
+		t.Fatalf("omitted-reason re-presentation: applied=%v err=%v", applied, err)
+	}
+	if parked, err := f.e.q.GetRunByID(f.e.ctx, f.run); err != nil {
+		t.Fatal(err)
+	} else if got, _ := storedPark(t, parked); got != want {
+		t.Fatalf("omitted reason erased the park: got %q want %q", got, want)
+	}
 	other := autopilotParkRequest(t, f, strp(semanticParkCoverageUncertain))
 	if _, applied, _, err := f.svc.SetStateReport(f.e.ctx, store.Worker{ID: f.worker, UserID: f.e.userID}, f.run, other); !errors.Is(err, ErrSemanticGateMismatch) || applied {
 		t.Fatalf("contradicting replay: applied=%v err=%v", applied, err)

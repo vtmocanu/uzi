@@ -221,7 +221,8 @@ func expectedSemanticPark(p *apitypes.SemanticGatePresentation) string {
 // records the accepted value on the presentation. An autopilot (auto_approve) report must carry
 // exactly the expected reason, or none only when the projection needs none. A human-gated run, or
 // one that already parked (SetRunAwaitingApproval clears auto_approve), may not supply a reason
-// except as an exact replay of the reason its stored presentation already carries.
+// except as an exact replay of the reason its stored presentation already carries; omitting it
+// on that candidate keeps the stored reason while the projection still expects it.
 func validateSemanticPark(run store.Run, req StateRequest, p *apitypes.SemanticGatePresentation) error {
 	expected := expectedSemanticPark(p)
 	supplied := ""
@@ -241,6 +242,11 @@ func validateSemanticPark(run store.Run, req StateRequest, p *apitypes.SemanticG
 			stored.Semantic.Candidate.Digest != p.Candidate.Digest || supplied != expected {
 			return ErrSemanticGateMismatch
 		}
+	} else if stored, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload); err == nil && ok && stored.Semantic != nil &&
+		stored.Semantic.SemanticPark != "" && stored.Semantic.Candidate.Digest == p.Candidate.Digest && stored.Semantic.SemanticPark == expected {
+		// A parked gate re-presented without its reason keeps the stored, still-expected reason:
+		// a worker cannot erase the truthful park reason from the same candidate.
+		supplied = stored.Semantic.SemanticPark
 	}
 	p.SemanticPark = supplied
 	return nil

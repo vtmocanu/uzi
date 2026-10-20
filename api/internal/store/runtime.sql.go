@@ -18440,10 +18440,10 @@ UPDATE runs SET
     -- auto_approve short-circuits the executor's preApproved path, skipping the gate
     -- with NO human in the loop, and the worker's ciFixHumanApproved initializer then
     -- reads that as approved. Clearing auto_approve here makes the resume re-gate.
-    -- Manual runs already carry auto_approve=false (no-op), and a normal structural
-    -- autopilot run never reaches this statement (it short-circuits in gatePlan and never
-    -- parks). The runs this affects are the forceGate ci_fix case and, since PRD #1230
-    -- D3, a semantic-enrolled autopilot run whose server coverage projection is not
+    -- Manual runs already carry auto_approve=false (no-op). An autopilot run parks here
+    -- only when something forces the human gate: the forceGate ci_fix case, an
+    -- auto-approved plan cross-check lead whose checker did not APPROVE (ADR-2149), and,
+    -- since PRD #1230 D3, a semantic-enrolled autopilot run whose server coverage projection is not
     -- complete or which carries maintainer criteria: it parks here from ` + "`" + `running` + "`" + ` (the
     -- semantic coverage park) and the cleared auto_approve makes any resume re-gate.
     auto_approve = false,
