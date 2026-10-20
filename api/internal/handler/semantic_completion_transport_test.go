@@ -171,12 +171,37 @@ func TestSemanticCompletionMaximumAdmission(t *testing.T) {
 	t.Logf("admitted 256 frozen maintainers, wire bytes=%d", len(raw))
 	// Keep each rejection above the ordinary 1 MiB boundary, while avoiding
 	// repeated maximum-contract validation. The full maximum is admitted above.
-	run, input = semanticCompletionTransportFixture(t, 32)
+	run, input = semanticCompletionTransportFixture(t, 1)
+	input.Guidance = strings.Repeat("x", apitypes.RunInputLegacyMaxBytes-16*1024)
 	raw, err = json.Marshal(input)
 	if err != nil || len(raw) <= apitypes.RunInputLegacyMaxBytes {
 		t.Fatalf("large rejection fixture bytes=%d err=%v", len(raw), err)
 	}
 	h = newRunsHandler(t, &runsStore{ownerID: run.UserID, run: run})
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	remainderBytes := len(raw) - len(fields["maintainers"]) + len("null")
+	if remainderBytes > apitypes.RunInputLegacyMaxBytes {
+		t.Fatalf("base ordinary remainder bytes=%d", remainderBytes)
+	}
+	baseRequest := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(raw))
+	baseRequest.Header.Set(apitypes.SemanticIdentityHeader, apitypes.SemanticIdentityVersion)
+	var admitted completionDecisionRequest
+	if err := h.decodeSemanticCompletionDecision(baseRequest, run.UserID, run.ID, &admitted); err != nil {
+		t.Fatalf("valid large base envelope rejected: %v", err)
+	}
+	if !reflect.DeepEqual(admitted, input) {
+		t.Fatal("base envelope changed on decode")
+	}
+	oversizedRemainder := input
+	oversizedRemainder.Guidance = strings.Repeat("x", apitypes.RunInputLegacyMaxBytes+1)
+	oversizedRaw, err := json.Marshal(oversizedRemainder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("negative base wire bytes=%d ordinary remainder bytes=%d", len(raw), remainderBytes)
 	for _, tc := range []struct {
 		name   string
 		raw    []byte
@@ -194,10 +219,13 @@ func TestSemanticCompletionMaximumAdmission(t *testing.T) {
 		{"other decision", bytes.Replace(raw, []byte("authorize_maintainer"), []byte("accept"), 1), run.UserID, apitypes.SemanticIdentityVersion},
 		{"missing revision", bytes.Replace(raw, []byte(`"contract_revision":1`), []byte(`"contract_revision":0`), 1), run.UserID, apitypes.SemanticIdentityVersion},
 		{"changed condition", bytes.Replace(raw, []byte(`"conditions":[`), []byte(`"conditions":["changed",`), 1), run.UserID, apitypes.SemanticIdentityVersion},
-		{"ordinary remainder", bytes.Replace(raw, []byte(`"guidance":""`), []byte(`"guidance":"`+strings.Repeat("x", apitypes.RunInputLegacyMaxBytes)+`"`), 1), run.UserID, apitypes.SemanticIdentityVersion},
+		{"ordinary remainder", oversizedRaw, run.UserID, apitypes.SemanticIdentityVersion},
 		{"total limit", []byte(strings.Repeat(" ", apitypes.SemanticRunInputMaxBytes+1)), run.UserID, apitypes.SemanticIdentityVersion},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.raw) <= apitypes.RunInputLegacyMaxBytes {
+				t.Fatalf("negative body below large-envelope boundary: %d", len(tc.raw))
+			}
 			r := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(tc.raw))
 			r.Header.Set(apitypes.SemanticIdentityHeader, tc.marker)
 			var dst completionDecisionRequest

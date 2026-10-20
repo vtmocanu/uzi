@@ -4401,6 +4401,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
 	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
 	// always names the id it adopts with, and a revision is positive.
+	if s.txBeginner == nil && stateUsesGenerationFence(req.State, owned) && semanticCompletionRequiresLock(owned) {
+		return owned, false, ErrSemanticCompletionAuthority
+	}
 	if s.txBeginner == nil && (req.State == "running" || req.State == "awaiting_approval") {
 		if txq, ok := s.q.(*store.Queries); ok {
 			if semantic, err := semanticEnrollmentPresent(ctx, txq, runID); err != nil || semantic {

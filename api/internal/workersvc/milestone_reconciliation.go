@@ -222,6 +222,9 @@ func changedMilestoneContract(r store.Run) bool {
 func (s *Service) beginClaimMutation(ctx context.Context, w store.Worker, id uuid.UUID, g *int64) (*Service, store.Run, pgx.Tx, error) {
 	if s.txBeginner == nil {
 		r, err := s.runOwnedByWorker(ctx, id, w)
+		if err == nil && semanticCompletionRequiresLock(r) {
+			return nil, r, nil, ErrSemanticCompletionAuthority
+		}
 		return s, r, nil, err
 	}
 	tx, err := s.beginReadCommitted(ctx)

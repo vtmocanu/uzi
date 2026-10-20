@@ -15,12 +15,12 @@ func TestSemanticCompletionOwnerAuthorizationReplayLiveDB(t *testing.T) {
 	svc := e.permitService(t)
 	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
 	id := e.seedFrozenRun(t, wid, []string{"m1"}, nil, false)
-	fixture := semanticCompletionFixture(t, true)
+	fixture := semanticCompletionTwoMaintainers(t)
 	e.exec(t, "UPDATE runs SET completion_contract=$2, milestones_frozen=$3 WHERE id=$1", id, fixture.CompletionContract, fixture.MilestonesFrozen)
 	e.parkCompletionBlocked(t, id)
 	e.seedPermit(t, id, wid, 1, "old-head")
 	c, _ := parseCompletionContract(fixture.CompletionContract)
-	dec := CompletionDecisionInput{Decision: "authorize_maintainer", Maintainers: semanticMaintainers(c), Reason: "authorize frozen owner steps", ContractRevision: 1}
+	dec := CompletionDecisionInput{Decision: "authorize_maintainer", Maintainers: semanticMaintainers(c)[:1], Reason: "authorize frozen owner steps", ContractRevision: 1}
 	foreignAdmin := uuid.New()
 	e.exec(t, "INSERT INTO users (id,email,password_hash,is_admin) VALUES ($1,$2,'hash',true)", foreignAdmin, "m4-"+foreignAdmin.String()+"@example.com")
 	if _, err := svc.DecideCompletion(e.ctx, foreignAdmin, id, dec); !errors.Is(err, ErrRunNotFound) {
@@ -45,8 +45,22 @@ func TestSemanticCompletionOwnerAuthorizationReplayLiveDB(t *testing.T) {
 	}
 	run.CompletionContract = raw
 	pending, err := CompletionPending(run)
-	if err != nil || pending.Criteria[0].AuthorizationRevision != 2 || pending.Criteria[0].Status != "unverified" {
+	if err != nil || len(pending.Criteria) != 2 {
 		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	for _, criterion := range pending.Criteria {
+		want := 1
+		if criterion.CriterionID == dec.Maintainers[0].ID {
+			want = 2
+		}
+		if criterion.AuthorizationRevision != want || criterion.Status != "unverified" {
+			t.Fatalf("selected authorization=%+v want revision %d", criterion, want)
+		}
+	}
+	all := dec
+	all.Maintainers = semanticMaintainers(c)
+	if _, err := svc.DecideCompletion(e.ctx, e.userID, id, all); !errors.Is(err, ErrCompletionRevisionConflict) {
+		t.Fatalf("all-authorizations falsely replayed selected decision: %v", err)
 	}
 	dec.Maintainers[0].Conditions = []string{"different"}
 	if _, err := svc.DecideCompletion(e.ctx, e.userID, id, dec); !errors.Is(err, ErrCompletionRevisionConflict) {
