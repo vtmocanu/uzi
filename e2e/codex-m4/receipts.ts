@@ -26,14 +26,14 @@
 // THE DENY / ALLOW LISTS (classifyPath). The shipped codex guardrail RUNTIME is everything under
 // `agent/` EXCEPT `agent/test/` (agent/src is COPY'd to /app and run via tsx; agent/codex/supervisor
 // is go-built; agent/templates holds the Dockerfiles + entrypoint; agent/package*.json,
-// agent/tsconfig.json, agent/devbox-global, agent/bin are build inputs). The proof ALSO consumes the
-// api module: the M3b proof builds its worker-route test server from the whole `api/` context, so
-// every `api/` path except a Go `*_test.go` is runtime too (#3148). Everything else that neither the
-// worker image runs as a guardrail nor the proof consumes — agent/test/, e2e/, prds/, docs/, adr/,
-// specs/, .claude/, deploy/ (the Helm chart), scripts/ (repo tooling), Taskfile.yml, *.md outside
-// api/, and any Go `*_test.go` outside agent/ (never compiled into a shipped or proof binary) — is
-// EVIDENCE; deploy/ and scripts/ reach the image only as the inert `COPY . /opt/uzi-src` source copy,
-// as every evidence path does. The deny lists (agent/ minus agent/test/, then api/ minus Go tests) are
+// agent/tsconfig.json, agent/devbox-global, agent/bin are build inputs). The api module is runtime
+// too: the M3b proof builds its worker-route test server from the whole `api/` context and exercises
+// it as an executable component, so every `api/` path except a Go `*_test.go` is a runtime/build
+// input (#3148). The proof HARNESS, tests and documentation are EVIDENCE — agent/test/, e2e/, prds/,
+// docs/, adr/, specs/, .claude/, Taskfile.yml, *.md outside api/, any Go `*_test.go` outside agent/
+// (never compiled into a shipped or test-server binary) — and so are deploy/ (the Helm chart) and
+// scripts/ (repo tooling), which neither the image nor the proof builds or runs; they reach the
+// image only as the inert `COPY . /opt/uzi-src` source copy. The deny lists (agent/ minus agent/test/, then api/ minus Go tests) are
 // checked FIRST so a runtime path can never be mis-shelved into the allow list; an unrecognized path
 // is `unclassified` and rejects (fail closed — a new top-level path must be classified deliberately).
 // receipts.test.ts PINS these lists to the real Dockerfile COPY set and the M3b test-server build
@@ -178,9 +178,9 @@ export function parseManifest(raw: unknown): { manifest: CandidateManifest } | {
   return { manifest };
 }
 
-/** The three path classes the evidence-only-tail rule turns on. `runtime` — part of the shipped
- *  codex guardrail runtime or an input the packaged proof consumes (the api test server);
- *  `evidence` — neither (tests/docs/e2e/chart/tooling); `unclassified` — an unrecognized path that
+/** The three path classes the evidence-only-tail rule turns on. `runtime` — a runtime/build input:
+ *  the shipped codex guardrail runtime or the api test server the proof builds and exercises;
+ *  `evidence` — the proof harness, tests, documentation, chart and repo tooling; `unclassified` — an unrecognized path that
  *  fails closed (a new top-level path must be classified deliberately). The deny lists are checked
  *  FIRST so a runtime path can never fall into the allow list. Pinned to the real Dockerfile COPY set
  *  and the M3b test-server build context by receipts.test.ts (see the module header). */
