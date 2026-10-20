@@ -172,6 +172,23 @@ for (const mode of ["absent", "invalid", "missing", "mirror", "conflict", "valid
   });
 }
 
+for (const matching of [false, true]) {
+  it(`origin HEAD preserves Unicode whitespace authority: matching=${matching}`, async () => {
+    const f = fixture();
+    try {
+      const name = matching ? "開発/custom\u00a0" : "開発/custom";
+      const head = "refs/remotes/origin/開発/custom\u00a0";
+      f.git(["check-ref-format", head]);
+      f.git(["update-ref", head, f.defaultSha]);
+      f.git(["symbolic-ref", "refs/remotes/origin/HEAD", head]);
+      const packed = await f.cache.checkpointPack(f.bare, f.branch, undefined, undefined,
+        undefined, undefined, undefined, undefined, { defaultBranch: name });
+      assert.ok(packed);
+      assert.deepEqual(await f.inventory(packed), matching ? f.optimized : f.legacy);
+    } finally { f.cleanup(); }
+  });
+}
+
 for (const name of ["開発/custom\u00a0", " 開発/custom "]) {
   it(`actual flight preserves exact default authority in inventory: ${JSON.stringify(name)}`, async () => {
     const f = fixture();
@@ -209,22 +226,45 @@ it("candidate equal to default retains candidate commits and trees but no blobs"
   } finally { f.cleanup(); }
 });
 
-for (const captured of [true, false]) it(`replay pins captured default including absence: ${captured}`, async () => {
-  const f = fixture();
-  try {
-    const range = await f.cache.resolveCheckpointRange(f.bare, f.branch,
-      { defaultBranch: captured ? "開発/custom" : undefined });
-    assert.ok(range);
-    const packed = await f.cache.checkpointPack(f.bare, f.branch, undefined, range);
-    assert.ok(packed);
-    const expected = captured ? f.optimized : f.legacy;
-    assert.deepEqual(await f.inventory(packed), expected);
-    f.git(["update-ref", "refs/remotes/origin/開発/custom", f.candidate]);
-    f.git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other"]);
-    range.defaultBlobSha = f.candidate;
-    assert.deepEqual(await f.inventory(await packed.replay()), expected);
-  } finally { f.cleanup(); }
-});
+for (const pinned of [true, false]) {
+  for (const mutation of ["move", "delete", "head-conflict", "create", "head-consistent", "no-head"] as const) {
+    it(`replay retains default capture: pinned=${pinned}, mutation=${mutation}`, async () => {
+      const f = fixture();
+      try {
+        const ref = "refs/remotes/origin/開発/custom";
+        const head = "refs/remotes/origin/HEAD";
+        const captured = mutation !== "create" && mutation !== "head-consistent";
+        if (mutation === "create") f.git(["update-ref", "-d", ref]);
+        if (mutation === "head-consistent") {
+          f.git(["symbolic-ref", head, "refs/remotes/origin/other"]);
+        }
+        const options = { defaultBranch: "開発/custom" };
+        const range = pinned
+          ? await f.cache.resolveCheckpointRange(f.bare, f.branch, options)
+          : undefined;
+        if (pinned) {
+          assert.ok(range);
+          assert.equal(range.defaultBlobSha, captured ? f.defaultSha : undefined);
+        }
+        const packed = await f.cache.checkpointPack(f.bare, f.branch, undefined, range ?? undefined,
+          undefined, undefined, undefined, undefined, options);
+        assert.ok(packed);
+        const expected = captured ? f.optimized : f.legacy;
+        assert.deepEqual(await f.inventory(packed), expected);
+        if (mutation === "move") f.git(["update-ref", ref, f.candidate]);
+        if (mutation === "delete") f.git(["update-ref", "-d", ref]);
+        if (mutation === "create") f.git(["update-ref", ref, f.defaultSha]);
+        if (mutation === "head-conflict") {
+          f.git(["symbolic-ref", head, "refs/remotes/origin/other"]);
+        }
+        if (mutation === "head-consistent") f.git(["symbolic-ref", head, ref]);
+        // Caller mutation must not replace the capture held by the replay closure.
+        if (range) range.defaultBlobSha = f.candidate;
+        assert.deepEqual(await f.inventory(await packed.replay()), expected);
+      } finally { f.cleanup(); }
+    });
+  }
+}
 
 for (const bounds of [{ records: 1 }, { bytes: 1 }, { lineBytes: 1 }, { durationMs: 0 }]) {
   it(`preparation cap falls back to exact legacy inventory: ${JSON.stringify(bounds)}`, async () => {

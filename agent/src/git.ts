@@ -8959,7 +8959,7 @@ export class GitCache {
       return boundary ? this.boundaryProcesses.run(boundary, scoped) : scoped();
     };
     const packed = await run(() => this.checkpointPackCaptured(barePath, branch, overlay, pinned, onStep,
-      sourceSha, beforePack, chainFrom, options));
+      sourceSha, beforePack, chainFrom, options, parent ? undefined : Infinity));
     if (!packed) return null;
     return { tipOid: packed.tipOid, pack: packed.pack, exited: packed.exited, cancel: packed.cancel,
       replay: async () => {
@@ -8984,6 +8984,7 @@ export class GitCache {
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
     options: { defaultBranch?: string; signal?: AbortSignal; deadline?: number } = {},
+    producerTimeoutMs?: number,
   ): Promise<{
     tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void>;
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void; settled: () => Promise<void> }>;
@@ -9008,7 +9009,11 @@ export class GitCache {
       this.checkCheckpointCooperation();
       const { stdout, exited, cancel, settled } = await this.spawnGit(
         barePath, selected === undefined ? ["pack-objects", "--revs", "--stdout"] : ["pack-objects", "--stdout"],
-        selected ?? `${candidate}\n^${floor}\n`, { stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024 },
+        selected ?? `${candidate}\n^${floor}\n`, {
+          stdoutCategory: "artifactBytes", stderrMaxBytes: 64 * 1024,
+          // checkpointPack's synthetic recovery scope must not add a producer timeout default.
+          timeoutMs: producerTimeoutMs,
+        },
       );
       return { pack: stdout, exited, cancel, settled };
     };
@@ -9110,10 +9115,17 @@ export class GitCache {
       this.checkCheckpointCooperation();
       return undefined;
     }
-    const head = await this.tryGitStdout(barePath, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"]);
+    let head = "";
+    try {
+      // Remove Git's terminator only; Unicode whitespace is valid ref spelling.
+      head = (await this.runGit(barePath, ["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])).replace(/\n$/, "");
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+    }
     this.checkCheckpointCooperation();
     const ref = `refs/remotes/origin/${name}`;
-    if (head.trim() && head.trim() !== ref) return undefined;
+    if (head && head !== ref) return undefined;
     const sha = await this.revParse(barePath, `${ref}^{commit}`);
     this.checkCheckpointCooperation();
     return sha && SHA40_RE.test(sha) ? sha : undefined;
@@ -14805,7 +14817,7 @@ try {
           cwd,
           env,
           identity: "worker_pat",
-          ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+          ...(childTimeout === undefined || !Number.isFinite(childTimeout) ? {} : { timeoutMs: childTimeout }),
           ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
         });
       } catch (cause) {

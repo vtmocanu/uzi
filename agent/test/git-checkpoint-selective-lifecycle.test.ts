@@ -406,6 +406,54 @@ for (const phase of ["captureCheckpointDefault", "checkpointExcludeRef", "buildW
   }
 }
 
+for (const scenario of [
+  { name: "no original recovery or deadline", expected: [undefined, undefined] },
+  { name: "ambient infinite recovery", parentDeadline: Infinity, expected: [600_000, 600_000] },
+  { name: "ambient finite recovery", parentDeadline: 61_000, expected: [60_000, 59_000] },
+  { name: "explicit deadline beyond ten minutes", deadline: 901_000, expected: [900_000, 899_000] },
+  { name: "boundary soft deadline", softDeadline: 21_000, expected: [20_000, 19_000] },
+  { name: "explicit and boundary soft deadlines", deadline: 901_000, softDeadline: 21_000, expected: [20_000, 19_000] },
+]) {
+  it(`producer timeout preserves ${scenario.name} on initial pack and replay`, async t => {
+    let now = 1_000;
+    t.mock.method(Date, "now", () => now);
+    const timers = trackTimers(t);
+    const git = cache(), owner = controlled(-1), parent = new AbortController();
+    Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
+    const timeouts: (number | undefined)[] = [], present: boolean[] = [];
+    const spawner: BoundaryProcessSpawner = async request => {
+      assert.ok(request.argv.includes("pack-objects"));
+      timeouts.push(request.timeoutMs);
+      present.push(Object.hasOwn(request, "timeoutMs"));
+      return owner.spawner(request);
+    };
+    const open = () => git.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+      () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+        undefined, undefined, { defaultBranch: "release", deadline: scenario.deadline }),
+      { softDeadlineAt: scenario.softDeadline, now: () => now });
+    const packed = await (scenario.parentDeadline === undefined ? open()
+      : git.withRecoveryOperation(parent.signal, scenario.parentDeadline, open));
+    assert.ok(packed);
+    try {
+      for await (const _chunk of packed.pack) { /* drain the actual spawnGit output */ }
+      assert.equal(await packed.exited, 0);
+      now = 2_000;
+      const replay = await packed.replay();
+      try {
+        for await (const _chunk of replay.pack) { /* join replay output before exit */ }
+        assert.equal(await replay.exited, 0);
+      } finally { replay.cancel(); replay.pack.destroy(); await replay.exited; }
+      assert.deepEqual(timeouts, scenario.expected);
+      assert.deepEqual(present, scenario.expected.map(timeout => timeout !== undefined));
+      await tick();
+      assert.equal(owner.live, 0);
+      assert.ok(owner.pipes.every(pipe => pipe.destroyed));
+      assert.equal(timers.size, 0);
+      assert.equal(getEventListeners(parent.signal, "abort").length, 0);
+    } finally { packed.cancel(); packed.pack.destroy(); await packed.exited; }
+  });
+}
+
 it("replay retains the original absolute deadline and captured range", async t => {
   let now = 1_000;
   t.mock.method(Date, "now", () => now);
