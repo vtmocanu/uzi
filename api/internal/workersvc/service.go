@@ -1939,6 +1939,9 @@ type Service struct {
 	// restart-losing — see quarantine_tracker.go. Nil-safe at every Service accessor so
 	// a struct-literal test service reads as "nothing latched".
 	quarantine *quarantineTracker
+	// memAuthority tracks workers whose run-lane claims were gated for lost memory authority
+	// (issue #3142). In-process and restart-losing, nil-safe — see memory_authority_tracker.go.
+	memAuthority *memoryAuthorityTracker
 	// forgeBaseURLAllowed is the SSRF gate for the M8 checkpoint-publish path (PRD
 	// #122): it reports whether a run's forge base URL is on the configured
 	// allowlist before the api will fetch/push against it. Set via
@@ -2312,7 +2315,7 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		p.RunWallCeiling = min(max(24*time.Hour, p.RunTimeout), 72*time.Hour)
 	}
 	return &Service{
-		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(),
+		q: q, box: box, p: p, now: time.Now, persistFail: newPersistFailTracker(), outbox: newOutboxTracker(), quarantine: newQuarantineTracker(), memAuthority: newMemoryAuthorityTracker(),
 		publishFn:            pushbroker.Publish,
 		deleteCheckpointFn:   pushbroker.Delete,
 		salvageListRefTipsFn: pushbroker.ListRefTips,
@@ -2407,6 +2410,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// (issue #2213) no longer applies; a still-latched worker re-reports it on its
 	// next heartbeat.
 	s.quarantine.evictIfSet(wkr.ID)
+	// A fresh incarnation reports its own memory authority (issue #3142).
+	s.memAuthority.evictIfSet(wkr.ID)
 	max := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 	// template is the worker's self-reported image template (PRD #18); empty →
 	// NULL (older image sends none). Soft signal only; never rejected here.
@@ -3173,7 +3178,19 @@ func (s *Service) RunBlockedOutcome(runID uuid.UUID) (reason string, workerID uu
 // beginner: fake-store unit tests) it keeps the single auto-commit ClaimRun, which still applies
 // the persisted-snapshot exclusions and the overflow closure. Assembly always runs OUTSIDE the tx.
 func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot) (*ClaimPayload, error) {
-	return s.claimLane(ctx, wkr, snapshot, "run")
+	return s.claimLane(ctx, wkr, snapshot, "run", MemoryAuthorityReport{})
+}
+
+// ClaimReported is Claim carrying the request's memory_authority report (issue #3142). Claim
+// itself means "member absent", so a capable worker is still gated (fail closed).
+func (s *Service) ClaimReported(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, report MemoryAuthorityReport) (*ClaimPayload, error) {
+	return s.claimLane(ctx, wkr, snapshot, "run", report)
+}
+
+// MemoryAuthorityLostFor returns when the api first gated this worker's run-lane claims for lost
+// memory authority, false when it is not currently gated (issue #3142). In-process only.
+func (s *Service) MemoryAuthorityLostFor(workerID uuid.UUID) (time.Time, bool) {
+	return s.memAuthority.get(workerID)
 }
 
 // ClaimCrossCheck uses the run claim assembly and exact-generation finish transaction.
@@ -3181,10 +3198,10 @@ func (s *Service) ClaimCrossCheck(ctx context.Context, wkr store.Worker, snapsho
 	if s.txBeginner == nil {
 		return nil, errors.New("cross-check claim requires a transaction")
 	}
-	return s.claimLane(ctx, wkr, snapshot, "cross_check")
+	return s.claimLane(ctx, wkr, snapshot, "cross_check", MemoryAuthorityReport{})
 }
 
-func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string) (*ClaimPayload, error) {
+func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *ActiveSnapshot, lane string, report MemoryAuthorityReport) (*ClaimPayload, error) {
 
 	// Vault gate (PRD #32 M3): while the run owner's vault is locked (after a pod
 	// restart, or a manual lock), do not claim any of their runs — report idle so
@@ -3293,7 +3310,20 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		custodyLimit = n
 	}
 	claimNow := s.now()
+	// Issue #3142: the memory-authority gate applies to the run/ordinary lanes only (the
+	// cross_check lane never reaches a memory runtime). claimRunInTx recomputes it from the
+	// locked re-read capabilities. A held report clears the visibility entry; an absent
+	// report from a worker that is not capable (old or guard-disabled) changes nothing.
+	memLost := lane != "cross_check" && memoryAuthorityLost(wkr.ProtocolCapabilities, report)
+	if lane != "cross_check" {
+		if memLost {
+			s.memAuthority.recordLost(wkr.ID, claimNow)
+		} else if report.held() {
+			s.memAuthority.clear(wkr.ID)
+		}
+	}
 	params := store.ClaimRunParams{
+		MemoryAuthorityLost:      memLost,
 		Lane:                     lane,
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
@@ -3366,7 +3396,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// This serializes both lane and legacy child occupancy before ClaimRun's snapshot.
 	if snapshot == nil || s.txBeginner == nil {
 		if s.txBeginner != nil {
-			return s.claimRunLeasedNoSnapshot(ctx, wkr, params)
+			return s.claimRunLeasedNoSnapshot(ctx, wkr, params, report)
 		}
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
@@ -3439,7 +3469,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
 	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params)
+	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params, report)
 	if err != nil {
 		return nil, err
 	}
@@ -7067,6 +7097,7 @@ func (s *Service) DeleteWorker(ctx context.Context, userID, workerID uuid.UUID) 
 	// best-effort — the TTL prune is the backstop for any path that skips this.
 	s.outbox.evict(workerID)
 	s.quarantine.evictIfSet(workerID)
+	s.memAuthority.evictIfSet(workerID)
 	return nil
 }
 

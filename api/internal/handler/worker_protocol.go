@@ -402,6 +402,7 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"completion_non_closing_v1"},
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},
+		{"worker_memory_authority_claim_v1"}, // issue #3142: this api accepts the run-lane claim body's memory_authority member
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
@@ -1091,6 +1092,11 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		// never 400s. Chat stays bodyless (D10).
 		var req struct {
 			ActiveSnapshot json.RawMessage `json:"active_snapshot"`
+			// MemoryAuthority is the worker's "held" | "lost" report (issue #3142), sent only when
+			// this api advertised worker_memory_authority_claim_v1. Independent of the active-snapshot
+			// kill switch below: it carries no snapshot, so a disabled api still accepts it. Any
+			// value other than "held" counts as lost; the cross_check lane ignores it.
+			MemoryAuthority *string `json:"memory_authority"`
 		}
 		if err := httpx.DecodeJSON(r, &req); err != nil && !errors.Is(err, io.EOF) {
 			httpx.Error(w, http.StatusBadRequest, "invalid request body")
@@ -1115,7 +1121,7 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("lane") == "cross_check" {
 			payload, err = h.wsvc.ClaimCrossCheck(r.Context(), wkr, snapshot)
 		} else {
-			payload, err = h.wsvc.Claim(r.Context(), wkr, snapshot)
+			payload, err = h.wsvc.ClaimReported(r.Context(), wkr, snapshot, workersvc.MemoryAuthorityReport{Value: req.MemoryAuthority})
 		}
 		if err != nil {
 			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,

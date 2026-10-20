@@ -1495,6 +1495,19 @@ WITH claimant AS MATERIALIZED (
            OR r.released_worker_id <> @worker_id
            OR r.released_worker_nonce IS DISTINCT FROM
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id))
+      -- Issue #3142: claim-time memory-authority gate. @memory_authority_lost is true when the
+      -- claimant's request says (or, for a capable worker, omits) that it no longer holds memory
+      -- authority; it then claims only the kinds that never reach a memory runtime. This mirrors
+      -- agent/src/worker.ts dispatch, where only the final `this.runner.execute(claim)` arm
+      -- reaches RunRunner (the only runner with a memory runtime); the exempt arms are
+      -- cross_check, judge, job, review_target_run_id and an egress_profile_id (isolated_fetch)
+      -- run. A new kind defaults to guard-bound (fail closed). Deliberately NOT mirrored into the
+      -- spread-peer clause, CountOnlineWorkersClaimableForRun or the ephemeral provisioner
+      -- queries, because the state is per-request, not a property of the worker row.
+      AND (NOT @memory_authority_lost::boolean
+           OR r.kind IN ('judge', 'job', 'cross_check')
+           OR r.review_target_run_id IS NOT NULL
+           OR r.egress_profile_id IS NOT NULL)
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run

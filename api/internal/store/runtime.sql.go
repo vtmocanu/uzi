@@ -1477,6 +1477,19 @@ WITH claimant AS MATERIALIZED (
            OR r.released_worker_id <> $2
            OR r.released_worker_nonce IS DISTINCT FROM
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = $2))
+      -- Issue #3142: claim-time memory-authority gate. @memory_authority_lost is true when the
+      -- claimant's request says (or, for a capable worker, omits) that it no longer holds memory
+      -- authority; it then claims only the kinds that never reach a memory runtime. This mirrors
+      -- agent/src/worker.ts dispatch, where only the final ` + "`" + `this.runner.execute(claim)` + "`" + ` arm
+      -- reaches RunRunner (the only runner with a memory runtime); the exempt arms are
+      -- cross_check, judge, job, review_target_run_id and an egress_profile_id (isolated_fetch)
+      -- run. A new kind defaults to guard-bound (fail closed). Deliberately NOT mirrored into the
+      -- spread-peer clause, CountOnlineWorkersClaimableForRun or the ephemeral provisioner
+      -- queries, because the state is per-request, not a property of the worker row.
+      AND (NOT $30::boolean
+           OR r.kind IN ('judge', 'job', 'cross_check')
+           OR r.review_target_run_id IS NOT NULL
+           OR r.egress_profile_id IS NOT NULL)
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -1486,7 +1499,7 @@ WITH claimant AS MATERIALIZED (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $2, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $30) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $31) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1506,10 +1519,10 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at, inventory_guarded)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $2, $31::text, $2, t.id, now(), now(),
+           $2, $32::text, $2, t.id, now(), now(),
            ('recovery_inventory_v1' = ANY($15::text[]))
     FROM target t
-    WHERE $32::boolean
+    WHERE $33::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1594,6 +1607,7 @@ type ClaimRunParams struct {
 	SnapshotFreshCutoff      pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 	RequestActiveIds         []uuid.UUID        `json:"request_active_ids"`
 	RequestActiveGens        []int64            `json:"request_active_gens"`
+	MemoryAuthorityLost      bool               `json:"memory_authority_lost"`
 	BackgroundGraceCutoff    pgtype.Timestamptz `json:"background_grace_cutoff"`
 	WorkerIdentity           string             `json:"worker_identity"`
 	RecoveryCapable          bool               `json:"recovery_capable"`
@@ -1669,6 +1683,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.SnapshotFreshCutoff,
 		arg.RequestActiveIds,
 		arg.RequestActiveGens,
+		arg.MemoryAuthorityLost,
 		arg.BackgroundGraceCutoff,
 		arg.WorkerIdentity,
 		arg.RecoveryCapable,
