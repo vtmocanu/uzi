@@ -12741,7 +12741,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     m2Runner.installHarness();
 
     for (const decision of ["partial", "accept", "missing scope"] as const) {
-      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async () => {
+      it(`issue3089 Codex live ${decision} binds refreshed permit scope through finalization`, { timeout: 15000 }, async (t) => {
         m2Runner.api.setRegisterProtocolFeatures(["claim_generation_fence", "completion_non_closing_v1"]);
         await m2Runner.client.register("codex-live-owner-decision");
         const forge = m2Runner.fakeGitlab();
@@ -12792,6 +12792,15 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
         ]);
         const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
         m2FollowPush(m2Runner.git, forge.pr);
+        const onAbort = () => t.diagnostic("issue3089 completion abort " + JSON.stringify({
+          decision, answered, providerLaunches: rig.providerLaunches(),
+          completionAttemptRequests: m2Runner.api.completionAttemptRequests.length,
+          completionPermitRequests: m2Runner.api.completionPermitRequests.length,
+          completionHoldRequests: m2Runner.api.completionHoldRequests.length,
+          statuses: m2Runner.api.states.filter(s => s.runId === claim.run_id).slice(-8).map(s => s.body.status),
+        }));
+        t.signal.addEventListener("abort", onAbort, { once: true });
+        t.after(() => t.signal.removeEventListener("abort", onAbort));
         await m2Runner.runner({ run: async ctx => {
           commitInTree(ctx.worktreePath, "issue3089.txt", "delivered first milestone\n");
           return executor.run(ctx);

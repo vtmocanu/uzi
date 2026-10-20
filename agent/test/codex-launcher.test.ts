@@ -2474,7 +2474,8 @@ describe("C2 real effect launcher capture policy", () => {
             get completed() {
               return (async () => {
                 const exit = await child.waitChild(1000);
-                assert.equal((await child.root.reap(1000)).ok, true);
+                const reapResult: Awaited<ReturnType<typeof child.root.reap>> = await child.root.reap(1000);
+                assert.equal(reapResult.ok, true, JSON.stringify(reapResult));
                 return exit;
               })();
             },
