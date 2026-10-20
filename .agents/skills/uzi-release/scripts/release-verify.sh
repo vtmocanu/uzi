@@ -187,7 +187,8 @@ fi
 GATES=(assert-ci-coverage assert-release-metadata assert-tag-smoke)
 legacy_gates=0
 if [ -n "${RELRUN:-}" ]; then
-  run_def="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}" --jq '"\(.head_sha) \(.path)"' 2>/dev/null)"
+  # A failed query must not be read, however valid its stdout looks.
+  run_def="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}" --jq '"\(.head_sha) \(.path)"' 2>/dev/null)" || run_def=""
   run_sha="${run_def%% *}"; run_path="${run_def#* }"; run_path="${run_path%%@*}"
   definition=""
   if [[ "$run_sha" =~ ^[0-9a-f]{40}$ ]] && [[ "$run_path" == .github/workflows/* ]]; then

@@ -112,7 +112,7 @@ if [ "${GHCR_STUB:-}" = 1 ]; then
       exit 0 ;;
     # The run's own definition (#2719): its head SHA (the tagged HEAD here) and path.
     'api repos/test/uzi/actions/runs/123 --jq '*)
-      printf '%s %s\n' "$(git rev-parse HEAD)" "${GHCR_RUN_PATH-.github/workflows/release.yml@refs/tags/v0.2.0}"; exit 0 ;;
+      printf '%s %s\n' "$(git rev-parse HEAD)" "${GHCR_RUN_PATH-.github/workflows/release.yml@refs/tags/v0.2.0}"; exit "${GHCR_RUN_RC:-0}" ;;
     *) exit 1 ;; # Unconfigured release queries fail closed.
   esac
 fi
@@ -1067,11 +1067,11 @@ ghcr_verify_case() {
   [ -z "${GHCR_CASE_FILTER:-}" ] || [ "verify-$name" = "$GHCR_CASE_FILTER" ] || return 0
   d="$(mktemp -d)"; seed_repo "$d"; ghcr_defaults
   export GHCR_BASE_OUT=$'0.2.0\n0.1.0' GHCR_JVM_OUT=$'0.2.0\n0.1.0'
-  unset GHCR_MISSING_JOB GHCR_RUN_PATH
+  unset GHCR_MISSING_JOB GHCR_RUN_PATH GHCR_RUN_RC
   # The release.yml definition the run used (#2719): current (all three gates) by default.
   mkdir -p "$d/.github/workflows"
   case "$name" in
-    legacy-run) printf 'name: release\njobs:\n  publish-api:\n    runs-on: ubuntu-latest\n' ;;
+    legacy-run|failed-run-query) printf 'name: release\njobs:\n  publish-api:\n    runs-on: ubuntu-latest\n' ;;
     comment-gate) printf 'jobs:\n  publish-api: # assert-ci-coverage used to run first\n    runs-on: ubuntu-latest\n' ;;
     quoted-gate-missing-job) printf 'jobs:\n    "assert-tag-smoke":\n        runs-on: ubuntu-latest\n' ;;
     empty-definition) : ;;
@@ -1086,6 +1086,7 @@ ghcr_verify_case() {
     current-missing-job) export GHCR_MISSING_JOB=assert-release-metadata ;;
     empty-definition|no-jobs-definition) ;;
     unreadable-run) export GHCR_RUN_PATH='' ;;
+    failed-run-query) export GHCR_RUN_RC=7 ;; # valid legacy-looking stdout, nonzero exit
     org-present) want=0; GHCR_KIND=Organization ;;
     kind-fallback-present) want=0; GHCR_KIND=''; GHCR_KIND_RC=7 ;;
     identity-rc-present) want=0; GHCR_IDENTITY_RC=7 ;;
@@ -1160,11 +1161,11 @@ YAML
       ghcr_absent "verify $name not legacy" 'predates the publish-time gates' "$(cat "$new")" ;;
     quoted-gate-missing-job) assert_contains "verify $name missing job" 'assert-tag-smoke not proven successful' "$(cat "$new")" ;;
     current-missing-job) assert_contains "verify $name missing job" 'assert-release-metadata not proven successful' "$(cat "$new")" ;;
-    empty-definition|no-jobs-definition|unreadable-run)
+    empty-definition|no-jobs-definition|unreadable-run|failed-run-query)
       assert_contains "verify $name unreadable definition" 'cannot read the workflow definition' "$(cat "$new")"
       ghcr_absent "verify $name not legacy" 'predates the publish-time gates' "$(cat "$new")" ;;
   esac
-  unset GHCR_MISSING_JOB GHCR_RUN_PATH
+  unset GHCR_MISSING_JOB GHCR_RUN_PATH GHCR_RUN_RC
   printf 'GHCR_CASE=verify-%s VERIFY_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$newrc" "$((FAILS - failures_before))"
   rm -rf "$d"; rm -f "$old" "$new" "$querylog"
   unset GHCR_QUERY_LOG
@@ -1239,7 +1240,7 @@ ghcr_regressions() {
     ghcr_verify_case "$name" "$baseline" "$record"
   done
   # #2719: legacy-run detection from the run's own workflow definition (no baseline: new output).
-  for name in legacy-run comment-gate quoted-gate-missing-job current-missing-job empty-definition no-jobs-definition unreadable-run; do
+  for name in legacy-run comment-gate quoted-gate-missing-job current-missing-job empty-definition no-jobs-definition unreadable-run failed-run-query; do
     ghcr_verify_case "$name" "" "$record"
   done
   if [ -f "$SCRIPTS_DIR/lib/ghcr.sh" ]; then
