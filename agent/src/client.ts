@@ -4652,7 +4652,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
       boundedReader = res.body.getReader({ mode: "byob" });
     } catch (error) {
       // Unsupported producers cannot bypass reservation with a default reader.
-      void res.body.cancel().catch(() => undefined);
+      const cancellation = res.body.cancel().catch(() => undefined);
+      if (ownedSignal) await cancellation;
       throw error;
     }
     reader = boundedReader;
@@ -4668,7 +4669,10 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     reader = defaultReader;
     read = () => defaultReader.read();
   }
-  const abort = () => { void reader.cancel(signal?.reason).catch(() => undefined); };
+  let cancellation: Promise<void> | undefined;
+  const cancel = (reason?: unknown): Promise<void> =>
+    cancellation ??= reader.cancel(reason).catch(() => undefined);
+  const abort = () => { void cancel(signal?.reason); };
   signal?.addEventListener("abort", abort, { once: true });
   try {
     signal?.throwIfAborted();
@@ -4690,8 +4694,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
     // Owned recovery passes join cancellation. Other callers keep the best-effort
     // cancellation semantics of readBoundedBytes (#2888).
-    if (ownedSignal) await reader.cancel().catch(() => undefined);
-    else void reader.cancel().catch(() => undefined);
+    if (ownedSignal) await cancel();
+    else void cancel();
   }
   budget?.check();
   if (scoped) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { WorkerClient, readRunAck } from "../src/client.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { MaintenanceResources } from "../src/recovery-maintenance.js";
 import { nullLogger } from "./helpers.js";
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -310,4 +311,34 @@ test("legacy four-argument release remains compatible without an ambient budget"
   });
   assert.deepEqual(await client.releaseRecoveryCustody("run", 7, "publication", undefined), { holds_released: 1 });
   assert.deepEqual(sent, { generation: 7, release_evidence: "publication" });
+});
+
+test("owned recovery query joins cancellation of an unsupported discovery response body", async () => {
+  const cancelling = deferred<void>(), release = deferred<void>();
+  let settled = false, sourceSettled = false;
+  const body = new ReadableStream<Uint8Array>({
+    async cancel() {
+      cancelling.resolve();
+      await release.promise;
+      sourceSettled = true;
+    },
+  }, { highWaterMark: 0 });
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => new Response(body),
+  });
+  const controller = new AbortController();
+  const operation = MaintenanceBudget.runOwned(controller.signal, () =>
+    MaintenanceResources.runDiscovery(() => client.listRecoveryHolds("run")))
+    .then(value => ({ value }), error => ({ error }))
+    .finally(() => { settled = true; });
+  try {
+    await cancelling.promise;
+    await tick();
+    assert.equal(settled, false, "owned body refusal returned before source cancellation settled");
+  } finally {
+    release.resolve();
+    await operation;
+  }
+  assert.equal(sourceSettled, true);
+  assert.ok("error" in await operation, "unsupported byte stream remains a refusal");
 });

@@ -27,7 +27,7 @@ async function within<T>(pending: Promise<T>, ms = 5000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([pending, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("readiness/settlement exceeded " + ms)), ms);
+      timer = setTimeout(() => reject(new assert.AssertionError({ message: "readiness/settlement exceeded " + ms })), ms);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -276,4 +276,49 @@ it("ordinary pass without shutdown still uploads and settles normally", linux, a
   assert.equal(requests.filter(p => p.endsWith("/upload")).length, 1);
   await c.shutdown();
   assert.equal(callerBudget.signal.aborted, false, "completed pass relinquishes its caller budget relay");
+});
+
+it("pass shutdown joins the first response-body source cancellation", linux, async t => {
+  const f = await fixture(t);
+  const reading = deferred(), cancellationStarted = deferred(), release = deferred();
+  let sourceSettled = false, shutdownSettled = false;
+  const paths: string[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    pull() { reading.resolve(); },
+    async cancel() {
+      cancellationStarted.resolve();
+      await release.promise;
+      sourceSettled = true;
+    },
+  }, { highWaterMark: 0 });
+  const client = new WorkerClient("http://fixture.invalid", token, "fixture", nullLogger(), {
+    fetch: async input => {
+      paths.push(String(input));
+      return String(input).endsWith("/reserve")
+        ? new Response(body, { status: 200 })
+        : Response.json({ error: "not_found" }, { status: 404 });
+    },
+  });
+  const record = await f.bundle();
+  const original = await fs.readFile(f.file(record), "utf8");
+  const c = coordinator(f, client);
+  const pass = c.resumePending();
+  let shutdown: Promise<void> | undefined;
+  try {
+    await within(reading.promise);
+    shutdown = c.shutdown().then(() => { shutdownSettled = true; });
+    await within(cancellationStarted.promise);
+    // Flush continuations after the reader closes while its source cleanup is held.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(sourceSettled, false);
+    assert.equal(shutdownSettled, false, "shutdown returned before response source cancellation settled");
+  } finally {
+    release.resolve();
+    await (shutdown ?? c.shutdown());
+    await pass;
+  }
+  assert.equal(sourceSettled, true);
+  assert.equal(await fs.readFile(f.file(record), "utf8"), original, "uncertain reserve retains its journal and identity");
+  assert.equal(paths.filter(url => url.endsWith("/reserve")).length, 1);
+  assert.equal(paths.some(url => /\/(?:upload|release|ack)(?:\/|$)/.test(url)), false);
 });
