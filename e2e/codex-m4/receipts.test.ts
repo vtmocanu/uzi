@@ -112,9 +112,9 @@ describe("checkReceipts", () => {
     assert.deepEqual(runtime.drift, [{ path: "agent/src/guardrails.ts", kind: "runtime" }]);
 
     // ...as does an unrecognized (unclassified) path, which fails closed...
-    const unknown = checkReceipts(committed(), baseManifest(), { paths: ["api/foo.go"], baseIsAncestor: true });
+    const unknown = checkReceipts(committed(), baseManifest(), { paths: ["web/src/foo.ts"], baseIsAncestor: true });
     assert.equal(unknown.ok, false);
-    assert.deepEqual(unknown.drift, [{ path: "api/foo.go", kind: "unclassified" }]);
+    assert.deepEqual(unknown.drift, [{ path: "web/src/foo.ts", kind: "unclassified" }]);
 
     // ...while a Go test file outside agent/ is evidence (never compiled into a shipped binary), and
     // one under agent/ stays runtime because the agent/ deny list is checked first.
@@ -122,7 +122,7 @@ describe("checkReceipts", () => {
     assert.equal(goTest.ok, true);
     assert.deepEqual(goTest.drift, []);
     assert.equal(classifyPath("agent/codex/supervisor/foo_test.go"), "runtime");
-    assert.equal(classifyPath("api/internal/workersvc/foo_test.go.orig"), "unclassified");
+    assert.equal(classifyPath("api/internal/workersvc/foo_test.go.orig"), "runtime");
 
     // ...but an EMPTY tail (candidate == proven base) keeps the candidate certified. THIS is the
     // fixed point: recording the gitignored manifest makes no commit, so the tail stays empty (or
@@ -398,6 +398,47 @@ describe("classifyPath is pinned to the Dockerfile COPY surface (anti-drift)", (
     for (const src of sources) {
       assert.equal(classifyPath(src), "runtime", `COPY source ${src} must classify as runtime`);
     }
+  });
+});
+
+describe("classifyPath covers what the M3b proof builds and nothing it does not (#3148)", () => {
+  const REPO = path.join(__dirname, "..", "..");
+
+  it("the M3b test server is built from the api/ context, so every non-test api path is runtime", () => {
+    // Pin the build context this classification depends on: if the test server ever builds from
+    // another directory, this fails and the api/ rule must be revisited.
+    const runner = readFileSync(path.join(REPO, "e2e", "codex-m3b", "run-lifecycle.sh"), "utf8");
+    const build = runner.split("\n").filter((l) => l.includes("testserver.Dockerfile") && l.includes("docker build"));
+    assert.equal(build.length, 1, `expected one test-server docker build line, found ${build.length}`);
+    assert.ok(build[0].trimEnd().endsWith('"$REPO/api"'), `test-server build context changed: ${build[0]}`);
+
+    const tracked = execFileSync("git", ["ls-files", "api"], { cwd: REPO, encoding: "utf8" })
+      .split("\n").filter((p) => p.length > 0);
+    assert.ok(tracked.length >= 100, `expected >= 100 tracked api paths, git listed ${tracked.length}`);
+    for (const p of tracked) {
+      assert.equal(classifyPath(p), p.endsWith("_test.go") ? "evidence" : "runtime", p);
+    }
+  });
+
+  it("the chart and repo tooling are evidence; other top-level paths still fail closed", () => {
+    for (const p of ["deploy/chart/templates/api-deployment.yaml", "deploy/values/aitools.yaml", "scripts/lib/shipping-paths.sh", "scripts/smoke.sh"]) {
+      assert.equal(classifyPath(p), "evidence", p);
+    }
+    for (const p of ["web/src/main.tsx", "controller/main.go", ".github/workflows/ci.yml", "fixtures/run-kinds/registry.json", "go.work"]) {
+      assert.equal(classifyPath(p), "unclassified", p);
+    }
+  });
+
+  it("a chart/tooling tail certifies; an api migration in the tail voids the receipt", () => {
+    const tooling = checkReceipts(committed(), baseManifest(), {
+      paths: ["deploy/chart/templates/api-deployment.yaml", "scripts/smoke.sh"], baseIsAncestor: true,
+    });
+    assert.equal(tooling.ok, true);
+    assert.deepEqual(tooling.drift, []);
+    const migration = "api/internal/store/migrations/00999_example.sql";
+    const api = checkReceipts(committed(), baseManifest(), { paths: [migration], baseIsAncestor: true });
+    assert.equal(api.ok, false);
+    assert.deepEqual(api.drift, [{ path: migration, kind: "runtime" }]);
   });
 });
 
