@@ -3528,6 +3528,15 @@ describe("M1 composed policy guidance delivery", () => {
     assert.equal(client.supportsPolicyHold(), true);
   }
 
+  async function finishCleanup(errors: unknown[], steps: (() => unknown)[]): Promise<void> {
+    // Each step is attempted once, in order; a failure never skips sibling cleanup.
+    for (const step of steps) {
+      try { await step(); } catch (error) { errors.push(error); }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "M1 observation and cleanup failures");
+  }
+
   // Each claim owns a fresh executor/transport; the API, worker home and session store survive.
   async function preservingFixture(atGate = false) {
     const diagnostics = recordingLog();
@@ -3601,17 +3610,16 @@ describe("M1 composed policy guidance delivery", () => {
       await withTimeout(running, 5000, "M1 owner cancellation");
       assert.ok(api.inputReceiptCalls.some(row => row.kind === "ack" && row.ids.includes(99)));
     }
-    async function cleanup() {
-      // At most three claims; stop every owned runner before joining their executions.
-      for (const entry of owned) entry.runner.shutdown();
-      try {
-        await withTimeout(Promise.all(owned.map(entry => entry.running)), 5000, "M1 replay cleanup");
-        assert.equal(finalPushes, 0);
-        assert.equal(forge.calls.length, 0);
-      } finally {
-        await api.close();
-        fx.cleanup();
-      }
+    async function cleanup(errors: unknown[]) {
+      // At most three claims; stop every owned runner before the five-second join.
+      await finishCleanup(errors, [
+        ...owned.map(entry => () => entry.runner.shutdown()),
+        () => withTimeout(Promise.all(owned.map(entry => entry.running)), 5000, "M1 replay cleanup"),
+        () => assert.equal(finalPushes, 0),
+        () => assert.equal(forge.calls.length, 0),
+        () => api.close(),
+        () => fx.cleanup(),
+      ]);
     }
     return { api, client, fx, claim, thread, start, cancel, cleanup, diagnostics, homeDir };
   }
@@ -3620,6 +3628,7 @@ describe("M1 composed policy guidance delivery", () => {
   for (const recovered of [true, false])
     it(`M2 numeric-ceiling/no-owner-Stop negative control session=${session} recovered=${recovered}`, async () => {
       const f = await preservingFixture(true);
+      const errors: unknown[] = [];
       try {
         // A numeric ceiling alone is not an accepted owner Stop or a feedback resolution.
         // Keep the unapproved candidate and pending revision; no Stop input is supplied.
@@ -3680,13 +3689,14 @@ describe("M1 composed policy guidance delivery", () => {
         }
         if (holds.length) await withTimeout(running, 5000, "unavailable source or session re-parks");
         else await f.cancel(running);
-      } finally { await f.cleanup(); }
+      } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
     });
 
   for (const full of [false, true]) for (const fresh of [false, true])
   for (const boundary of ["failure", "missing ceiling", "missing count", "missing IDs"] as const)
     it(`M2 required Stop ACK full=${full} fresh=${fresh} boundary=${boundary}`, async (t) => {
       const f = await preservingFixture();
+      const errors: unknown[] = [];
       let boundaries = 0;
       try {
         Object.assign(f.claim, { plan_approved: true, plan_md: "approved delivery", plan_source: "seeded",
@@ -3748,11 +3758,12 @@ describe("M1 composed policy guidance delivery", () => {
         assert.equal(f.api.policyHoldRequests[0]?.body.detail, "resume_rejected");
         assert.equal(f.api.states.some(s => s.body.seeded_from_default), false);
         assert.equal(f.api.states.some(s => s.body.status === "completed"), false);
-      } finally { await f.cleanup(); }
+      } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
     });
 
   for (const persisted of [false, true]) it(`M2 fresh claim crash persisted=${persisted} cannot replay grant`, async () => {
     const f = await preservingFixture();
+    const errors: unknown[] = [];
     try {
       f.claim.policy_hold_fresh_session = true;
       f.claim.session_id = null;
@@ -3792,11 +3803,12 @@ describe("M1 composed policy guidance delivery", () => {
         assert.equal(f.api.policyHoldRequests.at(-1)?.body.detail, "resume_rejected");
       }
       assert.equal(f.api.states.some(s => s.body.status === "failed" || s.body.status === "completed"), false);
-    } finally { await f.cleanup(); }
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
   });
 
   it("M1 two-claim crash after ACK replays unincluded guidance before model evidence", async () => {
     const f = await preservingFixture();
+    const errors: unknown[] = [];
     try {
       f.api.setInputs(f.claim.run_id, [{ id: 11, kind: "follow_up", body: "old ACKed unincluded guidance" }]);
       const first = f.start();
@@ -3828,11 +3840,12 @@ describe("M1 composed policy guidance delivery", () => {
         "replayed guidance inclusion");
       assert.deepEqual(f.api.inclusionCalls, [{ runId: f.claim.run_id, ids: [11, 12], generation: 2 }]);
       await f.cancel(second.running);
-    } finally { await f.cleanup(); }
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
   });
 
   it("M1 verified persisted gate without feedback re-presents old plan without a planning turn", async () => {
     const f = await preservingFixture(true);
+    const errors: unknown[] = [];
     try {
       const { rig, running } = f.start();
       await waitFor(() => f.api.states.some(row => row.body.status === "awaiting_approval"), "old gate re-presentation");
@@ -3845,11 +3858,12 @@ describe("M1 composed policy guidance delivery", () => {
       assert.equal(rig.transport.turnStartCount, 0);
       assert.equal(f.api.humanPlanApproved(f.claim.run_id), false);
       await f.cancel(running);
-    } finally { await f.cleanup(); }
+    } catch (error) { errors.push(error); } finally { await f.cleanup(errors); }
   });
 
   it("M1 verified pending revision settles feedback only after new plan gate ACK 7 to 8", async () => {
     const f = await preservingFixture(true);
+    const errors: unknown[] = [];
     let release!: () => void;
     const ack = new Promise<void>(resolve => { release = resolve; });
     try {
@@ -3877,7 +3891,9 @@ describe("M1 composed policy guidance delivery", () => {
       assert.equal(rig.transport.threadStartCount, 0);
       assert.equal(rig.transport.turnStartCount, 1, "new gate awaits owner action before implementation");
       await f.cancel(running);
-    } finally { release(); await f.cleanup(); }
+    } catch (error) { errors.push(error); } finally {
+      await finishCleanup(errors, [release, () => f.cleanup([])]);
+    }
   });
 
   for (const [scenario, tag] of [
@@ -3956,6 +3972,7 @@ describe("M1 composed policy guidance delivery", () => {
           docker: { state: "not_wired", removed: [], detail: "not wired" },
         }),
       }).execute(claim);
+      const errors: unknown[] = [];
       try {
         if (rejected) {
           get.release();
@@ -4012,15 +4029,19 @@ describe("M1 composed policy guidance delivery", () => {
         assert.ok(JSON.stringify(rig.transport.requests.find(row => row.method === "thread/resume")?.params).includes(thread));
         if (revision) assert.equal(api.inputReceiptCalls.some(row => row.kind === "applied" && row.ids.includes(13)), false,
           "refused revision feedback remains unsettled");
+      } catch (error) {
+        errors.push(error);
       } finally {
-        get.release();
-        releaseAck();
-        rig.transport.push(turnCompleted("failed", thread, "tn-1"));
-        await withTimeout(running, 5000, "composed cleanup");
-        assert.equal(finalPushes, 0, "policy holds never publish a final branch");
-        assert.equal(forge.calls.length, 0, "policy holds never create or update an MR");
-        await api.close();
-        fx.cleanup();
+        await finishCleanup(errors, [
+          () => get.release(),
+          releaseAck,
+          () => rig.transport.push(turnCompleted("failed", thread, "tn-1")),
+          () => withTimeout(running, 5000, "composed cleanup"),
+          () => assert.equal(finalPushes, 0, "policy holds never publish a final branch"),
+          () => assert.equal(forge.calls.length, 0, "policy holds never create or update an MR"),
+          () => api.close(),
+          () => fx.cleanup(),
+        ]);
       }
     });
 });
