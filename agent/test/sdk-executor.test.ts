@@ -7760,6 +7760,7 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     assert.match(first, /do not request plan approval again/);
     assert.doesNotMatch(first, /you supplied/);
     assert.ok(turns.length >= 2);
+    assert.ok(turns[1]!.promptText);
     assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-A/);
   });
 
@@ -7783,13 +7784,14 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     assert.doesNotMatch(p, /HIST-LIVE-RIDE/);
     assert.match(p, /LIVE-RIDE/);
     assert.ok(p.indexOf("LIVE-RIDE") > p.indexOf("SAME-WORDS"), "history reads before the live follow-up");
-    assert.ok(!included.some((id) => id === 3 || id === 4 || id === 5), "history ids get no inclusion receipt");
+    assert.deepEqual(included, [7], "only the live follow-up gets an inclusion receipt; history ids get none");
   });
 
   it("a non-reviewed seeded run places no history", async () => {
     const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
     const probe = reviewedResume({ reviewedPlanResume: false, seeded: true, priorOwnerFollowUps: [{ id: 1, body: "HIST-X" }] });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns[0]!.promptText);
     assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-X/);
   });
 
@@ -7797,6 +7799,7 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
     const probe = reviewedResume({ sessionId: "sess-resumed", priorOwnerFollowUps: [{ id: 1, body: "HIST-S" }] });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns[0]!.promptText);
     assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-S/);
   });
 
@@ -7816,7 +7819,35 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.ok(turns.length >= 3);
     assert.match(turns[1]!.promptText ?? "", /HIST-RESTART/, "the restarted turn carries the history");
+    assert.ok(turns[2]!.promptText);
     assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-RESTART/, "a later turn does not");
+  });
+
+  it("a turn aborted after a model event but before completing re-composes the history on its in-place restart", async () => {
+    const { queryFn, turns } = fakeTurns([
+      () => (async function* () {
+        yield assistantText("started");
+        throw new CredentialSwitchSignal();
+      })(),
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const included: number[] = [];
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-EVIDENCED" }],
+      attemptCredentialSwitch: async () => "gave_up" as const,
+      followUpIncluded: (id) => { included.push(id); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.ok(turns[1]!.promptText);
+    const restarted = turns[1]!.promptText ?? "";
+    assert.equal(restarted.split("HIST-EVIDENCED").length - 1, 1);
+    assert.match(restarted, /<owner_history_[0-9a-f]+>\nHIST-EVIDENCED\n<\/owner_history_[0-9a-f]+>/);
+    assert.equal(turns[1]!.options.resume, undefined, "the restart is a fresh session");
+    assert.ok(turns[2]!.promptText);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-EVIDENCED/);
+    assert.deepEqual(included, []);
   });
 
   it("a clarification answer turn does not carry history again", async () => {
@@ -7832,6 +7863,7 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     assert.ok(turns.length >= 2);
     assert.match(turns[0]!.promptText ?? "", /HIST-CLARIFY/);
     assert.match(turns[1]!.promptText ?? "", /the default/);
+    assert.ok(turns[1]!.promptText);
     assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-CLARIFY/);
   });
 });

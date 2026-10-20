@@ -2938,7 +2938,8 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
-      // Issue #3149: one-shot latch for the earlier-owner-follow-up history of a reviewed-plan resume.
+      // Issue #3149: one-shot latch for the earlier-owner-follow-up history of a reviewed-plan resume,
+      // spent when the carrying turn completes.
       // Not `first`: the held-batch service path resets `iteration` to 0 without setting hasParked.
       let priorOwnerHistoryPlaced = false;
       // Execution lifetime, independent of iteration resets and system/rework turns.
@@ -3198,15 +3199,11 @@ export class SdkExecutor implements Executor {
           );
           historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
         }
-        // The history latch is spent only when the turn reaches its first model event, so a turn
-        // that aborts before any event (credential switch, pause-now, wall refusal) and restarts
-        // composes the history again.
-        const onFirstEvent = ownerFirstEvent || historyRides
-          ? () => {
-              ownerFirstEvent?.();
-              if (historyRides) priorOwnerHistoryPlaced = true;
-            }
-          : undefined;
+        // The history latch is spent only when the turn completes (below, with resumeId): an
+        // aborted turn's in-place restart (credential switch, pause-now, wall refusal) does not
+        // advance resumeId, so it begins a fresh session and must carry the history again. Live-id
+        // sets only grow (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
+        const onFirstEvent = ownerFirstEvent;
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -3358,6 +3355,7 @@ export class SdkExecutor implements Executor {
         try {
           turn = await turnPromise;
           resumeId = turn.sessionId ?? resumeId;
+          if (historyRides) priorOwnerHistoryPlaced = true;
           if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
           // PRD #265 M1: latch the finished-milestone declaration the same way, so it
           // survives the terminating turn's `break` into the completed report.

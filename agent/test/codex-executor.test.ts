@@ -16213,7 +16213,9 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 history run");
       const texts = turnTexts(rig.epochs[0]!.transport);
       assert.equal(texts.length, 2);
-      assert.ok(hasFence(texts[0]!) && texts[0]!.indexOf(H1) < texts[0]!.indexOf(H2), "iteration 1 carries both, fenced, in order");
+      // Each history entry sits in its own nonce fence (renderPriorOwnerHistoryBlock).
+      const fenced = [...texts[0]!.matchAll(/<owner_history_([0-9a-f]{16})>\n([\s\S]*?)\n<\/owner_history_\1>/g)].map((m) => m[2]);
+      assert.deepEqual(fenced, [H1, H2], "iteration 1 carries both, each inside its own fence, in order");
       assert.ok(!texts[1]!.includes(H1) && !texts[1]!.includes(H2) && !hasFence(texts[1]!), "iteration 2 carries none");
       assert.deepEqual(included, [], "history ids never receipt");
     });
