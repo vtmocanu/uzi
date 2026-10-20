@@ -663,8 +663,10 @@ describe("credential-free fixed helper deadline binding", () => {
   // These are separate private-issuance and immutable-setup negatives, not proof
   // of helper predicates at the final guard. For independent scratch isolation,
   // use the real producer unchanged and count validateCaptureGitRequest entries.
-  // On entry 3 only, replace its local request argument with altered DATA while
-  // retaining the original canonical candidates/helper constants and validator
+  // This full-safety rig checks issuance, safety admission and adapter binding
+  // before the final post-setup launch guard (currently entry 4). Replace only
+  // that final entry's local request argument with altered DATA, retaining the
+  // original canonical candidates/helper constants and validator
   // body. Require prepared setup, policy refusal, no TypeError, and no fake spawn.
   // Repeat from a fresh export omitting only the launcher's final
   // assertCaptureLaunch: require fake spawn and a failing refusal assertion for
