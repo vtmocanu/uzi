@@ -2259,9 +2259,9 @@ binary (not `os.RemoveAll`, which cannot delete a Go module cache's read-only
 directories as their non-root owner) creates, liveness-locks, and removes
 that tmp through a dedicated fd-relative, no-follow tree-removal primitive
 (`internal/safetree`) once a confirmed drain proves it is safe. A worker-only
-emptyDir (the docker lane's run working directory is no longer an emptyDir, see
-[ADR-3153](adr/3153-runner-shared-pvc-subpath.md)), `codex-cmd-cache`
-(`/var/cache/uzi-codex-cmd`), gives each run's Codex commands a real
+emptyDir, `codex-cmd-cache`
+(`/var/cache/uzi-codex-cmd`; the docker lane's run working directory is no longer
+an emptyDir, see [ADR-3153](adr/3153-runner-shared-pvc-subpath.md)), gives each run's Codex commands a real
 `GOMODCACHE`/`GOCACHE`/npm cache instead of re-downloading every command, held
 by a uid-10003 holder process for the run and released only on an attested
 drain; a startup orphan reaper (`--reap-orphans`) sweeps anything a crash or an
@@ -2499,8 +2499,8 @@ claims while owned runs and pinned plan checkers may finish; only an atomic term
 custody clearance permit gated anonymous-volume prune and stop authorization.
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.
-DinD is scratch, including named volumes; replacing the Deployment loses DinD
-state only. Since #3153 the run working directory `/data/runner` is the
+DinD is scratch, including named volumes; this DinD maintenance recycle loses
+DinD state only. Since #3153 the run working directory `/data/runner` is the
 `runner-shared` subPath of the `data` PVC, so a replacement keeps it, while a
 legacy `{nix, data}` recycle deletes it (and any Docker-lane clones) as on the
 plain lane. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure

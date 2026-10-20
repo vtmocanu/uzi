@@ -365,7 +365,8 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    `git --git-dir=BARE for-each-ref refs/uzi-runner/` enumeration and recover from whichever
    pod holds the tip. Worker data PVCs survive a pod roll, so the previous worker's
    current pod still holds the bare ref from its last checkpoint or graceful-shutdown
-   fetch-back. A Docker worker's working clone does not survive the roll.
+   fetch-back. A Docker worker's working clone survives the roll on the data PVC
+   when it runs the runner-shared layout (#3153); an old-layout worker loses it.
    (Measured 2026-09-02, run #1009: an
    `agent-base` image auto-roll landed at the same instant as the 5-hour-limit resume, so the
    run was re-claimed on a fresh worker and cold-started from the default branch while its

@@ -111,8 +111,8 @@ running does not prevent the separate **DinD maintenance** path below.
 **Upgrade warning: automated DinD cleanup defaults on, including existing
 installs.** The daemon's containers, named and anonymous volumes, networks,
 images, and build cache are scratch, not durable storage. Sustained pressure
-can delete the entire `dind-data` PVC, including **named volumes**, and
-replacing the Deployment loses DinD state only: the shared run working
+can delete the entire `dind-data` PVC, including **named volumes**. That
+DinD maintenance recycle loses DinD state only: the shared run working
 directory (`/data/runner`) is on the `/data` volume and is kept (see
 [Run directory on the data volume](#run-directory-on-the-data-volume)). Keep deliverables in git, published checkpoints, or captured
 work. There is no preservation inventory or migration. An admin can opt out
@@ -183,7 +183,8 @@ per-pod `emptyDir`.
 
 - **Pod replacement keeps clones.** Eviction, a reschedule, a roll or a
   deleted pod no longer loses a run's clone or its uncommitted edits on a
-  worker that runs this layout. Deleting or recycling the `/data` volume
+  worker that runs this layout. A reschedule to another node also depends on
+  the data StorageClass supporting reattach, which has not been verified. Deleting or recycling the `/data` volume
   itself still deletes it, as on a non-Docker worker: the automatic
   `/nix`+`/data` recycle of a worker that holds no recovery custody, and
   removal of an ephemeral worker. A DinD-only maintenance recycle keeps
@@ -196,10 +197,14 @@ per-pod `emptyDir`.
   rootless daemon's uid cannot create files at the top of `runner-shared` or
   inside a run's checkout, so `docker run -v <checkout>:...` bind sources
   that need to write back into the checkout fail with a permission error
-  unless the directory is made writable another way. Under the uid split this
-  matches the old `emptyDir` behaviour; in single-uid mode it is tighter than
-  the old world-writable directory. **Run Docker workers in uid-split mode**
-  when builds must write into the checkout.
+  unless the directory is made writable another way, in either mode. Under
+  the uid split this matches the old `emptyDir` behaviour; in single-uid mode
+  it is tighter than the old world-writable directory (by permission
+  arithmetic, not measured). uid-split does not fix writability. **Run
+  Docker workers in uid-split mode** for a different reason: it closes the
+  single-uid subPath re-resolution residual (a worker-uid process replacing
+  `runner-shared` before a dind restart; see
+  [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)).
 
 ### Upgrading and rolling back
 
