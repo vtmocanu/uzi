@@ -710,6 +710,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		Branch:         textPtr(branch),
 		SessionID:      sessionID,
 		CheckpointTip:  textPtr(run.CheckpointTip),
+		// Issue #3194: read off the claimed run row, never derived from ownership or the tip.
+		CheckpointAttestedSource: textPtr(run.CheckpointAttestedSource),
 		// PRD #1247 M9 (task c): the last_seq recordRunCredential actually landed — bumped past any
 		// 'credential_switch' message it just inserted — NOT the stale run.LastSeq snapshot, so the
 		// worker never re-uses the server-inserted message's seq. Equals run.LastSeq when no switch

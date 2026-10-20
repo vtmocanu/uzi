@@ -6392,6 +6392,20 @@ type PublishResult struct {
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte, claimGeneration ...*int64) (PublishResult, error) {
+	var generation *int64
+	if len(claimGeneration) > 0 {
+		generation = claimGeneration[0]
+	}
+	return s.PublishAttested(ctx, wkr, runID, tipOid, nil, pack, generation)
+}
+
+// PublishAttested is Publish carrying the request's optional source attestation (issue #3194;
+// nil: a legacy or unattested publish). The pair (tipOid, attestedSource) is frozen here, at
+// admission: it rides every attempt row this publish writes and is persisted on the run only
+// inside the same successful checkpoint-tip write (set-only; a nil never clears a stored value).
+// An attestation is accepted only on a request stamped with the claim generation it was admitted
+// at, so a value is only ever bound to this run's current worker and generation.
+func (s *Service) PublishAttested(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, attestedSource *string, pack []byte, generation *int64) (PublishResult, error) {
 	// PRD #1810 D2 (residual 2): the publish is routed on the status read below, and a
 	// live-routed push must be SENT within livePublishPrePushBudget of that routing. The clock
 	// starts BEFORE the read, so a slow read can only shorten the budget, never start it after the
@@ -6401,9 +6415,8 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// 1. Server-derived authorization: the run must be owned by THIS worker.
 	// ErrRunNotOwned bubbles to the handler → 404. This is the only thing the worker
 	// named (the run id), and it can only reach its own runs.
-	var generation *int64
-	if len(claimGeneration) > 0 {
-		generation = claimGeneration[0]
+	if attestedSource != nil && generation == nil {
+		return PublishResult{}, ErrMissingClaimGeneration
 	}
 	// Admission reads the reconciliation audit only after worker -> run locking,
 	// including for legacy unstamped requests. Keep this caller-authorized snapshot
@@ -6520,7 +6533,8 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// waits out checkpointSupersessionCooling after its terminal commit, and each push is recorded
 	// durably before it is sent (checkpoint_publish_attempts), so one whose outcome is unknown and
 	// that lands late anyway is reconciled by the sweeper (reconcilePublishAttempts).
-	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt}
+	push := &checkpointPush{s: s, runID: runID, run: owned, branch: branch, ref: ref, opts: opts, routedAt: routedAt,
+		attestedSource: pgconv.TextPtr(attestedSource)}
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, push, tipOid)
 	}
@@ -6737,8 +6751,9 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 	runID := push.runID
 	if !push.base.observed {
 		if _, err := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
-			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
-			ID:            runID,
+			CheckpointTip:  pgtype.Text{String: tipOid, Valid: true},
+			ID:             runID,
+			AttestedSource: push.attestedSource,
 		}); err != nil {
 			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
 			return false
@@ -6746,7 +6761,7 @@ func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush,
 		return true
 	}
 	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
-		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip,
+		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip, AttestedSource: push.attestedSource,
 	})
 	if err != nil {
 		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)

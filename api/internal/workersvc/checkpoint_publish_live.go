@@ -69,7 +69,7 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 		return false, fmt.Errorf("lock live checkpoint attempt: %w", err)
 	}
 	if !current.ReconcileReadyAt.Valid || current.RunID != a.RunID ||
-		current.Ref != a.Ref || current.Tip != a.Tip {
+		current.Ref != a.Ref || current.Tip != a.Tip || current.AttestedSource != a.AttestedSource {
 		return false, nil
 	}
 	rec, err := q.LockCheckpointRetentionForConfirmation(ctx, a.RunID)
@@ -88,7 +88,9 @@ func (s *Service) confirmLivePublishAttempt(ctx context.Context, a store.Checkpo
 	}
 	n, err := q.ConfirmLiveCheckpointPublishAttempt(ctx, store.ConfirmLiveCheckpointPublishAttemptParams{
 		RunID: a.RunID, AttemptID: a.ID, Ref: a.Ref, Tip: a.Tip,
-		ExpectedTip: observedRun.CheckpointTip, HadRetention: hadRecord,
+		// Issue #3194: the attempt row's own frozen attestation; the UPDATE re-binds it to the row.
+		AttestedSource: current.AttestedSource,
+		ExpectedTip:    observedRun.CheckpointTip, HadRetention: hadRecord,
 		ObservedRef: observedRecord.Ref, ObservedRecoveryRef: observedRecord.RecoveryRef,
 		ObservedState: observedRecord.State, ObservedRecordTip: observedRecord.Tip,
 	})

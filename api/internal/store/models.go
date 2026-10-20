@@ -127,6 +127,7 @@ type CheckpointPublishAttempt struct {
 	Checks           int32              `json:"checks"`
 	LastError        pgtype.Text        `json:"last_error"`
 	ReconcileReadyAt pgtype.Timestamptz `json:"reconcile_ready_at"`
+	AttestedSource   pgtype.Text        `json:"attested_source"`
 }
 
 type CheckpointRetention struct {
@@ -1082,6 +1083,7 @@ type Run struct {
 	MemoryPolicy                []byte             `json:"memory_policy"`
 	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
+	CheckpointAttestedSource    pgtype.Text        `json:"checkpoint_attested_source"`
 }
 
 type RunCompletionAttempt struct {

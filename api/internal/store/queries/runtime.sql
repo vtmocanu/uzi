@@ -9455,7 +9455,12 @@ WHERE id = @id;
 -- PRD #1190: also stamp checkpoint_tip_at (a separate timestamp, not updated_at) so the
 -- pause UI can name the age of the last checkpoint — the "work since the last checkpoint"
 -- a `now` pause discards. It is written on every publish alongside checkpoint_tip.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHERE id = @id;
+--
+-- Issue #3194: checkpoint_attested_source is set-only, inside this same write and only from the
+-- publish's own frozen non-NULL value; a NULL (legacy or unattested publish) leaves it unchanged.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now(),
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
+WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 

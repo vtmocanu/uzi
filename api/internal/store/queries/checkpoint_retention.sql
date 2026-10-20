@@ -484,8 +484,10 @@ WHERE id = @run_id
 -- name: RecordCheckpointPublishAttempt :one
 -- Written immediately before one push. The caller refuses the push when this fails: no push is
 -- ever sent without its row.
-INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip)
-VALUES (@run_id, @branch::text, @ref::text, @tip::text)
+-- attested_source (issue #3194) is the push's frozen attestation, NULL when the publisher sent
+-- none; the reconcilers write exactly this row's value with its tip, never the run's current one.
+INSERT INTO checkpoint_publish_attempts (run_id, branch, ref, tip, attested_source)
+VALUES (@run_id, @branch::text, @ref::text, @tip::text, sqlc.narg(attested_source)::text)
 RETURNING id;
 
 -- name: MarkCheckpointPublishAttemptReady :execrows
@@ -546,7 +548,9 @@ SELECT * FROM checkpoint_retentions WHERE run_id = @run_id FOR UPDATE;
 -- while the forge list was in flight. They do not reserve against future competing attempts.
 UPDATE runs r
 SET checkpoint_tip = @tip::text,
-    checkpoint_tip_at = GREATEST(r.checkpoint_tip_at, now())
+    checkpoint_tip_at = GREATEST(r.checkpoint_tip_at, now()),
+    -- Issue #3194: set-only, from the confirmed attempt row's own frozen value (bound below).
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, r.checkpoint_attested_source)
 WHERE r.id = @run_id
   AND r.status NOT IN ('completed', 'failed', 'cancelled')
   AND (r.checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text
@@ -555,6 +559,7 @@ WHERE r.id = @run_id
       SELECT 1 FROM checkpoint_publish_attempts a
       WHERE a.id = @attempt_id AND a.run_id = r.id
         AND a.ref = @ref::text AND a.tip = @tip::text
+        AND a.attested_source IS NOT DISTINCT FROM sqlc.narg(attested_source)::text
         AND a.reconcile_ready_at IS NOT NULL
         AND (r.checkpoint_tip IS NULL OR r.checkpoint_tip = a.tip
              OR (r.checkpoint_tip_at IS NOT NULL AND r.checkpoint_tip_at <= a.attempted_at))
@@ -651,7 +656,11 @@ RETURNING checkpoint_retentions.state;
 -- already at @checkpoint_tip matches too (the same tip persisted meanwhile, by a retry or the
 -- attempts arm), so the writer tracks its push rather than reporting a moved tip; the tip itself
 -- does not change in that arm.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now()
+-- Issue #3194: checkpoint_attested_source is set-only, and only in this same successful write:
+-- the writer's own frozen value (Publish's request, or the reconciled attempt row), never cleared
+-- by a NULL (a legacy or unattested publish) and never copied from the run's current value.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now(),
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
 WHERE id = @id
   AND (checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text
        OR checkpoint_tip = @checkpoint_tip::text);
