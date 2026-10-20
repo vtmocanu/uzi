@@ -17341,7 +17341,10 @@ export class RunRunner {
       flight.sourceJoinFailed = true;
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
-      return this.reportPauseCaptureFailed(flight, true, "unverified");
+      flight.runLog.warn("pause park: capture scope unavailable; the run continues", {
+        run_id: flight.runId,
+      });
+      return this.reportPauseCaptureFailed(flight, false);
     });
   }
 

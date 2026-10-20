@@ -2246,3 +2246,91 @@ for (const reason of ["owner_cancel", "claim_loss", "untyped_lifecycle", "shutdo
     assert.equal(reg.isPoisoned(), reason !== "worker_shutdown");
   });
 }
+
+describe("R2 terminal disposal acquisition", () => {
+  function fixture(dispose: BoundarySeams["dispose"]) {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(3200));
+    let now = 100;
+    let expire: (() => void) | undefined;
+    let cancels = 0;
+    const safety = new CodexExecutionSafetyImpl(registry, {
+      quiesce: r => registry.quiesceChildren(r.deadlineMs),
+      reap: (r, epoch) => registry.reapProcesses(r.deadlineMs, epoch),
+      dispose, spawnRoot: spawnCounter().seam,
+      now: () => now,
+      armDeadline: (request, _ms, fire) => {
+        if (request.boundary !== "terminal") return () => {};
+        expire = fire;
+        return () => { cancels++; expire = undefined; };
+      },
+    });
+    return { registry, safety, advance: (ms: number) => { now += ms; },
+      expire: () => { assert.ok(expire); expire(); }, cancels: () => cancels };
+  }
+
+  for (const mode of ["hook", "zero", "expired"] as const) {
+    it(`returns incomplete on ${mode} acquisition expiry without releasing the real predecessor`, async () => {
+      let disposals = 0;
+      const f = fixture(async () => { disposals++; return { kind: "disposed" }; });
+      const entered = defer<void>(), release = defer<void>();
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: mode === "zero" ? 0 : 50 });
+      if (mode === "hook") { f.advance(50); f.expire(); }
+      if (mode === "expired") { f.advance(50); release.resolve(); }
+      try {
+        assert.deepEqual(await disposal, { kind: "incomplete", errors: [{
+          category: "timeout", message: "codex disposal expired in the boundary queue",
+        }] });
+        const events: string[] = [];
+        const successor = f.safety.withBoundary(req("checkpoint"), async () => { events.push("boundary"); });
+        const capture = f.safety.settleForCredentialFreeCapture(1000).then(result => {
+          events.push("capture"); return result;
+        });
+        if (mode !== "expired") {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          assert.deepEqual(events, [], "neither successor can overtake the real predecessor");
+          assert.equal(f.registry.state(), "closed", "expiry leaves the registry untouched");
+        }
+        release.resolve();
+        await active;
+        await successor;
+        assert.equal((await capture).kind, "observed_empty");
+        assert.deepEqual(events, ["boundary", "capture"], "retained slot eventually drains in order");
+        assert.equal(disposals, 0, "late predecessor settlement never starts terminal disposal");
+      } finally { release.resolve(); await active; }
+    });
+  }
+
+  for (const failure of [false, true]) {
+    it(`passes the original remaining budget and joins owned cleanup (throws=${failure})`, async () => {
+      const entered = defer<void>(), release = defer<void>(), disposing = defer<void>(), cleanup = defer<void>();
+      const primary = new Error("disposal failed");
+      const budgets: number[] = [];
+      const f = fixture(async request => {
+        budgets.push(request.deadlineMs); disposing.resolve(); await cleanup.promise;
+        if (failure) throw primary;
+        return { kind: "disposed" };
+      });
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 50 });
+      const checked = failure ? assert.rejects(disposal, error => error === primary) : disposal;
+      f.advance(20); release.resolve(); await active; await disposing.promise;
+      assert.deepEqual(budgets, [30]);
+      assert.equal(f.cancels(), 1, "acquisition timer is cancelled once before owned cleanup");
+      let laterRan = false;
+      const later = f.safety.withBoundary(req("checkpoint"), async () => { laterRan = true; });
+      f.advance(50);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(laterRan, false, "owned cleanup is joined even past the acquisition deadline");
+      cleanup.resolve(); await checked; await later;
+      assert.equal(laterRan, true, "success or throw releases the queue");
+      assert.equal(budgets.length, 1);
+    });
+  }
+});

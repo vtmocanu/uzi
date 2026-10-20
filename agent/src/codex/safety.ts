@@ -1214,15 +1214,40 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     return this.registry.acceptsCompletedCapture(proof);
   }
 
-  /** Terminal disposal shares the acquisition queue with capture and boundaries. */
+  /** Terminal disposal shares the acquisition queue with capture and boundaries.
+   * The deadline bounds acquisition only; once owned, disposal joins its cleanup.
+   * An expired acquisition retains its slot until the real predecessor settles. */
   async dispose(request: BoundaryRequest): Promise<ToolDisposal> {
     const deadlineAt = this.now() + Math.max(0, request.deadlineMs);
     const prior = this.queueTail;
     let release!: () => void;
     this.queueTail = new Promise<void>(resolve => { release = resolve; });
-    await prior;
-    try { return await this.seams.dispose({ ...request, deadlineMs: this.remainingMs(deadlineAt) }); }
-    finally { release(); }
+    let queued = true;
+    let cancelDeadline: (() => void) | undefined;
+    try {
+      const turn = await Promise.race([
+        prior.then(() => "ready" as const),
+        new Promise<"expired">(resolve => {
+          const remaining = this.remainingMs(deadlineAt);
+          if (remaining <= 0) { resolve("expired"); return; }
+          cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(
+            request, remaining, () => resolve("expired"));
+        }),
+      ]);
+      cancelDeadline?.();
+      cancelDeadline = undefined;
+      if (turn === "expired" || this.remainingMs(deadlineAt) <= 0) {
+        return { kind: "incomplete", errors: [{
+          category: "timeout", message: "codex disposal expired in the boundary queue",
+        }] };
+      }
+      queued = false;
+      return await this.seams.dispose({ ...request, deadlineMs: this.remainingMs(deadlineAt) });
+    } finally {
+      cancelDeadline?.();
+      if (queued) void prior.then(release);
+      else release();
+    }
   }
 }
 

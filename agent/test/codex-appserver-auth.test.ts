@@ -154,7 +154,10 @@ describe("Codex app-server auth: pinned startup ordering and modes", () => {
     const transport = new FakeTransport();
     await auth.authenticate(transport);
     await auth.handleServerRequest(transport, refreshRequest(1));
-    assert.ok(responses(transport).every(call => !("result" in (call.response as object))));
+    const refused = responses(transport);
+    assert.equal(refused.length, 1, "one refusal response is delivered");
+    assert.ok("error" in (refused[0]!.response as object));
+    assert.ok(!("result" in (refused[0]!.response as object)));
     await auth.handleServerRequest(transport, refreshRequest(2));
     assert.equal(operations.length, 2);
     assert.equal(operations[0], operations[1]);
