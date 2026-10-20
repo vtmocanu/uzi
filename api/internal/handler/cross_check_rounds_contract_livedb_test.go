@@ -21,7 +21,7 @@ import (
 func TestPlanCrossCheckAutomaticRoundsContractLiveDB(t *testing.T) {
 	h, router, pool := cliLiveDB(t)
 	ctx := context.Background()
-	h.wsvc = workersvc.New(h.q, h.box, workersvc.Params{PlanCrossCheckMaxRevisions: 2})
+	h.wsvc = workersvc.New(h.q, h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanCrossCheckMaxRevisions: 2})
 	h.wsvc.SetTxBeginner(pool)
 	owner := cliSeedUser(t, pool, false)
 	conn := rmSeedConn(t, pool, owner)

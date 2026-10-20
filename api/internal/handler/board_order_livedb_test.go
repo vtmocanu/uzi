@@ -84,7 +84,7 @@ func newBoardOrderFixture(ctx context.Context, t *testing.T, iids ...int64) boar
 			{Key: settings.KeyUziLabel, Value: "uzi"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 
 	sealed, err := box.Seal([]byte("glpat-dummy-token"))

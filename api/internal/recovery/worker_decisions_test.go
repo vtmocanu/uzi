@@ -82,7 +82,7 @@ func TestOwnerCustodyConfiguredCutoffAndSQLFields(t *testing.T) {
 			{Attention: "needs_action", DecisionNeeded: false},
 		}}
 		calls := 0
-		svc := New(st, nil, nil, Limits{CustodyHoldLimit: 8, WorkerHeartbeatStale: 73 * time.Second}, func() time.Time {
+		svc := New(st, nil, nil, Limits{CustodyHoldLimit: fixedLimit(8), WorkerHeartbeatStale: 73 * time.Second}, func() time.Time {
 			calls++
 			return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC).Add(time.Duration(calls-1) * time.Hour)
 		})
@@ -114,6 +114,48 @@ func TestOwnerCustodyConfiguredCutoffAndSQLFields(t *testing.T) {
 	}
 }
 
+// fixedLimit is a Limits.CustodyHoldLimit reader returning n.
+func fixedLimit(n int32) func(context.Context) (int32, error) {
+	return func(context.Context) (int32, error) { return n, nil }
+}
+
+// The configured custody_hold_limit reaches the aggregate query and the DTO, and is read once.
+func TestOwnerCustodyLimitFromSetting(t *testing.T) {
+	owner := uuid.New()
+	for _, limit := range []int32{4, 12} {
+		st := &ownerCustodyStore{}
+		reads := 0
+		svc := New(st, nil, nil, Limits{CustodyHoldLimit: func(context.Context) (int32, error) {
+			reads++
+			return limit, nil
+		}}, nil)
+		got, err := svc.ListHoldsForOwner(context.Background(), owner, false)
+		if err != nil || got.Aggregate.CustodyHoldLimit != int(limit) || st.aggregateParams.CustodyHoldLimit != limit || reads != 1 {
+			t.Fatalf("limit %d: dto=%+v params=%+v reads=%d err=%v", limit, got.Aggregate, st.aggregateParams, reads, err)
+		}
+	}
+}
+
+// An unreadable or unwired limit fails the call before any store read: no guessed number.
+func TestOwnerCustodyLimitUnavailable(t *testing.T) {
+	owner := uuid.New()
+	boom := errors.New("settings down")
+	for name, fn := range map[string]func(context.Context) (int32, error){
+		"error":    func(context.Context) (int32, error) { return 0, boom },
+		"nil func": nil,
+	} {
+		st := &ownerCustodyStore{}
+		svc := New(st, nil, nil, Limits{CustodyHoldLimit: fn}, nil)
+		got, err := svc.ListHoldsForOwner(context.Background(), owner, false)
+		if err == nil || (name == "error" && !errors.Is(err, boom)) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		if got.Holds != nil || got.Aggregate != (apitypes.RecoveryCustodyAggregateDTO{}) || st.aggregateParams != (store.GetCustodyAggregateForOwnerParams{}) {
+			t.Fatalf("%s: partial result %+v / store queried %+v", name, got, st.aggregateParams)
+		}
+	}
+}
+
 func TestOwnerCustodyAdmissionMembershipMerge(t *testing.T) {
 	owner := uuid.New()
 	idA, idB, idC, idClosed := uuid.New(), uuid.New(), uuid.New(), uuid.New()
@@ -131,7 +173,7 @@ func TestOwnerCustodyAdmissionMembershipMerge(t *testing.T) {
 		},
 	}
 	calls := 0
-	svc := New(st, nil, nil, Limits{CustodyHoldLimit: 8, WorkerHeartbeatStale: time.Minute}, func() time.Time {
+	svc := New(st, nil, nil, Limits{CustodyHoldLimit: fixedLimit(8), WorkerHeartbeatStale: time.Minute}, func() time.Time {
 		calls++
 		return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
 	})

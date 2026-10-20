@@ -92,7 +92,7 @@ func assertOwnerHold(t *testing.T, p *pinAgreementEnv, at time.Time, wantReason 
 	}
 	for _, id := range []uuid.UUID{p.gapRun, p.satRun} {
 		row := p.e.healthRowFor(t, id)
-		flag, reason := p.svc.healthTargetFor(p.e.ctx, at, row, healthThresholds{queued: p.queuedThreshold})
+		flag, reason := p.svc.healthTargetFor(p.e.ctx, at, row, healthThresholds{queued: p.queuedThreshold, custodyLimit: testCustodyLimit, custodyLimitOK: true})
 		if held {
 			if flag != healthWaitingWorker || reason != wantReason {
 				t.Errorf("run %s health=(%q,%q), want (%q,%q)", id, flag, reason, healthWaitingWorker, wantReason)

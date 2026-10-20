@@ -45,37 +45,7 @@ const (
 	// (4) both budget columns COALESCE onto the immutable frozen value, so the floor applies at
 	// most once.
 	sizeBudgetFactorL = 5
-
-	// custodyHoldLimit is the PRD #1296 M1 (D2/D4) owner-admission cap: the maximum
-	// admission-counted open recovery custody holds one owner may accumulate before new
-	// code-run admission PAUSES for that owner. Passed to ClaimRun as @custody_hold_limit;
-	// the claim's custody-admission predicate blocks a claim once the owner is at/above it,
-	// leaving the run queued (a distinct custody-limit reason surfaces through the health
-	// resolver against the SAME predicate in a later milestone). It bounds unpublished work
-	// awaiting recovery disposition PER OWNER (never a global stop-claiming switch, D4).
-	// ADR-2445 excludes at most one valid live current claim's non-decision hold per run;
-	// total custody remains open and still protects cleanup, release and teardown.
-	// Lead-design default 8; operator-configurable in a later milestone.
-	//
-	// Issue #1751 / ADR-1751 continuation exemption: a requeued run that was claimed before
-	// (claim_generation >= 1) and still holds its OWN open custody hold is exempt from this
-	// cap — it continues work already in custody, so it re-claims even at/above the limit
-	// (and may open another generation hold). The exemption is bounded per run: it holds
-	// only while the run's own open-hold count is below this limit, so a run the
-	// never-started sweep keeps requeueing (no hold release) cannot open holds forever.
-	// Fresh runs, runs whose own holds are all released/discarded, and runs already holding
-	// this many of their own are blocked. Concurrent claims can still overshoot the cap
-	// (#1318): it is an admission gate, not a strict ceiling.
-	custodyHoldLimit = 8
 )
-
-// CustodyHoldLimit is the exported form of the owner-admission cap above (PRD #1349 M5).
-// The owner recovery-hold API (internal/recovery, wired via internal/handler) needs the SAME
-// ceiling this package's ClaimRun/health path uses — for the aggregate's custody_hold_limit
-// field and the blocked-runs CASE — but internal/recovery must not import workersvc's private
-// constant (its docstring forbids importing this milestone's package). Exposing the one value
-// keeps both halves reading a single source rather than hardcoding 8 in two places.
-const CustodyHoldLimit = custodyHoldLimit
 
 // budgetDurationSeconds bounds server durations to the persisted SQL int4 range.
 // Ceilings are <=72h; the no-wall job compatibility floor preserves longer base values.

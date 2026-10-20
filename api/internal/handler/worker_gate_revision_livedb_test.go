@@ -50,7 +50,7 @@ func TestWorkerGateRevisionWireLiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	svc := workersvc.New(q, box, workersvc.Params{RunGateRefusalMax: 3})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunGateRefusalMax: 3})
 	svc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, wsvc: svc}
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))

@@ -47,7 +47,7 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 		pool:      pool,
 		q:         q,
 		box:       box,
-		wsvc:      workersvc.New(q, box, workersvc.Params{}),
+		wsvc:      workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		version:   "dev",
 		now:       time.Now,
 		startedAt: time.Now(),

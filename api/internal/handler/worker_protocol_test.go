@@ -155,7 +155,7 @@ func newProtocolHandler(t *testing.T, st workersvc.Store) *Handler {
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
-	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{})}
+	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 }
 
 // workerCtx builds a request carrying an authenticated worker plus a chi {id}
@@ -922,7 +922,7 @@ func TestWorkerHeartbeatDindAtFullDoesNotSetDiskOverThreshold(t *testing.T) {
 		t.Fatalf("new box: %v", err)
 	}
 	st := &protocolStore{}
-	h := &Handler{wsvc: workersvc.New(st, box, workersvc.Params{DiskPressureThreshold: 0.90})}
+	h := &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: 0.90})}
 	rec := httptest.NewRecorder()
 	body := `{"version":"1","stats":{"mem_bytes":100,"source":"cgroup",` +
 		`"disk_nix_bytes":10,"disk_nix_total_bytes":100,"disk_data_bytes":10,"disk_data_total_bytes":100,` +
@@ -1567,7 +1567,7 @@ func TestWorkerRegisterCarriesOutboxMaxPending(t *testing.T) {
 		t.Fatalf("new box: %v", err)
 	}
 	h := &Handler{
-		wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{}),
+		wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		cfg:  config.Config{WorkerOutboxMaxPending: 32},
 	}
 	rec := httptest.NewRecorder()

@@ -1170,13 +1170,21 @@ func (s *Service) checkBoardDrift(ctx context.Context, now time.Time) apitypes.H
 }
 
 // checkCustodyHolds warns when at least one owner is at the custody-hold admission limit.
-// `na` when the limit is non-positive (custody admission disabled) — a defensive guard the
-// caller's positive constant never trips in production.
+// The limit is the custody_hold_limit admin setting (#3150), read once per check through
+// Settings so this check keys on the SAME value ClaimRun gates on. `na` only when no
+// Settings is wired; an unreadable setting degrades the check to unknown with a summary
+// naming the key (never a fallback number, which could hide an owner the claim refuses).
 func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("custody.holds")
-	if s.cfg.CustodyHoldLimit <= 0 {
+	if s.cfg.Settings == nil {
 		c.Severity = sevNA
 		c.Summary = "Custody-hold admission is not configured."
+		return c
+	}
+	custodyLimit, lerr := s.cfg.Settings.CustodyHoldLimit(ctx)
+	if lerr != nil {
+		c = degradeUnknown(c, "custody.holds", fmt.Errorf("read custody_hold_limit: %w", lerr))
+		c.Summary = "The custody_hold_limit setting could not be read, so this signal is unavailable."
 		return c
 	}
 	ctx, cancel := context.WithTimeout(ctx, custodyHoldsReadBudget)
@@ -1185,7 +1193,7 @@ func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes
 		return degradeUnknown(c, "custody.holds", err)
 	}
 	cutoff := pgconv.Time(now.Add(-s.heartbeatStale()))
-	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
+	owners, err := s.cfg.Store.ListOwnersOverCustodyLimit(ctx, store.ListOwnersOverCustodyLimitParams{CustodyHoldLimit: custodyLimit, HeartbeatCutoff: cutoff})
 	if err != nil {
 		return degradeUnknown(c, "custody.holds", err)
 	}
@@ -1232,7 +1240,7 @@ func (s *Service) checkCustodyHolds(ctx context.Context, now time.Time) apitypes
 		if err := ctx.Err(); err != nil {
 			return degradeUnknown(c, "custody.holds", err)
 		}
-		agg, err := s.cfg.Store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{UserID: owner, CustodyHoldLimit: s.cfg.CustodyHoldLimit, HeartbeatCutoff: cutoff})
+		agg, err := s.cfg.Store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{UserID: owner, CustodyHoldLimit: custodyLimit, HeartbeatCutoff: cutoff})
 		if err != nil {
 			return degradeUnknown(c, "custody.holds", err)
 		}

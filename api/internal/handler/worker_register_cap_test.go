@@ -48,7 +48,7 @@ func TestRegisterClampsEphemeralWorkerCapToOne(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &capCaptureStore{registerStore: registerStore{kind: "hosted"}}
-			h := &Handler{wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{})}
+			h := &Handler{wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 			req := httptest.NewRequest(http.MethodPost, "/api/worker/register", strings.NewReader(tc.body))
 			wkr := store.Worker{ID: uuid.New(), UserID: uuid.New(), TokenHash: []byte("h"), Kind: "hosted", Ephemeral: tc.ephemeral}

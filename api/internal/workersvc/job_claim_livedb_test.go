@@ -237,11 +237,11 @@ func TestQueuedReasonNoJobCapableWorkerLiveDB(t *testing.T) {
 	row := store.ListActiveRunsForHealthRow{ID: uuid.New(), UserID: u, Kind: runkind.Job, Status: "queued", Health: healthOK, Harness: harnessClaude}
 
 	e.seedWorkerRow(t, u, false, nil) // old image only
-	if got := e.svc.queuedReason(e.ctx, time.Now(), row); got != reasonNoJobCapableWorker {
+	if got := e.svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonNoJobCapableWorker {
 		t.Fatalf("queuedReason = %q, want %q", got, reasonNoJobCapableWorker)
 	}
 	e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
-	if got := e.svc.queuedReason(e.ctx, time.Now(), row); got == reasonNoJobCapableWorker {
+	if got := e.svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got == reasonNoJobCapableWorker {
 		t.Fatalf("queuedReason still %q with a job-capable worker online", got)
 	}
 	issueRow := row
@@ -250,7 +250,7 @@ func TestQueuedReasonNoJobCapableWorkerLiveDB(t *testing.T) {
 	u2 := e2.seedJobUser(t)
 	issueRow.UserID = u2
 	e2.seedWorkerRow(t, u2, false, nil)
-	if got := e2.svc.queuedReason(e2.ctx, time.Now(), issueRow); got == reasonNoJobCapableWorker {
+	if got := e2.svc.queuedReason(e2.ctx, time.Now(), issueRow, thWithLimit(testCustodyLimit)); got == reasonNoJobCapableWorker {
 		t.Fatalf("an issue run must never get the job rung; got %q", got)
 	}
 }

@@ -21,7 +21,7 @@ func TestCreateRunInputReconciliationNotReadyOwnerAction(t *testing.T) {
 			st := &runsStore{ownerID: owner.ID, run: store.Run{
 				ID: runID, UserID: owner.ID, Status: "awaiting_approval", ReviseCount: revisions,
 			}}
-			h := &Handler{wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{PlanMaxRevisions: 3})}
+			h := &Handler{wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanMaxRevisions: 3})}
 			// The service has no recovery transaction backend: a valid reset request
 			// reaches ErrReconciliationNotReady without permitting any writes.
 			for attempt := 0; attempt < 2; attempt++ {

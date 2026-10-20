@@ -160,7 +160,7 @@ func TestCreateRunInputApproveExcludingGuardRoleNotifies(t *testing.T) {
 				{Name: "coder"},
 			},
 		}
-		h := &Handler{wsvc: workersvc.New(st, box, workersvc.Params{}), hub: hub.New()}
+		h := &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}), hub: hub.New()}
 		h.SetNotifier(notifysvc.New(ns, nil, 0, nil))
 		return h
 	}

@@ -391,8 +391,8 @@ const (
 	DefaultHostedWorkerQuota = "2"
 	// PRD #1908: ten concurrent non-terminal job runs per user by default.
 	DefaultJobMaxActivePerUser = "10"
-	// #3150: the per-owner custody admission limit, formerly the compile-time constant
-	// workersvc.custodyHoldLimit; every custody-admission consumer reads it through
+	// #3150: the per-owner custody admission limit, formerly a compile-time constant in
+	// the workers service; every custody-admission consumer reads it through
 	// Cache.CustodyHoldLimit.
 	DefaultCustodyHoldLimit = "8"
 	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim

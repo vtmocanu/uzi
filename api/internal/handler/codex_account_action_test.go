@@ -53,7 +53,7 @@ func TestOverlayCodexAccountActions(t *testing.T) {
 		// The run's own snapshotted alias label (PRD #1590 D6).
 		CodexSecretLabel: pgtype.Text{String: "work-laptop", Valid: true},
 	}}}
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	a, b := heldDTO(heldA), heldDTO(heldB)
 	c := apitypes.RunDTO{ID: other.String(), Status: "recovery_wait", RecoveryWaitCause: &forge}
@@ -107,7 +107,7 @@ func TestOverlayCodexAccountActionsKeepsSnapshot(t *testing.T) {
 		Status:           "recovery_wait",
 		CodexSecretLabel: pgtype.Text{String: "lookup-label", Valid: true},
 	}}}
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	snap := "dto-snapshot"
 	a := heldDTO(held)

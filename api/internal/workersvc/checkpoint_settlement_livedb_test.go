@@ -48,7 +48,7 @@ func (f *supersedeFix) reconcileRun(t *testing.T, svc *Service, runID uuid.UUID)
 // recoverySvc is a recovery.Service on the fixture's database with the custody-settlement hook
 // wired to svc1, exactly as handler.recovery() wires it in production.
 func (f *supersedeFix) recoverySvc() *recovery.Service {
-	rs := recovery.New(store.New(f.e.pool), f.e.pool, nil, recovery.Limits{CustodyHoldLimit: 8}, nil)
+	rs := recovery.New(store.New(f.e.pool), f.e.pool, nil, recovery.Limits{CustodyHoldLimit: fixedCustodyLimit(testCustodyLimit)}, nil)
 	rs.SetCustodySettledHook(f.svc1.SettleRetainedCheckpoint)
 	return rs
 }

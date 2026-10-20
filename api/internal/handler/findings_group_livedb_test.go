@@ -277,7 +277,7 @@ func newFGEnv(t *testing.T, httpForge http.Handler) *fgEnv {
 		pool: pool, q: q, box: box, cfg: config.Config{},
 		settings: settings.New(&settingsStore{rows: []store.AppSetting{{Key: settings.KeyUziLabel, Value: "uzi"}}}, time.Minute),
 		svc:      e.svc,
-		wsvc:     workersvc.New(q, box, workersvc.Params{}),
+		wsvc:     workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 	return e
 }

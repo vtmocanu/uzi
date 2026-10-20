@@ -56,7 +56,7 @@ func newReadSurfacesFixture(t *testing.T) *readSurfacesFixture {
 	t.Helper()
 	h, pool := secretsCRUDHandler(t)
 	h.cfg = config.Config{UsagePollInterval: 5 * time.Minute, CodexUsagePollInterval: 5 * time.Minute}
-	h.wsvc = workersvc.New(h.q, h.box, workersvc.Params{})
+	h.wsvc = workersvc.New(h.q, h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	ctx := context.Background()
 	f := &readSurfacesFixture{h: h, pool: pool, labels: map[uuid.UUID]string{}}
 	f.user, f.other, f.admin = mkSecretUser(t, pool), mkSecretUser(t, pool), mkSecretUser(t, pool)

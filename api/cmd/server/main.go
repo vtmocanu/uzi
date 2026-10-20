@@ -306,6 +306,9 @@ func run() error {
 	// approval-gate handler needs its SubmitInput and the socket manager captures
 	// its inbound handler at construction.
 	wsvc := workersvc.New(q, box, workersvc.Params{
+		// #3150: the claim and the health pill read the custody_hold_limit admin setting through
+		// the same settings cache every other custody consumer uses.
+		CustodyHoldLimit:              settingsCache,
 		RunTimeout:                    cfg.RunTimeout,
 		RunWallCeiling:                cfg.RunWallCeiling,
 		PlanCrossCheckTimeout:         cfg.PlanCrossCheckTimeout,
@@ -1093,7 +1096,7 @@ func run() error {
 	// suppresses it, exactly as it suppresses the per-run health nudge. It ticks on the sweep
 	// cadence (the SAME cadence the per-run health detector runs on), falling back to 15s when
 	// SWEEP_INTERVAL is unset (0), matching the sweeper's own default.
-	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, workersvc.CustodyHoldLimit, cfg.WorkerHeartbeatStale, time.Now, slog.Default())
+	custodyEpisodeRec := slacksvc.NewCustodyEpisodeReconciler(q, notifier, settingsCache, cfg.WorkerHeartbeatStale, time.Now, slog.Default())
 	custodyEpisodeInterval := cfg.SweepInterval
 	if custodyEpisodeInterval <= 0 {
 		custodyEpisodeInterval = 15 * time.Second
@@ -1134,7 +1137,6 @@ func run() error {
 		HostedWorkerVersion:          cfg.HostedWorkerVersion,
 		RunningVersion:               version,
 		HeartbeatStale:               cfg.WorkerHeartbeatStale,
-		CustodyHoldLimit:             int32(workersvc.CustodyHoldLimit),
 		RecoveryReadyPayloadPerOwner: cfg.RecoveryReadyPayloadPerOwner,
 		RecoveryInstanceBytes:        cfg.RecoveryInstanceBytes,
 		StoredFilesBudgetBytes:       cfg.StoredFilesBudgetBytes,

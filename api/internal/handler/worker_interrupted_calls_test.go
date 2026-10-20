@@ -40,7 +40,7 @@ func TestInterruptedCallsRouteDeadline(t *testing.T) {
 }
 
 func TestWorkerInterruptedCallsMalformed(t *testing.T) {
-	h := &Handler{wsvc: workersvc.New(nil, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(nil, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	router := chi.NewRouter()
 	router.Get("/runs/{id}/interrupted-calls", h.WorkerInterruptedCalls)
 	for _, tc := range []struct {

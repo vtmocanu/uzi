@@ -280,7 +280,7 @@ func newRunsHandler(t *testing.T, st workersvc.Store) *Handler {
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
-	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{}), hub: hub.New()}
+	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}), hub: hub.New()}
 }
 
 // runReq builds a GET request authenticated as user with a chi {id} route param.
@@ -1344,7 +1344,7 @@ func TestListRunMessagesGzip(t *testing.T) {
 	h := &Handler{
 		q:    store.New(gzipAuthDB{user: store.User{ID: owner.ID, IsActive: true}}),
 		cfg:  config.Config{JWTSecret: secret, AuthTokenTTL: time.Hour},
-		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		hub:  hub.New(),
 	}
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
@@ -1408,7 +1408,7 @@ func assertRouteGzip(t *testing.T, st *runsStore, user store.User, path, wantInB
 	h := &Handler{
 		q:    store.New(gzipAuthDB{user: user}),
 		cfg:  config.Config{JWTSecret: secret, AuthTokenTTL: time.Hour},
-		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		hub:  hub.New(),
 		now:  func() time.Time { return fixed },
 	}
@@ -1660,7 +1660,7 @@ func TestCreateRunInputRevisePlanCap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("new box: %v", err)
 		}
-		return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{PlanMaxRevisions: 3}), hub: hub.New()}
+		return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanMaxRevisions: 3}), hub: hub.New()}
 	}
 
 	// Under the cap (2 persisted, cap 3 → 3rd revise accepted) → 202.

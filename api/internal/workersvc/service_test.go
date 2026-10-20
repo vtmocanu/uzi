@@ -1870,6 +1870,7 @@ func (f *fakeStore) ListToolAllowlist(_ context.Context) ([]store.ToolAllowlist,
 // testParams are sane fixed knobs for the tests.
 func testParams() Params {
 	return Params{
+		CustodyHoldLimit:           defaultCustodyLimitReader(),
 		RunTimeout:                 2 * time.Hour,
 		RunWallCeiling:             8 * time.Hour,
 		RunIdleTimeout:             10 * time.Minute,

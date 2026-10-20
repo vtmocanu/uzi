@@ -235,7 +235,7 @@ func TestAdminDockerAllowlistTrustUnlocksMemberClaimLiveDB(t *testing.T) {
 		t.Fatalf("run requirements = %v", run.RequiredCapabilities)
 	}
 	cache := settings.New(q, time.Minute)
-	svc := workersvc.New(q, f.box, workersvc.Params{WorkerHeartbeatStale: time.Minute})
+	svc := workersvc.New(q, f.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute})
 	svc.SetTxBeginner(f.pool)
 	svc.SetDockerAllowlist(cache)
 	svc.SetCapabilitySettings(cache)

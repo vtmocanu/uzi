@@ -23,6 +23,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -152,9 +153,11 @@ func newSettleEnv(t *testing.T) *settleEnv {
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	fake := &settleFakeForge{head: settleHead}
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetForges(settleForgeBuilder{f: fake})
-	h := &Handler{pool: pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc}
+	h := &Handler{pool: pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc,
+		// The owner hold list reads the custody_hold_limit setting; production always wires the cache.
+		settings: settings.New(q, time.Minute)}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 
 	e := &settleEnv{

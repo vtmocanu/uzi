@@ -22,7 +22,7 @@ import (
 func promotingSecretsHandler(t *testing.T) (*Handler, *pgxpool.Pool, *int) {
 	t.Helper()
 	h, pool := secretsCRUDHandler(t)
-	wsvc := workersvc.New(store.New(pool), h.box, workersvc.Params{RunTimeout: 2 * time.Hour, WorkerHeartbeatStale: 45 * time.Second})
+	wsvc := workersvc.New(store.New(pool), h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunTimeout: 2 * time.Hour, WorkerHeartbeatStale: 45 * time.Second})
 	wsvc.SetTxBeginner(pool)
 	requests := new(int)
 	wsvc.SetBackground(func(fn func()) { *requests++; fn() })

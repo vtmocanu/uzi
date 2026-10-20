@@ -310,7 +310,7 @@ func TestCodexLimitPostParkForgeCustodySettlementLiveDB(t *testing.T) {
 	if tip, ok := forge.ref(result.Ref); !ok || tip != retentionTestTip {
 		t.Fatal("forge did not retain checkpoint")
 	}
-	rs := recovery.New(env.q, env.pool, nil, recovery.Limits{CustodyHoldLimit: 8}, nil)
+	rs := recovery.New(env.q, env.pool, nil, recovery.Limits{CustodyHoldLimit: fixedCustodyLimit(testCustodyLimit)}, nil)
 	w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.RecoveryArchiveV2)
 	gen := p.ClaimGeneration
 	released, err := rs.Release(env.ctx, w, fx.runID, apitypes.RecoveryReleaseRequest{Generation: &gen, ReleaseEvidence: strPtr("publication")})

@@ -85,7 +85,7 @@ func newHarnessRouteFixture(ctx context.Context, t *testing.T) harnessRouteFixtu
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
 	svc := forgesvc.New(q, box, 5*time.Second, nil)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetForges(svc) // required: StartRunForUser 500s ErrForgesUnavailable without it
 	// SetRepoGuard / SetTxBeginner deliberately NOT called: the guard is a documented no-op
 	// when nil, and this fixture never resolves a Codex harness (only claude, below), so the

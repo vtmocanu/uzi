@@ -649,7 +649,7 @@ func TestQueuedReasonCodexAccountGatedLiveDB(t *testing.T) {
 	if !row.CodexAccountGated {
 		t.Fatal("a quarantined account's queued run must be gated")
 	}
-	if got := fx.svc.queuedReason(env.ctx, time.Now(), row); got != reasonCodexAccountUnavailable {
+	if got := fx.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonCodexAccountUnavailable {
 		t.Fatalf("queuedReason = %q, want %q", got, reasonCodexAccountUnavailable)
 	}
 }

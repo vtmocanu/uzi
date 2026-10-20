@@ -267,7 +267,7 @@ func TestRollEvidenceOfflineLadderLiveDB(t *testing.T) {
 	worker := e.seedHeartbeatWorker(t, nil)
 	e.exec(t, "UPDATE workers SET draining_since=now(),status='offline' WHERE id=$1", worker)
 	row := e.healthRowFor(t, run)
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonNoWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonNoWorker {
 		t.Fatalf("offline roll reason=%q want=%q", got, reasonNoWorker)
 	}
 	t.Logf("observed offline-mid-roll reason: %s", reasonNoWorker)

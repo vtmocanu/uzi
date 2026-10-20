@@ -131,7 +131,7 @@ func TestUsageOutcomesSingleSnapshotIssue1451LiveDB(t *testing.T) {
 		afterAdmin:   flip(flipFactory),
 		afterPerUser: flip(flipPerUser),
 	}
-	h := &Handler{q: q, wsvc: workersvc.New(racing, nil, workersvc.Params{})}
+	h := &Handler{q: q, wsvc: workersvc.New(racing, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	call := func(fn http.HandlerFunc, admin bool) []byte {
 		t.Helper()

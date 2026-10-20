@@ -44,6 +44,14 @@ type claimGuardFixture struct {
 
 func newClaimGuardFixture(ctx context.Context, t *testing.T) claimGuardFixture {
 	t.Helper()
+	return newClaimGuardFixtureWith(ctx, t, func(*store.Queries) workersvc.CustodyHoldLimitReader { return defaultCustodyLimit() })
+}
+
+// newClaimGuardFixtureWith is newClaimGuardFixture with the workersvc custody limit reader
+// chosen by the caller (built from the fixture's own Queries), so a test can share one reader
+// across the claim and the other custody consumers.
+func newClaimGuardFixtureWith(ctx context.Context, t *testing.T, mkReader func(*store.Queries) workersvc.CustodyHoldLimitReader) claimGuardFixture {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
@@ -64,7 +72,7 @@ func newClaimGuardFixture(ctx context.Context, t *testing.T) claimGuardFixture {
 	// via SetRepoGuard — the M6 seam under test, no fakes on the guard path.
 	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: mkReader(q)})
 	wsvc.SetRepoGuard(pcheck)
 	// PRD #1590 M1: the run-lane claim settles in an exact-claim transaction, as main.go wires it.
 	wsvc.SetTxBeginner(pool)

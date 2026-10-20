@@ -190,7 +190,7 @@ func newBoardWriterFixture(ctx context.Context, t *testing.T, stub *boardWriterS
 			{Key: settings.KeyUziLabel, Value: wantUziLabel},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 	return f
 }

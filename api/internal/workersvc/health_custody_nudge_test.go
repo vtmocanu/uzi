@@ -19,7 +19,7 @@ func TestHealthCustodyLimitNudgeSuppressed(t *testing.T) {
 	r.StatusSince = ago(15 * time.Minute) // > 10m queued → past the threshold
 	fs := &healthFakeStore{
 		active:        []store.ListActiveRunsForHealthRow{r},
-		custodyHolds:  int64(custodyHoldLimit), // at the limit → reasonCustodyLimit
+		custodyHolds:  int64(testCustodyLimit), // at the limit → reasonCustodyLimit
 		onlineWorkers: 0,
 	}
 	svc := healthSvc(fs, defaultHealthSettings()) // cooldown 30m, but no prior nudge → would nudge
@@ -104,7 +104,7 @@ func TestHealthNonCustodyQueuedReasonStillNudges(t *testing.T) {
 	r.StatusSince = ago(15 * time.Minute)
 	fs := &healthFakeStore{
 		active:        []store.ListActiveRunsForHealthRow{r},
-		custodyHolds:  int64(custodyHoldLimit) - 1, // below the limit → custody rung falls through
+		custodyHolds:  int64(testCustodyLimit) - 1, // below the limit → custody rung falls through
 		onlineWorkers: 0,                           // → reasonNoWorker
 	}
 	svc := healthSvc(fs, defaultHealthSettings())

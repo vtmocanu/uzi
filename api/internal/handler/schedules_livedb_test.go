@@ -63,7 +63,7 @@ func newScheduleFixture(ctx context.Context, t *testing.T) scheduleFixture {
 		stranger: store.User{ID: uuid.New(), Email: fmt.Sprintf("sched-other-%s@e2e", uuid.NewString()[:8]), IsActive: true},
 	}
 	svc := forgesvc.New(q, box, 5*time.Second, nil)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	set := settings.New(&settingsStore{rows: []store.AppSetting{
 		{Key: settings.KeyUziLabel, Value: "uzi"},
 	}}, time.Minute)

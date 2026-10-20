@@ -59,7 +59,8 @@ func TestMemoryHoldOwnerOnlyCancelLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &Handler{q: fx.q, wsvc: workersvc.New(fx.q, nil, workersvc.Params{
-		RunTimeout: 2 * time.Hour, RunWallCeiling: 8 * time.Hour,
+		CustodyHoldLimit: defaultCustodyLimit(),
+		RunTimeout:       2 * time.Hour, RunWallCeiling: 8 * time.Hour,
 		WorkerHeartbeatStale: time.Minute,
 	})}
 	for _, user := range []store.User{foreign, admin} {

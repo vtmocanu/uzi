@@ -53,7 +53,7 @@ func (s *pendingOutcomeStore) CancelRunServerSideWithPendingOutcome(_ context.Co
 func newPendingOutcomeHandler(st workersvc.Store) *Handler {
 	// A nonzero heartbeat-stale window so a fresh worker reads as live; the terminal_pending lease
 	// (RunHasPendingOutcomeLease) is then the only reason hasLivePoller reports no poller.
-	return &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{WorkerHeartbeatStale: time.Hour})}
+	return &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Hour})}
 }
 
 func freshWorker() store.Worker {

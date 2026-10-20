@@ -48,7 +48,7 @@ func TestWorkerRunUsageRouteLiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc}
 	lim := mw.NewLimiter(100000, time.Minute, nil)

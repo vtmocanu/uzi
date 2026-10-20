@@ -118,7 +118,7 @@ func TestQueuedReasonReleasedWorkerLiveDB(t *testing.T) {
 	if !found {
 		t.Fatalf("run %s not listed for health", runID)
 	}
-	reason := svc.queuedReason(env.ctx, time.Now(), row)
+	reason := svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(testCustodyLimit))
 	want := "waiting for another worker, or restart worker the-only-worker (its previous process was released at the time limit)"
 	if reason != want {
 		t.Fatalf("queuedReason = %q, want %q", reason, want)

@@ -54,7 +54,7 @@ func TestSetRunPriorityLiveDB(t *testing.T) {
 		q:    q,
 		box:  box,
 		cfg:  config.Config{WorkerBackgroundGrace: 15 * time.Minute},
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 
 	owner := uuid.New()

@@ -100,8 +100,8 @@ func TestCrossCheckLaneHealthRungsLiveDB(t *testing.T) {
 			}
 			found := false
 			for _, row := range rows {
-				if row.ID == f.runID && f.svc.queuedReason(f.env.ctx, now, row) != reason {
-					t.Fatalf("child reason=%s", f.svc.queuedReason(f.env.ctx, now, row))
+				if row.ID == f.runID && f.svc.queuedReason(f.env.ctx, now, row, thWithLimit(testCustodyLimit)) != reason {
+					t.Fatalf("child reason=%s", f.svc.queuedReason(f.env.ctx, now, row, thWithLimit(testCustodyLimit)))
 				}
 				if row.ID == f.lead {
 					found = true
@@ -154,14 +154,14 @@ func TestCrossCheckLaneInheritedFencesLiveDB(t *testing.T) {
 				}
 			case "custody-affinity":
 				r := mustRun(t, f.env, f.runID)
-				for i := 0; i < custodyHoldLimit; i++ {
+				for i := 0; i < testCustodyLimit; i++ {
 					id := uuid.New()
 					if i == 0 {
 						id = f.runID
 					}
 					f.env.exec("INSERT INTO recovery_custody_holds(user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity) VALUES($1,$2,$3,1,'open',$4,'lane-fixture')", f.userID, r.RepoID, id, f.workerID)
 				}
-				adm, err := f.env.q.GetCustodyAdmissionForRun(f.env.ctx, store.GetCustodyAdmissionForRunParams{UserID: f.userID, RunID: f.runID, CustodyHoldLimit: custodyHoldLimit})
+				adm, err := f.env.q.GetCustodyAdmissionForRun(f.env.ctx, store.GetCustodyAdmissionForRunParams{UserID: f.userID, RunID: f.runID, CustodyHoldLimit: testCustodyLimit})
 				if err != nil {
 					t.Fatal(err)
 				}

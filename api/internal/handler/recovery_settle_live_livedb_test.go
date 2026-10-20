@@ -95,7 +95,7 @@ func (e *liveEnv) restart() {
 	e.t.Helper()
 	q := store.New(e.pool)
 	box := newHandlerTestBox(e.t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetForges(settleForgeBuilder{f: e.lf})
 	h := &Handler{pool: e.pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc}
 	lim := mw.NewLimiter(100000, time.Minute, nil)

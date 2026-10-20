@@ -156,7 +156,7 @@ func ciRepairHarnessE2E(ctx context.Context, t *testing.T, node, agent, scratch,
 			t.Fatal(err)
 		}
 	}
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetTxBeginner(f.pool)
 	wsvc.SetJobFiles(workersvc.NewJobFiles(f.pool, box, workersvc.JobFileLimits{}, nil))
 	fs := forgesvc.NewWithForgeBuilder(q, box, 10*time.Second, nil, func(kind forge.Type, base, token string, timeout time.Duration) (forge.Forge, error) {

@@ -146,9 +146,9 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 1)
 		f.seedHold(f.userID, run, 1, "open")
-		f.seedUnrelatedOpenHolds(custodyHoldLimit - 1)
-		if got := f.openHolds(t); got != custodyHoldLimit {
-			t.Fatalf("precondition: open holds = %d, want %d", got, custodyHoldLimit)
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1)
+		if got := f.openHolds(t); got != testCustodyLimit {
+			t.Fatalf("precondition: open holds = %d, want %d", got, testCustodyLimit)
 		}
 		got, gen := f.claim(t)
 		if got != run {
@@ -163,7 +163,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 1)
 		f.seedHold(f.userID, run, 1, "open")
-		f.seedUnrelatedOpenHolds(custodyHoldLimit + 2)
+		f.seedUnrelatedOpenHolds(testCustodyLimit + 2)
 		if got, _ := f.claim(t); got != run {
 			t.Fatalf("claimed %s, want the continuation run %s (exempt above the cap)", got, run)
 		}
@@ -173,7 +173,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 1)
 		f.seedHold(f.userID, run, 1, "open")
-		f.seedUnrelatedOpenHolds(custodyHoldLimit) // other runs' holds alone reach the cap
+		f.seedUnrelatedOpenHolds(testCustodyLimit) // other runs' holds alone reach the cap
 		if got, _ := f.claim(t); got != run {
 			t.Fatalf("claimed %s, want the continuation run %s", got, run)
 		}
@@ -183,7 +183,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		// Below the cap on the first claim: a fresh run is admitted and opens its gen-1 hold,
 		// which puts the owner exactly at the cap.
-		f.seedUnrelatedOpenHolds(custodyHoldLimit - 1)
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1)
 		run := f.seedRun("queued", 0)
 		for wantGen := int64(1); wantGen <= 3; wantGen++ {
 			got, gen := f.claim(t)
@@ -199,27 +199,27 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 			}
 			f.requeue(run)
 		}
-		if got := f.openHolds(t); got != int64(custodyHoldLimit)+2 {
-			t.Fatalf("owner open holds = %d, want %d (cap overshoot by continuation generations)", got, custodyHoldLimit+2)
+		if got := f.openHolds(t); got != int64(testCustodyLimit)+2 {
+			t.Fatalf("owner open holds = %d, want %d (cap overshoot by continuation generations)", got, testCustodyLimit+2)
 		}
 	})
 
 	t.Run("requeued run with own open holds one below the limit still claims", func(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
-		run := f.seedRun("queued", custodyHoldLimit-1)
-		for g := int64(1); g <= custodyHoldLimit-1; g++ {
+		run := f.seedRun("queued", testCustodyLimit-1)
+		for g := int64(1); g <= testCustodyLimit-1; g++ {
 			f.seedHold(f.userID, run, g, "open")
 		}
 		f.seedUnrelatedOpenHolds(1) // owner exactly at the cap
-		if got := f.openHolds(t); got != custodyHoldLimit {
-			t.Fatalf("precondition: open holds = %d, want %d", got, custodyHoldLimit)
+		if got := f.openHolds(t); got != testCustodyLimit {
+			t.Fatalf("precondition: open holds = %d, want %d", got, testCustodyLimit)
 		}
 		got, gen := f.claim(t)
 		if got != run {
-			t.Fatalf("claimed %s, want the continuation run %s (own holds %d < limit)", got, run, custodyHoldLimit-1)
+			t.Fatalf("claimed %s, want the continuation run %s (own holds %d < limit)", got, run, testCustodyLimit-1)
 		}
-		if gen != custodyHoldLimit {
-			t.Fatalf("claim generation = %d, want %d", gen, custodyHoldLimit)
+		if gen != testCustodyLimit {
+			t.Fatalf("claim generation = %d, want %d", gen, testCustodyLimit)
 		}
 	})
 
@@ -227,22 +227,22 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 
 	t.Run("requeued run whose own open holds reached the limit is refused", func(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
-		run := f.seedRun("queued", custodyHoldLimit)
-		for g := int64(1); g <= custodyHoldLimit; g++ {
+		run := f.seedRun("queued", testCustodyLimit)
+		for g := int64(1); g <= testCustodyLimit; g++ {
 			f.seedHold(f.userID, run, g, "open")
 		}
-		if got := f.openHolds(t); got != custodyHoldLimit {
-			t.Fatalf("precondition: open holds = %d, want %d (all the run's own)", got, custodyHoldLimit)
+		if got := f.openHolds(t); got != testCustodyLimit {
+			t.Fatalf("precondition: open holds = %d, want %d (all the run's own)", got, testCustodyLimit)
 		}
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (own open holds at the limit end the exemption)", got)
 		}
 		row := store.ListActiveRunsForHealthRow{ID: run, UserID: f.userID, Status: "queued", Kind: "issue"}
-		if got := f.svc.queuedReason(env.ctx, time.Now(), row); got != reasonCustodyLimit {
+		if got := f.svc.queuedReason(env.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonCustodyLimit {
 			t.Fatalf("health reason = %q, want %q", got, reasonCustodyLimit)
 		}
 		adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-			UserID: f.userID, RunID: run, CustodyHoldLimit: custodyHoldLimit,
+			UserID: f.userID, RunID: run, CustodyHoldLimit: testCustodyLimit,
 		})
 		if err != nil {
 			t.Fatalf("GetCustodyAdmissionForRun: %v", err)
@@ -251,7 +251,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 			t.Fatalf("admission = %+v, want not exempt at the per-run bound", adm)
 		}
 		agg, err := env.q.GetCustodyAggregateForOwner(env.ctx, store.GetCustodyAggregateForOwnerParams{
-			UserID: f.userID, CustodyHoldLimit: custodyHoldLimit,
+			UserID: f.userID, CustodyHoldLimit: testCustodyLimit,
 		})
 		if err != nil {
 			t.Fatalf("GetCustodyAggregateForOwner: %v", err)
@@ -266,7 +266,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		// release (SweepClaimedNeverStarted); each reclaim opens another generation hold.
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 0)
-		for wantGen := int64(1); wantGen <= custodyHoldLimit; wantGen++ {
+		for wantGen := int64(1); wantGen <= testCustodyLimit; wantGen++ {
 			if got, gen := f.claim(t); got != run || gen != wantGen {
 				t.Fatalf("claim %d = (%s, gen %d), want (%s, gen %d)", wantGen, got, gen, run, wantGen)
 			}
@@ -275,8 +275,8 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s with %d own open holds, want idle (per-run bound)", got, f.ownOpenHolds(t, run))
 		}
-		if own := f.ownOpenHolds(t, run); own != custodyHoldLimit {
-			t.Fatalf("own open holds = %d, want %d", own, custodyHoldLimit)
+		if own := f.ownOpenHolds(t, run); own != testCustodyLimit {
+			t.Fatalf("own open holds = %d, want %d", own, testCustodyLimit)
 		}
 	})
 
@@ -284,7 +284,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		run := f.seedRun("queued", 0)
 		f.seedHold(f.userID, run, 1, "open")
-		f.seedUnrelatedOpenHolds(custodyHoldLimit - 1)
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1)
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (claim_generation 0 is never a continuation)", got)
 		}
@@ -295,7 +295,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 	t.Run("fresh run refused at the cap", func(t *testing.T) {
 		f := newCustodyContinuationFixture(t, env)
 		f.seedRun("queued", 0)
-		f.seedUnrelatedOpenHolds(custodyHoldLimit)
+		f.seedUnrelatedOpenHolds(testCustodyLimit)
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (fresh run blocked at the cap)", got)
 		}
@@ -306,7 +306,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
 			run := f.seedRun(status, 1)
 			f.seedHold(f.userID, run, 1, "open")
-			f.seedUnrelatedOpenHolds(custodyHoldLimit)
+			f.seedUnrelatedOpenHolds(testCustodyLimit)
 			if got, _ := f.claim(t); got != uuid.Nil {
 				t.Fatalf("claimed %s (status %s), want idle", got, status)
 			}
@@ -318,7 +318,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		other := f.seedRun("claimed", 1)
 		f.seedHold(f.userID, other, 1, "open")
 		f.seedRun("queued", 1) // requeued, but holds nothing of its own
-		f.seedUnrelatedOpenHolds(custodyHoldLimit - 1)
+		f.seedUnrelatedOpenHolds(testCustodyLimit - 1)
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (another run's hold must not exempt)", got)
 		}
@@ -330,7 +330,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		stranger := env.seedUser(t)
 		t.Cleanup(func() { dropCustodyHolds(t, env, stranger) })
 		f.seedHold(stranger, run, 1, "open") // run_id is a plain column: constructible
-		f.seedUnrelatedOpenHolds(custodyHoldLimit)
+		f.seedUnrelatedOpenHolds(testCustodyLimit)
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (a foreign owner's hold must not exempt)", got)
 		}
@@ -341,7 +341,7 @@ func TestClaimCustodyContinuationLiveDB(t *testing.T) {
 		run := f.seedRun("queued", 2)
 		f.seedHold(f.userID, run, 1, "released")
 		f.seedHold(f.userID, run, 2, "discarded")
-		f.seedUnrelatedOpenHolds(custodyHoldLimit)
+		f.seedUnrelatedOpenHolds(testCustodyLimit)
 		if got, _ := f.claim(t); got != uuid.Nil {
 			t.Fatalf("claimed %s, want idle (no open own hold, no exemption)", got)
 		}
@@ -361,32 +361,32 @@ func TestCustodyContinuationHealthParityLiveDB(t *testing.T) {
 	exempt := f.seedRun("queued", 1)
 	f.seedHold(f.userID, exempt, 1, "open")
 	fresh := f.seedRun("queued", 0)
-	f.seedUnrelatedOpenHolds(custodyHoldLimit)
+	f.seedUnrelatedOpenHolds(testCustodyLimit)
 
 	now := time.Now()
 	row := func(id uuid.UUID) store.ListActiveRunsForHealthRow {
 		return store.ListActiveRunsForHealthRow{ID: id, UserID: f.userID, Status: "queued", Kind: "issue"}
 	}
-	if got := f.svc.queuedReason(env.ctx, now, row(exempt)); got == reasonCustodyLimit {
+	if got := f.svc.queuedReason(env.ctx, now, row(exempt), thWithLimit(testCustodyLimit)); got == reasonCustodyLimit {
 		t.Fatalf("exempt run reason = %q, want anything but the custody-limit reason", got)
 	}
-	if got := f.svc.queuedReason(env.ctx, now, row(fresh)); got != reasonCustodyLimit {
+	if got := f.svc.queuedReason(env.ctx, now, row(fresh), thWithLimit(testCustodyLimit)); got != reasonCustodyLimit {
 		t.Fatalf("fresh run reason = %q, want %q", got, reasonCustodyLimit)
 	}
 
 	adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-		UserID: f.userID, RunID: exempt, CustodyHoldLimit: custodyHoldLimit,
+		UserID: f.userID, RunID: exempt, CustodyHoldLimit: testCustodyLimit,
 	})
 	if err != nil {
 		t.Fatalf("GetCustodyAdmissionForRun(exempt): %v", err)
 	}
-	if !adm.ContinuationExempt || adm.OpenHolds != int64(custodyHoldLimit)+1 {
-		t.Fatalf("admission(exempt) = %+v, want exempt with %d open holds", adm, custodyHoldLimit+1)
+	if !adm.ContinuationExempt || adm.OpenHolds != int64(testCustodyLimit)+1 {
+		t.Fatalf("admission(exempt) = %+v, want exempt with %d open holds", adm, testCustodyLimit+1)
 	}
 	// Owner-scoped: asking about the exempt run as another user never reports it exempt.
 	stranger := env.seedUser(t)
 	adm, err = env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-		UserID: stranger, RunID: exempt, CustodyHoldLimit: custodyHoldLimit,
+		UserID: stranger, RunID: exempt, CustodyHoldLimit: testCustodyLimit,
 	})
 	if err != nil {
 		t.Fatalf("GetCustodyAdmissionForRun(stranger): %v", err)
@@ -396,7 +396,7 @@ func TestCustodyContinuationHealthParityLiveDB(t *testing.T) {
 	}
 
 	agg, err := env.q.GetCustodyAggregateForOwner(env.ctx, store.GetCustodyAggregateForOwnerParams{
-		UserID: f.userID, CustodyHoldLimit: custodyHoldLimit,
+		UserID: f.userID, CustodyHoldLimit: testCustodyLimit,
 	})
 	if err != nil {
 		t.Fatalf("GetCustodyAggregateForOwner: %v", err)

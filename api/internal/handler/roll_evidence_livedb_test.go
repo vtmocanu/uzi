@@ -21,7 +21,7 @@ import (
 func TestRollEvidenceRegisterNamesAndPollLiveDB(t *testing.T) {
 	h, pool, q, box, user := hostedLiveDB(t, "5")
 	ctx := context.Background()
-	h.wsvc = workersvc.New(q, box, workersvc.Params{WorkerHeartbeatStale: time.Minute})
+	h.wsvc = workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute})
 	h.wsvc.SetTxBeginner(pool)
 	h.hsvc = hostedsvc.New(q, box, time.Now, time.Minute)
 	worker, err := h.provisionHostedWorker(ctx, user, "user chosen", "base", "m", false, 5)

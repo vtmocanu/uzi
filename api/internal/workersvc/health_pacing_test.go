@@ -39,7 +39,7 @@ func TestHealthPacingQueuedReasons(t *testing.T) {
 				DiagnosticSuitable: tc.suitable, DiagnosticRolling: tc.rolling, DiagnosticRollContext: data,
 			}}
 			svc := healthSvc(fs, defaultHealthSettings())
-			if got := svc.queuedReason(context.Background(), t0, runRow("queued")); got != tc.want {
+			if got := svc.queuedReason(context.Background(), t0, runRow("queued"), thWithLimit(testCustodyLimit)); got != tc.want {
 				t.Fatalf("reason=%q want=%q", got, tc.want)
 			}
 			if len(fs.writes) != 0 {

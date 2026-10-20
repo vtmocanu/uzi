@@ -101,7 +101,7 @@ func (s *chatStore) ListChatRunsForUser(_ context.Context, userID uuid.UUID) ([]
 
 func newChatHandler(st workersvc.Store) *Handler {
 	return &Handler{
-		wsvc: workersvc.New(st, nil, workersvc.Params{ChatMaxTurns: 50}),
+		wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), ChatMaxTurns: 50}),
 		cfg:  config.Config{ChatMaxTurns: 50}, // the ListChats envelope reads max_turns from cfg
 	}
 }

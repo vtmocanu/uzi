@@ -80,7 +80,7 @@ func TestCrossCheckPinOppositeOrderSavesLiveDB(t *testing.T) {
 			}
 			defer pool.Close()
 			q := store.New(pool)
-			h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+			h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 			user := mkSecretUser(t, pool)
 			if existing {
 				_, err = pool.Exec(ctx, `INSERT INTO user_cross_check_pins (user_id,stage,harness,model,effort)
@@ -155,7 +155,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	}
 	defer pool.Close()
 	q := store.New(pool)
-	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	user := mkSecretUser(t, pool)
 	exec := func(sql string, args ...any) {
 		t.Helper()

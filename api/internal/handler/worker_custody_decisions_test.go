@@ -61,7 +61,7 @@ func TestWorkerListsCustodyDecisions(t *testing.T) {
 					if fail {
 						batch.err = errors.New("partial batch unavailable")
 					}
-					h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{}), recoverySvc: recovery.New(batch, nil, nil, recovery.Limits{}, nil)}
+					h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}), recoverySvc: recovery.New(batch, nil, nil, recovery.Limits{}, nil)}
 					req := httptest.NewRequest(http.MethodGet, "/api/workers", nil).WithContext(mw.ContextWithUser(context.Background(), store.User{ID: owner}))
 					rec := httptest.NewRecorder()
 					if admin {
@@ -119,7 +119,7 @@ func TestWorkerListsCustodyDecisionsWithoutHolds(t *testing.T) {
 					ownerRows: []store.ListWorkersByUserRow{{ID: id}},
 					adminRows: []store.ListAllWorkersRow{{Worker: store.Worker{ID: id}}},
 				}
-				h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+				h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 				batch := &custodyBatchStore{}
 				if available {
 					h.recoverySvc = recovery.New(batch, nil, nil, recovery.Limits{}, nil)

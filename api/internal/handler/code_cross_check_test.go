@@ -68,7 +68,7 @@ func TestCodeCrossCheckWorkerInterruptedProjection(t *testing.T) {
 				tx.check.HeadCommit = pgtype.Text{String: strings.Repeat("a", 40), Valid: true}
 				tx.check.BaseCommit = tx.check.HeadCommit
 			}
-			svc := workersvc.New(nil, nil, workersvc.Params{})
+			svc := workersvc.New(nil, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			svc.SetTxBeginner(tx)
 			h := &Handler{wsvc: svc}
 			router := chi.NewRouter()

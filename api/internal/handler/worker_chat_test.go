@@ -76,7 +76,7 @@ func (s *workerChatStore) ListRunMessagesForWorkerPage(_ context.Context, arg st
 }
 
 func newWorkerChatHandler(st workersvc.Store) *Handler {
-	return &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	return &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 }
 
 // workerReq builds a worker-authenticated request with an optional chi {id} param

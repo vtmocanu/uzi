@@ -75,7 +75,7 @@ func cliLiveDB(t *testing.T) (*Handler, http.Handler, *pgxpool.Pool) {
 			JWTSecret:    cliTestSecret,
 			AuthTokenTTL: time.Hour,
 		},
-		wsvc:     workersvc.New(q, box, workersvc.Params{}),
+		wsvc:     workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		settings: settings.New(&settingsStore{}, time.Minute),
 		hub:      hub.New(),
 	}

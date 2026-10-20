@@ -52,7 +52,7 @@ func setupJobFileRouteLimitsLiveDB(t *testing.T, limits workersvc.JobFileLimits)
 	}
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
-	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(pool)
 	jf := workersvc.NewJobFiles(pool, newHandlerTestBox(t), limits, nil)
 	svc.SetJobFiles(jf)
@@ -222,7 +222,7 @@ func TestWorkerJobInputFileUnavailableAfterFenceLiveDB(t *testing.T) {
 	e := setupJobFileRouteLiveDB(t)
 	// Rebuild the router over a service with no job-file store.
 	q := store.New(e.pool)
-	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(e.pool)
 	h := &Handler{q: q, wsvc: svc}
 	e.router = h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))

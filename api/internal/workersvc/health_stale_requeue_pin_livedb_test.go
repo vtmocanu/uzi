@@ -79,7 +79,7 @@ func (p *pinAgreementEnv) healthPinned(t *testing.T, now time.Time, run uuid.UUI
 	_, rawPinned := p.svc.staleRequeuePin(now, row)
 	_, ownerHeld := p.svc.ownerHold(now, row)
 	rawPinned = rawPinned || ownerHeld
-	flag, reason := p.svc.healthTargetFor(p.e.ctx, now, row, healthThresholds{queued: p.queuedThreshold})
+	flag, reason := p.svc.healthTargetFor(p.e.ctx, now, row, healthThresholds{queued: p.queuedThreshold, custodyLimit: testCustodyLimit, custodyLimitOK: true})
 	shown := flag == healthWaitingWorker && isStaleRequeuePinReason(reason)
 	if shown != rawPinned {
 		t.Fatalf("healthTargetFor pin=%v (%q, %q) disagrees with combined owner holds=%v", shown, flag, reason, rawPinned)

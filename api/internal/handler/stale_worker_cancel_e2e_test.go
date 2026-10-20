@@ -101,7 +101,7 @@ func TestStaleWorkerCancelE2E(t *testing.T) {
 			}()
 			q := store.New(pool)
 			box := newHandlerTestBox(t)
-			svc := workersvc.New(q, box, workersvc.Params{WorkerHeartbeatStale: time.Minute, WorkerHeartbeatInterval: 10 * time.Millisecond, ActiveSnapshotMaxEntries: 256, WorkerOutboxMaxPending: 32, TerminalPendingLease: time.Hour})
+			svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute, WorkerHeartbeatInterval: 10 * time.Millisecond, ActiveSnapshotMaxEntries: 256, WorkerOutboxMaxPending: 32, TerminalPendingLease: time.Hour})
 			svc.SetTxBeginner(pool)
 			svc.SetForgeBaseURLAllowed(func(string) bool { return true })
 			owner, conn, repo, worker, first, second := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()

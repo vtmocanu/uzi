@@ -126,7 +126,7 @@ type healthFakeStore struct {
 	// run's user and that the guards ahead of it (and the non-interlocked case) short-circuit.
 	protocolCalls []uuid.UUID
 	// custodyHolds is the canned GetCustodyAdmissionForRun open_holds answer (PRD #1296 M4): the
-	// owner's OPEN custody-hold count. >= custodyHoldLimit drives reasonCustodyLimit unless
+	// owner's OPEN custody-hold count. >= testCustodyLimit drives reasonCustodyLimit unless
 	// custodyExempt (issue #1751 continuation exemption) is set.
 	// custodyErr forces the read to fail (falls through to the generic queuedReason). The count
 	// predicate itself is pinned against a real Postgres by the store package; this side pins the
@@ -800,7 +800,7 @@ func TestHealthQueuedHandoffSetup(t *testing.T) {
 // TestHealthQueuedCustodyLimit drives the PRD #1296 M4 (D4) custody-limit rung through
 // detectRunHealth: a queued run whose OWNER is at the custody-hold admission limit reports
 // reasonCustodyLimit (flag healthWaitingWorker), resolved against the SAME predicate the
-// claim gates on (GetCustodyAdmissionForRun vs custodyHoldLimit) and AHEAD of every
+// claim gates on (GetCustodyAdmissionForRun vs testCustodyLimit) and AHEAD of every
 // worker-availability reason — so even a zero-worker fleet reports the custody block, because
 // bringing a worker online cannot clear it. Below the limit, or on a read error, it falls
 // through to the generic worker reasons rather than inventing one.
@@ -811,8 +811,8 @@ func TestHealthCustodyCountAndConfiguredCutoff(t *testing.T) {
 			fs := &healthFakeStore{custodyHolds: 12, custodyCounted: &counted}
 			svc := healthSvc(fs, defaultHealthSettings())
 			svc.p.WorkerHeartbeatStale = 137 * time.Second
-			reason := svc.queuedReason(context.Background(), t0, r)
-			if (reason == reasonCustodyLimit) != (counted >= custodyHoldLimit) {
+			reason := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit))
+			if (reason == reasonCustodyLimit) != (counted >= testCustodyLimit) {
 				t.Fatalf("total12/count%d reason=%q", counted, reason)
 			}
 			want := t0.Add(-137 * time.Second)
@@ -833,14 +833,14 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 		// custody rung is checked AHEAD of worker availability (it wins despite 0 workers).
 		want string
 	}{
-		{"at the limit fires custody reason (beats no-worker)", int64(custodyHoldLimit), false, nil, reasonCustodyLimit},
-		{"over the limit fires custody reason", int64(custodyHoldLimit) + 3, false, nil, reasonCustodyLimit},
-		{"one below the limit falls through", int64(custodyHoldLimit) - 1, false, nil, reasonNoWorker},
-		{"read error falls through (no invented reason)", int64(custodyHoldLimit), false, errors.New("boom"), reasonNoWorker},
+		{"at the limit fires custody reason (beats no-worker)", int64(testCustodyLimit), false, nil, reasonCustodyLimit},
+		{"over the limit fires custody reason", int64(testCustodyLimit) + 3, false, nil, reasonCustodyLimit},
+		{"one below the limit falls through", int64(testCustodyLimit) - 1, false, nil, reasonNoWorker},
+		{"read error falls through (no invented reason)", int64(testCustodyLimit), false, errors.New("boom"), reasonNoWorker},
 		// Issue #1751: a continuation-exempt run is admitted by ClaimRun at/over the cap, so
 		// the pill must not claim a custody block for it.
-		{"continuation-exempt run at the limit falls through", int64(custodyHoldLimit), true, nil, reasonNoWorker},
-		{"continuation-exempt run over the limit falls through", int64(custodyHoldLimit) + 3, true, nil, reasonNoWorker},
+		{"continuation-exempt run at the limit falls through", int64(testCustodyLimit), true, nil, reasonNoWorker},
+		{"continuation-exempt run over the limit falls through", int64(testCustodyLimit) + 3, true, nil, reasonNoWorker},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -870,8 +870,8 @@ func TestHealthQueuedCustodyLimit(t *testing.T) {
 			if len(fs.custodyRunCalls) != 1 || fs.custodyRunCalls[0] != r.ID {
 				t.Fatalf("custody run lookups = %v, want exactly [%s] (this run)", fs.custodyRunCalls, r.ID)
 			}
-			if len(fs.custodyLimitCalls) != 1 || fs.custodyLimitCalls[0] != custodyHoldLimit {
-				t.Fatalf("custody limit args = %v, want exactly [%d] (the claim's limit)", fs.custodyLimitCalls, custodyHoldLimit)
+			if len(fs.custodyLimitCalls) != 1 || fs.custodyLimitCalls[0] != testCustodyLimit {
+				t.Fatalf("custody limit args = %v, want exactly [%d] (the claim's limit)", fs.custodyLimitCalls, testCustodyLimit)
 			}
 		})
 	}
@@ -1536,7 +1536,7 @@ func TestHealthQueuedUpgradeSevenRungs(t *testing.T) {
 			fs := &healthFakeStore{active: []store.ListActiveRunsForHealthRow{r}, eligibility: store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1}}
 			svc := healthSvc(fs, defaultHealthSettings())
 			svc.capabilitySettings = fakeCapabilitySettings{on: true}
-			if got := svc.queuedReason(context.Background(), t0, r); got != ReasonWorkersUpgrading {
+			if got := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); got != ReasonWorkersUpgrading {
 				t.Fatalf("reason=%q", got)
 			}
 			if got := svc.detectRunHealth(context.Background(), t0); got != 1 {
@@ -1572,7 +1572,7 @@ func TestHealthQueuedWorkersUpgrading(t *testing.T) {
 			r := runRow("queued")
 			fs := &healthFakeStore{eligibility: tc.eligible, eligibilityErr: tc.err}
 			svc := healthSvc(fs, defaultHealthSettings())
-			if got := svc.queuedReason(context.Background(), t0, r); got != tc.want {
+			if got := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); got != tc.want {
 				t.Fatalf("reason=%q want=%q", got, tc.want)
 			}
 			if len(fs.eligibilityCalls) != 1 {

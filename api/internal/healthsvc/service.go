@@ -110,6 +110,9 @@ type Settings interface {
 	ReleaseCheckEnabled(ctx context.Context) (bool, error)
 	ReleaseStatus(ctx context.Context) (settings.ReleaseStatus, error)
 	AgentSourceEnabled(context.Context) (bool, error)
+	// CustodyHoldLimit is the custody_hold_limit admin setting, the admission ceiling
+	// custody.holds keys on; it fails closed (an error, never a default) when unreadable.
+	CustodyHoldLimit(ctx context.Context) (int32, error)
 	AgentSourceRepoURL(context.Context) (string, error)
 	AgentSourceRef(context.Context) (string, error)
 	AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error)
@@ -161,9 +164,6 @@ type Config struct {
 	// HeartbeatStale is config.WorkerHeartbeatStale: the "fresh heartbeat" window
 	// fleet.capacity and fleet.disk use. <= 0 falls back to defaultHeartbeatStale.
 	HeartbeatStale time.Duration
-	// CustodyHoldLimit is workersvc.CustodyHoldLimit, the admission ceiling custody.holds
-	// keys on.
-	CustodyHoldLimit int32
 	// Effective admission limits; non-positive values disable the respective ceiling.
 	RecoveryReadyPayloadPerOwner int64
 	RecoveryInstanceBytes        int64

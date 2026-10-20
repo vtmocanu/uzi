@@ -118,7 +118,7 @@ func TestListReposGithubProjectSyncLiveDB(t *testing.T) {
 			{Key: settings.KeyDockerRepoAllowlist, Value: ""},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/api/repos", nil)

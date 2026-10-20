@@ -102,7 +102,7 @@ func newHeldEnv(t *testing.T) *heldEnv {
 
 // newService builds a service wired to the env's stubbed forge, switch on.
 func (e *heldEnv) newService() *Service {
-	svc := New(e.q, e.pool, nil, Limits{ReadyRetention: e.retention, RequestDeadline: 10 * time.Second}, nil)
+	svc := New(e.q, e.pool, nil, Limits{CustodyHoldLimit: fixedLimit(8), ReadyRetention: e.retention, RequestDeadline: 10 * time.Second}, nil)
 	svc.SetHeldPublication(true, func(context.Context, uuid.UUID) (pushbroker.ListRefsOptions, error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()

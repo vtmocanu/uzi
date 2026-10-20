@@ -99,15 +99,15 @@ type Limits struct {
 	MaxConcurrentUploads   int           // concurrent uploads per API process.
 	MaxConcurrentDownloads int           // concurrent downloads per API process.
 	RequestDeadline        time.Duration // per upload/download request+transaction deadline.
-	// CustodyHoldLimit is the owner-admission ceiling (PRD #1349 M5, D6/D10) — the maximum
-	// admission-counted custody holds one owner may accumulate before code-run
-	// admission pauses. The handler sets it from workersvc.CustodyHoldLimit so the owner
-	// hold aggregate (ListHoldsForOwner) reports the SAME limit ClaimRun/health gate on, and
-	// passes it to GetCustodyAggregateForOwner's blocked-runs CASE. A non-positive value
-	// disables the blocked-runs gate exactly like the claim path. Typed int32 to map directly
-	// onto the store param (GetCustodyAggregateForOwnerParams.CustodyHoldLimit) with no lossy
-	// conversion; the owner DTO widens it to int.
-	CustodyHoldLimit int32
+	// CustodyHoldLimit reads the owner-admission ceiling (PRD #1349 M5, D6/D10; #3150) — the
+	// maximum admission-counted custody holds one owner may accumulate before code-run
+	// admission pauses. The handler wires it to the custody_hold_limit admin setting so the
+	// owner hold aggregate (ListHoldsForOwner) reports the SAME limit ClaimRun/health gate on,
+	// and passes it to GetCustodyAggregateForOwner's blocked-runs CASE. It is read once per
+	// ListHoldsForOwner call. A nil func or a read error fails the call (the handler answers
+	// 500): there is no fallback number, because a substituted default would misreport the
+	// configured limit.
+	CustodyHoldLimit func(context.Context) (int32, error)
 	// WorkerHeartbeatStale is the configured freshness window used by admission counts.
 	WorkerHeartbeatStale time.Duration
 	// StoredFilesBudgetBytes is the shared stored-file budget (UZI_STORED_FILES_BUDGET_BYTES, PRD

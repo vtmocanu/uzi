@@ -42,7 +42,7 @@ func findingsDismissLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Querie
 	}
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
-	h := &Handler{q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+	h := &Handler{q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	return h, pool, q
 }
 

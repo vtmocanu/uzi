@@ -57,7 +57,7 @@ func TestCreateRunInputPauseInvalidModeLiveDB(t *testing.T) {
 	exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status, kind, started_at)
 	      VALUES ($1,$2,$3,1,'t','d','running','issue', now() - interval '2 hours')`, runID, owner.ID, repoID)
 
-	h := &Handler{wsvc: workersvc.New(store.New(pool), nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(store.New(pool), nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	call := func(body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/runs/"+runID.String()+"/inputs", strings.NewReader(body))
 		rctx := chi.NewRouteContext()

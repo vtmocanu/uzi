@@ -63,7 +63,7 @@ func (f *adviceFakeStore) UpsertTaskReviewWithFindings(_ context.Context, arg st
 }
 
 func adviceRouter(st *adviceFakeStore, wkr store.Worker) http.Handler {
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

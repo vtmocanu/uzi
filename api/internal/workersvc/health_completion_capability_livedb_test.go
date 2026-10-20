@@ -38,7 +38,7 @@ func TestQueuedReasonNoCompletionCapableWorkerLiveDB(t *testing.T) {
 	v1 := int32(1)
 	runID := e.seedQueuedRun(t, &v1, nil) // interlocked, no required_capabilities
 
-	got := svc.queuedReason(e.ctx, time.Now(), e.interlockedQueuedRow(runID))
+	got := svc.queuedReason(e.ctx, time.Now(), e.interlockedQueuedRow(runID), thWithLimit(testCustodyLimit))
 	if got != reasonNoCompletionCapableWorker {
 		t.Fatalf("queuedReason = %q, want %q — an interlocked queued run with no protocol-capable "+
 			"worker online must surface the completion-capability block", got, reasonNoCompletionCapableWorker)
@@ -53,7 +53,7 @@ func TestQueuedReasonCompletionCapableWorkerFallsThroughLiveDB(t *testing.T) {
 	v1 := int32(1)
 	runID := e.seedQueuedRun(t, &v1, nil)
 
-	got := svc.queuedReason(e.ctx, time.Now(), e.interlockedQueuedRow(runID))
+	got := svc.queuedReason(e.ctx, time.Now(), e.interlockedQueuedRow(runID), thWithLimit(testCustodyLimit))
 	if got != reasonWaitingWorker {
 		t.Fatalf("queuedReason = %q, want %q when a protocol-capable worker is online", got, reasonWaitingWorker)
 	}
@@ -70,7 +70,7 @@ func TestQueuedReasonLegacyRunNeverCompletionCapableReasonLiveDB(t *testing.T) {
 
 	row := e.interlockedQueuedRow(runID)
 	row.CompletionContractVersion = pgtype.Int4{} // legacy: NULL contract version
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got == reasonNoCompletionCapableWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got == reasonNoCompletionCapableWorker {
 		t.Fatalf("queuedReason = %q, but a legacy run is not interlocked — the completion-protocol rung "+
 			"must not fire for it", got)
 	}

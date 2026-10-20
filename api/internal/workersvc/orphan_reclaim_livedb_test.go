@@ -40,7 +40,7 @@ func orphanReclaimParams(e interlockLiveDB, w store.Worker) store.ClaimRunParams
 	p := e.claimParams(w.ID, w.ProtocolCapabilities, true)
 	p.WorkerIdentity = workerIdentity(w)
 	p.RecoveryCapable = true
-	p.CustodyHoldLimit = 8 // All scenarios remain below the positive owner custody cap.
+	p.CustodyHoldLimit = testCustodyLimit // All scenarios remain below the owner custody cap.
 	p.WorkerCaps = w.Capabilities
 	p.ClaimantDraining = w.DrainingSince.Valid
 	p.WorkerIsolatedLane = w.IsolatedLane

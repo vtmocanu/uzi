@@ -107,7 +107,7 @@ func newPoisonFixture(t *testing.T) poisonFixture {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	h := &Handler{pool: pool, q: q, box: box, wsvc: workersvc.New(q, box, workersvc.Params{})}
+	h := &Handler{pool: pool, q: q, box: box, wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	userID, connID, repoID, workerID, runID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	exec := func(sql string, args ...any) {
@@ -498,7 +498,7 @@ func (u *unstorableStore) InsertRunMessage(context.Context, store.InsertRunMessa
 
 func postToFakeStore(t *testing.T, insertErr error) *httptest.ResponseRecorder {
 	t.Helper()
-	h := &Handler{wsvc: workersvc.New(&unstorableStore{insertErr: insertErr}, newHandlerTestBox(t), workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(&unstorableStore{insertErr: insertErr}, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages",
 		strings.NewReader(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"t":"clean"}}]}`))
 	rctx := chi.NewRouteContext()
@@ -747,7 +747,7 @@ func (s *foldingStore) UpdateRunLastSeq(context.Context, store.UpdateRunLastSeqP
 func TestWorkerMessagesUnstorableOutsideTheInsertStays500(t *testing.T) {
 	h := &Handler{wsvc: workersvc.New(
 		&foldingStore{lastSeqErr: &pgconn.PgError{Code: "22P05", Message: "boom"}},
-		newHandlerTestBox(t), workersvc.Params{})}
+		newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages",
 		strings.NewReader(`{"messages":[{"seq":1,"kind":"text","agent":"lead","payload":{"t":"clean"}}]}`))
 	rctx := chi.NewRouteContext()

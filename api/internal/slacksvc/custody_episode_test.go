@@ -2,6 +2,7 @@ package slacksvc
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -31,6 +32,7 @@ type custodyEpisodeFakeStore struct {
 	clearedCall []uuid.UUID // every ClearCustodyEpisodeNotice call, in order
 	cutoffs     []pgtype.Timestamptz
 	limitSeen   []int32 // every custody_hold_limit param passed to the list reads
+	aggLimits   []int32 // every custody_hold_limit param passed to the aggregate read
 }
 
 func (f *custodyEpisodeFakeStore) ListOwnersOverCustodyLimit(_ context.Context, arg store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
@@ -75,6 +77,7 @@ func (f *custodyEpisodeFakeStore) ClearCustodyEpisodeNotice(_ context.Context, u
 }
 
 func (f *custodyEpisodeFakeStore) GetCustodyAggregateForOwner(_ context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error) {
+	f.aggLimits = append(f.aggLimits, arg.CustodyHoldLimit)
 	f.cutoffs = append(f.cutoffs, arg.HeartbeatCutoff)
 	if f.aggErr != nil {
 		return store.GetCustodyAggregateForOwnerRow{}, f.aggErr
@@ -101,6 +104,9 @@ type custodyEpisodeFakeSettings struct {
 	enabled bool
 	baseURL string
 	enabErr error
+	limit   int32 // custody_hold_limit returned by CustodyHoldLimit (a zero value is only a test default, see newCustodyEpisodeReconciler)
+	limErr  error // forces CustodyHoldLimit to fail
+	reads   *int  // when non-nil, counts CustodyHoldLimit reads
 }
 
 func (s custodyEpisodeFakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -110,8 +116,18 @@ func (s custodyEpisodeFakeSettings) PublicBaseURL(context.Context) (string, erro
 	return s.baseURL, nil
 }
 
+func (s custodyEpisodeFakeSettings) CustodyHoldLimit(context.Context) (int32, error) {
+	if s.reads != nil {
+		*s.reads++
+	}
+	return s.limit, s.limErr
+}
+
 func newCustodyEpisodeReconciler(st *custodyEpisodeFakeStore, notif *custodyEpisodeFakeNotifier, set custodyEpisodeFakeSettings) *CustodyEpisodeReconciler {
-	return NewCustodyEpisodeReconciler(st, notif, set, 8, 73*time.Second, time.Now, nil)
+	if set.limit == 0 && set.limErr == nil {
+		set.limit = 8
+	}
+	return NewCustodyEpisodeReconciler(st, notif, set, 73*time.Second, time.Now, nil)
 }
 
 // TestCustodyEpisodeCrossingSendsOneDM: one owner over the limit drives exactly one Notify with
@@ -301,22 +317,91 @@ func TestCustodyEpisodeListErrorNoOp(t *testing.T) {
 	}
 }
 
-// TestCustodyEpisodeNonPositiveLimitNoop: a non-positive limit disables the admission gate, so the
-// reconciler does no work at all (no list reads, no sends).
-func TestCustodyEpisodeNonPositiveLimitNoop(t *testing.T) {
-	st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uuid.New()}}
+// TestCustodyEpisodeLimitUnreadableNoop: an unreadable custody_hold_limit is a fail-closed no-op —
+// no list reads, no re-arm, no claim, no DM. There is no fallback number.
+func TestCustodyEpisodeLimitUnreadableNoop(t *testing.T) {
+	uid := uuid.New()
+	st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uid}, cleared: []uuid.UUID{uid}}
 	notif := &custodyEpisodeFakeNotifier{}
-	r := NewCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true}, 0, 73*time.Second, time.Now, nil)
+	r := newCustodyEpisodeReconciler(st, notif, custodyEpisodeFakeSettings{enabled: true, limErr: errors.New("settings down")})
 
 	r.Reconcile(context.Background())
 
-	if len(st.limitSeen) != 0 {
-		t.Errorf("list reads = %d, want 0 with a non-positive limit", len(st.limitSeen))
+	if len(st.limitSeen) != 0 || len(st.aggLimits) != 0 || len(st.claimOrder) != 0 || len(st.clearedCall) != 0 {
+		t.Errorf("store touched on unreadable limit: lists=%v aggs=%v claims=%v clears=%v", st.limitSeen, st.aggLimits, st.claimOrder, st.clearedCall)
 	}
 	if len(notif.notifications) != 0 {
-		t.Errorf("Notify called %d times, want 0 with a non-positive limit", len(notif.notifications))
+		t.Errorf("Notify called %d times, want 0 on an unreadable limit", len(notif.notifications))
 	}
 }
+
+// TestCustodyEpisodeLimitReachesEveryQuery: the setting is read once per tick and the same value
+// feeds the cleared list, the over-limit list and the aggregate.
+func TestCustodyEpisodeLimitReachesEveryQuery(t *testing.T) {
+	for _, limit := range []int32{4, 12} {
+		uid := uuid.New()
+		st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uid}}
+		reads := 0
+		r := newCustodyEpisodeReconciler(st, &custodyEpisodeFakeNotifier{}, custodyEpisodeFakeSettings{enabled: true, limit: limit, reads: &reads})
+
+		r.Reconcile(context.Background())
+
+		if reads != 1 {
+			t.Errorf("limit %d: setting read %d times in one tick, want 1", limit, reads)
+		}
+		if len(st.limitSeen) != 2 || st.limitSeen[0] != limit || st.limitSeen[1] != limit {
+			t.Errorf("limit %d: list limits = %v, want [%d %d]", limit, st.limitSeen, limit, limit)
+		}
+		if len(st.aggLimits) != 1 || st.aggLimits[0] != limit {
+			t.Errorf("limit %d: aggregate limits = %v, want [%d]", limit, st.aggLimits, limit)
+		}
+	}
+}
+
+// TestCustodyEpisodeSettingChangeTakesEffectNextTick: the limit is re-read each tick, so raising it
+// above an owner's count re-arms the notice (owner now in the cleared set) and lowering it below the
+// count notifies. The fake store models the SQL result for each limit.
+func TestCustodyEpisodeSettingChangeTakesEffectNextTick(t *testing.T) {
+	uid := uuid.New()
+	st := &custodyEpisodeFakeStore{}
+	notif := &custodyEpisodeFakeNotifier{}
+	limit := int32(4)
+	r := NewCustodyEpisodeReconciler(st, notif, limitFunc{custodyEpisodeFakeSettings{enabled: true}, func() int32 { return limit }}, 73*time.Second, time.Now, nil)
+
+	// Owner holds 6 counted holds. At limit 4 they are over: one DM.
+	st.overLimit = []uuid.UUID{uid}
+	r.Reconcile(context.Background())
+	if len(notif.notifications) != 1 {
+		t.Fatalf("limit 4: Notify = %d, want 1", len(notif.notifications))
+	}
+
+	// Raised to 12: no longer over, now in the cleared set -> re-armed, no DM.
+	limit = 12
+	st.overLimit, st.cleared = nil, []uuid.UUID{uid}
+	r.Reconcile(context.Background())
+	if len(st.clearedCall) != 1 || len(notif.notifications) != 1 {
+		t.Fatalf("limit 12: clears=%v notifications=%d, want 1 clear and still 1 DM", st.clearedCall, len(notif.notifications))
+	}
+	if got := st.limitSeen[len(st.limitSeen)-1]; got != 12 {
+		t.Fatalf("limit 12 tick queried with %d", got)
+	}
+
+	// Lowered back to 4: over again -> a new DM.
+	limit = 4
+	st.overLimit, st.cleared = []uuid.UUID{uid}, nil
+	r.Reconcile(context.Background())
+	if len(notif.notifications) != 2 {
+		t.Fatalf("limit 4 again: Notify = %d, want 2", len(notif.notifications))
+	}
+}
+
+// limitFunc overrides the fake settings' limit with a live function.
+type limitFunc struct {
+	custodyEpisodeFakeSettings
+	fn func() int32
+}
+
+func (l limitFunc) CustodyHoldLimit(context.Context) (int32, error) { return l.fn(), nil }
 
 // ── buildCustodyEpisodeNotification (pure) ─────────────────────────────────────
 
@@ -367,7 +452,7 @@ func TestCustodyEpisodeConfiguredCutoff(t *testing.T) {
 	uid := uuid.New()
 	st := &custodyEpisodeFakeStore{overLimit: []uuid.UUID{uid}}
 	calls := 0
-	r := NewCustodyEpisodeReconciler(st, &custodyEpisodeFakeNotifier{}, custodyEpisodeFakeSettings{enabled: true}, 8, 73*time.Second, func() time.Time {
+	r := NewCustodyEpisodeReconciler(st, &custodyEpisodeFakeNotifier{}, custodyEpisodeFakeSettings{enabled: true, limit: 8}, 73*time.Second, func() time.Time {
 		calls++
 		return now.Add(time.Duration(calls-1) * time.Hour)
 	}, nil)

@@ -143,7 +143,7 @@ func TestEphemeralDockerLatePlanApprovalLiveDB(t *testing.T) {
 			}
 			// The actual provisioned worker owns the gate; Docker was inferred only after provisioning.
 			cliMustExec(t, fx.pool, `UPDATE runs SET status='awaiting_approval',worker_id=$2,plan_md='Build and smoke-test the container',required_capabilities=ARRAY['docker'],gate_revision=1 WHERE id=$1`, run, worker.ID)
-			svc := workersvc.New(fx.q, fx.box, workersvc.Params{})
+			svc := workersvc.New(fx.q, fx.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			svc.SetTxBeginner(fx.pool)
 			result, err := svc.SubmitInput(fx.ctx, fx.userID, run, "approve_plan", "", nil)
 			if preference {
@@ -338,7 +338,7 @@ func TestEphemeralDockerWarmStepAsideLiveDB(t *testing.T) {
 	run := fx.followUp(warm)
 	_, probe := fx.dockerProvisioner(true, true, true, 2, false)
 	p := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, probe, hostedsvc.EphemeralConfig{BackgroundGrace: 5 * time.Minute, DockerEnabled: true, MaxPerUser: 2, DefaultSize: "m", Lease: 2 * time.Hour})
-	svc := workersvc.New(fx.q, fx.box, workersvc.Params{WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
+	svc := workersvc.New(fx.q, fx.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute})
 	svc.SetTxBeginner(fx.pool)
 	svc.SetEphemeralLease(2 * time.Hour)
 	svc.SetDockerAllowlist(probe)

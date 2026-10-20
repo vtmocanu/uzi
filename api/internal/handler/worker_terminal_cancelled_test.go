@@ -84,7 +84,7 @@ func TestWorkerRunInputsTerminalCancelled(t *testing.T) {
 					st.ownedErr = pgx.ErrNoRows
 				}
 				h := newProtocolHandler(t, st.protocolStore)
-				h.wsvc = workersvc.New(st, newHandlerTestBox(t), workersvc.Params{})
+				h.wsvc = workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 				req := workerReq(http.MethodGet, "", id)
 				if capable {
 					w := store.Worker{ID: uuid.New(), ProtocolCapabilities: []string{capability.InputReceiptsV1}}

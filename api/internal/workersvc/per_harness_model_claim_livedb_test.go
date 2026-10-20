@@ -432,7 +432,7 @@ func TestQueuedReasonNoCustomCodexCapableWorkerLiveDB(t *testing.T) {
 	t.Run("codex-harness worker but no custom-capable worker -> reasonNoCustomCodexCapableWorker", func(t *testing.T) {
 		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // online, harness-only
 		runID := e.seedCodexIssueRunWithModel(t, nil)
-		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID))
+		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID), thWithLimit(testCustodyLimit))
 		if got != reasonNoCustomCodexCapableWorker {
 			t.Fatalf("queuedReason = %q, want %q", got, reasonNoCustomCodexCapableWorker)
 		}
@@ -444,7 +444,7 @@ func TestQueuedReasonNoCustomCodexCapableWorkerLiveDB(t *testing.T) {
 	t.Run("custom-capable worker online -> falls through", func(t *testing.T) {
 		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 		runID := e.seedCodexIssueRunWithModel(t, nil)
-		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID))
+		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID), thWithLimit(testCustodyLimit))
 		if got == reasonNoCustomCodexCapableWorker {
 			t.Fatalf("queuedReason = %q, must NOT be the custom-Codex reason when a custom-capable worker is online", got)
 		}

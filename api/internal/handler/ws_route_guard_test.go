@@ -111,7 +111,7 @@ func wsGuardRouter(t *testing.T) (http.Handler, *wsGuardDB, uuid.UUID) {
 	h := &Handler{
 		q:    store.New(db),
 		cfg:  config.Config{JWTSecret: wsGuardSecret, AuthTokenTTL: time.Hour},
-		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{}),
+		wsvc: workersvc.New(st, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		hub:  hub.New(),
 	}
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
