@@ -302,8 +302,8 @@ func TestLayoutMigrationRollSnapshotRefreshesLayout(t *testing.T) {
 }
 
 // B1: a held worker carrying its own incomplete reservation must not wedge its pool.
-// The "canary" variant has no peer, so it pins only the withdrawal of the held
-// canary's reservation and the later roll; re-election among peers is not exercised.
+// The "canary" variant has no peer pool, so it pins only the withdrawal of the held
+// canary's reservation and the later roll.
 // The "participant" variant shares the pool with a promoted canary.
 // The hold withdraws the reservation (metadata only); once custody releases, the
 // worker is admitted afresh and rolls.
@@ -732,12 +732,9 @@ func TestLayoutMigrationFailedWithdrawalSuppressesCohortCompletion(t *testing.T)
 			if err := f.tickErr(t, h, canary); err == nil {
 				t.Fatal("expected the unconfirmed withdrawal to surface as an error")
 			}
-			m, err := decodeRoll(lmAnnotation(t, f, "d2"))
-			if err != nil || m == nil {
-				t.Fatalf("canary marker: %v %v", m, err)
-			}
-			if m.Completed {
-				t.Fatal("the canary was marked Completed in the same tick the held worker's reservation could not be withdrawn")
+			lmAssertCohortFenced(t, f, "d1", "d2")
+			if failure == "mirror" && lmAnnotation(t, f, "d1") == "" {
+				t.Fatal("the deployment marker was withdrawn although the mirror cancel failed")
 			}
 		})
 	}
@@ -812,5 +809,54 @@ func lmDifferingMirror(t *testing.T, objs []runtime.Object, m *rollMarker) {
 		if p, ok := o.(*corev1.PersistentVolumeClaim); ok && p.Name == dataPVCName("d1") {
 			p.Annotations = map[string]string{annotationRoll: string(raw)}
 		}
+	}
+}
+
+// lmAssertCohortFenced: the canary is not Completed and the pool reports the held
+// worker as the reason.
+func lmAssertCohortFenced(t *testing.T, f *lmFixture, held, canary string) {
+	t.Helper()
+	m, err := decodeRoll(lmAnnotation(t, f, canary))
+	if err != nil || m == nil {
+		t.Fatalf("canary marker: %v %v", m, err)
+	}
+	if m.Completed {
+		t.Fatal("the canary was marked Completed in the same tick the held worker's reservation was unresolved")
+	}
+	p := f.m.PacingOutcomes()[canary]
+	if p == nil || p.State != "held" || p.BlockingWorkerID == nil || *p.BlockingWorkerID != held || p.BlockingReason == nil || len(*p.BlockingReason) > 192 {
+		t.Fatalf("canary pacing = %+v, want held, blocked by %s with a short reason", p, held)
+	}
+}
+
+// A held participant already blocked at snapshot time (its claim-mirror cleanup failed)
+// still fences the pool, and rolls once custody releases and the apiserver recovers.
+func TestLayoutMigrationSnapshotBlockedHeldWorkerFencesPool(t *testing.T) {
+	hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: "participant"})
+	cObjs, canary := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "canary", promoted: true})
+	objs := append(hObjs, cObjs...)
+	// An identical mirror makes the snapshot itself try (and here fail) to clear it.
+	for _, o := range objs {
+		if p, ok := o.(*corev1.PersistentVolumeClaim); ok && p.Name == dataPVCName("d1") {
+			p.Annotations = map[string]string{annotationRoll: lmAnnotationOf(t, objs, "d1")}
+		}
+	}
+	f := lmCluster(t, false, objs...)
+	fail := true
+	f.client.PrependReactor("patch", "persistentvolumeclaims", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if fail && a.(k8stesting.PatchAction).GetName() == dataPVCName("d1") {
+			return true, nil, errors.New("injected patch failure")
+		}
+		return false, nil, nil
+	})
+	_ = f.tickErr(t, h, canary)
+	lmAssertCohortFenced(t, f, "d1", "d2")
+	fail = false
+	h.CustodyHeld = false
+	for i := 0; i < 10 && !lmRolled(t, f, "d1"); i++ {
+		_ = f.tickErr(t, h, canary)
+	}
+	if !lmRolled(t, f, "d1") {
+		t.Fatalf("never rolled after release; pacing %+v", f.m.PacingOutcomes()["d1"])
 	}
 }

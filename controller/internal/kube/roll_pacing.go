@@ -65,7 +65,10 @@ type rollTick struct {
 	outcomes  map[string]*protocol.Pacing
 	start     time.Time
 	uncertain map[string]bool
-	errors    []error
+	// layoutUncertain names, per coverage key, the held worker whose own reservation
+	// could not be shown withdrawn (see holdForLayoutMigration).
+	layoutUncertain map[string]string
+	errors          []error
 }
 type rollTickKey struct{}
 
@@ -81,7 +84,7 @@ func (m *Materializer) PacingOutcomes() map[string]*protocol.Pacing {
 }
 
 func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) (*rollTick, []protocol.DesiredWorker) {
-	t := &rollTick{entries: map[string]*rollEntry{}, outcomes: map[string]*protocol.Pacing{}, start: m.now(), uncertain: map[string]bool{}}
+	t := &rollTick{entries: map[string]*rollEntry{}, outcomes: map[string]*protocol.Pacing{}, start: m.now(), uncertain: map[string]bool{}, layoutUncertain: map[string]string{}}
 	if start, ok := reconcile.PollStart(ctx); ok {
 		t.start = start
 	}
@@ -250,23 +253,52 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 // metadata-only (no template or replicas change, no pod replaced) and is the same
 // cancellation planPool already applies to an obsolete marker; the worker simply
 // re-enters admission as a fresh drifted participant after the hold lifts.
+//
+// Whenever an open reservation could not be shown withdrawn (the cancel failed, or
+// the snapshot already left the worker blocked with one still present), the pool is
+// marked uncertain and planPool skips completing its cohort this tick.
+//
+// Invariant relied on: a held canary never has in-flight participants. Participants
+// get roll budget only after the canary is promoted, and a promoted canary is on the
+// target template, so it is not drifted and cannot be held.
 func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, e *rollEntry) {
 	t.outcomes[e.w.ID].State = "held"
 	t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
-	if e.blocked != "" || e.dep == nil || e.marker == nil || e.marker.Completed {
+	fence := func() {
+		key := coverageKey(e.coverage)
+		t.uncertain[key] = true
+		t.layoutUncertain[key] = e.w.ID
+	}
+	if e.blocked != "" {
+		if hasOpenReservation(e) {
+			fence()
+		}
+		return
+	}
+	if e.dep == nil || e.marker == nil || e.marker.Completed {
 		return
 	}
 	if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
 		if err := m.mirrorRoll(ctx, e, nil); err != nil {
 			e.blocked = "held reservation mirror cancellation unconfirmed"
-			t.uncertain[coverageKey(e.coverage)] = true
+			fence()
 			return
 		}
 	}
 	if err := m.reserveRoll(ctx, e, nil); err != nil {
 		e.blocked = "held reservation cancellation unconfirmed"
-		t.uncertain[coverageKey(e.coverage)] = true
+		fence()
 	}
+}
+
+// hasOpenReservation reports any reservation metadata that is not a Completed
+// marker: an incomplete decoded marker, an undecodable or unrestored Deployment
+// annotation, or a retained claim mirror.
+func hasOpenReservation(e *rollEntry) bool {
+	if e.marker != nil {
+		return !e.marker.Completed
+	}
+	return (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != "")
 }
 
 func pacingText(s string) *string {
@@ -475,7 +507,15 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		// A held worker whose own reservation could not be withdrawn marked this pool
 		// uncertain earlier in the tick: completing the canary now would pair a
 		// Completed cohort with that worker's still-incomplete marker.
-		if t.uncertain[coverageKey(pool[0].coverage)] {
+		if key := coverageKey(pool[0].coverage); t.uncertain[key] {
+			if id := t.layoutUncertain[key]; id != "" {
+				for _, e := range pool {
+					p := t.outcomes[e.w.ID]
+					p.State = "held"
+					p.BlockingWorkerID = pacingText(id)
+					p.BlockingReason = pacingText("cohort completion suspended: layout-held worker " + id + " reservation unresolved")
+				}
+			}
 			return
 		}
 		for _, e := range pool {
