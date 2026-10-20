@@ -885,8 +885,11 @@ echo "uzi-seed-nix: seeded"
 // on runner-shared is a sticky directory owned by the worker, and .tmp is a
 // worker-owned directory inside it: the rootless daemon (uid 1000), the uid-split
 // runner (10002) and runner-cmd (10003) own neither, so rename/unlink of .tmp fail
-// with EPERM. The -L/-d checks here only reject state a previous boot or an earlier
-// principal left behind.
+// with EPERM. That holds for the rootless posture only: a rootful (privileged) daemon,
+// or a root container it runs, can still replace .tmp, and since the PVC persists the
+// next boot then refuses here until an operator repairs the volume (ADR-3153). The
+// -L/-d checks here only reject state a previous boot or an earlier principal left
+// behind.
 func runnerInitScript() string {
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -1412,8 +1415,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 				VolumeMounts: workerMounts,
 			}},
 			// Built above: [token, data, nix, codex-cmd-cache] plus, for a docker worker, the daemon's
-			// private data-root PVC (issue #224 M-a) + the shared run workdir emptyDir
-			// (and, rootless only, the shared socket-dir emptyDir).
+			// private data-root PVC (issue #224 M-a) (and, rootless only, the shared socket-dir
+			// emptyDir). The shared run workdir is a subPath mount of data, not a volume.
 			Volumes: volumes,
 		},
 	}
