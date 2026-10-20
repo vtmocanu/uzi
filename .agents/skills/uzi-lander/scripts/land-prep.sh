@@ -335,9 +335,14 @@ union_continue() {
 MERGE_CL_SAVED=""
 restore_merge_changelog() {
   [ -n "$MERGE_CL_SAVED" ] || return 0
-  cp "$MERGE_CL_SAVED/git-conflict" CHANGELOG.md || log "ERROR: could not restore git's CHANGELOG.md conflict text from $MERGE_CL_SAVED"
-  rm -rf "$MERGE_CL_SAVED"; MERGE_CL_SAVED=""
   trap - INT TERM HUP
+  if ! cp "$MERGE_CL_SAVED/git-conflict" CHANGELOG.md; then
+    # Keep the only copy of git's conflict text; the worktree's CHANGELOG.md is not it.
+    log "ERROR: could not restore git's CHANGELOG.md conflict text in $WT; it is kept at $MERGE_CL_SAVED/git-conflict"
+    echo "RESULT=restore_failed BACKUP=$MERGE_CL_SAVED/git-conflict WORKTREE=$WT"
+    exit 3
+  fi
+  rm -rf "$MERGE_CL_SAVED"; MERGE_CL_SAVED=""
 }
 merge_union_continue() {
   local conflicted stages s1 s2 s3 d cu_out rc

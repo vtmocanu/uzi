@@ -184,6 +184,26 @@ s3=$(git -C "$WT" ls-files -u -- CHANGELOG.md | awk '$3 == 3 { print $2 }')
 grep -q '^<<<<<<< HEAD' "$WT/CHANGELOG.md" || fail "C: git's own conflict text was not restored: $(cat "$WT/CHANGELOG.md")"
 grep -q '^<<<<<<< origin/main' "$WT/CHANGELOG.md" && fail "C: the regenerated orientation leaked into the worktree"
 git -C "$WT" merge --abort
+# C2. ...and when putting git's conflict text back fails, the saved copy is kept and named,
+#     exit 3 (never a quiet exit 5 over a CHANGELOG.md that is not git's).
+GIT_CONFLICT=$(git -C "$WT" -c merge.conflictStyle=diff3 merge -q --no-ff --no-edit origin/main >/dev/null 2>&1; cat "$WT/CHANGELOG.md")
+git -C "$WT" merge --abort
+REAL_CP=$(command -v cp)
+cat > "$WORK/bin/cp" <<STUB
+#!/usr/bin/env bash
+if [ "\${2:-}" = CHANGELOG.md ]; then echo "cp: simulated restore failure" >&2; exit 1; fi
+exec "$REAL_CP" "\$@"
+STUB
+chmod +x "$WORK/bin/cp"
+run mc 403 --no-push
+rm -f "$WORK/bin/cp"
+[ "$rc" -eq 3 ] || fail "C2: a failed restore returned rc=$rc, want 3: $(out 403)"
+grep -q "ERROR: could not restore git's CHANGELOG.md conflict text" "$WORK/out.403" || fail "C2: the failed restore was not named: $(out 403)"
+backup=$(sed -n 's/^RESULT=restore_failed BACKUP=\([^ ]*\) .*/\1/p' "$WORK/out.403")
+[ -n "$backup" ] && [ -f "$backup" ] || fail "C2: the saved conflict text was not kept: $(out 403)"
+[ "$(cat "$backup")" = "$GIT_CONFLICT" ] || fail "C2: the kept copy is not git's conflict text"
+rm -rf "$(dirname "$backup")"
+git -C "$WT" merge --abort
 
 # D. a non-CHANGELOG conflict stops mid-merge on the branch; an unconcluded merge is refused
 #    even with a clean tree; committing it lets --skip-rebase continue.
