@@ -37,7 +37,7 @@ wait_status "$RUN_RV" awaiting_approval
 RV_GATE_V1_JSON="$(apiget "/api/runs/$RUN_RV")"
 PLAN_V1="$(printf '%s\n' "$RV_GATE_V1_JSON" | jq -r '.run.plan_md // empty')"
 printf '%s\n' "$RV_GATE_V1_JSON" | jq -e --arg run "$RUN_RV" \
-  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not)' >/dev/null \
+  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
   || fail "production revision gate was inconsistent or exposed dormant semantic data"
 [ -n "$PLAN_V1" ] || fail "revise-path run reached the v1 gate with no plan_md"
 pass "run $RUN_RV reached the v1 plan gate (awaiting_approval) with a plan"
@@ -72,7 +72,7 @@ printf '%s' "$PLAN_V2" | grep -q '(revision 1: applied feedback)' \
   || fail "v2 plan_md never picked up the stub revision marker (got: ${PLAN_V2:-none})"
 [ "$PLAN_V2" != "$PLAN_V1" ] || fail "v2 plan_md is identical to v1 (the revision did not take)"
 printf '%s\n' "$RV_GATE_V2_JSON" | jq -e --arg run "$RUN_RV" \
-  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not)' >/dev/null \
+  '.run | .id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
   || fail "production revised gate was inconsistent or exposed dormant semantic data"
 [ "$(apiget "/api/runs/$RUN_RV/messages" | jq '[.messages[] | select(.kind=="plan")] | length')" -ge 2 ] \
   || fail "expected >=2 'plan' messages after the revision round (v1 + v2)"

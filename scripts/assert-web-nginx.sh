@@ -180,7 +180,7 @@ cat > "$W/stub.conf" <<'STUBCONF'
 server {
     listen 8080;
     gzip off;
-    location ~ "^/api/runs/[0-9a-fA-F-]{36}/inputs$" {
+    location ~ "^/api/runs/[0-9a-fA-F-]{36}/(inputs|completion/decision)$" {
         client_max_body_size 18m;
         return 200 '{"input":"STUB-SEMANTIC-INPUT"}';
     }
@@ -373,11 +373,14 @@ for v in $VARIANTS; do
     fetch "$v-apifiles" "$port" /api/v1/files
     check "/api/v1/files: status 200 (got $STATUS)" has_status 200
     check "/api/v1/files: reaches the stub" raw_eq "$v-apifiles" "$STUB/files.json"
-    owner_input=/api/runs/12345678-1234-4123-8123-123456789012/inputs
-    fetch "$v-input-exact" "$port" "$owner_input" -X POST --data-binary "@$W/approval-exact.bin"
-    check "semantic input: exact 17 MiB reaches upstream (got $STATUS)" has_status 200
-    fetch "$v-input-over" "$port" "$owner_input" -X POST --data-binary "@$W/approval-over.bin"
-    check "semantic input: 17 MiB plus one byte rejected (got $STATUS)" has_status 413
+    for owner_path in inputs completion/decision; do
+      owner_input=/api/runs/12345678-1234-4123-8123-123456789012/$owner_path
+      owner_tag=${owner_path//\//-}
+      fetch "$v-$owner_tag-exact" "$port" "$owner_input" -X POST --data-binary "@$W/approval-exact.bin"
+      check "semantic $owner_path: exact 17 MiB reaches upstream (got $STATUS)" has_status 200
+      fetch "$v-$owner_tag-over" "$port" "$owner_input" -X POST --data-binary "@$W/approval-over.bin"
+      check "semantic $owner_path: 17 MiB plus one byte rejected (got $STATUS)" has_status 413
+    done
     fetch "$v-ordinary-over" "$port" /api/identity -X POST --data-binary "@$W/ordinary-over.bin"
     check "ordinary API: 1 MiB plus one byte rejected (got $STATUS)" has_status 413
     fetch "$v-worker-over" "$port" "/api/worker/runs/12345678-1234-4123-8123-123456789012/inputs" -X POST --data-binary "@$W/ordinary-over.bin"

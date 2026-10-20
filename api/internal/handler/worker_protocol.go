@@ -1431,7 +1431,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// NULL), at any generation; it proves neither a newer claim nor a landed outcome.
 			httpx.ErrorReason(w, http.StatusNotFound, "run not found for this worker", "run_not_owned")
 		case errors.Is(err, workersvc.ErrRunWallExpired):
-			ack := h.workerStateAck(r, run)
+			ack, ackErr := h.workerStateAck(r, run)
+			if ackErr != nil {
+				httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+				return
+			}
 			ack["applied"] = false
 			ack["reason"] = "wall_expired"
 			httpx.JSON(w, http.StatusConflict, ack)
@@ -1465,7 +1469,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		ack := h.workerStateAck(r, run)
+		ack, ackErr := h.workerStateAck(r, run)
+		if ackErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+			return
+		}
 		if req.RequireRunning {
 			ack["applied"] = false
 			if run.Status == "running" && run.PauseMode.String == "wall" {
@@ -1475,7 +1483,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
-	ack := h.workerStateAck(r, run)
+	ack, ackErr := h.workerStateAck(r, run)
+	if ackErr != nil {
+		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+		return
+	}
 	if result.RevisionInputID != nil {
 		ack["revision_input_id"] = *result.RevisionInputID
 		ack["superseded_revision_input_ids"] = append([]int64{}, result.SupersededRevisionInputIDs...)
@@ -1529,12 +1541,18 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 // D3/D4). It is shared by the 200 ack and the ORDINARY not-applied 409 ack — both hand back a run
 // the worker may still be holding, so both must carry the switch signal. It is deliberately NOT
 // used for the stale_claim 409 disposition, which already tells the worker to STOP the flight.
-func (h *Handler) workerStateAck(r *http.Request, run store.Run) map[string]any {
-	ack := map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)}
+func (h *Handler) workerStateAck(r *http.Request, run store.Run) (map[string]any, error) {
+	pending, err := workersvc.CompletionPending(run)
+	if err != nil {
+		return nil, err
+	}
+	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto.CompletionPending = pending
+	ack := map[string]any{"run": dto}
 	if sig := workersvc.PendingCredentialSwitchSignal(run); sig != nil {
 		ack["credential_switch"] = sig
 	}
-	return ack
+	return ack, nil
 }
 
 // WorkerRunInputs consumes and returns any pending steering inputs, FIFO.

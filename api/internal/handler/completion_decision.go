@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -15,21 +16,27 @@ import (
 // #1227 M1): the owner/admin decision on a completion-blocked run. Decision is one of:
 //
 //   - "continue" (#1226, owner-only): resume with optional guidance (capped by MaxGuidanceBytes).
+//
 //   - "partial" (#1227, owner/admin): reduce scope to the keep milestone-id set, with a required
 //     reason and the fenced contract_revision.
+//
 //   - "accept" (#1227, owner/admin): accept the criteria criterion-id set, with a required reason
 //     and the fenced contract_revision.
+//
+//   - "authorize_maintainer": owner-only renewal of exact existing semantic maintainer
+//     UUIDs, conditions and verification steps in maintainers, with a fenced revision.
 //
 // Any other value is a 400. The service (DecideCompletion) performs the ID validation, revision
 // fence and transaction; the handler validates the request SHAPE (decision domain, reason cap +
 // non-empty for partial/accept) and maps the typed errors to status codes.
 type completionDecisionRequest struct {
-	Decision         string   `json:"decision"`
-	Guidance         string   `json:"guidance"`
-	Keep             []string `json:"keep"`
-	Criteria         []string `json:"criteria"`
-	Reason           string   `json:"reason"`
-	ContractRevision int      `json:"contract_revision"`
+	Maintainers      []apitypes.SemanticMaintainerApproval `json:"maintainers"`
+	Decision         string                                `json:"decision"`
+	Guidance         string                                `json:"guidance"`
+	Keep             []string                              `json:"keep"`
+	Criteria         []string                              `json:"criteria"`
+	Reason           string                                `json:"reason"`
+	ContractRevision int                                   `json:"contract_revision"`
 }
 
 // ContinueCompletionDecision records the owner's decision on a completion-blocked run (PRD
@@ -53,7 +60,7 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var req completionDecisionRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	if err := h.decodeSemanticCompletionDecision(r, user.ID, runID, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
@@ -63,7 +70,7 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 			httpx.Error(w, http.StatusBadRequest, "guidance is too long")
 			return
 		}
-	case "partial", "accept":
+	case "partial", "accept", "authorize_maintainer":
 		if len(req.Reason) > MaxGuidanceBytes {
 			httpx.Error(w, http.StatusBadRequest, "reason is too long")
 			return
@@ -73,12 +80,13 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 			return
 		}
 	default:
-		httpx.Error(w, http.StatusBadRequest, "decision must be one of \"continue\", \"partial\", \"accept\"")
+		httpx.Error(w, http.StatusBadRequest, "decision must be one of \"continue\", \"partial\", \"accept\", \"authorize_maintainer\"")
 		return
 	}
 
 	run, err := h.wsvc.DecideCompletion(r.Context(), user.ID, runID, workersvc.CompletionDecisionInput{
 		Decision:         req.Decision,
+		Maintainers:      req.Maintainers,
 		Guidance:         req.Guidance,
 		Keep:             req.Keep,
 		Criteria:         req.Criteria,
@@ -101,5 +109,11 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto.CompletionPending, err = workersvc.CompletionPending(run)
+	if err != nil {
+		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": dto})
 }

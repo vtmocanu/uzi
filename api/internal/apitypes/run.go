@@ -205,12 +205,13 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
-	SemanticGate                                   *SemanticGateDTO   `json:"semantic_gate,omitempty"`
-	ResetStateDigest                               string             `json:"reset_state_digest,omitempty"`
-	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
-	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
-	WorkerRecovery                                 *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
-	MemoryHold                                     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
+	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
+	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
+	ResetStateDigest                               string                `json:"reset_state_digest,omitempty"`
+	MilestoneReconciliations                       []json.RawMessage     `json:"milestone_reconciliations,omitempty"`
+	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
+	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
+	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for

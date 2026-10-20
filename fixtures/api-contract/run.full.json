@@ -1,4 +1,25 @@
 {
+  "completion_pending": {
+    "version": 1,
+    "contract_revision": 1,
+    "criteria": [
+      {
+        "criterion_id": "x",
+        "milestone_id": "x",
+        "kind": "x",
+        "text": "x",
+        "reason": "x",
+        "conditions": [
+          "x"
+        ],
+        "verification_steps": [
+          "x"
+        ],
+        "authorization_revision": 1,
+        "status": "x"
+      }
+    ]
+  },
   "semantic_gate": {
     "presentation": {
       "candidate": {

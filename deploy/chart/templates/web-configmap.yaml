@@ -73,7 +73,7 @@ data:
 
         # Exact semantic approval echoes (#1230). The API still applies the
         # ordinary 1 MiB input limit and exact owner/presentation authority.
-        location ~ "^/api/runs/[0-9a-fA-F-]{36}/inputs$" {
+        location ~ "^/api/runs/[0-9a-fA-F-]{36}/(inputs|completion/decision)$" {
             gzip off;
             client_max_body_size 17m;
             proxy_request_buffering on;
