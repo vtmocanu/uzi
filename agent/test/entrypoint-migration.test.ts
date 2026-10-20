@@ -1409,7 +1409,8 @@ describe("PRD #1493 M2: legacy run HOME survives migration and still validates (
 // Issue #3153: the Docker-lane TMPDIR carve-out (`/data/runner/.tmp`) and the per-uid scratch
 // under it. `/data/runner` is a subPath of the PERSISTENT data volume, so nothing there is ever
 // recursively wiped or re-owned: an existing leaf is adopted only when it is a real directory
-// owned by its expected user with mode exactly 0700, anything else fails startup closed.
+// owned by its expected user (runner leaf: any mode; worker leaf: no group/other write), then
+// normalised leaf-only to 0700; anything else fails startup closed.
 // ---------------------------------------------------------------------------------------------
 describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, record-only)", () => {
   interface Lane { h: Harness; runnerRoot: string; carve: string; worker: string; runner: string }
@@ -1444,8 +1445,8 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch an adopted leaf");
       assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm on the Docker lane");
       assert.ok(!r.ops.some((o) => o.startsWith("chown -R") && o.includes(".tmp")), "no recursive chown of the carve-out");
-      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=2\n`), r.stderr);
-      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.runner} entries=2\n`), r.stderr);
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=2 previous_mode=700\n`), r.stderr);
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.runner} entries=2 previous_mode=700\n`), r.stderr);
       assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
       assert.equal(fs.readFileSync(path.join(l.runner, "PRECIOUS"), "utf8"), "x");
       assert.equal(r.env.get("TMPDIR"), l.worker);
@@ -1480,10 +1481,38 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
     } finally { cleanup(l); }
   });
 
+  // Adoption of a wider-mode leaf normalises THE LEAF ONLY (reclaim -> chmod 00700 -> hand-back),
+  // never recursively, never with rm.
+  for (const [name, setup, mode, which] of [
+    ["a runner leaf at 755", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o755); }, "755", "runner"],
+    ["a runner leaf at 2777", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o2777); }, "2777", "runner"],
+    ["a worker leaf at 750", (x: Lane) => { leaf(x.worker, 0o750); leaf(x.runner); }, "750", "worker"],
+  ] as const) {
+    it(`adopts ${name} and normalises the leaf only`, () => {
+      const l = lane(setup);
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+        assert.equal(r.status, 0, r.stderr);
+        const dir = which === "runner" ? l.runner : l.worker;
+        const owner = which === "runner" ? "runner:runner" : "worker:worker";
+        const reclaim = r.ops.indexOf(`chown -h 0:0 ${dir}`);
+        const chmod = r.ops.indexOf(`chmod 00700 ${dir}`);
+        const handback = r.ops.indexOf(`chown -h ${owner} ${dir}`);
+        assert.ok(reclaim >= 0 && chmod > reclaim && handback > chmod, `ops: ${r.ops.join(" | ")}`);
+        assert.deepEqual(touching(r.ops, dir).sort(), [`chmod 00700 ${dir}`, `chown -h 0:0 ${dir}`, `chown -h ${owner} ${dir}`].sort(), "leaf-only ops");
+        assert.ok(!touching(r.ops, l.carve).some((o) => /^(chown|chmod) (-R|.* -R)/.test(o)), "no recursive op under the carve-out");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm");
+        assert.ok(r.stderr.includes(`${dir} entries=2 previous_mode=${mode}\n`), r.stderr);
+        assert.equal(fs.readFileSync(path.join(dir, "PRECIOUS"), "utf8"), "x");
+      } finally { cleanup(l); }
+    });
+  }
+
   for (const [name, setup, env, reason] of [
     ["a leaf owned by someone else", (x: Lane) => { leaf(x.worker); leaf(x.runner); }, { STUB_OWNER_RUNNER: "worker" }, /owner is worker, expected runner/],
-    ["a leaf with a wider mode", (x: Lane) => { leaf(x.worker, 0o755); leaf(x.runner); }, {}, /mode is 755, expected 700/],
-    ["a leaf with extra setgid", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o2700); }, {}, /mode is 2700, expected 700/],
+    ["a worker leaf owned by someone else", (x: Lane) => { leaf(x.worker); leaf(x.runner); }, { STUB_OWNER_WORKER: "runner" }, /owner is runner, expected worker/],
+    ["a worker leaf at 770", (x: Lane) => { leaf(x.worker, 0o770); leaf(x.runner); }, {}, /mode is 770, group\/other write set/],
+    ["a worker leaf at 2770 (fsGroup re-walk)", (x: Lane) => { leaf(x.worker, 0o2770); leaf(x.runner); }, {}, /mode is 2770, group\/other write set/],
   ] as const) {
     it(`fails closed on ${name}: non-zero exit, specific message, nothing removed, re-owned or re-moded`, () => {
       const l = lane(setup);

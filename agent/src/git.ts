@@ -1565,9 +1565,11 @@ const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
 const RETIRE_SCRATCH_REPORTED_PATHS = 10;
 /** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
  *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
- *  with an emptyDir. This per-process counter makes every best-effort removal that fails visible
- *  (it is bumped, with a specific warning, by {@link GitCache.removeBestEffort} and by
- *  `deleteRetainedArtifact`). It confers no deletion authority and drives no reclaim. */
+ *  with an emptyDir. This per-process counter counts FAILED REMOVAL ATTEMPTS (not distinct paths:
+ *  the same path failing on two attempts counts twice) that leave bytes retained, for any error
+ *  class except ENOENT. It is bumped, with a specific warning, by {@link GitCache.removeBestEffort}
+ *  and by `deleteRetainedArtifact`; the `retainedUndeletable` log fields carry this same count. It
+ *  confers no deletion authority and drives no reclaim. */
 let retainedUndeletable = 0;
 export function retainedUndeletableCount(): number {
   return retainedUndeletable;
@@ -3337,13 +3339,14 @@ export class GitCache {
       this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: sanitizeForLog(why, 157) });
       return false;
     };
-    // issue #3153: a permission/occupancy failure is counted (retainedUndeletable) and logged with
-    // its errno; the artifact stays retained. Returns false for any other failure class so the
-    // caller keeps its existing diagnostic.
+    // issue #3153: EVERY failed removal attempt (any error class; ENOENT never reaches here) is
+    // counted (retainedUndeletable, failed-removal attempts) and the artifact stays retained. A
+    // permission/occupancy errno additionally gets the specific warning below; it returns false
+    // for any other failure class so the caller keeps its existing diagnostic.
     const noteUndeletable = (err: unknown): boolean => {
+      retainedUndeletable++;
       const code = undeletableCode(err);
       if (code === undefined) return false;
-      retainedUndeletable++;
       this.log.warn("runner clone retention: could not delete (not permitted); keeping it", {
         path: target, code, retainedUndeletable,
       });
@@ -10095,12 +10098,14 @@ export class GitCache {
     if (holding && opts.discard && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
+      await fs.rm(holding, { recursive: true, force: true }).catch((e) => {
+        retainedUndeletable++;
         this.log.warn("retireRunnerClone: holding dispose failed", {
           path: holding,
           error: gitErrorMessage(e),
-        }),
-      );
+          retainedUndeletable,
+        });
+      });
     }
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
@@ -10159,7 +10164,7 @@ export class GitCache {
     if (retained.length > 0) {
       this.log.warn("runner retire scratch retained", {
         count: retained.length,
-        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS),
+        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(p, 157)),
         removedEmpty: removed,
       });
     }
@@ -10169,7 +10174,8 @@ export class GitCache {
   /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
    *  runner/TMPDIR tree (or its holding sibling). Never throws where the old `.catch(() => undefined)`
    *  swallowed; a failure (ENOENT aside, which `force` already tolerates) is counted in
-   *  `retainedUndeletable` and logged with the path and errno so a persistent-volume leak is visible.
+   *  `retainedUndeletable` (failed-removal attempts) and logged with the path and errno so a
+   *  persistent-volume leak is visible.
    *  Returns true when the target is gone. `emptyDir` is a non-recursive rmdir. */
   private async removeBestEffort(target: string, site: string, kind: "tree" | "file" | "emptyDir" = "tree"): Promise<boolean> {
     try {
@@ -11230,8 +11236,8 @@ export class GitCache {
       });
       return { trusted, findings };
     } finally {
-      await fs.rm(configPath, { force: true }).catch(() => undefined);
-      await fs.rm(reportPath, { force: true }).catch(() => undefined);
+      await this.removeBestEffort(configPath, "gitleaks-config", "file");
+      await this.removeBestEffort(reportPath, "gitleaks-report", "file");
     }
   }
 

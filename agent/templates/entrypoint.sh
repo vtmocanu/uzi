@@ -578,13 +578,19 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
   # DOCKER LANE: the per-uid scratch lives on the persistent volume and writer exclusion
   # cannot be established from here. A rootful daemon can write anywhere whatever the
   # ownership, and a lingering old pod that still co-mounts the RWO volume may be writing its
-  # own scratch. So nothing here is ever recursively wiped, re-owned or re-moded. An existing
-  # leaf is ADOPTED only when it is a real directory owned by its expected user with mode
-  # exactly 0700 (only that user, or root, could have placed content in it); anything else
+  # own scratch. So nothing here is ever recursively wiped, re-owned or re-moded: only the
+  # LEAF itself is normalised to 0700. An existing leaf is ADOPTED when it is a real directory
+  # owned by its expected user. uzi-runner is runner-owned (the untrusted runner can chmod it,
+  # so a persisted mode is no evidence of tampering and a refusal would be a runner-triggerable
+  # durable outage): it is adopted at ANY mode. uzi-worker is worker-owned (the runner cannot
+  # chmod it): it is adopted only with no group/other WRITE bit (mode & 022 == 0), so an
+  # fsGroup re-walk to 2770 still fails startup closed. A wrong owner, symlink or non-directory
   # fails startup closed with the contents untouched. An absent leaf is created fresh.
   SCRATCH_REASON=
-  scratch_check() { # $1 path, $2 expected owner name; sets SCRATCH_REASON (empty = adoptable or absent)
+  SCRATCH_PREV_MODE=
+  scratch_check() { # $1 path, $2 expected owner name, $3 runner|worker; sets SCRATCH_REASON / SCRATCH_PREV_MODE
     SCRATCH_REASON=
+    SCRATCH_PREV_MODE=
     if [ -L "$1" ]; then SCRATCH_REASON="is a symlink"; return 0; fi
     [ -e "$1" ] || return 0
     if [ ! -d "$1" ]; then SCRATCH_REASON="is not a directory"; return 0; fi
@@ -593,10 +599,13 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
     fi
     sc_owner="${sc_posture%% *}"
     sc_mode="${sc_posture#* }"
+    case "$sc_mode" in "" | *[!0-7]*) SCRATCH_REASON="mode could not be read"; return 0 ;; esac
     if [ "$sc_owner" != "$2" ]; then
       SCRATCH_REASON="owner is $sc_owner, expected $2"
-    elif [ "$sc_mode" != 700 ]; then
-      SCRATCH_REASON="mode is $sc_mode, expected 700"
+    elif [ "$3" = worker ] && [ $((0$sc_mode & 022)) -ne 0 ]; then
+      SCRATCH_REASON="mode is $sc_mode, group/other write set"
+    else
+      SCRATCH_PREV_MODE="$sc_mode"
     fi
   }
   scratch_refuse() { # $1 path, $2 reason
@@ -612,19 +621,26 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
     echo "$sc_n"
   }
   # Validate BOTH leaves before touching either, so a refusal changes nothing.
-  scratch_check "$WORKER_TMPDIR" worker
+  scratch_check "$WORKER_TMPDIR" worker worker
   [ -z "$SCRATCH_REASON" ] || scratch_refuse "$WORKER_TMPDIR" "$SCRATCH_REASON"
-  scratch_check "$RUNNER_TMPDIR" runner
+  sc_worker_prev="$SCRATCH_PREV_MODE"
+  scratch_check "$RUNNER_TMPDIR" runner runner
   [ -z "$SCRATCH_REASON" ] || scratch_refuse "$RUNNER_TMPDIR" "$SCRATCH_REASON"
-  for sc_leaf in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
-    if [ -e "$sc_leaf" ]; then
-      echo "uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): $sc_leaf entries=$(scratch_entries "$sc_leaf")" >&2
-    fi
-  done
-  for sc_pair in "$WORKER_TMPDIR|$WORKER_OWNER" "$RUNNER_TMPDIR|runner:runner"; do
+  sc_runner_prev="$SCRATCH_PREV_MODE"
+  for sc_pair in "$WORKER_TMPDIR|$WORKER_OWNER|$sc_worker_prev" "$RUNNER_TMPDIR|runner:runner|$sc_runner_prev"; do
     sc_leaf="${sc_pair%%|*}"
-    sc_owner="${sc_pair#*|}"
-    if [ ! -e "$sc_leaf" ]; then
+    sc_rest="${sc_pair#*|}"
+    sc_owner="${sc_rest%%|*}"
+    sc_prev="${sc_rest#*|}"
+    if [ -e "$sc_leaf" ]; then
+      echo "uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): $sc_leaf entries=$(scratch_entries "$sc_leaf") previous_mode=$sc_prev" >&2
+      if [ "$sc_prev" != 700 ]; then
+        # Leaf only, root has no CAP_FOWNER/FSETID semantics: reclaim to root, chmod, hand back.
+        "$CHOWN" -h 0:0 "$sc_leaf"
+        "$CHMOD" 00700 "$sc_leaf"
+        "$CHOWN" -h "$sc_owner" "$sc_leaf"
+      fi
+    else
       "$MKDIR" "$sc_leaf"
       if [ -L "$sc_leaf" ]; then scratch_refuse "$sc_leaf" "became a symlink while being created"; fi
       "$CHMOD" 00700 "$sc_leaf"

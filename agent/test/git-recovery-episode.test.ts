@@ -1593,10 +1593,11 @@ for (const settled of [false, true]) {
     });
 }
 
-// Issue #3153: `<dataDir>/runner` persists across a pod replacement on the Docker lane, so a
-// journaled clone that survived must be discovered by a fresh worker process. The clone path is
-// the only thing a restart used to remove; these pin that nothing else gates discovery.
-test("a journaled clone that survives a simulated restart under runnerRoot is discovered without source_missing (#3153)", async () => {
+// Issue #3153 PIN tests: `<dataDir>/runner` persists across a pod replacement on the Docker lane,
+// so a journaled clone that survived must be discovered by a fresh worker process. These pass on
+// the pre-fix agent code too (the pre-fix loss came from the emptyDir mount, not agent code); they
+// pin that nothing in the agent gates discovery of surviving bytes.
+test("pin: a journaled clone that survives a simulated restart under runnerRoot is discovered without source_missing (#3153)", async () => {
   const restarted = recreate(); // fresh GitCache over the same dataDir, as after a pod replacement
   const found = await restarted.discoverRetainedRecovery(fx.originPath, branch, key, runId);
   assert.equal(found?.journal.clonePath, source.clonePath);
@@ -1610,7 +1611,7 @@ test("a journaled clone that survives a simulated restart under runnerRoot is di
   assert.equal((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))?.journal.clonePath, source.clonePath);
 });
 
-test("retained predecessor residue survives a simulated restart and is still inventoried (#3153)", async () => {
+test("pin: retained predecessor residue survives a simulated restart and is still inventoried (#3153)", async () => {
   const { tip, successor } = await ready();
   const restarted = recreate();
   const inventory = await restarted.readInventoryCloneHeads(bare, runId);
