@@ -1592,3 +1592,33 @@ for (const settled of [false, true]) {
       assert.deepEqual(journal().retainedSources, before.retainedSources);
     });
 }
+
+// Issue #3153: `<dataDir>/runner` persists across a pod replacement on the Docker lane, so a
+// journaled clone that survived must be discovered by a fresh worker process. The clone path is
+// the only thing a restart used to remove; these pin that nothing else gates discovery.
+test("a journaled clone that survives a simulated restart under runnerRoot is discovered without source_missing (#3153)", async () => {
+  const restarted = recreate(); // fresh GitCache over the same dataDir, as after a pod replacement
+  const found = await restarted.discoverRetainedRecovery(fx.originPath, branch, key, runId);
+  assert.equal(found?.journal.clonePath, source.clonePath);
+  assert.ok(fs.statSync(path.join(source.clonePath, ".git")).isDirectory());
+  // checkedRecovery (reached through a reservation) also passes: no RetainedRecoveryBlockedError.
+  const reservation = await restarted.reserveRecoveryIteration(bare, branch, key, source);
+  assert.equal(reservation.attempts, 1);
+  assert.notEqual(journal().recovery?.stage, "blocked");
+  // a persistent TMPDIR carve-out beside the clones is not a recovery source and changes nothing
+  fs.mkdirSync(path.join(fx.dataDir, "runner", ".tmp", "uzi-worker"), { recursive: true });
+  assert.equal((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))?.journal.clonePath, source.clonePath);
+});
+
+test("retained predecessor residue survives a simulated restart and is still inventoried (#3153)", async () => {
+  const { tip, successor } = await ready();
+  const restarted = recreate();
+  const inventory = await restarted.readInventoryCloneHeads(bare, runId);
+  assert.equal(inventory.kind, "verified");
+  if (inventory.kind === "verified") {
+    assert.ok(inventory.clones.some(clone => clone.clonePath === source.clonePath), "predecessor discovered");
+  }
+  assert.ok(fs.existsSync(source.clonePath), "predecessor clone untouched by the restart");
+  assert.ok(fs.existsSync(successor.path));
+  assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+});

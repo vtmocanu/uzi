@@ -391,6 +391,10 @@ if [ ! -f "$LEGACY_SENTINEL" ]; then
       for c in "$DATA_DIR/$tree"/* "$DATA_DIR/$tree"/.[!.]* "$DATA_DIR/$tree"/..?*; do
         [ -e "$c" ] || continue
         [ -L "$c" ] && continue                          # never dereference an attacker-planted symlink into a chown -R
+        # issue #3153: the controller's runner-init owns the TMPDIR carve-out (worker:worker 0755,
+        # inside this sticky root). Re-owning it runner:runner would hand the worker's tmp to the
+        # runner uid, so the legacy migration never touches it.
+        if [ "$tree" = runner ] && [ "$c" = "$DATA_DIR/runner/.tmp" ]; then continue; fi
         "$CHOWN" -R runner:runner "$c"
       done
     fi
@@ -497,56 +501,176 @@ fi
 # we `chown 0:0` each dir back to root (CAP_CHOWN, which the root startup window has; no
 # CAP_FOWNER needed) and then chmod — so an unconditional chmod can never EPERM here.
 #
-# DOCKER-LANE TMPDIR (PRD #1493 M2 change 2 / coupling #2): the k8s docker lane pre-sets an
-# ambient TMPDIR to the DinD-shared run workdir (render_dind.go: /data/runner) so a
-# `docker run -v <src>` bind source staged under $TMPDIR resolves in the daemon's filesystem.
-# When that ambient TMPDIR is present, derive BOTH private per-uid tmpdirs BENEATH it (still
-# one per uid, still 0700, still worker-/runner-owned) so bind sources stay inside the shared
-# workdir. With no ambient TMPDIR (compose, and plain-lane k8s), keep /tmp/uzi-worker +
-# /tmp/uzi-runner EXACTLY as before.
-if [ -n "${TMPDIR:-}" ]; then
-  WORKER_TMPDIR="$TMPDIR/uzi-worker"
-  RUNNER_TMPDIR="$TMPDIR/uzi-runner"
+# DOCKER-LANE TMPDIR (PRD #1493 M2 change 2 / coupling #2; issue #3153): the k8s docker lane
+# sets an ambient TMPDIR on the DinD-shared run workdir so a `docker run -v <src>` bind source
+# staged under $TMPDIR resolves in the daemon's filesystem. That workdir (/data/runner) is a
+# subPath of the PERSISTENT data volume, so it SURVIVES a pod replacement and a boot-time wipe
+# of anything under it would delete content this entrypoint cannot prove is orphaned. Two shapes:
+#   * TMPDIR == $DATA_DIR/runner (a controller that predates issue #3153): the runner root
+#     itself. Handled as before for the root; the per-uid scratch under it follows the
+#     Docker-lane adopt-or-refuse rule below.
+#   * TMPDIR strictly below $DATA_DIR/runner (the carve-out, /data/runner/.tmp): a carve-out
+#     root created by the controller's runner-init (worker:worker 0755, inside the sticky
+#     3775 runner root, which is what stops a runner-uid process replacing it). It is
+#     re-asserted here every boot, and refused if it is a symlink or not a directory.
+# Either way BOTH private per-uid tmpdirs live BENEATH TMPDIR (still one per uid, still 0700,
+# worker-/runner-owned) so bind sources stay inside the shared workdir. With TMPDIR unset
+# (compose, and plain-lane k8s), /tmp/uzi-worker + /tmp/uzi-runner are kept EXACTLY as before.
+TMPDIR_NORM="${TMPDIR:-}"
+while [ "${TMPDIR_NORM%/}" != "$TMPDIR_NORM" ] && [ -n "${TMPDIR_NORM%/}" ]; do
+  TMPDIR_NORM="${TMPDIR_NORM%/}"
+done
+RUNNER_ROOT="$DATA_DIR/runner"
+SCRATCH_DOCKER_LANE=
+SCRATCH_CARVEOUT=
+case "$TMPDIR_NORM" in
+  "$RUNNER_ROOT") SCRATCH_DOCKER_LANE=1 ;;
+  "$RUNNER_ROOT"/*) SCRATCH_DOCKER_LANE=1; SCRATCH_CARVEOUT="$TMPDIR_NORM" ;;
+esac
+if [ -n "$TMPDIR_NORM" ]; then
+  WORKER_TMPDIR="$TMPDIR_NORM/uzi-worker"
+  RUNNER_TMPDIR="$TMPDIR_NORM/uzi-runner"
 else
   WORKER_TMPDIR=/tmp/uzi-worker
   RUNNER_TMPDIR=/tmp/uzi-runner
 fi
-# HARDEN ADOPTION (PRD #1493 rework / CWE-732 CodeRabbit): TMPDIR is an ambient, possibly
-# PERSISTENT shared volume on the docker lane (render_dind.go pre-sets it to /data/runner),
-# so an untrusted principal can pre-create uzi-worker/uzi-runner. `mkdir -p` NO-OPS on an
-# existing dir (it keeps that dir's mode AND contents), and a planted SYMLINK at that name
-# would make the chmod/chown below DEREFERENCE onto its target. A persistent docker-lane
-# parent is sticky (3775), and after the first boot these entries are worker/runner-owned;
-# root deliberately lacks CAP_FOWNER, so it cannot unlink either entry through that parent.
-# Reclaim each existing entry itself with CAP_CHOWN before removing it. `-h` is load-bearing:
-# a planted symlink is re-owned rather than dereferenced, then `rm -rf` unlinks the link itself.
-# A real tree may itself contain sticky directories with runtime-owned files. Reclaim only its
-# directories, then clear their modes to 0700 before removal; this gives root ownership of every
-# deletion parent without chowning files (which could be hardlinks to state outside this scratch
-# tree). find does not follow symlinks by default, and -xdev bounds traversal to one filesystem.
-# These paths hold only disposable per-uid scratch (git/npm/node temp); no resumed-run state
-# lives here (that is under /data/agent-home + the clone), so a boot-time wipe is safe.
-for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
-  if [ -e "$tmpdir" ] || [ -L "$tmpdir" ]; then
-    "$CHOWN" -h 0:0 "$tmpdir"
-    if [ -d "$tmpdir" ] && [ ! -L "$tmpdir" ]; then
-      "$FIND" "$tmpdir" -xdev -type d -exec "$CHOWN" 0:0 '{}' +
-      # GNU chmod preserves directory setgid with 0700; 00700 clears special bits.
-      "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 00700 '{}' +
-    fi
+
+# A carve-out root must be a real directory: refuse a symlink, and refuse an existing
+# non-directory. Nothing is deleted, unlinked or re-owned on refusal. (require_real_carveout_root
+# above checks only -L; its other callers are unchanged.)
+require_real_carveout_dir() {
+  if [ -L "$1" ]; then
+    echo "uzi-entrypoint: refusing to start: $1 is a symlink" >&2
+    exit 1
   fi
-done
-"$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
-"$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
-# Then RECLAIM to root and re-assert 0700 UNCONDITIONALLY (no `[ -O ]` guard): root reclaims
-# via CAP_CHOWN (the root startup window has CHOWN, no FOWNER), so the chmod always succeeds
-# even when a prior boot left the dir worker/runner-owned -- the SAME restart-safe reclaim the
-# token block and the legacy-migration roots use. No `if`-wrapper (unlike the token's EROFS
-# read-only Secret mount): these tmpdirs are ALWAYS a writable mount, never read-only.
-"$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 00700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
-# runner:runner 0700 -- owner-only, so even the worker (a `runner`-GROUP member) cannot reach
-# it (0700 grants the group nothing); true per-uid isolation.
-"$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 00700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+  if [ -e "$1" ] && [ ! -d "$1" ]; then
+    echo "uzi-entrypoint: refusing to start: $1 exists and is not a directory" >&2
+    exit 1
+  fi
+}
+
+if [ -n "$SCRATCH_CARVEOUT" ]; then
+  # Exactly ONE level below the runner root, so the only parent ever traversed is the
+  # runner root itself (already a real, sticky directory). No `mkdir -p` anywhere.
+  SCRATCH_CARVEOUT_NAME="${SCRATCH_CARVEOUT#"$RUNNER_ROOT"/}"
+  case "$SCRATCH_CARVEOUT_NAME" in
+    ''|.|..|*/*)
+      echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM must be a direct child of $RUNNER_ROOT" >&2
+      exit 1 ;;
+  esac
+  require_real_carveout_root "$RUNNER_ROOT"
+  require_real_carveout_dir "$SCRATCH_CARVEOUT"
+  [ -e "$SCRATCH_CARVEOUT" ] || "$MKDIR" "$SCRATCH_CARVEOUT"
+  require_real_carveout_dir "$SCRATCH_CARVEOUT"
+  if [ ! -d "$SCRATCH_CARVEOUT" ]; then
+    echo "uzi-entrypoint: refusing to start: could not create $SCRATCH_CARVEOUT" >&2
+    exit 1
+  fi
+  # Re-asserted every boot, matching runner-init (worker:worker 0755). Reclaim to root first:
+  # the root window has no CAP_FOWNER, so a chmod of a dir a prior boot handed to `worker`
+  # would EPERM otherwise. `-h` keeps every chown from dereferencing.
+  "$CHOWN" -h 0:0 "$SCRATCH_CARVEOUT"
+  "$CHMOD" 0755 "$SCRATCH_CARVEOUT"
+  "$CHOWN" -h "$WORKER_OWNER" "$SCRATCH_CARVEOUT"
+fi
+
+if [ -n "$SCRATCH_DOCKER_LANE" ]; then
+  # DOCKER LANE: the per-uid scratch lives on the persistent volume and writer exclusion
+  # cannot be established from here. A rootful daemon can write anywhere whatever the
+  # ownership, and a lingering old pod that still co-mounts the RWO volume may be writing its
+  # own scratch. So nothing here is ever recursively wiped, re-owned or re-moded. An existing
+  # leaf is ADOPTED only when it is a real directory owned by its expected user with mode
+  # exactly 0700 (only that user, or root, could have placed content in it); anything else
+  # fails startup closed with the contents untouched. An absent leaf is created fresh.
+  SCRATCH_REASON=
+  scratch_check() { # $1 path, $2 expected owner name; sets SCRATCH_REASON (empty = adoptable or absent)
+    SCRATCH_REASON=
+    if [ -L "$1" ]; then SCRATCH_REASON="is a symlink"; return 0; fi
+    [ -e "$1" ] || return 0
+    if [ ! -d "$1" ]; then SCRATCH_REASON="is not a directory"; return 0; fi
+    if ! sc_posture="$("$BUSYBOX" stat -c '%U %a' "$1" 2>/dev/null)"; then
+      SCRATCH_REASON="owner and mode could not be read"; return 0
+    fi
+    sc_owner="${sc_posture%% *}"
+    sc_mode="${sc_posture#* }"
+    if [ "$sc_owner" != "$2" ]; then
+      SCRATCH_REASON="owner is $sc_owner, expected $2"
+    elif [ "$sc_mode" != 700 ]; then
+      SCRATCH_REASON="mode is $sc_mode, expected 700"
+    fi
+  }
+  scratch_refuse() { # $1 path, $2 reason
+    echo "uzi-entrypoint: refusing to start: per-uid scratch $1 cannot be safely adopted ($2); contents preserved; see ADR-3153 operator procedure" >&2
+    exit 1
+  }
+  scratch_entries() { # top-level entry count, or "unknown" when root cannot list it
+    if [ ! -r "$1" ] || [ ! -x "$1" ]; then echo unknown; return 0; fi
+    sc_n=0
+    for sc_e in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+      if [ -e "$sc_e" ] || [ -L "$sc_e" ]; then sc_n=$((sc_n + 1)); fi
+    done
+    echo "$sc_n"
+  }
+  # Validate BOTH leaves before touching either, so a refusal changes nothing.
+  scratch_check "$WORKER_TMPDIR" worker
+  [ -z "$SCRATCH_REASON" ] || scratch_refuse "$WORKER_TMPDIR" "$SCRATCH_REASON"
+  scratch_check "$RUNNER_TMPDIR" runner
+  [ -z "$SCRATCH_REASON" ] || scratch_refuse "$RUNNER_TMPDIR" "$SCRATCH_REASON"
+  for sc_leaf in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
+    if [ -e "$sc_leaf" ]; then
+      echo "uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): $sc_leaf entries=$(scratch_entries "$sc_leaf")" >&2
+    fi
+  done
+  for sc_pair in "$WORKER_TMPDIR|$WORKER_OWNER" "$RUNNER_TMPDIR|runner:runner"; do
+    sc_leaf="${sc_pair%%|*}"
+    sc_owner="${sc_pair#*|}"
+    if [ ! -e "$sc_leaf" ]; then
+      "$MKDIR" "$sc_leaf"
+      if [ -L "$sc_leaf" ]; then scratch_refuse "$sc_leaf" "became a symlink while being created"; fi
+      "$CHMOD" 00700 "$sc_leaf"
+      "$CHOWN" -h "$sc_owner" "$sc_leaf"
+    fi
+  done
+else
+  # NOT the docker lane: /tmp (or an ambient TMPDIR outside the persistent runner volume) is
+  # the container's own writable layer, so no other writer can exist and a boot-time wipe is
+  # the long-standing behaviour, kept unchanged.
+  #
+  # HARDEN ADOPTION (PRD #1493 rework / CWE-732 CodeRabbit): an untrusted principal can
+  # pre-create uzi-worker/uzi-runner. `mkdir -p` NO-OPS on an existing dir (it keeps that
+  # dir's mode AND contents), and a planted SYMLINK at that name would make the chmod/chown
+  # below DEREFERENCE onto its target. A sticky parent can hold entries that, after the first
+  # boot, are worker/runner-owned; root deliberately lacks CAP_FOWNER, so it cannot unlink
+  # either entry through that parent. Reclaim each existing entry itself with CAP_CHOWN before
+  # removing it. `-h` is load-bearing: a planted symlink is re-owned rather than dereferenced,
+  # then `rm -rf` unlinks the link itself.
+  # A real tree may itself contain sticky directories with runtime-owned files. Reclaim only
+  # its directories, then clear their modes to 0700 before removal; this gives root ownership
+  # of every deletion parent without chowning files (which could be hardlinks to state outside
+  # this scratch tree). find does not follow symlinks by default, and -xdev bounds traversal
+  # to one filesystem. These paths hold only disposable per-uid scratch (git/npm/node temp).
+  for tmpdir in "$WORKER_TMPDIR" "$RUNNER_TMPDIR"; do
+    if [ -e "$tmpdir" ] || [ -L "$tmpdir" ]; then
+      "$CHOWN" -h 0:0 "$tmpdir"
+      if [ -d "$tmpdir" ] && [ ! -L "$tmpdir" ]; then
+        "$FIND" "$tmpdir" -xdev -type d -exec "$CHOWN" 0:0 '{}' +
+        # GNU chmod preserves directory setgid with 0700; 00700 clears special bits.
+        "$FIND" "$tmpdir" -xdev -type d -exec "$CHMOD" 00700 '{}' +
+      fi
+    fi
+  done
+  "$RM" -rf "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
+  "$MKDIR" -p "$WORKER_TMPDIR" "$RUNNER_TMPDIR"
+  # Then RECLAIM to root and re-assert 0700 UNCONDITIONALLY (no `[ -O ]` guard): root reclaims
+  # via CAP_CHOWN (the root startup window has CHOWN, no FOWNER), so the chmod always succeeds
+  # even when a prior boot left the dir worker/runner-owned -- the SAME restart-safe reclaim the
+  # token block and the legacy-migration roots use. No `if`-wrapper (unlike the token's EROFS
+  # read-only Secret mount): these tmpdirs are ALWAYS a writable mount, never read-only.
+  "$CHOWN" 0:0 "$WORKER_TMPDIR"; "$CHMOD" 00700 "$WORKER_TMPDIR"; "$CHOWN" "$WORKER_OWNER" "$WORKER_TMPDIR"
+  # runner:runner 0700 -- owner-only, so even the worker (a `runner`-GROUP member) cannot reach
+  # it (0700 grants the group nothing); true per-uid isolation.
+  "$CHOWN" 0:0 "$RUNNER_TMPDIR"; "$CHMOD" 00700 "$RUNNER_TMPDIR"; "$CHOWN" runner:runner "$RUNNER_TMPDIR"
+fi
 
 # --- (a4) issue #1598: the Codex command-cache root, runner-cmd 0700 ---------------
 # The supervisor's uid-10003 cache holder creates ONE random per-run dir under this root

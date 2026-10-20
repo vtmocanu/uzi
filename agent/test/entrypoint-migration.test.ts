@@ -189,6 +189,19 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
     "busybox",
     '#!/bin/sh\nsub=$1; shift\ncase "$sub" in\n' +
       "  stat)\n" +
+      // Issue #3153: the Docker-lane per-uid scratch posture probe (`stat -c '%U %a' <leaf>`). The
+      // owner NAME is faked per leaf (STUB_OWNER_WORKER / STUB_OWNER_RUNNER) because the suite cannot
+      // chown; the mode is the REAL mode of the fixture dir.
+      '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%U %a" ]; then\n' +
+      '      case "${3##*/}" in\n' +
+      '        uzi-worker) o=${STUB_OWNER_WORKER:-worker} ;;\n' +
+      '        uzi-runner) o=${STUB_OWNER_RUNNER:-runner} ;;\n' +
+      "        *) o=root ;;\n" +
+      "      esac\n" +
+      '      m=$(stat -c %a "$3" 2>/dev/null || stat -f %Lp "$3" 2>/dev/null) || exit 1\n' +
+      '      printf "%s %s\\n" "$o" "$m"\n' +
+      "      exit 0\n" +
+      "    fi\n" +
       '    if [ "$#" -eq 3 ] && [ "$1" = "-c" ] && [ "$2" = "%h" ]; then\n' +
       '      n=$(ls -ld -- "$3" 2>/dev/null | awk \'{print $2}\')\n' +
       '      case "$n" in ""|*[!0-9]*) exit 1 ;; esac\n' +
@@ -776,7 +789,8 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       assert.equal(r.status, 0, `ambient-TMPDIR run must succeed (stderr: ${r.stderr})`);
       // Both private tmpdirs are created BENEATH the ambient TMPDIR (bind sources resolve in
       // the DinD-shared workdir), and the worker's is exported as TMPDIR across the drop.
-      assert.ok(opMatches(r.ops, "mkdir", `${workdir}/uzi-worker`, `${workdir}/uzi-runner`), "tmpdirs must derive beneath the ambient TMPDIR");
+      // Issue #3153: the Docker lane creates each ABSENT leaf with its own plain (non -p) mkdir.
+      assert.ok(opMatches(r.ops, "mkdir", `${workdir}/uzi-worker`) && opMatches(r.ops, "mkdir", `${workdir}/uzi-runner`), "tmpdirs must derive beneath the ambient TMPDIR");
       assert.equal(r.env.get("TMPDIR"), `${workdir}/uzi-worker`, "TMPDIR must be the derived worker tmp");
       assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), `${workdir}/uzi-runner`, "UZI_RUNNER_TMPDIR must be the derived runner tmp");
     } finally {
@@ -1388,5 +1402,206 @@ describe("PRD #1493 M2: legacy run HOME survives migration and still validates (
     } finally {
       fs.rmSync(h.root, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Issue #3153: the Docker-lane TMPDIR carve-out (`/data/runner/.tmp`) and the per-uid scratch
+// under it. `/data/runner` is a subPath of the PERSISTENT data volume, so nothing there is ever
+// recursively wiped or re-owned: an existing leaf is adopted only when it is a real directory
+// owned by its expected user with mode exactly 0700, anything else fails startup closed.
+// ---------------------------------------------------------------------------------------------
+describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, record-only)", () => {
+  interface Lane { h: Harness; runnerRoot: string; carve: string; worker: string; runner: string }
+  function lane(setup?: (l: Lane) => void, carveExists = true): Lane {
+    const h = makeHarness();
+    fs.mkdirSync(h.data);
+    fs.mkdirSync(h.nix);
+    fs.writeFileSync(h.token, "t");
+    const runnerRoot = path.join(h.data, "runner");
+    const carve = path.join(runnerRoot, ".tmp");
+    fs.mkdirSync(runnerRoot);
+    if (carveExists) fs.mkdirSync(carve);
+    const l: Lane = { h, runnerRoot, carve, worker: path.join(carve, "uzi-worker"), runner: path.join(carve, "uzi-runner") };
+    setup?.(l);
+    return l;
+  }
+  function leaf(dir: string, mode = 0o700): void {
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "PRECIOUS"), "x");
+    fs.mkdirSync(path.join(dir, "nested"));
+    fs.chmodSync(dir, mode);
+  }
+  /** Any op that names a per-uid leaf (or something under it). */
+  const touching = (ops: string[], ...dirs: string[]): string[] => ops.filter((o) => dirs.some((d) => o.includes(d)));
+  const cleanup = (l: Lane): void => { fs.rmSync(l.h.root, { recursive: true, force: true }); };
+
+  it("adopts matching 0700 leaves: contents preserved, no rm / chown / chmod / mkdir on them, diagnostic printed", () => {
+    const l = lane((x) => { leaf(x.worker); leaf(x.runner); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch an adopted leaf");
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm on the Docker lane");
+      assert.ok(!r.ops.some((o) => o.startsWith("chown -R") && o.includes(".tmp")), "no recursive chown of the carve-out");
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=2\n`), r.stderr);
+      assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.runner} entries=2\n`), r.stderr);
+      assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+      assert.equal(fs.readFileSync(path.join(l.runner, "PRECIOUS"), "utf8"), "x");
+      assert.equal(r.env.get("TMPDIR"), l.worker);
+      assert.equal(r.env.get("UZI_RUNNER_TMPDIR"), l.runner);
+    } finally { cleanup(l); }
+  });
+
+  it("re-asserts the carve-out root every boot: reclaim, chmod 0755, hand-over to worker:worker (no recursion)", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      const reclaim = r.ops.indexOf(`chown -h 0:0 ${l.carve}`);
+      const chmod = r.ops.indexOf(`chmod 0755 ${l.carve}`);
+      const handover = r.ops.indexOf(`chown -h worker:worker ${l.carve}`);
+      assert.ok(reclaim >= 0 && chmod > reclaim && handover > chmod, `ops: ${r.ops.join(" | ")}`);
+    } finally { cleanup(l); }
+  });
+
+  it("creates ABSENT leaves fresh (mkdir, chmod 00700, chown -h) without any rm", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      for (const [dir, owner] of [[l.worker, "worker:worker"], [l.runner, "runner:runner"]] as const) {
+        const mk = r.ops.findIndex((o) => o === `mkdir ${dir}`);
+        const mode = r.ops.findIndex((o, i) => i > mk && o === `chmod 00700 ${dir}`);
+        const own = r.ops.findIndex((o, i) => i > mode && o === `chown -h ${owner} ${dir}`);
+        assert.ok(mk >= 0 && mode > mk && own > mode, `${dir}: ${r.ops.join(" | ")}`);
+      }
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+    } finally { cleanup(l); }
+  });
+
+  for (const [name, setup, env, reason] of [
+    ["a leaf owned by someone else", (x: Lane) => { leaf(x.worker); leaf(x.runner); }, { STUB_OWNER_RUNNER: "worker" }, /owner is worker, expected runner/],
+    ["a leaf with a wider mode", (x: Lane) => { leaf(x.worker, 0o755); leaf(x.runner); }, {}, /mode is 755, expected 700/],
+    ["a leaf with extra setgid", (x: Lane) => { leaf(x.worker); leaf(x.runner, 0o2700); }, {}, /mode is 2700, expected 700/],
+  ] as const) {
+    it(`fails closed on ${name}: non-zero exit, specific message, nothing removed, re-owned or re-moded`, () => {
+      const l = lane(setup);
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve, ...env });
+        assert.notEqual(r.status, 0);
+        assert.match(r.stderr, /refusing to start: per-uid scratch .* cannot be safely adopted \(/);
+        assert.match(r.stderr, reason);
+        assert.match(r.stderr, /contents preserved; see ADR-3153 operator procedure/);
+        assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch either leaf");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+        assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+        assert.equal(r.env.size, 0, "must not reach the privilege drop");
+      } finally { cleanup(l); }
+    });
+  }
+
+  it("fails closed on a symlink leaf and leaves its target untouched", () => {
+    const l = lane((x) => {
+      const target = path.join(x.h.root, "elsewhere");
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, "keep"), "k");
+      fs.symlinkSync(target, x.worker);
+    });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /per-uid scratch .*uzi-worker cannot be safely adopted \(is a symlink\)/);
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), []);
+      assert.ok(fs.lstatSync(l.worker).isSymbolicLink());
+      assert.equal(fs.readFileSync(path.join(l.h.root, "elsewhere", "keep"), "utf8"), "k");
+    } finally { cleanup(l); }
+  });
+
+  it("fails closed on a non-directory leaf", () => {
+    const l = lane((x) => { fs.writeFileSync(x.runner, "file"); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /uzi-runner cannot be safely adopted \(is not a directory\)/);
+      assert.equal(fs.readFileSync(l.runner, "utf8"), "file");
+      assert.deepEqual(touching(r.ops, l.worker, l.runner), []);
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a symlinked carve-out root and a non-directory one, touching nothing", () => {
+    for (const kind of ["symlink", "file"] as const) {
+      const l = lane((x) => {
+        fs.rmdirSync(x.carve);
+        if (kind === "symlink") {
+          fs.mkdirSync(path.join(x.h.root, "elsewhere"));
+          fs.symlinkSync(path.join(x.h.root, "elsewhere"), x.carve);
+        } else fs.writeFileSync(x.carve, "f");
+      });
+      try {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+        assert.notEqual(r.status, 0, kind);
+        assert.match(r.stderr, kind === "symlink" ? /\.tmp is a symlink/ : /\.tmp exists and is not a directory/);
+        assert.deepEqual(touching(r.ops, l.carve).filter((o) => !o.startsWith("chown -R") && !o.startsWith("mkdir -p")), [], kind);
+        assert.equal(r.env.size, 0);
+      } finally { fs.rmSync(l.h.root, { recursive: true, force: true }); }
+    }
+  });
+
+  it("refuses to start when the carve-out cannot be created (no mkdir -p of missing parents)", () => {
+    const l = lane(undefined, false); // .tmp absent; the NOOP mkdir stub creates nothing
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /could not create .*\.tmp/);
+      assert.ok(r.ops.includes(`mkdir ${l.carve}`), "plain mkdir of the final component");
+      assert.ok(!r.ops.some((o) => o.startsWith("mkdir -p") && o.includes(l.carve)));
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a TMPDIR nested more than one level below the runner root", () => {
+    const l = lane();
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: path.join(l.carve, "deeper") });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /must be a direct child of/);
+    } finally { cleanup(l); }
+  });
+
+  it("reverse skew: TMPDIR == /data/runner keeps the old root handling (no carve-out ops) and still never wipes leaves", () => {
+    const l = lane((x) => { leaf(path.join(x.runnerRoot, "uzi-worker")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.runnerRoot });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(!r.ops.some((o) => o.startsWith("chmod 0755")), "no carve-out re-assertion of the runner root");
+      assert.ok(!r.ops.includes(`chown -h 0:0 ${l.runnerRoot}`), "the runner root itself is not reclaimed");
+      assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
+      assert.ok(r.stderr.includes(`${path.join(l.runnerRoot, "uzi-worker")} entries=2`), r.stderr);
+      assert.equal(r.env.get("TMPDIR"), path.join(l.runnerRoot, "uzi-worker"));
+    } finally { cleanup(l); }
+  });
+
+  it("non-Docker (TMPDIR unset): the long-standing wipe is unchanged", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.data);
+      fs.mkdirSync(h.nix);
+      fs.writeFileSync(h.token, "t");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.ops.includes("rm -rf /tmp/uzi-worker /tmp/uzi-runner"), r.ops.join(" | "));
+      assert.ok(r.ops.includes("chown 0:0 /tmp/uzi-worker"));
+      assert.doesNotMatch(r.stderr, /per-uid scratch adopted/);
+    } finally { fs.rmSync(h.root, { recursive: true, force: true }); }
+  });
+
+  it("(a2b) legacy migration re-owns runner children but skips the .tmp carve-out", () => {
+    const l = lane((x) => { fs.mkdirSync(path.join(x.runnerRoot, "legacy-repo")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
+      assert.equal(r.status, 0, r.stderr);
+      assert.ok(r.ops.includes(`chown -R runner:runner ${path.join(l.runnerRoot, "legacy-repo")}`), r.ops.join(" | "));
+      assert.ok(!r.ops.some((o) => o.startsWith("chown -R") && o.includes(l.carve)), "the carve-out is never re-owned runner:runner");
+    } finally { cleanup(l); }
   });
 });

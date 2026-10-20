@@ -1561,6 +1561,28 @@ const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
 const RETAINED_RESIDUE_PER_KEY = 5;
 const RESIDUE_ENUMERATION_BUDGET = 4096;
 const RETENTION_WARNING_KEYS = 128;
+const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
+const RETIRE_SCRATCH_REPORTED_PATHS = 10;
+/** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
+ *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
+ *  with an emptyDir. This per-process counter makes every best-effort removal that fails visible
+ *  (it is bumped, with a specific warning, by {@link GitCache.removeBestEffort} and by
+ *  `deleteRetainedArtifact`). It confers no deletion authority and drives no reclaim. */
+let retainedUndeletable = 0;
+export function retainedUndeletableCount(): number {
+  return retainedUndeletable;
+}
+const UNDELETABLE_CODES = new Set(["EACCES", "EPERM", "ENOTEMPTY"]);
+/** The permission/occupancy class of a failed removal (errno code, else the rm stderr text), or undefined. */
+function undeletableCode(err: unknown): string | undefined {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (typeof code === "string" && UNDELETABLE_CODES.has(code)) return code;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/permission denied/i.test(msg)) return "EACCES";
+  if (/operation not permitted/i.test(msg)) return "EPERM";
+  if (/not empty/i.test(msg)) return "ENOTEMPTY";
+  return undefined;
+}
 const RETENTION_WARNING_INTERVAL_MS = 3600_000;
 /** The operator/canonical runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
@@ -1969,9 +1991,11 @@ export class GitCache {
    *  A SIBLING of runnerRoot under the SAME dataDir PATH, but OUTSIDE the runner-writable
    *  `runner/<repo>` tree: a retired clone lands here where the untrusted runner uid
    *  cannot reach it. NOTE (issue #1354): sharing the dataDir path does NOT imply the same
-   *  device — on a docker-lane (dind) worker `runner/` is a separate emptyDir while this
-   *  quarantine sits on the `/data` PVC, so a rename from runnerRoot into here CAN hit
-   *  EXDEV; retireRunnerClone carries an intra-device fallback for exactly that. Terminal
+   *  device or the same mount — on a docker-lane (dind) worker `runner/` is a SEPARATE bind mount (a
+   *  `runner-shared` subPath of the `/data` PVC since issue #3153; formerly an emptyDir) while this
+   *  quarantine is on the PVC root mount, so a rename from runnerRoot into here still hits EXDEV
+   *  even though both sit on the same filesystem; retireRunnerClone carries an intra-device
+   *  fallback for exactly that. Terminal
    *  trash is disposed from here; a foreign quarantine is retained here for forensics. */
   private readonly runnerHoldingRoot: string;
   /** PRD #1296 M3 — the durable durable-recovery journal + verified-bundle store, a
@@ -3016,8 +3040,10 @@ export class GitCache {
   }
 
   /** issue #1783 M2 — lstat reconciliation: true when `p` exists (any type), false on ENOENT;
-   *  any other error propagates (fail closed). A pod restart makes the paths vanish while the
-   *  journal and ledger (on the PVC) survive, so every path they name is re-checked here. */
+   *  any other error propagates (fail closed). The journal and ledger (on the data PVC) can name paths
+   *  that are gone (removed by something else; on the Docker lane `<runnerRoot>` itself persists
+   *  since issue #3153, so a pod restart alone no longer removes them), so every path they name is
+   *  re-checked here. */
   private async pathPresent(p: string): Promise<boolean> {
     return fs.lstat(p).then(
       () => true,
@@ -3272,7 +3298,7 @@ export class GitCache {
     if (last !== undefined && now - last < RETENTION_WARNING_INTERVAL_MS) return;
     this.retentionWarnings.set(canonical, now);
     this.log.warn("runner clone retention: automatic reclaim disabled", {
-      key: sanitizeForLog(key, 157), attempts, residue, orphanedSkills,
+      key: sanitizeForLog(key, 157), attempts, residue, orphanedSkills, retainedUndeletable,
     });
   }
 
@@ -3311,6 +3337,18 @@ export class GitCache {
       this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: sanitizeForLog(why, 157) });
       return false;
     };
+    // issue #3153: a permission/occupancy failure is counted (retainedUndeletable) and logged with
+    // its errno; the artifact stays retained. Returns false for any other failure class so the
+    // caller keeps its existing diagnostic.
+    const noteUndeletable = (err: unknown): boolean => {
+      const code = undeletableCode(err);
+      if (code === undefined) return false;
+      retainedUndeletable++;
+      this.log.warn("runner clone retention: could not delete (not permitted); keeping it", {
+        path: target, code, retainedUndeletable,
+      });
+      return true;
+    };
     const root = path.resolve(this.runnerRoot);
     if (path.dirname(parent) !== root || path.dirname(target) !== parent) return refuse("not a direct child of a runner repo dir");
     if (!isExpected(path.basename(target))) return refuse("not the expected retained artifact of this key");
@@ -3347,7 +3385,7 @@ export class GitCache {
         return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
-        refuse(gitErrorMessage(err));
+        if (!noteUndeletable(err)) refuse(gitErrorMessage(err));
         if (opts.strictValidation) throw err;
         return false;
       }
@@ -3358,7 +3396,9 @@ export class GitCache {
       // An rm that may still be alive: stop the whole sweep (the caller logs "nothing further
       // removed") rather than start another delete beside it.
       if (err instanceof RunnerDeleteUnsettledError) throw err;
-      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      if (!noteUndeletable(err)) {
+        this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
       if (opts.strictValidation) throw err;
       return false;
     }
@@ -5121,7 +5161,7 @@ export class GitCache {
     } catch (err) {
       return `bundle verification failed: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
     } finally {
-      if (dir !== undefined) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      if (dir !== undefined) await this.removeBestEffort(dir, "bundle-verify");
     }
   }
 
@@ -8372,8 +8412,10 @@ export class GitCache {
    * issue #1783 M2 review (N4, NB2, NB3) — bound one branch's attempt ledger, under the caller's bare
    * lock (the attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId
    * (in last-write order), dropping every unparseable value and every entry whose (absolute) path is
-   * gone (lstat ENOENT), whatever its state: after a pod roll `<runnerRoot>` is an emptyDir, so a
-   * gone path has nothing left for any reader to find. Two exceptions are always kept:
+   * gone (lstat ENOENT), whatever its state: a gone path has nothing left for any reader to
+   * find. (Before issue #3153 `<runnerRoot>` was an emptyDir that vanished with the pod; it now
+   * persists on the data volume, so an entry whose path is gone was removed by something else, and
+   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Two exceptions are always kept:
    *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
    *     resolve through the ledger);
    *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
@@ -8970,7 +9012,7 @@ export class GitCache {
     } catch (err) {
       return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
     } finally {
-      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(scratch, "scan-scratch");
     }
   }
 
@@ -9421,8 +9463,8 @@ export class GitCache {
       ).trim();
       return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
     } finally {
-      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
-      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(tmpIdx, "ckpt-index", "file");
+      await this.removeBestEffort(tmpWork, "ckpt-worktree");
     }
   }
 
@@ -9768,8 +9810,10 @@ export class GitCache {
       }
       // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
       //    dataDir PATH — but NOT necessarily the same device: on a docker-lane worker
-      //    runnerRoot is an emptyDir and this quarantine is on the /data PVC, so the step-4
-      //    rename CAN hit EXDEV (issue #1354); the EXDEV branch below is that fallback. NOT
+      //    runnerRoot is a separate bind mount (a runner-shared subPath of the /data PVC since issue
+      //    #3153, formerly an emptyDir) and this quarantine is on the PVC root mount, so the step-4
+      //    rename CAN hit EXDEV (issue #1354) even on one filesystem; the EXDEV branch below is
+      //    that fallback and is kept. NOT
       //    under the runner-writable tree. Sanitized, generated components. Create-or-assert
       //    the parent 0700 BEFORE the rename, so a rename ENOENT below unambiguously means
       //    the SOURCE is missing.
@@ -9806,8 +9850,9 @@ export class GitCache {
         const e = err as NodeJS.ErrnoException;
         if (e.code === "EXDEV") {
           // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
-          // DIFFERENT devices on a docker-lane worker (emptyDir vs PVC), so the rename to
-          // holdingDest is a cross-device move that cannot happen. Free the canonical with
+          // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
+          // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
+          // cannot happen even when both sit on one filesystem. Free the canonical with
           // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
           // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
           // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
@@ -9847,7 +9892,7 @@ export class GitCache {
               // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
               // retry can re-copy. No scratch parent exists yet (created below), so this
               // cleanup is scoped strictly to the copy.
-              await fs.rm(holdingDest, { recursive: true, force: true }).catch(() => undefined);
+              await this.removeBestEffort(holdingDest, "retire-incomplete-copy");
               throw copyErr;
             }
             // The completed off-tree copy is recorded. NOW free the canonical with the
@@ -9896,7 +9941,7 @@ export class GitCache {
         if (movedTo !== undefined) {
           await fs.rename(movedTo, clonePath).then(
             async () => {
-              if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch");
             },
             (renameErr: unknown) =>
               this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
@@ -10025,7 +10070,7 @@ export class GitCache {
                 await this.worktreeHead(movedTo) !== opts.completionSource.expectedHead)
               throw new Error("completion rollback source cannot be verified");
             await fs.rename(movedTo, clonePath);
-            if (scratch) await fs.rmdir(scratch).catch(() => undefined);
+            if (scratch) await this.removeBestEffort(scratch, "completion-rollback-scratch", "emptyDir");
           } catch (rollbackError) {
             this.log.warn("retireRunnerClone: completion rollback retained residue", {
               clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
@@ -10060,9 +10105,88 @@ export class GitCache {
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(scratch, "retire-scratch");
     }
     return result.disposition;
+  }
+
+  /** issue #3153 — startup inspector for `<runnerRoot>/.retire-*` scratch parents (the intra-device
+   *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
+   *  replacements now, so a crash between the rename and the disposal leaves one behind that no
+   *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
+   *  before any retire or recovery path is reachable, and confers no new deletion authority:
+   *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
+   *    - an EMPTY real directory is removed with a non-recursive rmdir (atomic: it fails if a writer
+   *      populated it since the listing);
+   *    - anything else (non-empty, symlink, non-directory, unreadable, rmdir failure) is retained.
+   *      Entries inside a parent are only counted, never stat'ed or followed.
+   *  Retained parents are reported by ONE counted warning `runner retire scratch retained`
+   *  (bounded path list). Never recursive; never throws. */
+  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ removed: number; retained: number }> {
+    const root = path.resolve(this.runnerRoot);
+    const retained: string[] = [];
+    let removed = 0;
+    try {
+      const rst = await fs.lstat(root);
+      if (rst.isSymbolicLink() || !rst.isDirectory()) return { removed, retained: 0 };
+      const names: string[] = [];
+      for await (const entry of await fs.opendir(root)) {
+        if (entry.name.startsWith(".retire-")) names.push(entry.name);
+        if (names.length >= RETIRE_SCRATCH_ENUMERATION_BUDGET) break;
+      }
+      for (const name of names.sort()) {
+        const p = path.join(root, name);
+        try {
+          const st = await fs.lstat(p);
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) continue;
+          if (st.isSymbolicLink() || !st.isDirectory()) { retained.push(p); continue; }
+          let empty = true;
+          for await (const _entry of await fs.opendir(p)) { empty = false; break; }
+          if (!empty) { retained.push(p); continue; }
+          await fs.rmdir(p);
+          removed++;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+          retained.push(p);
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.log.warn("runner retire scratch inspection failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
+      return { removed, retained: retained.length };
+    }
+    if (retained.length > 0) {
+      this.log.warn("runner retire scratch retained", {
+        count: retained.length,
+        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS),
+        removedEmpty: removed,
+      });
+    }
+    return { removed, retained: retained.length };
+  }
+
+  /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
+   *  runner/TMPDIR tree (or its holding sibling). Never throws where the old `.catch(() => undefined)`
+   *  swallowed; a failure (ENOENT aside, which `force` already tolerates) is counted in
+   *  `retainedUndeletable` and logged with the path and errno so a persistent-volume leak is visible.
+   *  Returns true when the target is gone. `emptyDir` is a non-recursive rmdir. */
+  private async removeBestEffort(target: string, site: string, kind: "tree" | "file" | "emptyDir" = "tree"): Promise<boolean> {
+    try {
+      if (kind === "emptyDir") await fs.rmdir(target);
+      else await fs.rm(target, kind === "tree" ? { recursive: true, force: true } : { force: true });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      retainedUndeletable++;
+      this.log.warn("runner scratch removal failed; keeping it", {
+        path: target,
+        site,
+        code: (err as NodeJS.ErrnoException).code ?? undeletableCode(err) ?? "unknown",
+        retainedUndeletable,
+      });
+      return false;
+    }
   }
 
   /** issue #1354 — create an intra-device scratch parent directly under runnerRoot (the
@@ -10086,8 +10210,8 @@ export class GitCache {
   private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string,
     guard?: () => Promise<void>): Promise<boolean> {
     if (residueQuarantine() !== undefined) {
-      await fs.rm(scratchParent, { recursive: true, force: true }).catch(() => undefined);
-      if (copy) await fs.rm(copy, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(scratchParent, "retire-latched-scratch-parent");
+      if (copy) await this.removeBestEffort(copy, "retire-latched-copy");
       throw new CloneRetainedByQuarantineError();
     }
     if (guard) await guard();
@@ -10847,7 +10971,7 @@ export class GitCache {
     } catch {
       return { trusted: false, findings: [] };
     } finally {
-      if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      if (scratch) await this.removeBestEffort(scratch, "patch-scan-scratch");
     }
   }
 
