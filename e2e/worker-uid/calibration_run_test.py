@@ -1,5 +1,6 @@
 """Fake-Docker host regressions: no daemon, cgroup load, build or install."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -16,6 +17,14 @@ import calibration_check as check
 
 HARNESS = Path(__file__).resolve().parent
 SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
+
+
+def fixture_calls(calls):
+    """Keep seed/fixture accounting separate from independently owned diagnostics."""
+    names = {c[c.index("--name") + 1] for c in calls if c[:2] == ["docker", "create"]
+             and "-diag-" in c[c.index("--name") + 1]}
+    handles = names | {hashlib.sha256(name.encode()).hexdigest() for name in names}
+    return [c for c in calls if not any(arg in handles for arg in c)]
 
 # These programs execute only the literal inert fixture operations below.
 STUB = r'''
@@ -215,7 +224,7 @@ class RunnerTest(unittest.TestCase):
         _, calls = self.invoke()
         self.assertFalse(any(c[:2] == ["docker", "volume"] for c in calls),
                          "calibration must use image-native dependencies without copy-up")
-        fixtures = [c for c in calls if c[:2] == ["docker", "create"] and "-seed" not in c[c.index("--name") + 1]]
+        fixtures = [c for c in fixture_calls(calls) if c[:2] == ["docker", "create"] and "-seed" not in c[c.index("--name") + 1]]
         self.assertEqual(len(fixtures), 2)
         for command in fixtures:
             mounts = [command[i + 1] for i, arg in enumerate(command) if arg == "--mount"]
@@ -228,11 +237,11 @@ class RunnerTest(unittest.TestCase):
         result, calls = self.invoke()
         self.assertNotEqual(result.returncode, 0, result.stderr)
         reports = check.reports(result.stdout)
-        self.assertEqual(len([c for c in calls if c[0:2] == ["docker", "start"]]), 3)
+        self.assertEqual(len([c for c in calls if c[0:2] == ["docker", "start"]]), 11)
         self.assertTrue(all(r["status"] == "FAILED" and r["hostCleanup"]["confirmed"] for r in reports))
         directory = next((self.root / ".uzi/scratch").iterdir())
-        self.assertEqual(len(list(directory.glob("*.stdout"))), 3)  # two raw + final stdout
-        self.assertEqual(len(list(directory.glob("*.status"))), 2)
+        self.assertEqual(len(list(directory.glob("*.stdout"))), 11)  # two raw + eight diagnostic + final stdout
+        self.assertEqual(len(list(directory.glob("*.status"))), 10)
         self.assertEqual(json.loads((directory / "host-cleanup.json").read_text()),
                          {r["fixtureId"]: r["hostCleanup"] for r in reports})
         state = json.loads((self.root / "state.json").read_text())
@@ -250,6 +259,31 @@ class RunnerTest(unittest.TestCase):
             if call[1] == "rm":
                 self.assertEqual(len(call[-1]), 64)
 
+    def test_failed_prerequisite_still_starts_plain_and_guarded_diagnostics(self):
+        result, calls = self.invoke()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        reports = check.reports(result.stdout)
+        self.assertTrue(all(any("actual default reader unavailable:" in reason for reason in report["reasons"])
+                            for report in reports), "fixture failure remains recorded")
+        directory = next((self.root / ".uzi/scratch").iterdir())
+        self.assertTrue((directory / "node-diagnostic.json").exists(),
+                        "fixture prerequisite failure must still run diagnostics")
+        measured = json.loads((directory / "node-diagnostic.json").read_text())
+        self.assertEqual([(r["limitBytes"], r["workload"]) for r in measured],
+                         [(size, workload) for size in calibration.DIAG_SIZES
+                          for workload in calibration.DIAG_WORKLOADS + calibration.DIAG_GUARDED_WORKLOADS])
+        guarded = [r for r in measured if r.get("leg") == "guarded"]
+        self.assertEqual(len(guarded), 2)
+        self.assertTrue(all(r["psiSynthesized"] is True for r in guarded))
+        creates = [c for c in calls if c[:2] == ["docker", "create"]
+                   and "-diag-" in c[c.index("--name") + 1]]
+        starts = {c[-1] for c in calls if c[:2] == ["docker", "start"]}
+        self.assertEqual(len(creates), 8)
+        for command in creates:
+            name = command[command.index("--name") + 1]
+            self.assertIn(hashlib.sha256(name.encode()).hexdigest(), starts)
+        self.assertEqual(json.loads((self.root / "state.json").read_text()), {})
+
     def test_failed_or_unparseable_or_timeout_never_pass_and_stop_next_size(self):
         for mode in ("missing", "malformed", "timeout", "active-failure", "zero-failed"):
             with self.subTest(mode=mode):
@@ -258,7 +292,7 @@ class RunnerTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 reports = check.reports(result.stdout)
                 self.assertTrue(all(r["status"] == "FAILED" for r in reports))
-                starts = [c for c in calls if c[0] == "timeout" and c[3:5] == ["docker", "start"]]
+                starts = [c for c in fixture_calls(calls) if c[0] == "timeout" and c[3:5] == ["docker", "start"]]
                 self.assertEqual(len(starts), 3 if mode == "zero-failed" else 2)
                 self.assertTrue(all(r["hostCleanup"] is not None for r in reports))
                 # A fresh invocation owns different names; previous state must be empty.
@@ -270,6 +304,7 @@ class RunnerTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 (self.root / "probe-done").unlink(missing_ok=True)
                 result, calls = self.invoke(mode)
+                calls = fixture_calls(calls)
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 check.reports(result.stdout)  # explicit aborted report for both sizes
                 self.assertLessEqual(sum(c[:2] == ["docker", "start"] for c in calls), 1)
@@ -290,6 +325,7 @@ class RunnerTest(unittest.TestCase):
                 (self.root / "calls").write_text("")
                 (self.root / "state.json").write_text("{}")
                 result, calls = self.invoke("fixture-lost-ack-" + str(number))
+                calls = fixture_calls(calls)
                 self.assertNotEqual(result.returncode, 0)
                 reports = check.reports(result.stdout)
                 self.assertEqual(len(reports), 2)
@@ -305,7 +341,7 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(len([c for c in calls if c[:3] == ["docker", "volume", "rm"]]), 0)
                 directory = sorted((self.root / ".uzi/scratch").iterdir(), key=lambda p: p.stat().st_mtime)[-1]
                 entries = [json.loads(line) for line in (directory / "requests.jsonl").read_text().splitlines()]
-                self.assertEqual(len(entries), number + 1)
+                self.assertEqual(len([entry for entry in entries if "-diag-" not in entry["name"]]), number + 1)
                 self.assertTrue((directory / "docker-output").exists())
                 for report in reports[:number]:
                     proof = report["hostCleanup"]
@@ -344,13 +380,13 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(reports), 2)
         self.assertTrue(all(r["status"] == "FAILED" for r in reports))
         self.assertIn("producer status", reports[0]["reasons"][0])
-        self.assertEqual(len([c for c in calls if c[:2] == ["docker", "start"]]), 2)
+        self.assertEqual(len([c for c in fixture_calls(calls) if c[:2] == ["docker", "start"]]), 2)
         self.assertNotIn(b"CALIBRATION PASSED", result.stderr)
         self.assertNotIn(b"\x1b", result.stderr)
         directory = next((self.root / ".uzi/scratch").iterdir())
-        raw = next(p for p in directory.glob("*.stdout") if p.name != "reports.stdout").read_bytes()
+        raw = (directory / (reports[0]["fixtureId"] + ".stdout")).read_bytes()
         self.assertEqual(check.reports(raw, count=1)[0]["status"], poison)
-        self.assertEqual(next(directory.glob("*.status")).read_text(), "EXIT=7\n")
+        self.assertEqual((directory / (reports[0]["fixtureId"] + ".status")).read_text(), "EXIT=7\n")
         manifest = json.loads((directory / "expected.json").read_text())
         for report, fixture in zip(reports, manifest["fixtures"]):
             for key, value in {**manifest["identity"], **fixture}.items():
@@ -560,7 +596,7 @@ class RunnerTest(unittest.TestCase):
         class FakeHost:
             def __init__(self, manifest, directory, image):
                 self.manifest, self.directory = manifest, directory
-            def run(self): events.append("run")
+            def run(self): events.append("run"); self.manifest["imageId"] = "sha256:" + "c" * 64
             def measure_diagnostics(self): events.append("measure"); raise ValueError("diagnostic harness broke")
             def finish(self): events.append("finish")
             def publish(self, error=None): events.append(("publish", error))
@@ -571,12 +607,52 @@ class RunnerTest(unittest.TestCase):
                 calibration.main()
         self.assertEqual(events, ["run", "measure", "finish", ("publish", None)])
 
+    def test_fixture_failure_only_measures_after_image_resolution(self):
+        for provisioned in (False, True):
+            with self.subTest(provisioned=provisioned):
+                events = []
+                class FakeHost:
+                    def __init__(self, manifest, directory, image): self.manifest = manifest
+                    def run(self):
+                        events.append("run")
+                        if provisioned: self.manifest["imageId"] = "sha256:" + "c" * 64
+                        raise ValueError("fixture failed")
+                    def measure_diagnostics(self): events.append("measure")
+                    def finish(self): events.append("finish")
+                    def publish(self, error=None): events.append(("publish", str(error)))
+                argv = ["calibration.py", "--image", "x", "--mode", "local", "--run-id", "r", "--attempt", "1"]
+                with patch.object(calibration, "Host", FakeHost), patch.object(calibration, "SCRATCH", self.root / "scratch"), \
+                        patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, "fixture failed"):
+                        calibration.main()
+                self.assertEqual(events, ["run", *(["measure"] if provisioned else []),
+                                          "finish", ("publish", "fixture failed")])
+
+    def test_interrupts_cleanup_without_measurement_continuation_or_publication(self):
+        for step in ("run", "measure"):
+            with self.subTest(step=step):
+                events = []
+                class FakeHost:
+                    def __init__(self, manifest, directory, image): self.manifest = manifest
+                    def run(self):
+                        events.append("run")
+                        self.manifest["imageId"] = "sha256:" + "c" * 64
+                        if step == "run": raise KeyboardInterrupt()
+                    def measure_diagnostics(self): events.append("measure"); raise KeyboardInterrupt()
+                    def finish(self): events.append("finish")
+                    def publish(self, error=None): events.append("publish")
+                argv = ["calibration.py", "--image", "x", "--mode", "local", "--run-id", "r", "--attempt", "1"]
+                with patch.object(calibration, "Host", FakeHost), patch.object(calibration, "SCRATCH", self.root / "scratch"), \
+                        patch.object(sys, "argv", argv), self.assertRaises(KeyboardInterrupt):
+                    calibration.main()
+                self.assertEqual(events, ["run", *(["measure"] if step == "measure" else []), "finish"])
+
     def test_diagnostic_cleanup_failure_publishes_both_reports_failed(self):
         events = []
         class FakeHost:
             def __init__(self, manifest, directory, image):
                 self.manifest, self.directory = manifest, directory
-            def run(self): events.append("run")
+            def run(self): events.append("run"); self.manifest["imageId"] = "sha256:" + "c" * 64
             def measure_diagnostics(self): events.append("measure"); raise ValueError("diagnostic harness broke")
             def finish(self): events.append("finish"); raise ValueError("container cleanup failed")
             def publish(self, error=None): events.append(("publish", str(error)))

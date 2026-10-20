@@ -534,19 +534,19 @@ def main():
     host = Host(manifest, directory, args.image)
     error = diagnostic_error = None
     try:
-        host.run()
         try:
-            host.measure_diagnostics()
+            host.run()
         except Exception as exc:
-            # Harness failure only, kept apart from the calibration reports: when owned cleanup in
-            # host.finish() succeeds, the two reports publish exactly as they would without the
-            # diagnostic. A diagnostic container whose own cleanup fails makes finish() fail, and
-            # both reports are then published FAILED (fail-closed by design).
-            diagnostic_error = exc
-    except Exception as exc:
-        # Ordinary implementation/shape errors still require owned cleanup and
-        # two explicit failure reports. Interrupts retain their normal semantics.
-        error = exc
+            # Retain fixture failures, including an unavailable production PSI reader.
+            # Interrupts bypass diagnostics and publishing while still running owned cleanup.
+            error = exc
+        if "imageId" in manifest:
+            try:
+                host.measure_diagnostics()
+            except Exception as exc:
+                # Independent measurement still runs after fixture failure. Its own failure is
+                # separate; unconfirmed owned cleanup below fails both reports closed.
+                diagnostic_error = exc
     finally:
         try:
             host.finish()
