@@ -1156,7 +1156,8 @@ func (m *Materializer) oldUsable(t *rollTick, e *rollEntry) bool {
 
 // currentUsable requires current incarnation proof even without roll history.
 // It borrows the promotion seam with an empty prior nonce; the current nonce must
-// still be nonempty and proven by the heartbeat for the single physical pod.
+// still be nonempty and proven by the heartbeat for the single non-terminating,
+// non-terminal pod.
 func (m *Materializer) currentUsable(t *rollTick, e *rollEntry) bool {
 	if e.dep == nil || workerImage(e.dep) != workerImage(e.target) {
 		return false
@@ -1218,7 +1219,8 @@ func (m *Materializer) promoted(t *rollTick, e *rollEntry) bool {
 	current := 0
 	good := false
 	for _, pod := range e.pods {
-		if pod.DeletionTimestamp != nil || pod.UID == "" || !maintenancePodOwner(pod, e.sets) {
+		// Serving evidence does not prove process death or authorize destruction.
+		if pod.DeletionTimestamp != nil || pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded || pod.UID == "" || !maintenancePodOwner(pod, e.sets) {
 			continue
 		}
 		current++

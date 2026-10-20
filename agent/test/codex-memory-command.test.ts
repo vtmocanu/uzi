@@ -30,9 +30,9 @@ function captured(): CapturedMemoryContext {
   });
   return { commands, context, flight, lifecycleRevision: 1 };
 }
-function broker(spawnCommand: SpawnCommandSeam, registry: ExecutionRegistry, capturedMemory?: CapturedMemoryContext) {
+function broker(spawnCommand: SpawnCommandSeam, registry: ExecutionRegistry, capturedMemory?: CapturedMemoryContext, signal?: AbortSignal) {
   return new CodexCallbackBroker({
-    registry, spawnCommand, capturedMemory, worktreePath: WT,
+    registry, spawnCommand, capturedMemory, signal, worktreePath: WT,
     grants: { role: "coder", phase: "implement", isRoot: true, allowedTools: new Set(["Bash"]), allowedSkills: new Set() },
     fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }),
   });
@@ -44,7 +44,7 @@ function fakeRoot(supervisorPid = 50, rss = 100) {
   const stderr = new PassThrough();
   let disposes = 0;
   let observations = 0;
-  let observeHook: (() => Promise<ObservationOutcome>) | undefined;
+  let observeHook: ((budgetMs?: number) => Promise<ObservationOutcome>) | undefined;
   let disposeHeld = false;
   const disposal = deferred<Awaited<ReturnType<CodexRootHandle["dispose"]>>>();
   let clean = true;
@@ -62,7 +62,7 @@ function fakeRoot(supervisorPid = 50, rss = 100) {
     supervisorPid, transport: { stdin: new PassThrough(), stdout, stderr },
     failed: undefined, whenFailed: new Promise(() => {}),
     snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
-    observe: async () => { observations++; return observeHook ? observeHook() : evidence; },
+    observe: async (budgetMs) => { observations++; return observeHook ? observeHook(budgetMs) : evidence; },
     waitChild: async () => child.promise,
     dispose: async () => {
       disposes++;
@@ -73,7 +73,7 @@ function fakeRoot(supervisorPid = 50, rss = 100) {
     },
   };
   return { handle, child, observations: () => observations, disposes: () => disposes,
-    observeWith: (hook: () => Promise<ObservationOutcome>) => { observeHook = hook; },
+    observeWith: (hook: (budgetMs?: number) => Promise<ObservationOutcome>) => { observeHook = hook; },
     hangDisposal: () => { disposeHeld = true; },
     completeDisposal: () => {
       stdout.end(); stderr.end();
@@ -329,6 +329,95 @@ test("unavailable initial memory evidence preserves ordinary command execution a
   assert.equal(root.disposes(), 1, "ordinary exit still joins registered cleanup");
   assert.equal(registry.hasLiveCommandRoot(), false);
   assert.equal(c.commands.eligibleEntries()?.length, 0);
+});
+
+async function probeInitialEnrollment(
+  observe: (budgetMs: number | undefined, context: CapturedMemoryContext) => Promise<ObservationOutcome>,
+  deadlineMs = 200,
+  signal?: AbortSignal,
+) {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  root.observeWith(ms => observe(ms, c));
+  let enrolledAtExit: number | undefined;
+  const handle = { ...root.handle, waitChild: async () => {
+    enrolledAtExit = c.commands.eligibleEntries()?.length;
+    root.child.resolve({ event: "child_exit", code: 0 });
+    return root.handle.waitChild();
+  } };
+  const result = await broker(makeDefaultSpawnCommand(registry, async () => handle, deadlineMs,
+    WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c, signal)
+    .handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  return { result, enrolledAtExit, observations: root.observations(), disposes: root.disposes(),
+    remaining: c.commands.eligibleEntries() };
+}
+
+const staleObservation: ObservationOutcome = { event: "observe", id: 1, state: "unavailable", reason: "stale" };
+const completeObservation: ObservationOutcome = { event: "observe", id: 2, state: "complete",
+  supervisor: { pid: 50, startTime: ticks }, root: { pid: 51, startTime: ticks },
+  processes: [{ pid: 51, startTime: ticks, ppid: 50, rss: 100 }] };
+
+test("initial stale observation is retried and a later complete sample enrolls before command exit", async () => {
+  let calls = 0;
+  const r = await probeInitialEnrollment(async () => ++calls === 1 ? staleObservation : completeObservation);
+  assert.equal(r.result.ok, true);
+  assert.equal(r.observations, 2);
+  assert.equal(r.enrolledAtExit, 1);
+  assert.equal(r.disposes, 1);
+  assert.deepEqual(r.remaining, [], "ordinary cleanup unregisters the recovered enrollment");
+});
+
+for (const [deadlineMs, step, starts] of [
+  [200, 20, [0, 20]],
+  [12_000, 400, [0, 400, 800]],
+] as const) {
+  test(`persistent stale stops retry starts at min(1000 ms, deadline/4): ${deadlineMs}`, async t => {
+    let now = 0;
+    t.mock.method(performance, "now", () => now);
+    const observedStarts: number[] = [];
+    const budgets: Array<number | undefined> = [];
+    const r = await probeInitialEnrollment(async ms => {
+      observedStarts.push(now); budgets.push(ms); now += step;
+      return staleObservation;
+    }, deadlineMs);
+    assert.equal(r.result.ok, true, "uncertainty does not stop ordinary execution");
+    assert.deepEqual(observedStarts, starts);
+    assert.ok(observedStarts.every(start => start < Math.min(1000, deadlineMs / 4)));
+    assert.ok(budgets.every(ms => ms === deadlineMs / 2));
+    assert.ok(now < deadlineMs, "the last in-flight observation stays within the enrollment bound");
+    assert.equal(r.enrolledAtExit, 0);
+    assert.equal(r.disposes, 1);
+  });
+}
+
+for (const reason of ["unreadable", "timeout", "transport", "busy", "oversize"] as const) {
+  test(`initial non-stale ${reason} is not retried`, async () => {
+    const r = await probeInitialEnrollment(async () => ({ ...staleObservation, reason }));
+    assert.equal(r.result.ok, true);
+    assert.equal(r.observations, 1);
+    assert.equal(r.enrolledAtExit, 0);
+    assert.equal(r.disposes, 1);
+  });
+}
+
+test("identity and admission are checked on the complete sample after stale", async () => {
+  for (const mode of ["identity", "retired", "held", "aborted"] as const) {
+    let calls = 0;
+    const ac = new AbortController();
+    const r = await probeInitialEnrollment(async (_ms, c) => {
+      if (++calls === 1) return staleObservation;
+      if (mode === "retired") c.commands.retire(c.context);
+      if (mode === "held") c.commands.acquireLatch(c.context);
+      if (mode === "aborted") ac.abort();
+      return mode === "identity" ? { ...completeObservation, supervisor: { pid: 999, startTime: ticks } } : completeObservation;
+    }, 200, ac.signal);
+    assert.equal(r.observations, 2, mode);
+    assert.equal(r.result.ok, false, mode);
+    assert.equal(r.enrolledAtExit, undefined, "refused enrollment disposes before command wait");
+    assert.deepEqual(r.remaining, [], mode);
+    assert.equal(r.disposes, 1, mode);
+  }
 });
 
 test("failed or retired initial enrollment boundedly reaps the already launched root", async () => {

@@ -80,7 +80,7 @@ func TestCodexCompletionReleasedWorkerHealthLiveDB(t *testing.T) {
 	row := e.codexIndicatingQueuedRow(runID)
 	row.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
 	row.ReleasedWorkerID = pgtype.UUID{Bytes: workerID, Valid: true}
-	reason := svc.queuedReason(e.ctx, time.Now(), row)
+	reason := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit))
 	if reason != "waiting for another worker, or restart worker w-"+workerID.String()[:8]+" (its previous process was released at the time limit)" {
 		t.Fatalf("released worker reason = %q", reason)
 	}
@@ -133,19 +133,19 @@ func TestCodexCompletionHealthIntersectionLiveDB(t *testing.T) {
 	runID := e.seedCodexQueuedRun(t)
 	row := e.codexIndicatingQueuedRow(runID)
 	row.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonNoCodexCompletionCapableWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonNoCodexCompletionCapableWorker {
 		t.Fatalf("split fleet reason = %q", got)
 	}
 	e.seedWorker(t, codexCompletionCaps())
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonWaitingWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonWaitingWorker {
 		t.Fatalf("capable fleet reason = %q", got)
 	}
 	row.CodexCustomRoot = true
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonNoCustomCodexCapableWorker && got != reasonNoCodexCompletionCapableWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonNoCustomCodexCapableWorker && got != reasonNoCodexCompletionCapableWorker {
 		t.Fatalf("custom root lacking model protocol reason = %q", got)
 	}
 	e.seedWorker(t, append(codexCompletionCaps(), capability.CodexCustomModelV1))
-	if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonWaitingWorker {
+	if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonWaitingWorker {
 		t.Fatalf("custom root capable reason = %q", got)
 	}
 	n, err := e.q.CountOnlineWorkersSatisfyingCodexCompletion(e.ctx, store.CountOnlineWorkersSatisfyingCodexCompletionParams{UserID: e.userID, CustomRoot: true})

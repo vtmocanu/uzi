@@ -269,17 +269,23 @@ const (
 	reasonRepoNotDockerAllowedAdmin  = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; add it under Admin → Instance → Docker worker repo allowlist"
 	reasonRepoNotDockerAllowedMember = "this repo isn't on the Docker worker repo allowlist, so your Docker workers can't run it; ask an admin to add it under Admin → Instance → Docker worker repo allowlist"
 	// reasonCustodyLimit (PRD #1296 M4, D4) is emitted for a queued run whose OWNER is at
-	// the custody-hold admission limit — they hold >= custodyHoldLimit admission-counted
-	// open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
+	// the custody-hold admission limit — they hold >= the custody_hold_limit setting's
+	// admission-counted open holds (ADR-2445), so ClaimRun's owner-scoped custody-admission clause matches no row and
 	// the run stays queued until the owner resolves or discards some unpublished-work
 	// archives. Resolved against the SAME predicate the claim gates on
-	// (GetCustodyAdmissionForRun's admission-counted holds vs the same custodyHoldLimit
-	// constant, plus ClaimRun's continuation exemption, issue #1751), so the pill and the
+	// (GetCustodyAdmissionForRun's admission-counted holds vs the same custody_hold_limit
+	// value the claim read, plus ClaimRun's continuation exemption, issue #1751), so the pill and the
 	// claim can never disagree. Maps to the SAME healthWaitingWorker enum (no
 	// migration — runs.health_reason is free text). A NEW const, never a reuse of the
 	// pool_wait/recovery_wait park reasons (D4): this is an owner-admission block, not a
 	// credential-pool or transient-recovery hold, and its fix is archive retry/discard.
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
+	// reasonCustodyLimitUnavailable (#3150) is emitted for a queued non-cross_check run when the
+	// custody_hold_limit setting could not be read this tick. ClaimRun is refused the same way
+	// (claimLane fails closed on an unreadable limit), so no custody-gated run is admitted and
+	// the honest cause is the instance-wide setting, not the owner's holds or the fleet. Same
+	// healthWaitingWorker enum; no nudge (see detectRunHealth).
+	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
 	// reasonCodexAccountUnavailable (PRD #1590 M2, D2) is emitted for a queued Codex subscription
 	// run that ClaimRun's account gate excludes: its linked account is quarantined, or a re-login
 	// on its alias is in flight or has just linked the same identity with newer material. No
@@ -389,6 +395,11 @@ type healthThresholds struct {
 	nearTimeoutPct int
 	queued         time.Duration
 	approval       time.Duration
+	// custodyLimit is the custody_hold_limit setting read once for this tick, valid only when
+	// custodyLimitOK. The zero value (not OK) means UNAVAILABLE, so a threshold struct built
+	// without the read can never be mistaken for a configured or disabled limit (#3150).
+	custodyLimit   int32
+	custodyLimitOK bool
 }
 
 // detectRunHealth runs one health pass over every active run and returns the number
@@ -446,6 +457,12 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 		// no nudge is emitted, health_notified_at is not stamped for this reason (notifiedAt stays
 		// NULL below), so the per-run cooldown is never burned by a deferred custody crossing.
 		if reason == reasonCustodyLimit {
+			nudge = false
+		}
+		// #3150: an unreadable custody_hold_limit setting is an instance-wide failure that blocks
+		// every owner's claims, not a per-run wait; a "waiting for a worker to pick it up" DM
+		// (the enum's nudge head) would be false, and an admin acts on the pill, not a DM storm.
+		if reason == reasonCustodyLimitUnavailable {
 			nudge = false
 		}
 		// issue #1367: SUPPRESS the per-run Slack nudge for the undispatched-handoff reason too.
@@ -538,17 +555,17 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 			_, stalePinned := s.staleRequeuePin(now, r)
 			_, ownerHeld := s.ownerHold(now, r)
 			if stalePinned || ownerHeld {
-				if reason := s.queuedReason(ctx, now, r); isStaleRequeuePinReason(reason) {
+				if reason := s.queuedReason(ctx, now, r, th); isStaleRequeuePinReason(reason) {
 					return healthWaitingWorker, reason
 				}
 			}
-			return s.earlyDockerAllowlistTarget(ctx, now, r)
+			return s.earlyDockerAllowlistTarget(ctx, now, r, th)
 		}
 		// Every queued-past-threshold reason is resolved in queuedReason, most-fundamental
 		// first (vault-lock, no online worker, no capability-eligible worker, priority-class
 		// re-label, then the fleet reasons). The flag is always healthWaitingWorker; only the
 		// reason string differs, so healthSince's "stuck for Xm" preservation keeps working.
-		return healthWaitingWorker, s.queuedReason(ctx, now, r)
+		return healthWaitingWorker, s.queuedReason(ctx, now, r, th)
 	case "awaiting_approval":
 		// auto_approve runs self-resolve their gate and must never nudge anyone to
 		// approve them (Decision 8).
@@ -1062,7 +1079,7 @@ func stallBaseline(r store.ListActiveRunsForHealthRow) time.Time {
 // the capability-gap and the completion-protocol checks stay AHEAD of the priority-class
 // re-label, so a demoted-but-unplaceable run still reports the actionable capability block
 // rather than a yield message.
-func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) string {
+func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) string {
 	// PRD #400 Decision 6 / issue #1367: an undispatched task run (its uzi/task/<id> branch
 	// push or dispatch never landed) is NOT waiting for a worker — ClaimRun never offers it
 	// (kind<>'task' OR dispatched_at IS NOT NULL), so none of the fleet reasons below is the
@@ -1076,34 +1093,39 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		return reasonVaultLocked
 	}
 	// PRD #1296 M4 (D4): the owner-scoped custody-admission block. When the owner holds
-	// >= custodyHoldLimit admission-counted open holds (ADR-2445), ClaimRun's custody-admission
-	// clause matches no row and the run stays queued no matter how many idle, capable
-	// workers exist — so this is a FUNDAMENTAL, fleet-independent block, resolved right
+	// >= the custody_hold_limit setting's admission-counted open holds (ADR-2445), ClaimRun's
+	// custody-admission clause matches no row and the run stays queued no matter how many idle,
+	// capable workers exist — so this is a FUNDAMENTAL, fleet-independent block, resolved right
 	// after the vault-lock (the only other owner-account-state block) and AHEAD of every
 	// worker-availability reason: adding worker slots cannot clear counted custody, and naming a
 	// worker reason would point at the wrong cause. Read against the SAME predicate the
 	// claim gates on (GetCustodyAdmissionForRun: the owner's admission-counted holds and the same
-	// custodyHoldLimit constant), so the pill and the claim never disagree. Issue #1751 /
-	// ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold count
-	// at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
+	// limit value, read once per tick into th), so the pill and the claim never disagree. Issue
+	// #1751 / ADR-1751: a CONTINUATION-EXEMPT run (claim_generation >= 1 and its own open-hold
+	// count at least 1 and below the limit, the SAME expression ClaimRun's custody clause uses) is
 	// admitted at/over the cap, so it never gets the custody reason; a run already holding
-	// custodyHoldLimit holds of its own is not exempt and gets it like new work. A non-positive limit DISABLES the gate on the claim
-	// side too, so this rung stays silent then. The per-run read sits behind the
+	// limit holds of its own is not exempt and gets it like new work. #3150: there is no
+	// disabled/zero limit; when the setting could not be read this tick (th.custodyLimitOK
+	// false, which is also the zero value) ClaimRun refuses too, so the rung reports
+	// reasonCustodyLimitUnavailable instead of guessing. The per-run read sits behind the
 	// queued-threshold guard in healthTargetFor, so it runs for ~0 runs/tick except for a run held by
 	// either owner hold below that threshold (healthTargetFor computes queuedReason for it, once per
-	// tick until its hold ends) and the early docker-allowlist probe; a read error
+	// tick until its hold ends) and the early docker-allowlist probe; a per-run read error
 	// falls through to the generic reasons below rather than inventing a reason on a failed
 	// lookup (the conservative degrade the sibling per-run lookups use).
 	// Hold-free cross-check children bypass custody admission independently of
 	// bounded code-publishing continuation; their placement and account gates remain.
-	if custodyHoldLimit > 0 && r.Kind != "cross_check" {
+	if r.Kind != "cross_check" {
+		if !th.custodyLimitOK {
+			return reasonCustodyLimitUnavailable
+		}
 		adm, cerr := s.q.GetCustodyAdmissionForRun(ctx, store.GetCustodyAdmissionForRunParams{
-			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: custodyHoldLimit,
+			UserID: r.UserID, RunID: r.ID, CustodyHoldLimit: th.custodyLimit,
 			HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 		})
 		if cerr != nil {
 			slog.Error("health: read custody admission", "run_id", r.ID, "error", cerr)
-		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(custodyHoldLimit) {
+		} else if !adm.ContinuationExempt && adm.AdmissionCountedHolds >= int64(th.custodyLimit) {
 			return reasonCustodyLimit
 		}
 	}
@@ -1590,7 +1612,7 @@ func (s *Service) repoNotDockerAllowedReason(ctx context.Context, ownerID uuid.U
 // is eligible for the repo, and queuedReason resolves to the docker-allowlist reason (so
 // every more-fundamental rung still wins); every other path, including any probe read error (an owner-lookup failure still shows the Member wording),
 // returns (healthOK, "").
-func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow) (string, string) {
+func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	if !r.RepoID.Valid || r.EgressProfileID.Valid || s.dockerAllowlist == nil {
 		return healthOK, ""
 	}
@@ -1622,7 +1644,7 @@ func (s *Service) earlyDockerAllowlistTarget(ctx context.Context, now time.Time,
 	if elig != 0 {
 		return healthOK, ""
 	}
-	if reason := s.queuedReason(ctx, now, r); isRepoNotDockerAllowedReason(reason) {
+	if reason := s.queuedReason(ctx, now, r, th); isRepoNotDockerAllowedReason(reason) {
 		return healthWaitingWorker, reason
 	}
 	return healthOK, ""
@@ -1654,10 +1676,24 @@ func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r stor
 }
 
 // healthThresholds reads all thresholds once per tick (the settings cache is a 5s
-// read-through, so this is cheap). Each accessor already falls back to its default
-// on a read error; healthDur maps a non-positive value to a disabled (zero) signal.
+// read-through, so this is cheap). Each duration accessor already falls back to its default
+// on a read error; healthDur maps a non-positive value to a disabled (zero) signal. The
+// custody limit read does NOT fall back (#3150): a nil reader or a read error leaves
+// custodyLimitOK false, which queuedReason reports as reasonCustodyLimitUnavailable.
 func (s *Service) healthThresholds(ctx context.Context) healthThresholds {
+	var limit int32
+	limitOK := false
+	if s.p.CustodyHoldLimit != nil {
+		n, err := s.p.CustodyHoldLimit.CustodyHoldLimit(ctx)
+		if err != nil {
+			slog.Error("health: read custody_hold_limit", "error", err)
+		} else {
+			limit, limitOK = n, true
+		}
+	}
 	return healthThresholds{
+		custodyLimit:   limit,
+		custodyLimitOK: limitOK,
 		stall:          healthDur(s.healthSettings.HealthStallSeconds(ctx)),
 		toolCall:       healthDur(s.healthSettings.HealthToolCallSeconds(ctx)),
 		nearTimeoutPct: healthPct(s.healthSettings.HealthNearTimeoutPct(ctx)),

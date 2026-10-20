@@ -24,7 +24,7 @@ func TestCrossCheckLaneAffinityIsNotReleasedWorkerLiveDB(t *testing.T) {
 		if !r.WorkerID.Valid || r.ReleasedWorkerID.Valid {
 			t.Fatal("affinity confused with released process")
 		}
-		if got := f.svc.queuedReason(f.env.ctx, now, r); got != reasonPlanCrossCheckWaiting {
+		if got := f.svc.queuedReason(f.env.ctx, now, r, thWithLimit(testCustodyLimit)); got != reasonPlanCrossCheckWaiting {
 			t.Fatalf("affinity health reason: %s", got)
 		}
 	}
@@ -49,7 +49,7 @@ func TestCrossCheckLaneAffinityIsNotReleasedWorkerLiveDB(t *testing.T) {
 		if !r.ReleasedWorkerID.Valid {
 			t.Fatal("released identity lost")
 		}
-		if got := f.svc.queuedReason(f.env.ctx, now, r); !strings.Contains(got, "restart worker ") {
+		if got := f.svc.queuedReason(f.env.ctx, now, r, thWithLimit(testCustodyLimit)); !strings.Contains(got, "restart worker ") {
 			t.Fatalf("released rung lost: %s", got)
 		}
 	}

@@ -29,3 +29,50 @@ test(`settlement diagnostic projects bounded retention reason ${retainedReason}`
 });
 
 }
+
+for (const suffix of [
+  'maintenance-v1-22222222-2222-4222-8222-222222222222',
+  'maintenance-v1-22222222-2222-1222-8222-222222222222',
+  'maintenance-v1-22222222-2222-4222-7222-222222222222',
+  'MAINTENANCE-v1-22222222-2222-4222-8222-222222222222',
+  'maintenance-v2-22222222-2222-4222-8222-222222222222',
+  'maintenance-v1-22222222-2222-4222-8222-222222222222\n',
+  'maintenan',
+]) {
+  test(`settlement diagnostic reports deny-only origin without authenticating ${JSON.stringify(suffix)}`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'settlement-origin-'));
+    const run = '11111111-1111-4111-8111-111111111111';
+    const producer = suffix === 'maintenance-v1-22222222-2222-4222-8222-222222222222';
+    try {
+      for (const name of ['outbox', 'recovery']) await fs.mkdir(path.join(root, name, run), { recursive: true });
+      await fs.writeFile(path.join(root, 'outbox', run, 'terminal-2.json'), '{}');
+      await fs.writeFile(path.join(root, 'recovery', run, suffix + '.json'), JSON.stringify({ captureId: suffix, state: 'pinned', mac: 'DO_NOT_LOG' }));
+      const output = execFileSync(process.execPath, [fileURLToPath(new URL('./settlement-diagnostic.mjs', import.meta.url)), root], { encoding: 'utf8', timeout: 10000 });
+      assert.ok(!output.includes('DO_NOT_LOG'));
+      const row = JSON.parse(output);
+      assert.equal(row.authenticated, false);
+      assert.equal(row.recovery_records.length, 1);
+      const record = row.recovery_records[0];
+      assert.equal(record.observed_origin, producer ? 'producer' : 'malformed');
+      assert.equal(record.capture_id, producer ? suffix : null);
+      assert.equal(record.error, producer ? null : 'maintenance_origin_invalid');
+      if (!producer) assert.ok(!output.includes(JSON.stringify(suffix)), 'invalid suffix is not echoed');
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+}
+
+test('settlement diagnostic refuses prefixed filename/body mismatch without identity repair', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'settlement-origin-mismatch-'));
+  const run = '11111111-1111-4111-8111-111111111111';
+  const capture = 'maintenance-v1-22222222-2222-4222-8222-222222222222';
+  try {
+    for (const name of ['outbox', 'recovery']) await fs.mkdir(path.join(root, name, run), { recursive: true });
+    await fs.writeFile(path.join(root, 'outbox', run, 'terminal-2.json'), '{}');
+    await fs.writeFile(path.join(root, 'recovery', run, capture + '.json'), JSON.stringify({ captureId: 'DO_NOT_LOG', state: 'pinned' }));
+    const output = execFileSync(process.execPath, [fileURLToPath(new URL('./settlement-diagnostic.mjs', import.meta.url)), root], { encoding: 'utf8', timeout: 10000 });
+    const record = JSON.parse(output).recovery_records[0];
+    assert.ok(!output.includes('DO_NOT_LOG'));
+    assert.equal(record.error, 'capture_identity_mismatch');
+    assert.equal(record.state, null);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});

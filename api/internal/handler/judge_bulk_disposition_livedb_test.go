@@ -49,7 +49,7 @@ func bulkDispositionLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Querie
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	return &Handler{pool: pool, q: q, box: box, cfg: config.Config{}, wsvc: workersvc.New(q, box, workersvc.Params{})}, pool, q
+	return &Handler{pool: pool, q: q, box: box, cfg: config.Config{}, wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}, pool, q
 }
 
 // bulkFixture seeds one user with `runs` judged runs, each carrying every coordinate in

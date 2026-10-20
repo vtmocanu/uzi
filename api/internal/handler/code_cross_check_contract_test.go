@@ -42,7 +42,7 @@ func TestCodeCrossCheckStatusWireFixtures(t *testing.T) {
 
 	for name, row := range map[string]store.CrossCheck{"status-pending.json": pending, "status-completed.json": completed} {
 		t.Run(name, func(t *testing.T) {
-			svc := workersvc.New(nil, nil, workersvc.Params{})
+			svc := workersvc.New(nil, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			svc.SetTxBeginner(&codeStatusTx{lead: lead, check: row})
 			h := &Handler{wsvc: svc}
 			router := chi.NewRouter()

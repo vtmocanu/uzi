@@ -43,6 +43,7 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
   hosted_worker_quota: "2",
+  custody_hold_limit: "8",
   ci_autofix_enabled: "true",
   release_check_enabled: "true",
   release_check_banner_enabled: "true",

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
@@ -899,7 +900,7 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // it lists only live custody (state='open'), dropping resolved released/discarded history. It
 // stamps each hold with a server-derived Attention, and folds the aggregate: OpenHolds is
 // total open custody; AdmissionCountedHolds and BlockedRuns use the admission predicate,
-// CustodyHoldLimit from the configured ceiling, and DecisionNeeded is the count of holds whose
+// CustodyHoldLimit from the configured custody_hold_limit setting (read once), and DecisionNeeded is the count of holds whose
 // derived attention awaits an owner decision (needs_action or source_only) — active protection and
 // self-releasing archive_ready rows are excluded (D10). OpenHolds/BlockedRuns come from the
 // separate owner-wide aggregate query, so they are structurally independent of openOnly.
@@ -911,6 +912,14 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // always non-nil so it marshals as [] (never null). No run scope — this is the owner-wide list;
 // the CLI narrows by run.
 func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openOnly bool) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	if s.limits.CustodyHoldLimit == nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, errors.New("read custody hold limit: no reader wired")
+	}
+	// Read the limit once; the aggregate query and the DTO both use this value.
+	custodyLimit, err := s.limits.CustodyHoldLimit(ctx)
+	if err != nil {
+		return apitypes.RecoveryCustodyHoldsDTO{}, fmt.Errorf("read custody hold limit: %w", err)
+	}
 	now := s.now()
 	cutoff := pgconv.Time(now.Add(-s.limits.WorkerHeartbeatStale))
 	params := store.ListCustodyHoldsForOwnerParams{UserID: userID}
@@ -929,7 +938,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 	)
 	// Issue #2970: the list, the per-hold membership and the aggregate are read from one
 	// snapshot with one cutoff, so the per-hold flags always sum to AdmissionCountedHolds.
-	err := s.ownerRead(ctx, func(q Store) error {
+	err = s.ownerRead(ctx, func(q Store) error {
 		var err error
 		if rows, err = q.ListCustodyHoldsForOwner(ctx, params); err != nil {
 			return err
@@ -942,7 +951,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		}
 		agg, err = q.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
 			UserID:           userID,
-			CustodyHoldLimit: s.limits.CustodyHoldLimit,
+			CustodyHoldLimit: custodyLimit,
 			HeartbeatCutoff:  cutoff,
 		})
 		return err
@@ -980,7 +989,7 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{
 			OpenHolds:             int(agg.OpenHolds),
 			AdmissionCountedHolds: int(agg.AdmissionCountedHolds),
-			CustodyHoldLimit:      int(s.limits.CustodyHoldLimit),
+			CustodyHoldLimit:      int(custodyLimit),
 			DecisionNeeded:        decisionNeeded,
 			BlockedRuns:           int(agg.BlockedRuns),
 		},

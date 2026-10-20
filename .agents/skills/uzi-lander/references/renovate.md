@@ -19,7 +19,7 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
   its night schedule, Renovate rebases a behind branch, then merges once every check is green,
   at most one PR per run. A green patch PR can therefore still be open: awaiting the next
   scheduled run, mid-rebase, in a group that also carries a minor or digest (a group
-  automerges only when every update in it does), or excluded (Codex runtime,
+  automerges only when every update in it does), or excluded (the agent runtimes: Codex runtime,
   `@anthropic-ai/claude-agent-sdk`). Land it by hand like any other.
   A red `main` after a night with no lander merge may be one of these.
 - **A pending `renovate/stability-days` blocks automerge** even though GitHub does not require
@@ -59,7 +59,8 @@ versions, for anything touching how uzi uses the package.
 - Nothing breaking affects uzi and checks are green: take the major, drop the minor.
 - Adopting it needs real code changes: merge the safe minor/patch now, file the major as
   its own `dependencies`/`enhancement` issue (`gh issue create`), report it at batch end.
-- An `@anthropic-ai/claude-agent-sdk` major also gets the adoption review below.
+- An agent-runtime bump (Claude Agent SDK or Codex runtime) also gets the adoption read below,
+  whatever its update type.
 
 ## A minor/patch bump is not automatically a drop-in
 
@@ -73,16 +74,28 @@ CI is the arbiter, and two classes redden a green-looking bump:
   `kubeadm.k8s.io/v1beta3` config the pinned `kind` emits (`Create KinD cluster` fails with
   `uses an old API spec`), so bump the action in tandem.
 
-## `@anthropic-ai/claude-agent-sdk`: read for adoption, not just the lockfile
+## Agent runtimes (Claude Agent SDK, Codex): read for adoption, not just the lock
 
-It is the agent-runtime core (`agent/` builds on it, incl. the `PreToolUse` guardrail hooks
-and `settingSources`), so a new version can ship capabilities uzi should adopt.
+Both harnesses' engines are runtime core, and neither bump automerges (`renovate.json`): a
+new version can break uzi or ship capabilities uzi should adopt.
 
 - Read **every intermediate version's notes**, not only the target's: `0.3.235 → 0.3.238`
   spans `.236` and `.237`. Renovate embeds one section per version in the PR body; if thin,
-  read `anthropics/claude-agent-sdk-typescript` `CHANGELOG.md` across the whole span.
-- Scan for new hooks, tool-runner/permission APIs, session/streaming features and options;
-  cross-check against the four guardrail layers and the run lifecycle in `ARCHITECTURE.md`.
+  read the upstream source across the whole span:
+  - Claude: `@anthropic-ai/claude-agent-sdk`, `anthropics/claude-agent-sdk-typescript`
+    `CHANGELOG.md`.
+  - Codex: the native runtime in `agent/codex/codex-package.lock` (not an npm SDK; uzi
+    drives `codex app-server`, ADR-1106), `openai/codex` `rust-v*` GitHub release notes.
+- Scan for breaking changes and for new capabilities, then cross-check against the four
+  guardrail layers and the run lifecycle in `ARCHITECTURE.md`:
+  - Claude: hooks (the `PreToolUse` deny-hook), tool-runner/permission APIs,
+    `settingSources`, session/streaming features and options.
+  - Codex: app-server protocol, approval and dynamic-callback (`item/tool/call`) changes,
+    hook trust, sandbox and feature defaults that could re-enable effectful native
+    execution or extensions (ADR-1106 *Execution policy*), session/resume and streaming.
+- The Codex bump arrives red by design: runtime probe/launcher parity blocks a lock-only
+  bump until `CODEX_PROBE_EXPECTATION` and `CODEX_BIN` are reconciled (PR-body note). That
+  fix goes on your own branch (below), with the Codex guardrail/conformance checks green.
 - Merging the bump implements none of it. Propose anything useful to the user and offer an
   `enhancement` issue, separate from the bump; never implement it in the bump PR. Report
   what you found, or "nothing actionable", at batch end.

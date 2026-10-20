@@ -151,7 +151,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 	}
 	useClock := func(t *testing.T, clock *time.Time, beforeLock func()) {
 		t.Helper()
-		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 		svc.SetClock(func() time.Time { return *clock })
 		svc.SetTxBeginner(pauseTestBeginner{pool: e.pool, beforeLock: beforeLock})
 		h := &Handler{q: q, wsvc: svc, now: func() time.Time { return *clock }}
@@ -391,7 +391,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 				}
 				tq := store.New(tx)
 				clock := parkAt
-				svc := workersvc.New(tq, newHandlerTestBox(t), workersvc.Params{})
+				svc := workersvc.New(tq, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 				svc.SetTxBeginner(e.pool)
 				h := &Handler{q: tq, wsvc: svc,
 					now: func() time.Time { return clock }}
@@ -547,7 +547,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 	})
 	t.Run("pause_settlement_failure_rolls_back", func(t *testing.T) {
 		id := newRun(t)
-		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 		svc.SetTxBeginner(pauseTestBeginner{pool: e.pool, failSettlement: true})
 		worker, err := q.GetWorkerByID(ctx, e.worker)
 		if err != nil {
@@ -574,7 +574,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 		gen := int64(4)
 		for _, change := range []string{"status='paused'", "claim_generation=5", "claim_released_at=now()"} {
 			id := newRun(t)
-			svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+			svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			svc.SetTxBeginner(pauseTestBeginner{pool: e.pool, beforeLock: func() {
 				e.exec(t, "UPDATE runs SET "+change+" WHERE id=$1", id)
 			}})
@@ -590,7 +590,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 			}
 		}
 		id := newRun(t)
-		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 		checked := false
 		svc.SetTxBeginner(pauseTestBeginner{pool: e.pool, beforeCommit: func() error {
 			checked = true

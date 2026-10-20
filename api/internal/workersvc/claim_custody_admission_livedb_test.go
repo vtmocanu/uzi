@@ -183,14 +183,14 @@ func TestFreshClaimCustodyAdmissionLiveDB(t *testing.T) {
 			fresh := f.seedRun("queued", 0)
 			cutoff := pgconv.Time(f.now.Add(-f.svc.p.WorkerHeartbeatStale))
 			adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-				UserID: f.userID, RunID: fresh, CustodyHoldLimit: custodyHoldLimit, HeartbeatCutoff: cutoff})
+				UserID: f.userID, RunID: fresh, CustodyHoldLimit: testCustodyLimit, HeartbeatCutoff: cutoff})
 			if err != nil {
 				t.Fatal(err)
 			}
 			if adm.OpenHolds != 8 || adm.AdmissionCountedHolds != tc.counted || adm.ContinuationExempt {
 				t.Fatalf("admission facts = %+v, want total8/count%d/no exemption", adm, tc.counted)
 			}
-			reason := f.svc.queuedReason(env.ctx, f.now, store.ListActiveRunsForHealthRow{ID: fresh, UserID: f.userID, Kind: "issue"})
+			reason := f.svc.queuedReason(env.ctx, f.now, store.ListActiveRunsForHealthRow{ID: fresh, UserID: f.userID, Kind: "issue"}, thWithLimit(testCustodyLimit))
 			if (reason == reasonCustodyLimit) != (tc.counted >= 8) {
 				t.Fatalf("health reason=%q count=%d", reason, tc.counted)
 			}
@@ -314,7 +314,7 @@ func TestCustodyConcurrentAdmissionPressureLiveDB(t *testing.T) {
 	env.exec("UPDATE runs SET status='paused' WHERE id=ANY($1)", []uuid.UUID{first, second})
 	fresh := f.seedRun("queued", 0)
 	adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-		UserID: f.userID, RunID: fresh, CustodyHoldLimit: custodyHoldLimit, HeartbeatCutoff: pgconv.Time(f.now.Add(-f.svc.p.WorkerHeartbeatStale))})
+		UserID: f.userID, RunID: fresh, CustodyHoldLimit: testCustodyLimit, HeartbeatCutoff: pgconv.Time(f.now.Add(-f.svc.p.WorkerHeartbeatStale))})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -156,7 +156,7 @@ func TestSweepFiresOnlyUziLabelledCandidateLiveDB(t *testing.T) {
 	// Real workersvc.Service (the real uzi_label gate) and a real Scheduler firing through
 	// it. The scheduler supplies the forge for issue capture; guardDefaultBranch is
 	// inert without a repo guard.
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	sched := schedsvc.New(q, wsvc, sweepGateBuilder{f: &sweepGateForge{}}, sweepGateSettings{}, nil, nil, time.Minute, nil)
 
 	tickAt := time.Now()

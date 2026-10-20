@@ -467,6 +467,8 @@ export class RetainedSourceServer {
     const now = this.deps.now ?? Date.now;
     const sleep = this.deps.sleep ?? ((ms: number) => realSleep(ms));
     // 2. Close the claim gate. From here until the finally, only `retained_ops` is ours to reopen.
+    // Never alongside the #3031 terminal producer's writer exclusion.
+    if (gate.heldBy("terminal_maintenance")) return this.refusal("worker_not_idle");
     gate.close("retained_ops");
     try {
       // 3. Wait for in-flight claims to drain (a claim stays counted until its run is in the active set).

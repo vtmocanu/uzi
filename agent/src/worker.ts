@@ -395,6 +395,14 @@ export class Worker {
   private async runLifecycle(controller: AbortController): Promise<void> {
     const signal = controller.signal;
     const tasks: Promise<void>[] = [];
+    let recoveryDrain: Promise<void> | undefined;
+    const stopRecoveries = () => {
+      if (!recoveryDrain && typeof this.runner.shutdownRecoveries === "function") {
+        tasks.push(recoveryDrain = this.runner.shutdownRecoveries());
+      }
+    };
+    // Abort can arrive while Promise.all(tasks) is still joining a loop child.
+    signal.addEventListener("abort", stopRecoveries, { once: true });
     try {
       // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
       // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
@@ -512,6 +520,8 @@ export class Worker {
       // Boot/registration failures also stop and join loops already started.
       void this.shutdownMemory();
       controller.abort();
+      stopRecoveries();
+      signal.removeEventListener("abort", stopRecoveries);
       await Promise.allSettled(tasks);
     }
   }

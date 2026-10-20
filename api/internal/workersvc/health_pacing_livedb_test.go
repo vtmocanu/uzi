@@ -34,7 +34,7 @@ func TestHealthPacingStaticAndFenceLiveDB(t *testing.T) {
 			if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: w, Kind: "fleet", Phase: PhaseStuck, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "held", TargetImage: "repo:bad"}}); err != nil {
 				t.Fatal(err)
 			}
-			if got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run)); !strings.Contains(got, "worker roll") {
+			if got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run), thWithLimit(testCustodyLimit)); !strings.Contains(got, "worker roll") {
 				t.Fatalf("baseline %q", got)
 			}
 			switch tc.name {
@@ -50,7 +50,7 @@ func TestHealthPacingStaticAndFenceLiveDB(t *testing.T) {
 			default:
 				e.exec(t, tc.change, w)
 			}
-			if got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run)); strings.Contains(got, "worker roll") {
+			if got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run), thWithLimit(testCustodyLimit)); strings.Contains(got, "worker roll") {
 				t.Fatalf("false attribution %q", got)
 			}
 		})
@@ -122,7 +122,7 @@ func TestHealthPacingProfilePlacementLiveDB(t *testing.T) {
 		}
 		for _, r := range rows {
 			if r.ID == run {
-				return f.svc.queuedReason(f.env.ctx, now, r)
+				return f.svc.queuedReason(f.env.ctx, now, r, thWithLimit(testCustodyLimit))
 			}
 		}
 		t.Fatal("run missing")
@@ -151,14 +151,14 @@ func TestHealthPacingOfflineLiveDB(t *testing.T) {
 	now := time.Now().UTC()
 	e.exec(t, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',capabilities='{gpu}',status='offline',last_heartbeat_at=$2 WHERE id=$1", w, now.Add(-time.Hour))
 	row := e.healthRowFor(t, run)
-	if got := svc.queuedReason(e.ctx, now, row); got != reasonNoWorker {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != reasonNoWorker {
 		t.Fatalf("baseline %q", got)
 	}
 	reason := "original ImagePullBackOff"
 	if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: w, Kind: "fleet", Phase: PhaseStuck, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "held", TargetImage: "repo:bad", BlockingReason: &reason}}); err != nil {
 		t.Fatal(err)
 	}
-	got := svc.queuedReason(e.ctx, now, row)
+	got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit))
 	if !strings.Contains(got, "waiting for worker roll (held) to repo:bad: original ImagePullBackOff") {
 		t.Fatalf("held %q", got)
 	}
@@ -169,38 +169,38 @@ func TestHealthPacingOfflineLiveDB(t *testing.T) {
 	// The old registration may remain API-online briefly after Recreate. The
 	// fresh pod failure still explains a wait before that generic heartbeat expires.
 	e.exec(t, "UPDATE workers SET status='online',last_heartbeat_at=$2 WHERE id=$1", w, now)
-	if got := svc.queuedReason(e.ctx, now, row); !strings.Contains(got, "worker roll") {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); !strings.Contains(got, "worker roll") {
 		t.Fatalf("cached old heartbeat concealed replacement failure: %q", got)
 	}
 	e.exec(t, "UPDATE workers SET status='offline',last_heartbeat_at=$2 WHERE id=$1", w, now.Add(-time.Hour))
 	// A fresh readiness receipt must not prolong old pacing.
 	e.exec(t, "UPDATE worker_upgrade_reports SET pacing_observed_at=$2,observed_at=$3 WHERE worker_id=$1", w, now.Add(-time.Minute-time.Second), now)
-	if got := svc.queuedReason(e.ctx, now, row); got != reasonNoWorker {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != reasonNoWorker {
 		t.Fatalf("expired %q", got)
 	}
 	e.exec(t, "UPDATE worker_upgrade_reports SET pacing_observed_at=$2 WHERE worker_id=$1", w, now)
 	e.exec(t, "UPDATE workers SET capabilities='{}' WHERE id=$1", w)
-	if got := svc.queuedReason(e.ctx, now, row); strings.Contains(got, "worker roll") {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); strings.Contains(got, "worker roll") {
 		t.Fatalf("incompatible %q", got)
 	}
 	e.exec(t, "UPDATE workers SET capabilities='{gpu}' WHERE id=$1", w)
 	peer := e.seedHeartbeatWorker(t, nil)
 	e.exec(t, "UPDATE workers SET capabilities='{gpu}',max_concurrent_runs=1 WHERE id=$1", peer)
 	e.seedActiveRunOwnedBy(t, peer)
-	if got := svc.queuedReason(e.ctx, now, row); got != reasonAllWorkersBusy {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != reasonAllWorkersBusy {
 		t.Fatalf("healthy retained busy %q", got)
 	}
 	// A retained provider with a stuck report still vetoes roll attribution while busy.
 	if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: peer, Kind: "fleet", Phase: PhaseStuck, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "held", TargetImage: "repo:bad"}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := svc.queuedReason(e.ctx, now, row); got != reasonAllWorkersBusy {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != reasonAllWorkersBusy {
 		t.Fatalf("retained with stuck report %q", got)
 	}
 	e.exec(t, "DELETE FROM worker_upgrade_reports WHERE worker_id=$1", peer)
 	// An offline suitable provider with no roll context vetoes exclusivity too.
 	e.exec(t, "UPDATE workers SET status='offline',last_heartbeat_at=$2 WHERE id=$1", peer, now.Add(-time.Hour))
-	if got := svc.queuedReason(e.ctx, now, row); got != reasonNoWorker {
+	if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != reasonNoWorker {
 		t.Fatalf("unexplained offline %q", got)
 	}
 }
@@ -244,7 +244,7 @@ func TestHealthPacingDrainOnlyLiveDB(t *testing.T) {
 					}
 				}
 			}
-			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run))
+			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run), thWithLimit(testCustodyLimit))
 			if tc.legacy && got != ReasonWorkersUpgrading {
 				t.Fatalf("active drain-only exemption lost: %q", got)
 			}

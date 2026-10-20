@@ -82,7 +82,7 @@ func newFCEnv(t *testing.T, caps fcCaps, withToken bool) *fcEnv {
 	}
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	h := &Handler{pool: pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{}), settings: e.caps, hub: hub.New()}
+	h := &Handler{pool: pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}), settings: e.caps, hub: hub.New()}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 	e.router = h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 	e.tls = h.WorkerRoutes(lim)

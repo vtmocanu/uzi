@@ -340,7 +340,7 @@ func TestLaneMirrorsLiveDB(t *testing.T) {
 	if !row.EgressProfileID.Valid {
 		t.Fatalf("ListActiveRunsForHealth row for the bound run carries no egress_profile_id: %+v", row)
 	}
-	if got := f.svc.queuedReason(f.env.ctx, time.Now(), row); got != reasonWaitingIsolatedLane {
+	if got := f.svc.queuedReason(f.env.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonWaitingIsolatedLane {
 		t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingIsolatedLane)
 	}
 }
@@ -417,7 +417,7 @@ func TestIsolatedLaneQueuedReasonLiveDB(t *testing.T) {
 	} {
 		f.svc.ephemeralSettings = tc.settings
 		f.svc.SetIsolatedLaneEnabled(!tc.laneOff)
-		if got := f.svc.queuedReason(f.env.ctx, time.Now(), byID[tc.run]); got != tc.want {
+		if got := f.svc.queuedReason(f.env.ctx, time.Now(), byID[tc.run], thWithLimit(testCustodyLimit)); got != tc.want {
 			t.Errorf("%s: queuedReason = %q, want %q", tc.name, got, tc.want)
 		}
 	}

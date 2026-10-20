@@ -86,7 +86,7 @@ func (p *publishStore) SetRunCheckpointTip(context.Context, store.SetRunCheckpoi
 // injectable stubs.
 func newPublishHandler(t *testing.T, st workersvc.Store, box *secretbox.Box, allow func(string) bool, publish func(context.Context, pushbroker.Options) (pushbroker.Result, error)) *Handler {
 	t.Helper()
-	wsvc := workersvc.New(st, box, workersvc.Params{})
+	wsvc := workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetForgeBaseURLAllowed(allow)
 	if publish != nil {
 		wsvc.SetPublishFn(publish)

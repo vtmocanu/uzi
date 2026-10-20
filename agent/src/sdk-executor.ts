@@ -74,6 +74,7 @@ import {
 import {
   buildCIFixPlanPrompt,
   buildImplementPrompt,
+  selectPriorOwnerHistory,
   interruptedCallsNote,
   buildLeadSystemPrompt,
   buildPlanPrompt,
@@ -2937,6 +2938,10 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
+      // Issue #3149: one-shot latch for the earlier-owner-follow-up history of a reviewed-plan resume,
+      // spent when the carrying turn completes.
+      // Not `first`: the held-batch service path resets `iteration` to 0 without setting hasParked.
+      let priorOwnerHistoryPlaced = false;
       // Execution lifetime, independent of iteration resets and system/rework turns.
       // Consumed at harness dispatch after refreshCodeCrossCheckTools has settled.
       let interruptedOwnerDispatched = false;
@@ -3135,7 +3140,7 @@ export class SdkExecutor implements Executor {
         completionRework = undefined;
         if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
         const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
-        const onFirstEvent = ownerRides
+        const ownerFirstEvent = ownerRides
           ? () => {
               if (ownerBatch !== ownerRides) return;
               ownerBatch = undefined;
@@ -3175,6 +3180,37 @@ export class SdkExecutor implements Executor {
           decisionsMemoImplementInjected = true;
           announceDecisionsMemo(ctx);
         }
+        // Issue #3149: history rides only a turn that renders it (not a system-text or rework turn),
+        // once. Ids the lead receives live this turn or on this claim are dropped by id. No inclusion
+        // receipt is ever issued for a history id.
+        let priorOwnerFollowUps: string[] | undefined;
+        let historyRides = false;
+        if (
+          !priorOwnerHistoryPlaced &&
+          ctx.reviewedPlanResume === true &&
+          !ctx.sessionId &&
+          followUp === undefined &&
+          !reworkForTurn
+        ) {
+          const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
+          priorOwnerFollowUps = selectPriorOwnerHistory(
+            ctx.priorOwnerFollowUps,
+            (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false),
+          );
+          historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
+        }
+        // The history latch is spent only when the turn completes (below, with resumeId) AND the
+        // model processed it: an aborted turn's in-place restart (credential switch, pause-now, wall
+        // refusal) does not advance resumeId, so it begins a fresh session and must carry the history
+        // again, and a success terminal with no model-processing evidence never saw it. Live-id sets
+        // only grow (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
+        let historyProcessed = false;
+        const onFirstEvent = ownerFirstEvent || historyRides
+          ? () => {
+              ownerFirstEvent?.();
+              historyProcessed = true;
+            }
+          : undefined;
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -3214,6 +3250,7 @@ export class SdkExecutor implements Executor {
             seededPlan: seededPlanBody,
             followUp,
             ownerFollowUps: ownerRides?.map((f) => f.body),
+            priorOwnerFollowUps,
             completionRework: reworkForTurn,
             ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
@@ -3325,6 +3362,7 @@ export class SdkExecutor implements Executor {
         try {
           turn = await turnPromise;
           resumeId = turn.sessionId ?? resumeId;
+          if (historyRides && historyProcessed) priorOwnerHistoryPlaced = true;
           if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
           // PRD #265 M1: latch the finished-milestone declaration the same way, so it
           // survives the terminating turn's `break` into the completed report.

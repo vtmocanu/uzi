@@ -39,7 +39,7 @@ func TestEphemeralDockerHealthReleasedAllowlistFallback(t *testing.T) {
 			svc := healthSvc(fs, defaultHealthSettings())
 			svc.SetEffectiveDockerTier(true)
 			svc.SetDockerAllowlist(fakeAllowlistReader{ids: tc.ids, err: tc.err})
-			if reason := svc.queuedReason(context.Background(), t0, r); reason != reasonWaitingWorker {
+			if reason := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); reason != reasonWaitingWorker {
 				t.Fatalf("reason=%q", reason)
 			}
 			wantQueries := 1

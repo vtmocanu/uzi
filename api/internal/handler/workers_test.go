@@ -61,7 +61,7 @@ func deleteWorkerReq(user store.User, id uuid.UUID) *http.Request {
 func TestDeleteWorkerCustodyConflict(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	st := &deleteWorkerStore{holds: 3}
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	rec := httptest.NewRecorder()
 	h.DeleteWorker(rec, deleteWorkerReq(owner, uuid.New()))
@@ -98,7 +98,7 @@ func TestDeleteWorkerCustodyConflict(t *testing.T) {
 func TestDeleteWorkerNormalSucceeds(t *testing.T) {
 	owner := store.User{ID: uuid.New()}
 	st := &deleteWorkerStore{deleteRows: 1}
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	rec := httptest.NewRecorder()
 	h.DeleteWorker(rec, deleteWorkerReq(owner, uuid.New()))

@@ -111,7 +111,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3173,6 +3173,7 @@ export class CodexExecutor implements Executor {
       // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when every entry is reported included. A turn that
       // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
       let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      let priorOwnerHistoryPlaced = false;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
       // run's gate, else (a pre-approved resume) the claim's frozen list.
       const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
@@ -3375,7 +3376,28 @@ export class CodexExecutor implements Executor {
         const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
           checkedPlan ? { milestones: approvedMilestones } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
-        const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBatch(ownerRides.map((f) => f.body))].join("\n") : ownerBase;
+        // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
+        // resume (never a system-text turn), deduped by id against this turn's live batch and the
+        // claim's live ids. The latch is spent only on the turn's first model event, so a turn that
+        // aborts before any event composes the history again. No inclusion receipt for a history id.
+        // The `systemFollowUp === undefined` term is defensive: every system-text turn follows an
+        // evidenced turn that already spent the latch, and a system-text body replaces basePrompt,
+        // so today it never changes the outcome; it keeps history off such a turn if that changes.
+        let historyBodies: string[] = [];
+        if (systemFollowUp === undefined && ctx.reviewedPlanResume === true && !ctx.sessionId && !priorOwnerHistoryPlaced) {
+          const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
+          historyBodies = selectPriorOwnerHistory(ctx.priorOwnerFollowUps, (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false));
+        }
+        const historyRides = historyBodies.length > 0;
+        const firstEventHandler = ownerRides || historyRides
+          ? () => {
+              if (historyRides) priorOwnerHistoryPlaced = true;
+              onOwnerFirstEvent?.();
+            }
+          : undefined;
+        const basePrompt = ownerRides || historyRides
+          ? [ownerBase, ...renderPriorOwnerHistory(historyBodies), ...(ownerRides ? renderFollowUpBatch(ownerRides.map((f) => f.body)) : [])].join("\n")
+          : ownerBase;
         const implementBody = systemFollowUp !== undefined
           ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
@@ -3396,7 +3418,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
@@ -4958,8 +4980,9 @@ export class CodexExecutor implements Executor {
 
   /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
-   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
-   *  ctx.approvedPlan, unframed) or the issue fallback. Every body is then followed by the shared
+   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the persisted
+   *  ctx.approvedPlan, framed with REVIEWED_RESUME_APPROVAL_GUIDANCE on a reviewed-plan resume
+   *  (#3149), unframed otherwise) or the issue fallback. Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
    *  there is one and followed by the milestone tracker note when there is one.
    *
@@ -4992,6 +5015,19 @@ export class CodexExecutor implements Executor {
           "supersedes the issue text; do not re-plan or resubmit it.",
           "<approved_plan>",
           gatedPlan,
+          "</approved_plan>",
+        ].join("\n")
+      : approved && ctx.reviewedPlanResume === true && !ctx.sessionId && ctx.seeded !== true
+      ? [
+          // Issue #3149: a reviewed-plan resume states the approval. The seeded/no-session terms are
+          // defence in depth; the resume-eligibility rule already implies them.
+          REVIEWED_RESUME_APPROVAL_GUIDANCE,
+          "",
+          "The approved plan below, between the <approved_plan> and </approved_plan> tags, is your",
+          "authoritative instruction for this run and supersedes the issue text; do not re-plan or",
+          "resubmit it.",
+          "<approved_plan>",
+          approved,
           "</approved_plan>",
         ].join("\n")
       : approved ? approved : ctx.issueIid != null

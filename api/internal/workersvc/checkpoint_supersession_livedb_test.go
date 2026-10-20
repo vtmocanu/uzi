@@ -396,7 +396,7 @@ func TestSupersessionFreesBranchForNewRunLiveDB(t *testing.T) {
 	}
 
 	// D3 reader: the owner's hold list names where the old run's work now lives.
-	holds, err := recovery.New(store.New(f.e.pool), f.e.pool, nil, recovery.Limits{CustodyHoldLimit: 8}, nil).
+	holds, err := recovery.New(store.New(f.e.pool), f.e.pool, nil, recovery.Limits{CustodyHoldLimit: fixedCustodyLimit(testCustodyLimit)}, nil).
 		ListHoldsForOwner(f.e.ctx, f.e.userID, true)
 	if err != nil {
 		t.Fatalf("ListHoldsForOwner: %v", err)

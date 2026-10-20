@@ -44,19 +44,16 @@ func (h *Handler) healthService() *healthsvc.Service {
 				quarantine = h.wsvc.ResidueQuarantineFor
 			}
 			h.healthSvc = healthsvc.New(healthsvc.Config{
-				WorkerEligibilityForHealth: eligibility,
-				ResidueQuarantine:          quarantine,
-				Store:                      h.q,
-				Pool:                       h.pool,
-				Settings:                   h.settings,
-				SlackState:                 h.slackState,
-				Now:                        h.now,
-				HostedWorkerVersion:        h.cfg.HostedWorkerVersion,
-				RunningVersion:             h.version,
-				HeartbeatStale:             h.cfg.WorkerHeartbeatStale,
-				// The custody admission ceiling ClaimRun/recovery gate on, so custody.holds
-				// never disagrees with the claim path. int32() is a compile-time conversion.
-				CustodyHoldLimit:             int32(workersvc.CustodyHoldLimit),
+				WorkerEligibilityForHealth:   eligibility,
+				ResidueQuarantine:            quarantine,
+				Store:                        h.q,
+				Pool:                         h.pool,
+				Settings:                     h.settings,
+				SlackState:                   h.slackState,
+				Now:                          h.now,
+				HostedWorkerVersion:          h.cfg.HostedWorkerVersion,
+				RunningVersion:               h.version,
+				HeartbeatStale:               h.cfg.WorkerHeartbeatStale,
 				RecoveryReadyPayloadPerOwner: h.cfg.RecoveryReadyPayloadPerOwner,
 				RecoveryInstanceBytes:        h.cfg.RecoveryInstanceBytes,
 				StoredFilesBudgetBytes:       h.cfg.StoredFilesBudgetBytes,

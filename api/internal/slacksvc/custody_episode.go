@@ -55,36 +55,36 @@ type custodyEpisodeNotifier interface {
 }
 
 // custodyEpisodeSettings is the settings surface the reconciler reads: the health-notification
-// enablement gate it REUSES (Decision D10: no new enable flag) and the operator base URL its deep
-// link is built from. *settings.Cache satisfies it.
+// enablement gate it REUSES (Decision D10: no new enable flag), the operator base URL its deep
+// link is built from, and the custody admission limit (the custody_hold_limit admin setting,
+// #3150; fails closed with an error, never a default). *settings.Cache satisfies it.
 type custodyEpisodeSettings interface {
 	HealthEnabled(ctx context.Context) (bool, error)
 	PublicBaseURL(ctx context.Context) (string, error)
+	CustodyHoldLimit(ctx context.Context) (int32, error)
 }
 
 // CustodyEpisodeReconciler sends the one-per-episode owner blocked-custody Slack DM. It holds the
 // narrow collaborators main.go already wires (the store, the notify seam, the settings reader) and
-// the custody admission limit (workersvc.CustodyHoldLimit), so a crossing at that exact limit is
-// what it notifies on.
+// the custody admission limit it reads from that settings reader on every tick, so a crossing at
+// that exact limit is what it notifies on and a changed setting takes effect on the next tick.
 type CustodyEpisodeReconciler struct {
 	store          custodyEpisodeStore
 	notifier       custodyEpisodeNotifier
 	settings       custodyEpisodeSettings
-	limit          int
 	heartbeatStale time.Duration
 	now            func() time.Time
 	logger         *slog.Logger
 }
 
-// NewCustodyEpisodeReconciler builds a CustodyEpisodeReconciler. limit is the custody admission
-// cap (main.go passes workersvc.CustodyHoldLimit); a non-positive limit disables the admission
-// gate, so Reconcile becomes a no-op. heartbeatStale and now must be the configured
+// NewCustodyEpisodeReconciler builds a CustodyEpisodeReconciler. The custody admission cap comes
+// from settings.CustodyHoldLimit on each Reconcile. heartbeatStale and now must be the configured
 // stale duration and a non-nil clock. A nil logger defaults to slog.Default().
-func NewCustodyEpisodeReconciler(store custodyEpisodeStore, notifier custodyEpisodeNotifier, settings custodyEpisodeSettings, limit int, heartbeatStale time.Duration, now func() time.Time, logger *slog.Logger) *CustodyEpisodeReconciler {
+func NewCustodyEpisodeReconciler(store custodyEpisodeStore, notifier custodyEpisodeNotifier, settings custodyEpisodeSettings, heartbeatStale time.Duration, now func() time.Time, logger *slog.Logger) *CustodyEpisodeReconciler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CustodyEpisodeReconciler{store: store, notifier: notifier, settings: settings, limit: limit, logger: logger, heartbeatStale: heartbeatStale, now: now}
+	return &CustodyEpisodeReconciler{store: store, notifier: notifier, settings: settings, logger: logger, heartbeatStale: heartbeatStale, now: now}
 }
 
 // Reconcile re-arms closed episodes then notifies every owner freshly at/over the custody limit,
@@ -110,14 +110,16 @@ func (r *CustodyEpisodeReconciler) Reconcile(ctx context.Context) {
 	if !enabled {
 		return
 	}
-	// A non-positive limit DISABLES the admission gate (the claim path treats it the same), so
-	// there is no episode to open or close. CustodyHoldLimit is a positive const, so this is a
-	// defensive guard — and it also stops ListOwnersOverCustodyLimit from matching every owner.
-	if r.limit <= 0 {
+	// Read the limit ONCE per tick (#3150) and feed the same value to all three queries. An
+	// unreadable setting is a fail-closed no-op: no re-arm and no notify, because acting on a
+	// guessed limit could close or open an episode the claim path does not agree with. The
+	// setting is validated to 1..1000, so there is no zero/disabled limit here.
+	limit, lerr := r.settings.CustodyHoldLimit(ctx)
+	if lerr != nil {
+		r.logger.Error("custody episode: read custody_hold_limit", "error", lerr)
 		return
 	}
 	cutoff := pgconv.Time(r.now().Add(-r.heartbeatStale))
-	limit := int32(r.limit) //nolint:gosec // G115: the custody admission limit is a small positive const (8)
 
 	// Re-arm FIRST: clear the notice for owners who dropped below the limit. Best-effort — a
 	// list/clear error is logged and the notify pass still runs.

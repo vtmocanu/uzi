@@ -95,7 +95,7 @@ func newWallParkExtendHTTPEnv(t *testing.T, capSeconds int) *wallParkExtendHTTPE
 		e.worker, e.owner.ID, "w-"+e.worker.String(), e.worker[:])
 
 	e.race = &wallParkRaceStore{Queries: store.New(pool)}
-	svc := workersvc.New(e.race, nil, workersvc.Params{RunTimeout: 2 * time.Hour, RunWallCeiling: 8 * time.Hour})
+	svc := workersvc.New(e.race, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunTimeout: 2 * time.Hour, RunWallCeiling: 8 * time.Hour})
 	svc.SetHealthSettings(wallParkExtendCapFake{cap: capSeconds})
 	e.h = &Handler{q: e.race.Queries, wsvc: svc}
 	return e

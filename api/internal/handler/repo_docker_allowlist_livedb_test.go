@@ -93,7 +93,7 @@ func TestListReposDockerAllowlistedLiveDB(t *testing.T) {
 			{Key: settings.KeyDockerRepoAllowlist, Value: allowlistValue},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 
 	r := httptest.NewRequest(http.MethodGet, "/api/repos", nil)
@@ -254,7 +254,7 @@ func TestListReposDockerBlockedLiveDB(t *testing.T) {
 			{Key: settings.KeyDockerRepoAllowlist, Value: repoAllowlisted.String()},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 
 	listFor := func(u store.User) map[string]apitypes.RepoDTO {

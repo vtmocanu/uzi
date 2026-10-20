@@ -152,6 +152,10 @@ type fakeSettings struct {
 	healthErr      error
 	relEnabledErr  error
 	relStatusErr   error
+	// custodyLimit / custodyErr back CustodyHoldLimit (#3150); zero means no limit configured
+	// in this fake, so tests that exercise custody.holds set it explicitly.
+	custodyLimit int32
+	custodyErr   error
 }
 
 func (f *fakeSettings) HealthEnabled(context.Context) (bool, error) {
@@ -162,6 +166,10 @@ func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) {
 }
 func (f *fakeSettings) ReleaseStatus(context.Context) (settings.ReleaseStatus, error) {
 	return f.release, f.relStatusErr
+}
+
+func (f *fakeSettings) CustodyHoldLimit(context.Context) (int32, error) {
+	return f.custodyLimit, f.custodyErr
 }
 
 func (f *fakeSettings) AgentSourceEnabled(context.Context) (bool, error) {
@@ -181,6 +189,10 @@ func (f *fakeSettings) AgentSourceStatus(context.Context) (settings.AgentSourceS
 var fixedNow = time.Date(2026, 9, 20, 3, 0, 0, 0, time.UTC)
 
 func newSvc(fs *fakeStore, sett *fakeSettings) *Service {
+	// Default the custody limit to 3 for tests that do not set one (a nil fake stays nil).
+	if sett != nil && sett.custodyLimit == 0 && sett.custodyErr == nil {
+		sett.custodyLimit = 3
+	}
 	return New(Config{
 		Store:               fs,
 		Settings:            sett,
@@ -188,7 +200,6 @@ func newSvc(fs *fakeStore, sett *fakeSettings) *Service {
 		HostedWorkerVersion: "0.84.0",
 		RunningVersion:      "0.84.0",
 		HeartbeatStale:      45 * time.Second,
-		CustodyHoldLimit:    3,
 	})
 }
 
@@ -745,17 +756,76 @@ func TestCustodyHolds(t *testing.T) {
 		wantSev    string
 		wantSubstr string
 	}{
-		{"na when limit not configured", 0, nil, sevNA, "not configured"},
 		{"ok when none over", 3, nil, sevOK, "No owner is at the custody-hold"},
 		{"warn when owners over", 3, []uuid.UUID{uuid.New(), uuid.New()}, sevWarn, "2 owner(s) are at the custody-hold"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := New(Config{Store: &fakeStore{custodyOwners: tc.owners}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, CustodyHoldLimit: tc.limit})
+			svc := New(Config{Store: &fakeStore{custodyOwners: tc.owners}, Settings: &fakeSettings{custodyLimit: tc.limit}, Now: func() time.Time { return fixedNow }})
 			c := svc.checkCustodyHolds(context.Background(), svc.now())
 			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
 				t.Fatalf("got %q / %q", c.Severity, c.Summary)
 			}
 		})
+	}
+}
+
+func TestCustodyHoldsNAWithoutSettings(t *testing.T) {
+	c := New(Config{Store: &fakeStore{}, Now: func() time.Time { return fixedNow }}).checkCustodyHolds(context.Background(), fixedNow)
+	if c.Severity != sevNA {
+		t.Fatalf("severity = %q, want na when no settings are wired", c.Severity)
+	}
+}
+
+// The limit reaches the owner selection and every aggregate read, and is read once per check.
+func TestCustodyHoldsUsesSettingLimit(t *testing.T) {
+	for _, limit := range []int32{4, 12} {
+		owners := []uuid.UUID{uuid.New()}
+		st := &fakeStore{custodyOwners: owners}
+		reads := &countingSettings{fakeSettings: fakeSettings{custodyLimit: limit}}
+		c := New(Config{Store: st, Settings: reads, Now: func() time.Time { return fixedNow }}).checkCustodyHolds(context.Background(), fixedNow)
+		if c.Severity != sevWarn {
+			t.Fatalf("limit %d: severity = %q", limit, c.Severity)
+		}
+		if len(st.custodyListParams) != 1 || st.custodyListParams[0].CustodyHoldLimit != limit {
+			t.Fatalf("limit %d: selection params = %+v", limit, st.custodyListParams)
+		}
+		if len(st.custodyAggregateParams) != 1 || st.custodyAggregateParams[0].CustodyHoldLimit != limit {
+			t.Fatalf("limit %d: aggregate params = %+v", limit, st.custodyAggregateParams)
+		}
+		if reads.calls != 1 {
+			t.Fatalf("limit %d: setting read %d times, want once", limit, reads.calls)
+		}
+	}
+}
+
+type countingSettings struct {
+	fakeSettings
+	calls int
+}
+
+func (c *countingSettings) CustodyHoldLimit(ctx context.Context) (int32, error) {
+	c.calls++
+	return c.fakeSettings.CustodyHoldLimit(ctx)
+}
+
+// An unreadable setting degrades the check to unknown, names the key, and runs no store query.
+func TestCustodyHoldsSettingUnreadable(t *testing.T) {
+	st := &fakeStore{custodyOwners: []uuid.UUID{uuid.New()}}
+	c := New(Config{Store: st, Settings: &fakeSettings{custodyErr: fmt.Errorf("%w: boom", settings.ErrCustodyHoldLimitUnavailable)}, Now: func() time.Time { return fixedNow }}).checkCustodyHolds(context.Background(), fixedNow)
+	if c.Severity != sevUnknown || !strings.Contains(c.Summary, "custody_hold_limit") || c.Action != nil || len(c.Evidence) != 0 {
+		t.Fatalf("unreadable setting check = %+v", c)
+	}
+	if len(st.custodyListParams) != 0 || len(st.custodyAggregateParams) != 0 {
+		t.Fatalf("store queried despite unreadable limit: %+v %+v", st.custodyListParams, st.custodyAggregateParams)
+	}
+}
+
+// A typed-nil *settings.Cache (an unwired handler setting) must fail closed, not panic.
+func TestCustodyHoldsTypedNilCache(t *testing.T) {
+	var cache *settings.Cache
+	c := New(Config{Store: &fakeStore{}, Settings: cache, Now: func() time.Time { return fixedNow }}).checkCustodyHolds(context.Background(), fixedNow)
+	if c.Severity != sevUnknown {
+		t.Fatalf("severity = %q, want unknown", c.Severity)
 	}
 }
 
@@ -938,18 +1008,14 @@ func TestCustodyHoldsSkipListing(t *testing.T) {
 		owners []uuid.UUID
 		want   string
 	}{
-		{"disabled", 0, []uuid.UUID{uuid.New()}, sevNA},
 		{"no owners", 3, nil, sevOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := &fakeStore{custodyOwners: tc.owners}
 			fs.custodySelect = func(context.Context, store.ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
-				if tc.limit == 0 {
-					t.Fatal("selected owners when disabled")
-				}
 				return tc.owners, nil
 			}
-			c := New(Config{Store: fs, CustodyHoldLimit: tc.limit}).checkCustodyHolds(context.Background(), fixedNow)
+			c := New(Config{Store: fs, Settings: &fakeSettings{custodyLimit: tc.limit}}).checkCustodyHolds(context.Background(), fixedNow)
 			if c.Severity != tc.want || len(fs.custodyQueries) != 0 || c.Action != nil {
 				t.Fatalf("skip listing = %+v, calls = %d", c, len(fs.custodyQueries))
 			}
@@ -997,12 +1063,11 @@ func TestReleaseCheck(t *testing.T) {
 func TestEvaluateRollupAndRegistry(t *testing.T) {
 	svc := New(Config{
 		Store:               &fakeStore{},
-		Settings:            &fakeSettings{healthEnabled: true, releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}},
+		Settings:            &fakeSettings{healthEnabled: true, releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}, custodyLimit: 3},
 		SlackState:          func() string { return slacksvc.StateDisabled },
 		Now:                 func() time.Time { return fixedNow },
 		HostedWorkerVersion: "", // no hosted workers configured ⇒ fleet.roll na
 		RunningVersion:      "0.84.0",
-		CustodyHoldLimit:    3,
 	})
 	svc.probeDB = func(context.Context) dbStat {
 		return dbStat{pingDur: time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}
@@ -1057,12 +1122,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 func TestEvaluateHealthDisabled(t *testing.T) {
 	svc := New(Config{
 		Store:               &fakeStore{},
-		Settings:            &fakeSettings{healthEnabled: false, releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}},
+		Settings:            &fakeSettings{healthEnabled: false, releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}, custodyLimit: 3},
 		SlackState:          func() string { return slacksvc.StateDisabled },
 		Now:                 func() time.Time { return fixedNow },
 		HostedWorkerVersion: "",
 		RunningVersion:      "0.84.0",
-		CustodyHoldLimit:    3,
 	})
 	svc.probeDB = func(context.Context) dbStat {
 		return dbStat{pingDur: time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}
@@ -1092,12 +1156,11 @@ func TestEvaluateHealthDisabled(t *testing.T) {
 func TestEvaluateHealthReadError(t *testing.T) {
 	svc := New(Config{
 		Store:               &fakeStore{},
-		Settings:            &fakeSettings{healthErr: errors.New("settings read failed"), releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}},
+		Settings:            &fakeSettings{healthErr: errors.New("settings read failed"), releaseEnabled: true, release: settings.ReleaseStatus{LatestTag: "v0.84.0"}, custodyLimit: 3},
 		SlackState:          func() string { return slacksvc.StateDisabled },
 		Now:                 func() time.Time { return fixedNow },
 		HostedWorkerVersion: "",
 		RunningVersion:      "0.84.0",
-		CustodyHoldLimit:    3,
 	})
 	svc.probeDB = func(context.Context) dbStat {
 		return dbStat{pingDur: time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}
@@ -1152,7 +1215,7 @@ func TestDegradeUnknownOnQueryError(t *testing.T) {
 		assertUnknown(t, svc.checkBoardDrift(context.Background(), fixedNow), degradeSummary)
 	})
 	t.Run("custody.holds", func(t *testing.T) {
-		// CustodyHoldLimit is 3 (via newSvc), so the na guard does not fire first.
+		// The custody limit is 3 (via newSvc), so the unreadable-setting guard does not fire first.
 		svc := newSvc(&fakeStore{custodyErr: boom}, &fakeSettings{})
 		assertUnknown(t, svc.checkCustodyHolds(context.Background(), svc.now()), degradeSummary)
 	})
@@ -1225,12 +1288,11 @@ func TestHostileInputSanitized(t *testing.T) {
 	}
 	svc := New(Config{
 		Store:               &fakeStore{workers: workers},
-		Settings:            &fakeSettings{healthEnabled: true, releaseEnabled: false},
+		Settings:            &fakeSettings{healthEnabled: true, releaseEnabled: false, custodyLimit: 3},
 		SlackState:          func() string { return slacksvc.StateDisabled },
 		Now:                 func() time.Time { return fixedNow },
 		HostedWorkerVersion: "0.84.0",
 		RunningVersion:      "0.84.0",
-		CustodyHoldLimit:    3,
 	})
 	svc.probeDB = func(context.Context) dbStat {
 		return dbStat{pingDur: time.Millisecond, acquiredConns: 1, maxConns: 20, schemaAtHead: true}
@@ -1603,7 +1665,7 @@ func TestCustodyHoldsConfiguredCutoffAndFacts(t *testing.T) {
 	owners := []uuid.UUID{uuid.New(), uuid.New()}
 	st := &fakeStore{custodyOwners: owners, custodyAggregate: store.GetCustodyAggregateForOwnerRow{OpenHolds: 11, AdmissionCountedHolds: 8}}
 	calls := 0
-	svc := New(Config{Store: st, Settings: &fakeSettings{}, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second, Now: func() time.Time {
+	svc := New(Config{Store: st, Settings: &fakeSettings{custodyLimit: 8}, HeartbeatStale: 73 * time.Second, Now: func() time.Time {
 		calls++
 		return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC).Add(time.Duration(calls-1) * time.Hour)
 	}})
@@ -1638,7 +1700,7 @@ func TestCustodyHoldsConfiguredCutoffAndFacts(t *testing.T) {
 
 func TestCustodyHoldsAggregateError(t *testing.T) {
 	st := &fakeStore{custodyOwners: []uuid.UUID{uuid.New()}, custodyAggregateErr: errors.New("aggregate failed")}
-	svc := New(Config{Store: st, CustodyHoldLimit: 8, HeartbeatStale: 73 * time.Second})
+	svc := New(Config{Store: st, Settings: &fakeSettings{custodyLimit: 8}, HeartbeatStale: 73 * time.Second})
 	got := svc.checkCustodyHolds(context.Background(), fixedNow)
 	if got.Severity != sevUnknown || len(got.Evidence) != 0 {
 		t.Fatalf("failed aggregate check=%+v", got)

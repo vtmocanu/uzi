@@ -730,7 +730,8 @@ uzi version
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
   `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
   `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
-  `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
+  `blocked_runs` aggregate (the listing errors if the server cannot read a valid
+  `custody_hold_limit`; an admin saves one). Capacity uses admission count against the configured `custody_hold_limit` (default 8);
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
   an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
   same-owner worker with a fresh non-null heartbeat (inclusive configured
@@ -739,7 +740,7 @@ uzi version
   Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
   remain counted; `active` attention alone is not eligibility. Accounting releases nothing
   and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
-  bypass owner admission with 1–7 own total open holds, losing that exemption at 8;
+  bypass owner admission with 1 to limit-1 own total open holds, losing that exemption at the limit;
   `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
   exceed the limit under the statement-snapshot gate. The current API emits the new field
   even at zero; the CLI falls back to total only when an older API omits it, preserving
