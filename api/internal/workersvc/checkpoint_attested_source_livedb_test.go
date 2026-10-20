@@ -233,26 +233,22 @@ func TestTerminalReconcileStoresAttemptFrozenSourceLiveDB(t *testing.T) {
 	}
 }
 
-// TestClaimCarriesAttestedSourceLiveDB: real Claim assembly serves the run row's stored
+// TestClaimCarriesAttestedSourceLiveDB: real claim assembly serves the run row's stored
 // attestation as checkpoint_attested_source, and omits the key when the run has none.
 func TestClaimCarriesAttestedSourceLiveDB(t *testing.T) {
 	for _, stored := range []pgtype.Text{attestText(attestS2), {}} {
 		t.Run(map[bool]string{true: "attested", false: "unattested"}[stored.Valid], func(t *testing.T) {
 			e := setupCodexLiveDB(t)
 			user, worker, repo := e.seedCodexInfra(t)
-			sealed, err := e.box.Seal([]byte(codexToken("anthropic")))
-			if err != nil {
-				t.Fatal(err)
-			}
-			e.exec("INSERT INTO user_secrets(id,user_id,kind,label,is_default,ciphertext,sealed_with) VALUES($1,$2,'anthropic_token',$3,true,$4,'master')", uuid.New(), user, "model-"+uuid.NewString(), sealed)
+			// The claim body comes from assembleClaim over the claimed run row (the same seam
+			// claimWire uses); claim eligibility is not what this pins.
 			run := uuid.New()
-			e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,checkpoint_tip,checkpoint_attested_source) VALUES($1,$2,$3,'issue',102,'t','d','queued',$4,$5)",
-				run, user, repo, attestTipA, stored)
+			e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,worker_id,checkpoint_tip,checkpoint_attested_source) VALUES($1,$2,$3,'issue',102,'t','d','claimed',$4,$5,$6)",
+				run, user, repo, worker, attestTipA, stored)
 			svc := New(e.q, e.box, testParams())
-			svc.SetTxBeginner(e.pool)
-			p, err := svc.Claim(e.ctx, store.Worker{ID: worker, UserID: user, Name: "attest-worker", Status: "online"}, nil)
+			p, err := svc.assembleClaim(e.ctx, store.Worker{ID: worker, UserID: user}, mustRun(t, e, run))
 			if err != nil || p == nil || p.RunID != run.String() {
-				t.Fatalf("Claim: payload=%+v err=%v", p, err)
+				t.Fatalf("assembleClaim: payload=%+v err=%v", p, err)
 			}
 			if got := pgconv.TextPtr(p.CheckpointAttestedSource); got != stored {
 				t.Fatalf("claim checkpoint_attested_source = %+v, want %+v", got, stored)
