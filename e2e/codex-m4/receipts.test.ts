@@ -116,6 +116,14 @@ describe("checkReceipts", () => {
     assert.equal(unknown.ok, false);
     assert.deepEqual(unknown.drift, [{ path: "api/foo.go", kind: "unclassified" }]);
 
+    // ...while a Go test file outside agent/ is evidence (never compiled into a shipped binary), and
+    // one under agent/ stays runtime because the agent/ deny list is checked first.
+    const goTest = checkReceipts(committed(), baseManifest(), { paths: ["api/internal/workersvc/foo_test.go"], baseIsAncestor: true });
+    assert.equal(goTest.ok, true);
+    assert.deepEqual(goTest.drift, []);
+    assert.equal(classifyPath("agent/codex/supervisor/foo_test.go"), "runtime");
+    assert.equal(classifyPath("api/internal/workersvc/foo_test.go.orig"), "unclassified");
+
     // ...but an EMPTY tail (candidate == proven base) keeps the candidate certified. THIS is the
     // fixed point: recording the gitignored manifest makes no commit, so the tail stays empty (or
     // evidence-only) and never invalidates the very candidate it certifies.
