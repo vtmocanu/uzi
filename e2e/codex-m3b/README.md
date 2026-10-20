@@ -69,7 +69,7 @@ task test:codex-proof
 ```
 
 `.github/workflows/codex-packaged-proof.yml` runs `task test:codex-proof`'s script
-(`e2e/codex-proof/run-proof.sh`) nightly and on pull requests touching what the proof consumes.
+(`e2e/codex-proof/run-proof.sh`) nightly and on pull requests touching the Codex runtime, packaging or these harnesses.
 It sets `UZI_CODEX_PROOF_STRICT=1`, under which `run-lifecycle.sh` also fails on any skipped,
 todo or missing test, including a skipped `describe` that `node --test` never counts.
 

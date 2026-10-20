@@ -15,26 +15,24 @@ name: Codex packaged proof
     - cron: "41 2 * * *"
   workflow_dispatch:
   pull_request:
-    # What the proof consumes: the agent runtime (scripts/lib/shipping-paths.sh AGENT_PATHS),
-    # the one agent test the M3b leg mounts, the proof harnesses and the API the M3b test server
-    # is built from. The nightly run covers everything else.
+    # Codex runtime, packaging and harness changes only. The traced full input set (all of
+    # agent/src, the M3b-mounted agent test, api/ non-test sources) matched ~56% of main commits
+    # over two weeks; this set matched ~15% (measured 2026-10-20) and still covers both rot
+    # classes seen so far: harness edits (#3114) and template/entrypoint changes (#1619). API and
+    # other worker-source changes get the full proof from the nightly run instead.
     paths:
       - ".github/workflows/codex-packaged-proof.yml"
-      - "agent/src/**"
+      - "agent/codex/**"
+      - "agent/src/codex/**"
+      - "agent/templates/**"
+      - "agent/devbox-global/**"
       - "agent/package.json"
       - "agent/package-lock.json"
       - "agent/tsconfig.json"
-      - "agent/bin/**"
-      - "agent/templates/**"
-      - "agent/devbox-global/**"
-      - "agent/codex/**"
-      - "agent/test/codex-command-root-linux.test.ts"
       - "e2e/codex-m0/**"
       - "e2e/codex-m3a/**"
       - "e2e/codex-m3b/**"
       - "e2e/codex-proof/**"
-      - "api/**"
-      - "!api/**/*_test.go"
 
 permissions:
   contents: read
