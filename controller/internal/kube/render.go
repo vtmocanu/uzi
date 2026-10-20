@@ -890,7 +890,8 @@ echo "uzi-seed-nix: seeded"
 // symlink or non-directory makes the next boot refuse here until an operator repairs
 // the volume (ADR-3153), while a real directory is re-owned under uid-split. The
 // -L/-d checks here only reject state a previous boot or an earlier principal left
-// behind.
+// behind. They run once per pod: kubelet re-resolves the subPath when dind restarts,
+// and this init container does not rerun then (the single-uid residual in ADR-3153).
 func runnerInitScript() string {
 	return fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -1303,9 +1304,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// The shared run workdir (M-workdir, issue #3153), BOTH postures: the runner-shared
 		// subPath of the `data` PVC, mounted into the worker AND the dind sidecar at the SAME
 		// path so a `docker run -v` bind source under the run's checkout resolves in the
-		// daemon. It survives a pod replacement. Decision 3 (amended): dind mounts ONLY this
-		// subPath of data, never the whole volume, and none of token or /nix; the invariant
-		// test pins that. The worker's own whole-volume `data` mount at /data already covers
+		// daemon. It survives a pod replacement. Decision 3 (amended): the rendered dind
+		// mounts ONLY this subPath of data, never the whole volume, and none of token or
+		// /nix; the invariant test pins that (single-uid residual: ADR-3153). The worker's own whole-volume `data` mount at /data already covers
 		// /data/runner, so the worker gets this mount AFTER it and it shadows the
 		// PVC's old `runner/` directory (a different directory from `runner-shared/`).
 		workerMounts = append(workerMounts, runnerWorkdirMount())

@@ -57,9 +57,13 @@ const (
 //
 // It used to be a pod-lifetime emptyDir, which lost every clone on any pod replacement
 // (issue #3153). It is now the dindWorkdirSubPath subPath of the `data` PVC, so it
-// survives a replacement. Decision 3 is amended, not dropped: dind mounts ONLY that
-// subPath of `data`, never the whole volume, so the clone cache at /data/repos, the
-// agent home, /nix and the token/secret mounts stay UNSHARED with dind. The subPath is
+// survives a replacement. Decision 3 is amended, not dropped: the pod spec mounts ONLY
+// that subPath of `data` into dind, never the whole volume, so the clone cache at
+// /data/repos, the agent home, /nix and the token/secret mounts stay UNSHARED with
+// dind. Residual (ADR-3153): kubelet re-resolves the subPath on every container start,
+// so in single-uid mode the worker uid, which owns /data, can swap the entry and make
+// a later dind restart mount more of the volume. That uid already holds all of /data;
+// under uid-split no untrusted identity can write /data. The subPath is
 // `runner-shared` and not the legacy `runner` because existing PVCs carry a root-owned
 // 0755 `runner` directory (the old emptyDir's mount point), which kubelet would not
 // re-own. The runner-init init container creates and secures the entry before dind
@@ -280,8 +284,8 @@ exec dockerd --host=tcp://127.0.0.1:2375 --tls=false "--mtu=$min" "--config-file
 // DECISION 3 (amended by issue #3153) — the one security invariant on a wired worker:
 // it mounts ONLY its OWN data root, the shared run workdir and — rootless only — the
 // shared socket dir; NONE of the worker's token or /nix, and of the `data` PVC ONLY the
-// dindWorkdirSubPath subPath at dindWorkdirDir (never the whole volume: the /data cache
-// and agent home stay out of reach). A `docker run -v <anything>:/x` then binds this
+// dindWorkdirSubPath subPath at dindWorkdirDir (as rendered, never the whole volume: the
+// /data cache and agent home stay out of reach; see the single-uid residual above). A `docker run -v <anything>:/x` then binds this
 // container's fs, which holds none of them. render_test.go pins this.
 //
 // The data root's fill level is metered by a SEPARATE, unprivileged sidecar
