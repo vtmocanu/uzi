@@ -361,8 +361,7 @@ save_outbox_agent_evidence() {
     return 0
   fi
   # Host-side bound like storage_diagnostic_snapshot: never run the exec unbounded.
-  # E2E_HOST_LIMITER lets the hermetic test substitute a function for the real command.
-  limiter="${E2E_HOST_LIMITER:-$(command -v timeout || command -v gtimeout || true)}"
+  limiter="$(command -v timeout || command -v gtimeout || true)"
   if [ -z "$limiter" ]; then
     echo '{"error":"no_host_timeout"}' > "$dir/recovery-records-$label.jsonl" 2>/dev/null || true
     echo "outbox cleanup: recovery record projection skipped, no timeout command ($label)" >&2

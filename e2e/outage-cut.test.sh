@@ -10,8 +10,8 @@ fixture() {
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
   BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
   RESTORING=0 PROJECTION_FAIL=0
-  limit_stub() { shift; "$@"; }
-  export E2E_HOST_LIMITER=limit_stub
+  # Host limiter fixture: records the bound it was given, then runs the command.
+  timeout() { printf 'limit %s\n' "$1" >> "$SCRATCH/calls"; shift; "$@"; }
   export UZI_E2E_RECOVERY_FAST_REDRIVE=1
   storage_diagnostic_snapshot() {
     case "$1" in
@@ -223,24 +223,44 @@ for label in before-api-restore before-agent-recreate; do
     echo "FAIL: projection $label leaked foreign or secret data"; exit 1
   fi
 done
-awk 'index($0, "exec -T -u 0 agent timeout 15 node --input-type=module - /data") { n++; if (!agent) before++ }
-  index($0, "force-recreate agent") { agent=1 } END { exit(n == 2 && before == 2 && agent ? 0 : 1) }' "$SCRATCH/calls" \
+awk 'index($0, "exec -T -u 0 agent timeout 15 node --input-type=module - /data") { n++; if (!agent) before++; if (prev == "limit 20") bounded++ }
+  index($0, "force-recreate agent") { agent=1 } { prev=$0 }
+  END { exit(n == 2 && before == 2 && bounded == 2 && agent ? 0 : 1) }' "$SCRATCH/calls" \
   || { echo 'FAIL: projection did not run twice before agent recreation'; exit 1; }
 echo 'PASS: failing receipt wait still saves agent logs and allowlisted recovery projections before agent recreation'
-# A failing projection exec is a warning only: cleanup must still recreate api and agent.
+# A failing projection exec is a warning only: cleanup must still recreate api and agent, and
+# save_outbox_agent_evidence itself must return 0 (the phase runs under errexit).
 : > "$SCRATCH/calls"
 (
   fixture
   configure_outbox_api_alias
   PROJECTION_FAIL=1
+  save_outbox_agent_evidence probe || { echo 'FAIL: evidence returned nonzero on failed projection'; exit 1; }
   OUTBOX_RESTORE_NEEDED=1
   restore_outbox_resolution
-) > "$SCRATCH/projfail.log" 2>&1 || { echo 'FAIL: failed projection aborted cleanup'; exit 1; }
+) > "$SCRATCH/projfail.log" 2>&1 || { echo 'FAIL: failed projection aborted cleanup'; cat "$SCRATCH/projfail.log"; exit 1; }
 grep -F 'recovery record projection failed (before-api-restore)' "$SCRATCH/projfail.log" >/dev/null \
   || { echo 'FAIL: missing projection failure warning'; exit 1; }
 grep -F 'force-recreate api' "$SCRATCH/calls" >/dev/null && grep -F 'force-recreate agent' "$SCRATCH/calls" >/dev/null \
   || { echo 'FAIL: cleanup did not recreate api and agent after projection failure'; exit 1; }
-echo 'PASS: failed projection warns and cleanup still recreates api and agent'
+echo 'PASS: failed projection warns, evidence returns 0 and cleanup still recreates api and agent'
+# No host timeout/gtimeout: the projection is skipped (never run unbounded) and evidence returns 0.
+: > "$SCRATCH/calls"
+nohost_bin="$SCRATCH/nohost-bin"
+mkdir -p "$nohost_bin" "$SCRATCH/artifacts/52-api-outage-outbox"
+ln -s "$(command -v mkdir)" "$nohost_bin/mkdir"
+(
+  fixture
+  unset -f timeout
+  PATH="$nohost_bin"
+  save_outbox_agent_evidence probe || { echo 'FAIL: evidence returned nonzero without host timeout'; exit 1; }
+) > "$SCRATCH/nohost.log" 2>&1 || { echo 'FAIL: missing host timeout aborted evidence'; cat "$SCRATCH/nohost.log"; exit 1; }
+grep -F 'recovery record projection skipped, no timeout command (probe)' "$SCRATCH/nohost.log" >/dev/null \
+  || { echo 'FAIL: missing no_host_timeout warning'; exit 1; }
+grep -F no_host_timeout "$SCRATCH/artifacts/52-api-outage-outbox/recovery-records-probe.jsonl" >/dev/null \
+  || { echo 'FAIL: missing no_host_timeout marker'; exit 1; }
+! grep -F 'exec -T -u 0 agent' "$SCRATCH/calls" >/dev/null || { echo 'FAIL: projection ran without a host limiter'; exit 1; }
+echo 'PASS: absent host timeout skips the projection with a marker and returns 0'
 fixture
 configure_outbox_api_alias
 restore_outbox_resolution
@@ -365,4 +385,4 @@ done
   jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
 )
 echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
-echo 'cases=23 passed=23'
+echo 'cases=24 passed=24'
