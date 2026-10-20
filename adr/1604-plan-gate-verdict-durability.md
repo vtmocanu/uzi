@@ -87,7 +87,7 @@ plan the owner answered.
    the credential-switch path rather than reporting `running`
    (`approveRefusedBySwitchPending`).
 
-Related, issue #3178: when the re-presented gate's earlier session could not be resumed, the approved plan body also rides the first implement prompt (`gateApprovedWithoutSession`, `agent/src/sdk-executor.ts`); see the D4 amendment in `adr/0759-protect-run-work-usage-limit-park.md`.
+Related, issue #3178 (Claude only): when the re-presented gate's earlier session could not be resumed, the approved plan body also rides the first implement prompt (`gateApprovedWithoutSession`, `agent/src/sdk-executor.ts`); see the D4 amendment in `adr/0759-protect-run-work-usage-limit-park.md`.
 
 ## Context
 
