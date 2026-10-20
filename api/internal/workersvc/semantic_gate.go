@@ -222,7 +222,7 @@ func expectedSemanticPark(p *apitypes.SemanticGatePresentation) string {
 // exactly the expected reason, or none only when the projection needs none. A human-gated run, or
 // one that already parked (SetRunAwaitingApproval clears auto_approve), may not supply a reason
 // except as an exact replay of the reason its stored presentation already carries; omitting it
-// on that candidate keeps the stored reason while the projection still expects it.
+// on that parked candidate records the server-expected reason.
 func validateSemanticPark(run store.Run, req StateRequest, p *apitypes.SemanticGatePresentation) error {
 	expected := expectedSemanticPark(p)
 	supplied := ""
@@ -243,10 +243,11 @@ func validateSemanticPark(run store.Run, req StateRequest, p *apitypes.SemanticG
 			return ErrSemanticGateMismatch
 		}
 	} else if stored, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload); err == nil && ok && stored.Semantic != nil &&
-		stored.Semantic.SemanticPark != "" && stored.Semantic.Candidate.Digest == p.Candidate.Digest && stored.Semantic.SemanticPark == expected {
-		// A parked gate re-presented without its reason keeps the stored, still-expected reason:
-		// a worker cannot erase the truthful park reason from the same candidate.
-		supplied = stored.Semantic.SemanticPark
+		stored.Semantic.SemanticPark != "" && stored.Semantic.Candidate.Digest == p.Candidate.Digest {
+		// A parked gate re-presented without its reason keeps a truthful one: the server's own
+		// expected reason for this candidate (the stored one, or its successor after the projection
+		// moved, e.g. a reclaim). A worker can neither erase it nor keep a stale one.
+		supplied = expected
 	}
 	p.SemanticPark = supplied
 	return nil
