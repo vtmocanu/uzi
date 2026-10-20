@@ -72,10 +72,11 @@ export type ClosedSourceObservation = Readonly<{
 
 // randomUUID(): lowercase RFC 4122 v4. Ordinary capture ids and both temp suffixes use it.
 const UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
-const ORDINARY_TEMP_RE = new RegExp(`^${UUID_V4}(?:\\.json\\.${UUID_V4}\\.tmp|\\.${UUID_V4}\\.bundle\\.tmp)(?![\\s\\S])`);
+const ORDINARY_TEMP_RE = new RegExp(`^${UUID_V4}(?:\\.json\\.${UUID_V4}\\.tmp|\\.${UUID_V4}\\.bundle\\.tmp|\\.bundle)(?![\\s\\S])`);
 
 /** A record or bundle temp name this coordinator writes (writeRecordUnlocked, bundleTmpPath) for an
- *  ordinary capture, whose id is always randomUUID(). */
+ *  ordinary capture, whose id is always randomUUID(), or an ordinary bundle whose record was already
+ *  removed (removeGenerationRecordsUnlocked deletes the record first and tolerates a failed bundle rm). */
 function ordinaryTempEntry(name: string): boolean {
   return ORDINARY_TEMP_RE.test(name);
 }
@@ -4584,9 +4585,9 @@ export class RecoveryCoordinator {
         // Unknown entries, including truncated namespace filenames and incomplete writes,
         // cannot prove an empty or ordinary-only inventory. Names grant no origin authority.
         this.checkJournalMetadata(budget);
-        // Ordinary callers tolerate this coordinator's own interrupted temp writes of an ordinary
-        // capture (a crash between write and rename); they grant no authority. Producer scopes and
-        // a producer capture's temp stay strict.
+        // Ordinary callers tolerate this coordinator's own interrupted temp writes and orphaned bundles
+        // of an ordinary capture (a crash between write and rename, or between record and bundle
+        // removal); they grant no authority. Producer scopes and producer-capture names stay strict.
         if (!bundles.has(name) && !(ordinaryTemps && ordinaryTempEntry(name)))
           throw new Error("unknown recovery journal entry");
         const stat = await fs.lstat(path.join(dir, name));

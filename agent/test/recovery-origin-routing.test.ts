@@ -611,3 +611,19 @@ for (const kind of ["symlink", "directory"] as const) {
     assert.equal(await f.pin(), undefined);
   });
 }
+
+test("an orphaned ordinary bundle whose record was removed does not block an ordinary pin", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, `${tempUuid}.bundle`), "orphan");
+  const pinned = await f.pin();
+  assert.ok(pinned, JSON.stringify(f.warnings));
+  assert.equal(pinned.generation, 7);
+});
+
+test("an orphaned producer bundle still refuses an ordinary pin", async t => {
+  const f = await fixture(t);
+  await f.seal({ ...f.partial(ordinary), generation: 6 });
+  await fs.writeFile(path.join(f.recoveryRoot, f.context.runId, `${producer}.bundle`), "orphan");
+  assert.equal(await f.pin(), undefined);
+});
