@@ -7850,6 +7850,22 @@ describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () =>
     assert.deepEqual(included, []);
   });
 
+  it("a completed turn with no model-processing evidence does not spend the history", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultNoTurns()],
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({ priorOwnerFollowUps: [{ id: 7, body: "HIST-UNSEEN" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.match(turns[0]!.promptText ?? "", /HIST-UNSEEN/);
+    assert.ok(turns[1]!.promptText);
+    assert.equal((turns[1]!.promptText ?? "").split("HIST-UNSEEN").length - 1, 1, "the next turn carries the history once");
+    assert.ok(turns[2]!.promptText);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-UNSEEN/, "spent once a model-processed turn completes");
+  });
+
   it("a clarification answer turn does not carry history again", async () => {
     const { queryFn, turns } = fakeTurns([
       [askUserTurn("which config?"), resultSuccess()],

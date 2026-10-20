@@ -3199,11 +3199,18 @@ export class SdkExecutor implements Executor {
           );
           historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
         }
-        // The history latch is spent only when the turn completes (below, with resumeId): an
-        // aborted turn's in-place restart (credential switch, pause-now, wall refusal) does not
-        // advance resumeId, so it begins a fresh session and must carry the history again. Live-id
-        // sets only grow (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
-        const onFirstEvent = ownerFirstEvent;
+        // The history latch is spent only when the turn completes (below, with resumeId) AND the
+        // model processed it: an aborted turn's in-place restart (credential switch, pause-now, wall
+        // refusal) does not advance resumeId, so it begins a fresh session and must carry the history
+        // again, and a success terminal with no model-processing evidence never saw it. Live-id sets
+        // only grow (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
+        let historyProcessed = false;
+        const onFirstEvent = ownerFirstEvent || historyRides
+          ? () => {
+              ownerFirstEvent?.();
+              historyProcessed = true;
+            }
+          : undefined;
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -3355,7 +3362,7 @@ export class SdkExecutor implements Executor {
         try {
           turn = await turnPromise;
           resumeId = turn.sessionId ?? resumeId;
-          if (historyRides) priorOwnerHistoryPlaced = true;
+          if (historyRides && historyProcessed) priorOwnerHistoryPlaced = true;
           if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
           // PRD #265 M1: latch the finished-milestone declaration the same way, so it
           // survives the terminating turn's `break` into the completed report.
