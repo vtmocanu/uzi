@@ -927,6 +927,10 @@ type Store interface {
 	// and leaves the pending-pause columns untouched, so the owner-pause path is unaffected. 0
 	// rows (guard fail) is the non-paused ack the worker's park order must retain the run on.
 	SetRunCompletionHold(ctx context.Context, arg store.SetRunCompletionHoldParams) (store.Run, error)
+	// SetRunBaseAttestationHold (issue #3194) holds a `--require-base` run whose retained work
+	// carries no attestation: running -> paused with hold_reason='base_attestation_missing',
+	// fenced to this worker's live claim generation. An owner-only exit; nothing automatic leaves it.
+	SetRunBaseAttestationHold(ctx context.Context, arg store.SetRunBaseAttestationHoldParams) (store.Run, error)
 	ResumePausedRun(ctx context.Context, arg store.ResumePausedRunParams) (store.ResumePausedRunRow, error)
 	// PRD #1732 D14: the credential_disabled park writer (exact undelivered claim), and the
 	// promoter's two keyset worklists (one owner's held runs; owners with any held run).
