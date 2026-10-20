@@ -305,7 +305,8 @@ test("runner-init as root builds worker:runner 3775 with a worker:worker 0755 .t
     assert.equal(owner(path.join(shared, ".tmp")), `${WORKER_UID}:${WORKER_UID}`, `${round}: .tmp is worker:worker`);
     assert.equal(mode(path.join(shared, ".tmp")).toString(8), "755", `${round}: .tmp mode`);
     assert.deepEqual(fs.readdirSync(shared), [".tmp"]);
-    // The second run must neither recreate nor re-own .tmp: same inode, owner and mode as after round 1.
+    // The second run must not recreate .tmp and must leave it worker:worker 0755 (same inode as after
+    // round 1). The script re-owns .tmp transiently on every root run; that is not asserted here.
     const tmpStat = fs.lstatSync(path.join(shared, ".tmp"));
     const tmpIdentity = `${tmpStat.ino}:${tmpStat.uid}:${tmpStat.gid}:${(tmpStat.mode & 0o7777).toString(8)}`;
     if (tmpAfterFresh === undefined) tmpAfterFresh = tmpIdentity;

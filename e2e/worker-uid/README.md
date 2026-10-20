@@ -179,7 +179,7 @@ dind uid, uids 0 and 101000 for daemon-written content). The argv is production'
   (`GitCache.deleteRetainedArtifact`) in split mode (the real `setpriv`-to-runner `rm -rf`) and single-uid
   mode (in-process `fs.rm`): with a vetoing writer guard nothing is touched and nothing is counted; with the
   guards open the artifact is retained, the undeletable counter rises by exactly one, the "could not delete
-  (not permitted)" diagnostic names the path and errno, and the foreign content that cannot be removed (directories holding files, the non-writable and sticky directories, the live writer's file) keeps its owner, mode and inode; the loose files in the non-sticky 0777 `out` directory are removed.
+  (not permitted)" diagnostic names the path and errno, and the foreign content that cannot be removed (directories holding files, the non-writable and sticky directories) keeps its owner, mode and inode, and the live foreign writer keeps appending. The loose files in the non-sticky 0777 `out` directory are not asserted either way.
 
 The container gets a 415-second watchdog plus five-second kill grace; each leaf has its own
 timeout of at most 115 seconds. Its results are checked against `shared-expected.json` like the
