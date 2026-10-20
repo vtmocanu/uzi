@@ -89,7 +89,7 @@ func TestCustodyHoldLimitReadFailure(t *testing.T) {
 		t.Fatalf("stale-on-error: got %d, %v; want the cached 4", n, err)
 	}
 	c.Invalidate()
-	if n, err := c.CustodyHoldLimit(ctx); err == nil || n != 0 {
+	if n, err := c.CustodyHoldLimit(ctx); !errors.Is(err, ErrCustodyHoldLimitUnavailable) || n != 0 {
 		t.Fatalf("failed refresh after Invalidate: got %d, %v; want 0 and an error", n, err)
 	}
 }
@@ -98,7 +98,16 @@ func TestCustodyHoldLimitReadFailure(t *testing.T) {
 // error, not a panic and not a default.
 func TestCustodyHoldLimitNilCache(t *testing.T) {
 	var c *Cache
-	if n, err := c.CustodyHoldLimit(context.Background()); err == nil || n != 0 {
-		t.Fatalf("nil cache: got %d, %v; want 0 and an error", n, err)
+	if n, err := c.CustodyHoldLimit(context.Background()); !errors.Is(err, ErrCustodyHoldLimitUnavailable) || n != 0 {
+		t.Fatalf("nil cache: got %d, %v; want 0 and ErrCustodyHoldLimitUnavailable", n, err)
+	}
+}
+
+// TestCustodyHoldLimitEnvPrecedence pins the AdminView precedence (ENV over DB row).
+func TestCustodyHoldLimitEnvPrecedence(t *testing.T) {
+	c := New(&fakeStore{rows: []store.AppSetting{row(KeyCustodyHoldLimit, "12")}}, time.Minute)
+	c.ConfigureSecrets(nil, map[string]string{KeyCustodyHoldLimit: "3"})
+	if n, err := c.CustodyHoldLimit(context.Background()); err != nil || n != 3 {
+		t.Fatalf("env override: got %d, %v; want 3", n, err)
 	}
 }

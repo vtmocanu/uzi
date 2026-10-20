@@ -8,7 +8,9 @@
 // The cache is per-process. The replica that serves an admin PUT invalidates its
 // own cache, so the change applies there on the next read; every other replica
 // keeps serving its snapshot until the TTL (SETTINGS_CACHE_TTL, default 5s)
-// expires, so a change reaches every replica within one TTL without a restart.
+// expires and its next refresh succeeds, so a change reaches every replica within
+// one TTL without a restart. A replica whose refresh fails keeps serving its last
+// good snapshot (stale-on-error) until a read succeeds.
 package settings
 
 import (
