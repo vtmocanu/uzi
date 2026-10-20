@@ -167,8 +167,9 @@ func TestClaimCustodyLimitUnavailableLiveDB(t *testing.T) {
 	}
 }
 
-// The cross_check lane never reads the setting: a settings outage cannot strand an eligible
-// checker child, which every custody clause exempts. The run lane stays fail-closed.
+// The dedicated cross_check lane never reads the setting: a settings outage cannot strand an
+// eligible checker child claimed there. The run lane stays fail-closed, including for a legacy
+// run-lane checker child (an accepted #3150 limit).
 func TestClaimCustodyLimitCrossCheckLaneLiveDB(t *testing.T) {
 	boom := fmt.Errorf("%w: boom", settings.ErrCustodyHoldLimitUnavailable)
 	t.Run("cross_check lane claims the child with a failing reader", func(t *testing.T) {

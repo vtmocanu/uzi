@@ -282,8 +282,8 @@ const (
 	reasonCustodyLimit = "you have too much unpublished work awaiting recovery; resolve or discard some recovery archives to start new runs"
 	// reasonCustodyLimitUnavailable (#3150) is emitted for a queued non-cross_check run when the
 	// custody_hold_limit setting could not be read this tick. ClaimRun is refused the same way
-	// (claimLane fails closed on an unreadable limit), so no run is admitted anywhere and the
-	// honest cause is the instance-wide setting, not the owner's holds or the fleet. Same
+	// (claimLane fails closed on an unreadable limit), so no custody-gated run is admitted and
+	// the honest cause is the instance-wide setting, not the owner's holds or the fleet. Same
 	// healthWaitingWorker enum; no nudge (see detectRunHealth).
 	reasonCustodyLimitUnavailable = "new runs are paused: the custody hold limit setting could not be read; an admin should check Admin → Instance settings"
 	// reasonCodexAccountUnavailable (PRD #1590 M2, D2) is emitted for a queued Codex subscription

@@ -27,7 +27,7 @@ describe("CustodyHoldLimitCard", () => {
     expect(button().disabled).toBe(true);
   });
 
-  it.each(["0", "-1", "abc", "8.5", "+12", "1001", ""])("rejects %j client-side without calling the API", (value) => {
+  it.each(["0", "-1", "abc", "8.5", "+12", "1001", "", "1e3", "1e2"])("rejects %j client-side without calling the API", (value) => {
     render(<Harness />);
     fireEvent.change(input(), { target: { value } });
     expect(input().getAttribute("aria-invalid")).toBe("true");

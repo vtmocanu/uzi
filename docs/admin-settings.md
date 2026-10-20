@@ -272,8 +272,9 @@ and anything above 1000.
     but legacy checker children claimed through the ordinary run lane wait that cycle);
   - queued runs show "new runs are paused: the custody hold limit setting could not
     be read; an admin should check Admin → Instance settings";
-  - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns an
-    error and `custody.holds` reports `unknown`, naming `custody_hold_limit`.
+  - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns a
+    generic error;
+  - the `custody.holds` health check reports `unknown` and names `custody_hold_limit`.
 
   An admin saving a valid value clears it.
 

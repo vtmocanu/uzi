@@ -3278,9 +3278,12 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	// passes 0: ClaimRun's lane clause restricts that lane to kind='cross_check' rows, and the
 	// custody clause admits every cross_check row regardless of the limit
 	// (`@custody_hold_limit::int <= 0 OR r.kind = 'cross_check' OR ...`), so 0 is inert there
-	// and a settings outage cannot strand a checker child. Every other lane fails closed: an
-	// unreadable limit refuses the claim (the handler logs and answers 500; the run stays
-	// queued) rather than guessing a number.
+	// and a settings outage cannot strand a child on the dedicated checker lane. Every other
+	// lane fails closed: an unreadable limit refuses the claim (the handler logs and answers
+	// 500; the run stays queued) rather than guessing a number. That includes a legacy
+	// plan-stage checker child claimed through the run lane, which the SQL cannot separate
+	// from custody-gated rows by parameter alone; it waits until the setting is readable
+	// (an accepted #3150 limit; its pill keeps the ordinary fleet reason).
 	var custodyLimit int32
 	if lane != "cross_check" {
 		n, lerr := s.custodyLimit(ctx)
