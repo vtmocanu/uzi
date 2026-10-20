@@ -49,7 +49,13 @@ func TestPolicyStopReviewOwnerLiveDB(t *testing.T) {
  plan_md=E'exact candidate\n',milestones_candidate=milestones_frozen,size_class='s',started_at=status_since-interval '1 minute',budget_wall_seconds=57600
  WHERE id=$1`, id, outcome, sourceGen, reviewGen, gateRev, presentation, payload, digest[:], source)
 	human := "  exact human body\n\n"
-	e.exec(`INSERT INTO run_user_inputs(id,run_id,kind,body,gate_binding,gate_revision) VALUES($1,$2,'revise_plan',$3,'bound',$4)`, inputID, id, human, gateRev)
+	// A primary revision names a taken input; keep its complete delivery tuple
+	// distinct from approval and retain the exact timestamp for token restoration.
+	var deliveredAt time.Time
+	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs(id,run_id,kind,body,gate_binding,gate_revision,consumed_at,consumed_worker_id,consumed_claim_generation)
+ VALUES($1,$2,'revise_plan',$3,'bound',$4,now(),$5,$6) RETURNING consumed_at`, inputID, id, human, gateRev, e.worker, sourceGen).Scan(&deliveredAt); err != nil {
+		t.Fatal(err)
+	}
 	frozen := json.RawMessage(`[{"id":"m1","title":"m1"},{"id":"m2","title":"m2"},{"id":"m3","title":"m3"}]`)
 	candidate := workersvc.PlanCrossCheckCandidate{PlanMd: "exact candidate\n", Milestones: frozen, RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s", BaseCommit: strings.Repeat("a", 40), PlanningDiff: "exact diff\n"}
 	ccDigest, err := candidate.Digest()
@@ -242,13 +248,13 @@ func TestPolicyStopReviewOwnerLiveDB(t *testing.T) {
 			t.Fatal("known bound history changed current cohort")
 		}
 		e.exec("DELETE FROM run_user_inputs WHERE id=$1", old)
-		e.exec("UPDATE run_user_inputs SET gate_binding='unbound',gate_revision=NULL WHERE id=$1", inputID)
+		e.exec("UPDATE run_user_inputs SET gate_binding='unbound',gate_revision=NULL,consumed_at=NULL,consumed_claim_generation=NULL,consumed_worker_id=NULL WHERE id=$1", inputID)
 		reject(e.owner, holdToken, "policy_stop_review_unverifiable")
-		e.exec("UPDATE run_user_inputs SET consumed_at=now(),consumed_claim_generation=$2,consumed_worker_id=$3 WHERE id=$1", inputID, sourceGen, e.worker)
+		e.exec("UPDATE run_user_inputs SET consumed_at=$2,consumed_claim_generation=$3,consumed_worker_id=$4 WHERE id=$1", inputID, deliveredAt, sourceGen, e.worker)
 		if len(review().Manifest.HumanFeedback) != 1 {
 			t.Fatal("proven primary omitted")
 		}
-		e.exec("UPDATE run_user_inputs SET gate_binding='bound',gate_revision=$2,consumed_at=NULL,consumed_claim_generation=NULL,consumed_worker_id=NULL WHERE id=$1", inputID, gateRev)
+		e.exec("UPDATE run_user_inputs SET gate_binding='bound',gate_revision=$2,consumed_at=$3,consumed_claim_generation=$4,consumed_worker_id=$5 WHERE id=$1", inputID, gateRev, deliveredAt, sourceGen, e.worker)
 	})
 	t.Run("contract_revision_changes_token", func(t *testing.T) {
 		contract := `{"profile":"structural","revision":1,"criteria":[{"id":"m1.c1","milestone_id":"m1","text":"m1","audit":null,"finding_ids":[]},{"id":"m2.c1","milestone_id":"m2","text":"m2","audit":null,"finding_ids":[]},{"id":"m3.c1","milestone_id":"m3","text":"m3","audit":null,"finding_ids":[]}]}`
