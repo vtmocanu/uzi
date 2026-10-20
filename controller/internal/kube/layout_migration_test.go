@@ -302,6 +302,9 @@ func TestLayoutMigrationRollSnapshotRefreshesLayout(t *testing.T) {
 }
 
 // B1: a held worker carrying its own incomplete reservation must not wedge its pool.
+// The "canary" variant has no peer, so it pins only the withdrawal of the held
+// canary's reservation and the later roll; re-election among peers is not exercised.
+// The "participant" variant shares the pool with a promoted canary.
 // The hold withdraws the reservation (metadata only); once custody releases, the
 // worker is admitted afresh and rolls.
 func TestLayoutMigrationHeldWorkerWithIncompleteReservationDoesNotWedgePool(t *testing.T) {
@@ -604,7 +607,7 @@ func lmObjects(t *testing.T, o lmOpts) ([]runtime.Object, protocol.DesiredWorker
 	dep := RenderDeployment(cfg, w, testSpec(t, "base", "m"))
 	dep.Namespace, dep.UID, dep.ResourceVersion = ns, types.UID("uid-"+dep.Name), "1"
 	if o.marker != "" {
-		dep = markedDeployment(t, cfg, w, false)
+		dep = markedDeployment(t, cfg, w, o.marker == "completed")
 		dep.Namespace, dep.UID, dep.ResourceVersion = ns, types.UID("uid-"+dep.Name), "1"
 		if o.marker == "participant" {
 			m, err := decodeRoll(dep.Annotations[annotationRoll])
@@ -661,6 +664,25 @@ func lmCluster(t *testing.T, force bool, objs ...runtime.Object) *lmFixture {
 	return &lmFixture{m: m, client: client, cord: cord, logs: logs}
 }
 
+// tickErr is tickAll that returns the Reconcile error instead of failing.
+func (f *lmFixture) tickErr(t *testing.T, ws ...protocol.DesiredWorker) error {
+	t.Helper()
+	obs, err := f.m.Observe(context.Background())
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	return f.m.Reconcile(context.Background(), ws, obs)
+}
+
+func lmAnnotation(t *testing.T, f *lmFixture, id string) string {
+	t.Helper()
+	d, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(id), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.Annotations[annotationRoll]
+}
+
 func (f *lmFixture) tickAll(t *testing.T, ws ...protocol.DesiredWorker) {
 	t.Helper()
 	obs, err := f.m.Observe(context.Background())
@@ -680,4 +702,115 @@ func lmRolled(t *testing.T, f *lmFixture, id string) bool {
 		t.Fatal(err)
 	}
 	return d.Spec.Template.Annotations[AnnotationSpecHash] != lmStaleHash
+}
+
+// When the held participant's reservation cannot be withdrawn, the pool is uncertain
+// for the tick: the promoted canary must NOT be marked Completed beside the held
+// worker's still-incomplete marker.
+func TestLayoutMigrationFailedWithdrawalSuppressesCohortCompletion(t *testing.T) {
+	for _, failure := range []string{"deployment", "mirror"} {
+		t.Run(failure, func(t *testing.T) {
+			hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: "participant"})
+			cObjs, canary := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "canary", promoted: true})
+			objs := append(hObjs, cObjs...)
+			if failure == "mirror" {
+				dm, err := decodeRoll(lmAnnotationOf(t, objs, "d1"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				lmDifferingMirror(t, objs, dm)
+			}
+			f := lmCluster(t, false, objs...)
+			f.client.PrependReactor("patch", "*", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				pa := a.(k8stesting.PatchAction)
+				if failure == "deployment" && a.GetResource().Resource == "deployments" && pa.GetName() == deploymentName("d1") ||
+					failure == "mirror" && a.GetResource().Resource == "persistentvolumeclaims" && pa.GetName() == dataPVCName("d1") {
+					return true, nil, errors.New("injected patch failure")
+				}
+				return false, nil, nil
+			})
+			if err := f.tickErr(t, h, canary); err == nil {
+				t.Fatal("expected the unconfirmed withdrawal to surface as an error")
+			}
+			m, err := decodeRoll(lmAnnotation(t, f, "d2"))
+			if err != nil || m == nil {
+				t.Fatalf("canary marker: %v %v", m, err)
+			}
+			if m.Completed {
+				t.Fatal("the canary was marked Completed in the same tick the held worker's reservation could not be withdrawn")
+			}
+		})
+	}
+}
+
+// lmAnnotationOf returns the deployment marker of the named seeded Deployment.
+func lmAnnotationOf(t *testing.T, objs []runtime.Object, id string) string {
+	t.Helper()
+	for _, o := range objs {
+		if d, ok := o.(*appsv1.Deployment); ok && d.Name == deploymentName(id) {
+			return d.Annotations[annotationRoll]
+		}
+	}
+	t.Fatal("no deployment")
+	return ""
+}
+
+// A held participant whose retained /data claim carries a DIFFERENT mirror than its
+// Deployment marker: both are withdrawn, and the worker rolls after custody releases.
+func TestLayoutMigrationHeldWithdrawsDifferingMirror(t *testing.T) {
+	hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: "participant"})
+	dm, err := decodeRoll(lmAnnotationOf(t, hObjs, "d1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lmDifferingMirror(t, hObjs, dm)
+	f := lmCluster(t, false, hObjs...)
+	f.tickAll(t, h)
+	if a := lmAnnotation(t, f, "d1"); a != "" {
+		t.Fatalf("deployment marker kept: %s", a)
+	}
+	claim, _ := f.client.CoreV1().PersistentVolumeClaims(lmNS()).Get(context.Background(), dataPVCName("d1"), metav1.GetOptions{})
+	if claim.Annotations[annotationRoll] != "" {
+		t.Fatalf("claim mirror kept: %s", claim.Annotations[annotationRoll])
+	}
+	h.CustodyHeld = false
+	for i := 0; i < 8 && !lmRolled(t, f, "d1"); i++ {
+		f.tickAll(t, h)
+	}
+	if !lmRolled(t, f, "d1") {
+		t.Fatal("never rolled after release")
+	}
+}
+
+// A held worker's COMPLETED marker is history, not a reservation: the hold leaves it
+// alone. A peer's incomplete marker keeps the historic-retire loop from clearing it first.
+func TestLayoutMigrationHeldLeavesCompletedMarker(t *testing.T) {
+	hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: "completed"})
+	pObjs, peer := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "participant"})
+	want := lmAnnotationOf(t, hObjs, "d1")
+	f := lmCluster(t, false, append(hObjs, pObjs...)...)
+	_ = f.tickErr(t, h, peer)
+	if got := lmAnnotation(t, f, "d1"); got != want {
+		t.Fatalf("completed marker changed:\n got %s\nwant %s", got, want)
+	}
+	if lmRolled(t, f, "d1") {
+		t.Fatal("held worker rolled")
+	}
+}
+
+// lmDifferingMirror stamps d1's retained /data claim with a valid marker that differs
+// from the Deployment's, so the snapshot leaves the mirror for the hold to withdraw.
+func lmDifferingMirror(t *testing.T, objs []runtime.Object, m *rollMarker) {
+	t.Helper()
+	m.Hash = strings.Repeat("a", 64)
+	m.Coverage.Scheduling, m.Coverage.Protocol = []string{}, []string{}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		if p, ok := o.(*corev1.PersistentVolumeClaim); ok && p.Name == dataPVCName("d1") {
+			p.Annotations = map[string]string{annotationRoll: string(raw)}
+		}
+	}
 }

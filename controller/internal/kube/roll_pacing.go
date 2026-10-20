@@ -259,11 +259,13 @@ func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, 
 	if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
 		if err := m.mirrorRoll(ctx, e, nil); err != nil {
 			e.blocked = "held reservation mirror cancellation unconfirmed"
+			t.uncertain[coverageKey(e.coverage)] = true
 			return
 		}
 	}
 	if err := m.reserveRoll(ctx, e, nil); err != nil {
 		e.blocked = "held reservation cancellation unconfirmed"
+		t.uncertain[coverageKey(e.coverage)] = true
 	}
 }
 
@@ -470,6 +472,12 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		}
 	}
 	if allPromoted && blocker == "" {
+		// A held worker whose own reservation could not be withdrawn marked this pool
+		// uncertain earlier in the tick: completing the canary now would pair a
+		// Completed cohort with that worker's still-incomplete marker.
+		if t.uncertain[coverageKey(pool[0].coverage)] {
+			return
+		}
 		for _, e := range pool {
 			if e.w.ID == canary {
 				r := *e.marker
