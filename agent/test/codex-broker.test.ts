@@ -536,6 +536,36 @@ describe("CodexCallbackBroker: authority is bound to the grant, not the args", (
 });
 
 
+describe("issue3089 owner request broker admission", () => {
+  for (const eligible of [true, false]) {
+    it(`uses worker admission, including malformed supplied requests: ${eligible}`, async () => {
+      const h = makeBroker({ grants: grants({ ownerDecisionRequested: eligible }) });
+      for (const value of [null, [], { reason: " " }, { reason: "😀".repeat(501) },
+        { reason: "ok", kind: "partial" }, { reason: "ok", milestones: ["m1"] }]) {
+        const result = await h.broker.handleToolCall(rt(), "signal_done", {
+          owner_decision_requested: value, summary: "LEAK",
+        }, "root");
+        if (eligible) {
+          assertDenied(result, "invalid_signal");
+          assert.ok(!JSON.stringify(result).includes("LEAK"));
+        } else {
+          assert.equal(result.ok, true);
+          if (result.ok) assert.deepEqual(result.output, { done: true, summary: "LEAK" });
+        }
+      }
+      const good = await h.broker.handleToolCall(rt(), "signal_done", {
+        owner_decision_requested: { reason: "  " + "😀".repeat(500) + "  " },
+      }, "root");
+      assert.equal(good.ok, true);
+      if (good.ok) assert.deepEqual(good.output, { done: true,
+        ...(eligible ? { ownerDecisionRequested: { reason: "😀".repeat(500) } } : {}) });
+      assertDenied(await h.broker.handleToolCall(rt(), "signal_done", {
+        owner_decision_requested: { reason: "child" },
+      }, "child"), "signal_root_only");
+    });
+  }
+});
+
 describe("m1 non-closing broker", () => {
   it("returns a neutral error then accepts a corrected dispatch", async () => {
     const h = makeBroker();
@@ -1091,6 +1121,7 @@ describe("CodexCallbackBroker: issue #2048 command deadline through the real def
         supervisorPid: 20,
         transport: { stdin: new PassThrough(), stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async (ms: number) => {
           await new Promise<void>((resolve) => setTimeout(resolve, 10));
           throw new SupervisedChildExitTimeoutError(ms);

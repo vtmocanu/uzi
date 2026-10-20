@@ -70,7 +70,7 @@ test("fourth reservation stays refused across fresh claims", async t => {
   assert.equal(f.read().recovery?.attempts, 3);
 });
 
-for (const blocker of ["decoded_history_limit", "clock_invalid", "quiescence_failed", "budget_exhausted"] as const) {
+for (const blocker of ["decoded_history_limit", "clock_invalid", "quiescence_failed", "budget_exhausted", "readiness_cleanup_unconfirmed"] as const) {
   test(`already blocked ${blocker} survives a new claim and expiry unchanged`, async t => {
     const f = fixture(t);
     await f.reserve(1);

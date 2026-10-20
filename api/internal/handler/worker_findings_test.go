@@ -273,6 +273,10 @@ func TestWorkerCreateFindingCaptureSilent(t *testing.T) {
 	}
 }
 
+func (s *notifyingSpyStore) IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error) {
+	return false, pgx.ErrNoRows
+}
+
 // GetSecretEnablement satisfies notifysvc.Store's credential re-check (PRD #1732 D13),
 // which only the early-reset alert calls; no finding path reaches it.
 func (s *notifyingSpyStore) GetSecretEnablement(context.Context, store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {

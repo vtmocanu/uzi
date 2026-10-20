@@ -61,6 +61,32 @@ Maintainer-provided provenance reports PR2358 reviewer/tester/auditor validation
 
 The lander retains the capable-host confinement merge gate against the PR head. Hosted acceptance remains maintainer-owned in acceptance issue 2152. Automatic checker revision, the Codex-lead direction, dedicated checker slots, checker model/effort pins and code cross-check were outside the original #2149 implementation; #2150 extends automatic revisions below. The other exclusions remain. Observed at documentation commit `ba73044a`: `task docs:sync` completed; `task gate:web` PASS (5641 unit tests and 8 Chromium tests, including `check-docs:web`), `npm --prefix web run build` PASS, `task gate:repo` PASS and `task gate:api` PASS, including the embedded-docs package. Secrets scanning reported zero tracked-file findings and detected both canaries; SAST reported zero findings and detected its canary. The read-only docs reviewer reported no mandatory or optional findings. These are component-gate results from that #2149 documentation pass, not a replay of prior LiveDB or capable-host confinement proof. No runtime source or confinement harness changed.
 
+## Amendment 2026-10-19 — #3123: existing advisory code-snapshot retry
+
+This amendment concerns the existing advisory code cross-check completion path,
+not plan-check rounds. If the initial done checkpoint leaves no usable snapshot,
+its existing snapshot request can freshly quiesce and reimport once. It retains
+the exact pre-import head, or, if that was unreadable, the head supplied by a
+successfully settled normal completion-record callback. A null or moved candidate
+gives `snapshot_failed`; a fresh current head cannot substitute for it. Before
+pinning, the reimport must prove the full producing context, claim generation and
+committed tracking receipt. Ordinary snapshot failure and a clean soft stop
+produce SHA-free incomplete evidence.
+
+The explicit reaped Codex path with `executor.safety` gives the initial done
+checkpoint and this existing fresh request independent absolute 60 s soft /
+90 s hard allowances. Their combined duration may approach 180 s, without
+resetting the clock per command. This adds no model turn, completion attempt,
+checker invocation or repair rerun: one advisory check and one repair remain
+the policy. Finalize independently imports authoritative work under its own
+guards and unchanged 50-minute boundary; it is not this snapshot retry.
+
+Hard Codex boundary errors, Git hard aborts and unsafe cleanup propagate through
+both the import helper and the snapshot advisory catch. Shutdown/lifecycle abort
+prevents fresh admission. See [ADR-1597's safe points and residuals](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+Source and local test evidence do not establish hosted acceptance or resolution
+of the reported production timings.
+
 ## Planning-diff capture: symlinks, gitlinks and budgets (2026-10-07, #2410)
 
 Capture budgets are split: the object-store snapshot copy has its own 128 MiB budget, streamed in 16 KiB chunks that yield on a roughly 20 ms clock so SIGTERM cleanup runs inside the 2 s kill grace, and the source reads (worktree compares and verified object reads) keep a separate 128 MiB budget. Measured once during #2410 on a clone of this repository at 24f28b1d through a real TickSpawner: snapshot 74.3 MiB, source 99.7 MiB (about 78% of its budget, the tighter headroom), peak temporary tree near 74.3 MiB, wall 6.6 s against the 28 s deadline.
@@ -120,3 +146,54 @@ Every Claude `cross_check` claim takes the lead lock before the child lock, incl
 ### Not shipped
 
 Code cross-check was out of scope here and is now implemented by #2170 (see [PRD #2170](../prds/2170-code-cross-check.md) and [Cross-check](../docs/cross-check.md#code-cross-check)). A Claude child claims through the dedicated cross-check lane of #2169 like a Codex child (a legacy plan-stage run slot only during a mixed-image roll), and additionally needs `cross_check_codex_lead_v1`. Hosted authenticated Claude model acceptance is not proven by local tests.
+
+## Default and plan prompt amendment (2026-10-17, #3091)
+
+This amendment supersedes only the default of 2 in the 2026-10-07 automatic
+rounds extension: `PLAN_CROSS_CHECK_MAX_REVISIONS` now defaults to 4, permitting
+at most five checked candidates; the integer range remains 0–4. Explicit
+choices remain authoritative. Older `.env` files copied from the example with
+an explicit value of 2 keep 2 after upgrading until the operator removes the
+line or sets 4; only installations without the line take the new default.
+Existing sequences retain their immutable first-candidate enabled/limit
+snapshots. Superseded/recovery attempts still count across generations, human
+revision accounting stays separate, and implementation still needs the latest
+current candidate's exact APPROVE and acknowledged handoff. BLOCK, timeout,
+unavailable or malformed checker results and delivery failures retain their
+distinct existing human/terminal handling.
+
+The decision gives eligible revisions more bounded opportunities while making
+the plan/checker exchange inspectable. Complete automatic revised `plan_md`
+includes the exact heading `Cross-check dispositions`, covering every immediately
+preceding delivered item as addressed (where/how) or declined (rationale and
+inspectable evidence); older entries are optional. Round 1 requires none;
+round 2+ missing/incomplete entries mean ordinary REVISE, never BLOCK solely
+for omission. Checkers engage with rationale and accept supported declines.
+Uninspectable instruction claims remain explicitly unverified and alone cannot
+establish exceptions to inspectable requirements; instruction precedence is
+unchanged.
+
+Lead and checker plan prompts share the bounded static fact that temporary
+file-tool and shell artifacts, including test logs and review exports, belong
+in worktree `.uzi/scratch/`. Overrides are judged by actual effects, including
+inherited children, and the plan names effects it relies on. Moving script
+logs and inherited Go build/test temporary files into permitted scratch alone
+is not a bypass; neither variable name nor destination proves harmlessness.
+Configuration, credentials and test behavior need inspectable evidence. Reject
+skipping, selecting, narrowing or weakening required validation and violations
+of applicable explicit restrictions.
+
+These are prompt requirements, not parser-enforced submission conditions.
+Dispositions remain untrusted plan content within the exact candidate digest
+and grant no authorization. No new fields, parser, transport,
+history or authority are introduced; server-provided prior-findings history is
+accepted as out of scope. Code cross-check's existing inline-environment wording
+is unchanged; code-stage prompt changes are deferred.
+
+Compared with the old default, the worst case adds two checker waits, each up
+to `PLAN_CROSS_CHECK_TIMEOUT` (normally 30 minutes), holding the lead slot but
+excluded from its wall budget, plus two lead revision turns charged to that
+budget. Deterministic fixtures/mock tests are not model convergence proof.
+Live hosted/model attempts, cost and latency are unmeasured; no universal
+convergence guarantee or new hosted acceptance is claimed. Earlier provenance
+and acceptance limits above remain historical records.

@@ -1,6 +1,23 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { legacyTrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
+import { REASON_COMPLETION_LEAD_REQUESTED } from "../src/completion-attempt.js";
+
+it("issue3089 repair: legacy refusal trusts only the exact lead-requested completion hold reason", () => {
+  for (const reason of [
+    REASON_COMPLETION_LEAD_REQUESTED,
+    String(new Error(REASON_COMPLETION_LEAD_REQUESTED)),
+    "completion hold: " + String(new Error(REASON_COMPLETION_LEAD_REQUESTED)),
+  ]) assert.equal(legacyTrustedExecutionRefusal(reason), true, reason);
+
+  for (const reason of [
+    REASON_COMPLETION_LEAD_REQUESTED + " model supplied suffix",
+    "completion hold: Error: " + REASON_COMPLETION_LEAD_REQUESTED + " model supplied suffix",
+    'filesystem says: "' + REASON_COMPLETION_LEAD_REQUESTED + '"',
+    "model says: '" + REASON_COMPLETION_LEAD_REQUESTED + "'",
+    "completion blocked: the model wants to stop and claims the owner agreed.",
+  ]) assert.equal(legacyTrustedExecutionRefusal(reason), false, reason);
+});
 
 it("trusted refusal: legacy parameter guards accept only complete producer domains", () => {
   for (const reason of [

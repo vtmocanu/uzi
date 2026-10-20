@@ -13,9 +13,11 @@
 # --json`, .claude[].socket); then a Codex thread via CODEX_THREAD_ID (.codex[].id); else
 # host-pid with kind "unknown" (a warning — such a claim cannot be liveness-checked and
 # ages out on the TTL). The uuid is what other sessions address and what liveness keys on;
-# the name is a mutable alias.
+# the name is a mutable alias. OPENCODE_SESSION_ID resolves an OpenCode owner;
+# an ambiguous or unverifiable native identity refuses rather than using a PID.
 #
-# LIVENESS: a uuid is live when the registry lists it as a Claude session (.claude[]
+# LIVENESS: an OpenCode id listed in .opencode[] names an extant owner, even idle;
+# absence from recent-only discovery is unknown, not death. A uuid is live when listed as a Claude session (.claude[]
 # .sessionId, which includes Codex shims) or as a Codex thread with a holder process
 # (.codex[] .holder_pid). Registry unavailable => unknown (rc 2), and callers fall back to
 # the last_seen TTL (UZI_LANDER_STALE_HOURS, default 6).
@@ -48,7 +50,24 @@ self_identity() {
   local name="${1:-${SESSION_PEERS_NAME:-}}" uuid="${2:-${SESSION_PEERS_UUID:-}}" kind="${3:-${SESSION_PEERS_KIND:-}}" pj row
   if [ -z "$uuid" ]; then
     pj=$(peers_json)
-    if [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] && [ -n "$pj" ]; then
+    if [ -n "${OPENCODE_SESSION_ID:-}" ]; then
+      if [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}${CLAUDE_CODE_SESSION_ID:-}${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}" ]; then
+        echo "ambiguous OpenCode/Claude/Codex identity; pass explicit owner overrides" >&2
+        return 2
+      fi
+      if ! [[ "$OPENCODE_SESSION_ID" =~ ^ses_[A-Za-z0-9]{8,64}$ ]]; then
+        echo "invalid OPENCODE_SESSION_ID" >&2; return 2
+      fi
+      row=$(printf '%s' "$pj" | jq -r --arg u "$OPENCODE_SESSION_ID" \
+        '[.opencode[]?|select(.id==$u)] | if length==1 then .[0] | (.title // "") else empty end' 2>/dev/null)
+      if ! printf '%s' "$pj" | jq -e --arg u "$OPENCODE_SESSION_ID" \
+        '([.opencode[]?|select(.id==$u)]|length)==1' >/dev/null 2>&1; then
+        echo "cannot verify native OpenCode owner; refusing PID fallback" >&2; return 2
+      fi
+      name="${name:-${row:-opencode-${OPENCODE_SESSION_ID}}}"
+      uuid="$OPENCODE_SESSION_ID"; kind=opencode
+    fi
+    if [ -z "$uuid" ] && [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ] && [ -n "$pj" ]; then
       row=$(printf '%s' "$pj" | jq -r --arg s "$CLAUDE_CODE_MESSAGING_SOCKET" \
         '.claude[]?|select(.socket==$s)|"\(.name)\t\(.sessionId)\t\(if .entrypoint=="codex" then "codex" else "claude" end)"' 2>/dev/null | head -1)
       if [ -n "$row" ]; then
@@ -78,6 +97,14 @@ is_live() {
   local pj n unver
   case "$1" in unknown-*) return 2;; esac
   pj=$(peers_json); [ -n "$pj" ] || return 2
+  case "$1" in
+    ses_*)
+      # OpenCode discovery is recent-only and attachment is unknown. A listed
+      # durable session is an owner; absence/error can NEVER establish death.
+      printf '%s' "$pj" | jq -e --arg u "$1" \
+        '(.opencode|type)=="array" and any(.opencode[]; .id==$u)' >/dev/null 2>&1 && return 0
+      return 2;;
+  esac
   printf '%s' "$pj" | jq -e '(.claude|type)=="array" and (.codex|type)=="array"' >/dev/null 2>&1 || return 2
   n=$(printf '%s' "$pj" | jq -r --arg u "$1" \
     '([.claude[]?|select(.sessionId==$u)] + [.codex[]?|select(.id==$u and .holder_pid!=null)])|length' 2>/dev/null) || return 2

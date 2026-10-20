@@ -209,11 +209,9 @@ for (const { caller, afterUnlinkFault, liveClient } of [
     const attemptId = mintAttemptId(generation);
     const clone = await git.runnerCloneForBranch(bare, branch, "issue-2883", {
       isLive: () => false,
-      quiescent: async () => true,
       beforeFree: async () => { throw new Error("seed cannot free a clone"); },
     }, claim.run_id, false, undefined, {
       attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),
-      quiescent: async () => true,
     });
     fs.writeFileSync(path.join(clone.path, "delivered.txt"), "delivered\n");
     command(clone.path, ["add", "delivered.txt"]);

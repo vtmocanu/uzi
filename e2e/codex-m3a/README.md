@@ -42,12 +42,16 @@ untrusted uid.
 ## The five controls
 
 1. **Channel boundary (nondumpability) + positive control** (`control_1`). Launches the
-   supervisor via the real launcher with a stub child that, as the runner uid, tries to
-   read `/proc/<supervisor>/fd/3` (control) and `/fd/4` (evidence): BOTH are DENIED
-   (`EACCES`) because the supervisor set `PR_SET_DUMPABLE(0)`, so its `/proc` is root-owned.
-   The **positive control** proves the denial is specifically nondumpability, not a blanket
-   `/proc` restriction: a same-uid runner process holding an open fd with default dumpable
-   IS readable by another runner process. An independent side-probe repeats the denial.
+   supervisor via the real launcher (`kind: "command"`, so the root runs as the cap-less
+   `runner-cmd` uid 10003) with a stub child that, as that uid, tries to read
+   `/proc/<supervisor>/fd/3` (control) and `/fd/4` (evidence): BOTH are DENIED (`EACCES`)
+   because the supervisor set `PR_SET_DUMPABLE(0)`, so its `/proc` is root-owned. The
+   **positive control** proves the denial is specifically nondumpability, not a blanket
+   `/proc` restriction: a same-uid (10003) process holding an open fd with default dumpable
+   IS readable by another same-uid process. An independent side-probe repeats the denial.
+   Controls 1 and 4 create their trees and run every probe as uid 10003 under the
+   group-writable `/data/runner/m3a` (2770, group `runner`, as production `/data/runner`);
+   probing as the runner uid would be denied for the wrong reason.
 
 2. **Profile enforcement, fail-before-fork, no bypass** (`control_2a`, `control_nnp`).
    (2a) Drives the supervisor directly as the runner with a WRONG `--expect-uid 9999`:
@@ -69,7 +73,8 @@ untrusted uid.
 4. **Disposal via ECHILD+__WALL, not group kill** (`control_4`). Launches a stub child that
    forks a `setsid`'d grandchild into its OWN process group. On dispose the launcher reports
    `state:"drained"`, `authority:"ECHILD+__WALL"`, and `reaped` includes BOTH the child and
-   the differently-grouped grandchild; neither survives. A process-group kill would have
+   the differently-grouped grandchild; both are first proven alive and visible to uid 10003,
+   so their absence after dispose means reaped rather than a wrong-uid `kill -0` EPERM. A process-group kill would have
    missed the grandchild.
 
 5. **Fresh-tree ownership + env delivery** (`control_5`). Drives `launch-cli` with a

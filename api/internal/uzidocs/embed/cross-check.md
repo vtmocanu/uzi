@@ -47,8 +47,14 @@ plan. Checker findings arrive as fenced, potentially wrong or hostile
 advice. The revision prompt tells the lead to verify them against the code,
 issue and uzi rules, and to decline conflicting advice.
 
-The default budget allows two automatic revisions (three checked candidates).
-Superseded attempts count too, including recovery after worker loss; they do
+The default budget allows four automatic revisions (five checked candidates),
+with a configurable integer range of 0–4. Explicit choices remain authoritative;
+existing sequences keep their immutable first-candidate enabled/limit snapshots,
+so configuration changes affect new checks only. Older `.env` files explicitly
+setting `PLAN_CROSS_CHECK_MAX_REVISIONS=2` keep 2 after upgrading until the
+operator removes the line or sets it to 4; only installations without the line
+take the new default. Superseded attempts count across generations too,
+including recovery after worker loss; they do
 not spend your human revision allowance. Exhaustion parks with
 `plan cross-check: revisions exhausted`. A round-capable worker with a zero
 budget exhausts on REVISE; an older worker keeps the changes-requested human
@@ -118,6 +124,38 @@ vault remains a transient wait. A pinned Claude model the account cannot use
 (the SDK reports `model_not_found`) is treated the same way. A checker session
 whose confinement cannot be confirmed at startup fails the check with
 `confinement_failed`.
+
+### Automatic plan revision contract
+
+The complete automatically revised `plan_md` must include the exact heading
+**Cross-check dispositions**, with one disposition for each item delivered by
+the immediately preceding check: addressed (where and how in the plan), or
+declined (rationale and inspectable evidence). Older entries are optional.
+Round 1 does not require dispositions; missing or incomplete entries in round 2
+and later call for ordinary REVISE, never BLOCK solely for that omission.
+The checker engages with the rationale and accepts evidence-supported declines
+as appropriate. An uninspectable instruction claim must be explicitly unverified;
+it alone cannot establish an exception to an inspectable requirement. Actual
+instruction precedence is unchanged.
+
+Lead and checker plan prompts share a bounded, static worker fact: temporary
+file-tool and shell artifacts, including test logs and review exports, belong
+under `.uzi/scratch/` in the worktree. Environment overrides are evaluated by
+actual effects, including inherited children; the plan must name the effects
+it relies on. Relocating script logs and inherited Go build/test temporary files
+to permitted scratch is not alone a bypass. Neither a variable name nor its
+destination proves harmlessness: effects on configuration, credentials and test
+behavior need inspectable evidence. Reject overrides that skip, select, narrow
+or otherwise weaken required validation, or violate an applicable explicit
+restriction.
+
+This is a prompt contract: dispositions remain inside the exact candidate
+digest as untrusted plan content, not authorization. It adds no fields, parser,
+transport, history or authority. Code cross-check guidance is unchanged.
+Deterministic fixtures and mock tests do not prove model convergence; live
+hosted/model attempts, cost and latency are unmeasured, with no universal
+convergence guarantee. The [configuration notes](./configuration.md#cross-check-settings)
+explain the bounded additional wait and lead revision cost.
 
 ## 3. Read the evidence and decide
 
@@ -353,9 +391,15 @@ the check when it is created; later edits affect new checks only. Forking from
 an older default-branch commit does not select older instructions. The pin is
 acquired even with consent off, but the file is read only with consent on.
 An absent, unreadable, unsafe or oversized file leaves a successful pin with empty text.
-If quiescence or fresh Git acquisition fails, the advisory check is incomplete
-(`snapshot_failed`): no durable snapshot ref, metadata or instructions are
-created, and no SHA is invented.
+If the initial done checkpoint leaves its snapshot unavailable, the existing
+snapshot request freshly quiesces and reimports once, using the retained exact
+pre-import head. If the initial head was unreadable, only the successfully
+settled normal completion-record callback can supply the fallback. A null or
+moved candidate gives `snapshot_failed`, without substituting a new head.
+Pinning requires verified producing context, claim generation and committed
+tracking receipt. Ordinary failure or a clean soft stop leaves SHA-free
+incomplete evidence; no successful snapshot or instruction provenance is claimed.
+Hard boundary, Git hard-abort and unsafe-cleanup errors fail closed.
 
 Both completion paths freshly quiesce the lead before the credentialed fetch
 and durable local pin, within the worker's held boundary. Branch validation
@@ -373,10 +417,19 @@ and repair compare the pin explicitly. Status exposes nullable
 NULL/absent provenance and their historical digests, without backfill.
 
 The existing 64 KiB, 8-hop, repository-root, `.git/`, regular-blob, import
-stripping and advisory-fencing protections remain in place. Git acquisition
-retains its pre-existing unbounded budgets; this change adds no acquisition
-credential, source or background process and does not establish a new security
-or acquisition-time bound.
+stripping and advisory-fencing protections remain in place. The earlier
+acquisition-budget description predates the bounded reaped Codex done path.
+Explicit reaped Codex done checkpoints with
+`executor.safety` now have independent absolute 60 s soft / 90 s hard allowances
+for the initial checkpoint and existing fresh snapshot request (up to nearly
+180 s combined). The clocks include gate/queue waits, preliminary reads,
+reconciliation, quiescence and actions; commands do not restart them.
+Shutdown/lifecycle abort prevents fresh admission. Shared Claude and non-reaped
+paths are unchanged. This adds no model turn, completion attempt, checker
+invocation or repair rerun. Finalize independently imports work with its existing
+guards and separate 50-minute boundary; it is not a snapshot retry. Storage
+settlement can outlast an allowance; see [Checkpoint budgets](./configuration.md#checkpoints-two-tiers-prd-122-m8-prd-267).
+These source/test boundaries do not establish hosted acceptance.
 
 ### Snapshot cleanup
 

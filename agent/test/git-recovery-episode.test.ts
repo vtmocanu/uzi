@@ -149,7 +149,7 @@ function protectedValue(value = journal()): string {
 }
 
 function attemptSeed(n: number) {
-  return { attemptId: aid(n), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true };
+  return { attemptId: aid(n), isLive: () => false, beforeSeed: async () => {} };
 }
 
 for (const overlap of [false, true]) {
@@ -239,6 +239,7 @@ test("custody isolation: every primary retained predecessor and successor surviv
     `.uzi-residue-${key}.residue-00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
   for (const [i, residue] of residues.entries()) {
     fs.mkdirSync(residue);
+    fs.writeFileSync(path.join(residue, "sentinel"), `original residue-${i}\n`);
     fs.utimesSync(residue, i + 1, i + 1);
   }
   const warnings: unknown[][] = [];
@@ -247,11 +248,18 @@ test("custody isolation: every primary retained predecessor and successor surviv
   const reader = new GitCache(fx.dataDir, logger, undefined, testGitCacheOptions());
   const next = await reader.createOrAttachRunnerClone(bare, 2512, noProofReseed, "run-next", false, undefined, attemptSeed(4));
   assert.ok(fs.existsSync(next.path), "seed and retention sweep complete despite damaged custody");
-  assert.equal(fs.existsSync(residues[0]!), false, "sweep deletes the oldest unrelated disposable residue");
-  assert.ok(residues.slice(1).every(residue => fs.existsSync(residue)));
-  assert.equal(warnings.length, 2, "compaction and sweep each emit one fixed summary");
-  assert.ok(warnings.every(args => args.length === 1 && args[0] ===
-    "recovery custody discovery: incomplete physical evidence; attribution remains protected"));
+  for (const [i, residue] of residues.entries()) {
+    assert.equal(fs.readFileSync(path.join(residue, "sentinel"), "utf8"), `original residue-${i}\n`);
+  }
+  const physicalWarnings = warnings.filter(args => args[0] ===
+    "recovery custody discovery: incomplete physical evidence; attribution remains protected");
+  const retentionWarnings = warnings.filter(args => args[0] ===
+    "runner clone retention: automatic reclaim disabled");
+  assert.equal(physicalWarnings.length, 2, "compaction and diagnostics each emit one physical summary");
+  assert.ok(physicalWarnings.every(args => args.length === 1));
+  assert.equal(retentionWarnings.length, 1, "one stable retention diagnostic");
+  assert.equal(retentionWarnings[0]!.length, 2);
+  assert.equal(warnings.length, 3, "only physical and retention warning categories");
   const ledger = git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`]).split("\n").map(raw => JSON.parse(raw));
   assert.equal(ledger.filter(e => e.attemptId === aid(2)).length, 1, "compaction ran");
   for (const [id, clonePath] of [[aid(2), expected.clonePath], [aid(3), before.clonePath]]) {
@@ -395,7 +403,7 @@ test("discard exact detached run preserves newer active ownership and fresh atte
   await cache.detachTerminalRetained(bare, branch, key, before);
   const nextRun = "run-next";
   const next = await recreate().createOrAttachRunnerClone(bare, 2512, noProofReseed, nextRun, false, undefined, {
-    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => true,
+    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {},
   });
   await cache.markRecoveryCapture(bare, next.path, branch, nextRun, next.attemptId);
   const active = journal();
@@ -581,12 +589,10 @@ test("missing-source identity mismatches and missing known own source never over
   for (const attempt of [false, true]) {
     await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, {
       isLive: () => false,
-      quiescent: async () => true,
       beforeFree: async () => { calls.push("free"); },
     }, runId, false, undefined, attempt ? {
       attemptId: aid(3), isLive: () => { calls.push("live"); return false; },
       beforeSeed: async () => { calls.push("seed"); },
-      quiescent: async () => { calls.push("sweep"); return true; },
     } : undefined), { message: "known recovery source is missing; nothing seeded" });
     assert.deepEqual(calls, []);
     assert.deepEqual(snapshot(), ownEvidence);
@@ -1287,7 +1293,7 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   assert.throws(() => git(bare, ["rev-parse", "--verify", `refs/uzi-recovery-episode/${runId}/${tip}`]));
   await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId), /fresh attempt/);
   const clone = await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId, true, undefined, {
-    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {}, quiescent: async () => false,
+    attemptId: aid(3), isLive: () => false, beforeSeed: async () => {},
   });
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });

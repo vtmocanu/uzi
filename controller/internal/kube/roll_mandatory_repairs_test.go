@@ -3,15 +3,19 @@ package kube
 import (
 	"context"
 	"fmt"
-	k8stesting "k8s.io/client-go/testing"
+	"reflect"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/vtmocanu/uzi/controller/internal/preset"
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
@@ -291,30 +295,152 @@ func TestMandatoryPromotedDrainRelease(t *testing.T) {
 }
 
 func TestMandatoryHistoricalPressureDeadline(t *testing.T) {
-	w := evidence(desired("w1"), m5Now)
-	w.Busy, w.DiskPressure = true, true
-	since := m5Now.Add(-2 * time.Hour)
-	w.DrainingSince, w.DrainingReason = &since, token("disk_pressure")
-	d := markedDeployment(t, testConfig(), w, true)
-	objects := []runtime.Object{d}
-	for _, p := range RenderPVCs(testConfig(), w, testSpec(t, w.Template, w.Size)) {
-		objects = append(objects, p)
-	}
-	m, c := newMat(t, objects...)
-	m.now = func() time.Time { return m5Now }
-	m.drain.Deadline = time.Hour
-	f := &fakeCordoner{}
-	m.cordoner = f
-	rollTickTest(t, m, []protocol.DesiredWorker{w})
-	got, err := c.AppsV1().Deployments(testConfig().Namespace).Get(context.Background(), d.Name, metav1.GetOptions{})
-	if err != nil || got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
-		t.Fatalf("independent deadline did not scale down: %v", err)
-	}
-	rollTickTest(t, m, []protocol.DesiredWorker{w})
-	if _, err = c.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName(w.ID), metav1.GetOptions{}); err == nil {
-		t.Fatal("historical reservation blocked pressure deadline")
-	}
-	if len(f.clearCalls) != 0 || len(f.calls) != 0 {
-		t.Fatalf("independent drain was changed: %+v", f)
+	for _, mode := range []string{"unchanged", "admission-held", "pod-present", "restore-pod-present", "nix-unready", "data-unready", "drift-generation", "drift-hash", "drift-image"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			w := evidence(desired("w1"), m5Now)
+			w.Busy, w.DiskPressure = true, true
+			since := m5Now.Add(-2 * time.Hour)
+			w.DrainingSince, w.DrainingReason = &since, token("disk_pressure")
+			d := markedDeployment(t, testConfig(), w, true)
+			peer := evidence(desired("w2"), m5Now)
+			peer.Busy = true
+			peerDep := RenderDeployment(testConfig(), peer, testSpec(t, peer.Template, peer.Size))
+			peerDep.UID, peerDep.ResourceVersion = "peer-deployment", "1"
+			objects := []runtime.Object{d, peerDep}
+			for _, p := range RenderPVCs(testConfig(), w, testSpec(t, w.Template, w.Size)) {
+				objects = append(objects, p)
+			}
+			m, c := newMat(t, objects...)
+			m.now = func() time.Time { return m5Now }
+			m.drain.Deadline = time.Hour
+			f := &fakeCordoner{}
+			m.cordoner = f
+			currentProof(t, c, &peer, m5Now)
+			tick := func() {
+				t.Helper()
+				m = matrixRestart(m)
+				rollTickTest(t, m, []protocol.DesiredWorker{w, peer})
+			}
+			get := func() *appsv1.Deployment {
+				t.Helper()
+				got, err := c.AppsV1().Deployments(m.cfg.Namespace).Get(ctx, d.Name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got
+			}
+			tick()
+			if got := get(); got.Spec.Replicas == nil || *got.Spec.Replicas != 0 {
+				t.Fatal("independent deadline did not scale down")
+			}
+			if mode == "pod-present" {
+				at := metav1.NewTime(m5Now)
+				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "terminating-old", Namespace: m.cfg.Namespace, UID: "old-pod", Labels: objectLabels(w.ID), DeletionTimestamp: &at}}
+				if err := c.Tracker().Create(corev1.SchemeGroupVersion.WithResource("pods"), pod, pod.Namespace); err != nil {
+					t.Fatal(err)
+				}
+				c.ClearActions()
+				tick()
+				assertBusyDriftUnchanged(t, c, get())
+				if len(deletedSet(c)) != 0 {
+					t.Fatal("pressure recycle deleted claims while old pod remained")
+				}
+				if err := c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), pod.Namespace, pod.Name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tick()
+			if _, err := c.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Get(ctx, dataPVCName(w.ID), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("historical reservation blocked pressure deadline: %v", err)
+			}
+			// Pressure has cleared, but Busy remains true through re-mint and restore.
+			// New drift must not borrow the independent drain's elapsed permission.
+			w.DiskPressure = false
+			switch mode {
+			case "drift-generation":
+				w.Generation++
+			case "drift-hash":
+				m.cfg.APIURL = "https://replacement.example.com"
+			case "drift-image":
+				var err error
+				m.resolver, err = preset.NewResolver("harbor.example.com/uzi", "v2.0.0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				m.cfg.RollTargetVersion = "2.0.0"
+			}
+			before := get()
+			c.ClearActions()
+			tick() // Re-mint missing claims; restoration needs a later live observation.
+			if mode == "admission-held" {
+				w.RollEvidence.OwnerID = "different-owner"
+				tick()
+				assertBusyDriftUnchanged(t, c, before)
+				w.RollEvidence.OwnerID = "owner-A"
+			}
+			if mode == "restore-pod-present" {
+				at := metav1.NewTime(m5Now)
+				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-old-pod", Namespace: m.cfg.Namespace, UID: "late-old-pod", Labels: objectLabels(w.ID), DeletionTimestamp: &at}}
+				if err := c.Tracker().Create(corev1.SchemeGroupVersion.WithResource("pods"), pod, pod.Namespace); err != nil {
+					t.Fatal(err)
+				}
+				tick()
+				assertBusyDriftUnchanged(t, c, before)
+				if err := c.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("pods"), pod.Namespace, pod.Name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "nix-unready" || mode == "data-unready" {
+				name := nixPVCName(w.ID)
+				if mode == "data-unready" {
+					name = dataPVCName(w.ID)
+				}
+				p, err := c.CoreV1().PersistentVolumeClaims(m.cfg.Namespace).Get(ctx, name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				at := metav1.NewTime(m5Now)
+				p.DeletionTimestamp = &at
+				if err := c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), p, p.Namespace); err != nil {
+					t.Fatal(err)
+				}
+				tick()
+				assertBusyDriftUnchanged(t, c, before)
+				p.DeletionTimestamp = nil
+				if err := c.Tracker().Update(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), p, p.Namespace); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tick()
+			if mode == "drift-generation" || mode == "drift-hash" || mode == "drift-image" {
+				tick() // A fresh observation now sees the re-minted live claims.
+				obs, err := m.Observe(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				live := false
+				for _, o := range obs {
+					if o.ID == w.ID {
+						live = o.HasNixPVC && o.NixPVCSize != nil && o.HasDataPVC && o.DataPVCLive
+					}
+				}
+				if !live {
+					t.Fatal("drift negative never reached live replacement volumes")
+				}
+				if outcome := m.PacingOutcomes()[w.ID]; outcome == nil || outcome.State != "active" {
+					t.Fatalf("drift negative was held before busy template guard: %+v", outcome)
+				}
+				assertBusyDriftUnchanged(t, c, before)
+				return
+			}
+			got := get()
+			if !w.Busy || got.UID != d.UID || got.Spec.Replicas == nil || *got.Spec.Replicas != 1 || !reflect.DeepEqual(got.Spec.Template, d.Spec.Template) || got.Annotations[annotationRoll] != d.Annotations[annotationRoll] {
+				t.Fatal("unchanged retained deployment failed to restore while busy")
+			}
+			if len(f.clearCalls) != 0 || len(f.calls) != 0 {
+				t.Fatalf("independent drain was changed: %+v", f)
+			}
+		})
 	}
 }

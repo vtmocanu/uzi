@@ -59,6 +59,15 @@ export class AdviceTeardownDiagnostic {
     return this.events.some((e) => e.event === "evidence" && e.category === "child_exit");
   }
 
+  /** Unknown is deliberately not false: missing phase or truncated evidence
+   * must never pass a no-premature-exit assertion. */
+  providerChildExitObservedBeforeDispose(): boolean | "unknown" {
+    const start = this.events.find((e) => e.event === "phase" && e.phase === "dispose_start");
+    if (!start || this.truncated) return "unknown";
+    return this.events.some((e) => e.event === "evidence" && e.category === "child_exit" &&
+      (e.ordinal as number) < (start.ordinal as number));
+  }
+
   private failureSignature(warnings: Record<string, unknown>[]): Record<string, unknown> {
     const disposeStart = this.events.find((e) => e.event === "phase" && e.phase === "dispose_start");
     const known = disposeStart !== undefined && !this.truncated;

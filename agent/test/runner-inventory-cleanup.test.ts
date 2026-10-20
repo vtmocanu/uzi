@@ -330,7 +330,8 @@ it("stale terminal supersession preserves guarded recovery and finalize custody"
 for (const sibling of ["none", "unreadable", "uncovered"] as const) {
   it(`inventory cleanup authority FINAL ACK ${sibling}`, async () => {
     const { gitlab } = fakeGitlab();
-    const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key");
+    let now = Date.now();
+    const r = runner({ run: async () => ({ branch: "task" }) }, gitlab, "journal-key", { now: () => now });
     const internals = r as unknown as {
       recovery: RecoveryCoordinator;
       outbox: TerminalOutboxDeps["outbox"];
@@ -366,6 +367,10 @@ for (const sibling of ["none", "unreadable", "uncovered"] as const) {
     assert.equal(requests.length, 1, "feature loss retains exact request without wire replay");
     client.hasFeature = name => name === "recovery_inventory_v1";
     loseAck = false;
+    await internals.recovery.resumePending(undefined, [record]);
+    assert.equal(requests.length, 1, "restored feature preserves per-record FINAL retry spacing");
+    assert.equal((await internals.recovery.inspect(runId))[0]?.finalAcknowledged, undefined);
+    now += 60_000;
     await internals.recovery.resumePending(undefined, [record]);
     assert.equal(requests.length, 2);
     assert.deepEqual(requests[1], requests[0], "restored feature replays frozen identity");

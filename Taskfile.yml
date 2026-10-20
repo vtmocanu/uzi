@@ -2720,12 +2720,28 @@ tasks:
       - python3 e2e/worker-uid/check_test.py
       - python3 e2e/worker-uid/run_test.py
       - python3 e2e/worker-uid/gate_test.py
+      - python3 -B e2e/worker-uid/calibration_check_test.py
+      - python3 -B e2e/worker-uid/calibration_run_test.py
 
   test:agent:worker-uid:
-    desc: agent - require real worker UID ownership tests inside the base image
+    desc: agent - require worker UID proofs and private cgroup memory calibration
+    # Direct I/O preserves standalone calibration report markers in CI.
+    interactive: true
     cmds:
       - task: test:worker-uid-harness
+      # This lane's CI job installs agent dependencies; gate:repo deliberately does not.
+      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/calibration-producer.test.mts
+      - cd agent && node --import tsx --test --test-timeout=120000 ../e2e/worker-uid/inventory.test.mts
+      - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
       - bash e2e/worker-uid/run.sh
+      - |
+          if [ "${GITHUB_ACTIONS:-}" = true ]; then
+            python3 -B e2e/worker-uid/calibration.py --image "${WORKER_UID_IMAGE:-wuid-2134-base:local}" --mode ci
+          else
+            python3 -B e2e/worker-uid/calibration.py --image "${WORKER_UID_IMAGE:-wuid-2134-base:local}" --mode local \
+              --run-id "${WORKER_MEMORY_CALIBRATION_RUN_ID:?set an explicit local calibration run identity}" \
+              --attempt "${WORKER_MEMORY_CALIBRATION_ATTEMPT:?set an explicit local calibration attempt}"
+          fi
 
   test:agent:shard:
     desc: agent unit-test shard for CI (exactly 1/2 or 2/2; no M4)
@@ -2948,6 +2964,8 @@ tasks:
     # `platforms: [linux]`. GOTOOLCHAIN=local pins the host toolchain (the module go.mod
     # floors go 1.26.0); -mod=vendor builds offline from the committed vendor tree;
     # -buildvcs=false skips VCS stamping, which otherwise fails inside a linked worktree.
+    # Real-profile observation fixtures use supervisor_observation_real and are
+    # required by test:agent:worker-uid; this repo target needs no privileged setup.
     dir: agent/codex/supervisor
     env:
       GOTOOLCHAIN: local
@@ -2960,6 +2978,17 @@ tasks:
         if [ -n "$drift" ]; then printf 'gofmt drift:\n%s\n' "$drift"; exit 1; fi
       - go vet ./...
       - go test ./...
+
+  test:codex-supervisor:real:
+    desc: Required real observation fixtures under the worker-UID command profile
+    platforms: [linux]
+    interactive: true
+    dir: agent/codex/supervisor
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=vendor -buildvcs=false
+    cmds:
+      - go test -count=1 -timeout=30s -v -tags=supervisor_observation_real -run '^TestRealObservationSupervisedTrees$' .
 
   test:home-uid-split:
     desc: Opt-in run the HOME cleanup suite as the worker uid under the real uid split (#1607)

@@ -366,7 +366,7 @@ into `argo-apps:apps/uzi/values/dev-cluster.yaml` (re-verify if the cluster chan
   (`16.10` also mirrored; `16.3` is **not**). The CNPG cluster pins
   `registry.example.com/cloudnative-pg/postgresql:16.4` (also what a sibling app
   uses on the cluster). PG16 is a fleet-consistency choice, not an operator ceiling — the
-  dev-cluster CNPG operator 1.23.5 supports up to PG17.
+  dev-cluster CNPG operator 1.23.5 supported up to PG17 (the fleet now runs 1.30.1).
 
 - **Forge egress.** The api dials `gitlab.example.com` from the cluster (issue
   sync, MR creation); `FORGE_ALLOWED_BASE_URLS` is set to it. Confirm dev-cluster
@@ -553,11 +553,26 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.controller.replicaCount` | `1` | Enabled controller rendering accepts `0` or `1`, with Recreate strategy. `0` stops reconciliation. Extra controllers outside the chart are unsupported; there is no multi-controller coordination. |
 | `workers.rollConcurrency` | `1` | Positive integer: concurrent admitted replacements per coverage pool after canary promotion. Busy draining reservations and unconfirmed writes consume slots. |
 | `workers.rollTargetVersion` | verified image stamp in published charts (`""` in source) | Exact verified baked version of the pinned worker image, including `+g<commit>`. Release packaging verifies each pinned template image signature and matching config at one resolved digest, then injects the common stamp. Per-cluster overrides still win; custom worker pins/source charts need a matching verified override. Remove a hand-set per-cluster `workers.rollTargetVersion` when using the published chart's worker pin: otherwise it becomes stale at the next pin bump and holds the roll again. ADR-1720's full stamp cannot be derived from those tags. Missing mapping holds paced rolls before cordoning; never infer it from the replacement or strip metadata. |
-| `workers.drainDeadline` | `"24h"` | Go duration (`"1h"`, `"30m"`) bounding a busy worker's **admitted image turn**, not the fleet wait. Expiry requires a bounded fresh re-cordon/poll confirming the current expired drain timestamp. It cannot bypass admission, capacity or a stuck-pool hold. Independent maintenance deadlines retain their own meaning; interrupted runs use the existing requeue path. |
-| `workers.forceRoll` | `false` | Explicit emergency bypass of pacing, holds, promotion evidence and busy waits for drifted workers. Can remove remaining capacity. Custody and independent maintenance fences still apply; no automatic rollback. Restore `false` after the emergency. |
+| `workers.drainDeadline` | `"24h"` | Compatible Go duration (`"1h"`, `"30m"`), with unchanged positive-only parsing; exposed as `UZI_WORKER_DRAIN_DEADLINE`. Now bounds only independent **nondrifted** pressure/nix-size maintenance, which can interrupt busy runs and delete /data unless custody-held. No elapsed timer permits busy spec-hash/generation replacement or associated recycle, even with no pacing entry/plain drain; shortening this value no longer forces image upgrades. No new knob. |
+| `workers.forceRoll` | `false` | **Global** emergency bypass of pacing, holds, incarnation proof and busy deferral for drifted workers, plus busy deferral for independent maintenance. May interrupt runs and lose all capacity; neither targeted nor a recovery guarantee. Custody-held data and independent DinD readiness/identity/pod-absence guards remain authoritative; DinD has no deadline or ForceRoll bypass. No automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
 
 ### Deploying paced hosted rolls (#1470)
+
+Under #3103, actual image-pin/template/size spec-hash or generation drift and
+associated recycle wait indefinitely for genuine idle. Run-bound workers are
+outside pacing but follow the same busy-image policy. Any assigned nonterminal
+run blocks, including queued, paused and all waits/gates. Own pinned
+continuations/checkers may finish; unrelated new roots, unassigned children and
+judge intake are refused. An admitted busy drainer consumes pool concurrency
+(default one) without replacement coverage, canary proof or post-promotion proof and can
+hold the pool indefinitely. Unadmitted peers stay uncordoned and claimable,
+without a legacy-recycle escape; separately fenced DinD maintenance remains
+independent. Idle guards and custody still apply even with no assigned blockers.
+No timer automatically uncordons workers. Indefinite waits can delay capacity
+turnover and security fixes; choose global ForceRoll only as an explicit emergency
+trade-off. Unchanged retained zero-replica Deployment restore while busy keeps
+its existing guard.
 
 Deploy the new API first, then the new singleton controller and matching chart
 RBAC, keeping `workers.image.tag` steady. Verify poll evidence and report support

@@ -21,6 +21,9 @@ import (
 )
 
 type fakeNotifStore struct {
+	codexCurrent  bool
+	codexErr      error
+	codexAsked    []store.IsCodexEarlyResetCurrentParams
 	rc            store.GetSlackRunContextRow
 	crossCheckRun store.Run
 	rcErr         error

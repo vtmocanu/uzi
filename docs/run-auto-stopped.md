@@ -16,6 +16,16 @@ The agent streams its work back to uzi as messages. Occasionally a message is so
 
 Modern workers (v0.10.1 and later) handle this themselves: they isolate the one bad message, replace it with a marker, and carry on — so you should rarely see an auto-stop at all. **The auto-stop exists mainly for workers on older images.** If you are seeing these, the first thing worth checking is your worker's version.
 
+## Completion publication refusals
+
+A [completion publication hold](run-completion-hold.md) is a separate path
+from this persistence auto-stop. On a supported interlocked issue run,
+closing commit messages or an unknown completion projection hold before
+push and preserve work. An accepted or ambiguous hold does not emit a
+failed terminal report; a definitive hold refusal can fail. Legacy declared
+runs, and new declared refusals against an API without
+`completion_non_closing_v1`, retain terminal refusal behavior.
+
 ## What uzi checks before stopping anything
 
 An auto-stop is deliberately hard to trigger. Every one of these must hold:

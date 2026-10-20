@@ -22,10 +22,12 @@ import (
 // CI_AUTOFIX_CONFIG_PATHS values the poller's CI auto-fix is built from. The server-side repair
 // floor (workersvc.CIRepairConfigFloor) is unioned into ConfigPaths by the run creation seam.
 type CIRepairConfig struct {
-	MaxJobs      int
-	LogTailBytes int
-	MaxAttempts  int
-	ConfigPaths  []string
+	MaxJobs          int
+	LogTailBytes     int
+	MaxAttempts      int
+	ConfigPaths      []string
+	ArtifactMaxFiles int
+	ArtifactMaxBytes int64
 }
 
 // SetCIRepair wires the ci_watch bounds. Call once at startup. A zero field falls back to the
@@ -74,7 +76,7 @@ func ciIgnoredEvent(event string) bool {
 // outcome (Status "completed" plus a Conclusion); GitLab and Forgejo fold everything into
 // Status, so a terminal status counts.
 func ciCompleted(r forge.WorkflowRun) bool {
-	if r.Status == "completed" || r.Conclusion != "" {
+	if r.Status == "completed" {
 		return true
 	}
 	switch pipelinestatus.Tone(r.Status) {
@@ -175,6 +177,9 @@ func (e *Scheduler) fireCIWatch(ctx context.Context, sched store.RunSchedule) (F
 	}
 	selectors, err := parseCIWorkflows(sched.CiWorkflows)
 	if err != nil {
+		return FireOutcome{}, err
+	}
+	if _, err := parseCIArtifacts(sched.CiArtifacts); err != nil {
 		return FireOutcome{}, err
 	}
 	repo, f, err := e.resolveRepoForge(ctx, sched)
@@ -397,6 +402,15 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 		if i >= ciMaxSnapshots {
 			break
 		}
+		current := func() (bool, error) { return ciRevalidate(ctx, f, repo, k) }
+		ok, ferr := current()
+		if ferr != nil {
+			return ciStartReadFailure(res, k, ferr)
+		}
+		if !ok {
+			res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+			continue
+		}
 		ps := store.PipelineStatus{PipelineID: k.run.ID, Ref: k.run.Branch, Sha: k.run.SHA, WebUrl: k.run.WebURL}
 		snap, serr := workersvc.BuildFailureSnapshot(ctx, f, repo.ForgeProjectID, ps, cfg.MaxJobs, cfg.LogTailBytes)
 		if serr != nil {
@@ -409,9 +423,34 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 		// The signature is taken from the original bounded snapshot, never from the
 		// presentation-shortened description text.
 		sig := workersvc.FailureSignature(snap)
+		ok, ferr = current()
+		if ferr != nil {
+			return ciStartReadFailure(res, k, ferr)
+		}
+		if !ok {
+			res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+			continue
+		}
+		manifest, inputs := e.ciCollectArtifacts(ctx, sched, repo, f, cfg, k)
+		ok, ferr = current()
+		if ferr != nil {
+			return ciStartReadFailure(res, k, ferr)
+		}
+		if !ok {
+			res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+			continue
+		}
 		tgt := ciTargetFor(target, k)
 
 		if reason := workersvc.CILoopGuard(k.ep, sig, cfg.MaxAttempts); reason != "" {
+			ok, ferr = current()
+			if ferr != nil {
+				return ciStartReadFailure(res, k, ferr)
+			}
+			if !ok {
+				res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+				continue
+			}
 			switch terr := e.runs.TransitionCIWatchEpisode(ctx, workersvc.CIWatchTransition{
 				CIWatchTarget: tgt, HaltReason: reason, Signature: sig, MaxAttempts: cfg.MaxAttempts,
 			}); {
@@ -430,9 +469,17 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 			continue
 		}
 
+		reserve := 0
+		if manifest != nil {
+			required, rerr := manifest.RequiredRenderBytes()
+			if rerr != nil {
+				return res, rerr
+			}
+			reserve = required + 10 // separating newline and the fixed artifact fence
+		}
 		desc, tooLarge := composeCIRepairDescription(body, guidanceOf(sched), ciEvidence{
 			Workflow: k.run.Name, URL: k.run.WebURL, SHA: k.run.SHA, Jobs: snap.FailedJobs,
-		}, cfg.MaxJobs)
+		}, cfg.MaxJobs, reserve)
 		if tooLarge {
 			res.skips = append(res.skips, ciSkip(k, SkipDescriptionTooLarge))
 			return res, nil // the trusted prefix is shared by every candidate
@@ -445,9 +492,18 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 			e.logger.Warn("scheduler: ci_watch ci_config_path lookup failed, creating no run", "schedule", sched.ID.String(), "error", perr)
 			return res, fmt.Errorf("project ci_config_path: %w", perr)
 		}
+		ok, ferr = current()
+		if ferr != nil {
+			return ciStartReadFailure(res, k, ferr)
+		}
+		if !ok {
+			res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+			continue
+		}
 		title := ciRepairTitle(k.run.Name, k.run.Number)
 		run, cerr := e.runs.CreateCIRepairRun(ctx, workersvc.CIRepairRunParams{
 			UserID: sched.UserID, RepoID: sched.RepoID, ScheduleID: sched.ID,
+			ArtifactManifest: manifest, ArtifactInputs: inputs,
 			Title: title, Description: desc, AutoApprove: sched.AutoApprove, WaitOnLimit: sched.WaitOnLimit,
 			MrReworkEnabled: scheduleMrRework(sched), Model: scheduleModel(sched),
 			OverrideSubagentModel: scheduleOverrideSubagentModel(sched),
@@ -473,6 +529,14 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 		case errors.As(cerr, &halted):
 			// The locked row halted, or tripped the guard, between the unlocked read and the
 			// lock. The create rolled back; record the halt in its own transaction.
+			ok, ferr = current()
+			if ferr != nil {
+				return ciStartReadFailure(res, k, ferr)
+			}
+			if !ok {
+				res.skips = append(res.skips, ciSkip(k, SkipCIAlreadyHandled))
+				continue
+			}
 			switch terr := e.runs.TransitionCIWatchEpisode(ctx, workersvc.CIWatchTransition{
 				CIWatchTarget: tgt, HaltReason: halted.Reason, Signature: sig, MaxAttempts: cfg.MaxAttempts,
 			}); {

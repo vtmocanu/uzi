@@ -55,7 +55,11 @@ func newCILive(t *testing.T, runs ...forge.WorkflowRun) *ciLive {
 	if _, err := pool.Exec(ctx, `UPDATE forge_connections SET token_ciphertext = $1 WHERE user_id = $2`, sealed, user); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, "UPDATE repos SET forge_project_id=42 WHERE id=$1", repo); err != nil {
+		t.Fatal(err)
+	}
 	svc := workersvc.New(q, box, workersvc.Params{})
+	svc.SetJobFiles(workersvc.NewJobFiles(pool, box, workersvc.JobFileLimits{}, nil))
 	svc.SetTxBeginner(pool)
 	cf := &ciForge{runs: runs, jobs: map[int64][]forge.Job{}, tails: map[int64]string{}}
 	rebuildJobs := func() {

@@ -555,7 +555,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -583,6 +583,11 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 			ink = m.pal.amber
 		}
 		out := prefix + paintSeg(ink, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	if isMemoryHold(r.RunDTO) {
+		line := "Memory hold · Resume/Cancel · detail: enter"
+		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}
 	if isWorkerRecoveryExhausted(r.RunDTO) {

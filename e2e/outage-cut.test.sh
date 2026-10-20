@@ -59,7 +59,7 @@ fixture() {
   make_outbox_run() {
     case "${1:-}" in cut_barrier|first_cut_barrier) BARRIER_ARMED=1 ;; esac
   }
-  wait_permit_retrying() { wait_terminal_lost "$@"; }
+  wait_publication_retrying() { wait_terminal_lost "$@"; }
   wait_terminal_lost() {
     [ "$FIXTURE_FINISHED" = 0 ] || fail 'slow helper let fixture finish before API cut'
     [ "$SLOW_HELPER:$BARRIER_RELEASED" != 1:0 ] || fail 'cut barrier never released'
@@ -77,6 +77,59 @@ fixture() {
   }
   eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|restore_outage_state|f42_cut)\(\) \{/,/^\}/' "$PHASE")"
 }
+# Extract the real helper; the old name lets the same assertions demonstrate the
+# regression against the pre-change phase rather than failing during setup.
+publication_helper="$(awk '/^wait_(publication|permit)_retrying\(\) \{/ { sub(/\(\).*/, ""); print; exit }' "$PHASE")"
+[ -n "$publication_helper" ] || { echo 'FAIL: publication helper missing'; exit 1; }
+publication_predicate_case() (
+  fixture
+  eval "$(awk '/^wait_(publication|permit)_retrying\(\) \{/,/^\}/' "$PHASE")"
+  # Each miss advances the helper clock; no real-time polling in these fixtures.
+  sleep() { SECONDS=$((SECONDS + 1)); }
+  fake_compose() { printf '%s\n' "$evidence"; }
+  local expected="$1" evidence="$2" rc=0
+  "$publication_helper" "$RUN_B1" 2 || rc=$?
+  [ "$rc" = "$expected" ] || fail "$3: expected rc=$expected, got $rc"
+)
+for log_format in json compose compose-spaced; do
+  run=00000000-0000-0000-0000-000000000001
+  other=00000000-0000-0000-0000-000000000002
+  durable="{\"msg\":\"finalize record durable\",\"run_id\":\"$run\"}"
+  retry="{\"msg\":\"state report failed, retrying\",\"run_id\":\"$run\",\"status\":\"running\"}"
+  terminal="{\"msg\":\"state report failed, retrying\",\"run_id\":\"$run\",\"status\":\"completed\"}"
+  wrong_run="{\"msg\":\"state report failed, retrying\",\"run_id\":\"$other\",\"status\":\"running\"}"
+  wrong_durable="{\"msg\":\"finalize record durable\",\"run_id\":\"$other\"}"
+  permit="{\"msg\":\"completion permit request failed, retrying\",\"run_id\":\"$run\"}"
+  if [ "$log_format" != json ]; then
+    # Compose prefixes the worker's compact JSON.
+    durable="agent-1  | $durable"
+    retry="agent-1  | $retry"
+    if [ "$log_format" = compose-spaced ]; then
+      retry="agent-1  | { \"run_id\" : \"$run\", \"status\" : \"running\", \"msg\" : \"state report failed, retrying\" }"
+    fi
+    terminal="agent-1  | $terminal"
+    wrong_run="agent-1  | $wrong_run"
+    wrong_durable="agent-1  | $wrong_durable"
+    permit="agent-1  | $permit"
+  fi
+  publication_predicate_case 0 "$durable
+$retry" 'ordered durable + running retry'
+  echo "PASS: $log_format publication predicate accepts ordered durable + running retry"
+  publication_predicate_case 1 "$durable
+$wrong_run" 'other run retry'
+  publication_predicate_case 1 "$wrong_durable
+$retry" 'other run durable'
+  publication_predicate_case 1 "$durable
+$terminal" 'terminal status retry'
+  publication_predicate_case 1 "$retry
+$durable" 'retry before durable'
+  publication_predicate_case 1 "$durable
+$permit" 'permit-only retry'
+  publication_predicate_case 1 "$durable
+$terminal
+{\"run_id\":\"$run\",\"status\":\"running\"}" 'running status on a different line'
+  echo "PASS: $log_format publication predicate rejects other runs, terminal status, reversed order, permit-only and split-line status"
+done
 fixture
 configure_outbox_api_alias
 SLOW_HELPER=1
@@ -136,7 +189,7 @@ for case_number in 4 5 6; do
     eval "$(awk -v selected="$case_number" '
       /^say "CASE [0-9]+:/ { inside = index($0, "CASE " selected ":") > 0 }
       inside && (/^make_outbox_run/ || /^api_cut$/ || /^release_outbox_cut_barrier/ ||
-        /^terminal_lost_b[234]=/ || /^permit_retrying_b4=/ || /^api_back$/ ||
+        /^terminal_lost_b[234]=/ || /^publication_retrying_b4=/ || /^api_back$/ ||
         index($0, "\"${COMPOSE[@]}\" restart agent") == 1) { print }
     ' "$PHASE")"
     [ "$API_AVAILABLE:$ALIAS_AVAILABLE:$BARRIER_ARMED:$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0:1:1:0 ] \
@@ -144,6 +197,32 @@ for case_number in 4 5 6; do
   )
   echo "PASS: real CASE $case_number cannot finish during slow helper startup before the cut"
 done
+# Exercise the real CASE 6 timeout/judgement sequence with the real helper.
+rc=0
+(
+  fixture
+  configure_outbox_api_alias
+  # shellcheck disable=SC2034  # evaluated real CASE 6 commands consume this id
+  RUN_B4="$RUN_B1"
+  make_outbox_run cut_barrier
+  eval "$(awk '/^wait_publication_retrying\(\) \{/,/^\}/' "$PHASE")"
+  sleep() { SECONDS=$((SECONDS + 1)); }
+  fail() {
+    [ "$API_AVAILABLE:$ALIAS_AVAILABLE" = 1:0 ] || exit 2
+    echo "API restored before failure: $*" >&2
+    exit 9
+  }
+  eval "$(awk '
+    /^say "CASE 6:/ { inside=1 }
+    inside && /^api_cut$/ { commands=1 }
+    inside && /^wait_status/ { exit }
+    commands { print }
+  ' "$PHASE")"
+) > "$SCRATCH/publication-timeout.log" 2>&1 || rc=$?
+[ "$rc" = 9 ] || { echo "FAIL: CASE 6 timeout expected restored failure rc=9, got $rc"; exit 1; }
+grep -F 'API restored before failure: case 6:' "$SCRATCH/publication-timeout.log" >/dev/null
+grep -F 'never retried its publication-running ACK after durable finalize' "$SCRATCH/publication-timeout.log" >/dev/null
+echo 'PASS: real CASE 6 publication timeout restores API before assertion failure'
 for case_number in 7 8; do
   (
     fixture
@@ -199,4 +278,4 @@ done
   jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
 )
 echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
-echo 'cases=14 passed=14'
+echo 'cases=21 passed=21'

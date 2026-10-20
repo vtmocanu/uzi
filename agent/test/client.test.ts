@@ -617,7 +617,7 @@ describe("reportState", () => {
     const ack = await client.reportState("run-1", { status: "failed", failure_reason: "boom" });
     // completedCount rides every ACK now: the RunDTO's milestones_completed is null (a nil Go
     // slice, no progress reported), which readRunAck reads as the fresh completed count 0.
-    assert.deepStrictEqual(ack, { applied: false, status: "cancelled", completedCount: 0 });
+    assert.deepStrictEqual(ack, { applied: false, status: "cancelled", runId: "run-1", completedCount: 0 });
     assert.strictEqual(api.states.length, 0);
   });
 
@@ -639,7 +639,7 @@ describe("reportState acknowledgement (PRD #35)", () => {
     const ack = await client.reportState("run-1", { status: "limit_wait", rate_limit_type: "five_hour" });
     // completedCount 0 rides the ACK: the parked RunDTO's milestones_completed is null (no
     // progress reported yet), which readRunAck reads as a fresh completed count of 0.
-    assert.deepStrictEqual(ack, { applied: true, status: "limit_wait", completedCount: 0 });
+    assert.deepStrictEqual(ack, { applied: true, status: "limit_wait", runId: "run-1", completedCount: 0 });
   });
 
   // 🔴 THE DISCRIMINATING CASE. Everything else in this file passes against an
@@ -1214,6 +1214,7 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
           head: "cafef00d",
           issued_at: "2026-07-10T00:00:00Z",
           finding_ids: ["f1", "f2"],
+          completion_scope: {},
         },
       },
     }));
@@ -1228,6 +1229,7 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
       assert.strictEqual(out.permit!.id, "permit-1");
       assert.strictEqual(out.permit!.contractRevision, 1);
       assert.deepStrictEqual(out.permit!.findingIds, ["f1", "f2"]);
+      assert.deepStrictEqual(out.permit!.completionScope, {});
       const req = srv.requests.at(-1)!;
       assert.match(req.path ?? "", /\/api\/worker\/runs\/run-1\/completion\/permit$/);
       assert.strictEqual(req.body.contract_revision, 1, "the frozen revision rides the permit request");
@@ -1236,6 +1238,29 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
       await srv.close();
     }
   });
+
+  for (const scope of [
+    { deferred: [{ milestone_id: "m2", title: "Deferred integration", reason: "Later" }] },
+    { accepted: [{ id: "m2.c1", milestone_id: "m2", text: "Integration check", reason: "Waived" }] },
+    {},
+  ]) {
+    it("issue3089 permit mapper preserves explicit scope " + JSON.stringify(scope), async () => {
+      const srv = await stubServer(() => ({ status: 200, body: {
+        granted: true, permit: {
+          id: "p3089", contract_revision: 2, branch: "agent/issue-3089", head: "cafef00d",
+          issued_at: "2026-10-17T00:00:00Z", finding_ids: [], completion_scope: scope,
+        },
+      } }));
+      try {
+        const out = await clientFor(srv.url).requestCompletionPermit("run-1", {
+          contractRevision: 2, branch: "agent/issue-3089", head: "cafef00d",
+        });
+        assert.equal(out.granted, true);
+        assert.deepEqual((out.permit as unknown as { completionScope?: unknown })?.completionScope, scope,
+          "issue3089 raw permit scope survives WorkerClient mapping, including explicit empty scope");
+      } finally { await srv.close(); }
+    });
+  }
 
   it("requestCompletionPermit maps a DENIED 200 body without throwing", async () => {
     // Every denial is a NON-TERMINAL 200 body (granted:false + deny_reason), never a 4xx — the

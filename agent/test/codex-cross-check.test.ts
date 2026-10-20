@@ -2,7 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough, Writable } from "node:stream";
 import { createHash } from "node:crypto";
-import { CodexCrossCheck, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
+import { CodexCrossCheck, OWNER_GUIDANCE_LABEL, REPO_INSTRUCTIONS_DIFF_NOTE, codeCrossCheckBrief, crossCheckBrief, crossCheckPrompt, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import type { CodexRootHandle, CodexLaunchSpec, CodexEffectLaunchSpec } from "../src/codex/launcher.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import type { WorkerClient } from "../src/client.js";
@@ -144,6 +144,16 @@ function rig(options: {
    }, cleanupConfirmed);
   } };
 }
+
+it("plan checker wires the shared brief into trusted developer instructions, separate from candidate DATA", async () => {
+ const r = rig();
+ assert.equal(await r.run(), verdict);
+ const brief = r.requests.find((frame) => frame.method === "thread/start")!.params!.developerInstructions;
+ const data = r.requests.find((frame) => frame.method === "turn/start")!.params!.input[0].text;
+ assert.equal(brief, crossCheckBrief("Read and Search"));
+ assert.match(data, /<candidate_[a-f0-9]{32}>/);
+ assert.doesNotMatch(brief, /<candidate_[a-f0-9]{32}>/);
+});
 
 function codeClaim(): ClaimResponse {
  const c = claim();

@@ -112,9 +112,10 @@ export class MaintenanceBudget {
   }
 
   /** Only inert queue waits: callers must preserve their slot behind earlier holders. */
-  static async waitFor<T>(pending: Promise<T>): Promise<T> {
+  static async waitFor<T>(pending: Promise<T>, operationSignal?: AbortSignal): Promise<T> {
     this.current()?.check();
-    const signal = this.signal();
+    const ambient = this.signal();
+    const signal = operationSignal && ambient ? AbortSignal.any([ambient, operationSignal]) : operationSignal ?? ambient;
     if (!signal) return pending;
     signal.throwIfAborted();
     let onAbort!: () => void;

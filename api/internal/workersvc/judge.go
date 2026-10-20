@@ -1246,9 +1246,16 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 		// defaultEffort is the zero pgtype.Text (invalid) here → resolveEffortPtr → medium
 	}
 
+	frozenMemoryPolicy, policyErr := optionalMemoryPolicy(run.MemoryPolicy)
+	if policyErr != nil {
+		return nil, policyErr
+	}
 	payload := &ClaimPayload{
-		RunID: run.ID.String(),
-		Kind:  run.Kind,
+		MemoryEpisode:           run.MemoryEpisode,
+		MemoryInterventionCount: run.MemoryInterventionCount,
+		MemoryPolicy:            frozenMemoryPolicy,
+		RunID:                   run.ID.String(),
+		Kind:                    run.Kind,
 		// PRD #1247 M2 fix round: the judge lane forks here BEFORE assembleClaim's ordinary
 		// `ClaimGeneration: run.ClaimGeneration` (claim_assembly.go), so this literal must carry
 		// the field itself. ClaimRun has already incremented the judge run's row to >= 1, and the

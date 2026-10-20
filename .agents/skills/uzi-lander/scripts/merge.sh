@@ -45,6 +45,8 @@
 #      the exact command is printed for the user to run via a `!` line. Also the PR
 #      conflicting with its base (mergeable=CONFLICTING), checked before the required
 #      checks because GitHub runs no pull_request CI on a conflicting PR: run land-prep.sh
+#      Also an unverifiable merge-lock owner identity: no merge attempted and no
+#      alternate command to execute; reconcile native identity or explicit owner overrides.
 #   4  an mr_rework run is active on this MR — defer
 #   5  every-author blockers live (lib/pr-comments.sh): ANY unresolved, non-outdated review
 #      thread (CodeRabbit, Greptile, CodeQL, a human, any other author), an open
@@ -371,7 +373,8 @@ SD=$(state_dir) || SD=""
 LOCK=""
 if [ -n "$SD" ]; then
   LOCK="$SD/locks/merge"
-  me=$(self_identity 2>/dev/null); my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
+  me=$(self_identity) || { echo "cannot verify merge-lock owner" >&2; exit 3; }
+  my_uuid=$(printf '%s' "$me" | cut -f2); my_name=$(printf '%s' "$me" | cut -f1)
   if ! mkdir "$LOCK" 2>/dev/null; then
     o_uuid=$(cat "$LOCK/uuid" 2>/dev/null || echo ""); o_name=$(cat "$LOCK/name" 2>/dev/null || echo "?")
     age=$(( $(date +%s) - $(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || date +%s) ))

@@ -1,3 +1,4 @@
+import { isCheckpointBoundaryFailure } from "./checkpoint-stop.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { RequestError, type WorkerClient } from "./client.js";
 import { decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions, type CodeCrossCheckRecord, type CodeCrossCheckStatus } from "./code-cross-check-contract.js";
@@ -201,7 +202,8 @@ export async function checkCode(options: {
       if (atDeadline) return current;
     }
     return current;
-  } catch {
+  } catch (error) {
+    if (isCheckpointBoundaryFailure(error)) throw error;
     signal.throwIfAborted();
     return undefined;
   }

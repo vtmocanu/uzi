@@ -814,6 +814,7 @@ describe("Run defaults — early-limit-reset alert (PRD #1020 M5)", () => {
       </MemoryRouter>,
     );
     expect(earlyToggle().checked).toBe(true);
+    expect(screen.getByText(/weekly Anthropic or Codex limit reopens/)).toBeTruthy();
   });
 
   it("reflects the current opt-in state (off)", () => {

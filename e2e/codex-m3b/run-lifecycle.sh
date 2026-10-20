@@ -303,6 +303,8 @@ log "server up; contract origin=$CONTRACT_BASE_URL; internal worker route resolv
 log "running the packaged lifecycle suite in $IMAGE under the confinement posture (network $NET)"
 set +e
 # The single-quoted command is expanded by the inner container shell, not this host shell.
+# Match the worker's dedicated command-cache carveout while keeping the root filesystem
+# read-only. The real entrypoint must still establish runner-cmd ownership and mode 0700.
 # shellcheck disable=SC2016
 timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   --cap-drop ALL \
@@ -310,6 +312,7 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   --security-opt no-new-privileges \
   --read-only \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+  --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
   --tmpfs /work/repo:rw,exec,nosuid,size=64m,uid=10001,gid=10002,mode=2770 \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
   -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src -e UZI_R2_COMMAND_ROOT_LINUX=1 \

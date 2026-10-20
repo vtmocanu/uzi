@@ -52,7 +52,7 @@ class Transport extends EventEmitter {
       const emitEvidence = (): void => {
         this.frame(variant === "unconfirmed" ? {
           event: "dispose", id: frame.id, state: "unconfirmed", reason: "deadline",
-          killed: [], reaped: [], children: [this.pid + 1],
+          killed: [], reaped: [], children: [{ pid: this.pid + 1, startTime: "1" }],
         } : drained);
         if (variant === "late_unsafe") this.started({ nondumpable: false });
         if (variant === "late_malformed" || variant === "exit_before_bad_evidence") this.evidence.write("not-json\n");

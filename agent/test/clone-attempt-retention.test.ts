@@ -28,8 +28,8 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 
-// issue #1783 M2 — the git-layer half of per-attempt clone paths: the retention sweep that bounds
-// what retained attempts cost, the attempt ledger / recovery journal contract the watcher's backup
+// issue #1783 M2 / #1858 — the git-layer half of per-attempt clone paths: retained attempts
+// and bounded retention diagnostics, the attempt ledger / recovery journal contract the watcher's backup
 // script reads, the owner-path predicate (d′), and that an attempt path is an ordinary working
 // tree to every consumer that screens or runs in it.
 
@@ -122,7 +122,7 @@ function plantAttempt(s: Seeded, attemptId: string, runId: string, state: Attemp
   return { dir, skills };
 }
 
-function seedOpts(over: Partial<AttemptSeedOptions> = {}): AttemptSeedOptions & { quiescentCalls: string[][] } {
+function seedOpts(over: Partial<AttemptSeedOptions> & { quiescent?: (paths: string[]) => Promise<boolean> } = {}): AttemptSeedOptions & { quiescentCalls: string[][]; quiescent: (paths: string[]) => Promise<boolean> } {
   const quiescentCalls: string[][] = [];
   return {
     attemptId: mintAttemptId(9),
@@ -149,15 +149,15 @@ function ledgerState(s: Seeded, attemptId: string): string | undefined {
 // ─── P-retention ───────────────────────────────────────────────────────────────────────────
 
 describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
-  it("keeps the newest 3 abandoned attempts, deleting the oldest first, each with its skills sibling", async () => {
+  it("keeps all abandoned attempts and paired skills beyond the diagnostic threshold", async () => {
     const s = await keyFixture();
     const planted = [0, 1, 2, 3, 4, 5].map((i) => ({ id: idAt(i), ...plantAttempt(s, idAt(i), `run-${i}`, "abandoned") }));
     const opts = seedOpts();
     const seeded = await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
     for (const p of planted.slice(0, 3)) {
-      assert.equal(fs.existsSync(p.dir), false, `oldest ${p.id} deleted`);
-      assert.equal(fs.existsSync(p.skills), false, "with its skills sibling");
-      assert.equal(ledgerState(s, p.id), "retired");
+      assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), p.id);
+      assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
+      assert.equal(ledgerState(s, p.id), "abandoned");
     }
     for (const p of planted.slice(3)) {
       assert.equal(fs.existsSync(p.dir), true, `newest ${p.id} kept`);
@@ -165,7 +165,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
       assert.equal(ledgerState(s, p.id), "abandoned");
     }
     assert.equal(fs.existsSync(seeded.path), true, "the new attempt is seeded");
-    assert.deepEqual(opts.quiescentCalls[0], [planted[0]!.dir, planted[0]!.skills], "the scan covers the pair");
+    assert.deepEqual(opts.quiescentCalls, [], "automatic retention requests no proof");
   });
 
   it("orders by generation numerically within one second (g10 after g9)", () => {
@@ -202,8 +202,8 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.equal(fs.existsSync(path.join(ro, "file")), true, "the undeletable entry is kept");
     assert.equal(ledgerState(s, locked!.id), "abandoned", "and not marked retired");
     assert.ok(
-      lines.some((l) => (l as { msg?: string; path?: string }).msg?.includes("could not delete") && (l as { path?: string }).path === locked!.dir),
-      "the failed deletion is logged",
+      lines.some((l) => (l as { msg?: string }).msg === "runner clone retention: automatic reclaim disabled"),
+      "known retained excess is diagnosed",
     );
     for (const p of planted.slice(5)) assert.equal(fs.existsSync(p.dir), true);
   });
@@ -221,7 +221,7 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.equal(fs.existsSync(unknown), true);
   });
 
-  it("keeps at most 5 .uzi-residue-<key>.residue-<uuid> per key, oldest mtime first, only its own key's, only the pinned grammar", async () => {
+  it("retains all residue entries beyond the diagnostic threshold, including other keys and legacy names", async () => {
     const s = await keyFixture();
     const t0 = Date.UTC(2026, 0, 1) / 1000;
     const residue = [0, 1, 2, 3, 4, 5, 6].map((i) => {
@@ -240,13 +240,13 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     fs.utimesSync(legacy, t0 - 120, t0 - 120);
     const opts = seedOpts();
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
-    assert.deepEqual(residue.map((p) => fs.existsSync(p)), [false, false, true, true, true, true, true]);
+    assert.deepEqual(residue.map((p) => fs.existsSync(p)), [true, true, true, true, true, true, true]);
     assert.equal(fs.existsSync(other), true, "issue-30011's residue is not issue-3001's");
     assert.equal(fs.existsSync(legacy), true, "a name outside the pinned grammar is never deleted");
-    assert.deepEqual(opts.quiescentCalls, [[residue[0]], [residue[1]]], "each deletion is behind its own scoped scan");
+    assert.deepEqual(opts.quiescentCalls, [], "no retention proofs");
   });
 
-  it("residue: a journaled, live or not-quiescent residue is kept, and so is one the delete cannot remove (logged)", async () => {
+  it("retains journaled, live, busy and read-only residues while diagnosing excess", async () => {
     const s = await keyFixture();
     const t0 = Date.UTC(2026, 0, 1) / 1000;
     const residue = [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => {
@@ -277,8 +277,8 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
     assert.deepEqual(residue.map((p) => fs.existsSync(p)), [true, true, true, true, true, true, true, true, true]);
     assert.equal(fs.existsSync(path.join(ro, "file")), true);
     assert.ok(
-      lines.some((l) => (l as { msg?: string }).msg?.includes("could not delete") && (l as { path?: string }).path === locked),
-      "the failed deletion is logged",
+      lines.some((l) => (l as { msg?: string }).msg === "runner clone retention: automatic reclaim disabled"),
+      "known excess is diagnosed",
     );
   });
 
@@ -380,8 +380,8 @@ describe("issue #1783 M2 P-retention: the seed-time retention sweep", () => {
 
 // ─── review round (N1–N5) ──────────────────────────────────────────────────────────────────
 
-describe("issue #1783 M2 review: retention deletions are re-validated and run as the runner uid", () => {
-  it("under the uid split every deletion is the setpriv-wrapped /bin/rm -rf -- <target>, never an in-process rm", async () => {
+describe("issue #1858: automatic retention preserves artifacts under uid split", () => {
+  it("under the uid split automatic retention requests no deletion and preserves all artifacts", async () => {
     const calls: Array<{ command: string; args: string[] }> = [];
     const rec = recordingLogger();
     git = new GitCache(
@@ -408,16 +408,12 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
       return p;
     });
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(calls.map((c) => c.args.at(-1)), [planted[0]!.skills, planted[0]!.dir, residue[0]], "the skills sibling first (NB1)");
-    for (const c of calls) {
-      assert.equal(c.command, "/bin/setpriv", "wrapped by runnerCommand");
-      assert.deepEqual(c.args.slice(-4), ["/bin/rm", "-rf", "--", c.args.at(-1)], "the fixed rm argv, target last");
-      assert.ok(c.args.includes("--reuid"), "as the runner uid");
-    }
-    assert.equal(ledgerState(s, idAt(0)), "retired");
+    assert.deepEqual(calls, [], "no automatic runner-uid deletion");
+    assert.ok([...planted.flatMap(p => [p.dir, p.skills]), ...residue].every(p => fs.existsSync(p)));
+    assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("refuses a symlinked attempt; unlinks a symlinked or plain-file residue entry without following it (targets untouched)", async () => {
+  it("retains symlinked attempts, symlinked residues and plain-file residues with targets untouched", async () => {
     const s = await keyFixture();
     const victim = path.join(fx.dataDir, "victim");
     fs.mkdirSync(victim);
@@ -436,17 +432,17 @@ describe("issue #1783 M2 review: retention deletions are re-validated and run as
     for (let i = 0; i < 5; i++) fs.mkdirSync(path.join(s.parent, formatResidueName(s.key, randomUUID())));
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
     assert.equal(fs.lstatSync(oldest).isSymbolicLink(), true, "the symlinked attempt is kept");
-    assert.equal(fs.lstatSync(residueLink, { throwIfNoEntry: false }), undefined, "the symlinked residue entry is unlinked, never kept forever");
-    assert.equal(fs.existsSync(residueFile), false, "the plain-file residue entry is unlinked");
+    assert.equal(fs.lstatSync(residueLink).isSymbolicLink(), true, "the residue link stays");
+    assert.equal(fs.readFileSync(residueFile, "utf8"), "planted\n");
     assert.deepEqual(fs.readdirSync(victim), ["PRECIOUS"], "the link's target directory is untouched");
     assert.equal(fs.readFileSync(path.join(victim, "PRECIOUS"), "utf8"), "x");
     assert.equal(ledgerState(s, idAt(0)), "abandoned", "not marked retired");
     const refusals = lines.filter((l) => (l as { msg?: string }).msg?.includes("refusing to delete")).map((l) => (l as { path?: string }).path);
-    assert.deepEqual(refusals, [oldest], "only the symlinked attempt is refused");
+    assert.deepEqual(refusals, [], "no deletion validation is requested");
   });
 });
 
-describe("issue #1783 final: a timed-out retention rm is waited out, and an unsettled one stops the sweep", () => {
+describe("issue #1858: automatic retention never starts rm", () => {
   /** A stand-in rm child: the first spawn never exits on its own (the busybox rm still walking);
    *  later ones delete their target and exit 0. */
   function fakeRm(events: string[], onKill: (child: ChildProcess) => boolean) {
@@ -495,123 +491,26 @@ describe("issue #1783 final: a timed-out retention rm is waited out, and an unse
     git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim(), retentionDelete }));
   }
 
-  it("the group kill fails and 'close' never arrives: the sweep stops, no further delete starts, the artifact is kept", async () => {
+  it("repeated automatic seeds never start or signal rm and preserve attempts, skills and residues", async () => {
     const events: string[] = [];
-    const rm = fakeRm(events, () => false);
-    rm.closeWaitMs = 50;
+    const rm = fakeRm(events, () => { throw new Error("automatic retention must never signal rm"); });
     withRm(rm);
     const { s, planted, residue } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill"], "no delete after the unsettled one");
-    assert.equal(fs.existsSync(planted[0]!.skills), true);
-    assert.equal(fs.existsSync(planted[0]!.dir), true);
-    assert.equal(fs.existsSync(residue[0]!), true);
-    assert.equal(ledgerState(s, idAt(0)), "abandoned");
-    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
-    assert.match(String((warn as { error?: string } | undefined)?.error), /may still be running: group kill of pid \d+ failed after 20ms; no close within 50ms/);
-  });
-
-  it("N2: the group kill fails but 'close' arrives within the wait: the sweep goes on", async () => {
-    const events: string[] = [];
-    withRm(
-      fakeRm(events, (child) => {
-        setImmediate(() => {
-          events.push("close");
-          child.emit("close", 0, null);
-        });
-        return false;
-      }),
-    );
-    const { s, planted, residue } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(events.slice(0, 4), [`spawn ${path.basename(planted[0]!.skills)}`, "kill", "close", `spawn ${path.basename(residue[0]!)}`]);
-    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on after the ordinary timeout");
-  });
-
-  it("the kill lands but 'close' never arrives: the sweep stops, no further delete starts", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => true);
-    rm.closeWaitMs = 50;
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill"]);
-    assert.equal(fs.existsSync(residue[0]!), true);
-    const warn = lines.find((l) => (l as { msg?: string }).msg?.includes("retention sweep failed"));
-    assert.match(String((warn as { error?: string } | undefined)?.error), /no exit within 50ms/);
-    assert.doesNotMatch(String((warn as { error?: string } | undefined)?.error), /group kill of pid .* failed/);
-  });
-
-  it("'close' arrives after the kill: the next delete starts only after it, and the timed-out artifact is kept", async () => {
-    const events: string[] = [];
-    withRm(
-      fakeRm(events, (child) => {
-        setTimeout(() => {
-          events.push("close");
-          child.emit("close", null, "SIGKILL");
-        }, 300);
-        return true;
-      }),
-    );
-    const { s, planted, residue } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(events, [`spawn ${path.basename(planted[0]!.skills)}`, "kill", "close", `spawn ${path.basename(residue[0]!)}`]);
-    assert.equal(fs.existsSync(planted[0]!.skills), true, "the timed-out skills sibling is kept");
-    assert.equal(fs.existsSync(planted[0]!.dir), true, "and its attempt with it (skills-first)");
-    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on once the rm was gone");
-  });
-
-  it("NB-2: a later sweep never starts a second rm on a path an unsettled rm may still walk; it keeps and logs it", async () => {
-    const events: string[] = [];
-    const rm = fakeRm(events, () => false);
-    rm.closeWaitMs = 50;
-    withRm(rm);
-    const { s, planted, residue } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    const skillsSpawn = `spawn ${path.basename(planted[0]!.skills)}`;
-    assert.deepEqual(events, [skillsSpawn, "kill"], "the first sweep stopped on the unsettled rm");
-    // A second seed of the same key: its sweep reaches the same skills sibling first.
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-newer", false, undefined, seedOpts());
-    assert.equal(events.filter((e) => e === skillsSpawn).length, 1, "no second rm on the path the first rm may still walk");
-    assert.equal(fs.existsSync(planted[0]!.skills), true, "the unsettled target is kept");
-    assert.equal(fs.existsSync(planted[0]!.dir), true, "and its attempt with it (skills-first)");
-    const refusal = lines.find(
-      (l) => (l as { msg?: string }).msg?.includes("refusing to delete") && (l as { path?: string }).path === planted[0]!.skills,
-    ) as { reason?: string } | undefined;
-    assert.match(String(refusal?.reason), /runner-uid delete of this path .* may still be running/);
-    assert.equal(fs.existsSync(residue[0]!), false, "the sweep went on past the kept target");
-  });
-
-  it("NB-3: the worker log records a path entering the unsettled record and leaving it on 'close'", async () => {
-    const events: string[] = [];
-    let late: ChildProcess | undefined;
-    const rm = fakeRm(events, (child) => {
-      late = child;
-      return true;
-    });
-    rm.closeWaitMs = 50;
-    withRm(rm);
-    const { s, planted } = await sweepFixture();
-    await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    const entered = lines.find((l) => (l as { msg?: string }).msg?.includes("recorded as unsettled")) as
-      | { level?: string; path?: string; pending?: number }
-      | undefined;
-    assert.equal(entered?.level, "warn");
-    assert.equal(entered?.path, path.resolve(planted[0]!.skills));
-    assert.equal(entered?.pending, 1);
-    assert.equal(lines.some((l) => (l as { msg?: string }).msg?.includes("left the unsettled record")), false, "nothing left yet");
-    late!.emit("close", null, "SIGKILL");
-    const left = lines.find((l) => (l as { msg?: string }).msg?.includes("left the unsettled record")) as
-      | { level?: string; path?: string; pending?: number }
-      | undefined;
-    assert.equal(left?.level, "info");
-    assert.equal(left?.path, path.resolve(planted[0]!.skills));
-    assert.equal(left?.pending, 0);
+    for (let round = 0; round < 2; round++) {
+      await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
+      assert.deepEqual(events, [], "automatic retention never starts rm, so timeout/close state cannot grant deletion");
+      for (const p of planted) {
+        assert.equal(fs.readFileSync(path.join(p.dir, "WORK.txt"), "utf8"), path.basename(p.dir).split(".attempt-")[1]);
+        assert.equal(fs.readFileSync(path.join(p.skills, "plugin.json"), "utf8"), "{}");
+      }
+      assert.ok(residue.every(p => fs.existsSync(p)));
+      assert.equal(ledgerState(s, idAt(0)), "abandoned");
+    }
   });
 });
 
-describe("issue #1783 final: a directory swapped in for a residue link fails the unlink (EISDIR on Linux, EPERM on macOS) and is kept", () => {
-  it("the re-validation lstat reports a symlink while the entry is a real directory: the directory and its contents survive", async () => {
+describe("issue #1858: automatic retention preserves residue directories without unlink validation", () => {
+  it("automatic retention never requests delete validation; the residue directory and contents survive", async () => {
     const s = await keyFixture();
     const swapped = path.join(s.parent, formatResidueName(s.key, randomUUID()));
     fs.mkdirSync(path.join(swapped, "inner"), { recursive: true });
@@ -639,11 +538,11 @@ describe("issue #1783 final: a directory swapped in for a residue link fails the
       }),
     );
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.deepEqual(lied, [swapped], "the sweep's re-validation saw the swapped entry");
+    assert.deepEqual(lied, [], "automatic retention never calls delete validation");
     assert.equal(fs.lstatSync(swapped).isDirectory(), true, "the directory is kept");
     assert.equal(fs.readFileSync(path.join(swapped, "inner", "KEEP"), "utf8"), "k", "its contents survive");
     const refusal = lines.find((l) => (l as { path?: string; msg?: string }).path === swapped && (l as { msg?: string }).msg?.includes("refusing to delete"));
-    assert.match(String((refusal as { reason?: string } | undefined)?.reason), process.platform === "linux" ? /EISDIR/ : /EISDIR|EPERM/);
+    assert.equal(refusal, undefined);
   });
 });
 
@@ -843,7 +742,7 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     );
   }
 
-  it("a failed skills delete keeps the attempt dir (the skills dir is never left without it)", async () => {
+  it("retains attempts and paired skills with a skills-delete failure hook configured", async () => {
     failingOn((t) => path.basename(t).startsWith(".uzi-skills-"));
     const s = await keyFixture();
     const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
@@ -853,24 +752,24 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
     assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("a failed attempt delete after a successful skills delete orphans nothing, and the next seed retries it", async () => {
+  it("repeated seeds retain attempts and skills with an attempt-delete failure hook enabled or disabled", async () => {
     let failAttempt = true;
     failingOn((t) => failAttempt && !path.basename(t).startsWith("."));
     const s = await keyFixture();
     const planted = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "abandoned"));
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts());
-    assert.equal(fs.existsSync(planted[0]!.skills), false, "the skills sibling went first");
+    assert.equal(fs.existsSync(planted[0]!.skills), true, "skills are retained with the attempt");
     assert.equal(fs.existsSync(planted[0]!.dir), true, "the attempt is kept");
     assert.equal(ledgerState(s, idAt(0)), "abandoned", "still disposable, not retired");
     const orphans = fs.readdirSync(s.parent).filter((n) => n.startsWith(".uzi-skills-") && !fs.existsSync(path.join(s.parent, n.slice(".uzi-skills-".length))));
     assert.deepEqual(orphans, [], "no skills dir without its attempt");
     failAttempt = false;
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new-2", false, undefined, seedOpts({ attemptId: mintAttemptId(10) }));
-    assert.equal(fs.existsSync(planted[0]!.dir), false, "retried and deleted");
-    assert.equal(ledgerState(s, idAt(0)), "retired");
+    assert.equal(fs.existsSync(planted[0]!.dir), true, "retained on repeated seeds");
+    assert.equal(ledgerState(s, idAt(0)), "abandoned");
   });
 
-  it("sweeps an existing orphan skills dir (attempt gone, entry absent/abandoned/retired), never a reclaimed/live one's, a journaled one or another key's", async () => {
+  it("retains orphan skills for absent, abandoned and retired entries alongside protected and other-key skills", async () => {
     const s = await keyFixture();
     const key = `uzi-attempts.${s.branch}.entry`;
     const skillsOf = (i: number, k = s.key): string => {
@@ -905,10 +804,10 @@ describe("issue #1783 M2 final review (NB1): no orphaned .uzi-skills sibling", (
       },
     });
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, opts);
-    assert.equal(fs.existsSync(noEntry), false, "no ledger entry: swept");
-    assert.equal(fs.existsSync(retiredOne), false, "retired: swept");
+    assert.equal(fs.readFileSync(path.join(noEntry, "plugin.json"), "utf8"), "{}");
+    assert.equal(fs.readFileSync(path.join(retiredOne, "plugin.json"), "utf8"), "{}");
     for (const p of [reclaimedOne, liveOne, journaledOne, otherKey, busy, withAttempt.skills]) assert.equal(fs.existsSync(p), true, p);
-    assert.ok(scanned.some((c) => c.length === 1 && c[0] === noEntry), "behind a scoped scan");
+    assert.deepEqual(scanned, [], "no retention process proof");
   });
 });
 
@@ -968,7 +867,7 @@ describe("issue #1783 M2 final review (NB4): deleteRetainedArtifact's re-validat
 });
 
 describe("issue #1783 M2 review: crash-window orphans (N5)", () => {
-  it("a live entry that is not live here, unjournaled and without custody is disposable under the cap; the others are not", async () => {
+  it("retains crash-window live orphans alongside journaled, custody-held and worker-live attempts", async () => {
     const s = await keyFixture();
     const orphans = [0, 1, 2, 3].map((i) => plantAttempt(s, idAt(i), `run-${i}`, "live"));
     const journaledLive = plantAttempt(s, idAt(4), "run-4", "live");
@@ -978,9 +877,9 @@ describe("issue #1783 M2 review: crash-window orphans (N5)", () => {
     fs.mkdirSync(path.join(fx.dataDir, "recovery", "run-5"), { recursive: true });
     fs.writeFileSync(path.join(fx.dataDir, "recovery", "run-5", "capture.json"), "{}");
     await git.runnerCloneForBranch(s.bare, s.branch, s.key, noProofReseed, "run-new", false, undefined, seedOpts({ isLive: (p) => p === liveHere.dir }));
-    assert.equal(fs.existsSync(orphans[0]!.dir), false, "the oldest crash-window orphan is deleted");
-    assert.equal(fs.existsSync(orphans[0]!.skills), false);
-    assert.equal(ledgerState(s, idAt(0)), "retired");
+    assert.equal(fs.existsSync(orphans[0]!.dir), true, "the oldest crash-window orphan is retained");
+    assert.equal(fs.existsSync(orphans[0]!.skills), true);
+    assert.equal(ledgerState(s, idAt(0)), "live");
     for (const p of [...orphans.slice(1), journaledLive, custodyLive, liveHere]) assert.equal(fs.existsSync(p.dir), true, p.dir);
   });
 });

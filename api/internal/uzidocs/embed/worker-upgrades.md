@@ -16,6 +16,26 @@ The register-only detail matters before you read any badge: a worker that went o
 through an upgrade still reports the version it ran *before*, so a failed upgrade is detected
 by watching the pod rather than by asking the worker.
 
+## Completion publication compatibility
+
+Coordinate API and worker upgrades for `completion_non_closing_v1`. A new
+API stores the first non-closing reason from a completion attempt and sends
+it back in claim configuration; new workers on both harnesses restore it.
+Old workers ignore that claim intent. Against an API without the feature,
+a new declared pre-push refusal still fails rather than holding. Existing
+executor and post-push hold behavior is unchanged and can lose declaration
+intent.
+
+Deploy the additive `00343_completion_non_closing.sql` migration before the
+new API. It adds one nullable column with no backfill, default or index;
+the ALTER TABLE still takes a table lock. Retain the column on application
+rollback rather than running its destructive Down migration.
+
+The separate permit-scope compatibility rule requires an omitted scope to
+fall back only at exactly the claim revision (default 1). A different
+revision without scope holds closed. Upgrade both components for current
+scope rendering; see [Completion holds](run-completion-hold.md).
+
 ## Display states
 
 | Badge | Meaning | Action |
@@ -80,11 +100,15 @@ It clears when the pod recovers, not on a timer.
 
 Persistent hosted workers use one canary per owner, placement lane and effective
 registered capability pool before admitting more replacements. The default is
-one concurrent replacement per pool after promotion. Workers waiting behind a
-canary keep claiming on the old image; a healthy busy worker can still be useful
-capacity. A stuck participant holds the rest of its pool even after a drain
-deadline. A single-worker pool can lose service while its worker is replaced.
-Ephemeral workers are outside this pacing policy.
+one concurrent replacement per pool after promotion. Healthy peers waiting for
+admission keep claiming on the old image. For routine upgrades, an admitted busy
+worker with image, template or generation drift waits indefinitely until genuinely
+idle. It occupies a concurrency slot and supplies no replacement coverage, canary
+proof or post-promotion proof, and can hold its pool indefinitely. The drain deadline
+(default `24h`) applies only to independent nondrifted pressure/nix-size
+maintenance. Run-bound workers are outside pacing but follow the same busy-drift
+policy; see [Draining and cordoned](hosted-workers.md#draining-and-cordoned).
+A single-worker pool can lose service while its worker is replaced.
 
 A Ready pod alone does not promote a canary. The controller must connect the
 current Deployment, ReplicaSet and running pod UID to the target image, exact

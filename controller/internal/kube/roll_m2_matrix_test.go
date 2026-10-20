@@ -488,22 +488,25 @@ func TestM2MatrixDelayedDrainEventsRestart(t *testing.T) {
 	if len(cordon.clearCalls) != 0 || len(templatePatches(c)) != 0 {
 		t.Fatal("pending cordon was cleared or rolled")
 	}
-	// The API later commits that cordon. A restart must confirm provenance again
-	// before acting on its expired timestamp.
+	// A delayed API cordon remains a busy defer across restart, even when old.
 	since := m5Now.Add(-48 * time.Hour)
 	workers[0].DrainingSince = &since
 	workers[0].DrainingReason = token("image_roll")
-	cordon.confirmWorkers = map[string]protocol.DesiredWorker{workers[0].ID: workers[0]}
-	m = matrixRestart(m)
-	matrixUnknownTick(t, m, workers)
-	if len(cordon.calls) != 2 || len(templatePatches(c)) != 0 {
-		t.Fatalf("deadline skipped re-cordon: calls=%v patches=%v", cordon.calls, templatePatches(c))
-	}
+
 	cordon.err = nil
 	rollTickTest(t, matrixRestart(m), workers)
-	if len(cordon.calls) != 3 || len(templatePatches(c)) != 1 {
-		t.Fatalf("confirmed re-cordon failed to roll: calls=%v patches=%v", cordon.calls, templatePatches(c))
+	if len(templatePatches(c)) != 0 {
+		t.Fatal("delayed expired cordon authorized busy roll after restart")
 	}
+	// Once idle, the durable reservation permits only this canary, and restart
+	// still cannot admit a sibling without replacement proof.
+	workers[0].Busy = false
+	rollTickTest(t, matrixRestart(m), workers)
+	if len(templatePatches(c)) != 1 {
+		t.Fatalf("idle reserved canary did not roll: %v", templatePatches(c))
+	}
+	rollTickTest(t, matrixRestart(m), workers)
+	matrixNoSibling(t, c)
 	if len(cordon.clearCalls) != 0 {
 		t.Fatal("admitted image roll prematurely cleared drain")
 	}

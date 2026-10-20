@@ -247,7 +247,13 @@ worker pod rolls exactly once on this change, gated the same way every other
 worker roll is: an idle worker rolls straight away, while a busy worker is
 cordoned and drained before `Recreate`, up to the configurable
 `workers.drainDeadline` (24h by default) or a force-roll, either of which
-requeues its runs (see ADR-422). Compose needs no
+requeues its runs (the policy recorded at implementation time; see ADR-422).
+**Superseded narrowly by #3103 (2026-10-18):** busy spec-hash/generation drift,
+including this template change, now waits indefinitely for genuine idle.
+The unchanged default/positive-only deadline applies only to independent
+nondrifted pressure/nix-size maintenance. Global ForceRoll may interrupt runs
+and lose all capacity; custody-held data and independent DinD guards still apply.
+This does not change the cache lifecycle decision or historical evidence. Compose needs no
 configuration change: with the uid split its per-run cache lives in the
 container layer, removed when the run's command roots all drained;
 otherwise it is kept until the next container start's reaper, so there is

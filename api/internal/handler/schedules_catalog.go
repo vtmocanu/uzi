@@ -305,6 +305,20 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 		ciWorkflows = ciWorkflowsColumn(apitypes.ScheduleRequest{Target: cur.Target, CIWorkflows: apitypes.OptionalCIWorkflows{Present: true, Value: clean}})
 	}
 
+	ciArtifacts := cur.CiArtifacts
+	if req.CIArtifacts.Present {
+		clean, status, msg := normalizeCIArtifacts(req.CIArtifacts.Value)
+		if status != 0 {
+			httpx.Error(w, status, msg)
+			return store.RunSchedule{}, false
+		}
+		if cur.Target != "ci_watch" && len(clean) > 0 {
+			httpx.Error(w, http.StatusBadRequest, "ci_artifacts is only valid for a ci_watch schedule")
+			return store.RunSchedule{}, false
+		}
+		ciArtifacts = ciArtifactsColumn(apitypes.ScheduleRequest{Target: cur.Target, CIArtifacts: apitypes.OptionalCIArtifacts{Present: true, Value: clean}})
+	}
+
 	capacityReq := req
 	capacityReq.Target, capacityReq.Timing = cur.Target, cur.Timing
 	capacityReq.CapacityLimit, capacityReq.CapacityRoomNeeded = mergeScheduleCapacity(cur, req)
@@ -518,10 +532,11 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	customized = customized || harness.Valid
 	// ci_workflows (PRD #2865): the catalog baseline is "watch every workflow" (NULL), so any
 	// stored selector list diverges; clearing it un-customizes.
-	customized = customized || len(ciWorkflowsFromColumn(ciWorkflows)) > 0
+	customized = customized || len(ciWorkflowsFromColumn(ciWorkflows)) > 0 || len(ciArtifactsFromColumn(ciArtifacts)) > 0
 
 	final, err := qw.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 		CiWorkflows:                ciWorkflows,
+		CiArtifacts:                ciArtifacts,
 		Target:                     cur.Target,
 		RepoID:                     cur.RepoID,
 		IssueIid:                   pgtype.Int8{},

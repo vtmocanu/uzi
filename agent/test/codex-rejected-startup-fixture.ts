@@ -67,7 +67,7 @@ export class RejectedStartupTransport extends EventEmitter {
       uid: this.identity === "worker_pat" ? WORKER_UID : COMMAND_UID,
       liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true });
     this.frame({ event: "dispose", id: this.disposeId, state: "unconfirmed",
-      reason: "deadline", killed: [], reaped: [], children: [this.pid + 1] });
+      reason: "deadline", killed: [], reaped: [], children: [{ pid: this.pid + 1, startTime: "1" }] });
     this.endChannels(1);
   }
 

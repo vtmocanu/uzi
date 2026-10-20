@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -209,6 +210,7 @@ func CIWatchFingerprint(sched store.RunSchedule, defaultBranch pgtype.Text, reso
 	fp := struct {
 		RepoID                string  `json:"repo_id"`
 		Target                string  `json:"target"`
+		CIArtifacts           string  `json:"ci_artifacts"`
 		CIWorkflows           string  `json:"ci_workflows"`
 		Origin                string  `json:"origin"`
 		CatalogSlug           *string `json:"catalog_slug"`
@@ -226,7 +228,7 @@ func CIWatchFingerprint(sched store.RunSchedule, defaultBranch pgtype.Text, reso
 		Enabled               bool    `json:"enabled"`
 		DefaultBranch         *string `json:"default_branch"`
 	}{
-		RepoID: sched.RepoID.String(), Target: sched.Target, CIWorkflows: string(sched.CiWorkflows),
+		RepoID: sched.RepoID.String(), Target: sched.Target, CIArtifacts: string(sched.CiArtifacts), CIWorkflows: string(sched.CiWorkflows),
 		Origin: sched.Origin, CatalogSlug: textPtrFP(sched.CatalogSlug), Prompt: textPtrFP(sched.Prompt),
 		Guidance: textPtrFP(sched.Guidance), ResolvedBody: resolvedBody,
 		AutoApprove: sched.AutoApprove, WaitOnLimit: sched.WaitOnLimit, MrRework: mr,
@@ -386,8 +388,10 @@ type CIRepairRunParams struct {
 	Explicit                   *Harness
 	// CIConfigPaths are the configured defaults (and the project's own CI config path); the
 	// server-side floor CIRepairConfigFloor is unioned in regardless.
-	CIConfigPaths []string
-	Episode       CIWatchStart
+	CIConfigPaths    []string
+	ArtifactManifest *ciartifacts.Manifest
+	ArtifactInputs   []ciartifacts.Input
+	Episode          CIWatchStart
 }
 
 // CreateCIRepairRun queues the guarded kind='prompt' run for a red default-branch execution
@@ -431,7 +435,14 @@ func (s *Service) CreateCIRepairRun(ctx context.Context, p CIRepairRunParams) (s
 			}
 			return startCIWatchEpisodeLocked(ctx, cq, p.Episode)
 		},
-		after: func(ctx context.Context, q Store, run store.Run) error {
+		after: func(ctx context.Context, q Store, run *store.Run) error {
+			txq, ok := q.(*store.Queries)
+			if !ok {
+				return errCIRepairRequiresTx
+			}
+			if err := s.admitCIArtifacts(ctx, txq, run, p.ArtifactManifest, p.ArtifactInputs); err != nil {
+				return err
+			}
 			cq, err := asCI(q)
 			if err != nil {
 				return err

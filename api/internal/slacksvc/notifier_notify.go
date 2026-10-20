@@ -51,7 +51,7 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 	}
 
 	blocks, fallback := notificationBlocks(ev)
-	if !n.notifyCredentialCurrent(ctx, ev) {
+	if !n.notifyCodexCurrent(ctx, ev) || !n.notifyCredentialCurrent(ctx, ev) {
 		return
 	}
 	if _, err := n.poster.PostBlocks(ctx, channel, "", fallback, blocks); err != nil {

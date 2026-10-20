@@ -30,6 +30,7 @@ import (
 // volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
 // the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).
 var recoveryWaitCauses = map[string]bool{
+	recoveryCauseWorkerMemoryPressure:    true,
 	"forge_unreachable":                  true,
 	"empty_turn":                         true,
 	recoveryCauseProviderOutage:          true,

@@ -1,4 +1,7 @@
 {
+  "ci_artifacts": [
+    "x"
+  ],
   "ci_workflows": [
     "x"
   ],

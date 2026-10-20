@@ -1,4 +1,7 @@
+import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { CodexLaunchError, launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
@@ -26,7 +29,6 @@ import {
   attemptClonePath,
   attemptGeneration,
   cloneKeyOf,
-  compareAttemptIds,
   formatResidueName,
   isRetainedArtifactName,
   isWithinPath,
@@ -293,6 +295,72 @@ export class ScratchPublicationError extends Error {
   }
 }
 
+// Transport text is private and ephemeral. Only the safe formatter below reads it;
+// the public Error message and abort/residue classifications remain unchanged.
+const retainedGitDiagnostics = new WeakMap<Error, { stderr: string; context: string }>();
+const RETAINED_DIAGNOSTIC_INPUT_MAX = 64 * 1024;
+
+/** Redact unsplit inputs before sanitizing or cutting. Both ends survive a cut so
+ * a long source path cannot hide Git's trailing failure explanation. Bounds count
+ * UTF-16 units, including the marker; iteration keeps surrogate pairs together. */
+function retainedDiagnosticText(text: string, max: number, redactText: (text: string) => string): string {
+  const redacted = redactText(text.replace(/[\u2028\u2029]/g, "\n"));
+  const safe = sanitizeForLog(redacted.trim(), Number.POSITIVE_INFINITY);
+  if (safe.length <= max) return safe;
+  const half = Math.floor((max - 3) / 2);
+  const points = Array.from(safe);
+  let prefix = "", suffix = "";
+  for (const point of points) {
+    if (prefix.length + point.length > half) break;
+    prefix += point;
+  }
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (suffix.length + points[i]!.length > max - 3 - half) break;
+    suffix = points[i]! + suffix;
+  }
+  return prefix + "..." + suffix;
+}
+
+/** The only reader of runGit's private stderr. Fixed stage/code fields plus at
+ * most 1024 cause and 256 context units leave room for the constant warning text
+ * within 1536 units. Oversized raw inputs are omitted whole, never prefix-cut. */
+export function formatRetainedRecoveryDiagnostic(
+  error: unknown, redactText: (text: string) => string,
+): { diagnostic_stage: string; diagnostic_code: string; cause: string; context?: string } {
+  let stage = "recovery";
+  try {
+    const transport = error instanceof Error ? retainedGitDiagnostics.get(error) : undefined;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!transport && message.startsWith("retained_readiness_")) {
+      const reason = message.slice("retained_readiness_".length);
+      const known = RETAINED_READINESS_REASONS.has(reason) || [
+        "operation_required", "cancelled", "attribution", "cleanup", "missing_pipe",
+        "pipe", "output_limit", "nonzero", "child", "launch", "malformed",
+        "journal_changed", "validation", "profile",
+      ].includes(reason);
+      return { diagnostic_stage: "readiness", diagnostic_code: known
+        ? "retained_readiness_" + reason : "retained_readiness_validation", cause: "" };
+    }
+    stage = transport ? "git" : "recovery";
+    const cause = transport?.stderr || message;
+    const context = transport?.context;
+    // Check the original unsplit text, including leading whitespace, in bytes as
+    // well as units before normalization or redaction. No secret fragment is kept.
+    if (cause.length > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        (context?.length ?? 0) > RETAINED_DIAGNOSTIC_INPUT_MAX ||
+        Buffer.byteLength(cause, "utf8") + Buffer.byteLength(context ?? "", "utf8") > RETAINED_DIAGNOSTIC_INPUT_MAX) {
+      return { diagnostic_stage: stage, diagnostic_code: "input_oversized", cause: "[omitted: redaction input limit]" };
+    }
+    return {
+      diagnostic_stage: stage, diagnostic_code: transport ? "git_failed" : "recovery_failed",
+      cause: retainedDiagnosticText(cause, 1024, redactText),
+      ...(context ? { context: retainedDiagnosticText(context, 256, redactText) } : {}),
+    };
+  } catch {
+    return { diagnostic_stage: stage, diagnostic_code: "formatter_failed", cause: "" };
+  }
+}
+
 const DETAIL_MAX = 200;
 /** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
@@ -377,25 +445,7 @@ const MISSING_OBJECT_RE = /missing|bad object|unable to read|corrupt/i;
 const GIT_OUTPUT_ABORT_MESSAGE = "permit-held git output collection aborted: boundary deadline exceeded";
 const GIT_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
 
-/** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
-class GitBoundaryAbortError extends Error {
-  constructor(message: string, cause?: unknown) {
-    super(message, { cause });
-    this.name = "AbortError";
-  }
-}
-
-/** A checkpoint publication used its cooperative budget. The caller may skip
- * only after every started child has settled under the held permit. */
-export class CheckpointSoftDeadlineError extends Error {
-  constructor(cause?: CheckpointChildStartupTimeoutError) {
-    super(cause === undefined
-      ? "checkpoint publication soft deadline exceeded"
-      : "checkpoint publication soft deadline exceeded (started_deadline; cleanup verified)",
-    cause === undefined ? undefined : { cause });
-    this.name = "AbortError";
-  }
-}
+export { CheckpointSoftDeadlineError } from "./checkpoint-stop.js";
 
 function isAbortLike(error: unknown): error is Error {
   return error instanceof Error && error.name === "AbortError";
@@ -588,6 +638,7 @@ interface BoundaryProcessScope {
    * broker I/O; it must never abort an active child output collector. */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
+  now?: () => number;
   /** issue #1597 M2: awaited by {@link GitCache.withLock} AFTER its critical section and BEFORE the
    *  per-bare lock is released, so a scope (the mid-turn checkpoint tick) can settle a cancelled child
    *  and remove a lock file it provably owned while no other bare mutation can interleave. Never
@@ -618,6 +669,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Test-only supervised readiness root. Production always uses the immutable launcher. */
+  retainedReadinessLaunchForTest?: typeof launchCodexEffectRoot;
   /** Cumulative decoded object bytes per recovery operation. */
   recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
@@ -636,14 +689,14 @@ export interface GitCacheOptions {
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
-  /** issue #1783 M2 — test-only seam for the runner-uid deletions (the retention sweep's, and M3's
+  /** issue #1783 M2 — test-only seam for the runner-uid deletions (operator discard's, and M3's
    *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone; `run`
    *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
    *  passes it. The rest drive the REAL spawn/timeout/close-wait path of runRunnerUidDelete
    *  (and so must not be combined with `run`): `spawn` stands in for the detached spawn of the
    *  wrapped argv, `kill` for killRunnerGroup, `timeoutMs` / `closeWaitMs` for
    *  {@link RETENTION_RM_TIMEOUT_MS} / {@link RETENTION_RM_CLOSE_WAIT_MS}. `lstat` replaces the
-   *  retention sweep's re-validation lstat in deleteRetainedArtifact (issue #1783 final). */
+   *  runner-uid re-validation lstat in deleteRetainedArtifact (issue #1783 final). */
   retentionDelete?: {
     split?: boolean;
     run?: (command: string, args: string[]) => Promise<void>;
@@ -1185,6 +1238,11 @@ export class BareCacheIdentityError extends Error {
   }
 }
 
+/** A supervised retained-readiness effect has no positive cleanup proof. */
+export class RetainedReadinessCleanupUnconfirmedError extends Error {
+  constructor() { super("retained_readiness_cleanup"); }
+}
+
 export class RetainedRecoveryBlockedError extends Error {
   readonly reason = "source_missing";
   constructor(readonly barePath: string, readonly branch: string, readonly key: string,
@@ -1203,9 +1261,9 @@ export interface RecoveryJournalEntry extends RecoverySource {
 // worker bare (on the /data PVC, so it survives a container and a pod restart). Every value is the
 // JSON `{"attemptId","runId","clonePath","state"}`, appended with `git config --add`; for one
 // attemptId the LAST value wins. `live` is written when an attempt is seeded, `retired` when the
-// owner's terminal retire disposed of its clone (or the retention sweep deleted it), `abandoned`
+// owner's terminal retire disposed of its clone (or an operator discarded it), `abandoned`
 // when a VERIFIED capture released it IN PLACE (the clone stays on disk, unreachable by any
-// successor; its work is in the tracking ref, so the retention sweep may dispose of it), and
+// successor; its work is in the tracking ref, and automatic retention keeps it), and
 // `reclaimed` when the terminal-orphan reclaim released a FOREIGN owner's attempt in place WITHOUT
 // capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
 // attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
@@ -1495,16 +1553,16 @@ function attemptGenerationEvidence(attemptId: string): { generation: number | nu
   return { generation: g ?? null, unreadable: g === undefined && /-g[0-9]+-/.test(attemptId) };
 }
 
-/** Best-effort abandoned-attempt target per key (each with its skills sibling); refusals stay. */
+/** Abandoned-attempt diagnostic threshold per key (each with its skills sibling). */
 const RETAINED_ABANDONED_PER_KEY = 3;
 /** The private temp-file prefix of the atomic ledger compaction (inside the bare, beside `config`). */
 const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
-/** Best-effort residue retention target per clone key; protected or unproven excess stays. */
+/** Residue diagnostic threshold per clone key; all excess stays. */
 const RETAINED_RESIDUE_PER_KEY = 5;
 const RESIDUE_ENUMERATION_BUDGET = 4096;
-const RESIDUE_SWEEP_ATTEMPT_BUDGET = 16;
-const RESIDUE_SWEEP_CURSOR_KEYS = 128;
-/** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
+const RETENTION_WARNING_KEYS = 128;
+const RETENTION_WARNING_INTERVAL_MS = 3600_000;
+/** The operator/canonical runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
 const RETENTION_RM_BIN = "/bin/rm";
 const RETENTION_RM_TIMEOUT_MS = 120_000;
@@ -1544,7 +1602,6 @@ export interface CanonicalReseedOptions {
   beforeFree: (canonicalPath: string) => Promise<void>;
   /** Retention predicates, with the same contract as AttemptSeedOptions. */
   isLive: AttemptSeedOptions["isLive"];
-  quiescent: AttemptSeedOptions["quiescent"];
   /** Internal control errors must escape best-effort retention. */
   isInterruption?: (error: unknown) => boolean;
 }
@@ -1569,10 +1626,6 @@ export interface AttemptSeedOptions {
    *  written, so the caller can register the attempt live before any other seed of the key can
    *  run its sweep. */
   onSeeded?: (clonePath: string) => void;
-  /** The retention sweep's quiescence predicate: true when the scoped process scan over `paths`
-   *  finds nothing in scope. False, absent/unverified proof or a generic throw keeps the entry;
-   *  classified control/recovery interruptions escape best-effort retention. */
-  quiescent: (paths: string[], canonicalPath: string) => Promise<boolean>;
   /** Internal control errors must escape best-effort retention. */
   isInterruption?: (error: unknown) => boolean;
 }
@@ -1775,6 +1828,11 @@ export type CommittedTrackingOwnership =
 export interface FetchAgentBranchOptions {
   context: OwedCandidateContext;
   remotelyConfirmedSha?: string;
+  /** Worker-captured candidate; never substitute a newer branch head. */
+  expectedCandidateSha?: string;
+  /** Milestone policy soft-stops only while waiting for the bare lock. */
+  checkpointImportMode?: "done" | "milestone";
+  checkpointStep?: (step: BoundaryStep) => void;
 }
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
@@ -1933,9 +1991,9 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
-  /** Availability-only LRU progress, never a cached safety verdict. Restart/eviction
-   * restarts from the oldest excess; empty excess removes the key. */
-  private readonly residueSweepCursors = new Map<string, { mtimeMs: number; name: string }>();
+  /** Per-key warning timestamps, bounded by LRU eviction and reset on restart.
+   * These throttle diagnostics only and confer no deletion authority. */
+  private readonly retentionWarnings = new Map<string, number>();
   // Fresh no-child authority exists only in the GitCache invocation that created the pin.
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
@@ -1960,6 +2018,7 @@ export class GitCache {
     budget?.signal.throwIfAborted();
     if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
   }
+  private readonly retainedReadinessLaunch: typeof launchCodexEffectRoot;
   readonly recoveryDecodedLimitBytes: number;
   private readonly recoveryOperations = new AsyncLocalStorage<{
     signal: AbortSignal; deadline: number; budget?: MaintenanceBudget; closureBudget: ClosureBudget;
@@ -2042,7 +2101,7 @@ export class GitCache {
   /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
    *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
    *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
-   *  ({@link assertNoUnsettledDelete}), and the retention sweep keeps such a path or anything
+   *  ({@link assertNoUnsettledDelete}), and automatic retention keeps such a path or anything
    *  under it ({@link deleteRetainedArtifact}), for as long as that rm may still be running. An
    *  entry is logged (warn) when it is recorded and (info) when its 'close' removes it. */
   private readonly unsettledDeletes = new Map<string, number>();
@@ -2058,6 +2117,7 @@ export class GitCache {
     opts: GitCacheOptions = {},
   ) {
     this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
+    this.retainedReadinessLaunch = opts.retainedReadinessLaunchForTest ?? launchCodexEffectRoot;
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
@@ -2081,7 +2141,7 @@ export class GitCache {
     spawner: BoundaryProcessSpawner,
     signal: AbortSignal,
     action: () => Promise<T>,
-    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number } = {},
+    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
     return this.boundaryProcesses.run(
       { spawn: spawner, signal, ...hooks },
@@ -2804,12 +2864,9 @@ export class GitCache {
       const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
       if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
-      await this.sweepResidue(barePath, clonePath, reseed, warningScope).catch((err: unknown) => {
+      await this.diagnoseRetainedArtifacts(barePath, clonePath, undefined, reseed, warningScope).catch((err: unknown) => {
         if (reseed.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
-        this.log.warn("runner clone retention sweep failed; nothing further removed", {
-          key, error: sanitizeForLog(gitErrorMessage(err), 157),
-        });
       });
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
     });
@@ -2850,10 +2907,9 @@ export class GitCache {
    *      FAILED yet left nothing to rename has an unknown outcome and blocks.
    *   6. Confirm the canonical path is free (lstat ENOENT).
    *
-   * The residue is KEPT: nothing here deletes it. Only revalidated retention may reclaim it toward
-   * the best-effort per-key target: directories use the runner uid under the uid split, while files
-   * and symlinks are unlinked as entries. A directory the runner cannot delete stays. Any
-   * failure of steps 1, 3, 5 or 6 is a {@link CloneResidueBlockedError}.
+   * The residue is KEPT: nothing here deletes it. Automatic retention keeps directories,
+   * files and symlinks beyond the per-key diagnostic threshold. Any failure of steps 1, 3,
+   * 5 or 6 is a {@link CloneResidueBlockedError}.
    */
   private async freeCanonicalClonePath(canonical: string, key: string, reseed: CanonicalReseedOptions): Promise<void> {
     // An earlier claim's rm on this path may still be walking it: touch nothing (N1).
@@ -2976,7 +3032,7 @@ export class GitCache {
    * issue #1783 M2 — the attempt-path seed (Docker-wired or recovery-enabled): a fresh clone path
    * `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>`. The seed itself does not reuse or move a
    * predecessor's path: prior work reaches the new attempt through the tracking ref, checkpoint
-   * adoption and journal/capture flow in the bare. Post-seed retention may delete eligible excess.
+   * adoption and journal/capture flow in the bare. Post-seed diagnostics report retained excess without reclaiming it.
    *
    * The recovery journal is classified by IDENTITY — the (runId, repoDir/key) pair plus the
    * attempt grammar — not by literal path equality, so a journal naming the predecessor's
@@ -3041,11 +3097,11 @@ export class GitCache {
       // runnerCloneForClaim returns this seed, and the runner writes the recovery journal naming this
       // path (markRecoveryCapture) before any executor or agent starts in it. Between this append
       // and that write the path only ever sees the seed itself (the worker-driven runner-uid clone,
-      // checkout and scratch provisioning), the retention sweep below, and a worker-side read of the
+      // checkout and scratch provisioning), the retention diagnostic below, and a worker-side read of the
       // bare (the runner's originBranchTip). So a
       // `live` entry that no journal names, that is not live on this worker and whose run holds no
       // custody record was interrupted between this append and that journal write: it holds a seed
-      // and no agent work, and the retention sweep treats it as disposable under the abandoned cap.
+      // and no agent work, and the retention diagnostic counts it among abandoned attempts.
       await this.appendAttemptLedger(barePath, branch, {
         attemptId: attempt.attemptId,
         runId: runId ?? "",
@@ -3056,7 +3112,7 @@ export class GitCache {
       try {
         seeded = await this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
       } catch (err) {
-        // A half-seeded attempt holds no work; release it to the retention sweep.
+        // A half-seeded attempt holds no work; record it as abandoned for retained diagnostics.
         await this.appendAttemptLedger(barePath, branch, {
           attemptId: attempt.attemptId,
           runId: runId ?? "",
@@ -3066,13 +3122,9 @@ export class GitCache {
         throw err;
       }
       attempt.onSeeded?.(clonePath);
-      await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
+      await this.diagnoseRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
         if (attempt.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
-        this.log.warn("runner clone retention sweep failed; nothing further removed", {
-          key,
-          error: gitErrorMessage(err),
-        });
       });
       return { ...seeded, attemptId: attempt.attemptId };
     });
@@ -3121,229 +3173,107 @@ export class GitCache {
     return [...out].filter((p) => !isLive(p)).sort();
   }
 
-  /**
-   * issue #1783 M2 — the retention sweep, run at each attempt seed under the bare lock.
-   *
-   * Attempts: targets {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
-   * deletes the oldest beyond that (attempt-id order), each with its `.uzi-skills-*` sibling as a
-   * pair (the sibling first, so a failed attempt delete never orphans it). A skills sibling whose
-   * attempt dir is already gone and whose ledger entry is not `reclaimed`/`live` is swept too. The disposable kinds are `abandoned` (a verified capture released it in place) and a
-   * crash-window orphan: a `live` entry not live on this worker, named by no journal and whose run
-   * holds no custody record (see the ordering note in attemptCloneForBranch). `reclaimed` (an
-   * uncaptured foreign owner's attempt), `retired`, a live attempt and a dir with no ledger identity
-   * are never counted and never deleted.
-   *
-   * Residue: delegates to {@link sweepResidue}, the shared best-effort per-key helper also called
-   * by canonical reseeds. This attempt-only path retains the abandoned-attempt and orphaned-skills
-   * phases above; its residue phase runs after seed and live registration.
-   *
-   * `seeding` (the attempt path this seed just made) is never a candidate.
-   * Every deletion goes through {@link deleteRetainedArtifact} (re-validated, runner-uid). A deletion
-   * that fails or is refused (e.g. a root-owned dir, a symlinked attempt) is logged and the entry is
-   * kept. A residue entry that is a symlink or file is unlinked (the entry itself, never followed).
-   */
-  private async sweepRetainedArtifacts(
+  /** Read-only lower bounds over at most 4096 direct siblings. Observations confer no
+   * deletion authority. A failed observation makes its category partial; independent siblings
+   * continue within the enumeration budget. Only known excess produces a bounded warning. */
+  private async diagnoseRetainedArtifacts(
     barePath: string,
     canonical: string,
-    seeding: string,
-    attempt: AttemptSeedOptions,
+    seeding: string | undefined,
+    predicates: Pick<AttemptSeedOptions, "isLive" | "isInterruption">,
+    warningScope?: RecoveryPhysicalWarningScope,
   ): Promise<void> {
-    const parent = path.dirname(canonical);
-    const names = await fs.readdir(parent);
-    const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
-    const journaled = [...(await this.journaledClonePaths(barePath, warningScope))];
-    const ledgers = await this.readAllAttemptLedgers(barePath);
-    const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p));
-    const entryFor = (attemptId: string, p: string): (AttemptLedgerEntry & { branch: string }) | undefined => {
-      const e = ledgers.get(attemptId);
-      return e && e.clonePath === p ? e : undefined;
+    const attempts = { count: 0, complete: true };
+    const residue = { count: 0, complete: true };
+    const orphanedSkills = { count: 0, complete: true };
+    const interrupted = (err: unknown): void => {
+      if (predicates.isInterruption?.(err)) throw err;
+      this.checkRecoveryInterruption();
     };
-    const quiescent = async (paths: string[]): Promise<boolean> => {
-      try {
-        return await attempt.quiescent(paths, canonical);
-      } catch (err) {
-        if (attempt.isInterruption?.(err)) throw err;
-        this.checkRecoveryInterruption();
-        return false;
-      }
-    };
-
-    // 1. Disposable-kind attempts, oldest first beyond the cap.
-    const candidates: Array<{ p: string; attemptId: string; entry: AttemptLedgerEntry & { branch: string } }> = [];
-    for (const name of names) {
-      const p = path.join(parent, name);
-      const id = this.clonePathShape(p, canonical)?.attemptId;
-      // The attempt this seed just made is `live` and not yet journaled: never a candidate, whether
-      // or not the caller has registered it live yet.
-      if (id === undefined || p === seeding) continue;
-      const entry = entryFor(id, p);
-      if (entry === undefined || entry.runId === "") continue;
-      if (entry.state === "abandoned") {
-        candidates.push({ p, attemptId: id, entry });
-      } else if (entry.state === "live" && !attempt.isLive(p) && !namedByJournal(p) && !(await this.custodyHeld(entry.runId))) {
-        candidates.push({ p, attemptId: id, entry });
-      }
-    }
-    candidates.sort((a, b) => compareAttemptIds(a.attemptId, b.attemptId));
-    for (const a of candidates.slice(0, Math.max(0, candidates.length - RETAINED_ABANDONED_PER_KEY))) {
-      const skillsName = `.uzi-skills-${path.basename(a.p)}`;
-      const skills = path.join(parent, skillsName);
-      if (namedByJournal(a.p) || attempt.isLive(a.p) || (await this.custodyHeld(a.entry.runId))) continue;
-      if (!(await quiescent([a.p, skills]))) continue;
-      // The skills sibling FIRST: materializeSkillsPlugin rebuilds it for any attempt that runs, so
-      // losing it costs nothing, while an attempt dir deleted before a failed skills delete would
-      // leave the skills dir orphaned. A failed attempt delete after this keeps the attempt (still
-      // `abandoned`, retried at the next seed) and orphans nothing.
-      if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) continue;
-      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
-      const { branch: entryBranch, ...entry } = a.entry;
-      await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => undefined);
-      this.log.info("runner clone retention: deleted a retained attempt", { path: a.p, state: a.entry.state });
-    }
-
-    // 1b. Orphaned skills siblings of this key: a `.uzi-skills-<key>.attempt-<id>` whose attempt dir
-    // is gone (an older worker's attempt-first delete, or a crash between the two deletes) and whose
-    // ledger entry is neither `reclaimed` nor `live` (an absent entry, e.g. compacted away, counts as
-    // neither). A skills dir holds a rebuilt plugin tree, never run work. Deleted behind the same
-    // journal / live / scoped-quiescence checks and the same re-validated runner-uid delete.
-    for (const name of await fs.readdir(parent)) {
-      const art = parseRetainedArtifactName(name);
-      if (art?.kind !== "skills") continue;
-      const attemptDir = path.join(parent, art.cloneBasename);
-      const id = this.clonePathShape(attemptDir, canonical)?.attemptId;
-      if (id === undefined || attemptDir === seeding) continue;
-      if (await this.pathPresent(attemptDir)) continue;
-      const state = ledgers.get(id)?.state;
-      if (state === "reclaimed" || state === "live") continue;
-      const p = path.join(parent, name);
-      if (namedByJournal(attemptDir) || namedByJournal(p) || attempt.isLive(attemptDir) || attempt.isLive(p)) continue;
-      if (!(await quiescent([p]))) continue;
-      if (await this.deleteRetainedArtifact(parent, p, (n) => n === name)) {
-        this.log.info("runner clone retention: deleted an orphaned skills sibling", { path: p });
-      }
-    }
-
-    await this.sweepResidue(barePath, canonical, attempt, warningScope);
-  }
-
-  /** Residue-only retention under the bare lock: canonical seeds call this AFTER successful
-   * canonical free and BEFORE the new seed; attempt seeds call it after seed/live registration.
-   * Only exact parser-valid `.uzi-residue-<key>.residue-<uuid>` direct siblings of this key count.
-   * Validate the parent and enumerate its complete direct-entry set within the private fixed
-   * 4096-entry enumeration budget before reclamation; overflow or validation failure skips reclamation.
-   * No excess returns without another journal discovery. Sort by lstat mtime, then basename, and
-   * try at most 16 candidates from the original oldest excess slice toward
-   * {@link RETAINED_RESIDUE_PER_KEY}. An in-process round-robin cursor (128-key LRU)
-   * advances even on refusal, without caching safety evidence; restart/eviction starts
-   * from the oldest again, and no excess clears the cursor. Refused excess stays, with
-   * no newer compensating deletes and no hard disk or wall-time bound.
-   * Fresh readable journals (candidate or descendant), live registry and quarantine are checked
-   * around an affirmative scoped seed-process proof and again before deletion. A latched or newly
-   * latched unreadable-unattributed worker quarantine vetoes residue deletion. False, absent,
-   * unverified or generic thrown proof keeps the entry with bounded diagnostics; classified
-   * control/recovery interruptions propagate. Fresh-attempt unreadable relaxation grants no delete
-   * authority, and off-Linux absent process proof keeps entries. Canonical predicates retain
-   * configured best-effort Docker handling; attempt retention retains its process-only posture.
-   * {@link deleteRetainedArtifact} preserves uid/path/name checks and deletion deadlines; an rm
-   * possibly still alive stops further cleanup, and files/symlinks are unlinked without following.
-   */
-  private async sweepResidue(
-    barePath: string,
-    canonical: string,
-    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption">,
-    warningScope: RecoveryPhysicalWarningScope,
-  ): Promise<void> {
     const parent = path.dirname(canonical);
     const key = path.basename(canonical);
-    const validateParent = async (): Promise<void> => {
+    const names: string[] = [];
+    try {
       if (path.dirname(parent) !== path.resolve(this.runnerRoot)) throw new Error("not a direct runner repo dir");
       const st = await fs.lstat(parent);
       if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("runner repo dir is not a real directory");
-    };
-    await validateParent();
-    const names: string[] = [];
-    // Bound all direct siblings before any candidate stat, proof or deletion. The async
-    // iterator closes the directory on completion, overflow and read failure.
-    for await (const entry of await fs.opendir(parent)) {
-      if (names.length === RESIDUE_ENUMERATION_BUDGET) throw new Error("residue enumeration exceeds 4096-entry work budget");
-      names.push(entry.name);
+      for await (const entry of await fs.opendir(parent)) {
+        if (names.length === RESIDUE_ENUMERATION_BUDGET) {
+          attempts.complete = residue.complete = orphanedSkills.complete = false;
+          break;
+        }
+        names.push(entry.name);
+      }
+    } catch (err) {
+      interrupted(err);
+      attempts.complete = residue.complete = orphanedSkills.complete = false;
     }
-    const isOwnResidue = (n: string): boolean => {
-      const art = parseRetainedArtifactName(n);
-      return art?.kind === "residue" && art.key === key;
-    };
-    const residue: Array<{ p: string; name: string; mtimeMs: number }> = [];
+    let ledgers = new Map<string, AttemptLedgerEntry>();
+    let journaled: string[] = [];
+    let identitiesComplete = true;
+    try {
+      // The existing git config reader bounds output to 64 MiB. Malformed identities
+      // are unknown evidence rather than a disposable attempt.
+      for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+        const entry = parseAttemptLedgerEntry(raw);
+        if (!entry) identitiesComplete = false;
+        else ledgers.set(entry.attemptId, entry);
+      }
+      journaled = [...await this.journaledClonePaths(barePath, warningScope)];
+    } catch (err) {
+      interrupted(err);
+      identitiesComplete = false;
+    }
+    if (!identitiesComplete) attempts.complete = orphanedSkills.complete = false;
+    const named = (p: string): boolean => journaled.some(j => isWithinPath(j, p));
     for (const name of names) {
-      if (!isOwnResidue(name)) continue;
       const p = path.join(parent, name);
+      const art = parseRetainedArtifactName(name);
+      if (art?.kind === "residue" && art.key === key) {
+        try { await fs.lstat(p); residue.count++; }
+        catch (err) { interrupted(err); residue.complete = false; }
+        continue;
+      }
+      const attemptPath = art?.kind === "skills" ? path.join(parent, art.cloneBasename) : p;
+      const id = this.clonePathShape(attemptPath, canonical)?.attemptId;
+      if (id === undefined || attemptPath === seeding) continue;
+      const entry = ledgers.get(id);
       try {
-        const st = await fs.lstat(p);
-        residue.push({ p, name, mtimeMs: st.mtimeMs });
+        if (art?.kind === "skills") {
+          await fs.lstat(p);
+          try { await fs.lstat(attemptPath); continue; }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+          if (!identitiesComplete || entry?.state === "reclaimed" || entry?.state === "live" ||
+              named(attemptPath) || named(p) || predicates.isLive(attemptPath) || predicates.isLive(p)) continue;
+          orphanedSkills.count++;
+        } else {
+          await fs.lstat(p);
+          if (!entry || entry.clonePath !== p || entry.runId === "") continue;
+          if (entry.state === "abandoned") { attempts.count++; continue; }
+          if (entry.state !== "live" || predicates.isLive(p) || named(p)) continue;
+          // custodyHeld includes physical terminal protection and fails closed on unreadable
+          // stores/callback failures. True cannot distinguish protection from unknown evidence.
+          if (await this.custodyHeld(entry.runId)) { attempts.complete = false; continue; }
+          if (identitiesComplete) attempts.count++;
+        }
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        interrupted(err);
+        if (art?.kind === "skills") orphanedSkills.complete = false;
+        else attempts.complete = false;
       }
     }
     this.checkRecoveryInterruption();
-    if (residue.length <= RETAINED_RESIDUE_PER_KEY) {
-      this.residueSweepCursors.delete(canonical);
-      return;
-    }
-    // Complete journal discovery is required before reclamation. Ordinary reseeds with
-    // no excess avoid repeating the caller's journal discovery when nothing can be deleted.
-    await this.journaledClonePaths(barePath, warningScope);
-    const compare = (a: { mtimeMs: number; name: string }, b: { mtimeMs: number; name: string }): number =>
-      a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    residue.sort(compare);
-    const excess = residue.slice(0, residue.length - RETAINED_RESIDUE_PER_KEY);
-    const cursor = this.residueSweepCursors.get(canonical);
-    // A deleted cursor entry still defines its ordering position. Wrap after the
-    // last excess entry; the newest five never enter the candidate list.
-    const next = cursor === undefined ? 0 : excess.findIndex(r => compare(r, cursor) > 0);
-    const start = next < 0 ? 0 : next;
-    for (let n = 0; n < Math.min(RESIDUE_SWEEP_ATTEMPT_BUDGET, excess.length); n++) {
-      const r = excess[(start + n) % excess.length]!;
-      this.residueSweepCursors.delete(canonical);
-      this.residueSweepCursors.set(canonical, { mtimeMs: r.mtimeMs, name: r.name });
-      if (this.residueSweepCursors.size > RESIDUE_SWEEP_CURSOR_KEYS) {
-        this.residueSweepCursors.delete(this.residueSweepCursors.keys().next().value!);
-      }
-      const refuse = (reason: string): false => {
-        this.log.warn("runner clone retention: refusing residue deletion; keeping it", {
-          path: r.p, reason: sanitizeForLog(reason, 157),
-        });
-        return false;
-      };
-      const open = (): boolean => {
-        this.checkRecoveryInterruption();
-        if (residueQuarantine() !== undefined) return refuse("worker quarantined");
-        if (predicates.isLive(r.p)) return refuse("live path");
-        return true;
-      };
-      const validate = async (): Promise<boolean> => {
-        await validateParent();
-        const journaled = await this.journaledClonePaths(barePath, warningScope);
-        if ([...journaled].some((j) => isWithinPath(j, r.p))) return refuse("named by recovery journal");
-        return open();
-      };
-      if (!(await validate())) continue;
-      let proven: boolean;
-      try {
-        proven = await predicates.quiescent([r.p], canonical);
-      } catch (err) {
-        if (predicates.isInterruption?.(err)) throw err;
-        this.checkRecoveryInterruption();
-        refuse(gitErrorMessage(err));
-        continue;
-      }
-      if (!open()) continue;
-      if (proven !== true) { refuse("no affirmative quiescence proof"); continue; }
-      if (!(await validate())) continue;
-      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, {
-        unlinkNonDirectory: true, beforeDelete: validate, canDelete: open, strictValidation: true,
-      })) {
-        this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
-      }
-    }
+    if (attempts.count <= RETAINED_ABANDONED_PER_KEY && residue.count <= RETAINED_RESIDUE_PER_KEY && orphanedSkills.count === 0) return;
+    const now = Date.now();
+    const last = this.retentionWarnings.get(canonical);
+    this.retentionWarnings.delete(canonical);
+    this.retentionWarnings.set(canonical, last ?? now);
+    if (this.retentionWarnings.size > RETENTION_WARNING_KEYS) this.retentionWarnings.delete(this.retentionWarnings.keys().next().value!);
+    if (last !== undefined && now - last < RETENTION_WARNING_INTERVAL_MS) return;
+    this.retentionWarnings.set(canonical, now);
+    this.log.warn("runner clone retention: automatic reclaim disabled", {
+      key: sanitizeForLog(key, 157), attempts, residue, orphanedSkills,
+    });
   }
 
   /**
@@ -4446,57 +4376,98 @@ export class GitCache {
     opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
     if (!opts) throw new Error("fetchAgentBranch requires trusted claim context");
     opts = this.snapshotOwedOptions(opts);
-    await this.validateOwedContext(barePath, branch, opts.context);
-    if (runId !== opts.context.runId) throw new Error("fetchAgentBranch run identity mismatch");
-    this.validateConfirmedSha(opts.remotelyConfirmedSha);
-    // Only a worker-selected clone path is admitted to the pack transport.
-    if (!path.isAbsolute(clonePath) || !isWithinPath(path.resolve(clonePath), path.resolve(this.runnerRoot))) {
-      throw new Error("fetchAgentBranch requires a trusted runner clone path");
-    }
+    const checkpointScope = this.boundaryProcesses.getStore();
+    const prepare = async (): Promise<void> => {
+      this.checkCheckpointCooperation();
+      this.validateConfirmedSha(opts.expectedCandidateSha);
+      await this.validateOwedContext(barePath, branch, opts.context);
+      if (runId !== opts.context.runId) throw new Error("fetchAgentBranch run identity mismatch");
+      this.validateConfirmedSha(opts.remotelyConfirmedSha);
+      // Only a worker-selected clone path is admitted to the pack transport.
+      if (!path.isAbsolute(clonePath) || !isWithinPath(path.resolve(clonePath), path.resolve(this.runnerRoot))) {
+        throw new Error("fetchAgentBranch requires a trusted runner clone path");
+      }
+      this.checkCheckpointCooperation();
+    };
+    if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
+    else await prepare();
+    opts.checkpointStep?.("checkpoint_import_lock_wait");
     return this.withLock(barePath, async () => {
-      const observed = await this.observeTrackingUnderLock(barePath, branch);
-      const stage = `refs/uzi-incoming/${randomUUID()}`;
-      // Ordinary transport failures (including boundary aborts) deliberately throw.
-      await this.runGit(barePath, [
-        "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
-        "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
-      ]);
-      const incoming = await this.resolveCommitStrict(barePath, stage);
-      await this.requireOwedCommit(barePath, incoming);
-      let result: TrackingUpdateResult;
-      if (observed) {
-        result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
-      } else {
-        // The producing fetch context proves only incoming, never the unknown shared head.
-        try {
-          await this.pinOwedUnderLock(opts.context, incoming);
-          result = { kind: "not_updated", reason: "ownership_unknown" };
-        } catch (cause) {
-          const abort = this.boundaryAbortError(cause);
-          if (abort) throw abort;
-          result = { kind: "not_updated", reason: preservationReason(cause) };
+      const importBranch = async (): Promise<TrackingUpdateResult> => {
+        this.checkCheckpointCooperation();
+        const observed = await this.observeTrackingUnderLock(barePath, branch);
+        const stage = `refs/uzi-incoming/${randomUUID()}`;
+        opts.checkpointStep?.("checkpoint_import_transport");
+        // Ordinary transport failures (including boundary aborts) deliberately throw.
+        await this.runGit(barePath, [
+          "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
+          "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
+        ]);
+        opts.checkpointStep?.("checkpoint_import_poststage");
+        const incoming = await this.resolveCommitStrict(barePath, stage);
+        await this.requireOwedCommit(barePath, incoming);
+        if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
+          throw new Error("checkpoint candidate changed during acquisition");
         }
-      }
-      // A refusal can leave stage as the sole anchor if metadata/pinning failed.
-      // Delete it only after an independently verified durable anchor exists.
-      try {
-        if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-        } else if (result.kind === "updated" &&
-            await this.checkedTrackingSha(barePath, branch) === incoming) {
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-        } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
-          // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
-          // clone kept), so its stage must not accumulate one ref per refused attempt.
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        this.checkCheckpointCooperation();
+        let result: TrackingUpdateResult;
+        if (observed) {
+          result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
+        } else {
+          // The producing fetch context proves only incoming, never the unknown shared head.
+          result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
+            try {
+              await this.pinOwedUnderLock(opts.context, incoming);
+              return { kind: "not_updated", reason: "ownership_unknown" };
+            } catch (cause) {
+              const abort = this.boundaryAbortError(cause);
+              if (abort) throw abort;
+              return { kind: "not_updated", reason: preservationReason(cause) };
+            }
+          });
         }
-      } catch (cause) {
-        const abort = this.boundaryAbortError(cause);
-        if (abort) throw abort;
-        if (result.kind === "updated") throw cause;
-        // One cleanup attempt; a harmless stage must not erase the refusal reason.
-      }
-      return result;
+        // Ownership has settled. A stop now retains the private stage rather than
+        // moving a stall into optional anchor lookup or staging cleanup.
+        if (result.kind === "not_updated") {
+          await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+          if (checkpointScope?.softSignal?.aborted ||
+              (checkpointScope?.softDeadlineAt ?? Infinity) <= (checkpointScope?.now ?? Date.now)()) return result;
+        }
+        this.checkCheckpointCooperation();
+        {
+          // A refusal can leave stage as the sole anchor if metadata/pinning failed.
+          // Delete it only after an independently verified durable anchor exists.
+          try {
+            if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            } else if (result.kind === "updated" &&
+                await this.checkedTrackingSha(barePath, branch) === incoming) {
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
+              // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
+              // clone kept), so its stage must not accumulate one ref per refused attempt.
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            }
+          } catch (cause) {
+            // An inconclusive owner with a successfully preserved incoming pin is
+            // not a mutation failure: its cleanup stop must still propagate.
+            if (result.kind === "not_updated" && (observed || result.reason !== "ownership_unknown") &&
+                cause instanceof CheckpointSoftDeadlineError) {
+              await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+              return result;
+            }
+            const abort = this.boundaryAbortError(cause);
+            if (abort) throw abort;
+            if (result.kind === "updated") throw cause;
+            // One cleanup attempt; a harmless stage must not erase the refusal reason.
+          }
+        }
+        if (result.kind === "not_updated") await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        else this.checkCheckpointCooperation();
+        return result;
+      };
+      return opts.checkpointImportMode === "milestone"
+        ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
     });
   }
 
@@ -4622,7 +4593,14 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const observed = await this.observeTrackingUnderLock(barePath, branch);
       if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
-      return this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      this.checkCheckpointCooperation();
+      const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      if (result.kind === "not_updated") {
+        await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        return result;
+      }
+      this.checkCheckpointCooperation();
+      return result;
     });
   }
 
@@ -4643,7 +4621,11 @@ export class GitCache {
    *  runner-owned, so a worker-uid read would hit the B2 dubious-ownership boundary
    *  (git.ts B2 invariants). Best-effort. */
   async branchTip(clonePath: string, branch: string): Promise<string | null> {
-    const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch(() => "")).trim();
+    const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch((cause: unknown) => {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return "";
+    })).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
@@ -4701,7 +4683,11 @@ export class GitCache {
    */
   async worktreeHead(worktreePath: string): Promise<string | null> {
     const sha = (
-      await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]).catch(() => "")
+      await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]).catch((cause: unknown) => {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return "";
+      })
     ).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
@@ -4745,18 +4731,23 @@ export class GitCache {
         return { head_commit: head, base_commit: base };
       }
       const receiptId = randomUUID();
-      // Metadata first: an interrupted create can never acquire fresh-empty authority later.
-      await this.writeCodeSnapshotMetadata(barePath, {
-        version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+      this.checkCheckpointCooperation();
+      await this.maskCheckpointCooperation(async () => {
+        // Metadata first: an interrupted create can never acquire fresh-empty authority later.
+        await this.writeCodeSnapshotMetadata(barePath, {
+          version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+        });
+        await this.runGit(barePath, ["update-ref", ref, head, ""]);
       });
-      await this.runGit(barePath, ["update-ref", ref, head, ""]);
       if (this.codeSnapshotFreshReceipts.size >= 256) return { head_commit: head, base_commit: base };
       this.codeSnapshotFreshReceipts.add(receiptId);
       return { head_commit: head, base_commit: base,
         freshReceipt: { leadId: runId, head, pinGeneration, receiptId } };
     };
-    return this.withLock(barePath, () => pin
+    const result = await this.withLock(barePath, () => pin
       ? this.withCodeSnapshotFence(barePath, runId, operation) : operation());
+    this.checkCheckpointCooperation();
+    return result;
   }
 
   async codeSnapshotTip(barePath: string, runId: string): Promise<string> {
@@ -5889,6 +5880,169 @@ export class GitCache {
     return journal;
   }
 
+  /**
+   * Recovery-only permission readiness. One locked pass, at most 30 seconds of work
+   * and a separate five-second disposal reserve. Failure retains custody; a prefix
+   * of object permissions may already have gained group readability.
+   */
+  async normalizeRetainedSourceObjects(
+    barePath: string, branch: string, key: string, expectedSource: RecoverySource,
+  ): Promise<void> {
+    const operation = this.recoveryOperations.getStore();
+    if (!operation) throw new Error("retained_readiness_operation_required");
+    // The lock may report an expired operation after its callback settles. Keep
+    // this operation-local cleanup fact so that cannot authorize another attempt.
+    let cleanupFailure: RetainedReadinessCleanupUnconfirmedError | undefined;
+    try {
+      await this.withLock(barePath, async () => {
+        const refuse = (code: string): never => { throw new Error("retained_readiness_" + code); };
+        const check = () => {
+          if (operation.signal.aborted) refuse("cancelled");
+          if (Date.now() >= operation.deadline) refuse("deadline");
+          operation.budget?.check();
+        };
+        check();
+        const attribution = async () => {
+          const journal = await this.checkedRecovery(barePath, branch, key, expectedSource);
+          const kind = await this.classifyOwnerClonePath(barePath, branch, key, expectedSource.runId, expectedSource.clonePath);
+          if (!kind || (kind === "attempt") !== (expectedSource.attemptId !== undefined)) refuse("attribution");
+          return JSON.stringify(journal);
+        };
+        const journalBefore = await attribution();
+        const roots = [expectedSource.clonePath, path.join(expectedSource.clonePath, ".git"),
+          path.join(expectedSource.clonePath, ".git", "objects"), barePath, path.join(barePath, "objects")];
+        const identities = async () => {
+          const result: Array<{ id: string; uid: number; gid: number; mode: number }> = [];
+          for (const root of roots) {
+            check();
+            const st = await fs.lstat(root, { bigint: true });
+            if (!st.isDirectory() || st.isSymbolicLink()) refuse("unsafe_root");
+            result.push({ id: String(st.dev) + ":" + String(st.ino), uid: Number(st.uid),
+              gid: Number(st.gid), mode: Number(st.mode) & 0o7777 });
+          }
+          return result;
+        };
+        // Only the worker validates the private alternate target. The command
+        // helper compares its exact text and never opens or traverses this target.
+        const alternateTarget = async () => {
+          for (const dir of [barePath, path.join(barePath, "objects"), path.join(barePath, "objects/info")]) {
+            check();
+            let st;
+            try { st = await fs.lstat(dir); }
+            catch (error) {
+              if (dir.endsWith("/objects/info") && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+              throw error;
+            }
+            if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() ||
+                (st.mode & 0o002) !== 0 || ((st.mode & 0o020) !== 0 &&
+                  (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) refuse("alternates");
+          }
+          for (const name of ["alternates", "http-alternates"]) {
+            check();
+            try { await fs.lstat(path.join(barePath, "objects/info", name)); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+            refuse("alternates");
+          }
+        };
+        const before = await identities();
+        await alternateTarget();
+        const hardDeadline = Math.min(operation.deadline, Date.now() + 35000,
+          Date.now() + (operation.budget?.remainingMs() ?? Infinity));
+        const workDeadline = Math.min(Date.now() + 30000, hardDeadline - 5000);
+        if (workDeadline <= Date.now()) refuse("deadline");
+        let root: CodexRootHandle | undefined;
+        let error: string | undefined;
+        const unconfirmedCleanup = () => {
+          error = "cleanup";
+          cleanupFailure ??= new RetainedReadinessCleanupUnconfirmedError();
+        };
+        let child: Promise<void> | undefined;
+        let output = "", outBytes = 0, errBytes = 0;
+        const stopped = new AbortController();
+        const stop = (code: string) => { error ??= code; stopped.abort(); };
+        const cancelled = () => stop("cancelled");
+        const timer = setTimeout(() => stop("deadline"), Math.max(0, workDeadline - Date.now()));
+        operation.signal.addEventListener("abort", cancelled, { once: true });
+        try {
+          check();
+          root = await this.retainedReadinessLaunch({
+            identity: "command", command: process.execPath,
+            args: ["-e", RETAINED_READINESS_HELPER, JSON.stringify({ roots, identities: before.map(row => row.id), deadline: workDeadline })],
+            cwd: "/", env: { LANG: "C" }, supervisorBin: SUPERVISOR_BIN,
+          }, { startupCleanup: { attempt: {}, hardDeadlineAt: hardDeadline },
+            deadlines: { started: Math.max(1, workDeadline - Date.now()) } });
+          if (root.started.uid !== 10003 || !root.started.liveCapsZero || !root.started.noNewPrivs) stop("identity");
+          const { stdin, stdout, stderr } = root.transport;
+          if (!stdin || !stdout || !stderr) stop("missing_pipe");
+          const pipeEnds: Promise<void>[] = [];
+          for (const [stream, isError] of [[stdout, false], [stderr, true]] as const) {
+            if (stream) pipeEnds.push(new Promise<void>(resolve => {
+              if (stream.readableEnded) { resolve(); return; }
+              stream.once("end", resolve);
+              stream.once("close", () => { if (!stream.readableEnded) stop("pipe"); resolve(); });
+            }));
+            stream?.on("error", () => stop("pipe"));
+            stream?.on("data", (chunk: Buffer | string) => {
+              const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              if (isError) errBytes += b.length; else outBytes += b.length;
+              if (outBytes > 4096 || errBytes > 4096) {
+                stop("output_limit"); stdout?.destroy(); stderr?.destroy();
+              } else if (!isError) output += b.toString("utf8");
+            });
+          }
+          stdin?.on("error", () => stop("pipe"));
+          stdin?.end();
+          // Start the actual child join even on missing-pipe/identity refusal. A stop
+          // begins disposal immediately; the outstanding join is still awaited below.
+          child = root.waitChild(Math.max(1, workDeadline - Date.now()))
+            .then(ev => { if (ev.code !== 0) stop("nonzero"); }, () => stop("child"));
+          const abort = new Promise<void>(resolve => {
+            if (stopped.signal.aborted) resolve();
+            else stopped.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          await Promise.race([Promise.all([child, ...pipeEnds]), abort]);
+        } catch (cause) {
+          if (cause instanceof CodexLaunchError && cause.cleanupStatus === "unconfirmed") unconfirmedCleanup();
+          else error ??= "launch";
+        }
+        finally {
+          if (root) {
+            // Wiring failures must join the child too. Both waits are owned here;
+            // disposal starts without waiting for a cancelled child to exit first.
+            child ??= root.waitChild(Math.max(1, workDeadline - Date.now()))
+              .then(() => undefined, () => { error ??= "child"; });
+            try { if (!(await root.dispose(Math.max(1, hardDeadline - Date.now()))).clean) unconfirmedCleanup(); }
+            catch { unconfirmedCleanup(); }
+            await child;
+          }
+          clearTimeout(timer);
+          operation.signal.removeEventListener("abort", cancelled);
+        }
+        if (cleanupFailure) throw cleanupFailure;
+        if (error) refuse(error);
+        check();
+        const success = /^ok ([1-9][0-9]{0,6}) (0|[1-9][0-9]{0,6})\n(?![\s\S])/.exec(output);
+        if (!success || errBytes !== 0 || Number(success[1]) > 2000000 || Number(success[2]) > Number(success[1])) {
+          const reason = /^refused ([a-z_]+)\n(?![\s\S])/.exec(output)?.[1];
+          refuse(reason && RETAINED_READINESS_REASONS.has(reason) ? reason : "malformed");
+        }
+        const expected = before.map((row, index) => index === 2 && row.uid === 10003
+          ? { ...row, mode: row.mode | 0o050 } : row);
+        if (JSON.stringify(await identities()) !== JSON.stringify(expected)) refuse("displaced_root");
+        await alternateTarget();
+        if (await attribution() !== journalBefore) refuse("journal_changed");
+        check();
+      });
+    } catch (error) {
+      // Preserve cleanup uncertainty even if the operation deadline expired during
+      // disposal. The runner still gives actual lifecycle controls precedence.
+      if (cleanupFailure) throw cleanupFailure;
+      if (operation.signal.aborted) throw new Error("retained_readiness_cancelled");
+      if (error instanceof Error && /^retained_readiness_[a-z_]+(?![\s\S])/.test(error.message)) throw error;
+      throw new Error("retained_readiness_validation");
+    }
+  }
+
   /** Attribution only: indexing cannot repair legacy evidence or confer execution authority. */
   private async attributedRecovery(
     barePath: string, branch: string, key: string, expected: RecoverySource,
@@ -6271,7 +6425,7 @@ export class GitCache {
     reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
     guard?: () => void,
   ): Promise<void> {
-    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(reason)) throw new Error("invalid blocker");
+    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit", "readiness_cleanup_unconfirmed"].includes(reason)) throw new Error("invalid blocker");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
       guard?.();
@@ -7724,7 +7878,7 @@ export class GitCache {
               const base = path.basename(p.clonePath);
               const skills = `.uzi-skills-${base}`;
               try {
-                // The skills sibling first (see sweepRetainedArtifacts): a failed clone delete then
+                // The skills sibling first (see deleteRetainedArtifact): a failed clone delete then
                 // orphans nothing.
                 if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills))) {
                   outcomes[i]!.outcome = "retained";
@@ -8374,17 +8528,17 @@ export class GitCache {
   /**
    * issue #1783 M2 — release a predecessor attempt IN PLACE: the attempt-path replacement for
    * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
-   * so the retention sweep may later dispose of it), and for a terminal FOREIGN owner's attempt in
+   * and automatic retention keeps it), and for a terminal FOREIGN owner's attempt in
    * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
    * disposable — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
    * names this exact (runId, clonePath) and refuses otherwise (nothing written), appends the ledger
    * state, and only THEN clears the journal (the caller calls this only once any capture is
    * verified — the #1197 rule). The ledger goes first so the journal never stops protecting a path
    * whose release the ledger does not yet record: a path left `live`, unjournaled and not live here
-   * is a crash-window orphan the retention sweep may delete, which an uncaptured `reclaimed` attempt
+   * is a crash-window orphan automatic retention keeps, which an uncaptured `reclaimed` attempt
    * must never become. A failure after the re-validation throws {@link AttemptReleaseError} with the
    * journal kept. It performs NO filesystem operation on the path: a successor never
-   * moves or deletes a predecessor's path; only the retention sweep disposes of an `abandoned` one.
+   * moves or deletes a predecessor's path; automatic retention keeps an `abandoned` one.
    */
   async releaseAttemptInPlace(
     barePath: string,
@@ -12135,6 +12289,36 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
+  private checkCheckpointCooperation(): void {
+    this.checkReportProof();
+    this.checkRecoveryInterruption();
+    MaintenanceBudget.current()?.check();
+    const scope = this.boundaryProcesses.getStore();
+    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && (scope.now ?? Date.now)() >= scope.softDeadlineAt)) {
+      throw new CheckpointSoftDeadlineError();
+    }
+  }
+
+  /** Called under the existing lock, after observation. Only cooperative checkpoint
+   * cancellation is masked; the spawner, hard signal and release hook are identical. */
+  private maskCheckpointCooperation<T>(action: () => Promise<T>): Promise<T> {
+    const scope = this.boundaryProcesses.getStore();
+    return scope ? this.boundaryProcesses.run(
+      { ...scope, softSignal: undefined, softDeadlineAt: undefined }, action) : action();
+  }
+
+  private async withCheckpointHardOnly(action: () => Promise<TrackingUpdateResult>, checkBefore = true): Promise<TrackingUpdateResult> {
+    if (checkBefore) this.checkCheckpointCooperation();
+    const result = await this.maskCheckpointCooperation(action);
+    if (result.kind === "not_updated") {
+      await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+      return result;
+    }
+    await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+    return result;
+  }
+
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
     const scope = this.boundaryProcesses.getStore();
@@ -12144,7 +12328,7 @@ export class GitCache {
         : "permit-held git operation aborted";
       return new GitBoundaryAbortError(message, cause);
     }
-    if (cause instanceof CheckpointSoftDeadlineError) return cause;
+    if (cause instanceof CheckpointSoftDeadlineError || cause instanceof TrustedExecutionRefusal) return cause;
     if (cause instanceof CheckpointChildStartupTimeoutError) {
       if (scope?.softDeadlineAt === undefined) return cause;
       this.log.warn("checkpoint child startup timeout recovered", {
@@ -12152,12 +12336,69 @@ export class GitCache {
       });
       return new CheckpointSoftDeadlineError(cause);
     }
-    if (scope?.softSignal?.aborted) return new CheckpointSoftDeadlineError();
     if (cause instanceof GitBoundaryAbortError) return cause;
     // Foreign AbortError messages can carry remote text. Preserve the abort type and
     // original cause without copying that message onto the run-log surface.
     if (isAbortLike(cause)) return new GitBoundaryAbortError("permit-held git operation aborted", cause);
     return undefined;
+  }
+
+  /** Listener precedes async launch. Cancellation is owned by the returned handle,
+   * and completion includes both the exact child's completion and cancel settlement. */
+  private async spawnCheckpointProcess(boundary: BoundaryProcessScope, request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> {
+    let child: BoundaryProcessHandle | undefined;
+    let stopped = false;
+    let softCancellation: Promise<void> | undefined;
+    const cancellations: Promise<void>[] = [];
+    let admittingCancellation = true;
+    const cancel = (): Promise<void> => {
+      if (!admittingCancellation || !child) return Promise.resolve();
+      // Independent report/recovery callers retain their own settlement promises.
+      // The handle still owns disposal/reap; this wrapper only joins its requests.
+      const pending = Promise.resolve().then(() => child!.cancel());
+      cancellations.push(pending);
+      void pending.catch(() => undefined);
+      return pending;
+    };
+    const stop = (): void => {
+      if (!admittingCancellation) return;
+      stopped = true;
+      if (child) softCancellation ??= cancel();
+    };
+    boundary.softSignal?.addEventListener("abort", stop, { once: true });
+    if (boundary.softSignal?.aborted) stop();
+    try {
+      child = await boundary.spawn(request);
+    } catch (error) {
+      admittingCancellation = false;
+      boundary.softSignal?.removeEventListener("abort", stop);
+      if (stopped && !(error instanceof CheckpointChildStartupTimeoutError || error instanceof CheckpointSoftDeadlineError)) {
+        throw new CheckpointUnsafeCleanupError("checkpoint child startup cleanup unverified", error);
+      }
+      throw error;
+    }
+    if (stopped) stop();
+    const process = child;
+    const completed = (async () => {
+      const terminal = await Promise.allSettled([process.completed]);
+      // Close both listener and caller admission before capturing the final owner.
+      // No await may separate this closure from the cancellation snapshot.
+      admittingCancellation = false;
+      boundary.softSignal?.removeEventListener("abort", stop);
+      const cancelled = await Promise.allSettled(cancellations);
+      const failedCancellation = cancelled.find(result => result.status === "rejected");
+      if (failedCancellation?.status === "rejected") {
+        throw new CheckpointUnsafeCleanupError("checkpoint child cancellation cleanup unverified", failedCancellation.reason);
+      }
+      if (terminal[0]!.status === "rejected") {
+        if (stopped) throw new CheckpointUnsafeCleanupError("checkpoint child completion cleanup unverified", terminal[0]!.reason);
+        throw terminal[0]!.reason;
+      }
+      return stopped ? { code: -1, softTimedOut: true as const } : terminal[0]!.value;
+    })();
+    void completed.catch(() => undefined);
+    return { ...process, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr,
+      cancel, completed };
   }
 
   private async execScoped(
@@ -12208,10 +12449,10 @@ export class GitCache {
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
     if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
-    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
     const childTimeout = recovery
       ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
       : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
@@ -12222,7 +12463,7 @@ export class GitCache {
     assertNoCredentialedGitWhileQuarantined(options.env);
     let process: BoundaryProcessHandle;
     try {
-      process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
+      process = await this.spawnCheckpointProcess(boundary, { argv: [executable, ...args], cwd, env: options.env, identity,
         ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
         ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
       });
@@ -12359,7 +12600,13 @@ export class GitCache {
       if (err instanceof RunResidueBlockedError) throw err;
       const abort = this.boundaryAbortError(err);
       if (abort) throw abort;
-      throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const failure = new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
+      const stderr = (err as { stderr?: unknown })?.stderr;
+      retainedGitDiagnostics.set(failure, {
+        stderr: typeof stderr === "string" ? stderr : "",
+        context: `${cwd ?? ""}: git ${args.join(" ")}`,
+      });
+      throw failure;
     }
   }
 
@@ -12434,16 +12681,16 @@ export class GitCache {
     recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
-      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
       const childTimeout = recovery
         ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
         : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       let process: BoundaryProcessHandle;
       try {
-        process = await boundary.spawn({
+        process = await this.spawnCheckpointProcess(boundary, {
           argv: [GIT_BIN, ...withDir(cwd, args)],
           cwd,
           env,
@@ -12684,6 +12931,8 @@ export class GitCache {
       }, "command");
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
       // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
       // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
@@ -12878,7 +13127,8 @@ export class GitCache {
   private snapshotOwedOptions(opts: FetchAgentBranchOptions): FetchAgentBranchOptions {
     const c = opts.context;
     return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
-      remotelyConfirmedSha: opts.remotelyConfirmedSha };
+      remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
+      checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
@@ -13264,84 +13514,101 @@ export class GitCache {
     let divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" = "none";
     if (observed.sha) divergence = observed.owner?.runId === c.runId
       ? await this.ancestry(barePath, observed.sha, incoming) : "foreign";
+    let displacedContext: StoredOwedContext | undefined;
+    let incomingCovered: boolean;
     try {
       if (observed.sha && observed.owner &&
           (observed.owner.runId !== c.runId ||
             !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)))) {
-        // Only this run's confirmation can discharge its own debt.
-        await this.pinOwedUnderLock(await this.producingContext(barePath, branch, observed.owner), observed.sha);
-        if (observed.owner.runId === c.runId) retainedShas.push(observed.sha);
+        displacedContext = await this.producingContext(barePath, branch, observed.owner);
       }
-      await this.persistOwedContext(c);
-      if (!(await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha))) {
-        await this.pinOwedUnderLock(c, incoming);
-        retainedShas.push(incoming);
-      }
+      incomingCovered = await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha);
     } catch (cause) {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       return { kind: "not_updated", reason: preservationReason(cause) };
     }
-    try {
-      const key = `uzi-trackowner.${branch}.receiptversion`;
-      await this.runGit(barePath, ["config", "--local", "--replace-all", key, "1"]);
-      if (await this.checkedReceiptGovernance(barePath, branch) !== "governed") {
-        throw new Error("receipt governance readback mismatch");
+    opts.checkpointStep?.("checkpoint_import_premutation");
+    this.checkCheckpointCooperation();
+    return this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
+      opts.checkpointStep?.("checkpoint_import_mutation");
+      try {
+        if (displacedContext && observed.sha) {
+          // Only this run's confirmation can discharge its own debt.
+          await this.pinOwedUnderLock(displacedContext, observed.sha);
+          if (observed.owner?.runId === c.runId) retainedShas.push(observed.sha);
+        }
+        await this.persistOwedContext(c);
+        if (!incomingCovered) {
+          await this.pinOwedUnderLock(c, incoming);
+          retainedShas.push(incoming);
+        }
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
       }
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_pending_failed" };
-    }
-    try {
-      const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
-      if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: preservationReason(cause) };
-    }
-    const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
-      trackingSha: incoming, phase: "pending" };
-    try {
-      await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_pending_failed" };
-    }
-    try {
-      await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), incoming, observed.sha ?? "0".repeat(40)]);
-      if (await this.checkedTrackingSha(barePath, branch) !== incoming) throw new Error("tracking CAS readback mismatch");
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "tracking_update_failed" };
-    }
-    try {
-      await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), c.runId]);
-      if (await this.checkedOwnerStamp(barePath, branch, false) !== c.runId) throw new Error("owner stamp readback mismatch");
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "owner_stamp_failed" };
-    }
-    try {
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, { ...receipt, phase: "committed" });
-      const owner = await this.checkedTrackingOwner(barePath, branch, incoming);
-      if (owner?.runId !== c.runId || owner.generation !== c.generation || owner.context !== this.contextName(c)) throw new Error("committed owner readback mismatch");
-    } catch (cause) {
-      // One best-effort invalidation after an indeterminate committed write/readback.
-      // No retries: if the disk remains unavailable the original owed pin still survives.
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt)
-        .catch(() => undefined);
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_commit_failed" };
-    }
-    return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
-      retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
+      try {
+        const key = `uzi-trackowner.${branch}.receiptversion`;
+        await this.runGit(barePath, ["config", "--local", "--replace-all", key, "1"]);
+        if (await this.checkedReceiptGovernance(barePath, branch) !== "governed") {
+          throw new Error("receipt governance readback mismatch");
+        }
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_pending_failed" };
+      }
+      try {
+        const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
+        if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
+      }
+      const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
+        trackingSha: incoming, phase: "pending" };
+      try {
+        await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_pending_failed" };
+      }
+      try {
+        await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), incoming, observed.sha ?? "0".repeat(40)]);
+        if (await this.checkedTrackingSha(barePath, branch) !== incoming) throw new Error("tracking CAS readback mismatch");
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "tracking_update_failed" };
+      }
+      try {
+        await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), c.runId]);
+        if (await this.checkedOwnerStamp(barePath, branch, false) !== c.runId) throw new Error("owner stamp readback mismatch");
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "owner_stamp_failed" };
+      }
+      try {
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, { ...receipt, phase: "committed" });
+        const owner = await this.checkedTrackingOwner(barePath, branch, incoming);
+        if (owner?.runId !== c.runId || owner.generation !== c.generation || owner.context !== this.contextName(c)) throw new Error("committed owner readback mismatch");
+      } catch (cause) {
+        // One best-effort invalidation after an indeterminate committed write/readback.
+        // No retries: if the disk remains unavailable the original owed pin still survives.
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt)
+          .catch(() => undefined);
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_commit_failed" };
+      }
+      return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
+        retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
+    });
   }
 
   /** Strict restart enumeration; malformed metadata or pins throw rather than appearing empty. */
@@ -13879,6 +14146,181 @@ export class GitCache {
     return result;
   }
 }
+
+const RETAINED_READINESS_REASONS = new Set([
+  "deadline", "entry_limit", "depth_limit", "path_limit", "unsafe_root", "displaced_root",
+  "owner", "group", "access", "special_file", "special_mode", "world_write",
+  "hardlinked_mutation", "classification_drift", "alternates", "filesystem", "identity",
+]);
+
+// Fixed program: builtins only, no Git, shell, repository modules, or inherited env.
+// All traversal is descriptor-relative; only command-owned mutation candidates get fchmod.
+const RETAINED_READINESS_HELPER = String.raw`
+const fs = require("node:fs");
+const C = fs.constants, O_PATH = 0x200000;
+const { roots, identities, deadline } = JSON.parse(process.argv[1]);
+const ENTRY_LIMIT = 2000000, DEPTH_LIMIT = 64, PATH_LIMIT = 4096;
+const fds = new Set();
+let entries = 0, changed = 0;
+const links = [], rootMetadata = [];
+function refuse(reason) { const e = Error(); e.reason = reason; throw e; }
+function check() { if (Date.now() >= deadline) refuse("deadline"); }
+function fp(fd) { return "/proc/self/fd/" + fd; }
+function open(p, flags) { check(); const fd = fs.openSync(p, flags); fds.add(fd); return fd; }
+function close(fd) { fs.closeSync(fd); fds.delete(fd); }
+function id(s) { return String(s.dev) + ":" + String(s.ino); }
+function absolute(p) {
+  if (!p.startsWith("/") || Buffer.byteLength(p) > PATH_LIMIT) refuse("unsafe_root");
+  let fd = open("/", O_PATH | C.O_NOFOLLOW | C.O_DIRECTORY);
+  try {
+    for (const part of p.slice(1).split("/")) {
+      if (!part || part === "." || part === "..") refuse("unsafe_root");
+      const next = open(fp(fd) + "/" + part, O_PATH | C.O_NOFOLLOW | C.O_DIRECTORY);
+      close(fd); fd = next;
+    }
+    return fd;
+  } catch (e) { close(fd); throw e; }
+}
+function signature(s) { return [id(s), s.uid, s.gid, s.mode, s.nlink, s.size, s.mtimeMs, s.ctimeMs].join(":"); }
+function classify(s) {
+  if (!s.isDirectory() && !s.isFile()) refuse("special_file");
+  const mode = s.mode & 4095, dir = s.isDirectory();
+  if (mode & 2) refuse("world_write");
+  if ((mode & 2048) || (!dir && (mode & 3584))) refuse("special_mode");
+  if (![10001,10002,10003].includes(s.uid)) refuse("owner");
+  if (s.uid === 10003 && s.gid !== 10002) refuse("group");
+  const ownerAccess = dir ? 320 : 256;
+  if ((mode & ownerAccess) !== ownerAccess) refuse("access");
+  if (s.uid !== 10003) {
+    if (s.gid !== 10002 && !(s.uid === 10001 && s.gid === 10001)) refuse("group");
+    const needed = dir ? 5 : 4;
+    if (((mode >> 3) & needed) !== needed || s.gid !== 10002) {
+      if ((mode & needed) !== needed) refuse("access");
+    }
+  }
+  return s.uid === 10003 ? mode | (dir ? 40 : 32) : mode;
+}
+function verifyRoots() {
+  for (let index = 0; index < 3; index++) {
+    const fd = absolute(roots[index]);
+    try {
+      const s = fs.fstatSync(fd), before = rootMetadata[index];
+      if (id(s) !== identities[index] || s.uid !== before.uid || s.gid !== before.gid || s.nlink !== before.nlink)
+        refuse("displaced_root");
+      const mode = s.mode & 4095, prior = before.mode & 4095;
+      if (mode !== prior && !(index === 2 && before.uid === 10003 && mode === (prior | 40))) refuse("classification_drift");
+      classify(s);
+    } finally { close(fd); }
+  }
+}
+function verifyLinks() {
+  for (const link of links) {
+    const named = fs.lstatSync(fp(link.parent) + "/" + link.name);
+    if (named.isSymbolicLink() || id(named) !== id(fs.fstatSync(link.fd))) refuse("displaced_root");
+  }
+}
+function normalize(fd) {
+  const s = fs.fstatSync(fd), proposed = classify(s), mode = s.mode & 4095;
+  if (proposed === mode) return s;
+  if (s.isFile() && s.nlink > 1) refuse("hardlinked_mutation");
+  verifyRoots(); verifyLinks();
+  const immediate = fs.fstatSync(fd);
+  if (signature(s) !== signature(immediate) || classify(immediate) !== proposed) refuse("classification_drift");
+  check();
+  fs.fchmodSync(fd, proposed);
+  const after = fs.fstatSync(fd);
+  if (id(after) !== id(s) || after.uid !== s.uid || after.gid !== s.gid ||
+      after.nlink !== s.nlink || after.size !== s.size || after.mtimeMs !== s.mtimeMs ||
+      after.mode !== ((s.mode & ~4095) | proposed) ||
+      classify(after) !== proposed) refuse("classification_drift");
+  verifyRoots(); verifyLinks();
+  changed++;
+  return after;
+}
+function alternates(fd) {
+  const before = fs.fstatSync(fd);
+  if (!before.isFile() || before.size > PATH_LIMIT + 1) refuse("alternates");
+  const buf = Buffer.alloc(PATH_LIMIT + 2);
+  const n = fs.readSync(fd, buf, 0, buf.length, 0);
+  if (!buf.subarray(0,n).equals(Buffer.from(roots[4] + "\n", "utf8")) ||
+      signature(before) !== signature(fs.fstatSync(fd))) refuse("alternates");
+}
+function walk(fd, relative, depth) {
+  check();
+  if (depth > DEPTH_LIMIT) refuse("depth_limit");
+  if (Buffer.byteLength(roots[2] + (relative ? "/" + relative : "")) > PATH_LIMIT) refuse("path_limit");
+  if (++entries > ENTRY_LIMIT) refuse("entry_limit");
+  const s = normalize(fd), stable = signature(s);
+  verifyLinks();
+  if (signature(fs.fstatSync(fd)) !== stable) refuse("classification_drift");
+  if (!s.isDirectory()) return;
+  const directory = fs.opendirSync(fp(fd) + "/.", { encoding: "buffer" });
+  try {
+    let ent;
+    while ((ent = directory.readSync()) !== null) {
+      check();
+      const rawName = ent.name, name = Buffer.isBuffer(rawName) ? rawName.toString("utf8") : rawName;
+      if (Buffer.isBuffer(rawName) && !Buffer.from(name, "utf8").equals(rawName)) refuse("unsafe_root");
+      const rel = relative ? relative + "/" + name : name;
+      if (Buffer.byteLength(roots[2] + "/" + rel) > PATH_LIMIT) refuse("path_limit");
+      if (depth + 1 > DEPTH_LIMIT) refuse("depth_limit");
+      if (rel === "info/http-alternates") refuse("alternates");
+      if (!name || name === "." || name === ".." || name.includes("/")) refuse("unsafe_root");
+      // Inspect a pinned O_PATH descriptor before opening any special device.
+      const pinned = open(fp(fd) + "/" + name, O_PATH | C.O_NOFOLLOW);
+      let child;
+      try {
+        const initial = fs.fstatSync(pinned);
+        classify(initial);
+        child = open(fp(fd) + "/" + name, C.O_RDONLY | C.O_NOFOLLOW |
+          (initial.isDirectory() ? C.O_DIRECTORY : C.O_NONBLOCK));
+        const readable = fs.fstatSync(child);
+        if (id(readable) !== id(initial)) refuse("displaced_root");
+        if (signature(readable) !== signature(initial)) refuse("classification_drift");
+      } catch (e) { if (child !== undefined) close(child); throw e; }
+      finally { close(pinned); }
+      links.push({ parent: fd, name, fd: child });
+      try {
+        if (rel === "info/alternates") {
+          classify(fs.fstatSync(child));
+          alternates(child);
+          normalize(child);
+          if (++entries > ENTRY_LIMIT) refuse("entry_limit");
+        } else walk(child, rel, depth + 1);
+      } finally { links.pop(); close(child); }
+    }
+  } finally { directory.closeSync(); }
+  verifyLinks();
+  if (signature(fs.fstatSync(fd)) !== stable) refuse("classification_drift");
+}
+let result;
+try {
+  if (process.platform !== "linux" || process.getuid() !== 10003 || !process.getgroups().includes(10002)) refuse("identity");
+  const clone = absolute(roots[0]);
+  const git = open(fp(clone) + "/.git", O_PATH | C.O_DIRECTORY | C.O_NOFOLLOW);
+  const objects = open(fp(git) + "/objects", C.O_RDONLY | C.O_DIRECTORY | C.O_NOFOLLOW);
+  for (const [fd,index] of [[clone,0],[git,1],[objects,2]]) {
+    if (id(fs.fstatSync(fd)) !== identities[index]) refuse("displaced_root");
+    const st = fs.fstatSync(fd);
+    classify(st);
+    rootMetadata[index] = st;
+  }
+  // A commondir would redirect subsequent Git reads outside this verified object root.
+  try {
+    const common = open(fp(git) + "/commondir", O_PATH | C.O_NOFOLLOW);
+    close(common); refuse("unsafe_root");
+  } catch (e) { if (e.code !== "ENOENT") throw e; }
+  walk(objects, "", 0);
+  verifyRoots();
+  check();
+  result = "ok " + entries + " " + changed + "\n";
+} catch (e) {
+  result = "refused " + (e.reason || "filesystem") + "\n";
+} finally {
+  for (const fd of fds) { try { fs.closeSync(fd); } catch {} }
+}
+process.stdout.write(result);
+`;
 
 // Trusted cancel reader: Linux pinned parents, regular-file descriptors and raw readlink
 // bytes; no target traversal, Git, config, filters or writes. One failed path aborts

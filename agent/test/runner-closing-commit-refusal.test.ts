@@ -61,6 +61,18 @@ function committing(message: string, obs: { sha?: string }, declare: boolean, fi
 }
 
 describe("declared non-closing run with a closing commit message (issue #2779)", () => {
+  it("M2 stored claim declaration refuses a closing commit after resume without redeclaration", async () => {
+    const { gitlab, all } = fakeGitlab();
+    const obs: { sha?: string } = {};
+    const claim = gitlabClaim(2172, { config: { non_closing: { reason: "Human acceptance pending" } } });
+    await runner(committing("Fixes #2172", obs, false), gitlab).execute(claim);
+    assert.ok(obs.sha);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok((failureReason(claim.run_id) ?? "").includes(obs.sha!));
+    assert.equal(all.length, 0);
+    assert.equal(originHasBranch(), false);
+  });
+
   it("refuses before any push or forge call and names the offending commit", async () => {
     const { gitlab, all } = fakeGitlab();
     const obs: { sha?: string } = {};
@@ -180,8 +192,8 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.equal(gitIn(fx.originPath, ["rev-parse", `refs/heads/${BRANCH}`]), floor, "origin branch untouched");
     assert.equal(all.length, 0);
   });
-  // Issue #2815: the refusal stays keyed on the explicit declaration only. Owner-partial and
-  // scope-capped runs are not chosen by the agent, so a closing commit message does not refuse them.
+  // Legacy APIs retain the #2815 behavior: undeclared partial/capped runs still publish.
+  // Interlocked publication uses the fresh projection and is covered by the M3 guard suite.
   it("an owner-partial run (no declaration) with a closing commit message is not refused", async () => {
     const { gitlab } = fakeGitlab();
     const obs: { sha?: string } = {};

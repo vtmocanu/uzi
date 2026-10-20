@@ -138,6 +138,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-pause-lead-plain":      func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60, true) },
 		"detail-pause-owner-plain":     func(d bool) string { return detailPauseOrigin(d, now, "owner", 60, true) },
 		"detail-pause-neutral-plain":   func(d bool) string { return detailPauseOrigin(d, now, "", 60, true) },
+		"detail-memory-hold-known":     func(d bool) string { return detailMemoryHold(d, now, true) },
+		"detail-memory-hold-missing":   func(d bool) string { return detailMemoryHold(d, now, false) },
 		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval":     func(d bool) string { return detailAwaitingApproval(d, now) },
 		"detail-awaiting-input":        func(d bool) string { return detailAwaitingInput(d, now) },
@@ -1095,6 +1097,29 @@ func detailPaused(dark bool, now time.Time) string {
 	for i := 0; i < 4; i++ {
 		m = key(m, "k") // scroll up → detach follow → PAUSED ↓4 new
 	}
+	return m.View().Content
+}
+
+// detailMemoryHold uses the shared memoryHeldRun fixture through the shipped model.
+// Neither scene asserts current source/archive availability or latest edits.
+func detailMemoryHold(dark bool, now time.Time, knownAllowance bool) string {
+	run := memoryHeldRun()
+	run.ID = detailRunID
+	run.IssueTitle = "Add rate-limit headroom to the scheduler poll"
+	run.StartedAt = tp(now.Add(-4 * time.Minute))
+	run.WorkerRecovery = nil
+	run.RecoveryRetryNotBefore = nil
+	run.RequeueCount = 0
+	run.CheckpointContainsLatest = nil
+	if !knownAllowance {
+		run.MemoryHold = nil
+	}
+	msgs := []apitypes.MessageDTO{
+		msgDTO(1, "text", "lead", "", "", "Reviewing the scheduler backoff and its boundary case.", now.Add(-2*time.Minute)),
+	}
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	m = applyDetail(m, run, msgs)
+	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
 	return m.View().Content
 }
 

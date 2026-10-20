@@ -57,6 +57,7 @@ const SlackRetryAfter = 5 * time.Minute
 // satisfies it; tests inject a fake to assert the persist-first ordering and the
 // prune call.
 type Store interface {
+	IsCodexEarlyResetCurrent(context.Context, store.IsCodexEarlyResetCurrentParams) (bool, error)
 	InsertNotification(ctx context.Context, arg store.InsertNotificationParams) (store.Notification, error)
 	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	// GetSecretEnablement backs the credential re-check a credential-specific alert
@@ -134,7 +135,10 @@ type SlackRender struct {
 	Emoji      string
 	Facts      []string
 	Credential *CredentialFence
-	DeliveryID uuid.UUID
+	// DeliveryTag and CodexAccount fence Codex alerts independently of pointer presence.
+	DeliveryTag  string
+	CodexAccount *CodexAccountFence
+	DeliveryID   uuid.UUID
 }
 
 // durableRender is the persisted form of a SlackRender (notifications.slack_render). It is
@@ -218,7 +222,7 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 		payload = b
 	}
 
-	durable := n.DurableSlack && n.Slack != nil && n.Slack.Credential == nil && s.slack != nil
+	durable := n.DurableSlack && n.Slack != nil && n.Slack.Credential == nil && n.Slack.DeliveryTag == "" && n.Slack.CodexAccount == nil && s.slack != nil
 	var render []byte
 	if durable {
 		b, err := json.Marshal(durableRender{
