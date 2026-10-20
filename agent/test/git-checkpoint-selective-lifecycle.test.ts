@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { GitCache, type BoundaryProcessSpawner, type GitCacheOptions } from "../src/git.js";
 import { nullLogger } from "./helpers.js";
+import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError } from "../src/checkpoint-stop.js";
 
 const TIP = "a".repeat(40), FLOOR = "b".repeat(40), DEFAULT = "c".repeat(40);
 const TREE = "d".repeat(40), BLOB = "e".repeat(40);
@@ -81,6 +82,144 @@ function controlled(target: number, cap = false) {
   };
   return { spawner, entered, cancelled, release, calls, pipes, get live() { return live; } };
 }
+for (const stop of ["signal", "clock"] as const) {
+  it(`soft ${stop} before entry remains cooperative without launching a producer`, async () => {
+    const git = cache(), soft = new AbortController();
+    let launches = 0;
+    Object.assign(git, { spawnGit: async () => { launches++; throw new Error("unexpected launch"); } });
+    if (stop === "signal") soft.abort();
+    await assert.rejects(git.withBoundaryProcessSpawner(
+      async () => { throw new Error("unexpected boundary launch"); }, new AbortController().signal,
+      () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+        undefined, undefined, { signal: AbortSignal.any([soft.signal]) }),
+      { softSignal: soft.signal, softDeadlineAt: 100, now: () => stop === "clock" ? 100 : 0 },
+    ), CheckpointSoftDeadlineError);
+    assert.equal(launches, 0);
+  });
+
+  it(`soft ${stop} during preparation joins disposal and forbids fallback`, async () => {
+    const git = cache(), soft = new AbortController(), owner = controlled(0);
+    let now = 0, returned = false;
+    const pending = git.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
+      () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+        undefined, undefined, { signal: AbortSignal.any([soft.signal]) }),
+      { softSignal: soft.signal, softDeadlineAt: 60_000, now: () => now });
+    const rejected = assert.rejects(pending, CheckpointSoftDeadlineError).then(() => { returned = true; });
+    try {
+      await owner.entered.promise;
+      if (stop === "signal") soft.abort();
+      else { now = 60_000; owner.pipes[0]!.end(); }
+      await tick();
+      assert.equal(returned, false);
+      assert.equal(owner.calls.length, 1);
+      owner.release.resolve();
+      await rejected;
+      assert.equal(owner.live, 0);
+      assert.equal(owner.calls.length, 1);
+    } finally { owner.release.resolve(); await rejected; }
+  });
+
+  it(`replay retains cooperative ${stop} after leaving its boundary scope`, async () => {
+    const git = cache(), soft = new AbortController();
+    let now = 0, preparations = 0, launches = 0;
+    Object.assign(git, {
+      prepareCheckpointObjects: async () => { preparations++; return Buffer.from(TIP + "\\n"); },
+      spawnGit: async () => {
+        launches++;
+        return { stdout: Readable.from(["PACK"]), exited: Promise.resolve(0), cancel() {} };
+      },
+    });
+    const packed = await git.withBoundaryProcessSpawner(
+      async () => { throw new Error("unexpected boundary launch"); }, new AbortController().signal,
+      () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+        undefined, undefined, { signal: AbortSignal.any([soft.signal]) }),
+      { softSignal: soft.signal, softDeadlineAt: 60_000, now: () => now });
+    assert.ok(packed);
+    for await (const _chunk of packed.pack) { /* drain initial producer */ }
+    assert.equal(await packed.exited, 0);
+    if (stop === "signal") soft.abort();
+    else now = 60_000;
+    await assert.rejects(packed.replay(), CheckpointSoftDeadlineError);
+    assert.equal(preparations, 1);
+    assert.equal(launches, 1);
+  });
+}
+
+it("soft interruption during a producer retains typed failure and joins disposal", async () => {
+  const git = cache(), soft = new AbortController(), owner = controlled(0);
+  Object.assign(git, { prepareCheckpointObjects: async () => Buffer.from(TIP + "\n") });
+  const packed = await git.withBoundaryProcessSpawner(owner.spawner, new AbortController().signal,
+    () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+      undefined, undefined, { signal: AbortSignal.any([soft.signal]) }), { softSignal: soft.signal });
+  assert.ok(packed);
+  let returned = false;
+  const drain = (async () => { for await (const _chunk of packed.pack) { /* consume producer */ } })();
+  const rejected = assert.rejects(drain, CheckpointSoftDeadlineError).then(() => { returned = true; });
+  try {
+    await owner.entered.promise;
+    soft.abort();
+    await owner.cancelled.promise;
+    await tick();
+    assert.equal(returned, false, "stream failure waits for verified disposal");
+    owner.release.resolve();
+    await rejected;
+    assert.notEqual(await packed.exited, 0);
+    assert.equal(owner.live, 0);
+    assert.equal(owner.calls.length, 1, "no replacement producer");
+  } finally { owner.release.resolve(); await rejected; }
+});
+
+it("an independent caller abort stays hard even with a cooperative boundary", async () => {
+  const git = cache(), soft = new AbortController(), hard = new AbortController();
+  const reason = new DOMException("independent caller stopped", "AbortError");
+  let launches = 0;
+  Object.assign(git, { spawnGit: async () => { launches++; throw new Error("unexpected launch"); } });
+  hard.abort(reason);
+  soft.abort();
+  await assert.rejects(git.withBoundaryProcessSpawner(
+    async () => { throw new Error("unexpected boundary launch"); }, new AbortController().signal,
+    () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+      undefined, undefined, { signal: AbortSignal.any([hard.signal, soft.signal]) }),
+    { softSignal: soft.signal },
+  ), error => error === reason);
+  assert.equal(launches, 0);
+});
+
+it("a guard's combined caller abort remains cooperative without starting preparation", async () => {
+  const git = cache(), soft = new AbortController();
+  const signal = AbortSignal.any([soft.signal]);
+  let launches = 0;
+  Object.assign(git, { spawnGit: async () => { launches++; throw new Error("unexpected launch"); } });
+  await assert.rejects(git.withBoundaryProcessSpawner(
+    async () => { throw new Error("unexpected boundary launch"); }, new AbortController().signal,
+    () => git.checkpointPack("bare", "task", undefined, undefined, undefined, undefined,
+      async () => { soft.abort(); signal.throwIfAborted(); }, undefined, { signal }),
+    { softSignal: soft.signal },
+  ), CheckpointSoftDeadlineError);
+  assert.equal(launches, 0);
+});
+
+it("soft interruption cannot hide unverified preparation cleanup", async () => {
+  const git = cache(), soft = new AbortController();
+  const unsafe = new CheckpointUnsafeCleanupError("unverified disposal");
+  const owner = controlled(0);
+  const spawner: BoundaryProcessSpawner = async request => {
+    const child = await owner.spawner(request);
+    return { ...child, cancel: async () => { await child.cancel(); throw unsafe; } };
+  };
+  const pending = git.withBoundaryProcessSpawner(spawner, new AbortController().signal,
+    () => git.checkpointPack("bare", "task"), { softSignal: soft.signal });
+  const rejected = assert.rejects(pending, CheckpointUnsafeCleanupError);
+  try {
+    await owner.entered.promise;
+    soft.abort();
+    owner.release.resolve();
+    await rejected;
+    assert.equal(owner.calls.length, 1);
+    assert.equal(owner.live, 0);
+  } finally { owner.release.resolve(); await rejected; }
+});
+
 const stages = ["commits", "all objects", "private objects", "classification", "selection"] as const;
 for (const stage of stages) for (const stop of ["cancel", "deadline"] as const) {
   it(`parent ${stop} at ${stage} joins preparation and forbids every producer`, async t => {

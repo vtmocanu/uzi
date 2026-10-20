@@ -8906,14 +8906,44 @@ export class GitCache {
     const parent = this.recoveryOperation();
     const boundary = this.boundaryProcesses.getStore();
     const budget = MaintenanceBudget.current();
-    const signal = AbortSignal.any([options.signal, parent?.signal, MaintenanceBudget.signal(),
-      budget?.signal, boundary?.signal, boundary?.softSignal]
+    const signal = AbortSignal.any([parent?.signal, MaintenanceBudget.signal(),
+      budget?.signal, boundary?.signal]
       .filter((s): s is AbortSignal => !!s));
     const deadline = Math.min(options.deadline ?? Infinity, parent?.deadline ?? Infinity,
-      budget ? Date.now() + budget.remainingMs() : Infinity,
-      boundary?.softDeadlineAt === undefined ? Infinity
-        : Date.now() + boundary.softDeadlineAt - (boundary.now ?? Date.now)());
-    const run = <T>(action: () => Promise<T>) => this.withRecoveryOperation(signal, deadline, action);
+      budget ? Date.now() + budget.remainingMs() : Infinity);
+    // Cooperative stops stay in the boundary scope: recovery signals and deadlines are hard.
+    // Replay retains the original soft clock and supervisor without renewing either lifetime.
+    const run = <T extends { exited: Promise<number> } | null>(action: () => Promise<T>): Promise<T> => {
+      const scoped = async (): Promise<T> => {
+        // The runner's upload signal can combine the hard permit and cooperative signal.
+        // Relay only independent aborts into recovery; the boundary owns cooperative stopping.
+        const caller = new AbortController();
+        const cooperativeCallerAbort = () => !!boundary?.softSignal?.aborted &&
+          options.signal?.aborted && options.signal.reason === boundary.softSignal.reason;
+        const abort = () => {
+          if (!cooperativeCallerAbort()) caller.abort(options.signal?.reason);
+        };
+        const remove = () => options.signal?.removeEventListener("abort", abort);
+        options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted) abort();
+        try {
+          const result = await this.withRecoveryOperation(AbortSignal.any([signal, caller.signal]), deadline, async () => {
+            this.checkCheckpointCooperation();
+            return action();
+          });
+          if (result) void result.exited.then(remove, remove);
+          else remove();
+          return result;
+        } catch (error) {
+          remove();
+          if (!signal.aborted && !caller.signal.aborted && cooperativeCallerAbort() && error === options.signal?.reason) {
+            throw new CheckpointSoftDeadlineError();
+          }
+          throw error;
+        }
+      };
+      return boundary ? this.boundaryProcesses.run(boundary, scoped) : scoped();
+    };
     return run(async () => {
       const packed = await this.checkpointPackCaptured(barePath, branch, overlay, pinned, onStep,
         sourceSha, beforePack, chainFrom, options);
@@ -9188,7 +9218,8 @@ export class GitCache {
         return Buffer.concat(selected);
       });
     } catch (error) {
-      // Parent lifetime always wins, even if the optimization cap fired during disposal.
+      if (error instanceof CheckpointUnsafeCleanupError) throw error;
+      // Parent lifetime always wins over the optimization cap after verified disposal.
       this.checkCheckpointCooperation();
       if (error === cap || (stop.signal.aborted && error === stop.signal.reason)) return undefined;
       throw error;
