@@ -2998,8 +2998,8 @@ from execution failures:
 `run get` and `run list` use these full labels. The `admin runs` renderer
 uses the same labels, but its endpoint lists active runs only; terminal
 runs are not reachable through that listing. Human stops take precedence
-over `needs landing`, even when the run carries recoverable work. After human
-stops, a raw `failed` run with `fail_origin: base_diverged` reads `rejected`,
+over `needs landing`, even when the run carries recoverable work. When no human
+stop applies, a raw `failed` run with `fail_origin: base_diverged` reads `rejected`,
 before any `needs landing` presentation. On the web, its cause label is
 `rejected: base changed`; the CLI origin field remains raw `base_diverged`. A plan rejection
 keeps its `stopped (plan rejected)` label. Genuine
