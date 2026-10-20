@@ -46,14 +46,14 @@ func (f *custodyContinuationFixture) pillReason(t *testing.T, run uuid.UUID, th 
 
 func TestClaimCustodyLimitFreshBoundaryLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	for _, limit := range []int{4, 12} {
+	for _, limit := range []int32{4, 12} {
 		t.Run(fmt.Sprintf("limit-%d/limit-1 counted holds admit", limit), func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
-			reader := &fakeCustodyLimit{n: int32(limit)}
+			reader := &fakeCustodyLimit{n: limit}
 			f.svc.p.CustodyHoldLimit = reader
-			f.seedUnrelatedOpenHolds(limit - 1)
+			f.seedUnrelatedOpenHolds(int(limit) - 1)
 			fresh := f.seedRun("queued", 0)
-			if r := f.pillReason(t, fresh, thWithLimit(int32(limit))); r == reasonCustodyLimit {
+			if r := f.pillReason(t, fresh, thWithLimit(limit)); r == reasonCustodyLimit {
 				t.Fatalf("pill says custody limit one below it")
 			}
 			if got, _ := f.claim(t); got != fresh {
@@ -65,11 +65,11 @@ func TestClaimCustodyLimitFreshBoundaryLiveDB(t *testing.T) {
 		})
 		t.Run(fmt.Sprintf("limit-%d/limit counted holds block", limit), func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
-			reader := &fakeCustodyLimit{n: int32(limit)}
+			reader := &fakeCustodyLimit{n: limit}
 			f.svc.p.CustodyHoldLimit = reader
-			f.seedUnrelatedOpenHolds(limit)
+			f.seedUnrelatedOpenHolds(int(limit))
 			fresh := f.seedRun("queued", 0)
-			if r := f.pillReason(t, fresh, thWithLimit(int32(limit))); r != reasonCustodyLimit {
+			if r := f.pillReason(t, fresh, thWithLimit(limit)); r != reasonCustodyLimit {
 				t.Fatalf("pill reason = %q, want the custody limit reason at the limit", r)
 			}
 			if got, _ := f.claim(t); got != uuid.Nil {
@@ -87,16 +87,16 @@ func TestClaimCustodyLimitFreshBoundaryLiveDB(t *testing.T) {
 
 func TestClaimCustodyLimitContinuationLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
-	for _, limit := range []int{4, 12} {
+	for _, limit := range []int32{4, 12} {
 		t.Run(fmt.Sprintf("limit-%d/own holds limit-1 continue past the cap", limit), func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
-			f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: int32(limit)}
+			f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: limit}
 			run := f.seedRun("queued", int64(limit-1))
 			for g := int64(1); g <= int64(limit-1); g++ {
 				f.seedHold(f.userID, run, g, "open")
 			}
-			f.seedUnrelatedOpenHolds(limit) // owner is over the cap on other runs' holds alone
-			if r := f.pillReason(t, run, thWithLimit(int32(limit))); r == reasonCustodyLimit {
+			f.seedUnrelatedOpenHolds(int(limit)) // owner is over the cap on other runs' holds alone
+			if r := f.pillReason(t, run, thWithLimit(limit)); r == reasonCustodyLimit {
 				t.Fatalf("pill blocks a continuation-exempt run")
 			}
 			got, gen := f.claim(t)
@@ -106,12 +106,12 @@ func TestClaimCustodyLimitContinuationLiveDB(t *testing.T) {
 		})
 		t.Run(fmt.Sprintf("limit-%d/own holds == limit blocked", limit), func(t *testing.T) {
 			f := newCustodyContinuationFixture(t, env)
-			f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: int32(limit)}
+			f.svc.p.CustodyHoldLimit = &fakeCustodyLimit{n: limit}
 			run := f.seedRun("queued", int64(limit))
 			for g := int64(1); g <= int64(limit); g++ {
 				f.seedHold(f.userID, run, g, "open")
 			}
-			if r := f.pillReason(t, run, thWithLimit(int32(limit))); r != reasonCustodyLimit {
+			if r := f.pillReason(t, run, thWithLimit(limit)); r != reasonCustodyLimit {
 				t.Fatalf("pill reason = %q for a run at its own-hold limit", r)
 			}
 			if got, _ := f.claim(t); got != uuid.Nil {
