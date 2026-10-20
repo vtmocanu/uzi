@@ -1049,6 +1049,53 @@ test("two consecutive completion questions, each continued, each release their o
   }
 });
 
+for (const [label, tamper] of [
+  ["a rejected (applied: false)", (ack: StateAck) => ({ ...ack, applied: false })],
+  ["a stale-claim", (ack: StateAck) => ({ ...ack, staleClaim: true })],
+] as const) {
+  test(`after a completion continue, ${label} Running ACK releases nothing`, async () => {
+    const f = await setup();
+    const monitoring = f.memory.run();
+    let executorError: unknown, proof = false;
+    let questionWork: Promise<unknown> | undefined;
+    const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+    const report = client.reportState.bind(client);
+    const executor: Executor = { run: async ctx => {
+      try {
+        await ctx.reportIteration!(1);
+        const captured = ctx.capturedMemory!()!;
+        questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: "fixture" });
+        await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+        const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+        api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers: ["continue"] }))]);
+        assert.deepEqual(await questionWork, { outcome: "continue", guidance: undefined });
+        let tampered = false;
+        client.reportState = async (...args) => {
+          const ack = await report(...args);
+          if (!tampered && args[1].status === "running") { tampered = true; return tamper(ack); }
+          return ack;
+        };
+        await Promise.resolve(ctx.reportIteration!(2)).catch(() => {});
+        assert.equal(tampered, true);
+        assert.equal(captured.commands.phaseAdmits(captured.context), false, "the completion hold remains");
+        assert.equal(captured.commands.admitsCommands(captured.context), false);
+        proof = true;
+      } catch (error) { executorError = error; throw error; }
+      finally { client.reportState = report; await questionWork?.catch(() => {}); }
+      throw new Error("completion ACK control proof complete");
+    } };
+    try {
+      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim).catch(() => {});
+      if (executorError) throw executorError;
+      assert.equal(proof, true);
+    } finally {
+      clearTimeout(rescue);
+      await f.memory.stop(); await monitoring;
+    }
+  });
+}
+
 test("an expired completion question releases nothing on a later Running ACK", async () => {
   const f = await setup();
   f.claim.config = { ...f.claim.config, completion_hold_window_seconds: 1 } as typeof f.claim.config;
