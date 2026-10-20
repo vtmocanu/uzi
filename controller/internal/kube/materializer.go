@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -426,6 +427,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	for _, o := range byID {
 		if o.Namespace == ns {
 			o.PodsKnown = true
+			// Terminating pods are in byWorker too: they still hold the workdir.
+			o.RunnerLayout = observeRunnerLayout(byWorker[o.ID], true)
 		}
 	}
 	// Derive for every worker we have a DEPLOYMENT for, not merely for every worker we
@@ -611,6 +614,7 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 	tick, order := m.planRoll(ctx, desired, observedByID)
 	errs = append(errs, tick.errors...)
 	ctx = context.WithValue(ctx, rollTickKey{}, tick)
+	m.logLayoutMigrationHeld(desired, observedByID, tick)
 	uncertain := tick.uncertain
 
 	// Pass 2: create / roll the renderable workers. A failure here is collected and
@@ -708,6 +712,14 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	// DinD destruction requires its fenced lifecycle; this legacy helper fails
 	// closed even for combined selectors and force/deadline overrides.
 	if vols.DinD {
+		return nil
+	}
+	// Phase 0, first of all: scaling to zero or deleting the Deployment replaces the
+	// pods, which destroys an old-layout custody-held run workdir (issue #3153). This
+	// precedes the busy/cordon handling so a held worker is left entirely untouched,
+	// and it overrides ForceRoll and the maintenance deadline alike.
+	if migrationHeld(w, obs.RunnerLayout) {
+		m.log.Info(fmt.Sprintf("layout-migration-held-custody worker=%s", w.ID))
 		return nil
 	}
 	// Phase 0: busy drift waits for idle or force-roll. Independent maintenance
@@ -1039,6 +1051,17 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 		// No-drift alone proves neither API health nor ownership of a drain.
 		return nil
 	}
+	// Run-workdir layout migration guard (issue #3153), evaluated BEFORE rollDespiteBusy
+	// so it overrides ForceRoll and the paused-restore arm. Replacing an old-layout pod
+	// of a custody-held Docker worker destroys its in-pod run workdir. No patch, and no
+	// cordon or DrainingSince change: the worker keeps serving. layoutNone (pods known
+	// to be absent) is not held, which is what lets a paused worker be restored.
+	// Narrow exception to the emergency ForceRoll; kubelet eviction and node drain
+	// cannot be guarded here.
+	if migrationHeld(w, obs.RunnerLayout) {
+		m.log.Info(fmt.Sprintf("layout-migration-held-custody worker=%s", w.ID))
+		return nil
+	}
 	// Busy template drift waits for idle; only an operator force-roll bypasses it.
 	// An unchanged retained deployment may resume after the paused guards above.
 	rollDespiteBusy := m.drain.ForceRoll || (paused && obs.Generation == w.Generation && obs.SpecHash == wantHash)
@@ -1170,4 +1193,27 @@ func (m *Materializer) teardown(ctx context.Context, id, ns string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// logLayoutMigrationHeld logs once per tick the desired Docker workers whose
+// custody-held run workdir an old-layout replacement would destroy. Only workers
+// the cluster was observed to hold objects for are counted.
+func (m *Materializer) logLayoutMigrationHeld(desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker, tick *rollTick) {
+	var ids []string
+	for _, w := range desired {
+		obs, ok := observed[w.ID]
+		if !ok {
+			continue
+		}
+		if e := tick.entries[w.ID]; e != nil {
+			obs = e.o
+		}
+		if migrationHeld(w, obs.RunnerLayout) {
+			ids = append(ids, w.ID)
+		}
+	}
+	if len(ids) > 0 {
+		sort.Strings(ids)
+		m.log.Info(fmt.Sprintf("layout-migration-held-custody count=%d workers=%s", len(ids), strings.Join(ids, ",")))
+	}
 }

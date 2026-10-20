@@ -170,6 +170,15 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 		}
 		e.coverage = coverage
+		// Layout migration guard (issue #3153), BEFORE the ForceRoll override below: a
+		// held worker's template replacement would destroy custody-held run state, so
+		// it is never admitted, never a canary and never takes a roll slot. Not
+		// adding it to a pool is what keeps it out of all three.
+		if e.dep != nil && e.drift && migrationHeld(e.w, e.o.RunnerLayout) {
+			t.outcomes[e.w.ID].State = "held"
+			t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
+			continue
+		}
 		if !ok && e.blocked == "" {
 			e.blocked = "API coverage evidence unavailable; explicit recovery required"
 		}
@@ -801,6 +810,9 @@ func independentRebuild(e *rollEntry) bool {
 // Independent maintenance creates no image-roll participant. Existing image-roll
 // reservations are retained by the caller through the retained data claim.
 func (m *Materializer) reserveMaintenanceRoll(e *rollEntry) error {
+	if migrationHeld(e.w, e.o.RunnerLayout) {
+		return fmt.Errorf("layout migration custody hold; maintenance roll refused")
+	}
 	if e.marker == nil && e.drift && !m.drain.ForceRoll {
 		return fmt.Errorf("maintenance image admission unavailable; explicit recovery required")
 	}
@@ -1315,6 +1327,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		if e.dep != nil {
 			failure = replicaFailureReason(e.dep)
 		}
+		e.o.RunnerLayout = observeRunnerLayout(e.pods, true)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health
