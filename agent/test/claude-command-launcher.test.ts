@@ -645,10 +645,17 @@ describe("WRAPPER under the host bash", () => {
     } finally { killPidFile(pidFile); }
     // Builtins keep $$ in this shell without a pipeline whose construction temporarily opens
     // extra fds in that same shell. Recheck each symlink after globbing closes its own dir fd.
-    const fds = await runWrapper('for fd in /proc/$$/fd/*; do if [[ -L $fd ]]; then printf "%s\\n" "${fd##*/}"; fi; done');
+    const probe = 'for fd in /proc/$$/fd/*; do if [[ -L $fd ]]; then printf "%s\\n" "${fd##*/}"; fi; done';
+    // Baseline: the same probe spawned directly. A host may hand this test process fds without
+    // close-on-exec (the CI runner does), and every child inherits those; the wrapper must add none.
+    const direct = spawnSync(BASH, ["-c", probe], { stdio: ["pipe", "pipe", "pipe"], env: WRAPPER_ENV, encoding: "utf8" });
+    assert.equal(direct.status, 0);
+    const baseline = direct.stdout.trim().split(/\s+/).sort();
+    assert.ok(["0", "1", "2"].every(fd => baseline.includes(fd)), "the baseline sees stdio");
+    const fds = await runWrapper(probe);
     assert.equal(fds.code, 0);
     const names = fds.head.trim().split(/\s+/).sort();
-    assert.deepEqual(names, ["0", "1", "2"], "only stdio is open in the command");
+    assert.deepEqual(names, baseline, "the command sees only what a direct child inherits");
   });
 
   it("refuses any pre-existing spill path (FIFO, symlink, dangling symlink) without blocking or writing through it", { skip: WRAPPER_SKIP, timeout: 90000 }, async () => {
