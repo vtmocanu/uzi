@@ -95,7 +95,9 @@ interface InstalledState {
 let state: InstalledState | undefined;
 
 /** A package-contract break for the negative controls (#1565): drop a member, or override
- *  one manifest field. The lock is never changed, so the installer must notice the package. */
+ *  one manifest field. The lock's contract fields (members, manifest values, targets) stay
+ *  as committed; only its checksum is pointed at the synthetic archive, as for the positive
+ *  case, so the integrity gate passes and the rejection comes from contract validation. */
 interface PackageBreak {
   omitMember?: string;
   manifest?: Partial<Record<"layoutVersion" | "entrypoint" | "target", string | number>>;
@@ -281,8 +283,9 @@ describe("install-codex.sh ↔ probeCodexRuntime end-to-end format agreement", (
   });
 });
 
-// #1565: package-contract negative controls. Each breaks the package (never the lock) and
-// the real installer must refuse it before anything is installed or a receipt is written.
+// #1565: package-contract negative controls. Each breaks the package, never the lock's
+// contract fields (the checksum still matches the synthetic archive), and the real
+// installer must refuse it before anything is installed or a receipt is written.
 describe("install-codex.sh refuses a package that breaks the locked contract", () => {
   const otherTarget = (arch: string): string => (arch === "amd64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl");
   const cases: Array<[string, () => PackageBreak, RegExp]> = [
