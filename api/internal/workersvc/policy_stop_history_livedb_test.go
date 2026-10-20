@@ -90,6 +90,7 @@ func stopHistoryHold(t *testing.T, e codexTestEnv, f *gateFix, run uuid.UUID) ap
 	t.Helper()
 	req := policyRequest()
 	req.Phase = strPtr("implementation")
+	req.ExpectedGateRevision = i64(mustRun(t, e, run).GateRevision)
 	if _, disposition, err := f.svc.ReportPolicyHold(e.ctx, f.wkr, run, req); err != nil || disposition != PolicyHoldApplied {
 		t.Fatalf("hold %s: %v", disposition, err)
 	}
@@ -188,12 +189,76 @@ func TestPolicyStopHistoryPublicationLiveDB(t *testing.T) {
 	}
 }
 
+// This control uses actual running plan/progress and ordinary approval receipts.
+// It stops at API acceptance; it does not execute SQL Stop or compose a worker.
+func TestPolicyStopHistoryOrdinaryApprovalLiveDB(t *testing.T) {
+	e, f, run := stopHistoryRunningFixture(t)
+	execution := mustRun(t, e, run)
+	ms := []Milestone{{ID: "m1", Title: "one"}, {ID: "m2", Title: "two"}}
+	first := acceptanceGateRequest()
+	first.Milestones = &ms
+	f.mustPublish(run, first, 1)
+	active := stopHistoryInput(t, e, f, run, "ordinary revised candidate", true)
+	replacement := acceptanceGateRequest()
+	replacement.PlanMd = strPtr("# Ordinary replacement")
+	replacement.Milestones = &ms
+	replacement.ExpectedGateRevision, replacement.RevisionInputID = i64(1), &active
+	f.mustPublish(run, replacement, 2)
+	acceptanceApply(t, f, run, active)
+	approval, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, run, "approve_plan", "", nil,
+		SubmitInputOptions{ExpectedGateRevision: i64(2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptanceAck(t, f, run, approval.ID)
+	acceptanceApply(t, f, run, approval.ID)
+	if acceptanceSource(t, e, run).PrimaryRevision != nil {
+		t.Fatal("ordinary applied approval did not clear human primary")
+	}
+	history := acceptanceHistory(t, e, run)
+	autopilotRevisionReport(t, f, run, StateRequest{State: "running", ClaimGeneration: i64(1)})
+	review := stopHistoryHold(t, e, f, run)
+	before := mustRun(t, e, run)
+	if len(review.Manifest.HumanFeedback) != 1 || review.Manifest.HumanFeedback[0].AppliedAt == nil ||
+		review.Manifest.SourceContext.PrimaryRevision != nil {
+		t.Fatalf("ordinary applied history not disclosed: %+v", review.Manifest)
+	}
+	if !policyRevisionPlanApproved(e.ctx, e.q, before, true) {
+		t.Fatal("current ordinary approval lost before Stop")
+	}
+	result, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, run, "stop", "", nil,
+		SubmitInputOptions{ActionIfMatch: review.StopIfMatch})
+	if err != nil || result.PolicyStop == nil {
+		t.Fatalf("Stop=%+v err=%v", result, err)
+	}
+	if len(result.PolicyStop.SupersededRevisions) != 0 {
+		t.Fatalf("applied history became a waiver: %+v", result.PolicyStop)
+	}
+	after := mustRun(t, e, run)
+	if !policyRevisionPlanApproved(e.ctx, e.q, after, true) {
+		t.Fatal("accepted applied history erased independent current approval")
+	}
+	if acceptanceHistory(t, e, run) != history ||
+		!bytes.Equal(after.PolicyRevisionSource, before.PolicyRevisionSource) ||
+		after.PlanMd != before.PlanMd || after.GateRevision != before.GateRevision ||
+		!bytes.Equal(after.GatePresentedPayload, before.GatePresentedPayload) ||
+		!bytes.Equal(after.MilestonesFrozen, execution.MilestonesFrozen) ||
+		!bytes.Equal(after.MilestonesCompleted, execution.MilestonesCompleted) ||
+		!bytes.Equal(after.CompletionContract, execution.CompletionContract) ||
+		after.CompletionContractVersion != execution.CompletionContractVersion ||
+		after.ContractRevision != execution.ContractRevision {
+		t.Fatal("ordinary Stop changed history, approval provenance or frozen execution")
+	}
+}
+
 func TestPolicyStopHistoryPrimaryDeliveryLiveDB(t *testing.T) {
 	e, f, run := stopHistoryFixture(t)
 	active := stopHistoryInput(t, e, f, run, "taken primary", true)
 	e.exec("UPDATE run_user_inputs SET consumed_at=NULL,consumed_worker_id=NULL,consumed_claim_generation=NULL WHERE id=$1", active)
 	f.svc.p.PolicyStopNegotiated = true
-	_, disposition, err := f.svc.ReportPolicyHold(e.ctx, f.wkr, run, policyRequest())
+	req := policyRequest()
+	req.ExpectedGateRevision = i64(mustRun(t, e, run).GateRevision)
+	_, disposition, err := f.svc.ReportPolicyHold(e.ctx, f.wkr, run, req)
 	if err != nil || disposition != PolicyHoldApplied {
 		t.Fatalf("hold=%s err=%v", disposition, err)
 	}
@@ -252,9 +317,27 @@ func TestPolicyStopHistoryRefusesCorruptionLiveDB(t *testing.T) {
 func TestPolicyStopHistoryDistinctCandidatesLiveDB(t *testing.T) {
 	for _, verdict := range []string{"revise", "approve"} {
 		t.Run(verdict, func(t *testing.T) {
-			e, f, run := stopHistoryRunningFixture(t)
-			// Cross-check admission is explicit fixture configuration.
-			e.exec("UPDATE runs SET auto_approve=true,plan_cross_check_required=true WHERE id=$1", run)
+			e, f, old, _ := acceptanceUnpublishedFixture(t)
+			f.svc.p.PolicyStopNegotiated = true
+			f.svc.p.PlanMaxRevisions = 10
+			repo := uuid.UUID(mustRun(t, e, old).RepoID.Bytes)
+			seedEligibleIssue(t, e, repo, 9473)
+			created, err := f.svc.CreateRun(e.ctx, f.userID, repo, 9473, "checker history component", nil, nil, false, nil, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			run := created.ID
+			// Explicit legacy execution-scope precondition for this checker-history
+			// component. No plan has been persisted: both Submits obey initial
+			// admission. This is not a composed worker initial-planning trace.
+			e.exec(`UPDATE runs SET worker_id=$2,status='running',claim_generation=1,
+ auto_approve=true,plan_cross_check_required=true,session_id='checker-history-session',
+ milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]',
+ milestones_completed='["m1"]',completion_contract_version=NULL,contract_revision=NULL,completion_contract=NULL
+ WHERE id=$1`, run, f.wkr.ID)
+			if initial := mustRun(t, e, run); initial.PlanMd.Valid || initial.GateRevision != 0 {
+				t.Fatal("checker fixture persisted a plan before initial Submit")
+			}
 			c := PlanCrossCheckCandidate{PlanMd: "# Historical candidate A", Milestones: []byte("[]"), RequiredCapabilities: []string{}, RequiredTools: []string{}, SizeClass: "s", BaseCommit: strings.Repeat("a", 40)}
 			first, err := f.svc.SubmitPlanCrossCheck(e.ctx, f.wkr, run, 1, c, 1)
 			if err != nil {
@@ -499,11 +582,14 @@ func TestPolicyStopHistoryFiniteReadsLiveDB(t *testing.T) {
 			if taken == nil || taken.InputID == nil || *taken.InputID != stopDecimal(current) {
 				t.Fatal("second human revision lost source coverage")
 			}
-			if policyRevisionPlanApproved(e.ctx, e.q, mustRun(t, e, run), true) {
-				t.Fatal("human history approved an unapproved candidate")
+			if !policyRevisionPlanApproved(e.ctx, e.q, mustRun(t, e, run), true) {
+				t.Fatal("pre-hold reader lost legacy approval")
 			}
 			counter.ids = nil
 			review := stopHistoryHold(t, e, f, run)
+			if policyRevisionPlanApproved(e.ctx, e.q, mustRun(t, e, run), true) {
+				t.Fatal("human history approved an unapproved candidate after hold")
+			}
 			if mode == "published" {
 				assertIDs(active, predecessor)
 				if len(review.Manifest.HumanFeedback) != 3 {

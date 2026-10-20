@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -327,6 +328,9 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 		return true, nil
 	}
 	projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
+	if r.Kind != runkind.Issue {
+		projection.Milestones = nil
+	}
 	projected, err := projection.canonicalJSON()
 	current, currentErr := gatePayloadFromRow(r).canonicalJSON()
 	return err == nil && currentErr == nil && bytes.Equal(projected, current), nil

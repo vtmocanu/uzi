@@ -242,7 +242,7 @@ type revisionWriterFailureRow struct{ err error }
 
 func (r revisionWriterFailureRow) Scan(...any) error { return r.err }
 func (tx *revisionWriterTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if tx.owner.point == "witness" && strings.HasPrefix(sql, "SELECT (") {
+	if tx.owner.point == "witness" && (strings.HasPrefix(sql, "SELECT (") || strings.HasPrefix(sql, "-- name: GetPolicyStopRevisionInput :one")) {
 		tx.owner.hits++
 		return revisionWriterFailureRow{err: errors.New("injected witness read failure")}
 	}
@@ -256,6 +256,61 @@ func (tx *revisionWriterTx) Commit(ctx context.Context) error {
 	}
 	return tx.Tx.Commit(ctx)
 }
+
+// Public Task birth and real checker child/decision/publication APIs exercise the
+// source carrier component. Go supplies worker ownership and carrier messages;
+// this is not a Task Stop-eligibility or composed-worker proof.
+func TestPolicyRevisionWriterTaskPositiveGateLiveDB(t *testing.T) {
+	e, f, run, candidate := acceptanceUnpublishedFixture(t)
+	if mustRun(t, e, run).Kind != "task" {
+		t.Fatal("expected public Task birth")
+	}
+	take := func(id uuid.UUID) {
+		t.Helper()
+		source := acceptanceSource(t, e, run)
+		key := id.String()
+		if err := f.svc.AppendMessagesForClaim(e.ctx, f.wkr, run, []IncomingMessage{{
+			Seq: mustRun(t, e, run).LastSeq + 1, Kind: "plan_revising",
+			Payload: revisionWriterPayload(t, source, apitypes.PolicyRevisionRef{Source: "plan_cross_check", CrossCheckID: &key}),
+		}}, i64(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := f.svc.SubmitPlanCrossCheck(e.ctx, f.wkr, run, 1, candidate, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	autopilotDecide(t, e, f, first, "revise")
+	take(first.ID)
+	atZero := acceptanceSource(t, e, run)
+	if atZero.Gate != nil || atZero.PrimaryRevision == nil || atZero.PrimaryRevision.CrossCheckID == nil ||
+		*atZero.PrimaryRevision.CrossCheckID != first.ID.String() {
+		t.Fatalf("A was not taken at Gate 0: %+v", atZero)
+	}
+	candidate.PlanMd = "# Task candidate B"
+	second, err := f.svc.SubmitPlanCrossCheck(e.ctx, f.wkr, run, 1, candidate, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	autopilotDecide(t, e, f, second, "revise")
+	req := acceptanceGateRequest()
+	req.PlanMd = &candidate.PlanMd
+	req.RequiredCapabilities, req.RequiredTools = &candidate.RequiredCapabilities, &candidate.RequiredTools
+	req.SizeClass = &candidate.SizeClass
+	f.mustPublish(run, req, 1)
+	take(second.ID)
+	if len(mustRun(t, e, run).PolicyRevisionSource) == 0 {
+		t.Fatal("Task positive-gate carrier cleared verified source coverage")
+	}
+	got := acceptanceSource(t, e, run)
+	if got.Gate == nil || got.Gate.Revision != "1" || got.PrimaryRevision == nil ||
+		got.PrimaryRevision.CrossCheckID == nil || *got.PrimaryRevision.CrossCheckID != second.ID.String() ||
+		len(got.AssociatedCrossChecks) != 1 || got.AssociatedCrossChecks[0].CrossCheckID == nil ||
+		*got.AssociatedCrossChecks[0].CrossCheckID != first.ID.String() {
+		t.Fatalf("B did not retain closed source with A: %+v", got)
+	}
+}
+
 func TestPolicyRevisionWriterRollbackLiveDB(t *testing.T) {
 	for _, point := range []string{"writer", "zero", "witness", "commit"} {
 		t.Run(point, func(t *testing.T) {

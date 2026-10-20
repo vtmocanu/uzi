@@ -39,8 +39,15 @@ func policyRevisionPlanApproved(ctx context.Context, reader any, r store.Run, le
 			return false
 		}
 		m := record.Manifest
-		if m.SourceContext.PrimaryRevision != nil || len(m.HumanFeedback) != 0 {
+		if m.SourceContext.PrimaryRevision != nil {
 			return false
+		}
+		// Parsing above validates the complete immutable history. Only pending
+		// feedback is a waiver; applied history cannot erase a current approval.
+		for _, human := range m.HumanFeedback {
+			if human.AppliedAt == nil {
+				return false
+			}
 		}
 		// The accepted manifest survives settlement. Each stored witness is visited
 		// once; a revision refuses immediately, without reading mutable child rows.

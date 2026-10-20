@@ -101,6 +101,7 @@ func TestPolicyStopAcceptedManifestSelection(t *testing.T) {
 		Version: 1, RunID: run.String(), OutcomeID: uuid.NewString(), SourceGeneration: "1", ReviewGeneration: "2",
 		SourceContext: apitypes.PolicyRevisionSourceV1{Version: 1, AssociatedCrossChecks: []apitypes.PolicyRevisionRef{}},
 		Execution:     apitypes.PolicyStopExecution{ProposedCeiling: 1},
+		HumanFeedback: []apitypes.PolicyStopHumanFeedback{},
 	}
 	encode := func(m apitypes.PolicyStopManifest) []byte {
 		t.Helper()
