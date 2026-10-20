@@ -3438,6 +3438,15 @@ tasks:
       - mkdir -p api/internal/codexprice
       - cp agent/src/codex/codex-pricing.json api/internal/codexprice/codex-pricing.json
 
+  # codex-pins:sync rewrites every registered Codex pin site (agent/test/codex-pins.ts)
+  # from agent/codex/codex-package.lock (#1565). NOT a gate target: it WRITES the tree.
+  # The coordination and parity tests in test:agent are what gate a stale pin.
+  codex-pins:sync:
+    desc: rewrite every Codex version and digest pin from agent/codex/codex-package.lock
+    dir: agent
+    cmds:
+      - node --import tsx test/codex-pins-sync.cli.ts
+
   # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
   # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.
   # NOT a gate target and NOT under gate: it WRITES the tree; check:e2e-registry-doc
