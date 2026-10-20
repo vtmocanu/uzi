@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
@@ -10,9 +11,12 @@ import {
   BaseCommitDivergedError,
   BaseProofError,
   evaluateRequiredBase,
+  RunRunner,
   type ExecutorFactory,
   type RequiredBaseInput,
 } from "../src/runner.js";
+import { GitCache } from "../src/git.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -182,4 +186,102 @@ describe("--require-base on a same-run continuation (issue #3194)", () => {
     const reasons = failed.map((f) => f.body.failure_reason ?? "");
     assert.ok(reasons.some((r) => r.includes("no checkpoint attests")), `held for missing attestation: ${reasons.join(" | ")}`);
   });
+});
+
+// ── issue #3194 acceptance: the REAL budget wall park -> extend -> fresh claim ─────────────────
+//
+// Leg 1 works on the planned commit and parks at its wall (PRD #1497 capture-first park). The park
+// publishes the run's source with the attestation; the stub broker lands the pack in the fixture
+// origin under refs/uzi-checkpoints/<branch>, as the api does. Leg 2 is the claim the server issues
+// after `uzi run extend`: same run, next generation, carrying the persisted tip and its set-only
+// attestation. Clean committed work and dirty WIP (a wip(park) marker) must both continue, on the
+// same worker and on a fresh one.
+
+describe("--require-base wall park -> extend -> reclaim (issue #3194)", () => {
+  const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  const gitInput = (dir: string, args: string[], input: Buffer): string =>
+    execFileSync("git", ["-C", dir, ...args], { env: GIT_ENV, encoding: "utf8", input }).trim();
+
+  /** Land every publish in the fixture origin and record the server's set-only attestation. */
+  function brokerStub(branch: string): { persisted: { tip?: string; attested?: string }; restore: () => void } {
+    const persisted: { tip?: string; attested?: string } = {};
+    const orig = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, tipOid: string, pack: Readable, _signal?: AbortSignal, _gen?: number, attested?: string,
+    ) => {
+      const chunks: Buffer[] = [];
+      for await (const c of pack) chunks.push(Buffer.from(c as Buffer));
+      gitInput(fx.originPath, ["index-pack", "--stdin", "--fix-thin"], Buffer.concat(chunks));
+      gitIn(fx.originPath, ["update-ref", `refs/uzi-checkpoints/${branch}`, tipOid]);
+      persisted.tip = tipOid;
+      if (attested) persisted.attested = attested; // set-only: never cleared by an unattested publish
+      return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/${branch}` } };
+    };
+    return { persisted, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
+  }
+
+  for (const shape of ["committed", "wip"] as const) {
+    for (const where of ["same worker", "fresh worker"] as const) {
+      it(`${shape} work parked at the wall continues on the ${where}`, async () => {
+        const iid = 31940 + (shape === "wip" ? 2 : 0) + (where === "fresh worker" ? 1 : 0);
+        const branch = `agent/issue-${iid}`;
+        const { gitlab } = fakeGitlab();
+        const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+        const legs: RunContext[] = [];
+        const parked: (string | undefined)[] = [];
+        const factory: ExecutorFactory = () => ({
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              legs.push(ctx);
+              if (legs.length === 1) {
+                fs.writeFileSync(path.join(ctx.worktreePath, "leg1.txt"), "leg 1\n");
+                if (shape === "committed") {
+                  gitIn(ctx.worktreePath, ["add", "."]);
+                  gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "leg 1"]);
+                }
+                const outcome = await ctx.parkForWall?.({ completedCount: 0 });
+                parked.push(outcome);
+                return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
+              }
+              assert.ok(fs.existsSync(path.join(ctx.worktreePath, "leg1.txt")), "leg 1's work is present");
+              fs.writeFileSync(path.join(ctx.worktreePath, "leg2.txt"), "leg 2\n");
+              gitIn(ctx.worktreePath, ["add", "."]);
+              gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", "leg 2"]);
+              return { branch: ctx.branch };
+            },
+          },
+        });
+        const claim = gitlabClaim(iid, {
+          plan_approved: true, plan_source: "seeded", plan_md: "# Seeded plan\n- do it", session_id: null,
+          planned_base_commit: planned, require_base_match: true, claim_generation: 1,
+        });
+        const broker = brokerStub(branch);
+        try {
+          await runnerWith(factory, gitlab).execute(claim);
+          assert.equal(parked[0], "parked", "leg 1 parked at the wall");
+          assert.ok(broker.persisted.attested, "the park's publish carried the attestation");
+          const resumed = gitlabClaim(iid, {
+            ...claim, claim_generation: 2,
+            checkpoint_tip: broker.persisted.tip ?? null,
+            checkpoint_attested_source: broker.persisted.attested ?? null,
+          });
+          // `uzi run extend` resumes the paused run; the server's ownership now names the new claim.
+          api.setOwnershipStatus(claim.run_id, "running", 2);
+          const leg2Runner = where === "same worker"
+            ? runnerWith(factory, gitlab)
+            : new RunRunner(client, new GitCache(fs.mkdtempSync(path.join(os.tmpdir(), "cdr-3194-")), nullLogger(),
+              undefined, testGitCacheOptions()), factory, nullLogger(), 20, undefined,
+              { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab });
+          await leg2Runner.execute(resumed);
+        } finally {
+          broker.restore();
+        }
+        assert.equal(legs.length, 2, "leg 2 reached the executor");
+        const refusals = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed")
+          .map((s) => s.body.failure_reason ?? "").filter((r) => r.includes("--require-base"));
+        assert.deepEqual(refusals, [], "the continuation is not refused");
+        assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"), "leg 2 completed");
+      });
+    }
+  }
 });
