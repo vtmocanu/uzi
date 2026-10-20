@@ -100,14 +100,14 @@ function sdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith> {
 /** issue #1783 M2: the SDK runner on a DOCKER-WIRED worker (every claim seeds a fresh attempt
  *  path and a resume starts a fresh model session). The quiescence proof is scripted quiescent:
  *  what is under test is the gate binding, not the process scan. */
-function dockerWiredSdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith> {
+function dockerWiredSdkRunner(approvalMs = 4_000, queryFn: SdkQueryFn = sdkQuery()): ReturnType<typeof runnerWith> {
   const { gitlab } = fakeGitlab();
   const quiescent = async (): Promise<QuiesceRunOutcome> => ({
     process: { state: "quiescent", processes: [], killed: [], detail: "" },
     docker: { state: "docker_unconfirmed", removed: [], detail: "" },
   });
   return runnerWith(
-    () => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn: sdkQuery() }), homeDir }),
+    () => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn }), homeDir }),
     gitlab,
     undefined,
     nullLogger(),
@@ -118,6 +118,24 @@ function dockerWiredSdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith>
       quiesceRun: quiescent,
     },
   );
+}
+
+/** issue #3178: the scripted query, recording every prompt it receives (in turn order). */
+function capturingQuery(prompts: string[]): SdkQueryFn {
+  const inner = sdkQuery();
+  return (params) => {
+    const turn = prompts.length;
+    prompts.push("");
+    return (async function* (): AsyncGenerator<SDKMessage> {
+      const tee = (async function* () {
+        for await (const p of params.prompt) {
+          prompts[turn] += JSON.stringify(p);
+          yield p;
+        }
+      })();
+      yield* inner({ ...params, prompt: tee });
+    })();
+  };
 }
 
 function execute(exec: Executor, claim: ClaimResponse): Promise<void> {
@@ -263,6 +281,32 @@ describe("a resumed revise never keeps the persisted identity (PRD #1795 decisio
     assert.ok(api.isApplied(runId, revise!.id), "the revise was settled by the revised gate");
     assert.deepStrictEqual(exec.verdicts.map((v) => v.kind), ["revise", "approve"]);
   });
+});
+
+// issue #3178: a Docker-wired resume drops the earlier model session, so the first implement turn
+// opens a fresh session; the stored plan the gate re-presented and the human approved must ride it.
+describe("a gate-approved plan reaches the fresh implement session (issue #3178)", () => {
+  const SESSION = "0f5c2d4e-3333-4a2b-8c3d-000000000003";
+  const occurrences = (text: string, needle: string) => text.split(needle).length - 1;
+
+  for (const how of ["approve at the re-presented gate", "bound approve sent before execute"] as const) {
+    it(`${how}: the first implement prompt carries the stored plan once and the run completes`, async () => {
+      newApi();
+      const runId = freshClaim().run_id;
+      seed(runId, 3, ID_X);
+      if (how === "approve at the re-presented gate") approveWhenShown(runId);
+      else send(runId, row("approve_plan", null, { gate_binding: "bound", gate_revision: 3 }));
+      const prompts: string[] = [];
+      const claim = { ...resumeClaim(runId, 2), session_id: SESSION };
+      await dockerWiredSdkRunner(4_000, capturingQuery(prompts)).execute(claim);
+      assert.ok(feed(runId).some((t) => t.includes("earlier session is not resumed")), "the session was dropped");
+      assert.ok(statuses(runId).includes("completed"), "the approve was taken");
+      assert.ok(prompts.length >= 1);
+      const first = prompts[0]!;
+      assert.equal(occurrences(first, "PERSISTED PLAN"), 1, "the stored plan rides the first implement prompt once");
+      assert.ok(first.includes("approved at the plan gate for this run"));
+    });
+  }
 });
 
 describe("a declined re-presentation confirms nothing (PRD #1795 decision 6)", () => {

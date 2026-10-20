@@ -33,6 +33,8 @@ import {
   renderPriorOwnerHistory,
   selectPriorOwnerHistory,
   REVIEWED_RESUME_APPROVAL_GUIDANCE,
+  GATE_APPROVED_FRESH_SESSION_GUIDANCE,
+  CURRENT_EXECUTION_STATE_GUIDANCE,
   FOLLOW_UP_TRAILER,
   REPO_SUBAGENT_UNTRUSTED_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
@@ -2822,5 +2824,56 @@ describe("buildImplementPrompt — reviewed-plan resume framing and earlier owne
     });
     assert.doesNotMatch(p, /HIST-ONE/);
     assert.match(p, /REWORK-TEXT/);
+  });
+});
+
+describe("buildImplementPrompt — gate-approved plan on a fresh session (issue #3178)", () => {
+  const base = { branch: "b", subagentNames: ["coder"], first: true, iteration: 1 };
+  const gate = { ...base, gateApprovedWithoutSession: true, seededPlan: "GATE-PLAN-BODY" };
+
+  it("frames the plan as gate-approved and adds both guidance blocks", () => {
+    const p = buildImplementPrompt(gate);
+    assert.ok(p.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+    assert.ok(p.includes(CURRENT_EXECUTION_STATE_GUIDANCE));
+    assert.match(p, /It is the plan\napproved at the plan gate for this run — carry it out:\n<plan>\nGATE-PLAN-BODY\n<\/plan>/);
+    assert.doesNotMatch(p, /you supplied/);
+    assert.ok(!p.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+  });
+
+  it("states the approval as fact without a return-to-review mechanism", () => {
+    assert.match(GATE_APPROVED_FRESH_SESSION_GUIDANCE, /fresh session/);
+    assert.match(GATE_APPROVED_FRESH_SESSION_GUIDANCE, /could not be resumed/);
+    assert.match(GATE_APPROVED_FRESH_SESSION_GUIDANCE, /Do not request plan approval again/);
+    assert.match(GATE_APPROVED_FRESH_SESSION_GUIDANCE, /not evidence that any step the plan itself scheduled before the gate/);
+  });
+
+  it("is first-turn only", () => {
+    const p = buildImplementPrompt({ ...gate, first: false });
+    assert.ok(!p.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+    assert.ok(!p.includes(CURRENT_EXECUTION_STATE_GUIDANCE));
+    assert.ok(!p.includes("GATE-PLAN-BODY"));
+  });
+
+  it("adds nothing when the flag is absent or false", () => {
+    for (const flag of [undefined, false]) {
+      const p = buildImplementPrompt({ ...gate, gateApprovedWithoutSession: flag });
+      assert.ok(!p.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+      assert.ok(!p.includes(CURRENT_EXECUTION_STATE_GUIDANCE));
+    }
+  });
+
+  it("a seeded run keeps its wording and lacks the new guidance", () => {
+    const p = buildImplementPrompt({ ...gate, seeded: true });
+    assert.match(p, /you supplied for this run — carry it out:/);
+    assert.ok(!p.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+  });
+
+  it("a reviewed resume output is byte-identical with or without the flag", () => {
+    const reviewed = { ...base, reviewedPlanResume: true, seeded: false, seededPlan: "THE-PLAN-BODY" };
+    const plain = buildImplementPrompt(reviewed);
+    const flagged = buildImplementPrompt({ ...reviewed, gateApprovedWithoutSession: true });
+    assert.equal(flagged, plain);
+    assert.ok(plain.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+    assert.ok(!plain.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
   });
 });

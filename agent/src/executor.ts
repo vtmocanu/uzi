@@ -346,7 +346,9 @@ export interface RunContext {
    *  reseed recovered a tree). It both relaxes the preApproved session guard and, crucially,
    *  extends the embedSeededPlan gate so the plan BODY reaches the first implement turn
    *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
-   *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
+   *  the issue — the #209 M2 gap). Issue #3178 adds a second, independent term to that gate
+   *  (a plan approved at the gate with no session to carry it), which does not use this flag.
+   *  Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
   /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
    *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
