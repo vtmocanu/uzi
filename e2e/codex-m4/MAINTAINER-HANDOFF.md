@@ -140,7 +140,10 @@ Because these are committed `owed` clauses, the manifest must discharge each wit
    proof for a chosen `provenBaseCommit` — e.g. the base+jvm proof that already succeeded for
    commit `d054eace` (GitHub Actions run 34757302169) — or run
    `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` on both merge-candidate images and read
-   their digests (e.g. `docker image inspect --format '{{.Id}}'`). This is the same both-image
+   their digests (e.g. `docker image inspect --format '{{.Id}}'`). `task test:codex-proof` (and
+   its scheduled workflow, `.github/workflows/codex-packaged-proof.yml`) runs that proof plus the
+   M3a legs strictly on one image per template and writes each image ID to `receipt.json` only
+   when every leg passed. This is the same both-image
    packaged run `e2e/codex-m3b/README.md` documents; it is CI/maintainer-only because it needs
    native image builds plus a Landlock-capable kernel (in-worker image builds are storage-flaky
    and arm64 is unsupported for this proof — the worker builds no image and needs no cluster
