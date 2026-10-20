@@ -643,8 +643,9 @@ describe("WRAPPER under the host bash", () => {
       assert.ok(quiet.exitMs <= 2000, `a quiet background process held the wrapper for ${String(quiet.exitMs)}ms`);
       assert.ok(quiet.closed, "the transport closed promptly");
     } finally { killPidFile(pidFile); }
-    // Piped so that $$ stays the command's shell (a bare ls would exec in place and list its own dir fd).
-    const fds = await runWrapper('ls /proc/$$/fd | cat');
+    // Builtins keep $$ in this shell without a pipeline whose construction temporarily opens
+    // extra fds in that same shell. Recheck each symlink after globbing closes its own dir fd.
+    const fds = await runWrapper('for fd in /proc/$$/fd/*; do if [[ -L $fd ]]; then printf "%s\\n" "${fd##*/}"; fi; done');
     assert.equal(fds.code, 0);
     const names = fds.head.trim().split(/\s+/).sort();
     assert.deepEqual(names, ["0", "1", "2"], "only stdio is open in the command");
