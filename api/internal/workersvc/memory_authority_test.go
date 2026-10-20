@@ -162,3 +162,52 @@ func TestMemoryAuthorityTracker(t *testing.T) {
 		t.Fatalf("tracker size = %d, want cap %d", n, memoryAuthorityTrackerMaxWorkers)
 	}
 }
+
+// A fresh registration evicts a gated worker's entry, and the next held claim is not gated
+// (issue #3142). Register is the only path that makes a restarted worker report afresh.
+func TestRegisterEvictsMemoryAuthorityEntry(t *testing.T) {
+	w := worker()
+	w.ProtocolCapabilities = capableCaps()
+	fs := &fakeStore{claimErr: pgx.ErrNoRows, registerResult: store.Worker{ID: w.ID, Status: "online"}}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.Claim(context.Background(), w, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !fs.claimParams.MemoryAuthorityLost {
+		t.Fatal("setup: capable claim with the member absent was not gated")
+	}
+	if _, ok := svc.MemoryAuthorityLostFor(w.ID); !ok {
+		t.Fatal("setup: entry not recorded")
+	}
+	if _, _, err := svc.Register(context.Background(), w, "1", "base", nil, nil, capableCaps(), nil); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, ok := svc.MemoryAuthorityLostFor(w.ID); ok {
+		t.Error("Register left the entry")
+	}
+	if _, err := svc.ClaimReported(context.Background(), w, nil, MemoryAuthorityReport{Value: strp("held")}); err != nil {
+		t.Fatal(err)
+	}
+	if fs.claimParams.MemoryAuthorityLost {
+		t.Error("held claim after Register was gated")
+	}
+}
+
+func TestDeleteWorkerEvictsMemoryAuthorityEntry(t *testing.T) {
+	w := worker()
+	w.ProtocolCapabilities = capableCaps()
+	fs := &fakeStore{claimErr: pgx.ErrNoRows, deleteWorkerRows: 1}
+	svc := New(fs, newBox(t), testParams())
+	if _, err := svc.Claim(context.Background(), w, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := svc.MemoryAuthorityLostFor(w.ID); !ok {
+		t.Fatal("setup: entry not recorded")
+	}
+	if err := svc.DeleteWorker(context.Background(), w.UserID, w.ID); err != nil {
+		t.Fatalf("DeleteWorker: %v", err)
+	}
+	if _, ok := svc.MemoryAuthorityLostFor(w.ID); ok {
+		t.Error("DeleteWorker left the entry")
+	}
+}

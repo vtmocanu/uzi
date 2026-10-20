@@ -17,10 +17,11 @@ import (
 // claim_memory_authority_livedb_test.go pins issue #3142's ClaimRun predicate on the REAL
 // query: with @memory_authority_lost a claimant gets only the kinds that never reach a memory
 // runtime (judge, job, review task, profile-bound isolated run), while an ordinary issue run
-// stays queued; with the flag false the issue run claims. Not covered here: a run-lane
-// cross_check child (needs a cross_checks stage fixture; the OR arm is a plain kind test and
-// the cross_check lane itself is skipped in Service.claimLane). Skipped unless
-// UZI_TEST_DATABASE_URL points at a throwaway Postgres (./e2e/run-store-it.sh).
+// stays queued; with the flag false the issue run claims. One exempt fixture per OR arm of the
+// predicate: judge, job, cross_check (run-lane child), review_target_run_id and
+// egress_profile_id. The dedicated cross_check lane is exempt in Service.claimLane (it never
+// sends the flag), proved below through ClaimCrossCheck. Skipped unless UZI_TEST_DATABASE_URL
+// points at a throwaway Postgres (./e2e/run-store-it.sh).
 
 func (f *isoFix) rawClaimParams(w store.Worker, lost bool) store.ClaimRunParams {
 	now := time.Now()
@@ -156,5 +157,48 @@ func TestClaimMemoryAuthorityRegisterEvictsLiveDB(t *testing.T) {
 	}
 	if p == nil || p.RunID != run.String() {
 		t.Fatalf("held claim = %+v, want run %s", p, run)
+	}
+}
+
+// The cross_check OR arm: a legacy run-lane cross_check child is claimable by a lost claimant
+// (it never reaches a memory runtime), through the raw query and through Service.Claim for a
+// capable worker whose request omits the member.
+func TestClaimMemoryAuthorityCrossCheckChildExemptLiveDB(t *testing.T) {
+	t.Run("raw query, lost", func(t *testing.T) {
+		fx := newClaudeCheckerFix(t, BindModePinned)
+		w := wkrRow(t, fx.env, fx.workerID)
+		p := crossCheckClaimParams(w)
+		p.MemoryAuthorityLost = true
+		run, err := fx.env.q.ClaimRun(fx.env.ctx, p)
+		if err != nil || run.ID != fx.kid {
+			t.Fatalf("lost claimant ClaimRun: id=%s err=%v, want the cross_check child %s", run.ID, err, fx.kid)
+		}
+	})
+	t.Run("Service.Claim, capable and member absent", func(t *testing.T) {
+		fx := newClaudeCheckerFix(t, BindModePinned)
+		fx.env.exec(`UPDATE workers SET protocol_capabilities=array_cat(protocol_capabilities,$2) WHERE id=$1`, fx.workerID, capableCaps())
+		w := wkrRow(t, fx.env, fx.workerID)
+		p, err := fx.svc.Claim(fx.env.ctx, w, nil)
+		if err != nil || p == nil || p.RunID != fx.kid.String() {
+			t.Fatalf("Claim = %+v, %v; want the cross_check child %s", p, err, fx.kid)
+		}
+		if _, ok := fx.svc.MemoryAuthorityLostFor(w.ID); !ok {
+			t.Error("the gated run-lane claim was not recorded")
+		}
+	})
+}
+
+// The dedicated cross_check lane is never gated and never recorded, even for a capable worker
+// that omits the member.
+func TestClaimMemoryAuthorityCrossCheckLaneNotGatedLiveDB(t *testing.T) {
+	x := newCheckerCustodyFixture(t, "plan", "claude", "cross_check", false)
+	x.env.exec(`UPDATE workers SET protocol_capabilities=array_cat(protocol_capabilities,$2) WHERE id=$1`, x.worker, capableCaps())
+	w := wkrRow(t, x.env, x.worker)
+	p, err := x.svc.ClaimCrossCheck(x.env.ctx, w, nil)
+	if err != nil || p == nil || p.RunID != x.child.String() {
+		t.Fatalf("ClaimCrossCheck = %+v, %v; want the checker child %s", p, err, x.child)
+	}
+	if _, ok := x.svc.MemoryAuthorityLostFor(w.ID); ok {
+		t.Error("cross_check lane claim recorded a memory-authority entry")
 	}
 }

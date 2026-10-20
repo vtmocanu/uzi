@@ -74,3 +74,35 @@ func TestWorkerClaimMemoryAuthorityDoesNotRelaxSnapshotKillSwitch(t *testing.T) 
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
+
+// chatClaimStore records that the chat lane reached ClaimChatRun and that ClaimRun did not.
+type chatClaimStore struct {
+	*memClaimStore
+	chatCalled bool
+}
+
+func (c *chatClaimStore) ClaimChatRun(context.Context, store.ClaimChatRunParams) (store.Run, error) {
+	c.chatCalled = true
+	return store.Run{}, pgx.ErrNoRows
+}
+
+// The chat lane is a different queue: a worker that has lost memory authority (explicitly, or
+// capable with the member missing) still polls it, and ClaimRun's gate is never involved.
+func TestWorkerClaimChatLaneIgnoresMemoryAuthority(t *testing.T) {
+	capable := []string{capability.WorkerMemoryPressureV1, capability.WorkerMemoryAuthorityClaimV1}
+	for _, body := range []string{``, `{"memory_authority":"lost"}`} {
+		st := &chatClaimStore{memClaimStore: &memClaimStore{protocolStore: &protocolStore{}}}
+		h := newProtocolHandler(t, st)
+		rec := httptest.NewRecorder()
+		h.WorkerClaim(rec, claimReqAs("/api/worker/claim?lane=chat", body, capable))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("body %q: status = %d, want 204: %s", body, rec.Code, rec.Body.String())
+		}
+		if !st.chatCalled {
+			t.Errorf("body %q: chat lane did not reach ClaimChatRun", body)
+		}
+		if st.got != nil {
+			t.Errorf("body %q: chat lane reached ClaimRun: %+v", body, st.got)
+		}
+	}
+}
