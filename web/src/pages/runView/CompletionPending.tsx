@@ -20,13 +20,13 @@ export function CompletionPending({ run }: { run: { completion_pending?: unknown
   if (value === undefined || value === null) return null;
   if (!isCompletionPending(value)) {
     return <section aria-label="Unverified maintainer criteria" className="rounded-md border border-edge p-3 text-sm text-muted">
-      Pending maintainer criteria are unavailable or malformed. Refresh to try again.
+      Pending maintainer criteria could not be read.
     </section>;
   }
   if (value.criteria.length === 0) return null;
-  return <section aria-label="Unverified maintainer criteria" className="min-w-0 space-y-3 rounded-md border border-edge p-3 text-sm text-fg">
+  return <section aria-labelledby="completion-pending-heading" className="min-w-0 space-y-3 rounded-md border border-edge p-3 text-sm text-fg">
     <div>
-      <h3 className="font-semibold">Unverified maintainer criteria ({value.criteria.length})</h3>
+      <h3 id="completion-pending-heading" className="font-semibold">Unverified maintainer criteria ({value.criteria.length})</h3>
       <p className="text-muted">These criteria are unverified. They grant no completion authority and nothing here marks them as met.</p>
     </div>
     <ul className="space-y-3">

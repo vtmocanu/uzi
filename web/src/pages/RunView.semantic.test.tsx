@@ -7,6 +7,7 @@ import { RunView } from "./RunView";
 import { mockRuns } from "../mocks/data/runs";
 import { MOCK_MODE, type Run } from "../lib/api";
 import { hostileSemanticText, semanticGateFixture } from "../lib/semanticGate.testData";
+import { isSemanticGate } from "../lib/semanticGate";
 
 class Socket {
   static last: Socket;
@@ -241,8 +242,8 @@ function pendingFixture() {
     version: 1, contract_revision: 2,
     criteria: [{
       criterion_id: "c9", milestone_id: "m3", kind: "maintainer" as const, text: hostileSemanticText,
-      reason: "<b>Needs sign-off</b>", conditions: ["Release **sign-off**", "<script>alert(1)</script>"],
-      verification_steps: ["Check receipt‮"], authorization_revision: 5, status: "unverified" as const,
+      reason: "<b>Needs sign-off</b>\u202e\u0007", conditions: ["Release **sign-off**", "<script>alert(1)</script>"],
+      verification_steps: ["Check receipt\u202e"], authorization_revision: 5, status: "unverified" as const,
     }],
   };
 }
@@ -256,7 +257,7 @@ async function mountPending() {
 it("renders completion_pending as unverified, non-interactive plain text with full content", async () => {
   current.completion_pending = pendingFixture();
   const { container } = await mountPending();
-  const region = within(screen.getByRole("region", { name: "Unverified maintainer criteria" }));
+  const region = within(screen.getByRole("region", { name: /^Unverified maintainer criteria/ }));
   expect(region.getByText(/grant no completion authority/)).toBeTruthy();
   expect(region.getByText("c9")).toBeTruthy();
   expect(region.getByText("m3")).toBeTruthy();
@@ -265,17 +266,18 @@ it("renders completion_pending as unverified, non-interactive plain text with fu
   expect(region.getByText("<script>alert(1)</script>")).toBeTruthy();
   expect(region.getByText("Check receipt")).toBeTruthy();
   expect(region.getByText(/Owner approved: <img src=x onerror=alert\(1\)>/)).toBeTruthy();
+  expect(region.getByText(/\(milestone .*\) - Unverified/)).toBeTruthy();
   expect(region.queryAllByRole("checkbox")).toHaveLength(0);
   expect(region.queryAllByRole("button")).toHaveLength(0);
-  const section = container.querySelector('section[aria-label="Unverified maintainer criteria"]')!;
+  const section = container.querySelector('section[aria-labelledby="completion-pending-heading"]')!;
   expect(section.querySelector("b, script, img, input")).toBeNull();
-  expect(section.textContent).not.toContain("‮");
+  expect(section.textContent).not.toContain("\u202e");
 });
 
 it.each([undefined, { version: 1, contract_revision: 1, criteria: [] }])("renders nothing for absent or empty completion_pending: %j", async value => {
   if (value !== undefined) current.completion_pending = value;
   await mountPending();
-  expect(screen.queryByRole("region", { name: "Unverified maintainer criteria" })).toBeNull();
+  expect(screen.queryByRole("region", { name: /^Unverified maintainer criteria/ })).toBeNull();
 });
 
 it.each([
@@ -285,8 +287,8 @@ it.each([
 ])("shows a neutral unavailable note for malformed completion_pending: %j", async value => {
   (current as unknown as Record<string, unknown>).completion_pending = value;
   await mountPending();
-  const region = screen.getByRole("region", { name: "Unverified maintainer criteria" });
-  expect(region.textContent).toMatch(/unavailable or malformed/);
+  const region = screen.getByRole("region", { name: /^Unverified maintainer criteria/ });
+  expect(region.textContent).toMatch(/could not be read/);
   expect(within(region).queryAllByRole("checkbox")).toHaveLength(0);
 });
 
@@ -298,6 +300,12 @@ it.each([
   current.semantic_gate!.presentation.semantic_park = park;
   await mountPending();
   expect(within(screen.getByRole("region", { name: "Semantic plan review" })).getByText(text)).toBeTruthy();
+});
+
+it.each([7, null, ["x"], {}])("rejects a non-string semantic_park: %j", park => {
+  const gate = semanticGateFixture();
+  (gate.presentation as unknown as Record<string, unknown>).semantic_park = park;
+  expect(isSemanticGate(gate)).toBe(false);
 });
 
 it("shows no park line when semantic_park is absent", async () => {

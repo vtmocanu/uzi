@@ -143,8 +143,8 @@ export function semanticParkReason(value: string): string {
 
 // completion_pending is publication data: unverified maintainer criteria, never evidence of completion.
 const pendingCriterion = object({
-  criterion_id: string, milestone_id: string, kind: string, text: string, reason: string,
-  conditions: array(string), verification_steps: array(string), authorization_revision: integer, status: string,
+  criterion_id: string, milestone_id: string, kind: v => v === "maintainer", text: string, reason: string,
+  conditions: array(string), verification_steps: array(string), authorization_revision: integer, status: v => v === "unverified",
 });
 const pendingSchema = object({ version: integer, contract_revision: integer, criteria: array(pendingCriterion) });
 export function isCompletionPending(value: unknown): value is CompletionPendingDTO {

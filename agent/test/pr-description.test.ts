@@ -1089,7 +1089,7 @@ describe("maintainer-pending rendering under a scope cap and at the decoder maxi
     const body = renderBody(undefined, completion);
     assert.ok(body.length <= BODY_CAP_CHARS, String(body.length));
     for (const c of criteria) assert.ok(body.includes(c.criterion_id), c.criterion_id);
-    assert.match(body, /more criteria are shown in brief; their full text is on the run page/);
+    assert.match(body, /more criteria are shown in brief; their full text is on the run page for the run owner/);
     assert.equal(body.split(COMPLETION_END).length, 2);
   });
 });

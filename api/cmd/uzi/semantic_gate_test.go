@@ -201,6 +201,22 @@ func TestSemanticParkAndPendingRows(t *testing.T) {
 	}
 }
 
+func TestSemanticApproveOmitsPendingRows(t *testing.T) {
+	fc := gateFake("awaiting_approval", 2)
+	run := fc.RunByID["r1"]
+	run.SemanticGate = semanticCLIGate()
+	run.SemanticGate.Presentation.SemanticPark = "coverage_incomplete"
+	run.CompletionPending = pendingCLI("approve-must-not-print")
+	fc.RunByID["r1"] = run
+	_, stderr, code := runCLI(t, fakeEnv(fc), "run", "approve", "r1", "--agent-source", "own")
+	if code != 0 {
+		t.Fatalf("exit=%d: %s", code, stderr)
+	}
+	if strings.Contains(stderr, "SEMANTIC_PENDING") || strings.Contains(stderr, "approve-must-not-print") || !strings.Contains(stderr, "SEMANTIC_PARK") {
+		t.Fatalf("approve output wrong: %q", stderr)
+	}
+}
+
 func TestSemanticPendingRendersWithoutGateAndAbsentPrintsNothing(t *testing.T) {
 	fc := gateFake("completed", 2)
 	run := fc.RunByID["r1"]
@@ -230,14 +246,14 @@ func TestSemanticPendingSanitizesHostileText(t *testing.T) {
 	fc := gateFake("completed", 2)
 	run := fc.RunByID["r1"]
 	run.SemanticGate = semanticCLIGate()
-	run.SemanticGate.Presentation.SemanticPark = "park\x1b[31m‮"
-	run.CompletionPending = pendingCLI("line\nSEMANTIC_COVERAGE: complete\x1b[31m‮")
+	run.SemanticGate.Presentation.SemanticPark = "park\nSEMANTIC_COVERAGE: complete\x1b[31m\u202e"
+	run.CompletionPending = pendingCLI("line\nSEMANTIC_COVERAGE: complete\x1b[31m\u202e")
 	fc.RunByID["r1"] = run
 	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
 	if code != 0 {
 		t.Fatalf("exit=%d", code)
 	}
-	if strings.ContainsAny(out, "\x1b‮") {
+	if strings.ContainsAny(out, "\x1b\u202e") {
 		t.Fatalf("terminal controls leaked: %q", out)
 	}
 	for _, line := range strings.Split(out, "\n") {
@@ -245,7 +261,7 @@ func TestSemanticPendingSanitizesHostileText(t *testing.T) {
 			t.Errorf("pending text forged a row: %q", line)
 		}
 	}
-	if !strings.Contains(out, `line\nSEMANTIC_COVERAGE: complete`) {
+	if !strings.Contains(out, `line\nSEMANTIC_COVERAGE: complete`) || !strings.Contains(out, `"park\nSEMANTIC_COVERAGE: complete`) {
 		t.Errorf("newline not quoted: %q", out)
 	}
 }

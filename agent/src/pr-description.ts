@@ -1396,7 +1396,7 @@ function pendingBlock(pending: CompletionPending, deferredMilestones: readonly s
     "> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked.",
     ...(scopeCapped ? [] : [`> Outstanding milestones for the source issue: ${outstanding} (a deferred milestone that also holds a maintainer criterion counts once).`]),
     ...full,
-    ...(brief.length > 0 ? [`> ${brief.length} more criteria are shown in brief; their full text is on the run page.`, ...brief] : []),
+    ...(brief.length > 0 ? [`> ${brief.length} more criteria are shown in brief; their full text is on the run page for the run owner.`, ...brief] : []),
   ];
 }
 
