@@ -136,6 +136,7 @@ var jobRefusedRoutes = []struct {
 	{"memory list", "GET", "/memory", false},
 	{"decisions memo save", "POST", "/decisions-memo", false},
 	{"decisions memo read", "GET", "/decisions-memo", false},
+	{"interrupted calls read", "GET", "/interrupted-calls", false},
 	{"forge issue", "GET", "/forge/issues/1", false},
 	{"forge issues", "GET", "/forge/issues", false},
 	{"forge label events", "GET", "/forge/issues/1/label-events", false},

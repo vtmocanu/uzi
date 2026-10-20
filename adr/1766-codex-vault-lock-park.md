@@ -241,6 +241,26 @@ guarantee ignored files, bytes written after proof/capture or work from late wri
 episode-journal terminal failure remains unsolved. This exception changes no retention, deletion, drain, recovery
 framework or episode journal.
 
+### Amendment 2026-10-19 — #3123: done-checkpoint stopping
+
+A proven clean cooperative done-checkpoint stop can avoid registry poisoning;
+it grants no credential authority. Credential or lifecycle failures,
+`refresh_unknown`, uncertain refresh operations, hard expiry and unsafe cleanup
+retain their existing fail-closed handling. Git hard aborts keep their internal
+hard discriminator despite the historical `AbortError` name.
+
+Worker shutdown stops active and queued done attempts, including sibling runs,
+and prevents admission of a fresh advisory snapshot. This leaves #3101's typed
+actual-shutdown credential exception above intact, sharing the original absolute
+15 s default grace. The genuine installer-before-credential reconciliation
+established by #3109 remains required; cancellation must settle the installer,
+not bypass reconciliation with a fabricated ready result. Storage settlement
+cannot be interrupted by the soft allowance and unsafe cleanup can consume the
+grace; source and custody remain retained on a fail-closed result. Local tests
+with promptly settled predecessors verify receiver content within the original
+grace, not a guarantee for stalled storage or hosted/shared-worker acceptance.
+See [ADR-1597](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+
 ## D4: explicit unlock promotion with the ordinary recovery timer as backstop
 
 ### Original decision (#1766; amended by #1792)

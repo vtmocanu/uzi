@@ -175,9 +175,14 @@ A few things worth knowing:
   is instructed to never ask for one; a question that does is itself a red
   flag, wherever it reaches you. Question text is written by the agent from
   repository and issue content, so a hostile file in a repo can steer what
-  you're asked. Your answer is scrubbed of known credential patterns and
-  length-bounded regardless of which surface you answer from, but that's a
-  backstop, not a reason to test it.
+  you're asked. Your answer is scrubbed of known credential patterns
+  regardless of which surface you answer from, but that's a backstop, not a
+  reason to test it.
+- **One answer submission may total up to 40,000 characters** across all its
+  answers. A larger one is rejected with an error naming the size, and
+  nothing is sent, so the question stays open and you can shorten and
+  resend. A Slack thread reply is shorter still: anything past 2,000
+  characters is cut before it is sent, so answer long data on the web or CLI.
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
   answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
   is no configurable default action. The timer is held by the worker, so if
@@ -368,14 +373,19 @@ through these delivery states:
 | Received / Routed — no inclusion report | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |
 
 **When a follow-up is included.** Claude and Codex runs behave identically.
-Each owner follow-up is included in the next ordinary implementation prompt,
-one per turn, oldest first, so with several queued a later one stays Received
-or Routed until its turn starts. A follow-up sent at the plan gate is included
-in the first implementation prompt after you approve. Completion-rework,
-clarification and secret-gate turns carry only their own text; a follow-up
-that is waiting rides the next ordinary turn. "Included" is recorded once the
-turn carrying it reaches the model (the agent's first model activity in that
-turn). The follow-up is fenced as untrusted input in the prompt. After a
+Every queued owner follow-up is included in the next ordinary implementation
+prompt, oldest first, each in its own fenced untrusted block, up to a total of
+40,000 Unicode code points. A single follow-up larger than that cap is still
+included, alone. Whatever does not fit stays Received or Routed and waits for
+the next ordinary turn. The batch counts as one turn: it costs one charged
+implement or review iteration, not one per follow-up. A follow-up sent at the
+plan gate is included in the first implementation prompt after you approve.
+Completion-rework, clarification and secret-gate turns carry only their own
+text; a follow-up that is waiting rides the next ordinary turn. An interactive
+park still delivers one follow-up per park. "Included" is recorded per
+follow-up, once the turn carrying it reaches the model (the agent's first
+model activity in that turn). Each follow-up is fenced as untrusted input in
+the prompt. After a
 resume, a follow-up that a worker received, and that the worker reports
 inclusion for, but that was never included is sent to the lead again at every
 re-claim; rows received by an older worker that does not report inclusion are

@@ -1,3 +1,4 @@
+import { checkCheckpointStop, type CheckpointStop } from "./checkpoint-stop.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 // issue #1597 M2 — the per-flight SINK GATE: an async mutex that serialises every path that moves a
 // run's durable state (the checkpoint closure, the pause/wall/completion parks and the credential-
@@ -40,20 +41,24 @@ export class SinkGate {
 
   /** Run `fn` holding the gate, waiting (and preempting a holding tick) as needed. Re-entrant for
    *  the async call tree that already holds it. */
-  async run<T>(fn: () => Promise<T>): Promise<T> {
+  async run<T>(fn: () => Promise<T>, stop?: CheckpointStop): Promise<T> {
     MaintenanceBudget.current()?.check();
+    checkCheckpointStop(stop);
     const store = owned.getStore() ?? [];
     if (store.some((h) => h.gate === this && h.live)) {
       const result = await fn();
       MaintenanceBudget.current()?.check();
+      checkCheckpointStop(stop);
       return result;
     }
-    await this.lock(MaintenanceBudget.signal());
+    await this.lock(MaintenanceBudget.signal(), stop);
     const hold: Hold = { gate: this, live: true };
     try {
       MaintenanceBudget.current()?.check();
+      checkCheckpointStop(stop);
       const result = await owned.run([...store.filter((h) => h.live), hold], fn);
       MaintenanceBudget.current()?.check();
+      checkCheckpointStop(stop);
       return result;
     } finally {
       hold.live = false;
@@ -81,14 +86,17 @@ export class SinkGate {
     };
   }
 
-  private async lock(signal?: AbortSignal): Promise<void> {
+  private async lock(maintenanceSignal?: AbortSignal, stop?: CheckpointStop): Promise<void> {
+    const signal = maintenanceSignal && stop ? AbortSignal.any([maintenanceSignal, stop.signal]) : maintenanceSignal ?? stop?.signal;
+    MaintenanceBudget.current()?.check();
+    checkCheckpointStop(stop);
     if (!this.locked) {
       this.locked = true;
       this.holderPreempt = undefined;
       return;
     }
     // A tick holds it: ask it to stop. A gated holder has no preempt and is simply waited for.
-    this.holderPreempt?.();
+    const preempt = this.holderPreempt;
     await new Promise<void>((resolve, reject) => {
       const ready = () => {
         signal?.removeEventListener("abort", cancel);
@@ -98,11 +106,15 @@ export class SinkGate {
         const index = this.waiters.indexOf(ready);
         if (index < 0) return;
         this.waiters.splice(index, 1);
-        reject(signal!.reason);
+        if (maintenanceSignal?.aborted) reject(maintenanceSignal.reason);
+        else {
+          try { checkCheckpointStop(stop); } catch (error) { reject(error); }
+        }
       };
       this.waiters.push(ready);
       signal?.addEventListener("abort", cancel, { once: true });
       if (signal?.aborted) cancel();
+      preempt?.();
     });
     this.holderPreempt = undefined;
   }

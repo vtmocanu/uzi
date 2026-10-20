@@ -322,10 +322,13 @@ export interface HarnessAgent {
 
 export interface RunTurnRequest {
   semanticPlanning?: import("./semantic-plan.js").SemanticPlanning;
+  /** Worker has materialized and bound the current claim evidence reader. */
+  ciEvidencePrepared?: boolean;
   /** Worker-derived eligibility for owner-decision requests, never a model declaration. */
   ownerDecisionRequested?: boolean;
   /** Worker-derived park admission; never supplied by the model. */
   parkRunSupported?: boolean;
+  /** Worker-derived, phase-independent run eligibility (issue kind, non-interactive); phase authority stays with the broker. */
   nonInteractiveIssue?: boolean;
   /** Opted-in root registration persists; the broker checks live repair authority per call. */
   codeCrossCheck?: CodeCrossCheckToolAccess;
@@ -377,9 +380,9 @@ export type SafeBoundary =
   | "finalize"
   | "credentialed_git";
 
-/** Issue #1864: which checkpoint sink asked for a `checkpoint` boundary. Diagnostic only:
- *  it labels a boundary failure ("milestone checkpoint" vs "done checkpoint") and never
- *  changes what the boundary does. */
+/** Which sink asked for a checkpoint boundary. The runner selects a done-only scheduling
+ *  allowance from this label; safety also uses it to attribute failures. Scheduling only:
+ *  the label grants no lifecycle or credential authority. */
 export type BoundarySink = "milestone_checkpoint" | "done_checkpoint";
 
 /** Issues #1900 and #1914: fixed finalize/checkpoint steps reported to a boundary.
@@ -401,7 +404,17 @@ export type BoundaryStep =
   | "scratch_preflight"
   | "checkpoint_pack"
   | "checkpoint_upload"
-  | "checkpoint_report";
+  | "checkpoint_report"
+  | "checkpoint_sink_wait"
+  | "checkpoint_import_context"
+  | "checkpoint_import_lock_wait"
+  | "checkpoint_import_transport"
+  | "checkpoint_import_poststage"
+  | "checkpoint_import_premutation"
+  | "checkpoint_import_mutation"
+  | "checkpoint_import_readback"
+  | "checkpoint_code_head"
+  | "checkpoint_bridge";
 
 /** Runner-supplied cause for the actual shutdown checkpoint; credential reauthorization is still required. */
 export interface GracefulShutdownCheckpoint {
@@ -410,8 +423,10 @@ export interface GracefulShutdownCheckpoint {
 }
 
 type BoundaryRequestBase = {
+  /** Internal done-only cooperative cancellation; never grants credential authority. */
+  checkpointStop?: import("./checkpoint-stop.js").CheckpointStop;
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
-  /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
+  /** Scheduling policy only; this label grants no lifecycle or credential authority. */
   sink?: BoundarySink;
   /** Issue #1900: optional probe of the caller's active step. Diagnostic only: the safety
    *  owner reads it synchronously when the boundary deadline fires, to name that step. */

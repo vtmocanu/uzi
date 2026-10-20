@@ -624,8 +624,9 @@ historical-evidence rules above remain in force.
 - `pool_wait`: no token is available in the selected pool. It needs an
   eligible token or an explicit resume attempt, not a recovery timer. See
   [Waiting for a token](anthropic-token.md#waiting-for-a-token).
-- `paused`: an owner-requested hold that requires the owner to resume it.
-  See [Pausing and resuming a run](run-pause.md).
+- `paused`: an ordinary owner- or lead-requested pause requires owner
+  resume. The same status also covers system holds, whose next steps depend
+  on the hold reason. See [Pausing and resuming a run](run-pause.md).
 
 Related: [Run health](run-health.md) and
 [CLI run status](cli.md#run-status-and-what---follow-waits-for).

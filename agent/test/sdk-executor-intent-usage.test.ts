@@ -120,7 +120,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): Probe {
     sessionId: null,
     onSessionId: () => {},
     gatePlan: async () => approve,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: async () => undefined,
     checkpoint: async () => {},
     worktreeFingerprint: async () => "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",

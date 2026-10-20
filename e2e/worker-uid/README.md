@@ -1,7 +1,7 @@
 # Worker UID test lane
 
 `task test:agent:worker-uid` builds the base worker image and runs the ownership and cleanup
-leaves from five test files through its root entrypoint, which drops to the worker UID with runner
+leaves from eight test files through its root entrypoint, which drops to the worker UID with runner
 group membership and the production ambient capabilities. It runs offline, with
 disposable data and Nix mounts, and removes only its own containers and their
 anonymous volumes and its two named tool volumes after checking exact resource
@@ -88,10 +88,15 @@ tests must use literal titles and static `it` / `describe` declarations. The com
 inventory also recognizes explicit `test(...)` in the `.mts` fixture and requires
 its exact top-level proof title. Both inventories use this harness’s scoped
 `tsconfig.json`, which includes `.mts` files and future calibration fixtures
-without changing the agent project. The default inventory retains the five old
-files; `node e2e/worker-uid/inventory.mjs command` emits the separate command
-inventory. `expected.json` / `results.xml` and `command-expected.json` /
-`command-results.xml` are checked separately. The JUnit
+without changing the agent project. A sixth file, `agent/test/git-retained-permissions.test.ts`, adds nine required literal leaves for real-UID retained recovery: loose and packed objects, captured-tip ordering, the four mixed worker/runner hardlink variants, command-owned hardlink mutation refusal, and unsuccessful recovery retention. Its required titles cannot disappear, become nonliteral, move outside the UID gate, or be duplicated without failing inventory validation. Owner-only command objects and both existing hardlink names are checked under the real distinct UIDs. Root, single-UID execution and skipped results do not prove these cases. The command-owned hardlink refusal must reach `hardlinked_mutation`; a generic capture failure does not satisfy it. Both negative cases compare every original private object and directory snapshot plus exact source refs, allowing only the specified partial permission additions; both hardlink names remain exactly unchanged. The corrupt-source case must reach a blob-specific real fetch-integrity refusal after real readiness and clean runner status, rather than merely stop without adoption.
+
+A seventh file, `agent/test/claude-command-launcher.test.ts`, contributes its three literal leaves under the single `INIT_SKIP`-gated suite `real runner-uid command launcher` (issue #2471): the image supervisor launched at runner UID 10002 through the guarded-command wrapper, the memory-guard launcher preflight, and the image bash version. Its fake-supervisor and host-bash wrapper tests run in the normal host shards, not in this lane.
+
+An eighth file, `e2e/worker-uid/claude-command-real.test.mts`, contributes twelve required literal `it` leaves under the single `INIT_SKIP`-gated suite `real Claude guarded command lane` (issue #2471, M4). It runs in the same root-start worker-proof container (worker UID 10001, `UZI_UID_SPLIT=1`, runner UID 10002) and drives the real `ClaudeCommandLane` with the real launcher, image supervisor and `WorkerMemoryCommands`, entering each call through `lane.hook` then `lane.handle` as the SDK does. It proves: guard-style cancel and short-deadline expiry drain a detached command and its descendants; cancelling one run's command leaves a sibling run's command alive; another attempt's capture scan skips a live command's recorded root while the owner's reap still kills it; a candidate whose root start time differs from the enrolled one (simulating PID reuse by altering the observed start time, not by reusing a kernel PID) cancels nothing; a larger unattributed tree is never selected; the exact `worker_memory_pressure` result becomes the selected command's tool error; registrations from other sources, and unminted, cloned or foreign-context metadata, are never enrolled yet the command still runs; a command declaring its own worker marks gets no protection; a stopped supervisor, with a non-dumpable runner-UID descendant under it, cannot confirm disposal, so the lane is poisoned, exactly that supervisor is killed, and the owner's own reap reports `unverified` (never `quiescent`) while the descendant lives; and native Bash is kept when the guard is off. The non-dumpable descendant needs no prctl helper: the kernel marks a process non-dumpable when it execs a file it cannot read, so the case runs a worker-owned mode 0711 copy of the image's busybox (executable, not readable, by the runner UID) by its applet name. The inventory requires exactly one UID gate and all twelve literals under that suite; a missing, renamed, nonliteral, nested, duplicate or ungated leaf fails closed.
+
+The default inventory retains the five old files and adds the retained recovery file, the claude-command-launcher file (its three literal leaves above) and the claude-command-real file (its twelve); `node e2e/worker-uid/inventory.mjs command` emits the separate command
+inventory and `node e2e/worker-uid/inventory.mjs single` the single-uid inventory. `expected.json` / `results.xml`, `command-expected.json` /
+`command-results.xml` and `single-expected.json` / `single-<n>-results.xml` are checked separately. The JUnit
 checker requires each leaf exactly once and
 rejects skip, failure, error and missing results. Node and container failures,
 including exit 77 and watchdog timeouts, also fail the target even when the checker
@@ -116,6 +121,21 @@ or inherited skip, failure or error with its originating suite or testcase.
 JUnit messages, types, text and stacks are preserved; empty diagnostics say
 `no reason supplied`. Node 24 JUnit includes assertion and cancellation reasons,
 so no additional reporter is needed.
+
+After the command proof, a single-uid phase runs `e2e/worker-uid/single-uid-preflight.test.mts` in three more
+containers, each started directly as UID/GID 10001 with all capabilities dropped, no root entrypoint and
+no UID split (the Kubernetes `runAsUser` posture), from the base image so its supervisor is used. They
+differ only in the posture under test, named by `UZI_SINGLE_UID_EXPECT`, and each asserts from the process
+status file that it really has that posture before calling the real `memoryLauncherPreflight()`:
+
+- `ok`: `no-new-privileges`, empty bounding set; the preflight must return `{ ok: true }`.
+- `profile:noNewPrivs`: started without `no-new-privileges`; the preflight must refuse with that reason.
+- `profile:capBnd`: `no-new-privileges` plus one retained capability (`CHOWN`), so the bounding set is
+  nonzero while the effective set stays empty; the preflight must refuse with that reason.
+
+Each container gets a 65-second watchdog plus five-second kill grace (70 seconds), 60 seconds per leaf, and
+its own `single-<n>-results.xml` checked against `single-expected.json`; any container or checker failure
+fails the run. Worst case is 210 seconds on top of the other phases.
 
 `task test:worker-uid-harness` runs the Docker-free checker, shell wrapper and
 required-check regression tests. The wrapper tests stub Node inventory/pattern,
@@ -222,7 +242,7 @@ an active-leg failure. A demonstrated unavailable reader before any command
 launch permits collecting the other size's failed prerequisite evidence.
 
 Earlier local prerequisite probes lacked `memory.pressure` at both sizes.
-On any such host this fixture fails before load; there is no PSI substitute or
+On any such host this fixture fails before load; it has no PSI substitute (only the Node diagnostic guarded leg below does) or
 privileged fallback. CI acceptance requires both complete successful bound
 reports; local prerequisite failures and synthetic regressions provide no
 measurement acceptance. Docker-free regression data lives in
@@ -233,6 +253,48 @@ python3 -B -m unittest discover -s e2e/worker-uid -p 'calibration*_test.py'
 node --import ./agent/node_modules/tsx/dist/loader.mjs --test --test-concurrency=1 --test-timeout=120000 e2e/worker-uid/calibration-producer.test.mts
 cd agent && npx tsc --noEmit -p ../e2e/worker-uid/tsconfig.json
 ```
+
+### Node assert diagnostic calibration (issue #2471)
+
+After the two reports, `calibration.py` runs a measurement-only step of eight serial
+containers (both sizes, same flags as the fixtures, `--user 10003`, capless, no network).
+Per size: the generic Node 24 workload `many-mismatch` (`assert.deepStrictEqual` on two
+200,000-pair arrays, every second pair differing) and its two controls, `equivalent`
+(equal arrays) and `bounded-diagnostic` (boolean compare plus a fixed short message), each
+as a plain child so a kernel OOM kill is observable; and the **guarded leg**
+`guarded-many-mismatch`, the same workload run as a guarded Claude command. The guarded
+leg drives the real `ClaudeCommandLane` (`lane.hook` then `lane.handle`, as the SDK does),
+the real `launchRunnerCommandRoot` with the image supervisor at the container's own uid,
+a real `WorkerMemoryCommands` context, the real `WorkerMemoryReader` and the real
+`WorkerMemoryMonitor`; only the reservation ack service is a loopback fixture
+(`calibration-claude-guard.mts`). Each result is one JSON line between the
+`UZI_NODE_DIAGNOSTIC_BEGIN/END` markers and is kept in `node-diagnostic.json`.
+
+The guarded measurement reports the node version; the sampled series
+(`[sampleId, ms, currentBytes]`, bounded to 200) and peak growth; the threshold-crossing
+sample, reservation request/grant, cancel and confirmed-drain times with the derived
+crossing-to-reserve, cancel-to-drain and crossing-to-drain latencies; the exact
+`worker_memory_pressure` tool result the lane returned for the attributed tool use (or the
+recorded `oom_before_guard`, `deadline` or `exited_before_guard` outcome; the last requires the workload's own report line in the output as evidence it started); and
+cleanup evidence (lane live count and quiesce, empty registry, the command's pids gone, no
+leftover process, `oom_kill` delta, `memory.peak`). The guard's high-water mark (half the
+cgroup limit), the 250 ms sampling period and the 5 s response budget are measurement
+parameters picked to give the guard room to act, never hosted production thresholds. A guard
+that did not act in time or an OOM kill is a recorded result; a lane or launcher construction
+failure, a launch failure or lane refusal, a supervision or enrollment failure, an admission closed
+without the guard's result, a workload that never started (exit 127, an import error), unparseable
+output or unconfirmed cleanup fails like any host error, after the owned
+container is removed. A kernel kill of the container's main process before it reports (exit
+137) is recorded as `container_killed_no_report`. The guarded container's host bound is 90 s (the
+plain workloads keep 30 s), above the leg's ~59 s in-container worst case, so a slow `deadline`
+outcome is recorded rather than cut by the host.
+
+A host kernel without PSI (no `memory.pressure`) makes the production reader report
+`absent`. Only in this guarded leg's harness the reader gets a `readBytes` that is the real
+bounded read except that an absent `memory.pressure` is replaced by an all-zero PSI
+document; every other file (current, max, stat, events) stays real. Any such run sets
+`psiSynthesized: true` in the measurement, so a report never claims real PSI. The two
+Codex fixtures above have no such substitute and still fail on that host.
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.

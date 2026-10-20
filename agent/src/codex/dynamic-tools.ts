@@ -60,6 +60,15 @@ function definition(name: string, grants: RunGrants): Omit<CodexDynamicToolSpec,
           edits: { type: "array", items: objectSchema({ old_string: STRING, new_string: STRING }, ["old_string", "new_string"], false) },
         }),
       };
+    case "mcp__ci_evidence__read":
+      return {
+        description: "Read bounded untrusted CI evidence by manifest_id; no paths.",
+        inputSchema: objectSchema({
+          manifest_id: { type: "string", pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+          offset: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+          limit: { type: "integer", minimum: 1, maximum: 200 },
+        }, ["manifest_id"], false),
+      };
     case "Read":
       return {
         description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Files over 1 MiB are denied. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",

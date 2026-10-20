@@ -54,6 +54,7 @@ import {
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import type { UsageLeg, UsageSink } from "./usage-recorder.js";
 import { ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
+import { GUARDED_COMMAND_TOOL } from "./claude-command/grants.js";
 import { parsePluginErrors } from "./plugin-errors.js";
 import type {
   HarnessContext,
@@ -161,6 +162,8 @@ export interface ClaudeTurnConfig {
   model?: string;
   effort?: SdkOptions["effort"];
   attributionSettings?: SdkOptions["settings"];
+  /** Issue #2471: route native Bash to the guarded in-process command tool (GUARDED_COMMAND_TOOL). */
+  guardedCommand?: true;
 }
 
 /**
@@ -168,7 +171,7 @@ export interface ClaudeTurnConfig {
  * EXACTLY the insertion order the owner's literal used before the M2 extraction, so a
  * snapshot/stringify comparison in the frozen tests still matches byte-for-byte.
  */
-function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
+export function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
   const options: SdkOptions = {
     cwd: config.cwd,
     env: config.env,
@@ -197,6 +200,10 @@ function buildSdkOptions(config: ClaudeTurnConfig): SdkOptions {
   if (config.model) options.model = config.model;
   if (config.effort) options.effort = config.effort;
   if (config.attributionSettings) options.settings = config.attributionSettings;
+  if (config.guardedCommand) {
+    options.toolAliases = { Bash: GUARDED_COMMAND_TOOL };
+    options.disallowedTools = [...ASYNC_DEFERRAL_TOOLS, "Bash", "Monitor"];
+  }
   return options;
 }
 

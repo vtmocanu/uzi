@@ -391,9 +391,15 @@ the check when it is created; later edits affect new checks only. Forking from
 an older default-branch commit does not select older instructions. The pin is
 acquired even with consent off, but the file is read only with consent on.
 An absent, unreadable, unsafe or oversized file leaves a successful pin with empty text.
-If quiescence or fresh Git acquisition fails, the advisory check is incomplete
-(`snapshot_failed`): no durable snapshot ref, metadata or instructions are
-created, and no SHA is invented.
+If the initial done checkpoint leaves its snapshot unavailable, the existing
+snapshot request freshly quiesces and reimports once, using the retained exact
+pre-import head. If the initial head was unreadable, only the successfully
+settled normal completion-record callback can supply the fallback. A null or
+moved candidate gives `snapshot_failed`, without substituting a new head.
+Pinning requires verified producing context, claim generation and committed
+tracking receipt. Ordinary failure or a clean soft stop leaves SHA-free
+incomplete evidence; no successful snapshot or instruction provenance is claimed.
+Hard boundary, Git hard-abort and unsafe-cleanup errors fail closed.
 
 Both completion paths freshly quiesce the lead before the credentialed fetch
 and durable local pin, within the worker's held boundary. Branch validation
@@ -411,10 +417,19 @@ and repair compare the pin explicitly. Status exposes nullable
 NULL/absent provenance and their historical digests, without backfill.
 
 The existing 64 KiB, 8-hop, repository-root, `.git/`, regular-blob, import
-stripping and advisory-fencing protections remain in place. Git acquisition
-retains its pre-existing unbounded budgets; this change adds no acquisition
-credential, source or background process and does not establish a new security
-or acquisition-time bound.
+stripping and advisory-fencing protections remain in place. The earlier
+acquisition-budget description predates the bounded reaped Codex done path.
+Explicit reaped Codex done checkpoints with
+`executor.safety` now have independent absolute 60 s soft / 90 s hard allowances
+for the initial checkpoint and existing fresh snapshot request (up to nearly
+180 s combined). The clocks include gate/queue waits, preliminary reads,
+reconciliation, quiescence and actions; commands do not restart them.
+Shutdown/lifecycle abort prevents fresh admission. Shared Claude and non-reaped
+paths are unchanged. This adds no model turn, completion attempt, checker
+invocation or repair rerun. Finalize independently imports work with its existing
+guards and separate 50-minute boundary; it is not a snapshot retry. Storage
+settlement can outlast an allowance; see [Checkpoint budgets](./configuration.md#checkpoints-two-tiers-prd-122-m8-prd-267).
+These source/test boundaries do not establish hosted acceptance.
 
 ### Snapshot cleanup
 

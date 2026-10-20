@@ -8,6 +8,7 @@ import { createCodexExecutionSafety, CodexBoundaryError } from "../src/codex/saf
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
 import type { BoundaryRequest } from "../src/harness.js";
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../src/checkpoint-stop.js";
 import { SteeringChannel, PauseNowSignal, CredentialSwitchSignal } from "../src/steering.js";
 import { nullLogger, withReceipts } from "./helpers.js";
 
@@ -619,3 +620,150 @@ describe("M1 shutdown checkpoint authority", () => {
     } finally { budget.dispose(); }
   });
 });
+
+for (const side of ["captured", "reconciler"] as const) {
+  for (const other of ["active", "pause"] as const) {
+    for (const reason of ["untyped", "hard", "credential"] as const) {
+      it(`soft admission rejects ${side} ${reason} lifecycle with ${other} peer`, async () => {
+        const captured = new AbortController(), actual = new AbortController(), soft = new AbortController();
+        const bad = side === "captured" ? captured : actual;
+        const peer = side === "captured" ? actual : captured;
+        bad.abort(reason === "untyped" ? undefined : reason === "credential"
+          ? new CredentialSwitchSignal() : new Error("hard stop"));
+        if (other === "pause") peer.abort(new PauseNowSignal());
+        soft.abort();
+        const stop = { signal: soft.signal, lifecycleSignal: captured.signal,
+          cooperativeLifecycleReason: (value: unknown) => value instanceof PauseNowSignal };
+        assert.equal(cleanCheckpointAdmission(stop, actual.signal), false);
+        let calls = 0;
+        const reconcile = buildRunLaneReconcile("run-shutdown", {
+          releaseCodex: async () => { calls++; return { access_token: "fixture-next" }; },
+        } as never, binding("api_key"), () => {}, undefined, undefined, actual.signal);
+        const result = await reconcile({ boundary: "checkpoint", deadlineMs: 1000, checkpointStop: stop },
+          new AbortController().signal);
+        assert.equal(result.kind, "blocked");
+        assert.equal(calls, 0);
+      });
+    }
+  }
+}
+
+it("soft admission accepts two typed pause lifecycles without credential exchange", async () => {
+  const captured = new AbortController(), actual = new AbortController(), soft = new AbortController();
+  captured.abort(new PauseNowSignal()); actual.abort(new PauseNowSignal()); soft.abort();
+  const stop = { signal: soft.signal, lifecycleSignal: captured.signal,
+    cooperativeLifecycleReason: (value: unknown) => value instanceof PauseNowSignal };
+  assert.equal(cleanCheckpointAdmission(stop, actual.signal), true);
+  let calls = 0;
+  const reconcile = buildRunLaneReconcile("run-shutdown", {
+    releaseCodex: async () => { calls++; return { access_token: "fixture-next" }; },
+  } as never, binding("api_key"), () => {}, undefined, undefined, actual.signal);
+  await assert.rejects(reconcile({ boundary: "checkpoint", deadlineMs: 1000, checkpointStop: stop },
+    new AbortController().signal), CheckpointSoftDeadlineError);
+  assert.equal(calls, 0);
+});
+
+for (const authMode of ["api_key", "subscription"] as const) {
+  for (const pause of ["now", "wall", "withdrawn-now", "late-now", "late-wall"] as const) {
+    it(`${authMode}: genuine ${pause} preserves marked shutdown credential authority`, async () => {
+      const { ch, cancel } = channel();
+      const route = ch as unknown as { route(kind: string, body?: string, id?: number): void };
+      const late = pause.startsWith("late-");
+      let marked: BoundaryRequest | undefined = late ? request(ch) : undefined;
+      route.route("pause", pause.endsWith("wall") ? "wall" : "now", 1);
+      if (pause === "withdrawn-now") route.route("pause_cancel", undefined, 2);
+      marked ??= request(ch);
+      const tokens: string[] = [];
+      let calls = 0, sinks = 0;
+      const committed = { value: 3 };
+      const installer = createRunLaneInstallerReconcile(AbortSignal.any([cancel.signal, ch.terminalLifecycleSignal()]), {
+        runId: "run-shutdown", binding: binding(authMode), committed, registerToken: token => tokens.push(token),
+        client: {
+          releaseCodex: async () => { calls++; return { access_token: "fixture-next" }; },
+          refreshCodex: async () => { calls++; return { access_token: "fixture-next", generation: 4 }; },
+        } as never,
+      });
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(41));
+      const safety = createCodexExecutionSafety(registry, async () => { throw new Error("unused spawn"); }, installer.reconcile);
+      try {
+        await safety.withBoundary(marked, async () => { sinks++; });
+        assert.equal(marked.gracefulShutdownCheckpoint!.stopSignal.aborted, false);
+        assert.equal(calls, 1);
+        assert.equal(sinks, 1);
+        assert.deepEqual(tokens, ["fixture-next"]);
+        assert.equal(committed.value, authMode === "subscription" ? 4 : 3);
+        assert.equal(registry.isPoisoned(), false);
+      } finally {
+        await Promise.allSettled([installer.settle(), safety.dispose({ boundary: "terminal", deadlineMs: 100 })]);
+      }
+    });
+  }
+}
+
+for (const conflict of ["none", "withdrawn", "cancel", "claim", "switch", "disk", "terminal"] as const) {
+  it(`typed pause admission retains independent ${conflict} precedence`, async () => {
+    const { ch, cancel } = channel(1);
+    const lifecycle = ch.lifecycleSignal();
+    const route = ch as unknown as { route(kind: string, body?: string, id?: number): void; endFencedFlight(reason: string): void };
+    route.route("pause", "now", 1);
+    if (conflict === "withdrawn") route.route("pause_cancel", undefined, 2);
+    if (conflict === "cancel") ch.markCancelled();
+    if (conflict === "claim") route.endFencedFlight("stale");
+    if (conflict === "switch") ch.tripCredentialSwitch(1);
+    if (conflict === "disk") ch.requestDiskStop();
+    if (conflict === "terminal") ch.abortLifecycle(new Error("terminal"));
+    const soft = new AbortController(); soft.abort();
+    let calls = 0, sinks = 0;
+    const installer = createRunLaneInstallerReconcile(AbortSignal.any([cancel.signal, ch.terminalLifecycleSignal()]), {
+      runId: "run-shutdown", binding: binding("api_key"), registerToken: () => {},
+      client: { releaseCodex: async () => { calls++; return { access_token: "fixture-next" }; } } as never,
+    });
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(42));
+    const safety = createCodexExecutionSafety(registry, async () => { throw new Error("unused spawn"); }, installer.reconcile);
+    const clean = conflict === "none" || conflict === "withdrawn";
+    try {
+      await assert.rejects(safety.withBoundary({ boundary: "checkpoint", sink: "done_checkpoint", deadlineMs: 1000,
+        checkpointStop: { signal: soft.signal, lifecycleSignal: lifecycle, terminalSignal: AbortSignal.any([ch.terminalLifecycleSignal(), ch.checkpointAuthoritySignal()]),
+          cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal,
+          authorityRevoked: () => ch.isCancelled() || ch.claimFence() !== undefined ||
+            ch.pendingCredentialSwitch() !== undefined || ch.getPauseMode() === "disk" },
+      }, async () => { sinks++; }), clean ? CheckpointSoftDeadlineError : CodexBoundaryError);
+      assert.equal(lifecycle.reason instanceof PauseNowSignal, true);
+      assert.equal(registry.isPoisoned(), !clean);
+      assert.equal(calls, 0);
+      assert.equal(sinks, 0);
+    } finally {
+      await Promise.allSettled([installer.settle(), safety.dispose({ boundary: "terminal", deadlineMs: 100 })]);
+    }
+  });
+}
+
+for (const conflict of ["cancel", "claim", "switch", "disk", "terminal"] as const) {
+  it(`late ${conflict} revokes a mutation permit after typed pause spent the lifecycle`, async () => {
+    const { ch } = channel(1);
+    const lifecycle = ch.lifecycleSignal();
+    const soft = new AbortController();
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(43));
+    const safety = createCodexExecutionSafety(registry, async () => { throw new Error("unused spawn"); });
+    let afterPause: boolean | undefined, afterTerminal: boolean | undefined;
+    try {
+      await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000,
+        checkpointStop: { signal: soft.signal, lifecycleSignal: lifecycle, terminalSignal: AbortSignal.any([ch.terminalLifecycleSignal(), ch.checkpointAuthoritySignal()]),
+          cooperativeLifecycleReason: reason => reason instanceof PauseNowSignal },
+      }, async permit => {
+        (ch as unknown as { route(kind: string, body: string, id: number): void }).route("pause", "now", 1);
+        soft.abort();
+        afterPause = permit.signal.aborted;
+        if (conflict === "cancel") (ch as unknown as { route(kind: string): void }).route("cancel");
+        else if (conflict === "claim") (ch as unknown as { endFencedFlight(reason: string): void }).endFencedFlight("stale");
+        else if (conflict === "switch") ch.tripCredentialSwitch(1);
+        else if (conflict === "disk") ch.requestDiskStop();
+        else ch.abortLifecycle(new Error("terminal"));
+        afterTerminal = permit.signal.aborted;
+      }), CodexBoundaryError);
+      assert.equal(afterPause, false);
+      assert.equal(afterTerminal, true);
+      assert.equal(registry.isPoisoned(), true);
+    } finally { await Promise.allSettled([safety.dispose({ boundary: "terminal", deadlineMs: 100 })]); }
+  });
+}

@@ -100,6 +100,10 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	if workflowSet && !ciWatch {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--workflow is only valid with --ci-watch")
 	}
+	artifactSet := cmd.Flags().Changed("artifact")
+	if artifactSet && !ciWatch {
+		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--artifact is only valid with --ci-watch")
+	}
 	if ciWatch {
 		// --prompt is the optional instruction override here, not a separate target.
 		if issueSet || sweep {
@@ -161,6 +165,15 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 		req.Prompt = prompt // blank: the server defaults it to the ci-repair catalog body
 		if len(workflows) > 0 {
 			req.CIWorkflows = apitypes.OptionalCIWorkflows{Present: true, Value: workflows}
+		}
+		artifacts, aerr := ciArtifactFlags(cmd)
+		if aerr != nil {
+			return apitypes.ScheduleRequest{}, nil, aerr
+		}
+		req.Target = schedTargetCIWatch
+		req.Prompt = prompt // blank: the server defaults it to the ci-repair catalog body
+		if len(artifacts) > 0 {
+			req.CIArtifacts = apitypes.OptionalCIArtifacts{Present: true, Value: artifacts}
 		}
 	case issueSet:
 		if issue <= 0 {

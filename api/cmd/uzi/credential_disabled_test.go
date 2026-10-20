@@ -380,7 +380,7 @@ func TestRunLogsFollowCredentialDisabledIntoPause(t *testing.T) {
 	for _, tc := range []struct {
 		hold, want string
 	}{
-		{"", "run r1 paused by its owner; resume with uzi run resume r1; still following"},
+		{"", "run r1 paused; resume with uzi run resume r1; still following"},
 		{holdBudgetExhausted, "run r1 parked at its time limit; extend: uzi run extend r1 --by 2h; still following"},
 	} {
 		t.Run("hold="+tc.hold, func(t *testing.T) {
@@ -416,7 +416,7 @@ func TestRunWaitCredentialDisabledIntoPause(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, stderr)
 	}
-	if n := strings.Count(stderr, "run r1: now paused by its owner; resume with uzi run resume r1"); n != 1 {
+	if n := strings.Count(stderr, "run r1: now paused; resume with uzi run resume r1"); n != 1 {
 		t.Errorf("hold-change line appeared %d times, want 1:\n%s", n, stderr)
 	}
 	if !strings.Contains(stderr, "paused → completed") {

@@ -276,6 +276,55 @@ exited, any lock wait resolved, any in-flight publish rejected or completed — 
 proceeding. The tick, by contrast, only ever *tries* to acquire the gate
 (`tryAcquire`, non-blocking); a miss is a normal tick outcome (`gate_busy`), never an error.
 
+### Amendment 2026-10-19 — #3123: completion budgets and safe stops
+
+Explicit reaped Codex `done_checkpoint` calls with `executor.safety` use a
+60 s cooperative soft allowance and a 90 s hard allowance. Each attempt starts
+one absolute clock before sink-gate admission, preliminary tip reads, safety
+queue admission, reconciliation, quiescence and the action. Children use the
+remaining time; commands do not reset it. The initial done checkpoint and the
+existing fresh code-snapshot request each have their own allowance, so together
+they may approach 180 s. Shared Claude and non-reaped paths are unchanged;
+finalize retains its separate 50-minute boundary.
+
+Milestones retain 10 s soft / 30 s hard budgets. Before import, the bare-lock
+wait can forfeit its queued callback on a soft stop while retaining its
+predecessor in the queue. Once milestone import starts, transport, preservation,
+readback and bridging are hard-only; a soft stop cannot abandon that transition.
+This does not extend the milestone allowance to the done-checkpoint values.
+
+For done imports, Git's private `AsyncLocalStorage` scope masks the cooperative
+soft signal before the first displaced-head pin, producing-context persistence
+or receipt-governance mutation. The same held lock and observation cover owed
+pins, pending receipt, tracking CAS, owner stamp and committed receipt readback.
+Hard signals, authority and maintenance fences remain active. Awaited filesystem
+writes and fsync are not interruptible; even the hard deadline is not a storage
+latency guarantee. After settlement, cooperative stopping resumes. The Runner
+accepts ownership only on exact positive full-context proof, including generation
+and committed receipt, never on a presumed import.
+
+A soft stop can retain one private incoming stage per attempt. It grants no
+sweep, deletion or receipt-adoption authority. Only a proven clean soft stop
+avoids registry poisoning; credential and lifecycle faults, `refresh_unknown`,
+`operationUncertain`, hard expiry and unsafe cleanup retain their authority.
+Git's hard boundary error retains its historical `AbortError` name with a private
+hard discriminator; its name does not make it advisory.
+
+Worker shutdown stops active and queued done attempts across runs; shutdown or
+lifecycle abort prevents fresh snapshot admission. The actual shutdown sink's
+original absolute grace (15 s by default) is unchanged, including
+[the #3101 typed credential exception](1766-codex-vault-lock-park.md#amendment-3101-actual-graceful-shutdown-durability).
+Critical storage settlement is unbounded and unsafe cleanup may consume that
+grace, leaving source and custody retained on a fail-closed result. This adds no
+general scheduler, hard storage deadline or ephemeral-storage crash guarantee.
+
+Fixed sink/substep labels, duration and outcome diagnose these attempts without
+remote content or credentials. The reported 28.3 s suboperation and 32-minute
+finalize were not reproduced or diagnosed: the issue supplied combined sink
+timings. The local source/tests establish the implemented boundaries, not
+production incident resolution or hosted acceptance. See the
+[existing advisory snapshot retry](2149-cross-check.md#amendment-2026-10-19--3123-existing-advisory-code-snapshot-retry).
+
 ### Git-busy probe
 
 Before touching the runner clone, the tick opens `.git` exactly **once**, with

@@ -9,6 +9,8 @@ import { MemoryRouter } from "react-router-dom";
 import { ScheduleModal } from "./ScheduleModal";
 import { api, type Schedule } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { validArtifactSelectors, invalidArtifactSelectors } from "../lib/ciArtifacts.testVectors";
+import { ApiError } from "../lib/apiError";
 import { browserTimezone } from "../lib/timezone";
 import { mockApi as realMockApi } from "../mocks/mockApi";
 
@@ -162,6 +164,7 @@ describe("ScheduleModal — ci_watch target (PRD #2865)", () => {
     fireEvent.click(create);
     await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(1));
     expect(mockApi.createSchedule.mock.calls[0]![1].ci_workflows).toEqual([]);
+    expect(mockApi.createSchedule.mock.calls[0]![1].ci_artifacts).toEqual([]);
   });
 
   it("blocks submit on a duplicate workflow and says why", async () => {
@@ -232,4 +235,103 @@ describe("ScheduleModal — ci_watch target (PRD #2865)", () => {
     // The payload is one the mock (mirroring the server's default-patch lock) accepts.
     await expect(realMockApi.updateSchedule(id, input)).resolves.toMatchObject({ ci_workflows: ["ci.yml"] });
   });
+});
+
+
+const artifactField = () => screen.getByLabelText("Artifact names or globs (optional)") as HTMLTextAreaElement;
+describe("CI artifact form", () => {
+  for (const { input, expected } of validArtifactSelectors) {
+    it(`creates with selectors ${JSON.stringify(input).slice(0, 40)}`, async () => {
+      mockApi.createSchedule.mockResolvedValue({} as Schedule);
+      renderCreate();
+      await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+      pickTarget(/CI repair/);
+      fireEvent.change(artifactField(), { target: { value: input.join("\n") } });
+      const create = screen.getByRole("button", { name: "Create schedule" });
+      await waitFor(() => expect(create.hasAttribute("disabled")).toBe(false));
+      fireEvent.click(create);
+      await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalled());
+      expect(mockApi.createSchedule.mock.calls[0]![1].ci_artifacts).toEqual(expected);
+    });
+  }
+  for (const input of invalidArtifactSelectors) {
+    it(`blocks invalid selectors ${JSON.stringify(input).slice(0, 40)}`, async () => {
+      renderCreate();
+      await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+      pickTarget(/CI repair/);
+      fireEvent.change(artifactField(), { target: { value: input.join("\n") } });
+      expect(artifactField().getAttribute("aria-invalid")).toBe("true");
+      const help = document.getElementById("sched-ci-artifacts-error");
+      expect(help?.textContent).toMatch(/ci_artifacts/);
+      expect(screen.getByRole("button", { name: "Create schedule" }).hasAttribute("disabled")).toBe(true);
+    });
+  }
+  for (const id of ["sch-def-ci-uzi", "user-ci"]) {
+    it(`seeds, omits untouched, replaces, and clears ${id}`, async () => {
+      const editing = { ...(await realMockApi.getSchedule("sch-def-ci-uzi")), id, origin: id === "user-ci" ? "user" as const : "default" as const, ci_artifacts: ["logs-*"] };
+      mockApi.updateSchedule.mockResolvedValue(editing);
+      render(<MemoryRouter><ScheduleModal editing={editing} onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+      expect(artifactField().value).toBe("logs-*");
+      const save = screen.getByRole("button", { name: "Save changes" });
+      fireEvent.click(save);
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledTimes(1));
+      expect(mockApi.updateSchedule.mock.calls[0]![1].ci_artifacts).toBeUndefined();
+      fireEvent.change(artifactField(), { target: { value: "reports-*" } });
+      fireEvent.click(save);
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledTimes(2));
+      expect(mockApi.updateSchedule.mock.calls[1]![1].ci_artifacts).toEqual(["reports-*"]);
+      fireEvent.change(artifactField(), { target: { value: "" } });
+      fireEvent.click(save);
+      await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalledTimes(3));
+      expect(mockApi.updateSchedule.mock.calls[2]![1].ci_artifacts).toEqual([]);
+    });
+  }
+  it("explains fetching and keeps a rejected draft recoverable, omitting artifacts after target change", async () => {
+    mockApi.createSchedule.mockRejectedValueOnce(new ApiError(400, "Selector rejected by server"));
+    mockApi.createSchedule.mockResolvedValueOnce({} as Schedule);
+    renderCreate();
+    await waitFor(() => expect(mockApi.listRepos).toHaveBeenCalled());
+    pickTarget(/CI repair/);
+    expect(screen.getByText(/GitHub-only.*logs-only/)).toBeTruthy();
+    expect(screen.getByText(/blank to fetch no artifacts/)).toBeTruthy();
+    fireEvent.change(artifactField(), { target: { value: "logs-*" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create schedule" }));
+    await screen.findByText("Selector rejected by server");
+    expect(artifactField().value).toBe("logs-*");
+    pickTarget(/^Prompt/);
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "repair" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create schedule" }));
+    await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(2));
+    expect(mockApi.createSchedule.mock.calls[1]![1].ci_artifacts).toBeUndefined();
+  });
+});
+
+
+it("fans artifact selectors out to each repo and preserves them on a repoint edit", async () => {
+  mockApi.listRepos.mockResolvedValue({ repos: [
+    { id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" },
+    { id: "repo-atlas", path_with_namespace: "vtmocanu/atlas-api" },
+  ] } as Awaited<ReturnType<typeof api.listRepos>>);
+  mockApi.createSchedule.mockResolvedValue({} as Schedule);
+  const view = renderCreate();
+  await screen.findByLabelText("vtmocanu/atlas-api");
+  fireEvent.click(screen.getByLabelText("vtmocanu/atlas-api"));
+  pickTarget(/CI repair/);
+  fireEvent.change(artifactField(), { target: { value: "logs-*" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create schedule" }));
+  await waitFor(() => expect(mockApi.createSchedule).toHaveBeenCalledTimes(2));
+  const calls = mockApi.createSchedule.mock.calls;
+  expect(calls.map(([id]) => id).sort()).toEqual(["repo-atlas", "repo-uzi"]);
+  for (const [, input] of calls) expect(input.ci_artifacts).toEqual(["logs-*"]);
+  expect(calls[0]![1].sibling_group_id).toBe(calls[1]![1].sibling_group_id);
+  view.unmount();
+  const editing = { ...(await realMockApi.getSchedule("sch-def-ci-uzi")), origin: "user" as const, ci_artifacts: ["logs-*"] };
+  mockApi.updateSchedule.mockResolvedValue(editing);
+  render(<MemoryRouter><ScheduleModal editing={editing} onClose={vi.fn()} onSaved={vi.fn()} /></MemoryRouter>);
+  await waitFor(() => expect((screen.getByLabelText("Repo") as HTMLSelectElement).value).toBe("repo-uzi"));
+  fireEvent.change(screen.getByLabelText("Repo"), { target: { value: "repo-atlas" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(mockApi.updateSchedule).toHaveBeenCalled());
+  expect(mockApi.updateSchedule.mock.calls[0]![1]).toMatchObject({ repo_id: "repo-atlas" });
+  expect(mockApi.updateSchedule.mock.calls[0]![1].ci_artifacts).toBeUndefined();
 });

@@ -50,6 +50,10 @@ type removalBuilder struct {
 	f forge.Forge
 }
 
+func (b removalBuilder) CIArtifactScrubber([]byte) (func(string) string, error) {
+	return func(s string) string { return s }, nil
+}
+
 func (b removalBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
 	return b.f, nil
 }

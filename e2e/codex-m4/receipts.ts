@@ -28,7 +28,8 @@
 // is go-built; agent/templates holds the Dockerfiles + entrypoint; agent/package*.json,
 // agent/tsconfig.json, agent/devbox-global, agent/bin are build inputs). Everything else that the
 // worker image does not run as a guardrail — agent/test/, e2e/, prds/, docs/, adr/, specs/, .claude/,
-// Taskfile.yml, and *.md — is EVIDENCE. The deny list (agent/ minus agent/test/) is checked FIRST so
+// Taskfile.yml, *.md, and any Go `*_test.go` outside agent/ (never compiled into a shipped binary,
+// including the api image the M3b proof builds) — is EVIDENCE. The deny list (agent/ minus agent/test/) is checked FIRST so
 // a runtime path can never be mis-shelved into the allow list; an unrecognized path is `unclassified`
 // and rejects (fail closed — a new top-level path must be classified deliberately). receipts.test.ts
 // PINS these lists to the real Dockerfile COPY set, so they cannot silently drift from what the
@@ -184,7 +185,8 @@ export function classifyPath(p: string): PathClass {
   if (
     p.startsWith("e2e/") || p.startsWith("prds/") || p.startsWith("docs/") ||
     p.startsWith("adr/") || p.startsWith("specs/") || p.startsWith(".claude/") ||
-    p.startsWith("agent/test/") || p === "Taskfile.yml" || p.endsWith(".md")
+    p.startsWith("agent/test/") || p === "Taskfile.yml" || p.endsWith(".md") ||
+    p.endsWith("_test.go")
   ) return "evidence";
   return "unclassified";
 }

@@ -1075,6 +1075,7 @@ WITH claimant AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1338,6 +1339,7 @@ WITH claimant AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
                 -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
                 -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
@@ -4401,9 +4403,9 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND status <> 'paused'
+  -- All paused runs are protected above. Retain provider protection through
+  -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
@@ -4456,9 +4458,9 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-      -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-      -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+      AND status <> 'paused'
+      -- All paused runs are protected above. Retain provider protection through
+      -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
       AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
@@ -7717,6 +7719,60 @@ FROM authorized
 LEFT JOIN gaps ON true
 ORDER BY gaps.next_cursor ASC NULLS LAST;
 
+-- name: InterruptedCallsWindow :many
+-- Identity and claim authorization share the history statement's MVCC snapshot.
+-- The materialized ANY-KIND tail must precede every source-generation predicate.
+WITH authorized AS MATERIALIZED (
+    SELECT r.id FROM runs r JOIN workers w ON w.id = r.worker_id
+    WHERE r.id = @run_id::uuid AND w.id = @worker_id::uuid
+      AND w.user_id = @owner_id::uuid AND r.user_id = w.user_id
+      AND w.snapshot_register_nonce = @register_nonce::text
+      AND w.snapshot_register_nonce IS NOT NULL
+      AND @register_nonce::text <> '' AND @claim_generation::bigint >= 2
+      AND r.claim_generation = @claim_generation::bigint
+      AND r.claim_released_at IS NULL AND r.repo_id IS NOT NULL
+      AND r.status IN ('claimed', 'running')
+      AND r.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+), tail AS MATERIALIZED (
+    SELECT m.seq, m.kind, m.claim_generation, m.agent, m.agent_instance,
+           m.agent_label, m.payload
+    FROM run_messages m
+    WHERE m.run_id = @run_id::uuid AND EXISTS (SELECT 1 FROM authorized)
+    ORDER BY m.seq DESC LIMIT 256
+), source AS (
+    SELECT max(claim_generation)::bigint AS generation FROM tail
+    WHERE claim_generation > 0 AND claim_generation < @claim_generation::bigint
+      AND kind IN ('tool_use', 'tool_result')
+), selected AS (
+    SELECT t.* FROM tail t, source s
+    WHERE t.claim_generation = s.generation AND t.kind IN ('tool_use', 'tool_result')
+)
+SELECT (SELECT count(*) FROM tail)::int AS inspected_count,
+       COALESCE(source.generation, 0)::bigint AS source_generation,
+       s.seq, s.kind,
+       COALESCE(CASE WHEN char_length(s.agent) <= 128 THEN s.agent END, '')::text AS agent,
+       COALESCE(char_length(s.agent) > 128, false)::boolean AS agent_omitted,
+       (s.agent IS NOT DISTINCT FROM 'lead')::boolean AS explicit_lead,
+       (s.agent_instance IS NULL)::boolean AS null_lane,
+       COALESCE(CASE WHEN char_length(s.agent_instance) < 128
+                  AND octet_length(s.agent_instance) <= 1024
+            THEN s.agent_instance END, '')::text AS agent_instance,
+       COALESCE(CASE WHEN char_length(s.agent_label) <= 128 THEN s.agent_label END, '')::text AS agent_label,
+       COALESCE(char_length(s.agent_label) > 128, false)::boolean AS agent_label_omitted,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->'name') = 'string'
+                  AND char_length(s.payload->>'name') <= 128
+            THEN s.payload->>'name' END, '')::text AS tool_name,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)) = 'string'
+                  AND octet_length(s.payload->>(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)) <= 1024
+            THEN s.payload->>(CASE WHEN s.kind = 'tool_use' THEN 'id' ELSE 'tool_use_id' END)
+            END, '')::text AS call_id,
+       COALESCE(CASE WHEN jsonb_typeof(s.payload->'input'->'command') = 'string'
+                  AND char_length(s.payload->'input'->>'command') <= 2048
+            THEN s.payload->'input'->>'command' END, '')::text AS command,
+       COALESCE((char_length(s.payload->'input'->>'command') > 2048), false)::boolean AS command_omitted
+FROM authorized CROSS JOIN source LEFT JOIN selected s ON true
+ORDER BY s.seq DESC NULLS LAST;
+
 -- name: ListRunMessagesAfter :many
 -- Replay for a (re)connecting browser: everything after its last-seen seq, in
 -- order. The persisted log is authoritative; the WS layer (M5) is only a live
@@ -9137,7 +9193,7 @@ WITH pending AS (
     -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
     -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
     -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
-    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUps reads, alongside the
     -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
     -- 'answer' that resolves the worker's completion-question await), never this raw row — so
     -- draining it would likewise hit the default arm. PRD #1189 adds 'extend' for the SAME
@@ -9495,6 +9551,7 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard,
+       EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -9756,6 +9813,7 @@ WHERE run.id = @run_id
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
@@ -10204,6 +10262,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10405,6 +10464,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10476,6 +10536,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -11406,3 +11467,16 @@ WHERE run_id = @run_id
   AND COALESCE(payload->>'text', '') <> ''
 ORDER BY seq DESC
 LIMIT 1;
+
+-- name: CountOnlineWorkersSatisfyingCIArtifacts :one
+SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+ AND w.status = 'online'
+ AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+ AND NOT w.ephemeral AND NOT w.isolated_lane
+ AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
+ AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
+
+-- name: SaveCIArtifactAdmission :one
+UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description
+ WHERE id = @id AND kind = 'prompt' AND ci_config_guard
+RETURNING *;

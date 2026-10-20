@@ -43,6 +43,8 @@ node e2e/worker-uid/inventory.mjs > "$REPORT_DIR/expected.json"
 PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/expected.json")"
 node e2e/worker-uid/inventory.mjs command > "$REPORT_DIR/command-expected.json"
 COMMAND_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/command-expected.json")"
+node e2e/worker-uid/inventory.mjs single > "$REPORT_DIR/single-expected.json"
+SINGLE_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/single-expected.json")"
 if [ "${WORKER_UID_SKIP_BUILD:-}" != 1 ]; then
   phase image-build timeout --kill-after=5s 60s docker build -f agent/templates/base/Dockerfile -t "$IMAGE" .
 fi
@@ -77,7 +79,10 @@ phase worker-proof capture "$REPORT_DIR/results.xml" "$((${WORKER_UID_TIMEOUT:-6
   --test-name-pattern "$PATTERN" \
   /app/uzi-worker-uid-proof/agent/test/codex-launcher.test.ts /app/uzi-worker-uid-proof/agent/test/codex-executor.test.ts \
   /app/uzi-worker-uid-proof/agent/test/codex-shared-dir.test.ts /app/uzi-worker-uid-proof/agent/test/entrypoint-migration.test.ts \
-  /app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts
+  /app/uzi-worker-uid-proof/agent/test/git-planning-diff.test.ts \
+  /app/uzi-worker-uid-proof/agent/test/git-retained-permissions.test.ts \
+  /app/uzi-worker-uid-proof/agent/test/claude-command-launcher.test.ts \
+  /app/uzi-worker-uid-proof/e2e/worker-uid/claude-command-real.test.mts
 rc=$?
 set -e
 printf 'worker UID reports: %s\n' "$REPORT_DIR"
@@ -118,6 +123,42 @@ python3 e2e/worker-uid/check.py "$REPORT_DIR/command-expected.json" "$REPORT_DIR
 if [ "$command_rc" -ne 0 ]; then
   printf 'worker UID command node/container exit: %s\n' "$command_rc" >&2
 fi
-if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ]; then
+# Single-uid launcher preflight: started directly as the worker uid with no root
+# entrypoint and no uid split, in three postures that differ only in the flags below.
+# Base image (it ships the supervisor), never the uzi-entrypoint.
+single_failed=0
+run_single() {
+  local n=$1 posture=$2 label=$3
+  shift 3
+  local single_name="$NAME-single-$n" single_rc=0 single_checker_rc=0
+  owned_request container "$single_name"
+  phase "single-$label" capture "$REPORT_DIR/single-$n-results.xml" 70 \
+    timeout --kill-after=5s 65s docker run --pull never --network none \
+    --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$single_name" --user 10001:10001 --cap-drop ALL \
+    "$@" --workdir /proof --tmpfs /data --tmpfs /nix \
+    --tmpfs /proof/.uzi/scratch:exec,uid=10001,gid=10001,mode=0700 \
+    --tmpfs /app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755 \
+    --env HOME=/proof/.uzi/scratch --env TMPDIR=/proof/.uzi/scratch \
+    --env "UZI_SINGLE_UID_EXPECT=$posture" \
+    --mount "type=bind,src=$REPO/e2e/worker-uid,dst=/app/uzi-worker-uid-proof/e2e/worker-uid,readonly" \
+    --mount "type=bind,src=$REPO/agent/src,dst=/app/uzi-worker-uid-proof/agent/src,readonly" \
+    --mount "type=bind,src=$REPO/agent/tsconfig.json,dst=/app/uzi-worker-uid-proof/agent/tsconfig.json,readonly" \
+    --mount "type=bind,src=$REPO/agent/package.json,dst=/app/uzi-worker-uid-proof/agent/package.json,readonly" \
+    --entrypoint /usr/local/bin/node "$IMAGE" \
+    --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs \
+    --test --test-concurrency=1 --test-timeout=60000 --test-reporter=junit \
+    --test-name-pattern "$SINGLE_PATTERN" /app/uzi-worker-uid-proof/e2e/worker-uid/single-uid-preflight.test.mts || single_rc=$?
+  python3 e2e/worker-uid/check.py "$REPORT_DIR/single-expected.json" "$REPORT_DIR/single-$n-results.xml" || single_checker_rc=$?
+  if [ "$single_rc" -ne 0 ]; then
+    printf 'worker UID single-%s node/container exit: %s\n' "$n" "$single_rc" >&2
+  fi
+  if [ "$single_rc" -ne 0 ] || [ "$single_checker_rc" -ne 0 ]; then
+    single_failed=1
+  fi
+}
+run_single 1 ok ok --security-opt no-new-privileges
+run_single 2 profile:noNewPrivs noNewPrivs
+run_single 3 profile:capBnd capBnd --security-opt no-new-privileges --cap-add CHOWN
+if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ] || [ "$single_failed" -ne 0 ]; then
   exit 1
 fi

@@ -52,6 +52,7 @@ import { stageForMessages } from "../lib/runStage";
 import { PlainMarkdownExcerpt } from "../components/PlainMarkdownExcerpt";
 import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
+import { pauseOrigin, type PauseOrigin } from "../lib/pauseOrigin";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage, hasSideUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
@@ -818,6 +819,7 @@ function checkpointLine(run: Run): string {
  */
 export function PausedPanel({
   run,
+  origin = "",
   busy,
   canSteer = true,
   onResume,
@@ -825,6 +827,7 @@ export function PausedPanel({
   onExtend,
 }: {
   run: Run;
+  origin?: PauseOrigin;
   busy: boolean;
   canSteer?: boolean;
   onResume: () => void;
@@ -870,7 +873,7 @@ export function PausedPanel({
               parkAnnounce region instead — putting role="status" here too would duplicate it. */}
           <p className="text-sm font-semibold text-info">
             <span aria-hidden="true">‖ </span>
-            Paused by you{pausedAt ? ` at ${pausedAt}` : ""}
+            {origin === "lead_park" ? "Paused by the run's lead" : origin === "owner" ? "Paused by you" : "Paused"}{pausedAt ? ` at ${pausedAt}` : ""}
           </p>
           <p className="mt-0.5 text-xs text-muted">{checkpointLine(run)}</p>
           {view && (
@@ -1705,7 +1708,7 @@ export function RunView() {
   const { id = "" } = useParams();
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
-  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner } = useRunStream(id);
+  const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner, pauseOriginReady } = useRunStream(id);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
   // Provider holds, memory holds and worker exhaustion require confirmed ownership; other holds
@@ -2675,6 +2678,7 @@ export function RunView() {
       />
       <PausedPanel
         run={run}
+        origin={pauseOrigin(run, messages, pauseOriginReady)}
         busy={busy}
         canSteer={canSteer}
         onResume={() =>

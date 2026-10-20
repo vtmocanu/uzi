@@ -6,9 +6,10 @@ import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
+import { followUpRunes } from "../src/steering.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
-// Issue #1152: the implement loop's queued follow-up drain (`ctx.pullFollowUp`) must run
+// Issue #1152: the implement loop's queued follow-up drain (`ctx.pullFollowUps`) must run
 // at a cooperative-checkpoint boundary too. Before the fix the checkpoint branch
 // `continue`d past the only drain, so (1) a follow-up queued during a checkpointing turn
 // starved until some later non-checkpoint turn, and (2) the follow-up the checkpointing
@@ -88,8 +89,9 @@ function fakeTurns(scripts: ScriptedTurn[], queue: string[]): { queryFn: SdkQuer
 function makeCtx(
   queue: string[],
   overrides: Partial<RunContext> = {},
-): { ctx: RunContext; pulls: Array<string | undefined>; included: number[]; idOf: Map<string, number> } {
-  const pulls: Array<string | undefined> = [];
+): { ctx: RunContext; pulls: string[][]; included: number[]; idOf: Map<string, number> } {
+  // Each entry is the bodies one pullFollowUps call returned ([] when nothing was queued).
+  const pulls: string[][] = [];
   // Issue #1800: ids reported through ctx.followUpIncluded, and the id each pulled body was given.
   const included: number[] = [];
   const idOf = new Map<string, number>();
@@ -106,13 +108,22 @@ function makeCtx(
     config: null,
     sessionId: null,
     gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
-    pullFollowUp: () => {
-      const next = queue.shift();
-      pulls.push(next);
-      if (next === undefined) return undefined;
-      const id = idOf.size + 1;
-      idOf.set(next, id);
-      return { id, body: next };
+    // Honors the SteeringChannel.pullFollowUps contract: oldest first up to the rune cap, an
+    // oversized head taken alone only into an empty batch.
+    pullFollowUps: (remainingRunes, batchEmpty) => {
+      const taken: Array<{ id: number; body: string }> = [];
+      let remaining = remainingRunes;
+      while (queue.length > 0) {
+        const runes = followUpRunes(queue[0]!);
+        if (runes > remaining && !(batchEmpty && taken.length === 0)) break;
+        const body = queue.shift()!;
+        const id = idOf.size + 1;
+        idOf.set(body, id);
+        taken.push({ id, body });
+        remaining -= runes;
+      }
+      pulls.push(taken.map((t) => t.body));
+      return taken;
     },
     followUpIncluded: (id) => included.push(id),
     checkpoint: async () => {},
@@ -161,7 +172,7 @@ describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the
     assert.deepStrictEqual(queue, [], "the queue is fully drained");
   });
 
-  it("drains successive checkpoints one follow-up per turn, in FIFO order", async () => {
+  it("batches follow-ups queued during a checkpointing turn into the next turn, in FIFO order, without replay", async () => {
     const queue: string[] = [];
     const { queryFn, prompts } = fakeTurns(
       [
@@ -176,8 +187,9 @@ describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx(queue).ctx);
     assert.strictEqual(prompts.length, 5, "planning turn + four implement turns");
     assert.ok(!prompts[1]!.includes(A) && !prompts[1]!.includes(B), "iteration 1 carries neither");
-    assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "iteration 2 carries A only");
-    assert.ok(prompts[3]!.includes(B) && !prompts[3]!.includes(A), "iteration 3 carries B only");
+    assert.ok(prompts[2]!.includes(A) && prompts[2]!.includes(B), "iteration 2 carries both A and B");
+    assert.ok(prompts[2]!.indexOf(A) < prompts[2]!.indexOf(B), "A precedes B (FIFO)");
+    assert.ok(!prompts[3]!.includes(A) && !prompts[3]!.includes(B), "iteration 3 does not replay them");
     assert.ok(!prompts[4]!.includes(A) && !prompts[4]!.includes(B), "iteration 4 carries neither");
   });
 
@@ -199,7 +211,7 @@ describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the
     assert.ok(!prompts[3]!.includes(F), "iteration 3 (after a checkpoint) does not replay it");
   });
 
-  it("delivers queued follow-ups one per ordinary (non-checkpoint) turn, in order", async () => {
+  it("delivers queued follow-ups as one batch on the next ordinary (non-checkpoint) turn, in order", async () => {
     const queue: string[] = [];
     const { queryFn, prompts } = fakeTurns(
       [
@@ -213,9 +225,10 @@ describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the
     const { ctx, pulls } = makeCtx(queue);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
     assert.strictEqual(prompts.length, 4, "planning turn + three implement turns");
-    assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "iteration 2 carries the first only");
-    assert.ok(prompts[3]!.includes(B) && !prompts[3]!.includes(A), "iteration 3 carries the second only");
-    // Issue #1800: the pull happens at each implement loop top (undefined when nothing is queued).
-    assert.deepStrictEqual(pulls.filter((p) => p !== undefined), [A, B], "one dequeue per ordinary turn");
+    assert.ok(prompts[2]!.includes(A) && prompts[2]!.includes(B), "iteration 2 carries both");
+    assert.ok(prompts[2]!.indexOf(A) < prompts[2]!.indexOf(B), "A precedes B (FIFO)");
+    assert.ok(!prompts[3]!.includes(A) && !prompts[3]!.includes(B), "iteration 3 does not replay them");
+    // Issue #1800 / #3137: the pull happens at each implement loop top; the one non-empty pull is the whole batch.
+    assert.deepStrictEqual(pulls.filter((p) => p.length > 0), [[A, B]], "one batch dequeue for both follow-ups");
   });
 });

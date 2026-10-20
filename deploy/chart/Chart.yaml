@@ -8,8 +8,8 @@ type: application
 # version. api.image.tag / web.image.tag are left unset in values so the pod image
 # follows appVersion. Bump both per release; the cluster's ArgoCD auto-tracks the chart
 # (targetRevision `0.*`), so no per-release argo bump there (see deploy/README.md).
-version: 0.86.0-rc.18
-appVersion: "0.86.0-rc.18"
+version: 0.86.0-rc.19
+appVersion: "0.86.0-rc.19"
 
 # Links this chart's OCI package to the repository (GHCR reads
 # org.opencontainers.image.source from the pushed artifact's annotations).
@@ -27,18 +27,14 @@ annotations:
 dependencies:
   - name: cluster
     alias: postgres
-    # Pinned to the same `cluster` chart version the fleet's other CNPG apps use
-    # for fleet consistency, NOT the latest 0.7.x. Bump together with the fleet.
+    # Pinned to the `cluster` chart version the fleet's newest CNPG apps use (some
+    # still run 0.6.1), NOT the latest. Bump together with the fleet.
     #
-    # NOTE (corrected 2026-08-20): this chart's rendered `postgresql.cnpg.io/v1
-    # Cluster` is NOT a strict subset of the CRD operator 1.23.5 ships -- it always
-    # emits `.spec.monitoring.tls.enabled`, a field 1.23.5's Cluster CRD does not
-    # declare. Under client-side apply (Helm 3, and ArgoCD -- the real deploy path)
-    # the apiserver prunes that unknown field, so it is harmless. It only bites under
-    # Helm 4's server-side-apply default, which validates strictly and rejects it;
-    # the kind-smoke `helm install` therefore passes `--server-side=false` to match
-    # the production apply semantics. Closing the mismatch for good means bumping the
-    # CNPG operator+subchart pair fleet-wide so the CRD gains the field.
-    version: "0.6.1"
+    # The rendered Cluster always emits `.spec.monitoring.tls.enabled`. The CNPG
+    # operator's Cluster CRD declares that field (operator 1.30.1, the fleet's and
+    # the kind smoke's), so Helm 4's default server-side apply accepts it. An
+    # operator whose CRD lacks the field (1.23.x) rejects it under server-side apply
+    # ("field not declared in schema"); client-side apply prunes it (#448).
+    version: "0.8.1"
     repository: "oci://ghcr.io/cloudnative-pg/charts"
     condition: postgres.enabled

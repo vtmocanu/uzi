@@ -370,7 +370,8 @@ type ClaimPayload struct {
 	// Job is the job block of a kind='job' claim (PRD #1908): the caller's job type, title,
 	// prompt and named inputs. nil (key omitted) for every other kind. A job claim carries no
 	// repo, PAT, memory, skills or forge fields.
-	Job *ClaimJob `json:"job,omitempty"`
+	Job      *ClaimJob      `json:"job,omitempty"`
+	CIRepair *ClaimCIRepair `json:"ci_repair,omitempty"`
 	// BudgetWallSeconds is the job's wall-clock budget in seconds (PRD #1908): the job runner
 	// aborts and reports failed at this bound. Set only on a job claim, omitted otherwise.
 	BudgetWallSeconds *int32       `json:"budget_wall_seconds,omitempty"`

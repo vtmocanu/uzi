@@ -100,6 +100,7 @@ const CODEX_DYNAMIC_WIRE_NAMES: ReadonlyMap<string, string> = new Map([
   ["Bash", "uzi_bash"],
   ["apply_patch", "uzi_apply_patch"],
   ["Read", "uzi_read"],
+  ["mcp__ci_evidence__read", "uzi_ci_evidence_read"],
   ["Search", "uzi_search"],
   ["Skill", "uzi_skill"],
   ["mcp__forge__get_issue", "uzi_forge_get_issue"],

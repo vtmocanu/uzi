@@ -581,6 +581,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/worker/runs/{id}/memory", noLimiter},
 	{"GET", "/api/worker/runs/{id}/decisions-memo", noLimiter},
+	{"GET", "/api/worker/runs/{id}/interrupted-calls", noLimiter},
 	{"GET", "/api/worker/runs/{id}/message-gaps", noLimiter},
 	{"GET", "/api/worker/runs/{id}/orphan-classification", noLimiter},
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},

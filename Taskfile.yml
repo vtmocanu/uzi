@@ -2688,10 +2688,16 @@ tasks:
       - ./scripts/deadcode-knip.sh agent
 
   typecheck:agent:
-    desc: tsc --noEmit over agent
+    desc: tsc --noEmit over agent plus the opt-in Codex M3a/M3b harnesses
     dir: agent
     cmds:
       - npm run typecheck
+      # The M3a/M3b packaged-proof harnesses run only in maintainer-opt-in targets
+      # (test:codex-m3a:*, test:codex-m3b:packaged), so CI never compiled them and their
+      # type drift surfaced only at native O-proof time (#3100). Each check takes under a
+      # second.
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3a/tsconfig.json
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3b/tsconfig.json
 
   vulncheck:agent:
     desc: agent - npm audit at --audit-level=high over the FULL tree. NOT in `gate`

@@ -25,6 +25,10 @@
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { ClaudeCommandLane, GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
+import { buildGuardedCommandServer } from "./claude-command/server.js";
+import { GUARDED_COMMAND_SERVER, GUARDED_COMMAND_TOOL, shapeGuardedGrants, type UnavailableRole } from "./claude-command/grants.js";
+import type { CapturedMemoryContext } from "./codex/broker.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "./checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
@@ -35,6 +39,7 @@ import type {
   SDKMessage,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
@@ -69,6 +74,7 @@ import {
 import {
   buildCIFixPlanPrompt,
   buildImplementPrompt,
+  interruptedCallsNote,
   buildLeadSystemPrompt,
   buildPlanPrompt,
   buildRepoInstructionsContext,
@@ -97,7 +103,7 @@ import {
   type PrSummaryClaim,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
@@ -162,6 +168,13 @@ const PRD_DONE_PATH_MAX_LEN = 512;
 const REASON_WALL = "run exceeded its wall-clock timeout";
 const REASON_IDLE = "run stalled: no agent activity within the idle timeout";
 const REASON_CANCELLED = "run cancelled";
+// Issue #2471: the trip reason of a typed carrier (RunDrive.tripError). The carried error, not this
+// text, is what the turn throws.
+const REASON_MEMORY_AUTHORITY_LOST = "worker memory authority lost";
+/** Issue #2471: budget for the guarded command lane to dispose and confirm every live command
+ *  at a turn end: the lane's own join budget (worst-case abort cleanup of 42 s plus margin; see
+ *  worstCaseAbortJoinMs in claude-command/lane.ts, pinned by a unit test). */
+const GUARDED_LANE_QUIESCE_MS = GUARDED_LANE_JOIN_MS;
 // PRD #1190 M2: the internal trip reason for a `now` pause abort. Never a failure_reason — it
 // is converted to a thrown PauseNowSignal at every driveTurn throw site (tripError), which the
 // implement loop's turn catch takes to the pause-park path, so it never reaches a `failed`
@@ -309,6 +322,41 @@ class CliSignalDeathError extends Error {
     this.sessionId = sessionId;
     this.pid = pid;
   }
+}
+
+/**
+ * Issue #3137: build the owner follow-up batch for an ordinary turn. In-memory `queuedOwner`
+ * entries (follow-ups an interactive park received while the slot was held) go first, in
+ * order, under the same rune cap and oversized-first rule as SteeringChannel.pullFollowUps.
+ * The channel is pulled only when `queuedOwner` was fully drained into the batch, so a
+ * leftover queued entry never lets a later channel entry jump ahead of it. Mutates
+ * `queuedOwner` (taken entries are removed). Returns undefined when nothing is pending.
+ */
+export function fillOwnerBatch(
+  queuedOwner: Array<{ id: number; body: string }>,
+  ctx: RunContext,
+): Array<{ id: number; body: string }> | undefined {
+  const batch: Array<{ id: number; body: string }> = [];
+  let remaining = MAX_FOLLOW_UP_BATCH_RUNES;
+  while (queuedOwner.length > 0) {
+    const head = queuedOwner[0]!;
+    const runes = followUpRunes(head.body);
+    if (runes <= remaining) {
+      batch.push(queuedOwner.shift()!);
+      remaining -= runes;
+      continue;
+    }
+    if (batch.length === 0) {
+      batch.push(queuedOwner.shift()!);
+      remaining = 0;
+    }
+    break;
+  }
+  if (queuedOwner.length === 0) {
+    const pulled = ctx.pullFollowUps?.(remaining, batch.length === 0);
+    if (pulled !== undefined) batch.push(...pulled);
+  }
+  return batch.length > 0 ? batch : undefined;
 }
 
 /**
@@ -690,6 +738,10 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
 interface RunDrive {
   refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
+  /** Issue #2471: the exact error a memory-authority trip carries (the runner's stop, or an
+   *  unconfirmed-command error). When set, tripError returns it and no clear-and-continue site
+   *  may swallow it. */
+  tripError?: Error;
   currentAbort?: AbortController;
   currentChild: { pid?: number };
   wallRemainingMs: number;
@@ -740,7 +792,12 @@ interface DriveState {
   preToolUse: (
     allowedSubagents: string[],
     implementation?: boolean,
+    unavailable?: readonly UnavailableRole[],
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
+  /** Issue #2471: the guarded command lane of a memory-guard-bound run; undefined otherwise. */
+  lane?: ClaudeCommandLane;
+  /** Issue #2471: drops the runner's memory-authority listener. */
+  unsubscribeAuthority?: () => void;
   isIssueRun: boolean;
   /** issue #1866 M2: the run-start environment facts (runEnvProbe), rendered into the plan
    *  prompt and the first implement prompt. */
@@ -876,6 +933,14 @@ export class SdkExecutor implements Executor {
   private readonly rootStartTime?: StartTimeReader;
   /** issue #1783: whether an unrecordable CLI root was already logged (warn once per executor). */
   private rootDropWarned = false;
+  /** Issue #2471: the current run's guarded command lane (guard-bound runs only); kept after the run
+   *  so the sinks that follow it still see the poisoned/empty state. Reset at the next run(). */
+  private guardLane: ClaudeCommandLane | undefined;
+  /** Issue #2471: the lane disposal killAgentTree started; reapAttributedProcesses joins it. */
+  private laneDisposal: Promise<void> | undefined;
+  /** Issue #2471: this run's Claude CLI roots protected from the worker memory guard's victim
+   *  selection, keyed by pid, with the registry that holds each. */
+  private readonly protectedCliRoots = new Map<number, { registry: NonNullable<ClaudeCommandLane["registry"]>; root: ReturnType<NonNullable<ClaudeCommandLane["registry"]>["protect"]> }>();
   /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
@@ -957,7 +1022,7 @@ export class SdkExecutor implements Executor {
     // ownership, context read, terminal). All its deps are construction-available.
     this.harness = new ClaudeHarness({
       queryFn: this.queryFn,
-      spawn: this.spawn,
+      spawn: (opts) => this.spawnCli(opts),
       kill: this.kill,
       log: this.log,
       contextUsageTimeoutMs: this.contextUsageTimeoutMs,
@@ -981,6 +1046,15 @@ export class SdkExecutor implements Executor {
   killAgentTree(): void {
     // Last defense for synchronous callers; async destructive seams join first.
     this.summaryLifecycle.closed = true;
+    // Issue #2471: the lane's model commands are not in spawnedPids. Start their disposal now
+    // (synchronously triggered, never awaited here); reapAttributedProcesses joins it.
+    const lane = this.guardLane;
+    if (lane) {
+      this.laneDisposal = lane.quiesce(GUARDED_LANE_QUIESCE_MS).then(
+        () => undefined,
+        (err: unknown) => { this.log.warn("guarded command lane disposal was not confirmed", { error: errMessage(err) }); },
+      );
+    }
     for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
     this.intentFlight?.ctrl.abort();
     for (const pid of this.spawnedPids) {
@@ -1001,6 +1075,7 @@ export class SdkExecutor implements Executor {
     const root = recordRoot(pid, this.rootStartTime);
     if (root) {
       this.rootStartTimes.set(pid, root);
+      this.protectCliRoot(root);
       return;
     }
     this.rootStartTimes.delete(pid);
@@ -1011,14 +1086,71 @@ export class SdkExecutor implements Executor {
     });
   }
 
+  /** Spawn the Claude CLI; on a guard-bound run unprotect its root when it exits (Issue #2471). */
+  private spawnCli(opts: SpawnOptions): { pid?: number } {
+    const proc = this.spawn(opts);
+    const pid = proc.pid;
+    const once = (proc as { once?: (event: string, listener: () => void) => unknown }).once;
+    if (typeof pid === "number" && typeof once === "function") {
+      once.call(proc, "exit", () => this.unprotectCliRoot(pid));
+    }
+    return proc;
+  }
+
+  /** Issue #2471: shield a guard-bound run's CLI root from the worker memory guard (bounded: the
+   *  entry is dropped at the CLI's exit and every one at the run's end). */
+  private protectCliRoot(root: RecordedRoot): void {
+    const registry = this.guardLane?.registry;
+    if (!registry) return;
+    try {
+      this.unprotectCliRoot(root.pid);
+      this.protectedCliRoots.set(root.pid, {
+        registry,
+        root: registry.protect("provider", { pid: root.pid, startTime: String(root.startTime) }),
+      });
+    } catch (err) {
+      this.log.warn("agent CLI root could not be protected from the memory guard", { pid: root.pid, error: errMessage(err) });
+    }
+  }
+
+  private unprotectCliRoot(pid: number): void {
+    const held = this.protectedCliRoots.get(pid);
+    if (!held) return;
+    this.protectedCliRoots.delete(pid);
+    held.registry.unprotect(held.root);
+  }
+
+  private unprotectAllCliRoots(): void {
+    for (const pid of this.protectedCliRoots.keys()) this.unprotectCliRoot(pid);
+  }
+
+  /**
+   * Issue #2471: dispose and confirm every model command of a memory-guard-bound run within
+   * `deadlineMs`, and close the lane to new commands until the next turn. Resolves confirmed at
+   * once when the run has no lane. A lane that could not confirm a disposal stays poisoned, so
+   * every later settle reports unconfirmed.
+   */
+  async settleWorkerCommands(deadlineMs: number): Promise<{ confirmed: boolean }> {
+    const lane = this.guardLane;
+    if (!lane) return { confirmed: true };
+    try {
+      await lane.quiesce(deadlineMs);
+      return { confirmed: !lane.poisoned };
+    } catch {
+      return { confirmed: false };
+    }
+  }
+
   /** issue #1783 (R0): the CLI process-group roots not yet reaped, each with the start time
    *  captured when it was spawned (see Executor.recordedRootPids). A root whose start time could
-   *  not be read at spawn is omitted: it then exempts nothing. */
+   *  not be read at spawn is omitted: it then exempts nothing. A guard-bound run adds the
+   *  supervisor roots of its live model commands (lane-owned, never in spawnedPids). */
   recordedRootPids(): RecordedRoot[] {
-    return [...this.spawnedPids].flatMap((pid) => {
+    const cli = [...this.spawnedPids].flatMap((pid) => {
       const root = this.rootStartTimes.get(pid);
       return root ? [root] : [];
     });
+    return this.guardLane ? [...cli, ...this.guardLane.recordedRoots()] : cli;
   }
 
   /**
@@ -1033,6 +1165,9 @@ export class SdkExecutor implements Executor {
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
     await this.closeAndSettlePlanSummary();
+    // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
+    // the model commands already stopped (it never rejects).
+    await this.laneDisposal;
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
@@ -1193,6 +1328,9 @@ export class SdkExecutor implements Executor {
     this.spawnedPids.clear();
     this.deadCliPids.clear();
     this.rootStartTimes.clear();
+    this.unprotectAllCliRoots();
+    this.guardLane = undefined;
+    this.laneDisposal = undefined;
     this.runWorktree = ctx.worktreePath;
     // Fresh per-run reducer: the first-truthy-session latch must not survive a
     // second run() on this instance (one executor per run is the norm, but keep
@@ -1208,6 +1346,7 @@ export class SdkExecutor implements Executor {
     this.spentSwitchSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
+    let laneFailure: unknown;
     let liveState: RunDrive | undefined;
     const onTerminal = (): void => {
       if (liveState) this.trip(liveState, REASON_CANCELLED);
@@ -1235,6 +1374,13 @@ export class SdkExecutor implements Executor {
         }
         this.disarmWall(drive.state);
         if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
+        // Issue #2471: no model command may outlive the run. Join the lane before the deps join
+        // and the reap below; a failure is raised after the rest of the cleanup, and only when
+        // the run was otherwise returning a result (it never replaces an in-flight error).
+        drive.unsubscribeAuthority?.();
+        if (drive.lane) {
+          try { await drive.lane.quiesce(GUARDED_LANE_QUIESCE_MS); } catch (err) { laneFailure = err; }
+        }
         // PRD #121 M2: no install may outlive the run. On every path that never reached
         // the join — plan rejected, cancelled, no plan submitted, ci_fix not_code — the
         // install may still be in flight, and the runner tears the clone down and pushes
@@ -1254,6 +1400,12 @@ export class SdkExecutor implements Executor {
         // symlinks). The nix STORE is global (on the data volume), NOT here, so this
         // never evicts the warm-start cache. Best-effort, uid-aware (PRD #1809 M3).
         if (drive.provisionDir) await removeProvisionDir(drive.provisionDir, this.log);
+        this.unprotectAllCliRoots();
+        if (laneFailure !== undefined && summaryResult !== undefined) rethrow(laneFailure);
+        // The run is already throwing: the original error stands, the join failure is only logged.
+        if (laneFailure !== undefined) {
+          this.log.warn("guarded command lane join failed while the run was already failing", { error: errMessage(laneFailure) });
+        }
       }
     } finally {
       ctx.terminalLifecycleSignal?.removeEventListener("abort", onTerminal);
@@ -1277,6 +1429,7 @@ export class SdkExecutor implements Executor {
     }
 
     await fs.mkdir(this.homeDir, { recursive: true });
+    ctx.ciEvidence = await ctx.prepareCIEvidence?.();
     // The shared provisioning HOME lives elsewhere on the data volume; ensure it
     // exists before the install subprocess sets HOME to it (a no-op when it equals
     // the per-run homeDir, e.g. tests that don't split them).
@@ -1461,7 +1614,14 @@ export class SdkExecutor implements Executor {
     // SDK cannot resolve. Every use of this list is plan-turn; the implement turn
     // derives its own from `selectSubagents`.
     const planTurn = planTurnSubagents(assembled.subagents);
-    const planSubagentNames = Object.keys(planTurn.subagents);
+    // Issue #2471: a memory-guard-bound run (ctx.capturedMemory present at run start, fixed for the
+    // run) routes Bash to the supervised command tool, so the roster is shaped to it. The shaped
+    // keys feed the Agent guard's allow set and the delegation lines below.
+    const guarded = ctx.capturedMemory !== undefined;
+    const planShaped = guarded ? shapeGuardedGrants(planTurn.subagents) : undefined;
+    const planAgents = planShaped ? planShaped.agents : planTurn.subagents;
+    const planUnavailable: UnavailableRole[] = planShaped ? planShaped.unavailable : [];
+    const planSubagentNames = Object.keys(planAgents);
     // PRD #266 M1: each roster name's write capability, derived from the PRE-STRIP
     // `assembled.subagents` (NOT `planTurn.subagents`, which subtracts the write
     // tools and would falsely mark `coder` read-only). Built once and threaded into
@@ -1484,6 +1644,20 @@ export class SdkExecutor implements Executor {
       });
     }
 
+    if (planUnavailable.length > 0) {
+      this.log.warn("plan turn: subagents unavailable under the memory guard", {
+        run_id: ctx.runId,
+        unavailable: planUnavailable.map((role) => role.name),
+      });
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `not planning with ${planUnavailable.map((role) => `${role.name} is unavailable on this run: ${role.reason}`).join("; ")}`,
+        },
+      });
+    }
+
     // The Bash + path-guard hooks are roster-independent, so build them once and
     // reuse; only the Agent-guard hook's allowSet is frozen at construction and so
     // must be REBUILT when the implement roster differs from the plan roster (PRD
@@ -1494,11 +1668,19 @@ export class SdkExecutor implements Executor {
       this.dockerWired,
     );
     const pathHook = buildPathGuardHook(ctx.worktreePath, this.log, this.secretPaths, { sdkHomeDir: this.homeDir });
+    // Issue #2471: the guarded command lane (one per guard-bound run), created below once the
+    // run's MCP servers exist; the hook list reads it when a turn's options are built.
+    let lane: ClaudeCommandLane | undefined;
     const preToolUse = (
       allowedSubagents: string[],
       implementation = false,
+      unavailable: readonly UnavailableRole[] = [],
     ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
       { matcher: "Bash", hooks: [bashHook] },
+      ...(lane ? [
+        { matcher: "Bash", hooks: [lane.hook] },
+        { matcher: GUARDED_COMMAND_TOOL, hooks: [lane.hook] },
+      ] : []),
       {
         matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
         hooks: [pathHook],
@@ -1506,7 +1688,12 @@ export class SdkExecutor implements Executor {
       {
         matcher: NESTED_AGENT_TOOL,
         // null (constraints unavailable) must reach the guard as null, never coerce to [].
-        hooks: [buildAgentGuardHook(allowedSubagents, this.log, () => (ctx.operatorConstraints ? ctx.operatorConstraints() : []))],
+        hooks: [buildAgentGuardHook(
+          allowedSubagents,
+          this.log,
+          () => (ctx.operatorConstraints ? ctx.operatorConstraints() : []),
+          new Map(unavailable.map((role) => [role.name, `denied by guardrail: this role is unavailable on this run: ${role.reason}`])),
+        )],
       },
       {
         matcher: SEND_MESSAGE_TOOL,
@@ -1562,10 +1749,32 @@ export class SdkExecutor implements Executor {
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
     };
+    if (ctx.ciEvidence) mcpServers[CI_EVIDENCE_SERVER] = buildCIEvidenceServer(ctx.ciEvidence);
     const enableImplementationSignals = (): void => {
       signalParkRun = parkRunEnabled(ctx, "implement");
       mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
     };
+    if (guarded) {
+      // Issue #2471: the command lane shares the Claude CLI's exact env object (it derives the
+      // command env from it) and the run's redaction secrets; its turn trips go through the
+      // executor's typed carrier.
+      lane = new ClaudeCommandLane({
+        worktree: ctx.worktreePath,
+        cliEnv: env,
+        secretPaths: this.secretPaths,
+        dockerWired: this.dockerWired,
+        secrets: ctx.guardedCommandSecrets ?? [],
+        log: this.log,
+        capturedMemory: (): CapturedMemoryContext => {
+          const captured = ctx.capturedMemory?.();
+          if (!captured) throw new Error("worker memory context is unavailable for this run");
+          return captured;
+        },
+        tripTurn: (error) => this.tripCarrier(state, error),
+      });
+      mcpServers[GUARDED_COMMAND_SERVER] = buildGuardedCommandServer(lane);
+      this.guardLane = lane;
+    }
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
         client: this.client,
@@ -1664,10 +1873,12 @@ export class SdkExecutor implements Executor {
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
         harness: "claude",
+        ...(lane ? { guardedCommand: { unavailable: planUnavailable } } : {}),
       }),
-      agents: planTurn.subagents,
+      agents: planAgents,
       mcpServers,
-      preToolUse: preToolUse(planSubagentNames),
+      preToolUse: preToolUse(planSubagentNames, false, planUnavailable),
+      ...(lane ? { guardedCommand: true as const } : {}),
       ...(leadModel ? { model: leadModel } : {}),
       ...(effort ? { effort } : {}),
       ...(ctx.config?.attribution_enabled === false
@@ -1755,6 +1966,14 @@ export class SdkExecutor implements Executor {
     // drops the (restarted) turn as REASON_CREDENTIAL_SWITCH. One registration covers every turn.
     ctx.onCredentialSwitch?.(() => this.trip(state, REASON_CREDENTIAL_SWITCH));
 
+    // Issue #2471: the runner tells a guard-bound run when its memory authority is invalidated
+    // mid-run; the lane then trips the turn with that stop and disposes every live command.
+    // Subscribed last, so a setup failure above leaves no listener behind.
+    const authorityLane = lane;
+    const unsubscribeAuthority = authorityLane
+      ? ctx.onMemoryAuthorityLost?.((stop) => authorityLane.onAuthorityLost(stop))
+      : undefined;
+
     // The SDK session id evolves across turns; resume each turn from the last.
     let resumeId = ctx.sessionId ?? undefined;
 
@@ -1778,6 +1997,8 @@ export class SdkExecutor implements Executor {
       planSubagentNames,
       subagentCanWrite,
       preToolUse,
+      lane,
+      unsubscribeAuthority,
       isIssueRun,
       environmentFacts,
       baseConfig,
@@ -2048,9 +2269,10 @@ export class SdkExecutor implements Executor {
             // PRD #90: a ci_fix run can WRITE memory, so it reads the same inert,
             // nonce-fenced cross-run memory back (empty/absent injects nothing).
             memory: ctx.memory,
-            // Issue #105: only set when a dropped resume left this turn amnesiac on a
-            // branch that already carries pushed work.
+            // Best-effort existing branch commit count, independent of SDK session
+            // recovery; interruptedSnapshot supersedes legacy continuation wording.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // Judge rec (run 51757591): the commit this branch was cut from, so the lead
             // does not infer the parent from the clone's freshly-fetched default branch.
             baseCommit: ctx.baseCommit,
@@ -2080,8 +2302,9 @@ export class SdkExecutor implements Executor {
             openSelfImproveMRs: ctx.openSelfImproveMRs,
             // PRD #686 M4: uzi-vs-generic directive selection (absent ⇒ generic).
             selfImproveDogfood: ctx.selfImproveDogfood,
-            // Issue #105: see above — the fixed self_improve branch's prior cycles.
+            // Best-effort existing commits, including prior cycles and interrupted experiments.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // See above. The fixed self_improve branch is routinely seeded off a previous
             // cycle's tip, so its base is the least guessable of the three kinds.
             baseCommit: ctx.baseCommit,
@@ -2113,8 +2336,9 @@ export class SdkExecutor implements Executor {
             // Issue #2083: the earlier run's private decisions memo (mr_rework only; the
             // runner sets it only then), fenced as UNTRUSTED. Absent injects nothing.
             decisionsMemo: ctx.decisionsMemo,
-            // Issue #105: see above — prior pushed work on this issue's branch.
+            // Best-effort existing branch commits; SDK session recovery does not gate the count.
             priorWork: ctx.priorWork,
+            interruptedSnapshot: ctx.interruptedSnapshot,
             // See above.
             baseCommit: ctx.baseCommit,
             defaultBranchCommit: ctx.defaultBranchCommit,
@@ -2549,7 +2773,24 @@ export class SdkExecutor implements Executor {
       if (ctx.config?.override_subagent_model && leadModel) {
         applySubagentModelOverride(selectedSubagents, leadModel);
       }
-      const selectedNames = Object.keys(selectedSubagents);
+      // Issue #2471: a guard-bound run shapes the implement roster the same way as the plan roster.
+      const selectedShaped = drive.lane ? shapeGuardedGrants(selectedSubagents) : undefined;
+      const implementAgents = selectedShaped ? selectedShaped.agents : selectedSubagents;
+      const implementUnavailable: UnavailableRole[] = selectedShaped ? selectedShaped.unavailable : [];
+      const selectedNames = Object.keys(implementAgents);
+      if (implementUnavailable.length > 0) {
+        this.log.warn("implement roster: subagents unavailable under the memory guard", {
+          run_id: ctx.runId,
+          unavailable: implementUnavailable.map((role) => role.name),
+        });
+        ctx.emit({
+          kind: "status",
+          agent: "worker",
+          payload: {
+            text: `not implementing with ${implementUnavailable.map((role) => `${role.name} is unavailable on this run: ${role.reason}`).join("; ")}`,
+          },
+        });
+      }
       // PRD #266 M1: the implement roster's own capability map. Derived from
       // `selectedSubagents` — NOT the plan-turn `subagentCanWrite` built off
       // `assembled.subagents` — because the repo-source path's defs come from the repo
@@ -2561,14 +2802,15 @@ export class SdkExecutor implements Executor {
       drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {
         ...baseConfig,
-        agents: selectedSubagents,
+        agents: implementAgents,
         systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
           repoSourced: selection.source === "repo",
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
           harness: "claude",
+          ...(drive.lane ? { guardedCommand: { unavailable: implementUnavailable } } : {}),
         }),
-        preToolUse: preToolUse(selectedNames, true),
+        preToolUse: preToolUse(selectedNames, true, implementUnavailable),
         mcpServers: baseConfig.mcpServers,
       };
       ctx.emit({
@@ -2609,22 +2851,22 @@ export class SdkExecutor implements Executor {
       let iteration = 0;
       // Issue #1800: SYSTEM texts only (completion rework, clarification answer, secret
       // remediation): worker-authored turn prompts that own the next implement turn outright.
-      // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
+      // Owner follow-ups never ride this variable; they live in ownerBatch below.
       let followUp: string | undefined;
       let completionRework: { text: string; answered: boolean } | undefined;
-      // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
+      // Issue #1800 / #3137: the owner's follow-up batch (never empty), built (fillOwnerBatch) from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
       // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
-      // stamped included then, exactly once).
+      // every entry stamped included then, exactly once).
       // A turn that throws, parks, walls, pauses or is restarted first keeps it for the next turn.
-      let ownerFollowUp: { id: number; body: string } | undefined;
-      // Issue #1800: the held owner follow-up id the interactive-park branch already ran an extra
-      // turn for, so that branch is taken at most once per id.
+      let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      // Issue #1800: the first id of the held owner batch the interactive-park branch already ran an extra
+      // turn for, so that branch is taken at most once per held batch.
       let serviceTriedId: number | undefined;
-      // Issue #1800: follow-ups the interactive park received while ownerFollowUp was still held,
+      // Issue #1800: follow-ups the interactive park received while ownerBatch was still held,
       // in arrival order. They are already consumed from the server; the queue is in-memory only.
       // They refill the slot at the loop top (ahead of a fresh pull) and are serviced once the
-      // held follow-up reaches the model. A follow-up stranded by a run end stays
+      // held batch reaches the model. A follow-up stranded by a run end stays
       // consumed-but-not-included; the worker re-queues it at its next claim (from the claim-time
       // GET of consumed follow-ups), not the server.
       const queuedOwner: Array<{ id: number; body: string }> = [];
@@ -2701,6 +2943,9 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
+      // Execution lifetime, independent of iteration resets and system/rework turns.
+      // Consumed at harness dispatch after refreshCodeCrossCheckTools has settled.
+      let interruptedOwnerDispatched = false;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2894,13 +3139,13 @@ export class SdkExecutor implements Executor {
         // in its slot for the next ordinary turn.
         const reworkForTurn = completionRework;
         completionRework = undefined;
-        if (followUp === undefined && !reworkForTurn) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
-        const ownerRides = followUp === undefined && !reworkForTurn ? ownerFollowUp : undefined;
+        if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
+        const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
         const onFirstEvent = ownerRides
           ? () => {
-              if (ownerFollowUp?.id !== ownerRides.id) return;
-              ownerFollowUp = undefined;
-              ctx.followUpIncluded?.(ownerRides.id);
+              if (ownerBatch !== ownerRides) return;
+              ownerBatch = undefined;
+              for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
             }
           : undefined;
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
@@ -2923,6 +3168,7 @@ export class SdkExecutor implements Executor {
         // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
         // carried it. The "injected" line is emitted only when the block is placed.
         const firstImplementTurn = iteration === 1 && !hasParked;
+        const firstOrdinaryOwner = !interruptedOwnerDispatched && followUp === undefined && !reworkForTurn;
         const priorDecisionsMemo =
           firstImplementTurn &&
           !ctx.sessionId &&
@@ -2972,7 +3218,8 @@ export class SdkExecutor implements Executor {
             seeded: ctx.seeded,
             // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
-            followUp: followUp ?? ownerRides?.body,
+            followUp,
+            ownerFollowUps: ownerRides?.map((f) => f.body),
             completionRework: reworkForTurn,
             ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
@@ -2996,11 +3243,12 @@ export class SdkExecutor implements Executor {
             // present (drained fresh each turn, not first-turn-only). Rendered as worker guidance
             // ahead of any <follow_up> block. Absent ⇒ no block.
             safetySteer,
-            // PRD #209 (D7): a requeued seeded run whose transcript was dropped re-enters
-            // implement COLD — no plan turn carried the prior-work note. Threaded on the
-            // pre-approved path ONLY, so an ordinary gated run's implement prompt is
-            // byte-identical to before (it never carried this). First turn only.
-            priorWork: preApproved ? ctx.priorWork : undefined,
+            // PRD #209 (D7): carry existing branch commits on preapproved implementation.
+            // Preserve legacy first-turn rendering without a snapshot; with a snapshot,
+            // only the first ordinary owner receives this context, including when a
+            // clarification reuses iteration 1.
+            priorWork: preApproved && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
+            interruptedSnapshot: firstOrdinaryOwner ? ctx.interruptedSnapshot : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
             // can see the boundaries and checkpoint at each one. A pre-approved resume
             // uses the claim's frozen list; no approved breakdown adds no note.
@@ -3024,6 +3272,12 @@ export class SdkExecutor implements Executor {
           idleMs,
           onProgress,
           onFirstEvent,
+          firstOrdinaryOwner ? (prompt) => {
+            if (interruptedOwnerDispatched) return prompt;
+            const note = interruptedCallsNote(ctx.getInterruptedCalls?.());
+            interruptedOwnerDispatched = true;
+            return note ? `${prompt}\n\n${note}` : prompt;
+          } : undefined,
         );
         // PRD #1190 M2: await the turn through a catch for a `now` pause abort. driveTurn is an
         // async function, so even a synchronous trip check surfaces as a REJECTED promise here
@@ -3054,7 +3308,7 @@ export class SdkExecutor implements Executor {
             return true;
           }
           this.throwIfTerminal(ctx);
-          state.tripReason = undefined;
+          this.clearTrip(state);
           throwIfDiskStop(ctx);
           return false;
         };
@@ -3207,7 +3461,7 @@ export class SdkExecutor implements Executor {
             }
             if (outcome === "gave_up") {
               this.throwIfTerminal(ctx);
-              state.tripReason = undefined;
+              this.clearTrip(state);
               this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
               completionRework = reworkForTurn;
@@ -3262,7 +3516,7 @@ export class SdkExecutor implements Executor {
             if (outcome === "refused") {
               ctx.clearWallMode?.();
               this.throwIfTerminal(ctx);
-              state.tripReason = undefined;
+              this.clearTrip(state);
               throwIfDiskStop(ctx);
               completionRework = reworkForTurn;
               continue;
@@ -3331,20 +3585,20 @@ export class SdkExecutor implements Executor {
           if (ctx.interactive && ctx.awaitFollowUp && !finalizing) {
             // Issue #1800: defensive, not reachable through the public seams today: a turn that
             // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
-            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would
-            // consume a second follow-up from the server into an occupied slot, and one of the two
-            // would never be included. Service the held one first: run another turn instead of
+            // is still held (pulled, never evidenced) the batch has not reached the model yet. Parking
+            // would consume another follow-up from the server into an occupied slot, and one of the
+            // two would never be included. Service the held batch first: run another turn instead of
             // parking, with the same fresh budgets a received follow-up gets. Bounded: this is taken
-            // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
+            // once per held batch, keyed on its first id (`serviceTriedId`), and the system `followUp` text is cleared so the
             // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
             // through to the normal park: the follow-up stays unincluded and is re-queued at the
-            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND it
-            // (queuedOwner); queued ones are serviced once the held one reaches the model.
+            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND the
+            // batch (queuedOwner); queued ones are serviced once the held batch reaches the model.
             if (
-              (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id)
-              || (ownerFollowUp === undefined && queuedOwner.length > 0)
+              (ownerBatch !== undefined && serviceTriedId !== ownerBatch[0]!.id)
+              || (ownerBatch === undefined && queuedOwner.length > 0)
             ) {
-              if (ownerFollowUp !== undefined) serviceTriedId = ownerFollowUp.id;
+              if (ownerBatch !== undefined) serviceTriedId = ownerBatch[0]!.id;
               followUp = undefined;
               iteration = 0;
               state.wallRemainingMs = initialWallMs;
@@ -3400,7 +3654,7 @@ export class SdkExecutor implements Executor {
               followUp = undefined;
               // The slot may still be held (the bounded extra turn above did not evidence it):
               // keep the held one in front and queue this one behind it.
-              if (ownerFollowUp === undefined) ownerFollowUp = { id: outcome.id, body: outcome.body };
+              if (ownerBatch === undefined) ownerBatch = [{ id: outcome.id, body: outcome.body }];
               else queuedOwner.push({ id: outcome.id, body: outcome.body });
               // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
               // interactive run spans many follow-ups over its lifetime and must NOT fail with
@@ -3591,7 +3845,7 @@ export class SdkExecutor implements Executor {
                   if (outcome === "refused") {
                     ctx.clearWallMode?.();
                     this.throwIfTerminal(ctx);
-                    state.tripReason = undefined;
+                    this.clearTrip(state);
                     throwIfDiskStop(ctx);
                     return false;
                   }
@@ -3747,7 +4001,7 @@ export class SdkExecutor implements Executor {
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
 
         // Issue #1800: the system text this turn carried is spent. Queued owner follow-ups are
-        // pulled at the next loop top (FIFO, one per turn), immediately before the prompt that
+        // pulled at the next loop top (FIFO, batched up to the rune cap), immediately before the prompt that
         // carries them is built.
         followUp = undefined;
 
@@ -4064,7 +4318,7 @@ export class SdkExecutor implements Executor {
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
           this.throwIfTerminal(ctx);
-          state.tripReason = undefined;
+          this.clearTrip(state);
           this.markSwitchSignalSpent(ctx);
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
@@ -4278,6 +4532,7 @@ export class SdkExecutor implements Executor {
     // the prompt (evidencesModelProcessing), NOT on init or other lifecycle frames. A re-drive of
     // the same turn (driveTurnWithEmptyRecovery) calls it again, so the handler must be idempotent.
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     this.throwIfTerminal(ctx);
     // A trip may already be pending (e.g. a cancel that landed during the gate).
@@ -4291,6 +4546,8 @@ export class SdkExecutor implements Executor {
     state.currentChild = {};
 
     let idleTimer: NodeJS.Timeout | undefined;
+    // Issue #2471: the guarded command lane of this run (undefined unless guard-bound).
+    const lane = this.guardLane;
     const outstandingTools = new Set<string>();
     const armIdle = (): void => {
       if (idleTimer) clearTimeout(idleTimer);
@@ -4335,12 +4592,27 @@ export class SdkExecutor implements Executor {
     if (state.tripReason) throw this.tripError(state);
     try {
       armIdle();
+      if (lane) {
+        // Issue #2471: capture the worker-memory context for this turn. A capture failure has
+        // already tripped the turn with the runner's own stop (the carrier), and rethrows it.
+        lane.beginTurn(AbortSignal.any([
+          abortController.signal,
+          ...(ctx.signal ? [ctx.signal] : []),
+          ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : []),
+        ]));
+      }
       // The owner hands the adapter the per-turn ClaudeTurnConfig ingredients (plan
       // or implement, computed by phaseSetup/phaseRunLoop, agents.ts used as-is) plus
       // the current-child sink; the adapter assembles the SdkOptions and finalizes
       // resume/abort/spawn per turn.
       if (phase === "implement") await state.refreshCodeCrossCheckTools?.();
-      this.harness.prepareTurn(turnConfig, state.currentChild);
+      // Issue #2471: fail closed if a guard-bound run is ever about to build a turn without the
+      // guarded command routing (native Bash would then bypass the supervised lane).
+      if (lane && turnConfig.guardedCommand !== true) {
+        throw new TrustedExecutionRefusal("guard-bound run built a turn config without the guarded command routing");
+      }
+      this.harness.prepareTurn({ ...turnConfig, agents: withCIEvidenceAgents(turnConfig.agents ?? {}, ctx.ciEvidence) }, state.currentChild);
+      prompt += ciEvidencePrompt(ctx.ciEvidence);
       if (parkRunEnabled(ctx, phase)) {
         // buildImplementPrompt's later-turn opening must also allow dependency waiting.
         prompt = prompt.replace(
@@ -4349,6 +4621,7 @@ export class SdkExecutor implements Executor {
         );
         if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
       }
+      if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request: RunTurnRequest = {
         semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
@@ -4493,6 +4766,19 @@ export class SdkExecutor implements Executor {
       if (idleTimer) clearTimeout(idleTimer);
       this.disarmWall(state);
       state.currentAbort = undefined;
+      // The turn's CLI has exited: forget its pid so no later trip can signal a recycled one.
+      state.currentChild = {};
+      if (lane) {
+        // Issue #2471: no model command outlives its turn, so this runs before every catch arm of
+        // the implement loop and before any pause, wall or credential-switch park. A failed join
+        // never replaces an error already in flight: it is carried (first-wins, like any trip) and
+        // surfaces through the trip check right after this block when the turn was returning.
+        try {
+          await lane.quiesce(GUARDED_LANE_QUIESCE_MS);
+        } catch (err) {
+          this.tripCarrier(state, err instanceof Error ? err : new Error(errMessage(err)));
+        }
+      }
     }
     // The for-await terminal break has closed the SDK iterator, and the finally above
     // has debited the wall and cleared the turn's watchdog/abort state. The run's trip
@@ -4551,6 +4837,7 @@ export class SdkExecutor implements Executor {
     idleMs: number,
     onProgress?: (progress: MilestoneProgress) => void,
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
     // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
@@ -4575,6 +4862,7 @@ export class SdkExecutor implements Executor {
             idleMs,
             onProgress,
             onFirstEvent,
+            beforeDispatch,
           );
           lastProviderErr = undefined;
           return;
@@ -4888,6 +5176,9 @@ export class SdkExecutor implements Executor {
    *  path; every other trip reason throws its static Error(reason) exactly as before. Keeps the
    *  REASON_PAUSE_NOW sentinel from ever surfacing as a `failed` report's text. */
   private tripError(state: RunDrive): Error {
+    // Issue #2471: a memory-authority trip throws the exact error it carries (the runner's own
+    // stop must reach its retained-custody arm unchanged), never a rebuilt one.
+    if (state.tripError) return state.tripError;
     if (state.tripReason === REASON_PAUSE_NOW) return new PauseNowSignal();
     // PRD #1247 M5b: a credential-switch trip throws a CredentialSwitchSignal, which the implement
     // loop's turn catch propagates (it is neither a PauseNowSignal nor a WALL/IDLE trip) to the
@@ -4930,6 +5221,34 @@ export class SdkExecutor implements Executor {
     if (ctx.terminalLifecycleSignal?.aborted || ctx.claimFenced?.()) throw new Error(REASON_CANCELLED);
   }
 
+  /**
+   * Issue #2471: stop the current turn with `error` as the error it throws (the guarded command
+   * lane's typed carrier). It overrides only an earlier wall or idle trip; any other earlier
+   * trip (a pause, a credential switch, a cancel) keeps first-wins, so the owner's park proceeds
+   * as today, and the stop then surfaces at the next turn-start capture (memory has ended).
+   * A carrier already set is never replaced.
+   */
+  private tripCarrier(state: RunDrive, error: Error): void {
+    if (state.tripError) return;
+    const prior = state.tripReason;
+    if (prior !== undefined && prior !== REASON_WALL && prior !== REASON_IDLE) return;
+    state.tripError = error;
+    state.tripReason = REASON_MEMORY_AUTHORITY_LOST;
+    this.log.warn("run memory-guard trip, aborting SDK", { reason: REASON_MEMORY_AUTHORITY_LOST });
+    // Kill the CLI only while a turn is live: between turns currentChild holds the previous
+    // turn's exited pid, which the kernel may have recycled (issue #1656).
+    const live = state.currentAbort !== undefined;
+    state.currentAbort?.abort();
+    if (live) this.kill(state.currentChild.pid);
+  }
+
+  /** Clear a handled trip so the aborted turn restarts. A memory-authority carrier is never
+   *  cleared: it is rethrown, so no clear-and-continue site can swallow the runner's stop. */
+  private clearTrip(state: RunDrive): void {
+    if (state.tripError) throw state.tripError;
+    state.tripReason = undefined;
+  }
+
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */
   private trip(state: RunDrive, reason: string): void {
     if (state.tripReason) return; // first trip wins
@@ -4966,6 +5285,11 @@ export class SdkExecutor implements Executor {
       state.wallArmedAt = undefined;
     }
   }
+}
+
+/** Throw a stored failure from a place a bare `throw` would trip the unsafe-finally lint. */
+function rethrow(error: unknown): never {
+  throw error;
 }
 
 /** Convert an optional seconds value (any number tolerated) to ms. */

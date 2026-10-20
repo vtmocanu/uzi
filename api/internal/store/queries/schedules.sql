@@ -17,12 +17,12 @@
 -- through the one validator before insert; clone/add-repo copy the source row's columns
 -- so a derived row never drops the override.
 INSERT INTO run_schedules (
-    user_id, repo_id, target, issue_iid, labels, prompt, ci_workflows,
+    user_id, repo_id, target, issue_iid, labels, prompt, ci_workflows, ci_artifacts,
     timing, cron_expr, run_at, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, guidance, model, output_mode, override_subagent_model,
     remove_label_on_dispatch, capacity_limit, capacity_room_needed, sibling_group_id, harness, credential_override_mode, credential_override_secret_id
 ) VALUES (
-    @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'), sqlc.narg('ci_workflows'),
+    @user_id, @repo_id, @target, sqlc.narg('issue_iid'), sqlc.narg('labels'), sqlc.narg('prompt'), sqlc.narg('ci_workflows'), sqlc.narg('ci_artifacts'),
     @timing, sqlc.narg('cron_expr'), sqlc.narg('run_at'), @timezone, sqlc.narg('next_fire_at'),
     @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), @enabled, sqlc.narg('max_issues'), sqlc.narg('guidance'), sqlc.narg('model'), sqlc.narg('output_mode'), @override_subagent_model,
     @remove_label_on_dispatch, sqlc.narg('capacity_limit'), sqlc.narg('capacity_room_needed'), sqlc.narg('sibling_group_id'), sqlc.narg('harness'), sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id')
@@ -44,12 +44,12 @@ RETURNING *;
 -- handler then reads the existing row via GetDefaultScheduleForRepoSlug and returns 200).
 INSERT INTO run_schedules (
     user_id, repo_id, target, catalog_slug, origin, customized,
-    issue_iid, labels, prompt, guidance, ci_workflows,
+    issue_iid, labels, prompt, guidance, ci_workflows, ci_artifacts,
     timing, cron_expr, timezone, next_fire_at,
     auto_approve, wait_on_limit, mr_rework_enabled, enabled, max_issues, model, output_mode, remove_label_on_dispatch, capacity_limit, capacity_room_needed
 ) VALUES (
     @user_id, @repo_id, @target, @catalog_slug, 'default', false,
-    NULL, NULL, NULL, NULL, sqlc.narg('ci_workflows'),
+    NULL, NULL, NULL, NULL, sqlc.narg('ci_workflows'), sqlc.narg('ci_artifacts'),
     'recurring', @cron_expr, @timezone, @next_fire_at,
     @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), true, sqlc.narg('max_issues'), sqlc.narg('model'), sqlc.narg('output_mode'), @remove_label_on_dispatch, sqlc.narg('capacity_limit'), sqlc.narg('capacity_room_needed')
 )
@@ -86,7 +86,7 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND catalog_slug = @catalog_slug
 -- Written as SQL literals (no param) because the catalog baseline is always inherit.
 -- next_fire_at is recomputed in Go from the catalog cron+timezone and passed in.
 UPDATE run_schedules
-SET ci_workflows  = sqlc.narg('ci_workflows'),
+SET ci_workflows = sqlc.narg('ci_workflows'), ci_artifacts = sqlc.narg('ci_artifacts'),
     cron_expr     = @cron_expr,
     timezone      = @timezone,
     model         = sqlc.narg('model'),
@@ -143,7 +143,7 @@ SELECT * FROM run_schedules WHERE user_id = @user_id ORDER BY created_at DESC;
 -- explicit act of putting a schedule back into service, so it clears the terminal/error
 -- state; enabled (the pause flag) is orthogonal and untouched here.
 UPDATE run_schedules
-SET ci_workflows  = sqlc.narg('ci_workflows'),
+SET ci_workflows = sqlc.narg('ci_workflows'), ci_artifacts = sqlc.narg('ci_artifacts'),
     target        = @target,
     repo_id       = @repo_id,
     issue_iid     = sqlc.narg('issue_iid'),

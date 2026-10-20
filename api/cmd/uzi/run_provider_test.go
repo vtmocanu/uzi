@@ -155,11 +155,11 @@ func TestProviderCLIWaitFollowEdges(t *testing.T) {
 			countUpdate := retry
 			countUpdate.ProviderParkCount = 4
 			hold := providerHoldFixture()
-			ownerPause := runAt("paused")
-			credential := ownerPause
+			ordinaryPause := runAt("paused")
+			credential := ordinaryPause
 			reason := "credential_disabled"
 			credential.HoldReason = &reason
-			runs := []apitypes.RunDTO{generic, retry, retry, countUpdate, hold, hold, ownerPause, credential, hold, runAt("running"), runAt("failed")}
+			runs := []apitypes.RunDTO{generic, retry, retry, countUpdate, hold, hold, ordinaryPause, credential, hold, runAt("running"), runAt("failed")}
 			polls := 0
 			srv := providerSequenceServer(t, runs, &polls)
 			defer srv.Close()
@@ -171,7 +171,10 @@ func TestProviderCLIWaitFollowEdges(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit=%d: %s", code, stderr)
 			}
-			requireWorkerCopy(t, stderr, "provider outage", "counted parks: 3", "provider unavailable", "paused by its owner", "credential", "running")
+			requireWorkerCopy(t, stderr, "provider outage", "counted parks: 3", "provider unavailable", "paused; resume with uzi run resume r1", "credential", "running")
+			if strings.Contains(stderr, "paused by") {
+				t.Fatalf("pause attributed without current message evidence: %s", stderr)
+			}
 			if strings.Count(stderr, "provider outage") != 1 || strings.Count(stderr, "provider unavailable") != 2 {
 				t.Fatalf("edge notices repeated or missing: %s", stderr)
 			}

@@ -1,3 +1,4 @@
+import { normalizeCIArtifacts } from "../../lib/ciArtifacts";
 import {
   type CatalogEntry,
   type CIEpisodeDTO,
@@ -877,6 +878,11 @@ export const schedulesApi = {
       throw new ApiError(400, "ci_workflows is only valid for a ci_watch schedule");
     }
     const ciWorkflows = target === "ci_watch" ? normalizeCIWorkflows(input.ci_workflows ?? []) : [];
+    const artifacts = normalizeCIArtifacts(input.ci_artifacts ?? []);
+    if (artifacts.error) throw new ApiError(400, artifacts.error);
+    if (target !== "ci_watch" && artifacts.selectors.length > 0)
+      throw new ApiError(400, "ci_artifacts is only valid for a ci_watch schedule");
+
     const s: Schedule = {
       id: nextScheduleId(),
       repo_id: repoId,
@@ -890,6 +896,7 @@ export const schedulesApi = {
           ? (input.prompt?.trim() ? input.prompt : CI_REPAIR_PROMPT)
           : "",
       ...(ciWorkflows.length > 0 ? { ci_workflows: ciWorkflows } : {}),
+      ...(target === "ci_watch" && artifacts.selectors.length > 0 ? { ci_artifacts: artifacts.selectors } : {}),
       timing,
       cron_expr: timing === "recurring" ? (input.cron_expr ?? "") : "",
       run_at: timing === "once" ? (input.run_at ?? null) : null,
@@ -1019,6 +1026,13 @@ export const schedulesApi = {
         throw new ApiError(400, "ci_workflows is only valid for a ci_watch schedule");
       m.ci_workflows = next.length > 0 ? next : undefined;
     }
+    if (input.ci_artifacts !== undefined) {
+      const artifacts = normalizeCIArtifacts(input.ci_artifacts ?? []);
+      if (artifacts.error) throw new ApiError(400, artifacts.error);
+      if (m.target !== "ci_watch" && artifacts.selectors.length > 0)
+        throw new ApiError(400, "ci_artifacts is only valid for a ci_watch schedule");
+      m.ci_artifacts = artifacts.selectors.length > 0 ? artifacts.selectors : undefined;
+    }
     if (input.cron_expr !== undefined) m.cron_expr = input.cron_expr;
     if (input.run_at !== undefined) m.run_at = input.run_at;
     if (input.timezone !== undefined) m.timezone = input.timezone;
@@ -1073,7 +1087,10 @@ export const schedulesApi = {
         : null;
     if (m.target === "ci_watch" && m.prompt.trim() === "") m.prompt = CI_REPAIR_PROMPT;
     m.prompt = m.target === "prompt" || m.target === "ci_watch" ? m.prompt : "";
-    if (m.target !== "ci_watch") delete m.ci_workflows;
+    if (m.target !== "ci_watch") {
+      delete m.ci_workflows;
+      delete m.ci_artifacts;
+    }
     // PRD #929 M1: output mode is prompt-only; null it out on any other target.
     m.output_mode = m.target === "prompt" ? m.output_mode : null;
     m.cron_expr = m.timing === "recurring" ? m.cron_expr : "";
@@ -1105,8 +1122,8 @@ export const schedulesApi = {
           // so any non-empty overlay flips customized. The baked catalog guidance is NOT
           // compared (only the overlay's presence matters), matching the server.
           ((m.target === "prompt" || m.target === "sweep" || m.target === "ci_watch") && (m.guidance ?? "") !== "") ||
-          // PRD #2865: a ci_watch default's catalog baseline watches every workflow.
-          (m.target === "ci_watch" && (m.ci_workflows?.length ?? 0) > 0);
+          // A ci_watch catalog baseline watches every workflow and fetches no artifacts.
+          (m.target === "ci_watch" && ((m.ci_workflows?.length ?? 0) > 0 || (m.ci_artifacts?.length ?? 0) > 0));
       }
     }
     m.updated_at = new Date().toISOString();

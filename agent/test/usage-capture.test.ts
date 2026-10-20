@@ -359,7 +359,7 @@ describe("SdkExecutor with the usage recorder", () => {
       sessionId: null,
       onSessionId: () => {},
       gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
-      pullFollowUp: () => undefined,
+      pullFollowUps: () => [],
       reportIteration: () => {},
       ...overrides,
     };

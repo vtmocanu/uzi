@@ -188,10 +188,11 @@ export type MessageKind =
    *  run_messages kind (the column carries no DB CHECK; the message-ingest route
    *  accepts any non-empty kind), reusing the plan_feedback emit machinery. */
   | "steer_ack"
-  /** PRD #1190 M2: the run PARKED on an owner-requested pause. Emitted by the runner's pause
-   *  park path (mirroring `limit_wait`) once the checkpoint published and the server ACKed
-   *  `paused`. Payload `{ completed: number, total?: number }` — the milestone position the
-   *  park landed at. A free-form run_messages kind (the column carries no DB CHECK). */
+  /** The run PARKED after its checkpoint published and the server ACKed `paused`.
+   *  Best-effort delivery follows recovery pin and inventory handling. Payload
+   *  `{ completed: number, total?: number, origin?: "lead_park" | "owner" }` carries the milestone
+   *  position and optional display-only source, never pause authority or persistence state.
+   *  A free-form run_messages kind (the column carries no DB CHECK). */
   | "paused"
   /** PRD #1190 M2: a pending pause could NOT park because its checkpoint failed to publish
    *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload
@@ -1301,6 +1302,59 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
   planning_diff?: string;
 }
 
+/** CI repair evidence wire types mirror workersvc.ClaimCIRepair and ciartifacts. */
+export interface CIArtifactExecution {
+  run_id: number;
+  repository_id: number;
+  head_repository_id?: number;
+  workflow_key: string;
+  workflow?: string;
+  sha: string;
+  branch: string;
+  updated_at: string;
+  attempt?: number | null;
+}
+
+export interface CIArtifactEntry {
+  artifact_name?: string;
+  path?: string;
+  compressed_size?: number;
+  uncompressed_size?: number;
+  summary?: boolean;
+  artifact_id: string;
+  entry_ordinal: number;
+  label: string;
+  shortened?: boolean;
+  status: "kept" | "skipped";
+  reason?: string;
+  manifest_id?: string;
+  name?: string;
+  size?: number;
+  sha256?: string;
+}
+
+export interface CIArtifactManifest {
+  execution?: CIArtifactExecution | null;
+  reasons?: string[] | null;
+  omitted_kept_aliases?: number;
+  entries: CIArtifactEntry[];
+  omitted?: number | null;
+  uninspected?: boolean;
+}
+
+export interface ClaimCIRepairFile {
+  /** Canonical job_file UUID; aliases in manifest.entries share this ID. */
+  manifest_id: string;
+  name: string;
+  size: number;
+  sha256: string;
+}
+
+export interface ClaimCIRepair {
+  manifest: CIArtifactManifest;
+  input_files: ClaimCIRepairFile[];
+}
+
 /** Episode state carried by current APIs; absent on legacy claims. A null policy
  *  means the episode has not frozen an opt-in policy yet, never authorization. */
 export interface ClaimMemoryState {
@@ -1312,6 +1366,8 @@ export interface ClaimMemoryState {
 export interface ClaimResponse extends ClaimMemoryState {
   /** Server row only; no production enrollment writer in M2. */
   semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
+  /** Guarded prompt repair inputs; metadata is untrusted. */
+  ci_repair?: ClaimCIRepair;
   /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
   park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */

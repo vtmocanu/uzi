@@ -23,6 +23,7 @@ import type { RunDiskSampler } from "./run-disk.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
+import { memoryLauncherPreflight, type MemoryLauncherPreflightResult } from "./claude-command/preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
@@ -151,6 +152,9 @@ export class Worker {
     // started alongside the claim loops and settles after the signal aborts and the socket is closed.
     private readonly retainedSource?: { serve(signal: AbortSignal): Promise<void> },
     private readonly memory?: Pick<WorkerMemoryRuntime, "run" | "stop">,
+    // issue #2471 M1: the guarded-command launcher preflight, run only when the memory guard is
+    // enabled. Injectable so tests need no supervisor; production launches the real probe.
+    private readonly launcherPreflight: () => Promise<MemoryLauncherPreflightResult> = () => memoryLauncherPreflight(),
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
     if (!this.terminalRejections && outbox && typeof client.reportTerminalRejections === "function" &&
@@ -408,6 +412,18 @@ export class Worker {
         throw new Error(
           `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
         );
+      }
+      // issue #2471 M1: with the memory guard enabled, guarded Claude commands run under the
+      // immutable supervisor at the runner uid. A worker that cannot start it (or whose profile the
+      // supervisor refuses) must fail registration visibly, like the toolchain refusal above: throw
+      // to main.ts's fatal handler, no register, no retry. A guard-enabled worker that runs only Codex is
+      // refused too: the probe cannot tell which harness a later claim will use.
+      if (this.config.memoryGuard?.enabled) {
+        const launcher = await this.launcherPreflight();
+        if (!launcher.ok) {
+          this.log.error("memory guard launcher preflight FAILED — refusing to register", { reason: launcher.reason });
+          throw new Error(`memory guard launcher preflight failed: ${launcher.reason}`);
+        }
       }
       // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
       // restart sweep below provably excludes any record a live flight of this process writes later.
@@ -847,6 +863,8 @@ export class Worker {
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
           // the api offers a guarded repair run only to a worker advertising it.
           "ci_config_guard_v1",
+          // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
+          ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does

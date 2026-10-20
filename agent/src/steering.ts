@@ -411,6 +411,19 @@ function validReceipt(receipt: InputReceipt | null | undefined, ids: number[]): 
   return receipt.inputs.every((input) => expected.delete(input.id)) && expected.size === 0;
 }
 
+/** Cap on the total size of one batch of owner follow-ups delivered in a single turn. Matches the
+ *  server's answer-submission limit (maxAnswerBodyRunes × maxAnswerCount in
+ *  api/internal/workersvc/service.go). Counted in Unicode code points (followUpRunes) over the trimmed
+ *  bodies as queued; the fence markup the prompt adds is excluded. A standalone TS constant: no
+ *  cross-language sharing. */
+export const MAX_FOLLOW_UP_BATCH_RUNES = 40000;
+
+/** Code points in `body`: the one counting rule for the follow-up batch cap, for the steering
+ *  channel and any executor-side batch fill (UTF-16 length would double-count astral characters). */
+export function followUpRunes(body: string): number {
+  return [...body].length;
+}
+
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
@@ -1308,7 +1321,7 @@ export class SteeringChannel {
   }
 
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
-   *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
+   *  executor — via pullFollowUp/pullFollowUps or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
    *  follow-up (route → push) does NOT advance it; only DELIVERY (takeFollowUp shift) does,
    *  which is what makes it race-free across the park report's DB round-trip: the value is
@@ -1404,7 +1417,17 @@ export class SteeringChannel {
   }
 
   private readonly shutdownStop = new AbortController();
+
+  /** Revocation fence also fires for disk/switch delivery after a cooperative pause. */
+  checkpointAuthoritySignal(): AbortSignal {
+    return this.shutdownStop.signal;
+  }
+
   private shutdownCheckpoint?: GracefulShutdownCheckpoint;
+
+  workerShutdownCheckpoint(): GracefulShutdownCheckpoint | undefined {
+    return this.shutdownCheckpoint;
+  }
 
   /** Stop execution with existing reasons while preserving the shutdown sink's separate stop signal. */
   workerShutdown(deadlineAt: number): GracefulShutdownCheckpoint {
@@ -1907,9 +1930,34 @@ export class SteeringChannel {
 
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body
    *  so the executor can report the follow-up included (markFollowUpIncluded) once a prompt that
-   *  carried it has really started. */
+   *  carried it has really started. Retained as the channel's single-entry API (the steering unit
+   *  tests use it); executors take batches via pullFollowUps. */
   pullFollowUp(): { id: number; body: string } | undefined {
     return this.takeFollowUp();
+  }
+
+  /** Dequeue all pending follow-ups, oldest first, up to `remainingRunes` code points in total
+   *  (followUpRunes over the trimmed, queued bodies). An oversized entry never blocks the queue:
+   *  when it heads the queue and `batchEmpty` is true (the caller has nothing in the batch yet)
+   *  it is taken alone; otherwise it, and everything after it, waits for the next turn (the
+   *  longest-prefix precedent in agent/src/batcher.ts). Every take goes through takeFollowUp, so
+   *  the delivered watermark covers only the ids actually returned. */
+  pullFollowUps(remainingRunes: number, batchEmpty: boolean): { id: number; body: string }[] {
+    const taken: { id: number; body: string }[] = [];
+    let remaining = remainingRunes;
+    for (;;) {
+      const head = this.followUps[0];
+      if (!head) break;
+      const runes = followUpRunes(head.body);
+      if (runes <= remaining) {
+        taken.push(this.takeFollowUp()!);
+        remaining -= runes;
+      } else {
+        if (batchEmpty && taken.length === 0) taken.push(this.takeFollowUp()!);
+        break;
+      }
+    }
+    return taken;
   }
 
   /** Issue #1800: the executor put follow-up `id` into a prompt whose turn reached the model. Queues an inclusion
@@ -1946,7 +1994,7 @@ export class SteeringChannel {
 
   /** PRD #1416 M2: consume the worker-authoritative safety steer — return it and clear the slot,
    *  so it is delivered exactly once per arm. Both executors call this at their loop top ahead of
-   *  pullFollowUp, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
+   *  pullFollowUps, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
   pullSafetySteer(): string | undefined {
     const steer = this.safetySteer;
     this.safetySteer = undefined;
