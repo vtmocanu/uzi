@@ -3537,6 +3537,107 @@ describe("M1 composed policy guidance delivery", () => {
     if (errors.length > 1) throw new AggregateError(errors, "M1 observation and cleanup failures");
   }
 
+  it("finishCleanup retains the initiating error before independent cleanup failures and attempts every step in order", async () => {
+    const initiating = new Error("observation failed");
+    const join = new Error("join failed");
+    const assertion = new assert.AssertionError({ message: "cleanup assertion failed" });
+    const apiClose = new Error("API close failed");
+    const removal = new Error("fixture removal failed");
+    const calls: string[] = [];
+
+    await assert.rejects(finishCleanup([initiating], [
+      () => { calls.push("release"); },
+      () => { calls.push("shutdown"); },
+      async () => {
+        calls.push("join");
+        await Promise.resolve();
+        calls.push("join settled");
+        throw join;
+      },
+      () => { calls.push("assertion"); throw assertion; },
+      () => { calls.push("next assertion"); },
+      async () => { calls.push("API close"); throw apiClose; },
+      () => { calls.push("removal"); throw removal; },
+      () => { calls.push("last cleanup"); },
+    ]), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 5);
+      assert.equal(error.errors[0], initiating);
+      assert.equal(error.errors[1], join);
+      assert.equal(error.errors[2], assertion);
+      assert.equal(error.errors[3], apiClose);
+      assert.equal(error.errors[4], removal);
+      return true;
+    });
+    assert.deepEqual(calls, [
+      "release", "shutdown", "join", "join settled", "assertion", "next assertion",
+      "API close", "removal", "last cleanup",
+    ]);
+  });
+
+  for (const source of ["initiating", "cleanup"] as const)
+    it(`finishCleanup preserves single ${source} error identity and completes later steps`, async () => {
+      const failure = new Error("sole failure");
+      const calls: string[] = [];
+      await assert.rejects(finishCleanup(source === "initiating" ? [failure] : [], [
+        () => {
+          calls.push("first");
+          if (source === "cleanup") throw failure;
+        },
+        async () => { calls.push("last"); },
+      ]), error => {
+        assert.equal(error, failure);
+        return true;
+      });
+      assert.deepEqual(calls, ["first", "last"]);
+    });
+
+  it("finishCleanup rejects an early return on cleanup failure after attempting later steps", async () => {
+    const join = new Error("join failed");
+    const apiClose = new Error("API close failed");
+    const calls: string[] = [];
+    async function rejectedCase() {
+      try {
+        return "rejected case";
+      } finally {
+        await finishCleanup([], [
+          async () => { calls.push("join"); throw join; },
+          () => { calls.push("API close"); throw apiClose; },
+          () => { calls.push("removal"); },
+        ]);
+      }
+    }
+    await assert.rejects(rejectedCase(), error => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors[0], join);
+      assert.equal(error.errors[1], apiClose);
+      return true;
+    });
+    assert.deepEqual(calls, ["join", "API close", "removal"]);
+  });
+
+  it("finishCleanup preserves an early return when every cleanup step succeeds", async () => {
+    const calls: string[] = [];
+    async function rejectedCase() {
+      try {
+        return "rejected case";
+      } finally {
+        await finishCleanup([], [
+          async () => {
+            calls.push("join");
+            await Promise.resolve();
+            calls.push("join settled");
+          },
+          () => { calls.push("API close"); },
+          () => { calls.push("removal"); },
+        ]);
+      }
+    }
+    assert.equal(await rejectedCase(), "rejected case");
+    assert.deepEqual(calls, ["join", "join settled", "API close", "removal"]);
+  });
+
   // Each claim owns a fresh executor/transport; the API, worker home and session store survive.
   async function preservingFixture(atGate = false) {
     const diagnostics = recordingLog();
