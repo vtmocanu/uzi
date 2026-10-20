@@ -349,7 +349,7 @@ api_back() {
 # fed on stdin so the image needs no copy). Never fails: every step is guarded and a failure
 # only prints a warning to stderr. Runs are the phase's own; empty or non-UUID ones are skipped.
 save_outbox_agent_evidence() {
-  local label="$1" dir="$RUNROOT/artifacts/52-api-outage-outbox" run
+  local label="$1" dir="$RUNROOT/artifacts/52-api-outage-outbox" run limiter
   local -a runs=()
   mkdir -p "$dir" 2>/dev/null || true
   "${COMPOSE[@]}" logs --no-color agent > "$dir/agent-$label.log" 2>/dev/null || true
@@ -360,9 +360,17 @@ save_outbox_agent_evidence() {
     echo '{"error":"no_phase_runs"}' > "$dir/recovery-records-$label.jsonl" 2>/dev/null || true
     return 0
   fi
+  # Host-side bound like storage_diagnostic_snapshot: never run the exec unbounded.
+  # E2E_HOST_LIMITER lets the hermetic test substitute a function for the real command.
+  limiter="${E2E_HOST_LIMITER:-$(command -v timeout || command -v gtimeout || true)}"
+  if [ -z "$limiter" ]; then
+    echo '{"error":"no_host_timeout"}' > "$dir/recovery-records-$label.jsonl" 2>/dev/null || true
+    echo "outbox cleanup: recovery record projection skipped, no timeout command ($label)" >&2
+    return 0
+  fi
   # pipefail inside the subshell only: a failing exec or an early-closing head is a warning.
   ( set -o pipefail
-    "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data "${runs[@]}" \
+    "$limiter" 20 "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data "${runs[@]}" \
       < "$ROOT/e2e/recovery-record-projection.mjs" 2>/dev/null | head -c 262144 > "$dir/recovery-records-$label.jsonl"
   ) || echo "outbox cleanup: recovery record projection failed ($label)" >&2
   return 0

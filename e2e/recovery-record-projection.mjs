@@ -15,7 +15,7 @@ const integer = v => Number.isSafeInteger(v) && v >= 0 ? v : null;
 const bool = v => typeof v === 'boolean' ? v : null;
 const state = v => ['pinned', 'bundled', 'uploaded', 'needs_action'].includes(v) ? v : null;
 const reason = v => v === undefined || v === null ? null
-  : typeof v === 'string' && /^[a-z0-9_:]{1,96}$/.test(v) ? v : 'unrecognized';
+  : typeof v === 'string' && /^[a-z0-9_:]{1,96}$/.test(v) && !/[0-9a-f]{16,}/.test(v) ? v : 'unrecognized';
 const present = v => v !== undefined && v !== null;
 async function read(file) {
   if (Date.now() >= deadline) return { error: 'deadline' };

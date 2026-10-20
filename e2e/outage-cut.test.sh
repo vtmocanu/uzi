@@ -9,7 +9,9 @@ fixture() {
   RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
   BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
-  RESTORING=0
+  RESTORING=0 PROJECTION_FAIL=0
+  limit_stub() { shift; "$@"; }
+  export E2E_HOST_LIMITER=limit_stub
   export UZI_E2E_RECOVERY_FAST_REDRIVE=1
   storage_diagnostic_snapshot() {
     case "$1" in
@@ -46,6 +48,7 @@ fixture() {
         # standing in for the agent container's /data. Matched before the barrier-writer checks.
         if [ "${2:-}:${3:-}:${4:-}:${5:-}:${6:-}:${7:-}:${8:-}" = -T:-u:0:agent:timeout:15:node ] \
           && [ "${11:-}" = /data ]; then
+          [ "$PROJECTION_FAIL" = 0 ] || return 1
           node --input-type=module - "$SCRATCH/data" "${@:12}"
           return
         fi
@@ -212,9 +215,9 @@ for f in agent-before-api-restore.log agent-before-agent-recreate.log \
   [ -s "$art/$f" ] || { echo "FAIL: missing cleanup evidence $f"; exit 1; }
 done
 for label in before-api-restore before-agent-recreate; do
-  jq -e --arg run "$phase_run" --arg cap "$capture_id" \
-    '.run_id==$run and .capture_id==$cap and .state=="uploaded" and .reason=="final_retry_refused"
-      and .generation==4 and .final_request_present==true and .authenticated==false' \
+  jq -se --arg run "$phase_run" --arg cap "$capture_id" \
+    'any(.[]; .run_id==$run and .capture_id==$cap and .state=="uploaded" and .reason=="final_retry_refused"
+      and .generation==4 and .final_request_present==true and .authenticated==false)' \
     "$art/recovery-records-$label.jsonl" >/dev/null || { echo "FAIL: projection $label lacks the phase run record"; exit 1; }
   if grep -E "$foreign_run|foreign_reason|SECRET_|eeeeeeee|/data/" "$art/recovery-records-$label.jsonl" >/dev/null; then
     echo "FAIL: projection $label leaked foreign or secret data"; exit 1
@@ -224,6 +227,20 @@ awk 'index($0, "exec -T -u 0 agent timeout 15 node --input-type=module - /data")
   index($0, "force-recreate agent") { agent=1 } END { exit(n == 2 && before == 2 && agent ? 0 : 1) }' "$SCRATCH/calls" \
   || { echo 'FAIL: projection did not run twice before agent recreation'; exit 1; }
 echo 'PASS: failing receipt wait still saves agent logs and allowlisted recovery projections before agent recreation'
+# A failing projection exec is a warning only: cleanup must still recreate api and agent.
+: > "$SCRATCH/calls"
+(
+  fixture
+  configure_outbox_api_alias
+  PROJECTION_FAIL=1
+  OUTBOX_RESTORE_NEEDED=1
+  restore_outbox_resolution
+) > "$SCRATCH/projfail.log" 2>&1 || { echo 'FAIL: failed projection aborted cleanup'; exit 1; }
+grep -F 'recovery record projection failed (before-api-restore)' "$SCRATCH/projfail.log" >/dev/null \
+  || { echo 'FAIL: missing projection failure warning'; exit 1; }
+grep -F 'force-recreate api' "$SCRATCH/calls" >/dev/null && grep -F 'force-recreate agent' "$SCRATCH/calls" >/dev/null \
+  || { echo 'FAIL: cleanup did not recreate api and agent after projection failure'; exit 1; }
+echo 'PASS: failed projection warns and cleanup still recreates api and agent'
 fixture
 configure_outbox_api_alias
 restore_outbox_resolution
@@ -348,4 +365,4 @@ done
   jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
 )
 echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
-echo 'cases=22 passed=22'
+echo 'cases=23 passed=23'

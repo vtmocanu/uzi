@@ -98,6 +98,17 @@ test('unrecognized reason is not echoed; absent reason is null', () => withRoot(
   assert.ok(!out.includes('SECRET'));
 }));
 
+test('hex-digest-shaped reasons are not echoed', () => withRoot(async root => {
+  await mk(root, RUN);
+  const sha = 'c'.repeat(40), digest = 'ab01'.repeat(16);
+  await fs.writeFile(path.join(root, 'recovery', RUN, 'a.json'), JSON.stringify({ reason: sha }));
+  await fs.writeFile(path.join(root, 'recovery', RUN, 'b.json'), JSON.stringify({ reason: 'sha256:' + digest }));
+  const { out, rows } = await projectViaStdin(root, [RUN]);
+  assert.equal(rows[0].reason, 'unrecognized');
+  assert.equal(rows[1].reason, 'unrecognized');
+  assert.ok(!out.includes(sha) && !out.includes(digest));
+}));
+
 test('absent run directory yields one absent line', () => withRoot(async root => {
   const { rows } = await projectViaStdin(root, [RUN]);
   assert.deepEqual(rows, [{ run_id: RUN, error: 'absent' }]);
