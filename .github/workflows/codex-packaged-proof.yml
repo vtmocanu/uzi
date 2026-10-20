@@ -101,11 +101,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # A scheduled failure keeps exactly one open tracking issue: comment on it, else open it. The
+  # A scheduled failure (not a cancellation, e.g. one superseded by a manual run) keeps exactly one open tracking issue: comment on it, else open it. The
   # label is upserted first so the lookup cannot error on a missing label (e2e.yml pattern).
   report-failure:
     needs: packaged-proof
-    if: ${{ github.event_name == 'schedule' && (failure() || cancelled()) }}
+    if: ${{ github.event_name == 'schedule' && failure() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

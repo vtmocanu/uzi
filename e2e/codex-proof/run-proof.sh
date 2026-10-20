@@ -17,7 +17,8 @@
 #      Every leg runs even after an earlier one fails, so one run reports all of them.
 #   4. Re-read the image ID; it must equal step 1's.
 #
-# Outputs in $OUT: one log per leg, the strict TAP streams, status.json (always) and, only
+# Outputs in $OUT: one log per leg, the strict TAP streams, status.json (once the legs have run;
+# an early build or image-inspection failure exits before it) and, only
 # when every check passed, receipt.json plus a CANDIDATE_RECEIPT line on stdout. A locally
 # loaded image has no registry digest, so the receipt records the image ID and never invents
 # a digest.
