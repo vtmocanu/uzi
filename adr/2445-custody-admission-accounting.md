@@ -56,3 +56,21 @@ Phase 72's seeded holds have null `live_run_id` and `live_worker_id`, so none of
 ## Addendum: per-hold admission membership (#2970)
 
 `fn_custody_admission_members` is a read-only per-hold projection that lets an owner see which holds admission counts and why. `fn_custody_admission_count` remains the canonical accounting function and was not changed. Agreement between the two is guarded by parity tests (the mirrors in `custody_admission_livedb_test.go` plus a per-reason test). The owner listing reads the hold list, membership and aggregate in one repeatable-read read-only snapshot with one heartbeat cutoff. Clients never infer membership and treat an absent `counts_toward_admission` as unknown, never as not counted. The policy remains SQL-only; this adds visibility, not authority or a change to accounting.
+
+## Amendment 2026-10-20 — configurable custody admission limit (#3150)
+
+[Issue #3150](https://github.com/vtmocanu/uzi/issues/3150) makes the owner admission limit an admin setting. D1's "stays fixed at 8" and its "without ... a new configuration knob" no longer hold. Everything else in D1 to D6, and the accounting, is unchanged.
+
+**Why.** A fixed 8 blocked legitimate multi-run owners whose only safe alternatives were irreversible discards of held work or waiting for counted holds to stop counting. An admin can now size the gate to the deployment.
+
+**Decision.**
+
+- **D1.** The limit is the admin setting `custody_hold_limit` (`api/internal/settings/settings_custody.go`), default 8, a whole number from 1 to 1000. There is no zero-as-disable value, and the write-time validator rejects zero, negatives, non-integers, signed forms and values above the ceiling. It is one deployment-wide value applied separately to every owner; the compile-time constant is gone.
+- **D3.** The continuation bound is 1 through limit-1 of the run's own owner-scoped open holds, using the configured limit; at the limit the exemption is lost.
+- **D5.** Capacity displays compare `admission_counted_holds` to the configured `custody_hold_limit`. Claim admission, the continuation bound, queued-run health reasons, `blocked_runs`, the recovery aggregate, the `custody.holds` health check and Slack episode crossing/re-arm each read the setting once per claim, request or pass.
+- **D6.** "Counts can therefore exceed 8" now reads "exceed the configured limit"; the policy is still an admission gate, not a transactional ceiling.
+- **Fail-closed reads.** The accessor never substitutes 8 and never treats a bad value as zero. With no usable validated value (a read that fails with no cached snapshot, or a hand-edited invalid stored row), new run-lane claims are refused, queued runs show a "setting could not be read" pause reason, the owner hold listing returns an error, and `custody.holds` reports unknown. A failed refresh while a good value is cached keeps serving that value, except right after a save on that replica or right after boot, when the read fails. The dedicated cross-check claim lane is unaffected because checkers are exempt; legacy checker children claimed through the ordinary run lane wait that cycle.
+- **Lowering is non-destructive.** Lowering the limit blocks only applicable future claims. It never cancels runs and never releases or discards a hold.
+- **D4 is unchanged.** Prune, teardown and release safeguards still see every open hold, and the checker exemption and the statement-snapshot overshoot are unchanged.
+
+A change takes effect without a restart: the saving replica applies it on its next read and other replicas within one settings cache TTL (`SETTINGS_CACHE_TTL`, default 5s) once their refresh succeeds. See [Admin settings](../docs/admin-settings.md#custody-hold-limit).

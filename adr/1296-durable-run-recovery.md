@@ -698,3 +698,7 @@ credential, checker-slot and worker eligibility checks continue to apply.
 
 This amendment addresses [#3011](https://github.com/vtmocanu/uzi/issues/3011).
 It does not discount or release any existing hold.
+
+## Amendment 2026-10-20 — the custody admission limit is configurable (#3150)
+
+The "1–7 ... at 8" bound and "The limit remains 8" in the 2026-10-15 checker amendment above describe the default. The limit is now the admin setting `custody_hold_limit` (default 8, 1 to 1000), so the continuation bound is 1 through limit-1 of the configured limit. The checker exemption and accounting are unchanged. See the [ADR-2445 amendment](2445-custody-admission-accounting.md#amendment-2026-10-20--configurable-custody-admission-limit-3150).

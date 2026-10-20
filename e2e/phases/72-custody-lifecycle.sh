@@ -14,7 +14,7 @@
 # 2026-09-14 GitLab-lane wedge that #1349 fixes and PROVES the fix keeps later claims
 # unblocked. The incident (GitHub Actions run 34813174866, sanitized): stub-failed code
 # runs plus phase 45's SIGKILL/reclaim left EIGHT open custody holds for one owner, and
-# ClaimRun's owner-scoped custody-admission gate (custodyHoldLimit = 8) then refused
+# ClaimRun's owner-scoped custody-admission gate (the default custody_hold_limit, 8) then refused
 # every subsequent code-run claim for that owner — ten later phases timed out queued
 # against a healthy, idle, freshly-registered worker, and direct database mutation was
 # the only recovery path in production.
@@ -51,7 +51,7 @@
 #   same-worker two-generation release (M4) ....... api/internal/workersvc/custody_multihold_livedb_test.go
 #                                                    (TestSetStateCompletedSameWorkerMultiGenReleasesOnlyCurrentLiveDB)
 #   generation-exact reserve/release (M1/M4) ...... api/internal/recovery/reserve_release_generation_livedb_test.go
-#   8 admission-counted holds block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
+#   default-limit (8) admission-counted holds block a claim (M1) api/internal/store/recovery_exact_livedb_test.go,
 #                                                    api/internal/workersvc/claim_custody_livedb_test.go
 #   owner discard + confirm gate + owner scope +
 #     sibling safety + Bearer/cookie mount (M5) ... api/internal/handler/recovery_owner_holds_livedb_test.go
@@ -66,7 +66,7 @@
 say "PRD #1349 M7: custody-limit wedge repro + owner-disposition unblock"
 trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null || true; inventory_diagnostic_snapshot || true; fi' EXIT
 
-# The fixed admission limit (workersvc.custodyHoldLimit / apitypes CustodyHoldLimit).
+# The default of the custody_hold_limit admin setting (#3150); the e2e stack leaves it at 8.
 # ADR-2445 uses admission_counted_holds, separate from total open_holds. This is a
 # statement-snapshot gate, not a strict ceiling under concurrency or late staleness.
 LIMIT=8
@@ -144,7 +144,7 @@ pass "seeded $NEED open custody hold(s); owner now at the admission limit ($AFTE
 
 # The owner-wide aggregate (GET /api/recovery/holds — the board alert / Workers surface /
 # `uzi run recovery` all read it) must agree with total custody, separately establish
-# admission pressure (including the baseline holds), and echo the fixed limit.
+# admission pressure (including the baseline holds), and echo the configured limit (default 8).
 AGG="$(apiget /api/recovery/holds)"
 [ "$(printf '%s' "$AGG" | jq -r '.aggregate.open_holds')" = "$LIMIT" ] \
   || fail "aggregate.open_holds != $LIMIT (got $(printf '%s' "$AGG" | jq -r '.aggregate.open_holds'))"

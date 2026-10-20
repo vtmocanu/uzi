@@ -428,7 +428,7 @@ These are bounded observations, not a globally ordered snapshot:
 |---|---|---|---|---|
 | `schedules.paused` | A user with a [pause-all](scheduling.md#pausing-everything-at-once) in force while still owning enabled schedules — their labelled issues look queued but will not fire | any such user | — | — |
 | `board.drift` | A board column move given up (stuck pending past the give-up boundary) on a run that has an issue, in the last 24 hours | any given-up move | — | — |
-| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `na` when custody admission is disabled |
+| `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `unknown` when the `custody_hold_limit` setting cannot be read; `na` only when the health service has no settings wired |
 | `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
 | `agentsource.update` | Persisted [agent-source discovery](agent-source.md#update-checks-and-the-update-badge), compared with the current pin and last-applied SHA | newer semver tag or tracked branch moved | — | `na` when disabled, unconfigured or SHA-pinned; `unknown` before a recorded check or on a settings read failure |

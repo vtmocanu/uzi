@@ -52,3 +52,7 @@ The owner hold count can exceed the limit (by design, for continuations), and #1
 
 - An owner's open-hold count can grow past the limit while interrupted runs resume, bounded by D2a to the limit per run. Old generations are still cleaned up by capture/publication release, the completed-run ancestry settlement (#1582), and the live same-worker settlement (D4).
 - A run whose every hold is settled is treated like a fresh run at the limit.
+
+## Amendment 2026-10-20 — the limit is configurable (#3150)
+
+The limit this ADR names as the constant `workersvc.custodyHoldLimit` (8) is now the admin setting `custody_hold_limit`, default 8, 1 to 1000. The "1 to 7 ... at 8" rule above is the default-8 case: a previously claimed queued run bypasses owner admission while it has 1 through limit-1 of its own open holds and loses that exemption at the limit. The rationale, the three-predicate bound and the remedies are unchanged. See the [ADR-2445 amendment](2445-custody-admission-accounting.md#amendment-2026-10-20--configurable-custody-admission-limit-3150).
