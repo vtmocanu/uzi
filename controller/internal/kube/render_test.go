@@ -487,7 +487,7 @@ func TestWorkerDeclaresTheWholeEphemeralBudgetAndNoOtherContainerDoes(t *testing
 //  1. podEphemeralStorageLimitEviction fires as soon as ANY container declares a
 //     limit, and compares the SUM of declared limits against pod usage that INCLUDES
 //     the emptyDirs. One limit on `worker` therefore creates a pod-level ceiling that
-//     run-workdir — the run's own checkout — counts against. That is a DETERMINISTIC
+//     the emptyDirs (codex-cmd-cache) count against. That is a DETERMINISTIC
 //     eviction with no node pressure at all: this issue's failure, on schedule.
 //  2. A limit on `dind` is inert anyway (containerEphemeralStorageLimitEviction reads
 //     pod.Spec.Containers only, and dind is a restartable initContainer), so it buys
@@ -876,12 +876,13 @@ func TestDinDDataPVCIsRenderedForDockerWorkersOnly(t *testing.T) {
 // The volume SOURCE, asserted positively against a control. "No EmptyDir" alone would
 // pass on a volume that is neither (an unset VolumeSource renders as an empty
 // {} and the apiserver rejects it), so assert the claim IS a PVC and names the right
-// claim — and keep run-workdir in the same test as the control that proves the
-// assertion discriminates: it is still an emptyDir and MUST stay one (it holds the
-// run's checkout, so bounding or persisting it is the opposite of this fix).
-func TestDinDDataVolumeIsAPVCAndRunWorkdirIsStillAnEmptyDir(t *testing.T) {
+// claim. The control: since issue #3153 the run workdir is NOT an emptyDir any more
+// (its bytes would be destroyed with the pod); it is the runner-shared subPath of the
+// worker's own `data` PVC, and no emptyDir is mounted at /data/runner in any container.
+func TestDinDDataVolumeIsAPVCAndRunWorkdirIsADataPVCSubPathNotAnEmptyDir(t *testing.T) {
 	for _, p := range dindPostures() {
-		vols := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec.Volumes
+		pod := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m")).Spec.Template.Spec
+		vols := pod.Volumes
 
 		data := volumeByName(t, vols, dindDataVolume)
 		if data.PersistentVolumeClaim == nil {
@@ -895,11 +896,28 @@ func TestDinDDataVolumeIsAPVCAndRunWorkdirIsStillAnEmptyDir(t *testing.T) {
 			t.Errorf("[%s] %s carries BOTH a PVC and an emptyDir source", p.name, dindDataVolume)
 		}
 
-		// The control.
-		work := volumeByName(t, vols, dindWorkdirVolume)
-		if work.EmptyDir == nil {
-			t.Errorf("[%s] %s must stay an emptyDir: it holds the run's working tree, and this issue exists "+
-				"to stop that tree being destroyed, not to bound it", p.name, dindWorkdirVolume)
+		// The control: the run workdir is the data PVC (not a separate volume), and no
+		// emptyDir backs /data/runner in any container.
+		wd := volumeByName(t, vols, dataVolume)
+		if wd.PersistentVolumeClaim == nil || wd.PersistentVolumeClaim.ClaimName != "uzi-hw-abc-data" {
+			t.Errorf("[%s] the data volume must be the worker's data PVC, got %+v", p.name, wd.VolumeSource)
+		}
+		emptyDirs := map[string]bool{}
+		for _, v := range vols {
+			if v.EmptyDir != nil {
+				emptyDirs[v.Name] = true
+			}
+			if v.Name == "run-workdir" {
+				t.Errorf("[%s] the legacy run-workdir emptyDir volume must be gone (issue #3153)", p.name)
+			}
+		}
+		for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+			for _, vm := range c.VolumeMounts {
+				if emptyDirs[vm.Name] && pathsOverlap(vm.MountPath, dindWorkdirDir) {
+					t.Errorf("[%s] container %q mounts emptyDir %q at %q, overlapping %s: run bytes must live on the data PVC",
+						p.name, c.Name, vm.Name, vm.MountPath, dindWorkdirDir)
+				}
+			}
 		}
 	}
 }
@@ -1158,16 +1176,18 @@ func TestGenerationIsStampedOnThePodTemplate(t *testing.T) {
 // --- docker-capable workers (PRD #83 M3) -----------------------------------
 
 // THE ONE SECURITY INVARIANT on a wired worker (Decision 3): the DinD containers
-// mount NONE of the worker's token/`/data`/`/nix` volumes, so a `docker run -v
-// <anything>:/x` binds a filesystem that holds none of them. This is what closes the
+// mount NONE of the worker's token or /nix volumes, and of the `data` PVC ONLY the
+// runner-shared subPath at /data/runner (issue #3153 amends Decision 3), so a
+// `docker run -v <anything>:/x` binds a filesystem that holds none of the secrets. This is what closes the
 // docker `-v` vector on k8s; the in-container guardrail only denies "no daemon", it
 // is NOT containment. A failing assertion here is a real security regression, not a
 // style nit — do not "fix" it by loosening the check.
-func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
+func TestDindContainersMountOnlyTheRunnerSubPathOfTheDataVolume(t *testing.T) {
 	// The volumes (by name) and paths that carry the worker's secrets/state. The dind
 	// side must touch none of them, by EITHER name or mount path — POSTURE-INDEPENDENT.
-	// (The shared run workdir at dindWorkdirDir is a SEPARATE no-secrets emptyDir; it is
-	// deliberately not in this set — M-workdir shares only it, never token/data/nix.)
+	// The ONE exception is the shared run workdir: the `data` volume mounted with
+	// SubPath == dindWorkdirSubPath at exactly dindWorkdirDir (issue #3153). A
+	// whole-volume data mount, any other subPath or any other path fails.
 	// The Codex command-cache emptyDir (issue #1598) is worker-only too: the dind side must
 	// never see the untrusted build caches uid 10003 writes there.
 	forbiddenNames := map[string]bool{"token": true, "data": true, "nix": true, codexCmdCacheVolume: true}
@@ -1188,6 +1208,10 @@ func TestDindContainersMountNoneOfTheWorkersVolumes(t *testing.T) {
 				}
 				checked++
 				for _, vm := range c.VolumeMounts {
+					if vm.Name == dataVolume && vm.SubPath == dindWorkdirSubPath && vm.MountPath == dindWorkdirDir {
+						// The one permitted data mount. It must be writable-as-before, never the whole volume.
+						continue
+					}
 					if forbiddenNames[vm.Name] {
 						t.Errorf("dind container %q mounts the worker volume %q — this reopens the docker -v vector "+
 							"(a `docker run -v` into this container would expose the worker's secret/data/nix). Decision 3: "+
@@ -1321,7 +1345,7 @@ func TestCodexCmdCacheIsAWorkerOnlyEmptyDirWithNoSizeLimit(t *testing.T) {
 }
 
 // The docker sidecars are NATIVE SIDECARS (initContainers with restartPolicy: Always
-// + a startupProbe), ordered [seed-nix → dind-init → dind]. This is what makes k8s
+// + a startupProbe), ordered [seed-nix → runner-init → dind-init → dind]. This is what makes k8s
 // start the daemon before the worker and hold the worker until dockerd is listening
 // (the k8s half of the keystone readiness race). Order is load-bearing: dind-init
 // (the socket-dir chown) MUST precede dind, because rootless dockerd refuses to start
@@ -1332,12 +1356,14 @@ func TestDockerWorkerRendersNativeSidecarsInOrder(t *testing.T) {
 			dep := RenderDeployment(p.cfg, desiredDocker("abc"), testSpec(t, "base", "m"))
 			inits := dep.Spec.Template.Spec.InitContainers
 
-			// Rootless: [seed-nix, dind-init, dind, dind-meter]. Non-rootless: [seed-nix, dind,
-			// dind-meter] — no dind-init, since there is no shared socket dir to chown
-			// (loopback transport). dind-meter (issue #1759) is last in both.
-			wantOrder := []string{seedContainerName, dindInitContainerName, dindContainerName, dindMeterContainerName}
+			// Rootless: [seed-nix, runner-init, dind-init, dind, dind-meter]. Non-rootless:
+			// [seed-nix, runner-init, dind, dind-meter] — no dind-init, since there is no
+			// shared socket dir to chown (loopback transport). runner-init (issue #3153) is a
+			// regular init container ordered before every sidecar. dind-meter (issue #1759)
+			// is last in both.
+			wantOrder := []string{seedContainerName, runnerInitContainerName, dindInitContainerName, dindContainerName, dindMeterContainerName}
 			if p.nonRootless {
-				wantOrder = []string{seedContainerName, dindContainerName, dindMeterContainerName}
+				wantOrder = []string{seedContainerName, runnerInitContainerName, dindContainerName, dindMeterContainerName}
 			}
 			if len(inits) != len(wantOrder) {
 				t.Fatalf("init containers = %v, want %v", initNames(inits), wantOrder)
@@ -1351,7 +1377,10 @@ func TestDockerWorkerRendersNativeSidecarsInOrder(t *testing.T) {
 			// dind-meter is native too but deliberately probe-less (it must never gate the
 			// worker); TestDindMeterSidecarIsAnUnprivilegedReadOnlyStatfsSampler pins it.
 			for _, c := range inits {
-				if c.Name == seedContainerName || c.Name == dindMeterContainerName {
+				if c.Name == seedContainerName || c.Name == runnerInitContainerName || c.Name == dindMeterContainerName {
+					if c.Name == runnerInitContainerName && c.RestartPolicy != nil {
+						t.Errorf("runner-init must be a REGULAR init container so it completes before any sidecar starts")
+					}
 					continue
 				}
 				if c.RestartPolicy == nil || *c.RestartPolicy != corev1.ContainerRestartPolicyAlways {
@@ -2151,10 +2180,21 @@ func TestNonRootlessDindBindsOnlyLoopbackTCPViaExplicitCommand(t *testing.T) {
 	}
 }
 
-// M-workdir (PRD #89, a Decision-3 amendment): a no-secrets emptyDir mounted into BOTH
-// the worker and the dind sidecar at the SAME path, so a `docker run -v` bind source
-// under the run's checkout resolves in the daemon. Applies to BOTH postures. Secrets +
-// the /data cache + /nix stay unshared (the Decision-3 invariant above still holds).
+// subPathMount returns the mount of volume name at path in c.
+func subPathMount(c corev1.Container, name, path string) (corev1.VolumeMount, bool) {
+	for _, vm := range c.VolumeMounts {
+		if vm.Name == name && vm.MountPath == path {
+			return vm, true
+		}
+	}
+	return corev1.VolumeMount{}, false
+}
+
+// M-workdir (PRD #89, a Decision-3 amendment; amended again by issue #3153): the
+// runner-shared subPath of the data PVC mounted into BOTH the worker and the dind
+// sidecar at the SAME path, so a `docker run -v` bind source under the run's checkout
+// resolves in the daemon. Applies to BOTH postures. Secrets + the rest of /data + /nix
+// stay unshared.
 func TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets(t *testing.T) {
 	for _, p := range dindPostures() {
 		t.Run(p.name, func(t *testing.T) {
@@ -2163,36 +2203,32 @@ func TestDockerWorkerSharesTheRunWorkdirWithDindButNotSecrets(t *testing.T) {
 			worker := containerByName(t, pod.Containers, workerContainerName)
 			dind := containerByName(t, pod.InitContainers, dindContainerName)
 
-			wPath := mountPath(worker, dindWorkdirVolume)
-			dPath := mountPath(dind, dindWorkdirVolume)
-			if wPath == "" || dPath == "" {
-				t.Fatalf("both worker and dind must mount the shared workdir %q; worker=%q dind=%q", dindWorkdirVolume, wPath, dPath)
-			}
-			if wPath != dPath {
-				t.Errorf("the shared workdir must mount at the SAME path in worker and dind: worker=%q dind=%q — "+
-					"a differing path means a `docker run -v <src>` source resolves to an empty dir in the daemon", wPath, dPath)
-			}
-			if wPath != dindWorkdirDir {
-				t.Errorf("shared workdir path = %q, want %q (the agent's runner-clone root, coupled to agent/src/git.ts)", wPath, dindWorkdirDir)
-			}
-
-			// It is a no-secrets emptyDir (never a secret volume or a PVC).
-			v := volumeByName(t, pod.Volumes, dindWorkdirVolume)
-			if v.EmptyDir == nil {
-				t.Error("the shared workdir must be an emptyDir (no secret, torn down with the pod)")
-			}
-			if v.Secret != nil || v.PersistentVolumeClaim != nil {
-				t.Error("the shared workdir must carry no secret and no PVC")
+			for _, c := range []corev1.Container{worker, dind} {
+				vm, ok := subPathMount(c, "data", "/data/runner")
+				if !ok {
+					t.Fatalf("%q must mount the data volume at /data/runner (the agent's runner-clone root, coupled to agent/src/git.ts)", c.Name)
+				}
+				if vm.SubPath != "runner-shared" {
+					t.Errorf("%q /data/runner SubPath = %q, want runner-shared", c.Name, vm.SubPath)
+				}
+				if vm.ReadOnly {
+					t.Errorf("%q /data/runner must be writable", c.Name)
+				}
 			}
 
-			// A PLAIN worker never gets the shared workdir (docker-only; keeps its hash stable).
+			// The volume behind it is the worker's data PVC; there is no separate volume.
+			v := volumeByName(t, pod.Volumes, "data")
+			if v.PersistentVolumeClaim == nil || v.EmptyDir != nil || v.Secret != nil {
+				t.Errorf("the data volume must be a PVC, got %+v", v.VolumeSource)
+			}
+
+			// A PLAIN worker never gets the subPath mount (docker-only; keeps its hash stable).
 			plain := RenderDeployment(p.cfg, desired("abc"), testSpec(t, "base", "m"))
-			if mountPath(containerByName(t, plain.Spec.Template.Spec.Containers, workerContainerName), dindWorkdirVolume) != "" {
-				t.Error("a plain worker must not mount the shared run workdir")
-			}
-			for _, vol := range plain.Spec.Template.Spec.Volumes {
-				if vol.Name == dindWorkdirVolume {
-					t.Error("a plain worker must not render the shared run workdir volume")
+			for _, c := range append(append([]corev1.Container{}, plain.Spec.Template.Spec.InitContainers...), plain.Spec.Template.Spec.Containers...) {
+				for _, vm := range c.VolumeMounts {
+					if vm.SubPath != "" {
+						t.Errorf("plain worker container %q has a subPath mount %+v", c.Name, vm)
+					}
 				}
 			}
 		})
@@ -2222,12 +2258,12 @@ func TestDockerWorkerTMPDIRUnderSharedWorkdirAndPlainHasNone(t *testing.T) {
 			if !ok {
 				t.Fatal("a docker worker must set TMPDIR so tmp-staged bind sources land in the dind-visible shared workdir")
 			}
-			if tmp != dindWorkdirDir {
-				t.Errorf("TMPDIR = %q, want %q (the shared run workdir the dind sidecar also mounts)", tmp, dindWorkdirDir)
+			if tmp != "/data/runner/.tmp" {
+				t.Errorf("TMPDIR = %q, want /data/runner/.tmp (created by runner-init inside the shared run workdir)", tmp)
 			}
-			// TMPDIR must resolve inside the shared workdir mount, or a bind source under it
-			// is invisible to the daemon.
-			if mountPath(worker, dindWorkdirVolume) != dindWorkdirDir {
+			// TMPDIR must resolve inside the shared workdir mount (the runner-shared
+			// subPath), or a bind source under it is invisible to the daemon.
+			if _, ok := subPathMount(worker, "data", dindWorkdirDir); !ok || !strings.HasPrefix(tmp, dindWorkdirDir+"/") {
 				t.Errorf("TMPDIR %q is not covered by the shared workdir mount %q", tmp, dindWorkdirDir)
 			}
 		})

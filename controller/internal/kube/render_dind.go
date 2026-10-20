@@ -42,24 +42,41 @@ const (
 	dindDataVolume   = "dind-data"
 )
 
-// The shared run workdir (PRD #89 M-workdir — a Decision-3 amendment). A no-secrets
-// emptyDir mounted into BOTH the worker and the dind sidecar at the SAME path, so a
-// `docker run -v <src>:/x` / compose bind whose source is the run's checkout resolves
-// in the daemon's own filesystem. Without it the daemon mounts none of the worker fs,
-// so every bind source is an EMPTY dir — which breaks uzi's own e2e and most real
-// docker repos on ANY posture (the daemon never saw the worker's files). It bites
-// rootless and non-rootless equally, so it is rendered for both.
+// The shared run workdir (PRD #89 M-workdir, amended by issue #3153). The `runner`
+// subtree of the worker's data PVC, mounted into BOTH the worker and the dind sidecar
+// at the SAME path, so a `docker run -v <src>:/x` / compose bind whose source is the
+// run's checkout resolves in the daemon's own filesystem. Without it the daemon mounts
+// none of the worker fs, so every bind source is an EMPTY dir, which breaks uzi's own
+// e2e and most real docker repos on ANY posture. It bites rootless and non-rootless
+// equally, so it is rendered for both.
 //
 // The path is the agent's runner-clone root: git.ts sets runnerRoot =
 // <UZI_DATA_DIR>/runner and the run's SDK cwd is a clone under it, so the docker bind
-// source is /data/runner/... — COUPLED to agent/src/git.ts; if that root moves, this
-// must move with it. It is a SEPARATE emptyDir nested under /data (the cache PVC's
-// mountpoint), so the clone cache at /data/repos, /nix, and the token/secret mounts
-// stay UNSHARED with dind — Decision 3's crown-jewel isolation is preserved.
+// source is /data/runner/... COUPLED to agent/src/git.ts; if that root moves, this
+// must move with it.
+//
+// It used to be a pod-lifetime emptyDir, which lost every clone on any pod replacement
+// (issue #3153). It is now the dindWorkdirSubPath subPath of the `data` PVC, so it
+// survives a replacement. Decision 3 is amended, not dropped: dind mounts ONLY that
+// subPath of `data`, never the whole volume, so the clone cache at /data/repos, the
+// agent home, /nix and the token/secret mounts stay UNSHARED with dind. The subPath is
+// `runner-shared` and not the legacy `runner` because existing PVCs carry a root-owned
+// 0755 `runner` directory (the old emptyDir's mount point), which kubelet would not
+// re-own. The runner-init init container creates and secures the entry before dind
+// starts.
 const (
-	dindWorkdirVolume = "run-workdir"
-	dindWorkdirDir    = dataMountPath + "/runner"
+	dindWorkdirSubPath = "runner-shared"
+	dindWorkdirDir     = dataMountPath + "/runner"
+
+	// dataVolume is the worker's data PVC volume name (see podTemplate's volumes).
+	dataVolume = "data"
 )
+
+// runnerWorkdirMount is the data-PVC subPath mount shared by the worker and dind at
+// dindWorkdirDir. It is the ONLY data mount dind may have.
+func runnerWorkdirMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: dataVolume, MountPath: dindWorkdirDir, SubPath: dindWorkdirSubPath}
+}
 
 // The rootless dind uid/gid baked into docker:*-dind-rootless. The sidecar MUST run
 // as this uid — its /etc/subuid + /etc/subgid ranges are set up for 1000 — so it
@@ -260,11 +277,12 @@ exec dockerd --host=tcp://127.0.0.1:2375 --tls=false "--mtu=$min" "--config-file
 // Both keep seccomp Unconfined (the nested daemon profiles its children) and mount the
 // shared run workdir (M-workdir).
 //
-// DECISION 3 — the one security invariant on a wired worker: it mounts ONLY its OWN
-// data root, the shared run workdir (M-workdir, no secrets) and — rootless only — the
-// shared socket dir; NONE of the worker's token/`/data`(cache)/`/nix`. A `docker run -v
-// <anything>:/x` then binds this container's fs, which holds none of them. render_test.go
-// pins this.
+// DECISION 3 (amended by issue #3153) — the one security invariant on a wired worker:
+// it mounts ONLY its OWN data root, the shared run workdir and — rootless only — the
+// shared socket dir; NONE of the worker's token or /nix, and of the `data` PVC ONLY the
+// dindWorkdirSubPath subPath at dindWorkdirDir (never the whole volume: the /data cache
+// and agent home stay out of reach). A `docker run -v <anything>:/x` then binds this
+// container's fs, which holds none of them. render_test.go pins this.
 //
 // The data root's fill level is metered by a SEPARATE, unprivileged sidecar
 // (dindMeterContainer, issue #1759), not by this container and not by the worker: the
@@ -276,7 +294,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 	privileged := true
 
 	// The shared run workdir is mounted in BOTH postures (M-workdir).
-	mounts := []corev1.VolumeMount{{Name: dindWorkdirVolume, MountPath: dindWorkdirDir}}
+	mounts := []corev1.VolumeMount{runnerWorkdirMount()}
 
 	var sc *corev1.SecurityContext
 	var env []corev1.EnvVar
@@ -537,7 +555,7 @@ done
 // /var/lib/docker) is measurable from uid 10001 without being readable.
 //
 // Mounts EXACTLY two volumes: dind-data READ-ONLY at dindMeterDataDir, and its own
-// dind-meter emptyDir (rw) at dindMeterDir. NONE of token/data/nix/codex-cache/workdir.
+// dind-meter emptyDir (rw) at dindMeterDir. NONE of token/data/nix/codex-cache/workdir (not even the runner subPath).
 //
 // No startupProbe on purpose: the meter must never gate the worker. A native sidecar
 // without one counts as started once its process is running, so pod start proceeds to

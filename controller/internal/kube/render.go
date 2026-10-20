@@ -148,6 +148,23 @@ const (
 	// reseed only when the toolchain actually changed, preserving the warm-start cache
 	// of per-run provisioned packages the volume exists to hold.
 	toolchainProfileMarker = "/etc/uzi-toolchain-profile"
+
+	// runnerLayoutMarkerFile / runnerLayoutMarkerValue are the image-baked layout marker
+	// (issue #3153). The worker image that carries the runner-shared entrypoint changes
+	// writes runnerLayoutMarkerValue to runnerLayoutMarkerFile; the controller-rendered
+	// runner-init container refuses to touch the volume unless it is present, so an older
+	// image (whose entrypoint recursively re-owns /data/runner) never boots against the
+	// runner-shared layout. The agent image test pins the other half of this pair.
+	runnerLayoutMarkerFile  = "/etc/uzi-runner-layout"
+	runnerLayoutMarkerValue = "runner-shared-v1"
+
+	// runnerInitRoot / runnerInitTmp are the two directories runner-init creates and
+	// secures, as the init container sees them (the data PVC is mounted at
+	// dataSeedMountPath there, with no subPath). runnerInitRoot is what the worker and
+	// dind mount at dindWorkdirDir; runnerInitTmp is the TMPDIR beneath it.
+	runnerInitRoot = dataSeedMountPath + "/" + dindWorkdirSubPath
+	runnerInitTmp  = runnerInitRoot + "/.tmp"
+	runnerTmpDir   = dindWorkdirDir + "/.tmp"
 )
 
 // The uid/gid pinning. 10001 is PRD #51 M2's `worker` uid; v1 is single-container
@@ -188,6 +205,9 @@ const nixToolchainMarker = ".uzi-nix-toolchain"
 const (
 	workerContainerName = "worker"
 	seedContainerName   = "seed-nix"
+	// runnerInitContainerName: the Docker-only init that creates and secures the
+	// runner-shared subPath entry before dind (issue #3153).
+	runnerInitContainerName = "runner-init"
 	// The docker tier's two extra containers (PRD #83 M3), both native sidecars
 	// (initContainers with restartPolicy: Always).
 	dindContainerName     = "dind"
@@ -219,7 +239,7 @@ const (
 //  1. podEphemeralStorageLimitEviction fires as soon as ANY container declares a
 //     limit, and compares the SUM of declared limits against pod usage that INCLUDES
 //     the emptyDirs. So one limit on `worker` creates a pod-level ceiling that
-//     run-workdir counts against: a new DETERMINISTIC eviction path that fires with
+//     the emptyDirs (codex-cmd-cache) count against: a new DETERMINISTIC eviction path that fires with
 //     no node pressure at all, which is this issue's failure arriving on schedule
 //     instead of by luck.
 //  2. A limit on `dind` is inert anyway: containerEphemeralStorageLimitEviction
@@ -253,9 +273,8 @@ const (
 // you because it cannot bind on this resource (see values.yaml's ephemeralStorage
 // comment).
 const (
-	// Plain worker: the working tree is NOT on ephemeral storage. render.go mounts
-	// run-workdir only when w.Docker, so /data/runner falls through to the `data`
-	// PVC. What is left on ephemeral is container logs, the writable layer, and the
+	// Plain worker: the working tree is NOT on ephemeral storage. /data/runner is part
+	// of the `data` PVC mount. What is left on ephemeral is container logs, the writable layer, and the
 	// worker-only codex-cmd-cache emptyDir (codexCmdCacheDir). Logs plus the layer
 	// measured 45 KiB; kubelet's default log rotation ceiling is 10Mi x 5 per
 	// container. 512Mi is ~10x that ceiling.
@@ -272,21 +291,23 @@ const (
 	// never limits, and codex-cmd-cache carries no sizeLimit and no container declares
 	// an ephemeral limit (the 🔴 never-an-ephemeral-limit rule above).
 	workerDefaultEphemeralRequest = "512Mi"
-	// Docker worker: run-workdir IS an emptyDir, and it holds the run's entire
-	// working tree — one clone per run, multiplied by WORKER_MAX_CONCURRENT_RUNS,
-	// with $TMPDIR pointed at the same volume. This repo alone is a ~170 MiB runner
-	// clone before a single dependency install.
+	// Docker worker: the run working trees are NOT on ephemeral storage either. Since
+	// issue #3153 /data/runner is the runner-shared subPath of the `data` PVC (one clone
+	// per run, multiplied by WORKER_MAX_CONCURRENT_RUNS, with $TMPDIR beneath it), so
+	// those bytes count against the PVC and not against node ephemeral storage or this
+	// request. What is left on ephemeral for a Docker worker is the writable layers,
+	// container logs and the codex-cmd-cache emptyDir (same per-run contents, cleanup and
+	// ranking effect as the plain tier), plus the dind sidecar's own writable layer.
 	//
-	// The daemon's image cache is NOT on this budget since M-a (it is a PVC). What is
-	// left is the working trees plus the codex-cmd-cache emptyDir, which the docker tier
-	// carries on top of run-workdir with the same per-run contents, cleanup and ranking
-	// effect as the plain tier. Issue #1757 raised this from 4Gi to 5Gi as provisional,
-	// unmeasured headroom for that cache and to rank a busy worker later under node disk
-	// pressure. 5Gi and not 6Gi is a PACKING bound: a 17.55 GiB node holds three at 5Gi
-	// but two at 6Gi, and the chart's 10-worker docker tier must place on four such
+	// The daemon's image cache is NOT on this budget either (it is a PVC, M-a). Issue
+	// #1757 raised this from 4Gi to 5Gi as provisional, unmeasured headroom for the cache
+	// and to rank a busy worker later under node disk pressure. The value is UNCHANGED by
+	// #3153 and stays 5Gi unless remeasured: lowering it for the moved trees has not been
+	// measured, and 5Gi and not 6Gi is a PACKING bound: a 17.55 GiB node holds three at
+	// 5Gi but two at 6Gi, and the chart's 10-worker docker tier must place on four such
 	// nodes (TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes). It ranks and
 	// places; it never limits, and it cannot save a pod on a node whose root disk is too
-	// small. Re-derive what is actually left on ephemeral storage before raising it again.
+	// small. Re-derive what is actually left on ephemeral storage before changing it.
 	workerDefaultDockerEphemeralRequest = "5Gi"
 )
 
@@ -849,6 +870,70 @@ echo "uzi-seed-nix: seeded"
 `, src, dst, markerFile, nixSentinel, nixToolchainMarker, dataClear)
 }
 
+// runnerInitScript is the runner-init init container's program (issue #3153).
+//
+// It is golden-pinned byte for byte (testdata/runner-shared-init.sh); an e2e harness
+// executes that golden under real uids. Nothing user- or api-supplied is interpolated.
+//
+// Order matters and is pinned by a test: the IMAGE GATE is the first effective
+// statement, before any mkdir/chown/chmod, so an image whose entrypoint predates the
+// runner-shared layout never lets this script (or, because the pod stops here, dind or
+// the worker) touch the volume.
+//
+// Race safety comes from the permission structure, not from check-then-act. This
+// container runs before dind and the worker, so no in-pod writer exists yet. From then
+// on runner-shared is a sticky directory owned by the worker, and .tmp is a
+// worker-owned directory inside it: the rootless daemon (uid 1000), the uid-split
+// runner (10002) and runner-cmd (10003) own neither, so rename/unlink of .tmp fail
+// with EPERM. The -L/-d checks here only reject state a previous boot or an earlier
+// principal left behind.
+func runnerInitScript() string {
+	return fmt.Sprintf(`set -eu
+# 1. Image gate, before any write: the image must carry the runner-shared entrypoint.
+M=%[1]s
+if [ -L "$M" ] || [ ! -f "$M" ] || [ "$(cat "$M")" != "%[2]s" ]; then
+  echo "uzi-runner-init: worker image lacks runner-shared layout support (want %[2]s); refusing; upgrade the worker image or roll back the controller" >&2
+  exit 1
+fi
+R=%[3]s
+T=%[4]s
+fail() { echo "uzi-runner-init: $1" >&2; exit 1; }
+# check_dir refuses a symlink or a non-directory at the path. A missing path is fine.
+check_dir() {
+  if [ -L "$1" ]; then fail "$1 is a symlink; refusing to follow it (remove it from the data volume)"; fi
+  if [ -e "$1" ] && [ ! -d "$1" ]; then fail "$1 exists and is not a directory (remove it from the data volume)"; fi
+}
+# ensure_dir: mkdir WITHOUT -p, so a final-component symlink cannot be followed. EEXIST
+# is tolerated only if the path is then a real directory.
+ensure_dir() {
+  check_dir "$1"
+  mkdir "$1" 2>/dev/null || true
+  if [ -L "$1" ] || [ ! -d "$1" ]; then fail "$1 is not a real directory after mkdir"; fi
+}
+# 2. Create and validate the subPath entry, then .tmp beneath it.
+ensure_dir "$R"
+ensure_dir "$T"
+# 3. Ownership. Root (uid-split) can chown; the single-uid container cannot, so there it
+#    fails closed unless both entries are already owned by the current uid and R is sticky.
+if [ "$(id -u)" = 0 ]; then
+  chown -h worker:runner "$R"
+  chmod 3775 "$R"
+  chown -h worker:worker "$T"
+  chmod 0755 "$T"
+else
+  chmod 3775 "$R" "$T" 2>/dev/null || true
+  if [ ! -O "$R" ] || [ ! -O "$T" ] || [ ! -k "$R" ]; then
+    fail "$R and $T must be owned by uid $(id -u) with $R sticky, and could not be made so; see ADR-3153 for the operator remedy"
+  fi
+fi
+# 4. Final re-validation.
+check_dir "$R"
+check_dir "$T"
+[ -d "$R" ] && [ -d "$T" ] || fail "$R or $T is not a directory"
+echo "uzi-runner-init: runner-shared ready ($R, $T)"
+`, runnerLayoutMarkerFile, runnerLayoutMarkerValue, runnerInitRoot, runnerInitTmp)
+}
+
 // RenderDeployment builds a worker's Deployment, with the spec hash stamped in.
 func RenderDeployment(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) *appsv1.Deployment {
 	tmpl := podTemplate(cfg, w, spec)
@@ -970,14 +1055,16 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// TMPDIR into the shared run workdir (M-workdir), docker workers ONLY. A tool that
 		// stages a `docker run -v <src>:/x` / compose bind source under $TMPDIR (uzi's own
 		// e2e defaults its run dir to ${TMPDIR:-/tmp}/uzi-e2e-$$) needs <src> to resolve in
-		// the DAEMON's filesystem, not the worker's — otherwise the bind source is an empty
+		// the DAEMON's filesystem, not the worker's, otherwise the bind source is an empty
 		// dir in the daemon and the run silently sees nothing. The daemon shares only
-		// dindWorkdirDir with the worker, so tmp MUST live under it. Point it at the mount
-		// root directly: the emptyDir mount point always exists and is writable by fsGroup
-		// 10001 (no subdir to create, no agent/entrypoint change).
+		// dindWorkdirDir with the worker, so tmp MUST live under it. It points at the .tmp
+		// directory directly beneath the mount (runnerTmpDir). That directory is created and
+		// secured by the runner-init init container (issue #3153), which runs before dind
+		// and the worker; the mount root is no longer guaranteed to exist as a plain
+		// fsGroup-writable emptyDir root, so TMPDIR does not point at it.
 		//
 		// NO secret transits here (Decision 3 holds): the PAT is env-scoped not on disk,
-		// per-run secrets have their own volume, and the join token is its own mount — none
+		// per-run secrets have their own volume, and the join token is its own mount, none
 		// of them route through $TMPDIR. The daemon can already read this dir (it is shared
 		// by design), so tmp being dind-visible adds no exposure beyond the checkout that
 		// M-workdir already shares.
@@ -985,17 +1072,11 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// The agent honours this: on a single-uid non-root k8s start entrypoint.sh takes the
 		// single-uid branch (it unsets UZI_RUNNER_TMPDIR and does NOT set its own TMPDIR), so
 		// this pod-spec TMPDIR survives and runnerTmpdir() (= UZI_RUNNER_TMPDIR || TMPDIR)
-		// returns it — reaching both the worker and the repo's docker/compose. Render-only,
-		// verified against agent/templates/entrypoint.sh + agent/src/runner-uid.ts.
-		// COUPLING: the root-started A1 uid-split path (PRD #51 / PRD #1493) NOW runs on k8s
-		// behind UZI_WORKER_UID_SPLIT. Its root entrypoint branch would otherwise export its
-		// OWN tmpdirs UNDER /tmp — worker TMPDIR /tmp/uzi-worker (overriding this value) and
-		// UZI_RUNNER_TMPDIR /tmp/uzi-runner — both OUTSIDE /data/runner, landing repo bind
-		// sources outside the dind-shared workdir. Under the split the entrypoint instead
-		// relocates both tmpdirs BENEATH dindWorkdirDir (this TMPDIR), so a docker bind source
-		// staged under $TMPDIR still resolves in the daemon. M1 renders the TMPDIR the split
-		// then derives beneath; PRD #1493 M2 owns that entrypoint change.
-		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: dindWorkdirDir})
+		// returns it, reaching both the worker and the repo's docker/compose. Under the
+		// root-started uid-split path (PRD #51 / PRD #1493) the entrypoint instead relocates
+		// both tmpdirs BENEATH this TMPDIR so a docker bind source staged under $TMPDIR still
+		// resolves in the daemon. COUPLED to agent/templates/entrypoint.sh.
+		env = append(env, corev1.EnvVar{Name: "TMPDIR", Value: runnerTmpDir})
 
 		// The DinD prune gate (issue #1759), docker workers ONLY and ALWAYS explicit, so
 		// the agent never has to guess a default: "true" iff the cluster enabled disk
@@ -1164,13 +1245,27 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// regular-container sidecars ever start); native sidecars are the clean fix and
 		// are GA on k8s 1.29 (dev-cluster).
 		//
-		// Rootless (PRD #83): [seed-nix] → [dind-init: chown the socket dir to the
+		// issue #3153: runner-init (a REGULAR init container) is ordered right after
+		// seed-nix and before every native sidecar, so it completes before dind-init or dind
+		// start. It gates on the image's layout marker, then creates and secures the
+		// runner-shared subPath entry the worker and dind mount at dindWorkdirDir. No
+		// ephemeral request or limit (the never-a-limit rule above), and the same security
+		// context as seed-nix in both uid modes.
+		initContainers = append(initContainers, corev1.Container{
+			Name:            runnerInitContainerName,
+			Image:           spec.Image,
+			Command:         []string{"/bin/sh", "-c", runnerInitScript()},
+			Resources:       seedResources,
+			SecurityContext: seedSecurity,
+			VolumeMounts:    []corev1.VolumeMount{{Name: dataVolume, MountPath: dataSeedMountPath}},
+		})
+		// Rootless (PRD #83): [seed-nix] → [runner-init] → [dind-init: chown the socket dir to the
 		// rootless uid so dockerd can start] → [dind]. dind-init MUST precede dind
 		// because rootless dockerd REFUSES to start without a writable XDG_RUNTIME_DIR,
 		// and it also holds the socket at 0666 for the agent's own uid after the daemon
 		// creates it.
 		//
-		// Non-rootless (PRD #89): [seed-nix] → [dind]. There is NO shared socket dir to
+		// Non-rootless (PRD #89): [seed-nix] → [runner-init] → [dind]. There is NO shared socket dir to
 		// prepare — the worker reaches the root daemon over pod-loopback TCP, not a
 		// shared volume — so dind-init and the dind-sock socket volume+mounts are dropped
 		// entirely.
@@ -1191,12 +1286,15 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// can write nothing back. The worker still mounts NO dind-data (Decision 3); the
 		// meter is the only non-daemon container that sees that claim, read-only.
 		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindMeterVolume, MountPath: dindMeterDir, ReadOnly: true})
-		// The shared no-secrets run workdir (M-workdir), BOTH postures: mounted into the
-		// worker AND the dind sidecar at the SAME path so a `docker run -v` bind source
-		// under the run's checkout resolves in the daemon. Secrets + the /data cache +
-		// /nix stay UNSHARED (Decision 3): the invariant test pins that dind mounts none
-		// of token/data/nix.
-		workerMounts = append(workerMounts, corev1.VolumeMount{Name: dindWorkdirVolume, MountPath: dindWorkdirDir})
+		// The shared run workdir (M-workdir, issue #3153), BOTH postures: the runner-shared
+		// subPath of the `data` PVC, mounted into the worker AND the dind sidecar at the SAME
+		// path so a `docker run -v` bind source under the run's checkout resolves in the
+		// daemon. It survives a pod replacement. Decision 3 (amended): dind mounts ONLY this
+		// subPath of data, never the whole volume, and none of token or /nix; the invariant
+		// test pins that. The worker's own whole-volume `data` mount at /data already covers
+		// /data/runner, so the worker gets this mount AFTER it and it shadows that
+		// subdirectory with the same bytes (the runner-shared subPath).
+		workerMounts = append(workerMounts, runnerWorkdirMount())
 		volumes = append(volumes,
 			// The daemon's data root, mounted into `dind` ALONE (rootless HOME path or
 			// /var/lib/docker per posture). Its OWN PVC since issue #224 M-a — it was the
@@ -1210,9 +1308,6 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 					ClaimName: dindDataPVCName(w.ID),
 				},
 			}},
-			// The shared run workdir (M-workdir). emptyDir, so it is torn down with the pod
-			// and is never a persistence surface; carries the run's checkout, NO secrets.
-			corev1.Volume{Name: dindWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 			// The dind-meter sample dir (issue #1759). emptyDir, torn down with the pod;
 			// carries one statfs line, no secrets. Written by dind-meter, read by the worker.
 			corev1.Volume{Name: dindMeterVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
