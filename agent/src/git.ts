@@ -11945,7 +11945,9 @@ try {
   async produceRecoveryBundle(
     barePath: string,
     opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
+    signal?: AbortSignal,
   ): Promise<RecoveryBundleResult> {
+    if (signal) return this.withRecoveryOperation(signal, Infinity, () => this.produceRecoveryBundle(barePath, opts));
     MaintenanceResources.consumeIfActive("artifactBytes", 0);
     if (opts.guardedDefaultBranch !== undefined && opts.forgeTip !== undefined) {
       throw new Error("guardedDefaultBranch and forgeTip are mutually exclusive");

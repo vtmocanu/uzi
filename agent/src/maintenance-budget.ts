@@ -7,6 +7,8 @@ interface AttemptContext {
   factory?: () => MaintenanceBudget;
   activating?: boolean;
   pendingAbort?: AbortController;
+  ownedSignal?: AbortSignal;
+  ownedBudgets?: Set<MaintenanceBudget>;
   /** Producer clamps retain the original observation context for late cancellation. */
   producerParent?: AttemptContext;
 }
@@ -53,6 +55,50 @@ export class MaintenanceBudget {
     this.signal.throwIfAborted();
   }
 
+  private inheritSignal(signal: AbortSignal): void {
+    if (this.inherited.some(entry => entry.signal === signal)) return;
+    const abort = () => this.controller.abort(signal.reason);
+    if (signal.aborted) abort();
+    else { signal.addEventListener("abort", abort, { once: true }); this.inherited.push({ signal, abort }); }
+  }
+
+  private static linkOwnedBudget(context: AttemptContext, budget: MaintenanceBudget): void {
+    if (!context.ownedSignal) return;
+    budget.inheritSignal(context.ownedSignal);
+    context.ownedBudgets?.add(budget);
+  }
+
+  /** Owned recovery passes join transport settlement rather than racing their abort. */
+  static ownedSignal(): AbortSignal | undefined { return scope.getStore()?.ownedSignal; }
+
+  static async runOwned<T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> {
+    const parent = scope.getStore();
+    const callerSignal = this.signal();
+    const ownedSignal = callerSignal ? AbortSignal.any([callerSignal, signal]) : signal;
+    // A pass can be scheduled while a foreground caller still uses its ambient
+    // budget. Inherit that clock and cancellation without aborting the caller's
+    // controller or sharing its pending-attempt relay back into the run lane.
+    const budget = parent?.budget ? new MaintenanceBudget(parent.budget.remainingMs()) : undefined;
+    if (budget) budget.inheritedBudget = () => parent?.budget;
+    const context: AttemptContext & { ownedBudgets: Set<MaintenanceBudget> } = {
+      budget, ownedSignal, ownedBudgets: new Set<MaintenanceBudget>(),
+    };
+    if (budget) this.linkOwnedBudget(context, budget);
+    try { return await scope.run(context, action); }
+    finally {
+      // Only this pass's relay is removed; caller-owned clocks retain their original lifetime.
+      for (const budget of context.ownedBudgets) {
+        for (let i = budget.inherited.length - 1; i >= 0; i--) {
+          const entry = budget.inherited[i]!;
+          if (entry.signal !== ownedSignal) continue;
+          entry.signal.removeEventListener("abort", entry.abort);
+          budget.inherited.splice(i, 1);
+        }
+      }
+      budget?.dispose();
+    }
+  }
+
   /** Nested scopes retain the attempt object; separate async chains remain isolated. */
   static run<T>(budget: MaintenanceBudget, action: () => T): T {
     const context = scope.getStore();
@@ -62,7 +108,8 @@ export class MaintenanceBudget {
       this.attachBudget(context, current);
       return scope.run(context, action);
     }
-    return scope.run({ budget: current }, action);
+    if (context) this.linkOwnedBudget(context, current);
+    return scope.run({ budget: current, ownedSignal: context?.ownedSignal, ownedBudgets: context?.ownedBudgets }, action);
   }
 
   /**
@@ -77,7 +124,7 @@ export class MaintenanceBudget {
     const duration = Math.min(120_000, options.durationMs ?? 120_000, parent?.budget?.remainingMs() ?? Infinity);
     const child = new MaintenanceBudget(duration, options.now);
     child.inheritedBudget = () => parent?.budget;
-    const signals = [parent?.pendingAbort?.signal, parent?.budget?.signal, options.signal];
+    const signals = [parent?.pendingAbort?.signal, parent?.budget?.signal, parent?.ownedSignal, options.signal];
     for (const signal of signals) {
       if (!signal) continue;
       const abort = () => child.controller.abort(signal.reason);
@@ -86,7 +133,7 @@ export class MaintenanceBudget {
     }
     try {
       child.check();
-      return await scope.run({ budget: child, identity: parent?.identity, producerParent: parent }, async () => {
+      return await scope.run({ budget: child, identity: parent?.identity, producerParent: parent, ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets }, async () => {
         const result = await action(child);
         child.check();
         return result;
@@ -116,7 +163,7 @@ export class MaintenanceBudget {
       parent.budget?.check();
       return action();
     }
-    return scope.run({ identity, factory, pendingAbort: new AbortController() }, action);
+    return scope.run({ identity, factory, pendingAbort: new AbortController(), ownedSignal: parent?.ownedSignal, ownedBudgets: parent?.ownedBudgets }, action);
   }
 
   /** Observation constrains time only; it grants no custody authority. */
@@ -136,6 +183,7 @@ export class MaintenanceBudget {
   private static attachBudget(context: AttemptContext, budget: MaintenanceBudget): void {
     if (context.budget === budget) return;
     context.budget = budget;
+    this.linkOwnedBudget(context, budget);
     const relay = context.pendingAbort;
     if (!relay) return;
     const abort = () => relay.abort(budget.signal.reason);
@@ -146,7 +194,8 @@ export class MaintenanceBudget {
   /** Stable from attempt entry; obtaining it never starts the cancellation clock. */
   static signal(): AbortSignal | undefined {
     const context = scope.getStore();
-    return context?.pendingAbort?.signal ?? context?.budget?.signal;
+    const pending = context?.pendingAbort?.signal ?? context?.budget?.signal;
+    return context?.ownedSignal ? AbortSignal.any([context.ownedSignal, ...(pending ? [pending] : [])]) : pending;
   }
 
   /** Only inert queue waits: callers must preserve their slot behind earlier holders. */

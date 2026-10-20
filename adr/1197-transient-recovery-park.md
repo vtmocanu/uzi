@@ -144,13 +144,19 @@ rediscovery removes the guard.
 Reachable now, independently of the guard: after a run ends failed or
 blocked, the runner starts a pass that retries that run's saved custody
 FINAL under the existing replay proofs, and live re-drive waits while it
-holds the pass set. On shutdown the worker aborts every recovery pass and
-joins it. A pass step that ignores the abort (a git child, an RPC on its
-own timeout) still runs to its own limit, which can outlast the container
-grace. Before the join, such a step was neither aborted nor joined, and the
-handles it held could equally keep the process alive after `worker.run()`
-returned. Linking the pass abort into every git and RPC scope is owed
-before the guard is removed.
+holds the pass set. Each tracked pass owns an async-local signal combining
+its caller's cancellation with recovery shutdown. That signal reaches its
+Git operations and lock waits, cancellation budget (including a budget
+activated later), and every recovery HTTP attempt. Shutdown closes pass
+admission, aborts those owned operations and joins actual settlement; a Git
+child is reaped before its lock is released. An HTTP request interrupted
+after send retains the existing uncertain outcome and request identity;
+shutdown invents no ACK, release or cleanup proof.
+
+This scope does not cancel foreground or run-lane preservation. Caller-owned
+cancellation, the graceful checkpoint/credential allowance and bounded
+imports keep their existing deadlines and joins. Process-level production
+image shutdown latency remains a separate maintainer acceptance check.
 
 ### Server-owned backoff
 

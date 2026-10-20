@@ -2648,6 +2648,7 @@ export class WorkerClient {
   async reserveRecoveryCapture(
     runId: string,
     req: RecoveryReserveRequest,
+    signal?: AbortSignal,
   ): Promise<RecoveryReserveResponse> {
     // Keep the identity-bound digest intact while a rolled-back API is incompatible.
     if (req.coverage_digest !== undefined && !this.hasFeature("recovery_inventory_v1")) {
@@ -2656,18 +2657,20 @@ export class WorkerClient {
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/reserve`,
       req,
+      this.httpTimeoutMs,
+      signal,
     )) as RecoveryReserveResponse;
   }
 
   /** Atomically reconcile an exact inventory capture and fence it before granting
    * replacement authority. JSON POST. Throws RequestError on 4xx/5xx. */
-  async reconcileRecoveryCapture(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse> {
+  async reconcileRecoveryCapture(runId: string, captureId: string, req: RecoveryReconcileRequest, signal?: AbortSignal): Promise<RecoveryReconcileResponse> {
     if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; capture retained");
     return await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/reconcile`,
       req,
       this.httpTimeoutMs,
-      undefined,
+      signal,
       // The immutable receipt carries IDs, generation, outcome and optional disposition/evidence;
       // 16 KiB leaves ample protocol headroom while bounding actual response bytes.
       16 * 1024,
@@ -3064,13 +3067,13 @@ export class WorkerClient {
 
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
-  async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
+  async listRecoveryHolds(runId: string, signal?: AbortSignal): Promise<RecoveryHoldsResponse> {
     const incarnation = this.completionIncarnation;
     MaintenanceBudget.current()?.check();
     const ticket = this.beginCompletionObservation(runId);
     try {
       const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`;
-      const res = await this.fetchRaw("GET", path, undefined);
+      const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
       if (res.status >= 400) throw await this.toError("GET", path, res);
       let response: RecoveryHoldsResponse;
       try {
@@ -4474,11 +4477,12 @@ const MAINTENANCE_RESPONSE_MAX_BYTES = 1024 * 1024;
 
 function maintenanceSignal(timeoutMs: number): AbortSignal {
   const budget = MaintenanceBudget.current();
-  if (!budget) return AbortSignal.timeout(timeoutMs);
+  const pending = MaintenanceBudget.ownedSignal() ? MaintenanceBudget.signal() : undefined;
+  if (!budget) return pending ? AbortSignal.any([AbortSignal.timeout(timeoutMs), pending]) : AbortSignal.timeout(timeoutMs);
   budget.check();
   const duration = Math.floor(Math.min(timeoutMs, budget.remainingMs()));
   if (duration <= 0) throw new Error("maintenance deadline exhausted");
-  return AbortSignal.any([budget.signal, AbortSignal.timeout(duration)]);
+  return AbortSignal.any([budget.signal, AbortSignal.timeout(duration), ...(pending ? [pending] : [])]);
 }
 
 async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
@@ -4486,8 +4490,10 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) init = { ...init, signal: AbortSignal.any([resourceSignal, ...(init.signal ? [init.signal] : [])]) };
   const budget = MaintenanceBudget.current();
-  if (!budget && !resourceSignal) return transport(url, init);
-  if (!budget) {
+  if (!budget && !resourceSignal && !MaintenanceBudget.ownedSignal()) return transport(url, init);
+  if (!budget || MaintenanceBudget.ownedSignal()) {
+    budget?.check();
+    init.signal?.throwIfAborted();
     const res = await transport(url, init);
     if (init.signal) responseSignals.set(res, init.signal);
     return res;
@@ -4509,7 +4515,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
 
 async function readResponseText(res: Response): Promise<string> {
   const budget = MaintenanceBudget.current();
-  if (!budget && !MaintenanceResources.active()) return res.text();
+  if (!budget && !MaintenanceResources.active() && !MaintenanceBudget.ownedSignal()) return res.text();
   budget?.check();
   const text = await readBoundedText(res, MAINTENANCE_RESPONSE_MAX_BYTES, true);
   budget?.check();
@@ -4628,6 +4634,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
   const budget = MaintenanceBudget.current();
   budget?.check();
   const responseSignal = responseSignals.get(res);
+  const ownedSignal = MaintenanceBudget.ownedSignal();
+  if (ownedSignal) signal = AbortSignal.any([ownedSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   const resourceSignal = MaintenanceResources.signalIfActive();
   if (resourceSignal) signal = AbortSignal.any([resourceSignal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
@@ -4666,7 +4674,7 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
       signal?.throwIfAborted();
-      const { done, value } = await (budget ? budget.raceIO(read, undefined, signal) : read());
+      const { done, value } = await (budget && !MaintenanceBudget.ownedSignal() ? budget.raceIO(read, undefined, signal) : read());
       budget?.check();
       signal?.throwIfAborted();
       if (scoped) MaintenanceResources.checkIfActive();
@@ -4680,9 +4688,10 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
   } finally {
     signal?.removeEventListener("abort", abort);
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
-    // Best effort and not awaited: a source whose cancel never settles must not keep the caller's
-    // result or error from propagating (#2888).
-    void reader.cancel().catch(() => undefined);
+    // Owned recovery passes join cancellation. Other callers keep the best-effort
+    // cancellation semantics of readBoundedBytes (#2888).
+    if (ownedSignal) await reader.cancel().catch(() => undefined);
+    else void reader.cancel().catch(() => undefined);
   }
   budget?.check();
   if (scoped) {
