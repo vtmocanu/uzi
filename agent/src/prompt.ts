@@ -1761,6 +1761,10 @@ export interface ImplementPromptInput {
   /** The owner's queued follow-ups (untrusted), oldest first, rendered as one batch. The system
    *  `followUp` text owns its turn outright and takes precedence over this. */
   ownerFollowUps?: readonly string[];
+  /** Issue #3149: earlier owner follow-ups (bodies, oldest first) for a fresh reviewed-plan
+   *  session, already de-duplicated by input id by the caller and passed on ONE turn only (the
+   *  caller's latch decides, not `first`). Rendered once, fenced, before any live follow-up. */
+  priorOwnerFollowUps?: readonly string[];
   /** Worker-owned completion feedback, never wrapped as owner input. */
   completionRework?: { text: string; answered: boolean };
   /** Same worker-owned eligibility predicate as the signal_done tool schema. */
@@ -2021,6 +2025,10 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     );
   }
   if (input.first && input.reviewedPlanResume) lines.push("", CURRENT_EXECUTION_STATE_GUIDANCE);
+  // Issue #3149: a reviewed (gate-approved, not seeded) resume tells the fresh session so. Gated on
+  // `first` like the plan block below, so it is first-turn scaffolding.
+  const reviewedResumeFraming = input.first && input.reviewedPlanResume === true && !input.seeded;
+  if (reviewedResumeFraming) lines.push("", REVIEWED_RESUME_APPROVAL_GUIDANCE);
   // PRD #209 (D7): the amnesiac cold-start note, first turn only. Ordinary runs carry
   // this on the PLAN prompt and resume a session that saw it; a seeded run requeued
   // after its transcript was dropped had no plan turn, so it rides here. Empty (nothing
@@ -2041,7 +2049,9 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     lines.push(
       "",
       "The plan to implement is below, between the <plan> and </plan> tags. It is the plan",
-      "you supplied for this run — carry it out:",
+      reviewedResumeFraming
+        ? "approved at the plan gate for this run — carry it out:"
+        : "you supplied for this run — carry it out:",
       "<plan>",
       input.seededPlan,
       "</plan>",
@@ -2107,6 +2117,8 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       input.safetySteer,
     );
   }
+  // Issue #3149: earlier owner follow-ups read BEFORE any live follow-up, so a live correction wins.
+  if (input.priorOwnerFollowUps?.length) lines.push(...renderPriorOwnerHistory(input.priorOwnerFollowUps));
   if (input.followUp) lines.push(...renderFollowUpBlock(input.followUp));
   else if (input.ownerFollowUps?.length) lines.push(...renderFollowUpBatch(input.ownerFollowUps));
   if (input.completionRework) lines.push("", input.completionRework.text);

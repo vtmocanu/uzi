@@ -74,6 +74,7 @@ import {
 import {
   buildCIFixPlanPrompt,
   buildImplementPrompt,
+  selectPriorOwnerHistory,
   interruptedCallsNote,
   buildLeadSystemPrompt,
   buildPlanPrompt,
@@ -2937,6 +2938,9 @@ export class SdkExecutor implements Executor {
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
+      // Issue #3149: one-shot latch for the earlier-owner-follow-up history of a reviewed-plan resume.
+      // Not `first`: the held-batch service path resets `iteration` to 0 without setting hasParked.
+      let priorOwnerHistoryPlaced = false;
       // Execution lifetime, independent of iteration resets and system/rework turns.
       // Consumed at harness dispatch after refreshCodeCrossCheckTools has settled.
       let interruptedOwnerDispatched = false;
@@ -3175,6 +3179,24 @@ export class SdkExecutor implements Executor {
           decisionsMemoImplementInjected = true;
           announceDecisionsMemo(ctx);
         }
+        // Issue #3149: history rides only a turn that renders it (not a system-text or rework turn),
+        // once. Ids the lead receives live this turn or on this claim are dropped by id. No inclusion
+        // receipt is ever issued for a history id.
+        let priorOwnerFollowUps: string[] | undefined;
+        if (
+          !priorOwnerHistoryPlaced &&
+          ctx.reviewedPlanResume === true &&
+          !ctx.sessionId &&
+          followUp === undefined &&
+          !reworkForTurn
+        ) {
+          const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
+          priorOwnerFollowUps = selectPriorOwnerHistory(
+            ctx.priorOwnerFollowUps,
+            (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false),
+          );
+          priorOwnerHistoryPlaced = true;
+        }
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -3214,6 +3236,7 @@ export class SdkExecutor implements Executor {
             seededPlan: seededPlanBody,
             followUp,
             ownerFollowUps: ownerRides?.map((f) => f.body),
+            priorOwnerFollowUps,
             completionRework: reworkForTurn,
             ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told

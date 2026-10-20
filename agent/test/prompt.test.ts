@@ -2774,3 +2774,47 @@ describe("prior owner history (issue #3149)", () => {
     assert.match(REVIEWED_RESUME_APPROVAL_GUIDANCE, /not evidence that any step the plan itself scheduled before the gate/);
   });
 });
+
+describe("buildImplementPrompt — reviewed-plan resume framing and earlier owner history (issue #3149)", () => {
+  const base = { branch: "b", subagentNames: ["coder"], first: true, iteration: 1 };
+  const reviewed = { ...base, reviewedPlanResume: true, seeded: false, seededPlan: "THE-PLAN-BODY" };
+
+  it("a reviewed resume carries the approval guidance and says the plan was approved at the gate", () => {
+    const p = buildImplementPrompt(reviewed);
+    assert.ok(p.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+    assert.match(p, /It is the plan\napproved at the plan gate for this run/);
+    assert.doesNotMatch(p, /you supplied/);
+    assert.match(p, /THE-PLAN-BODY/);
+  });
+
+  it("a seeded run keeps the user-supplied wording and lacks the guidance", () => {
+    const p = buildImplementPrompt({ ...base, seeded: true, seededPlan: "SEEDED-BODY" });
+    assert.match(p, /you supplied for this run — carry it out:/);
+    assert.ok(!p.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+  });
+
+  it("an ordinary first turn lacks the guidance", () => {
+    assert.ok(!buildImplementPrompt(base).includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+  });
+
+  it("earlier owner history is fenced and reads before the live follow-up", () => {
+    const p = buildImplementPrompt({
+      ...reviewed, priorOwnerFollowUps: ["HIST-ONE", "HIST-TWO"], followUp: "LIVE-CORRECTION",
+    });
+    const h1 = p.indexOf("HIST-ONE");
+    assert.ok(h1 >= 0 && p.indexOf("HIST-TWO") > h1);
+    assert.match(p, /<owner_history_[0-9a-f]+>\nHIST-ONE\n<\/owner_history_[0-9a-f]+>/);
+    assert.ok(p.indexOf("LIVE-CORRECTION") > p.indexOf("HIST-TWO"));
+    const batch = buildImplementPrompt({ ...reviewed, priorOwnerFollowUps: ["HIST-ONE"], ownerFollowUps: ["LIVE-B"] });
+    assert.ok(batch.indexOf("LIVE-B") > batch.indexOf("HIST-ONE"));
+  });
+
+  it("the answered completion-rework path never carries history", () => {
+    const p = buildImplementPrompt({
+      ...reviewed, priorOwnerFollowUps: ["HIST-ONE"],
+      completionRework: { text: "REWORK-TEXT", answered: true },
+    });
+    assert.doesNotMatch(p, /HIST-ONE/);
+    assert.match(p, /REWORK-TEXT/);
+  });
+});

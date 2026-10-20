@@ -7742,3 +7742,54 @@ describe("M3 Claude producer projection compatibility", () => {
     assert.doesNotMatch(JSON.stringify(sent), /projection-private-value|\\u0000/);
   });
 });
+
+describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () => {
+  const reviewedResume = (extra: Partial<RunContext>) => makeCtx({
+    planApproved: true, seeded: false, reviewedPlanResume: true, sessionId: null,
+    approvedPlan: "zqx42 reviewed plan", config: { max_iterations: 5 }, ...extra,
+  });
+
+  it("places fenced history and the approval guidance on the first implement turn only", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("first pass"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({ priorOwnerFollowUps: [{ id: 7, body: "HIST-A" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const first = turns[0]!.promptText ?? "";
+    assert.match(first, /<owner_history_[0-9a-f]+>\nHIST-A\n<\/owner_history_[0-9a-f]+>/);
+    assert.match(first, /do not request plan approval again/);
+    assert.doesNotMatch(first, /you supplied/);
+    assert.ok(turns.length >= 2);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-A/);
+  });
+
+  it("drops a live id, keeps identical bodies under distinct ids, and issues no receipt for history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const included: number[] = [];
+    let pulled = false;
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [
+        { id: 3, body: "SAME-WORDS" }, { id: 4, body: "SAME-WORDS" },
+        { id: 5, body: "HIST-LIVE-CLAIM" }, { id: 7, body: "HIST-LIVE-RIDE" },
+      ],
+      isLiveFollowUpId: (id) => id === 5,
+      pullFollowUps: () => { if (pulled) return []; pulled = true; return [{ id: 7, body: "LIVE-RIDE" }]; },
+      followUpIncluded: (id) => { included.push(id); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const p = turns[0]!.promptText ?? "";
+    assert.equal(p.split("SAME-WORDS").length - 1, 2);
+    assert.doesNotMatch(p, /HIST-LIVE-CLAIM/);
+    assert.doesNotMatch(p, /HIST-LIVE-RIDE/);
+    assert.match(p, /LIVE-RIDE/);
+    assert.ok(p.indexOf("LIVE-RIDE") > p.indexOf("SAME-WORDS"), "history reads before the live follow-up");
+    assert.ok(!included.some((id) => id === 3 || id === 4 || id === 5), "history ids get no inclusion receipt");
+  });
+
+  it("a session-resumed or non-reviewed run places no history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = reviewedResume({ reviewedPlanResume: false, seeded: true, priorOwnerFollowUps: [{ id: 1, body: "HIST-X" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-X/);
+  });
+});
