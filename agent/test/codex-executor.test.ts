@@ -77,7 +77,7 @@ import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { createCodexTransport, CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type RunContext, type EmittedMessage, type Executor, type WallParkOutcome, type SecretRemediationDecision } from "../src/executor.js";
-import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
+import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
 import { makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit, commitInTree } from "./codex-reap-fixture.js";
 import * as m2Runner from "./runner-harness.js";
 import { followSuccessfulPush as m2FollowPush } from "./publication-fixture.js";
@@ -11585,7 +11585,7 @@ describe("Codex completion interlock", () => {
       const { ctx } = makeCtx({
         kind: mode === "eligible" || mode === "legacy" || mode === "interactive" ? "issue" : mode,
         interactive: mode === "interactive", completionInterlock: mode !== "legacy",
-        pullFollowUp: () => ({ id: 3089, body: "UNTRUSTED-OWNER-CORRECTION" }),
+        pullFollowUps: () => [{ id: 3089, body: "UNTRUSTED-OWNER-CORRECTION" }],
         recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
       });
       const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
@@ -11887,11 +11887,11 @@ describe("Codex completion interlock", () => {
       config: { max_iterations: 5 }, checkpoint: async () => {},
       recordCompletionAttempt: async () => ({ unmet: ++attempts === 1 ? ["m2"] : [], attemptCount: attempts }),
       askCompletionQuestion: async () => { queued = true; return { outcome: "continue" }; },
-      pullFollowUp: () => {
-        if (!queued) return undefined;
+      pullFollowUps: () => {
+        if (!queued) return [];
         queued = false;
         pulls++;
-        return { id: 3089, body: "QUEUED-OWNER-INPUT" };
+        return [{ id: 3089, body: "QUEUED-OWNER-INPUT" }];
       },
       followUpIncluded: id => included.push(id),
     });
@@ -15703,18 +15703,37 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   const A = "FOLLOWUP-MARKER-ALPHA-CODEX-7f3a";
   const B = "FOLLOWUP-MARKER-BRAVO-CODEX-2c9e";
 
-  /** A pullFollowUp over `queue` (ids 1, 2, ... in pull order) plus a followUpIncluded recorder. */
-  function followUpSeams(queue: string[]): { pullFollowUp: () => { id: number; body: string } | undefined; followUpIncluded: (id: number) => void; pulls: Array<string | undefined>; included: number[] } {
-    const pulls: Array<string | undefined> = [];
+  /** A pullFollowUps over `queue` (ids 1, 2, ... in pull order) plus a followUpIncluded recorder.
+   *  It honors the SteeringChannel.pullFollowUps contract (oldest first up to the rune cap, an
+   *  oversized head taken alone only into an empty batch) and records, per call, the bodies it
+   *  returned (`pulls`, [] when none) and its arguments (`pullArgs`). */
+  function followUpSeams(queue: string[]): {
+    pullFollowUps: (remainingRunes: number, batchEmpty: boolean) => { id: number; body: string }[];
+    followUpIncluded: (id: number) => void;
+    pulls: string[][];
+    pullArgs: Array<{ remainingRunes: number; batchEmpty: boolean }>;
+    included: number[];
+  } {
+    const pulls: string[][] = [];
+    const pullArgs: Array<{ remainingRunes: number; batchEmpty: boolean }> = [];
     const included: number[] = [];
     let nextId = 1;
     return {
       pulls,
+      pullArgs,
       included,
-      pullFollowUp: () => {
-        const body = queue.shift();
-        pulls.push(body);
-        return body === undefined ? undefined : { id: nextId++, body };
+      pullFollowUps: (remainingRunes, batchEmpty) => {
+        pullArgs.push({ remainingRunes, batchEmpty });
+        const taken: Array<{ id: number; body: string }> = [];
+        let remaining = remainingRunes;
+        while (queue.length > 0) {
+          const runes = followUpRunes(queue[0]!);
+          if (runes > remaining && !(batchEmpty && taken.length === 0)) break;
+          taken.push({ id: nextId++, body: queue.shift()! });
+          remaining -= runes;
+        }
+        pulls.push(taken.map((t) => t.body));
+        return taken;
       },
       followUpIncluded: (id) => { included.push(id); },
     };
@@ -15724,7 +15743,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     const queue: string[] = [];
     const rig = makeMultiEpochRig([script("th-1", [quiet, (th, tn) => [done(21, th, tn)]], (n) => { if (n === 1) queue.push(A); })]);
     const seams = followUpSeams(queue);
-    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 during-implementation run");
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.equal(texts.length, 2);
@@ -15739,7 +15758,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   it("(b) a follow-up queued before the implement loop (the plan gate) is in the FIRST implement prompt", async () => {
     const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
     const seams = followUpSeams([A]);
-    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 gate run");
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.equal(texts.length, 1, "the run finished in that one turn");
@@ -15747,17 +15766,64 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.deepEqual(seams.included, [1], "a one-turn run still reports it");
   });
 
-  it("delivers queued follow-ups one per ordinary turn, in FIFO order, without re-pulling a carried one", async () => {
+  it("delivers queued follow-ups as one batch on the next ordinary turn, in FIFO order, without re-pulling a carried one", async () => {
     const rig = makeMultiEpochRig([script("th-1", [spoke, spoke, (th, tn) => [done(31, th, tn)]])]);
     const seams = followUpSeams([A, B]);
-    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 FIFO run");
     const texts = turnTexts(rig.epochs[0]!.transport);
-    assert.ok(texts[0]!.includes(A) && !texts[0]!.includes(B));
-    assert.ok(texts[1]!.includes(B) && !texts[1]!.includes(A));
+    assert.ok(texts[0]!.includes(A) && texts[0]!.includes(B), "turn 1 carries both");
+    assert.ok(texts[0]!.indexOf(A) < texts[0]!.indexOf(B), "A precedes B (FIFO)");
+    assert.ok(!texts[1]!.includes(A) && !texts[1]!.includes(B), "turn 2 does not replay the batch");
     assert.ok(!texts[2]!.includes(A) && !texts[2]!.includes(B), "nothing replays");
-    assert.deepEqual(seams.pulls, [A, B, undefined], "one pull per ordinary turn");
+    assert.deepEqual(seams.pulls, [[A, B], [], []], "one batch pull, then an empty pull per later ordinary turn");
     assert.deepEqual(seams.included, [1, 2]);
+  });
+
+  it("#3137 three queued follow-ups ride one prompt, are receipted in that turn, and the next turn carries none", async () => {
+    const C = "FOLLOWUP-MARKER-CHARLIE-CODEX-5d41";
+    const rig = makeMultiEpochRig([script("th-1", [spoke, spoke, (th, tn) => [done(31, th, tn)]])]);
+    const seams = followUpSeams([A, B, C]);
+    const reported: number[] = [];
+    const iterationAtReceipt: Array<number | undefined> = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUps: seams.pullFollowUps,
+      followUpIncluded: (id) => { iterationAtReceipt.push(reported.at(-1)); seams.followUpIncluded(id); },
+      reportIteration: async (n) => { reported.push(n); return undefined; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 batch run");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.ok(texts[0]!.includes(A) && texts[0]!.includes(B) && texts[0]!.includes(C), "the first prompt carries all three");
+    assert.ok(texts[0]!.indexOf(A) < texts[0]!.indexOf(B) && texts[0]!.indexOf(B) < texts[0]!.indexOf(C), "in FIFO order");
+    assert.deepEqual(seams.included, [1, 2, 3], "every id receipted, in order");
+    assert.deepEqual(iterationAtReceipt, [1, 1, 1], "all receipts land while iteration 1 is the last one reported");
+    assert.deepEqual(reported.slice(0, 2), [1, 2], "the next ordinary turn reports iteration 2");
+    assert.ok(!/<follow_up_[0-9a-f]{16}>/.test(texts[1]!), "the next ordinary turn carries no follow-up fence");
+    assert.ok(![A, B, C].some((b) => texts[1]!.includes(b)), "nor any of the bodies");
+  });
+
+  it("#3137 a dropped turn holds the whole batch with no receipts and no channel pull; the re-drive delivers the same entries and receipts each once", async () => {
+    const C = "FOLLOWUP-MARKER-CHARLIE-CODEX-5d41";
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([A, B, C]);
+    const receiptsAtDrop: number[][] = [];
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => "now",
+      parkForPause: async () => { receiptsAtDrop.push([...seams.included]); return false; },
+      pullFollowUps: seams.pullFollowUps,
+      followUpIncluded: seams.followUpIncluded,
+    });
+    controller.abort(new PauseNowSignal());
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 dropped-batch run");
+    assert.deepEqual(receiptsAtDrop, [[]], "no receipt while the dropped turn held the batch");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 1, "the dropped drive sent nothing; the re-drive sent the prompt");
+    assert.ok(texts[0]!.indexOf(A) >= 0 && texts[0]!.indexOf(A) < texts[0]!.indexOf(B) && texts[0]!.indexOf(B) < texts[0]!.indexOf(C), "the same entries in the same order");
+    assert.deepEqual(seams.pulls, [[A, B, C]], "the channel was pulled once: not while the slot was held");
+    assert.deepEqual(seams.included, [1, 2, 3], "each receipted exactly once, by the drive that streamed");
   });
 
   it("(d) a turn dropped before its first event (declined now pause) keeps the follow-up; it is reported once", async () => {
@@ -15769,7 +15835,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       signal: controller.signal,
       pauseModeRequested: () => "now",
       parkForPause: async () => { parks++; return false; }, // declined: the dropped turn is re-driven
-      pullFollowUp: seams.pullFollowUp,
+      pullFollowUps: seams.pullFollowUps,
       followUpIncluded: seams.followUpIncluded,
     });
     // The owner's `now` is already pending when the turn starts, so it is dropped before streaming.
@@ -15779,7 +15845,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.equal(texts.length, 1, "the dropped drive sent nothing; the re-drive sent the prompt");
     assert.ok(texts[0]!.includes(A), "the re-driven turn carries the follow-up the dropped one held");
-    assert.deepEqual(seams.pulls, [A], "pulled once, never re-pulled");
+    assert.deepEqual(seams.pulls, [[A]], "pulled once, never re-pulled");
     assert.deepEqual(seams.included, [1], "reported exactly once, by the drive that streamed");
   });
 
@@ -15802,11 +15868,11 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       pauseModeRequested: () => "now",
       parkForPause: async () => false,
       onSessionId: () => { if (!controller.signal.aborted) controller.abort(new PauseNowSignal()); },
-      pullFollowUp: seams.pullFollowUp,
+      pullFollowUps: seams.pullFollowUps,
       followUpIncluded: (id) => { startsAtStamp.push(starts); seams.followUpIncluded(id); },
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 started-then-dropped run");
-    assert.deepEqual(seams.pulls.filter((p) => p !== undefined), [A], "pulled once, never re-pulled");
+    assert.deepEqual(seams.pulls, [[A]], "pulled once, never re-pulled while the slot was held");
     assert.deepEqual(seams.included, [1], "reported exactly once");
     assert.ok(starts >= 2, "the dropped drive sent turn/start and a second drive followed");
     assert.deepEqual(startsAtStamp, [2], "stamped by the turn/start that streamed model output, not the dropped one");
@@ -15820,7 +15886,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       ];
       const rig = makeMultiEpochRig([script("th-1", [acts, (th, tn) => [done(42, th, tn)]])]);
       const seams = followUpSeams([A]);
-      const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+      const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
       await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#1800 ${type}-only run`);
       const texts = turnTexts(rig.epochs[0]!.transport);
       assert.equal(texts.length, 2);
@@ -15846,10 +15912,128 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       },
     ]);
     const seams = followUpSeams([A]);
-    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#1800 lifecycle-only run");
     assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A), "the turn carried it");
     assert.deepEqual(seams.included, [], "but nothing evidenced the model processing it");
+  });
+
+  it("#3137 an oversized lone follow-up is pulled into an empty batch, delivered whole, and receipted", async () => {
+    const BIG = "x".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 1);
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([BIG]);
+    const { ctx } = makeCtx({ pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 oversized run");
+    assert.deepEqual(seams.pullArgs[0], { remainingRunes: MAX_FOLLOW_UP_BATCH_RUNES, batchEmpty: true });
+    assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(BIG), "the oversized body reaches the implement prompt whole");
+    assert.deepEqual(seams.included, [1], "its id is receipted");
+  });
+
+  it("#3137 a held batch survives an outer iteration without model evidence: no re-pull, delivered once", async () => {
+    const bare: TurnScript = (th, tn) => [threadStarted(th), turnCompleted("completed", th, tn)];
+    const rig = makeMultiEpochRig([script("th-1", [bare, (th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([A]);
+    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 held-slot run");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.ok(texts.length >= 2, "a second drive followed the evidence-free turn");
+    assert.ok(texts[0]!.includes(A) && texts[1]!.includes(A), "the held batch is re-delivered");
+    assert.deepEqual(seams.pulls, [[A]], "the channel was pulled once, not again while held");
+    assert.deepEqual(seams.included, [1]);
+  });
+
+  it("#3137 a held batch survives a provider-epoch recreation before model evidence: the new epoch re-carries every entry in order, one pull, receipts only after evidence", async () => {
+    // Epoch 0's drive streams only thread/started, so the wall elapses with no model evidence; the
+    // refused wall park reaps and recreates the provider epoch, and the same drive re-runs on it.
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(agentMessage("working", th)).push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    rig.deps = { ...rig.deps, wallMs: 50, boundaryDeadlineMs: 50 };
+    const seams = followUpSeams([A, B]);
+    let parks = 0;
+    const includedAtPark: number[][] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUps: seams.pullFollowUps,
+      followUpIncluded: seams.followUpIncluded,
+      parkForWall: async () => { includedAtPark.push([...seams.included]); return ++parks === 1 ? "refused" : "parked"; },
+      takeWallParkRefresh: () => ({ totalSeconds: 5, usedSeconds: 0 }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 epoch-recreate run");
+    assert.equal(rig.providerLaunches(), 2, "the refused wall park recreated the provider epoch");
+    const t0 = turnTexts(rig.epochs[0]!.transport);
+    const t1 = turnTexts(rig.epochs[1]!.transport);
+    assert.ok(t0[0]!.includes(A) && t0[0]!.includes(B), "the first epoch's turn carried the batch");
+    assert.equal(t1.length, 1, "the recreated epoch ran the re-drive");
+    assert.ok(t1[0]!.includes(A) && t1[0]!.includes(B) && t1[0]!.indexOf(A) < t1[0]!.indexOf(B), "the new epoch's turn carries every entry in order");
+    assert.deepEqual(seams.pulls, [[A, B]], "exactly one non-empty pull, no channel pull while held");
+    assert.deepEqual(includedAtPark, [[]], "no receipt before the recreation");
+    assert.deepEqual(seams.included, [1, 2], "each id receipted exactly once, by the turn on the new epoch");
+  });
+
+  it("#3137 a held batch survives a loop-top epoch recreation (refused loop-top park) before model evidence", async () => {
+    // Epoch 0's only turn streams thread/started and a completed terminal: no model evidence, so
+    // the batch stays held. At the next loop top a pending `wall` pause is refused (the park reaps),
+    // and the loop-top recreation mints epoch 1 before the owner slot fill.
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1")).push(turnCompleted("completed", "th-1", "tn-1"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(agentMessage("working", th)).push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const seams = followUpSeams([A, B]);
+    let mode: "wall" | null = null;
+    let parks = 0;
+    const includedAtPark: number[][] = [];
+    const launchesAtPark: number[] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 5 },
+      pullFollowUps: seams.pullFollowUps,
+      followUpIncluded: seams.followUpIncluded,
+      reportIteration: async (iteration) => {
+        if (iteration === 2) { mode = "wall"; return { pauseRequested: true }; }
+        return undefined;
+      },
+      pauseModeRequested: () => mode,
+      clearWallMode: () => { mode = null; },
+      parkForWall: async () => {
+        parks++;
+        includedAtPark.push([...seams.included]);
+        launchesAtPark.push(rig.providerLaunches());
+        return "refused";
+      },
+      takeWallParkRefresh: () => ({ totalSeconds: 600, usedSeconds: 0 }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3137 loop-top recreate run");
+    assert.equal(parks, 1, "the loop-top wall park was refused once");
+    assert.deepEqual(launchesAtPark, [1], "the park ran before any recreation");
+    assert.equal(rig.providerLaunches(), 2, "the loop-top block recreated the provider epoch");
+    const t0 = turnTexts(rig.epochs[0]!.transport);
+    const t1 = turnTexts(rig.epochs[1]!.transport);
+    assert.equal(t0.length, 1, "the bare turn ran on the first epoch");
+    assert.ok(t0[0]!.includes(A) && t0[0]!.includes(B), "the first epoch's turn carried the batch");
+    assert.equal(t1.length, 1, "the new epoch ran the delivering turn");
+    assert.ok(t1[0]!.includes(A) && t1[0]!.includes(B) && t1[0]!.indexOf(A) < t1[0]!.indexOf(B), "the new epoch's turn carries A then B");
+    assert.deepEqual(seams.pulls, [[A, B]], "exactly one non-empty pull, none while held");
+    assert.deepEqual(includedAtPark, [[]], "nothing receipted before the recreation");
+    assert.deepEqual(seams.included, [1, 2], "each id receipted once, by the turn on the new epoch");
   });
 
   it("a root tool item/completed with no start this turn does not stamp the follow-up when the turn fails", async () => {
@@ -15869,7 +16053,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       },
     ]);
     const seams = followUpSeams([A]);
-    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#1800 completion-only run");
     assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A), "the turn carried it");
     assert.deepEqual(seams.included, [], "a tool completion alone is not inclusion evidence");
@@ -15891,7 +16075,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       frozenMilestones: [{ id: "m1", title: "Alpha" }],
       checkpoint: async () => {},
       recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
-      pullFollowUp: seams.pullFollowUp,
+      pullFollowUps: seams.pullFollowUps,
       followUpIncluded: seams.followUpIncluded,
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 rework run");
@@ -15901,7 +16085,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(rework!.startsWith("Completion check (structural interlock)"), "the second turn is the rework");
     assert.ok(!rework!.includes(A), "the rework turn does not carry the follow-up");
     assert.ok(next!.includes(A), "the next ordinary turn does");
-    assert.deepEqual(seams.pulls, [undefined, A], "no pull while the rework text owned the turn");
+    assert.deepEqual(seams.pulls, [[], [A]], "no pull while the rework text owned the turn");
     assert.deepEqual(seams.included, [1]);
   });
 
@@ -15917,7 +16101,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       ]]),
       script("th-1", [spoke, (th, tn) => [done(31, th, tn)]], (n) => {
         if (n === 1) {
-          assert.deepEqual(seams.pulls, [undefined], "answer continuation never pulls owner guidance");
+          assert.deepEqual(seams.pulls, [[]], "answer continuation never pulls owner guidance");
           assert.deepEqual(queue, [A]);
           assert.deepEqual(seams.included, [], "omitted guidance is never acknowledged");
         } else {
@@ -15935,7 +16119,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
         return { kind: "answer", answers: ["retained-answer"] };
       },
       pullSafetySteer: () => { const pending = safetySteer; safetySteer = undefined; return pending; },
-      pullFollowUp: seams.pullFollowUp,
+      pullFollowUps: seams.pullFollowUps,
       followUpIncluded: seams.followUpIncluded,
       reportIteration: async (i) => { iterations.push(i); },
     });
@@ -15945,7 +16129,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(answer!.includes(steer) && answer!.indexOf(steer) < answer!.indexOf("A: retained-answer"));
     assert.ok(!answer!.includes(A));
     assert.ok(ordinary!.includes(A), "queued guidance reaches the later ordinary turn");
-    assert.deepEqual(seams.pulls, [undefined, A]);
+    assert.deepEqual(seams.pulls, [[], [A]]);
     assert.deepEqual(seams.included, [1]);
     assert.deepEqual(queue, []);
     assert.deepEqual(iterations, [1, 1, 2], "answer continuation preserves its iteration");
@@ -15954,7 +16138,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   it("(f) a non-issue run kind (task) delivers the follow-up too", async () => {
     const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
     const seams = followUpSeams([A]);
-    const { ctx } = makeCtx({ kind: "task", pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    const { ctx } = makeCtx({ kind: "task", pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 task run");
     assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A));
     assert.deepEqual(seams.included, [1]);

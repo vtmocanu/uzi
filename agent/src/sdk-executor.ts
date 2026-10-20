@@ -103,7 +103,7 @@ import {
   type PrSummaryClaim,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
-import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
@@ -322,6 +322,41 @@ class CliSignalDeathError extends Error {
     this.sessionId = sessionId;
     this.pid = pid;
   }
+}
+
+/**
+ * Issue #3137: build the owner follow-up batch for an ordinary turn. In-memory `queuedOwner`
+ * entries (follow-ups an interactive park received while the slot was held) go first, in
+ * order, under the same rune cap and oversized-first rule as SteeringChannel.pullFollowUps.
+ * The channel is pulled only when `queuedOwner` was fully drained into the batch, so a
+ * leftover queued entry never lets a later channel entry jump ahead of it. Mutates
+ * `queuedOwner` (taken entries are removed). Returns undefined when nothing is pending.
+ */
+export function fillOwnerBatch(
+  queuedOwner: Array<{ id: number; body: string }>,
+  ctx: RunContext,
+): Array<{ id: number; body: string }> | undefined {
+  const batch: Array<{ id: number; body: string }> = [];
+  let remaining = MAX_FOLLOW_UP_BATCH_RUNES;
+  while (queuedOwner.length > 0) {
+    const head = queuedOwner[0]!;
+    const runes = followUpRunes(head.body);
+    if (runes <= remaining) {
+      batch.push(queuedOwner.shift()!);
+      remaining -= runes;
+      continue;
+    }
+    if (batch.length === 0) {
+      batch.push(queuedOwner.shift()!);
+      remaining = 0;
+    }
+    break;
+  }
+  if (queuedOwner.length === 0) {
+    const pulled = ctx.pullFollowUps?.(remaining, batch.length === 0);
+    if (pulled !== undefined) batch.push(...pulled);
+  }
+  return batch.length > 0 ? batch : undefined;
 }
 
 /**
@@ -2810,22 +2845,22 @@ export class SdkExecutor implements Executor {
       let iteration = 0;
       // Issue #1800: SYSTEM texts only (completion rework, clarification answer, secret
       // remediation): worker-authored turn prompts that own the next implement turn outright.
-      // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
+      // Owner follow-ups never ride this variable; they live in ownerBatch below.
       let followUp: string | undefined;
       let completionRework: { text: string; answered: boolean } | undefined;
-      // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
+      // Issue #1800 / #3137: the owner's follow-up batch (never empty), built (fillOwnerBatch) from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
       // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
-      // stamped included then, exactly once).
+      // every entry stamped included then, exactly once).
       // A turn that throws, parks, walls, pauses or is restarted first keeps it for the next turn.
-      let ownerFollowUp: { id: number; body: string } | undefined;
-      // Issue #1800: the held owner follow-up id the interactive-park branch already ran an extra
-      // turn for, so that branch is taken at most once per id.
+      let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      // Issue #1800: the first id of the held owner batch the interactive-park branch already ran an extra
+      // turn for, so that branch is taken at most once per held batch.
       let serviceTriedId: number | undefined;
-      // Issue #1800: follow-ups the interactive park received while ownerFollowUp was still held,
+      // Issue #1800: follow-ups the interactive park received while ownerBatch was still held,
       // in arrival order. They are already consumed from the server; the queue is in-memory only.
       // They refill the slot at the loop top (ahead of a fresh pull) and are serviced once the
-      // held follow-up reaches the model. A follow-up stranded by a run end stays
+      // held batch reaches the model. A follow-up stranded by a run end stays
       // consumed-but-not-included; the worker re-queues it at its next claim (from the claim-time
       // GET of consumed follow-ups), not the server.
       const queuedOwner: Array<{ id: number; body: string }> = [];
@@ -3098,13 +3133,13 @@ export class SdkExecutor implements Executor {
         // in its slot for the next ordinary turn.
         const reworkForTurn = completionRework;
         completionRework = undefined;
-        if (followUp === undefined && !reworkForTurn) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
-        const ownerRides = followUp === undefined && !reworkForTurn ? ownerFollowUp : undefined;
+        if (followUp === undefined && !reworkForTurn) ownerBatch ??= fillOwnerBatch(queuedOwner, ctx);
+        const ownerRides = followUp === undefined && !reworkForTurn ? ownerBatch : undefined;
         const onFirstEvent = ownerRides
           ? () => {
-              if (ownerFollowUp?.id !== ownerRides.id) return;
-              ownerFollowUp = undefined;
-              ctx.followUpIncluded?.(ownerRides.id);
+              if (ownerBatch !== ownerRides) return;
+              ownerBatch = undefined;
+              for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
             }
           : undefined;
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
@@ -3177,7 +3212,8 @@ export class SdkExecutor implements Executor {
             seeded: ctx.seeded,
             // Ordinary seeded/resume plan embedding remains first-turn-only.
             seededPlan: seededPlanBody,
-            followUp: followUp ?? ownerRides?.body,
+            followUp,
+            ownerFollowUps: ownerRides?.map((f) => f.body),
             completionRework: reworkForTurn,
             ownerDecisionEligible: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
             // #157: the join above populated these, so the first implement turn can be told
@@ -3543,20 +3579,20 @@ export class SdkExecutor implements Executor {
           if (ctx.interactive && ctx.awaitFollowUp && !finalizing) {
             // Issue #1800: defensive, not reachable through the public seams today: a turn that
             // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
-            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would
-            // consume a second follow-up from the server into an occupied slot, and one of the two
-            // would never be included. Service the held one first: run another turn instead of
+            // is still held (pulled, never evidenced) the batch has not reached the model yet. Parking
+            // would consume another follow-up from the server into an occupied slot, and one of the
+            // two would never be included. Service the held batch first: run another turn instead of
             // parking, with the same fresh budgets a received follow-up gets. Bounded: this is taken
-            // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
+            // once per held batch, keyed on its first id (`serviceTriedId`), and the system `followUp` text is cleared so the
             // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
             // through to the normal park: the follow-up stays unincluded and is re-queued at the
-            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND it
-            // (queuedOwner); queued ones are serviced once the held one reaches the model.
+            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND the
+            // batch (queuedOwner); queued ones are serviced once the held batch reaches the model.
             if (
-              (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id)
-              || (ownerFollowUp === undefined && queuedOwner.length > 0)
+              (ownerBatch !== undefined && serviceTriedId !== ownerBatch[0]!.id)
+              || (ownerBatch === undefined && queuedOwner.length > 0)
             ) {
-              if (ownerFollowUp !== undefined) serviceTriedId = ownerFollowUp.id;
+              if (ownerBatch !== undefined) serviceTriedId = ownerBatch[0]!.id;
               followUp = undefined;
               iteration = 0;
               state.wallRemainingMs = initialWallMs;
@@ -3612,7 +3648,7 @@ export class SdkExecutor implements Executor {
               followUp = undefined;
               // The slot may still be held (the bounded extra turn above did not evidence it):
               // keep the held one in front and queue this one behind it.
-              if (ownerFollowUp === undefined) ownerFollowUp = { id: outcome.id, body: outcome.body };
+              if (ownerBatch === undefined) ownerBatch = [{ id: outcome.id, body: outcome.body }];
               else queuedOwner.push({ id: outcome.id, body: outcome.body });
               // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
               // interactive run spans many follow-ups over its lifetime and must NOT fail with
@@ -3959,7 +3995,7 @@ export class SdkExecutor implements Executor {
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
 
         // Issue #1800: the system text this turn carried is spent. Queued owner follow-ups are
-        // pulled at the next loop top (FIFO, one per turn), immediately before the prompt that
+        // pulled at the next loop top (FIFO, batched up to the rune cap), immediately before the prompt that
         // carries them is built.
         followUp = undefined;
 

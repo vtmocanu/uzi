@@ -441,27 +441,29 @@ export interface RunContext {
    * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
    */
   askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
-  /** M4: dequeue the next queued owner follow-up ({id, body}). Issue #1800: each executor pulls it
-   *  into a dedicated owner slot only immediately before it builds an ordinary implement prompt,
-   *  FIFO and one at a time, and carries it until a turn whose prompt held it yields its first
-   *  event evidencing the model processed it (not init or lifecycle), then reports it via {@link followUpIncluded}. The server's consumed_at ("Delivered")
+  /** M4: dequeue the pending owner follow-ups ({id, body}), oldest first. Issue #1800: each executor
+   *  pulls them into a dedicated owner slot only immediately before it builds an ordinary implement
+   *  prompt, as one batch up to the rune cap (see SteeringChannel.pullFollowUps for the cap and the
+   *  oversized-first-entry rule), and carries the batch until a turn whose prompt held it yields its
+   *  first event evidencing the model processed it (not init or lifecycle), then reports every id via
+   *  {@link followUpIncluded}. The server's consumed_at ("Delivered")
    *  records only the worker's receipt via the steering poll; included_at is the separate record
    *  that the turn carrying it reached the model (not that the model acted on it). */
-  pullFollowUp?(): { id: number; body: string } | undefined;
-  /** Issue #1800: follow-up `id` (from pullFollowUp or a park's `followup` outcome) was in a prompt
+  pullFollowUps?(remainingRunes: number, batchEmpty: boolean): { id: number; body: string }[];
+  /** Issue #1800: follow-up `id` (from pullFollowUps or a park's `followup` outcome) was in a prompt
    *  whose turn reached the model (a model-evidencing event arrived). Called once per follow-up; the runner reports
    *  it to the api (POST /inputs/included). Optional; absent (a stub) ⇒ nothing is reported. */
   followUpIncluded?(id: number): void;
   /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
    *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
-   *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
-   *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
+   *  pullFollowUps — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
+   *  Distinct from pullFollowUps: it carries no server input id and never touches the follow-up
    *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
   pullSafetySteer?(): string | undefined;
   /** Issue #1660: every operator follow-up received so far (steering.operatorConstraints), read
    *  by the Agent guard at each dispatch and attached to the subagent's prompt, or null when the
    *  earlier ones could not be loaded this claim (the guard denies dispatch). Unlike
-   *  pullFollowUp it consumes nothing. Optional;
+   *  pullFollowUps it consumes nothing. Optional;
    *  absent ⇒ no constraints. */
   operatorConstraints?(): readonly string[] | null;
   /**

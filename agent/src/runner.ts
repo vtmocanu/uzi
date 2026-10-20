@@ -11796,7 +11796,7 @@ export class RunRunner {
           claim.config ?? null,
           { confirmRunning: revisionRecovery?.hasActiveRevision === true },
         ),
-      pullFollowUp: () => steering.pullFollowUp(),
+      pullFollowUps: (remainingRunes, batchEmpty) => steering.pullFollowUps(remainingRunes, batchEmpty),
       // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
       followUpIncluded: (id) => steering.markFollowUpIncluded(id),
       // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection

@@ -245,11 +245,11 @@ interface CtxProbe {
   persisted: { planMd: string | null };
 }
 
-/** Issue #1800: a pullFollowUp over a queue of bodies, ids 1, 2, ... in pull order. */
+/** Issue #1800: a pullFollowUps result taking the next queued body (a one-entry batch), ids 1, 2, ... in pull order. */
 let pulledFollowUps = 0;
-function pullOf(queue: string[]): { id: number; body: string } | undefined {
+function pullOf(queue: string[]): { id: number; body: string }[] {
   const body = queue.shift();
-  return body === undefined ? undefined : { id: ++pulledFollowUps, body };
+  return body === undefined ? [] : [{ id: ++pulledFollowUps, body }];
 }
 
 function makeCtx(
@@ -300,7 +300,7 @@ function makeCtx(
       gateCall++;
       return v;
     },
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: (n) => {
       iterations.push(n);
     },
@@ -1051,7 +1051,7 @@ describe("SdkExecutor implement/review loop", () => {
       [assistantText("first pass"), resultSuccess()], // loop 1 (no done)
       [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (done)
     ]);
-    const probe = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: () => pullOf(followUps) });
+    const probe = makeCtx({ config: { max_iterations: 5 }, pullFollowUps: () => pullOf(followUps) });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
     // turns[0] = plan, turns[1] = loop1 (carries the follow-up), turns[2] = loop2 (no replay).
@@ -1074,7 +1074,7 @@ describe("SdkExecutor implement/review loop", () => {
     const probe = makeCtx({
       config: { max_iterations: 5 },
       // Queued only by loop 2's top (the pull sits right before the prompt is built).
-      pullFollowUp: () => (++pullCall === 2 ? pullOf(followUps) : undefined),
+      pullFollowUps: () => (++pullCall === 2 ? pullOf(followUps) : []),
       // Armed for the NEXT turn (drained at iteration 2's loop top), so the steer and the
       // follow-up land on the SAME prompt (turns[2]) and their ordering is observable.
       pullSafetySteer: () => (++steerCall === 2 ? "WORKER-SAFETY-STEER-BODY-777" : undefined),

@@ -139,7 +139,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; spies:
     sessionId: null,
     onSessionId: () => {},
     gatePlan: async () => approve,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: () => {},
     checkpoint: async () => {},
     worktreeFingerprint: async () => "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",

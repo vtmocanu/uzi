@@ -9165,7 +9165,7 @@ WITH pending AS (
     -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
     -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
     -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
-    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUps reads, alongside the
     -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
     -- 'answer' that resolves the worker's completion-question await), never this raw row — so
     -- draining it would likewise hit the default arm. PRD #1189 adds 'extend' for the SAME
