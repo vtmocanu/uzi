@@ -106,8 +106,19 @@ func (h *Handler) ResumeRunNow(w http.ResponseWriter, r *http.Request) {
 			UserID:                     user.ID,
 			AllowCompletionBlockedHold: false,
 			GlobalTimeoutSeconds:       int32(h.cfg.RunTimeout.Seconds()),
+			StaleCutoff:                pgtype.Timestamptz{Time: h.clock().Add(-h.cfg.WorkerHeartbeatStale), Valid: true},
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
+				// Issue #3181: a credential_switch_settling hold whose worker is still stopping the
+				// run's processes is its own refusal, not "no longer paused". Re-read the fence
+				// (the same predicate ResumePausedRun refuses on) rather than trusting the earlier
+				// read of the hold reason.
+				if settling, serr := h.q.CredentialSwitchHoldSettling(r.Context(), store.CredentialSwitchHoldSettlingParams{
+					RunID: runID, StaleCutoff: pgtype.Timestamptz{Time: h.clock().Add(-h.cfg.WorkerHeartbeatStale), Valid: true},
+				}); serr == nil && settling {
+					httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
+					return
+				}
 				if run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 					httpx.Error(w, http.StatusConflict, fmt.Sprintf("this run is out of time; extend it to resume: uzi run extend %s --by 2h", runID))
 					return

@@ -151,7 +151,8 @@ type latestRunDTO struct {
 	HealthReason *string    `json:"health_reason"`
 	HealthSince  *time.Time `json:"health_since"`
 	// HoldReason is the paused-run hold class (PRD #1226 'completion_blocked' / PRD #1497
-	// 'budget_exhausted'), null otherwise. Non-sensitive like Health/StopKind, so it rides the
+	// 'budget_exhausted' / issue #3181 'credential_switch_settling' and 'credential_switch_unsettled'),
+	// null otherwise. Non-sensitive like Health/StopKind, so it rides the
 	// shared card unconditionally: the board badge reads it to render a wall park as needing the owner.
 	HoldReason *string `json:"hold_reason"`
 	// DeadlineAt is the server-computed wall-clock deadline a running run will be stopped

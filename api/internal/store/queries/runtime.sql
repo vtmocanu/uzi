@@ -3686,6 +3686,10 @@ RETURNING runs.*;
 --     released_worker_* pair ParkRunsAtWall captured is PRESERVED (never re-read here — the park
 --     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 --     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
+-- Issue #3181: a 'credential_switch_unsettled' hold (the worker confirmed its processes stopped)
+-- resumes like an owner pause and keeps worker_id for the same-worker resume. A
+-- 'credential_switch_settling' hold is REFUSED (0 rows) while the settling fence holds
+-- (CredentialSwitchHoldSettling is the same predicate as a read); both reasons are cleared on resume.
 -- All guards use IS DISTINCT FROM / OR so a NULL hold_reason (an owner pause) always resumes.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -3693,6 +3697,10 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= @stale_cutoff::timestamptz
+                        AND w.dind_register_floor <= runs.status_since))
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -3741,7 +3749,8 @@ UPDATE runs SET
     -- D19: drop worker affinity for a server-side park; keep it for a worker-side park.
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
-    hold_reason = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_reason END,
+    -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
@@ -3759,6 +3768,14 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  -- Issue #3181: refuse a credential_switch_settling hold while its worker is still stopping the
+  -- run's processes (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
+  -- lifts when the worker settles it (credential_switch_unsettled), goes stale or vanishes, or
+  -- re-registers (dind_register_floor then moves past status_since).
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= @stale_cutoff::timestamptz
+                        AND w.dind_register_floor <= runs.status_since))
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
@@ -3966,6 +3983,65 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ));
 
+-- name: HoldCredentialSwitchUnsettled :execrows
+-- Issue #3181: the worker's HOLD report for a pending held-state credential switch whose local
+-- release could not be proven settled (the run's processes may still be alive). running -> paused,
+-- hold_reason 'credential_switch_settling', NON-TERMINAL. Unlike ReleaseCredentialSwitch it does
+-- NOT release the claim (claim_released_at stays NULL), does NOT requeue, does NOT bank budget
+-- (ResumePausedRun banks the paused gap once, from the status_since written here) and KEEPS the
+-- credential override, worker_id and session_id so the later resume spends the override on the
+-- same worker. The switch stamp IS cleared (the PRD #1190 pause-clear pattern: the pending request
+-- has been consumed by this hold), so a reclaim's epoch write finds nothing to settle.
+--
+-- THE WHERE IS THE FENCE: the reporting worker, the reported generation, an UNRELEASED claim, a
+-- running run of a kind that can hold (no job or cross_check), and a switch stamp actually pending
+-- AT THAT generation. Health is reset for SetRunPaused's allowlist reason.
+UPDATE runs SET
+    status                         = 'paused',
+    status_since                   = now(),
+    hold_reason                    = 'credential_switch_settling',
+    credential_switch_requested_at = NULL,
+    credential_switch_generation   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                     = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND claim_generation = @generation
+  AND claim_released_at IS NULL
+  AND status = 'running'
+  AND kind NOT IN ('job', 'cross_check')
+  AND credential_switch_requested_at IS NOT NULL
+  AND credential_switch_generation = @generation;
+
+-- name: SettleCredentialSwitchHold :execrows
+-- Issue #3181: the worker's acknowledgement that every process of the held run has stopped.
+-- credential_switch_settling -> credential_switch_unsettled; status and status_since are NOT
+-- touched (status_since anchors the incarnation fence and the banked paused gap). The incarnation
+-- fence: the acknowledging worker must not have re-registered since the hold was written
+-- (workers.dind_register_floor <= runs.status_since), because a re-registration means the
+-- acknowledging process is a new incarnation that proves nothing about the old one's processes.
+UPDATE runs SET
+    hold_reason = 'credential_switch_unsettled',
+    updated_at  = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.status = 'paused'
+  AND runs.hold_reason = 'credential_switch_settling'
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.dind_register_floor <= runs.status_since);
+
+-- name: CredentialSwitchHoldSettling :one
+-- Issue #3181: the settling fence as a read, the SAME predicate ResumePausedRun refuses on (true =
+-- the owner's resume / set-token must be refused). A paused run in 'credential_switch_settling'
+-- whose worker row still exists, heartbeats at or after the stale cutoff and has not re-registered
+-- since the hold was written. A missing run or worker reads false.
+SELECT (count(*) > 0)::boolean AS settling
+FROM runs r
+JOIN workers w ON w.id = r.worker_id
+WHERE r.id = sqlc.arg('run_id')::uuid AND r.status = 'paused'
+  AND r.hold_reason = 'credential_switch_settling'
+  AND w.last_heartbeat_at >= sqlc.arg('stale_cutoff')::timestamptz
+  AND w.dind_register_floor <= r.status_since;
+
 -- name: StampHeldCredentialSwitch :execrows
 -- PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
 -- `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*), written in ONE
@@ -4086,7 +4162,10 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
-  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4198,7 +4277,10 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
-  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE));
+  AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is

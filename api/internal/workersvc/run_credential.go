@@ -137,6 +137,14 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 			}
 			break
 		}
+		// Issue #3181: a credential_switch_settling hold whose worker is still stopping the run's
+		// processes refuses the switch BEFORE anything is written (the override would otherwise
+		// outlive a refused resume). A hold that settles or whose fence lifts resumes below.
+		if settling, serr := s.runHoldSettling(ctx, runID); serr != nil {
+			return SetRunCredentialResult{}, fmt.Errorf("set run credential: read hold fence: %w", serr)
+		} else if settling {
+			return SetRunCredentialResult{}, ErrRunHoldSettling
+		}
 		// Any other paused run (an owner pause, a completion or wall hold, or the provider
 		// hold): write the override FIRST (idempotent, harmless if the resume then finds 0
 		// rows), then resume. The write runs under the user's secret mutation lock and
@@ -375,8 +383,14 @@ func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID u
 		UserID:                     userID,
 		AllowCompletionBlockedHold: true,
 		GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+		StaleCutoff:                s.staleWorkerCutoff(),
 	}); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// A hold that turned settling between the fence read and this resume is the settling
+			// refusal, not a raced state change.
+			if settling, serr := s.runHoldSettling(ctx, runID); serr == nil && settling {
+				return ErrRunHoldSettling
+			}
 			return ErrCredentialSwitchRaced
 		}
 		return fmt.Errorf("resume paused run: %w", err)

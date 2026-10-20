@@ -120,7 +120,7 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	// The continue writes are NON-transactional and otherwise byte-identical to #1226: the shared
 	// resumeCompletionBlocked helper (also used by the #1227 partial/accept transaction) executes
 	// them against s.q, with followupGuidance == auditBody == guidance.
-	if err := resumeCompletionBlocked(ctx, s.q, run, userID, guidance, guidance, int32(s.p.RunTimeout.Seconds())); err != nil {
+	if err := resumeCompletionBlocked(ctx, s.q, run, userID, guidance, guidance, int32(s.p.RunTimeout.Seconds()), s.staleWorkerCutoff()); err != nil {
 		return store.Run{}, err
 	}
 	// Re-read owner-scoped so the DTO reflects the resumed (queued) status for the paused case,
@@ -150,7 +150,7 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 // ConsumeRunInputs so the worker never drains it) and CLEARS the served budget_exhausted steer
 // (D3). For the partial/accept path the caller runs this LAST inside the transaction, so a
 // not-blocked run rolls back the revision bump and permit invalidation atomically.
-func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID uuid.UUID, followupGuidance, auditBody string, globalTimeoutSeconds int32) error {
+func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID uuid.UUID, followupGuidance, auditBody string, globalTimeoutSeconds int32, staleCutoff pgtype.Timestamptz) error {
 	live := false
 	paused := false
 	switch {
@@ -204,6 +204,7 @@ func resumeCompletionBlocked(ctx context.Context, q Store, run store.Run, userID
 			UserID:                     userID,
 			AllowCompletionBlockedHold: true,
 			GlobalTimeoutSeconds:       globalTimeoutSeconds,
+			StaleCutoff:                staleCutoff,
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCompletionNotBlocked
@@ -383,7 +384,7 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	if err != nil {
 		return store.Run{}, err
 	}
-	if err := resumeCompletionBlocked(ctx, qtx, locked, locked.UserID, dec.Reason, auditBody, int32(s.p.RunTimeout.Seconds())); err != nil {
+	if err := resumeCompletionBlocked(ctx, qtx, locked, locked.UserID, dec.Reason, auditBody, int32(s.p.RunTimeout.Seconds()), s.staleWorkerCutoff()); err != nil {
 		return store.Run{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {

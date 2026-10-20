@@ -2,7 +2,11 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -222,4 +226,117 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		s.bcast.PublishState(owned.ID, run.Status)
 	}
 	return run, true, nil
+}
+
+// Credential-switch hold hold-reason values (issue #3181). A held-state switch whose local release
+// cannot be proven settled is reported as credential_switch_held: the run PAUSES (the claim is not
+// released) with hold_reason holdReasonCredentialSwitchSettling while the worker stops the run's
+// processes. The worker's credential_switch_hold_settled acknowledgement flips it to
+// holdReasonCredentialSwitchUnsettled, from which only the owner's resume (or set-token) moves the
+// run on.
+const (
+	holdReasonCredentialSwitchSettling  = "credential_switch_settling"
+	holdReasonCredentialSwitchUnsettled = "credential_switch_unsettled"
+	stateCredentialSwitchHeld           = "credential_switch_held"
+	stateCredentialSwitchHoldSettled    = "credential_switch_hold_settled"
+)
+
+// ErrRunHoldSettling is the owner-facing refusal of a resume or set-token on a run whose
+// credential_switch_settling hold is still fenced: its worker is alive, has not re-registered since
+// the hold and is still stopping the run's processes (issue #3181). The text is the operator-facing
+// 409 message.
+var ErrRunHoldSettling = errors.New("the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run")
+
+// staleWorkerCutoff is the heartbeat instant before which a worker counts as stale: the same
+// WorkerHeartbeatStale window the stale-worker requeue sweep uses.
+func (s *Service) staleWorkerCutoff() pgtype.Timestamptz {
+	return pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale))
+}
+
+// runHoldSettling reports whether the run's credential_switch_settling fence is up (the predicate
+// ResumePausedRun refuses on).
+func (s *Service) runHoldSettling(ctx context.Context, runID uuid.UUID) (bool, error) {
+	return s.q.CredentialSwitchHoldSettling(ctx, store.CredentialSwitchHoldSettlingParams{
+		RunID: runID, StaleCutoff: s.staleWorkerCutoff(),
+	})
+}
+
+// holdCredentialSwitch applies the credential_switch_held report (issue #3181): the worker could
+// not prove its local release settled, so instead of releasing the claim the run is PAUSED with
+// hold_reason credential_switch_settling. One fenced statement (HoldCredentialSwitchUnsettled)
+// requires the reported generation, an unreleased claim, the reporting worker, a running run and a
+// switch stamp pending at that generation. The stamp is cleared; the override, worker_id and
+// session are kept; no budget is banked (the later resume banks the paused gap once).
+//
+// IDEMPOTENT REDELIVERY: a 0-row result re-reads the run and converges when it is already paused
+// in either credential-switch hold at this generation and worker; anything else is applied=false
+// (the handler's ordinary 409 that changed nothing).
+func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	if req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHeld)
+	}
+	gen := *req.ClaimGeneration
+	rows, err := s.q.HoldCredentialSwitchUnsettled(ctx, store.HoldCredentialSwitchUnsettledParams{
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen,
+	})
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	cur, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if rows == 0 {
+		return cur, isCredentialSwitchHold(cur, gen, true), nil
+	}
+	if s.bcast != nil {
+		s.bcast.PublishState(owned.ID, cur.Status)
+	}
+	return cur, true, nil
+}
+
+// settleCredentialSwitchHold applies the credential_switch_hold_settled acknowledgement (issue
+// #3181): the worker proved every process of the held run stopped, so
+// credential_switch_settling becomes credential_switch_unsettled. SettleCredentialSwitchHold fences
+// on the worker, the generation and the incarnation (the worker must not have re-registered since
+// the hold was written). A 0-row result converges only when the hold is already unsettled at this
+// generation and worker; otherwise applied=false.
+func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Run, wkr store.Worker, req StateRequest) (store.Run, bool, error) {
+	if req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHoldSettled)
+	}
+	gen := *req.ClaimGeneration
+	rows, err := s.q.SettleCredentialSwitchHold(ctx, store.SettleCredentialSwitchHoldParams{
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen,
+	})
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	cur, err := s.runOwnedByWorker(ctx, owned.ID, wkr)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if rows == 0 {
+		return cur, cur.Status == "paused" && cur.ClaimGeneration == gen &&
+			cur.HoldReason.Valid && cur.HoldReason.String == holdReasonCredentialSwitchUnsettled, nil
+	}
+	if s.bcast != nil {
+		s.bcast.PublishState(owned.ID, cur.Status)
+	}
+	return cur, true, nil
+}
+
+// isCredentialSwitchHold reports whether the run is paused in a credential-switch hold at gen.
+// settlingToo admits the settling reason (the hold report's replay) beside the unsettled one.
+func isCredentialSwitchHold(r store.Run, gen int64, settlingToo bool) bool {
+	if r.Status != "paused" || r.ClaimGeneration != gen || r.ClaimReleasedAt.Valid || !r.HoldReason.Valid {
+		return false
+	}
+	switch r.HoldReason.String {
+	case holdReasonCredentialSwitchUnsettled:
+		return true
+	case holdReasonCredentialSwitchSettling:
+		return settlingToo
+	}
+	return false
 }

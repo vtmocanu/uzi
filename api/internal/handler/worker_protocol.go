@@ -446,6 +446,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
+		// Issue #3181: this api accepts {status:"credential_switch_held"} and
+		// {status:"credential_switch_hold_settled"} (each with claim_generation) and answers them
+		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
+		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
+		{"credential_switch_hold"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -1439,7 +1444,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrInvalidState):
-			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, completed, failed")
+			httpx.Error(w, http.StatusBadRequest, "state must be one of running, awaiting_approval, awaiting_input, awaiting_followup, limit_wait, recovery_wait, paused, pause_failed, credential_switch, credential_switch_failed, credential_switch_held, credential_switch_hold_settled, completed, failed")
 		default:
 			slog.Error("worker run state", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -1497,6 +1502,16 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// up on the idempotent-after-reclaim success (applied=true, status 'running'), leaving the
 		// old flight to continue on a claim the reclaim already owns.
 		ack["disposition"] = "released"
+	}
+	switch req.State {
+	case "credential_switch_held":
+		// Issue #3181: the hold applied (or replayed idempotently): the run is paused with its
+		// claim kept and the worker now stops the run's processes. The worker keys on this.
+		ack["disposition"] = "held"
+	case "credential_switch_hold_settled":
+		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
+		// credential_switch_unsettled and the owner's Resume is open.
+		ack["disposition"] = "hold_settled"
 	}
 	if req.State == "awaiting_approval" && gateRevision > 0 {
 		// PRD #1795 M1 (decision 5): the revision this report was answered with, allocated or

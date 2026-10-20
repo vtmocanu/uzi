@@ -4456,6 +4456,32 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 	return i, err
 }
 
+const credentialSwitchHoldSettling = `-- name: CredentialSwitchHoldSettling :one
+SELECT (count(*) > 0)::boolean AS settling
+FROM runs r
+JOIN workers w ON w.id = r.worker_id
+WHERE r.id = $1::uuid AND r.status = 'paused'
+  AND r.hold_reason = 'credential_switch_settling'
+  AND w.last_heartbeat_at >= $2::timestamptz
+  AND w.dind_register_floor <= r.status_since
+`
+
+type CredentialSwitchHoldSettlingParams struct {
+	RunID       uuid.UUID          `json:"run_id"`
+	StaleCutoff pgtype.Timestamptz `json:"stale_cutoff"`
+}
+
+// Issue #3181: the settling fence as a read, the SAME predicate ResumePausedRun refuses on (true =
+// the owner's resume / set-token must be refused). A paused run in 'credential_switch_settling'
+// whose worker row still exists, heartbeats at or after the stale cutoff and has not re-registered
+// since the hold was written. A missing run or worker reads false.
+func (q *Queries) CredentialSwitchHoldSettling(ctx context.Context, arg CredentialSwitchHoldSettlingParams) (bool, error) {
+	row := q.db.QueryRow(ctx, credentialSwitchHoldSettling, arg.RunID, arg.StaleCutoff)
+	var settling bool
+	err := row.Scan(&settling)
+	return settling, err
+}
+
 const decidePlanCrossCheck = `-- name: DecidePlanCrossCheck :one
 UPDATE cross_checks cc SET verdict = $1, reason_class = $2,
     findings = $3::jsonb, decided_at = now()
@@ -7692,6 +7718,50 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.DrainingReason,
 	)
 	return i, err
+}
+
+const holdCredentialSwitchUnsettled = `-- name: HoldCredentialSwitchUnsettled :execrows
+UPDATE runs SET
+    status                         = 'paused',
+    status_since                   = now(),
+    hold_reason                    = 'credential_switch_settling',
+    credential_switch_requested_at = NULL,
+    credential_switch_generation   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                     = now()
+WHERE id = $1 AND worker_id = $2
+  AND claim_generation = $3
+  AND claim_released_at IS NULL
+  AND status = 'running'
+  AND kind NOT IN ('job', 'cross_check')
+  AND credential_switch_requested_at IS NOT NULL
+  AND credential_switch_generation = $3
+`
+
+type HoldCredentialSwitchUnsettledParams struct {
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
+	Generation int64       `json:"generation"`
+}
+
+// Issue #3181: the worker's HOLD report for a pending held-state credential switch whose local
+// release could not be proven settled (the run's processes may still be alive). running -> paused,
+// hold_reason 'credential_switch_settling', NON-TERMINAL. Unlike ReleaseCredentialSwitch it does
+// NOT release the claim (claim_released_at stays NULL), does NOT requeue, does NOT bank budget
+// (ResumePausedRun banks the paused gap once, from the status_since written here) and KEEPS the
+// credential override, worker_id and session_id so the later resume spends the override on the
+// same worker. The switch stamp IS cleared (the PRD #1190 pause-clear pattern: the pending request
+// has been consumed by this hold), so a reclaim's epoch write finds nothing to settle.
+//
+// THE WHERE IS THE FENCE: the reporting worker, the reported generation, an UNRELEASED claim, a
+// running run of a kind that can hold (no job or cross_check), and a switch stamp actually pending
+// AT THAT generation. Health is reset for SetRunPaused's allowlist reason.
+func (q *Queries) HoldCredentialSwitchUnsettled(ctx context.Context, arg HoldCredentialSwitchUnsettledParams) (int64, error) {
+	result, err := q.db.Exec(ctx, holdCredentialSwitchUnsettled, arg.ID, arg.WorkerID, arg.Generation)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const includeRunInputRows = `-- name: IncludeRunInputRows :many
@@ -17093,8 +17163,12 @@ WITH candidates AS MATERIALIZED (
   AND runs.status = 'paused'
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= $4::timestamptz
+                        AND w.dind_register_floor <= runs.status_since))
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
-       OR (COALESCE(runs.budget_wall_seconds, $4::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       OR (COALESCE(runs.budget_wall_seconds, $5::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
 ), parent_mapping AS MATERIALIZED (
     SELECT candidates.id AS run_id, parent.id AS parent_id
@@ -17141,7 +17215,8 @@ UPDATE runs SET
     -- D19: drop worker affinity for a server-side park; keep it for a worker-side park.
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
-    hold_reason = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_reason END,
+    -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
@@ -17159,10 +17234,18 @@ WHERE runs.id = $1 AND runs.user_id = $2
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR $3::boolean)
+  -- Issue #3181: refuse a credential_switch_settling hold while its worker is still stopping the
+  -- run's processes (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
+  -- lifts when the worker settles it (credential_switch_unsettled), goes stale or vanishes, or
+  -- re-registers (dind_register_floor then moves past status_since).
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND w.last_heartbeat_at >= $4::timestamptz
+                        AND w.dind_register_floor <= runs.status_since))
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
-       OR (COALESCE(runs.budget_wall_seconds, $4::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
+       OR (COALESCE(runs.budget_wall_seconds, $5::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
   AND runs.id IN (SELECT run_id FROM eligible_candidates)
   AND (runs.kind <> 'cross_check' OR EXISTS (
@@ -17176,10 +17259,11 @@ RETURNING runs.id, runs.user_id, runs.status
 `
 
 type ResumePausedRunParams struct {
-	ID                         uuid.UUID `json:"id"`
-	UserID                     uuid.UUID `json:"user_id"`
-	AllowCompletionBlockedHold bool      `json:"allow_completion_blocked_hold"`
-	GlobalTimeoutSeconds       int32     `json:"global_timeout_seconds"`
+	ID                         uuid.UUID          `json:"id"`
+	UserID                     uuid.UUID          `json:"user_id"`
+	AllowCompletionBlockedHold bool               `json:"allow_completion_blocked_hold"`
+	StaleCutoff                pgtype.Timestamptz `json:"stale_cutoff"`
+	GlobalTimeoutSeconds       int32              `json:"global_timeout_seconds"`
 }
 
 type ResumePausedRunRow struct {
@@ -17228,12 +17312,17 @@ type ResumePausedRunRow struct {
 //     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 //     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
 //
+// Issue #3181: a 'credential_switch_unsettled' hold (the worker confirmed its processes stopped)
+// resumes like an owner pause and keeps worker_id for the same-worker resume. A
+// 'credential_switch_settling' hold is REFUSED (0 rows) while the settling fence holds
+// (CredentialSwitchHoldSettling is the same predicate as a read); both reasons are cleared on resume.
 // All guards use IS DISTINCT FROM / OR so a NULL hold_reason (an owner pause) always resumes.
 func (q *Queries) ResumePausedRun(ctx context.Context, arg ResumePausedRunParams) (ResumePausedRunRow, error) {
 	row := q.db.QueryRow(ctx, resumePausedRun,
 		arg.ID,
 		arg.UserID,
 		arg.AllowCompletionBlockedHold,
+		arg.StaleCutoff,
 		arg.GlobalTimeoutSeconds,
 	)
 	var i ResumePausedRunRow
@@ -18641,6 +18730,9 @@ WHERE id = $3 AND worker_id = $4 AND (kind <> 'cross_check' OR claim_generation 
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
 `
 
 type SetRunAwaitingFollowupParams struct {
@@ -18699,6 +18791,9 @@ WHERE id = $4 AND worker_id = $5 AND (kind <> 'cross_check' OR claim_generation 
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
 `
 
 type SetRunAwaitingInputParams struct {
@@ -21407,6 +21502,38 @@ func (q *Queries) SetWorkerSnapshotState(ctx context.Context, arg SetWorkerSnaps
 		arg.LeaseSeconds,
 		arg.ID,
 	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const settleCredentialSwitchHold = `-- name: SettleCredentialSwitchHold :execrows
+UPDATE runs SET
+    hold_reason = 'credential_switch_unsettled',
+    updated_at  = now()
+WHERE runs.id = $1 AND runs.worker_id = $2
+  AND runs.claim_generation = $3
+  AND runs.status = 'paused'
+  AND runs.hold_reason = 'credential_switch_settling'
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.dind_register_floor <= runs.status_since)
+`
+
+type SettleCredentialSwitchHoldParams struct {
+	ID         uuid.UUID   `json:"id"`
+	WorkerID   pgtype.UUID `json:"worker_id"`
+	Generation int64       `json:"generation"`
+}
+
+// Issue #3181: the worker's acknowledgement that every process of the held run has stopped.
+// credential_switch_settling -> credential_switch_unsettled; status and status_since are NOT
+// touched (status_since anchors the incarnation fence and the banked paused gap). The incarnation
+// fence: the acknowledging worker must not have re-registered since the hold was written
+// (workers.dind_register_floor <= runs.status_since), because a re-registration means the
+// acknowledging process is a new incarnation that proves nothing about the old one's processes.
+func (q *Queries) SettleCredentialSwitchHold(ctx context.Context, arg SettleCredentialSwitchHoldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleCredentialSwitchHold, arg.ID, arg.WorkerID, arg.Generation)
 	if err != nil {
 		return 0, err
 	}

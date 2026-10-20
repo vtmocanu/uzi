@@ -965,6 +965,15 @@ type Store interface {
 	// stale/superseded/foreign or already-cleared report affects 0 rows. failCredentialSwitch reads
 	// a 0-row result as a benign no-op (applied=false).
 	ClearCredentialSwitchByWorker(ctx context.Context, arg store.ClearCredentialSwitchByWorkerParams) (int64, error)
+	// HoldCredentialSwitchUnsettled / SettleCredentialSwitchHold / CredentialSwitchHoldSettling
+	// are the issue #3181 credential-switch hold: the worker's credential_switch_held report
+	// pauses the run (hold_reason credential_switch_settling, claim kept, stamp cleared, nothing
+	// banked); its credential_switch_hold_settled acknowledgement flips it to
+	// credential_switch_unsettled behind the incarnation fence; CredentialSwitchHoldSettling is
+	// the fence ResumePausedRun refuses on, as a read.
+	HoldCredentialSwitchUnsettled(ctx context.Context, arg store.HoldCredentialSwitchUnsettledParams) (int64, error)
+	SettleCredentialSwitchHold(ctx context.Context, arg store.SettleCredentialSwitchHoldParams) (int64, error)
+	CredentialSwitchHoldSettling(ctx context.Context, arg store.CredentialSwitchHoldSettlingParams) (bool, error)
 	// ClearCompletionBudgetExhausted clears the served budget_exhausted steer
 	// (completion_budget_exhausted_at) on the owner's CONTINUE decision (PRD #1226 M5, D3): a
 	// new owner decision is the third of D3's clears (alongside the worker acting on it /
@@ -3861,7 +3870,7 @@ type StateRequest struct {
 	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
-	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|credential_switch_failed|credential_switch_held|credential_switch_hold_settled|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -4299,7 +4308,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	}
 	// Withdrawal/release helpers have their own short claim transaction; they must
 	// not nest beneath the generic state fence on another connection.
-	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed") {
+	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed" ||
+		req.State == stateCredentialSwitchHeld || req.State == stateCredentialSwitchHoldSettled) {
 		locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 		if err != nil {
 			return owned, false, err
@@ -4380,6 +4390,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// stale check would wrongly reject an already-cleared redelivery).
 	if req.State == "credential_switch_failed" {
 		return s.failCredentialSwitch(ctx, owned, wkr, req)
+	}
+	// Issue #3181: the credential-switch HOLD report and its settlement acknowledgement. Like the
+	// release they are fenced+idempotent statements of their own, dispatched BEFORE the generic
+	// generation fence (whose stale check would reject a redelivery after the hold applied) and
+	// under the same claim mutation lock (beginClaimMutation above).
+	if req.State == stateCredentialSwitchHeld {
+		return s.holdCredentialSwitch(ctx, owned, wkr, req)
+	}
+	if req.State == stateCredentialSwitchHoldSettled {
+		return s.settleCredentialSwitchHold(ctx, owned, wkr, req)
 	}
 	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
 	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
