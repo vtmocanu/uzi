@@ -1,6 +1,8 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import * as ts from "typescript/unstable/ast";
 import { API } from "typescript/unstable/sync";
 import { fileURLToPath } from "node:url";
@@ -14,6 +16,39 @@ function value(key: string): string {
   return entries[0]!.slice(key.length + 1);
 }
 const version = value("CODEX_VERSION");
+
+it("tracked live Codex runtime pins match the lock", (t) => {
+  // This checkout-only suite already reads repo-level M4 sources. Packaged worker-UID
+  // and M3 image lanes select other files; missing git/checkout is a failure, not a skip.
+  const semver = String.raw`[0-9]+\.[0-9]+\.[0-9]+`;
+  const pattern = `(/opt/uzi-codex/|codex-cli |Codex worker uses runtime )(${semver})`;
+  const root = fileURLToPath(new URL("../../", import.meta.url));
+  const scan = spawnSync("git", [
+    "-c", "core.fsmonitor=false", "grep", "--no-color", "-I", "-l", "-z", "-E", pattern, "--", ".",
+    ":(exclude)adr/**", ":(exclude)prds/**", ":(exclude)CHANGELOG.md", ":(exclude)changelog.d/**",
+    // Recorded execution evidence, not the current worker contract.
+    ":(exclude)e2e/worker-uid/issue-2397-investigation.md",
+    // Synthetic version output deliberately includes mismatches to test the verifier.
+    ":(exclude)e2e/codex-m4/provision.test.ts",
+  ], { cwd: root, encoding: "utf8", maxBuffer: 1024 * 1024 });
+  assert.ifError(scan.error);
+  assert.equal(scan.status, 0, `git grep must find live Codex pins: ${scan.stderr}`);
+  const files = scan.stdout.split("\0").filter(Boolean);
+  const stale: string[] = [];
+  let matches = 0;
+  for (const file of files) {
+    const lines = readFileSync(join(root, file), "utf8").split("\n");
+    for (const [index, line] of lines.entries()) {
+      for (const match of line.matchAll(new RegExp(pattern, "g"))) {
+        matches++;
+        if (match[2] !== version) stale.push(`${file}:${index + 1}: ${match[0]}`);
+      }
+    }
+  }
+  assert.ok(matches > 0, "the tracked-text scan must examine live Codex pins");
+  assert.equal(stale.length, 0, `live Codex pins must match CODEX_VERSION=${version}:\n${stale.join("\n")}`);
+  t.diagnostic(`checked ${matches} live Codex pins in ${files.length} tracked files`);
+});
 
 it("the imported production launcher targets the locked install root", () => {
   assert.equal(CODEX_BIN, `/opt/uzi-codex/${version}/bin/codex`);
