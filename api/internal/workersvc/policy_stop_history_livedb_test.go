@@ -472,9 +472,17 @@ func TestPolicyStopHistoryStaleConfirmationLiveDB(t *testing.T) {
 			review := stopHistoryHold(t, e, f, run)
 			switch mode {
 			case "cohort":
+				// Like the persisted-context mutations below, inject this component
+				// precondition explicitly: bound public verdicts correctly refuse
+				// a paused run. This is not proof of a live feedback delivery path.
 				gate := mustRun(t, e, run).GateRevision
-				if _, err := f.svc.SubmitInputWithOptions(e.ctx, f.userID, run, "revise_plan", "new current cohort", nil, SubmitInputOptions{ExpectedGateRevision: &gate}); err != nil {
-					t.Fatal(err)
+				e.exec(`WITH bumped AS (
+ UPDATE runs SET revise_count=revise_count+1 WHERE id=$1 RETURNING id
+) INSERT INTO run_user_inputs(run_id,kind,body,gate_binding,gate_revision)
+ SELECT id,'revise_plan','new current cohort','bound',$2 FROM bumped`, run, gate)
+				renewed, err := f.svc.PolicyStopReviewForOwner(e.ctx, f.userID, run, PolicyHoldActionToken(mustRun(t, e, run)))
+				if err != nil || renewed.StopIfMatch == review.StopIfMatch || len(renewed.Manifest.HumanFeedback) != len(review.Manifest.HumanFeedback)+1 {
+					t.Fatalf("new bound cohort did not produce a changed complete review: %v", err)
 				}
 			case "source":
 				e.exec("UPDATE runs SET policy_revision_source=NULL WHERE id=$1", run)
@@ -490,6 +498,9 @@ func TestPolicyStopHistoryStaleConfirmationLiveDB(t *testing.T) {
 			var conflict *PolicyStopReviewConflict
 			if !errors.As(err, &conflict) {
 				t.Fatalf("changed context accepted: %v", err)
+			}
+			if mode == "cohort" && conflict.Reason != "policy_stop_token_stale" {
+				t.Fatalf("changed bound cohort did not reject the old review token: %v", err)
 			}
 			if before != policyOwnerStopSnapshot(t, e, run) {
 				t.Fatal("stale confirmation wrote state")
