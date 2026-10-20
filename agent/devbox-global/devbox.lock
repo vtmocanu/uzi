@@ -1,6 +1,20 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "actionlint": {
+      "resolved": "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4#actionlint",
+      "source": "nixpkg",
+      "systems": {
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "path": "/nix/store/bwxcfsghzk4hyynxgl3lvjgmcnkc7qhf-actionlint-1.7.12",
+              "default": true
+            }
+          ]
+        }
+      }
+    },
     "chromium": {
       "resolved": "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4#chromium",
       "source": "nixpkg",
@@ -398,6 +412,39 @@
           "outputs": [
             {
               "path": "/nix/store/pd9i09z0609g2x784rqy3pvakamkixq9-yq-go-4.54.1",
+              "default": true
+            }
+          ]
+        }
+      }
+    },
+    "zizmor": {
+      "resolved": "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4#zizmor",
+      "source": "nixpkg",
+      "systems": {
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "path": "/nix/store/alvxpamnx5bg4xrvaps5wdys4lnx2hl8-zizmor-1.31.0",
+              "default": true
+            }
+          ]
+        }
+      }
+    },
+    "zsh": {
+      "resolved": "github:NixOS/nixpkgs/f20cd90e28fe0403873f473b29e42662cd86e8c4#zsh",
+      "source": "nixpkg",
+      "systems": {
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "path": "/nix/store/xidw69qw6fzpj8hh6lyym6gxk946k6vc-zsh-5.9.2",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/ywx38i3kl0c2w4rajnwfpv4wdbz6pvgl-zsh-5.9.2-man",
               "default": true
             }
           ]

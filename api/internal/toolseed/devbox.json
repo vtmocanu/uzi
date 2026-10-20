@@ -371,8 +371,8 @@
   // semgrep is Python/OCaml with no static binary, so BYO-on-PATH via this baked toolchain is the
   // delivery (devs install locally, CI installs it) rather than a pinned-download wrapper.
   //
-  // The sibling lock is the version source of truth: nixpkgs 419fe0f4 resolves the
-  // default x86_64-linux output to python3.14-semgrep-1.172.0. Keep the bare `semgrep`
+  // The sibling lock is the version source of truth (at adoption, nixpkgs 419fe0f4 resolved the
+  // default x86_64-linux output to python3.14-semgrep-1.172.0). Keep the bare `semgrep`
   // selector; the lock selects the default output. Guard row:
   // `semgrep  semgrep  semgrep --version`. CI installs this lock's version
   // (scripts/semgrep-worker-version.sh), so a lock refresh moves CI with it;
@@ -394,6 +394,16 @@
   // Both x86_64-linux narinfos are HTTP 200 on cache.nixos.org (lsof-4.99.7 151 KiB,
   // procps-4.0.7 574 KiB download; closure glibc/ncurses/systemd-minimal-libs, all
   // cached). Hand-written lock entries at the pinned rev.
+  //
+  // `actionlint` + `zizmor` (2026-10-20, issue #2288) and `zsh` (issue #3075) restore
+  // fidelity of uzi's OWN gate, the yamllint/shellcheck/semgrep class: without them a
+  // worker's `lint:actions` prints SKIPPED and `check:skill-triage-render` exercises bash
+  // only, so a green hosted gate:repo proved neither. All three are single-binary bare
+  // selectors at the lock's rev (f20cd90e): actionlint-1.7.12 and zizmor-1.31.0 (outputs
+  // [out]), zsh-5.9.2 (outputsToInstall [out man]); x86_64-linux narinfos HTTP 200 on
+  // cache.nixos.org. Hand-written lock entries at the pinned rev. CI installs the lock's
+  // zizmor (scripts/worker-tool-version.sh) and keeps its sha256-pinned actionlint
+  // tarball; `task check:actions-tool-parity` fails when either drifts from this lock.
   "packages": [
     "go",
     "gcc",
@@ -419,6 +429,9 @@
     "yamllint",
     "semgrep",
     "lsof",
-    "procps.out"
+    "procps.out",
+    "actionlint",
+    "zizmor",
+    "zsh"
   ]
 }
