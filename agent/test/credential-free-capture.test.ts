@@ -100,7 +100,7 @@ describe("credential-free capture foundation (#2852)", () => {
           // beforeSpawn even without the maintenance environment overrides.
           env: {},
           beforeSpawn: async () => { effects++; },
-        }));
+        }), { message: "capture trusted executable refused" });
         assert.equal(reads, 0);
         assert.equal(effects, 0);
         assert.equal(r.specs.length, 0);
