@@ -78,7 +78,7 @@ describe("fixed capture reaper: portable closed admission", () => {
           seamFailure = error;
           throw error;
         }
-      }, undefined, { reaperAttempt: () => attempt });
+      }, undefined, undefined, { reaperAttempt: () => attempt });
     let pending!: ReturnType<typeof quiesceRunAttempt>;
     let continuation!: ReturnType<typeof quiesceRunAttempt>;
     let done = false;
@@ -163,7 +163,7 @@ describe("fixed capture reaper: portable closed admission", () => {
               return { code: 0 };
             } };
         } catch (error) { seamFailure = error; throw error; }
-      }, undefined, { reaperAttempt: () => attempt });
+      }, undefined, undefined, { reaperAttempt: () => attempt });
     try {
       const result = await MaintenanceBudget.run(budget, () =>
         safety.withCredentialFreeCapture(9000, async () => quiesceRunAttempt(request)))
@@ -190,7 +190,7 @@ describe("fixed capture reaper: portable closed admission", () => {
     let launches = 0;
     const safety = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(1)),
       async () => { throw new Error("legacy spawn forbidden"); }, undefined, undefined,
-      async () => { launches++; throw new Error("process seam forbidden"); }, undefined, { reaperAttempt: () => attempt });
+      async () => { launches++; throw new Error("process seam forbidden"); }, undefined, undefined, { reaperAttempt: () => attempt });
     const request: QuiesceRunRequest = { mode: "capture", attempt, cloneKey: attempt.cloneKey,
       targetPaths: [attempt.clonePath], processes: true, dockerHost: undefined, registry: live };
     try {

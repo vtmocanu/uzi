@@ -35,6 +35,7 @@ import type {
   SDKMessage,
   SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
+import { buildCIEvidenceServer, CI_EVIDENCE_SERVER, ciEvidencePrompt, withCIEvidenceAgents } from "./ci-evidence-tools.js";
 import type { Executor, ExecutorResult, RunContext, WallParkOutcome } from "./executor.js";
 import type { Logger } from "./log.js";
 import { buildSdkEnv } from "./sdk-env.js";
@@ -1277,6 +1278,7 @@ export class SdkExecutor implements Executor {
     }
 
     await fs.mkdir(this.homeDir, { recursive: true });
+    ctx.ciEvidence = await ctx.prepareCIEvidence?.();
     // The shared provisioning HOME lives elsewhere on the data volume; ensure it
     // exists before the install subprocess sets HOME to it (a no-op when it equals
     // the per-run homeDir, e.g. tests that don't split them).
@@ -1561,6 +1563,7 @@ export class SdkExecutor implements Executor {
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
     };
+    if (ctx.ciEvidence) mcpServers[CI_EVIDENCE_SERVER] = buildCIEvidenceServer(ctx.ciEvidence);
     const enableImplementationSignals = (): void => {
       signalParkRun = parkRunEnabled(ctx, "implement");
       mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
@@ -4350,7 +4353,8 @@ export class SdkExecutor implements Executor {
       // the current-child sink; the adapter assembles the SdkOptions and finalizes
       // resume/abort/spawn per turn.
       if (phase === "implement") await state.refreshCodeCrossCheckTools?.();
-      this.harness.prepareTurn(turnConfig, state.currentChild);
+      this.harness.prepareTurn({ ...turnConfig, agents: withCIEvidenceAgents(turnConfig.agents ?? {}, ctx.ciEvidence) }, state.currentChild);
+      prompt += ciEvidencePrompt(ctx.ciEvidence);
       if (parkRunEnabled(ctx, phase)) {
         // buildImplementPrompt's later-turn opening must also allow dependency waiting.
         prompt = prompt.replace(

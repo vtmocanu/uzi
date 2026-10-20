@@ -2020,6 +2020,7 @@ export interface CIEpisodePage {
 }
 
 export interface Schedule {
+  ci_artifacts?: string[];
   ci_workflows?: string[];
   ci_episodes?: CIEpisodePage;
   remove_label_on_dispatch: boolean;
@@ -2203,7 +2204,9 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
-  // Omitted preserves PATCH selectors; null or [] clears to all workflows.
+  // Omitted preserves PATCH selectors; null or [] fetches no artifacts.
+  ci_artifacts?: string[] | null;
+  // Omitted preserves PATCH selectors; null or [] watches all workflows.
   ci_workflows?: string[] | null;
   remove_label_on_dispatch?: boolean;
  capacity_limit?: number | null;

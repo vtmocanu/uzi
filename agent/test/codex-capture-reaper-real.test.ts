@@ -83,7 +83,7 @@ async function proof(hold: boolean, mode: "capture" | "own" = "capture", report 
         return result;
       };
       return root;
-    }, undefined, { reaperAttempt: () => attempt });
+    }, undefined, undefined, { reaperAttempt: () => attempt });
   const request = { mode, attempt, cloneKey: attempt.cloneKey,
     targetPaths: [attempt.clonePath], processes: true, dockerHost: undefined, registry: live,
     otherClaimInFlight: true,

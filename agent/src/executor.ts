@@ -118,6 +118,9 @@ export type SecretRemediationDecision =
  * compatible. The runner populates them from the claim.
  */
 export interface RunContext {
+  /** Called after harness-specific home preparation, before any model invocation. */
+  prepareCIEvidence?: () => Promise<import("./ci-evidence.js").PreparedCIEvidence>;
+  ciEvidence?: import("./ci-evidence.js").PreparedCIEvidence;
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;

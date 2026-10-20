@@ -1,4 +1,5 @@
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
+import { CheckpointSoftDeadlineError, CheckpointUnsafeCleanupError, GitBoundaryAbortError } from "./checkpoint-stop.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { CodexLaunchError, launchCodexEffectRoot, SUPERVISOR_BIN, type CodexRootHandle } from "./codex/launcher.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
@@ -562,25 +563,7 @@ const MISSING_OBJECT_RE = /missing|bad object|unable to read|corrupt/i;
 const GIT_OUTPUT_ABORT_MESSAGE = "permit-held git output collection aborted: boundary deadline exceeded";
 const GIT_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
 
-/** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
-class GitBoundaryAbortError extends Error {
-  constructor(message: string, cause?: unknown) {
-    super(message, { cause });
-    this.name = "AbortError";
-  }
-}
-
-/** A checkpoint publication used its cooperative budget. The caller may skip
- * only after every started child has settled under the held permit. */
-export class CheckpointSoftDeadlineError extends Error {
-  constructor(cause?: CheckpointChildStartupTimeoutError) {
-    super(cause === undefined
-      ? "checkpoint publication soft deadline exceeded"
-      : "checkpoint publication soft deadline exceeded (started_deadline; cleanup verified)",
-    cause === undefined ? undefined : { cause });
-    this.name = "AbortError";
-  }
-}
+export { CheckpointSoftDeadlineError } from "./checkpoint-stop.js";
 
 function isAbortLike(error: unknown): error is Error {
   return error instanceof Error && error.name === "AbortError";
@@ -774,6 +757,7 @@ interface BoundaryProcessScope {
    * broker I/O; it must never abort an active child output collector. */
   softSignal?: AbortSignal;
   softDeadlineAt?: number;
+  now?: () => number;
   /** issue #1597 M2: awaited by {@link GitCache.withLock} AFTER its critical section and BEFORE the
    *  per-bare lock is released, so a scope (the mid-turn checkpoint tick) can settle a cancelled child
    *  and remove a lock file it provably owned while no other bare mutation can interleave. Never
@@ -1963,6 +1947,11 @@ export type CommittedTrackingOwnership =
 export interface FetchAgentBranchOptions {
   context: OwedCandidateContext;
   remotelyConfirmedSha?: string;
+  /** Worker-captured candidate; never substitute a newer branch head. */
+  expectedCandidateSha?: string;
+  /** Milestone policy soft-stops only while waiting for the bare lock. */
+  checkpointImportMode?: "done" | "milestone";
+  checkpointStep?: (step: BoundaryStep) => void;
 }
 export type TrackingUpdateResult =
   | { kind: "updated"; trackingRef: string; candidateSha: string; retainedShas: string[];
@@ -2278,7 +2267,7 @@ export class GitCache {
     spawner: BoundaryProcessSpawner,
     signal: AbortSignal,
     action: () => Promise<T>,
-    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number } = {},
+    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number; now?: () => number } = {},
   ): Promise<T> {
     if (this.boundaryProcesses.getStore()?.capture) throw new Error("capture spawner cannot be replaced");
     return this.boundaryProcesses.run(
@@ -4605,57 +4594,98 @@ export class GitCache {
     opts: FetchAgentBranchOptions): Promise<TrackingUpdateResult> {
     if (!opts) throw new Error("fetchAgentBranch requires trusted claim context");
     opts = this.snapshotOwedOptions(opts);
-    await this.validateOwedContext(barePath, branch, opts.context);
-    if (runId !== opts.context.runId) throw new Error("fetchAgentBranch run identity mismatch");
-    this.validateConfirmedSha(opts.remotelyConfirmedSha);
-    // Only a worker-selected clone path is admitted to the pack transport.
-    if (!path.isAbsolute(clonePath) || !isWithinPath(path.resolve(clonePath), path.resolve(this.runnerRoot))) {
-      throw new Error("fetchAgentBranch requires a trusted runner clone path");
-    }
+    const checkpointScope = this.boundaryProcesses.getStore();
+    const prepare = async (): Promise<void> => {
+      this.checkCheckpointCooperation();
+      this.validateConfirmedSha(opts.expectedCandidateSha);
+      await this.validateOwedContext(barePath, branch, opts.context);
+      if (runId !== opts.context.runId) throw new Error("fetchAgentBranch run identity mismatch");
+      this.validateConfirmedSha(opts.remotelyConfirmedSha);
+      // Only a worker-selected clone path is admitted to the pack transport.
+      if (!path.isAbsolute(clonePath) || !isWithinPath(path.resolve(clonePath), path.resolve(this.runnerRoot))) {
+        throw new Error("fetchAgentBranch requires a trusted runner clone path");
+      }
+      this.checkCheckpointCooperation();
+    };
+    if (opts.checkpointImportMode === "milestone") await this.maskCheckpointCooperation(prepare);
+    else await prepare();
+    opts.checkpointStep?.("checkpoint_import_lock_wait");
     return this.withLock(barePath, async () => {
-      const observed = await this.observeTrackingUnderLock(barePath, branch);
-      const stage = `refs/uzi-incoming/${randomUUID()}`;
-      // Ordinary transport failures (including boundary aborts) deliberately throw.
-      await this.runGit(barePath, [
-        "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
-        "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
-      ]);
-      const incoming = await this.resolveCommitStrict(barePath, stage);
-      await this.requireOwedCommit(barePath, incoming);
-      let result: TrackingUpdateResult;
-      if (observed) {
-        result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
-      } else {
-        // The producing fetch context proves only incoming, never the unknown shared head.
-        try {
-          await this.pinOwedUnderLock(opts.context, incoming);
-          result = { kind: "not_updated", reason: "ownership_unknown" };
-        } catch (cause) {
-          const abort = this.boundaryAbortError(cause);
-          if (abort) throw abort;
-          result = { kind: "not_updated", reason: preservationReason(cause) };
+      const importBranch = async (): Promise<TrackingUpdateResult> => {
+        this.checkCheckpointCooperation();
+        const observed = await this.observeTrackingUnderLock(barePath, branch);
+        const stage = `refs/uzi-incoming/${randomUUID()}`;
+        opts.checkpointStep?.("checkpoint_import_transport");
+        // Ordinary transport failures (including boundary aborts) deliberately throw.
+        await this.runGit(barePath, [
+          "-c", "protocol.file.allow=user", "fetch", "--refmap=", "--no-tags",
+          "--no-write-fetch-head", `file://${clonePath}`, `+refs/heads/${branch}:${stage}`,
+        ]);
+        opts.checkpointStep?.("checkpoint_import_poststage");
+        const incoming = await this.resolveCommitStrict(barePath, stage);
+        await this.requireOwedCommit(barePath, incoming);
+        if (opts.expectedCandidateSha !== undefined && incoming !== opts.expectedCandidateSha) {
+          throw new Error("checkpoint candidate changed during acquisition");
         }
-      }
-      // A refusal can leave stage as the sole anchor if metadata/pinning failed.
-      // Delete it only after an independently verified durable anchor exists.
-      try {
-        if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-        } else if (result.kind === "updated" &&
-            await this.checkedTrackingSha(barePath, branch) === incoming) {
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
-        } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
-          // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
-          // clone kept), so its stage must not accumulate one ref per refused attempt.
-          await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+        this.checkCheckpointCooperation();
+        let result: TrackingUpdateResult;
+        if (observed) {
+          result = await this.promoteTrackingUnderLock(barePath, branch, incoming, observed, opts);
+        } else {
+          // The producing fetch context proves only incoming, never the unknown shared head.
+          result = await this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
+            try {
+              await this.pinOwedUnderLock(opts.context, incoming);
+              return { kind: "not_updated", reason: "ownership_unknown" };
+            } catch (cause) {
+              const abort = this.boundaryAbortError(cause);
+              if (abort) throw abort;
+              return { kind: "not_updated", reason: preservationReason(cause) };
+            }
+          });
         }
-      } catch (cause) {
-        const abort = this.boundaryAbortError(cause);
-        if (abort) throw abort;
-        if (result.kind === "updated") throw cause;
-        // One cleanup attempt; a harmless stage must not erase the refusal reason.
-      }
-      return result;
+        // Ownership has settled. A stop now retains the private stage rather than
+        // moving a stall into optional anchor lookup or staging cleanup.
+        if (result.kind === "not_updated") {
+          await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+          if (checkpointScope?.softSignal?.aborted ||
+              (checkpointScope?.softDeadlineAt ?? Infinity) <= (checkpointScope?.now ?? Date.now)()) return result;
+        }
+        this.checkCheckpointCooperation();
+        {
+          // A refusal can leave stage as the sole anchor if metadata/pinning failed.
+          // Delete it only after an independently verified durable anchor exists.
+          try {
+            if (await this.hasOwedAnchorUnderLock(barePath, opts.context.runId, incoming)) {
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            } else if (result.kind === "updated" &&
+                await this.checkedTrackingSha(barePath, branch) === incoming) {
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            } else if (result.kind === "not_updated" && result.reason === "owed_limit") {
+              // At the cap the incoming head is deliberately unpreserved (the run is stopped and its
+              // clone kept), so its stage must not accumulate one ref per refused attempt.
+              await this.runGit(barePath, ["update-ref", "-d", stage, incoming]);
+            }
+          } catch (cause) {
+            // An inconclusive owner with a successfully preserved incoming pin is
+            // not a mutation failure: its cleanup stop must still propagate.
+            if (result.kind === "not_updated" && (observed || result.reason !== "ownership_unknown") &&
+                cause instanceof CheckpointSoftDeadlineError) {
+              await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+              return result;
+            }
+            const abort = this.boundaryAbortError(cause);
+            if (abort) throw abort;
+            if (result.kind === "updated") throw cause;
+            // One cleanup attempt; a harmless stage must not erase the refusal reason.
+          }
+        }
+        if (result.kind === "not_updated") await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        else this.checkCheckpointCooperation();
+        return result;
+      };
+      return opts.checkpointImportMode === "milestone"
+        ? this.withCheckpointHardOnly(importBranch, false) : importBranch();
     });
   }
 
@@ -4781,7 +4811,14 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       const observed = await this.observeTrackingUnderLock(barePath, branch);
       if (!observed) return { kind: "not_updated", reason: "ownership_unknown" };
-      return this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      this.checkCheckpointCooperation();
+      const result = await this.promoteTrackingUnderLock(barePath, branch, sha, observed, opts);
+      if (result.kind === "not_updated") {
+        await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+        return result;
+      }
+      this.checkCheckpointCooperation();
+      return result;
     });
   }
 
@@ -4802,7 +4839,11 @@ export class GitCache {
    *  runner-owned, so a worker-uid read would hit the B2 dubious-ownership boundary
    *  (git.ts B2 invariants). Best-effort. */
   async branchTip(clonePath: string, branch: string): Promise<string | null> {
-    const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch(() => "")).trim();
+    const sha = (await this.runGitAsRunner(clonePath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]).catch((cause: unknown) => {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return "";
+    })).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
 
@@ -4860,7 +4901,11 @@ export class GitCache {
    */
   async worktreeHead(worktreePath: string): Promise<string | null> {
     const sha = (
-      await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]).catch(() => "")
+      await this.runGitAsRunner(worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"]).catch((cause: unknown) => {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return "";
+      })
     ).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
   }
@@ -4904,18 +4949,23 @@ export class GitCache {
         return { head_commit: head, base_commit: base };
       }
       const receiptId = randomUUID();
-      // Metadata first: an interrupted create can never acquire fresh-empty authority later.
-      await this.writeCodeSnapshotMetadata(barePath, {
-        version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+      this.checkCheckpointCooperation();
+      await this.maskCheckpointCooperation(async () => {
+        // Metadata first: an interrupted create can never acquire fresh-empty authority later.
+        await this.writeCodeSnapshotMetadata(barePath, {
+          version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+        });
+        await this.runGit(barePath, ["update-ref", ref, head, ""]);
       });
-      await this.runGit(barePath, ["update-ref", ref, head, ""]);
       if (this.codeSnapshotFreshReceipts.size >= 256) return { head_commit: head, base_commit: base };
       this.codeSnapshotFreshReceipts.add(receiptId);
       return { head_commit: head, base_commit: base,
         freshReceipt: { leadId: runId, head, pinGeneration, receiptId } };
     };
-    return this.withLock(barePath, () => pin
+    const result = await this.withLock(barePath, () => pin
       ? this.withCodeSnapshotFence(barePath, runId, operation) : operation());
+    this.checkCheckpointCooperation();
+    return result;
   }
 
   async codeSnapshotTip(barePath: string, runId: string): Promise<string> {
@@ -12483,6 +12533,36 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
+  private checkCheckpointCooperation(): void {
+    this.checkReportProof();
+    this.checkRecoveryInterruption();
+    MaintenanceBudget.current()?.check();
+    const scope = this.boundaryProcesses.getStore();
+    if (scope?.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (scope?.softSignal?.aborted || (scope?.softDeadlineAt !== undefined && (scope.now ?? Date.now)() >= scope.softDeadlineAt)) {
+      throw new CheckpointSoftDeadlineError();
+    }
+  }
+
+  /** Called under the existing lock, after observation. Only cooperative checkpoint
+   * cancellation is masked; the spawner, hard signal and release hook are identical. */
+  private maskCheckpointCooperation<T>(action: () => Promise<T>): Promise<T> {
+    const scope = this.boundaryProcesses.getStore();
+    return scope ? this.boundaryProcesses.run(
+      { ...scope, softSignal: undefined, softDeadlineAt: undefined }, action) : action();
+  }
+
+  private async withCheckpointHardOnly(action: () => Promise<TrackingUpdateResult>, checkBefore = true): Promise<TrackingUpdateResult> {
+    if (checkBefore) this.checkCheckpointCooperation();
+    const result = await this.maskCheckpointCooperation(action);
+    if (result.kind === "not_updated") {
+      await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+      return result;
+    }
+    await this.maskCheckpointCooperation(async () => this.checkCheckpointCooperation());
+    return result;
+  }
+
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
     const scope = this.boundaryProcesses.getStore();
@@ -12492,7 +12572,7 @@ export class GitCache {
         : "permit-held git operation aborted";
       return new GitBoundaryAbortError(message, cause);
     }
-    if (cause instanceof CheckpointSoftDeadlineError) return cause;
+    if (cause instanceof CheckpointSoftDeadlineError || cause instanceof TrustedExecutionRefusal) return cause;
     if (cause instanceof CheckpointChildStartupTimeoutError) {
       if (scope?.softDeadlineAt === undefined) return cause;
       this.log.warn("checkpoint child startup timeout recovered", {
@@ -12500,12 +12580,69 @@ export class GitCache {
       });
       return new CheckpointSoftDeadlineError(cause);
     }
-    if (scope?.softSignal?.aborted) return new CheckpointSoftDeadlineError();
     if (cause instanceof GitBoundaryAbortError) return cause;
     // Foreign AbortError messages can carry remote text. Preserve the abort type and
     // original cause without copying that message onto the run-log surface.
     if (isAbortLike(cause)) return new GitBoundaryAbortError("permit-held git operation aborted", cause);
     return undefined;
+  }
+
+  /** Listener precedes async launch. Cancellation is owned by the returned handle,
+   * and completion includes both the exact child's completion and cancel settlement. */
+  private async spawnCheckpointProcess(boundary: BoundaryProcessScope, request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> {
+    let child: BoundaryProcessHandle | undefined;
+    let stopped = false;
+    let softCancellation: Promise<void> | undefined;
+    const cancellations: Promise<void>[] = [];
+    let admittingCancellation = true;
+    const cancel = (): Promise<void> => {
+      if (!admittingCancellation || !child) return Promise.resolve();
+      // Independent report/recovery callers retain their own settlement promises.
+      // The handle still owns disposal/reap; this wrapper only joins its requests.
+      const pending = Promise.resolve().then(() => child!.cancel());
+      cancellations.push(pending);
+      void pending.catch(() => undefined);
+      return pending;
+    };
+    const stop = (): void => {
+      if (!admittingCancellation) return;
+      stopped = true;
+      if (child) softCancellation ??= cancel();
+    };
+    boundary.softSignal?.addEventListener("abort", stop, { once: true });
+    if (boundary.softSignal?.aborted) stop();
+    try {
+      child = await boundary.spawn(request);
+    } catch (error) {
+      admittingCancellation = false;
+      boundary.softSignal?.removeEventListener("abort", stop);
+      if (stopped && !(error instanceof CheckpointChildStartupTimeoutError || error instanceof CheckpointSoftDeadlineError)) {
+        throw new CheckpointUnsafeCleanupError("checkpoint child startup cleanup unverified", error);
+      }
+      throw error;
+    }
+    if (stopped) stop();
+    const process = child;
+    const completed = (async () => {
+      const terminal = await Promise.allSettled([process.completed]);
+      // Close both listener and caller admission before capturing the final owner.
+      // No await may separate this closure from the cancellation snapshot.
+      admittingCancellation = false;
+      boundary.softSignal?.removeEventListener("abort", stop);
+      const cancelled = await Promise.allSettled(cancellations);
+      const failedCancellation = cancelled.find(result => result.status === "rejected");
+      if (failedCancellation?.status === "rejected") {
+        throw new CheckpointUnsafeCleanupError("checkpoint child cancellation cleanup unverified", failedCancellation.reason);
+      }
+      if (terminal[0]!.status === "rejected") {
+        if (stopped) throw new CheckpointUnsafeCleanupError("checkpoint child completion cleanup unverified", terminal[0]!.reason);
+        throw terminal[0]!.reason;
+      }
+      return stopped ? { code: -1, softTimedOut: true as const } : terminal[0]!.value;
+    })();
+    void completed.catch(() => undefined);
+    return { ...process, stdin: process.stdin, stdout: process.stdout, stderr: process.stderr,
+      cancel, completed };
   }
 
   private async execScoped(
@@ -12556,10 +12693,10 @@ export class GitCache {
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
     if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
       throw new CheckpointSoftDeadlineError();
     }
-    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
     const childTimeout = recovery
       ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
       : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
@@ -12570,7 +12707,7 @@ export class GitCache {
     assertNoCredentialedGitWhileQuarantined(options.env);
     let process: BoundaryProcessHandle;
     try {
-      process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
+      process = await this.spawnCheckpointProcess(boundary, { argv: [executable, ...args], cwd, env: options.env, identity,
         ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
         ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
       });
@@ -12809,16 +12946,16 @@ export class GitCache {
     recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
-      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && (boundary.now ?? Date.now)() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
-      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - (boundary.now ?? Date.now)());
       const childTimeout = recovery
         ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
         : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       let process: BoundaryProcessHandle;
       try {
-        process = await boundary.spawn({
+        process = await this.spawnCheckpointProcess(boundary, {
           argv: [GIT_BIN, ...withDir(cwd, args)],
           cwd,
           env,
@@ -13061,6 +13198,8 @@ export class GitCache {
       }, "command");
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       // Preserve git's numeric exit code on the wrapped error so a caller can discriminate
       // an expected non-zero status (e.g. `config --unset-all` exit 5 = key absent) from a
       // real failure — the same `.code` idiom `tryGit` reads off the raw execFile error.
@@ -13257,7 +13396,8 @@ export class GitCache {
   private snapshotOwedOptions(opts: FetchAgentBranchOptions): FetchAgentBranchOptions {
     const c = opts.context;
     return { context: { ...c, defaultIdentity: c?.defaultIdentity && { ...c.defaultIdentity } },
-      remotelyConfirmedSha: opts.remotelyConfirmedSha };
+      remotelyConfirmedSha: opts.remotelyConfirmedSha, expectedCandidateSha: opts.expectedCandidateSha,
+      checkpointImportMode: opts.checkpointImportMode, checkpointStep: opts.checkpointStep };
   }
 
   private async validateOwedContext(barePath: string, branch: string, c: StoredOwedContext,
@@ -13643,84 +13783,101 @@ export class GitCache {
     let divergence: "none" | "ancestor" | "divergent" | "unknown" | "foreign" = "none";
     if (observed.sha) divergence = observed.owner?.runId === c.runId
       ? await this.ancestry(barePath, observed.sha, incoming) : "foreign";
+    let displacedContext: StoredOwedContext | undefined;
+    let incomingCovered: boolean;
     try {
       if (observed.sha && observed.owner &&
           (observed.owner.runId !== c.runId ||
             !(await this.remotelyCovers(barePath, observed.sha, opts.remotelyConfirmedSha)))) {
-        // Only this run's confirmation can discharge its own debt.
-        await this.pinOwedUnderLock(await this.producingContext(barePath, branch, observed.owner), observed.sha);
-        if (observed.owner.runId === c.runId) retainedShas.push(observed.sha);
+        displacedContext = await this.producingContext(barePath, branch, observed.owner);
       }
-      await this.persistOwedContext(c);
-      if (!(await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha))) {
-        await this.pinOwedUnderLock(c, incoming);
-        retainedShas.push(incoming);
-      }
+      incomingCovered = await this.remotelyCovers(barePath, incoming, opts.remotelyConfirmedSha);
     } catch (cause) {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       return { kind: "not_updated", reason: preservationReason(cause) };
     }
-    try {
-      const key = `uzi-trackowner.${branch}.receiptversion`;
-      await this.runGit(barePath, ["config", "--local", "--replace-all", key, "1"]);
-      if (await this.checkedReceiptGovernance(barePath, branch) !== "governed") {
-        throw new Error("receipt governance readback mismatch");
+    opts.checkpointStep?.("checkpoint_import_premutation");
+    this.checkCheckpointCooperation();
+    return this.maskCheckpointCooperation(async (): Promise<TrackingUpdateResult> => {
+      opts.checkpointStep?.("checkpoint_import_mutation");
+      try {
+        if (displacedContext && observed.sha) {
+          // Only this run's confirmation can discharge its own debt.
+          await this.pinOwedUnderLock(displacedContext, observed.sha);
+          if (observed.owner?.runId === c.runId) retainedShas.push(observed.sha);
+        }
+        await this.persistOwedContext(c);
+        if (!incomingCovered) {
+          await this.pinOwedUnderLock(c, incoming);
+          retainedShas.push(incoming);
+        }
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
       }
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_pending_failed" };
-    }
-    try {
-      const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
-      if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: preservationReason(cause) };
-    }
-    const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
-      trackingSha: incoming, phase: "pending" };
-    try {
-      await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_pending_failed" };
-    }
-    try {
-      await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), incoming, observed.sha ?? "0".repeat(40)]);
-      if (await this.checkedTrackingSha(barePath, branch) !== incoming) throw new Error("tracking CAS readback mismatch");
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "tracking_update_failed" };
-    }
-    try {
-      await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), c.runId]);
-      if (await this.checkedOwnerStamp(barePath, branch, false) !== c.runId) throw new Error("owner stamp readback mismatch");
-    } catch (cause) {
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "owner_stamp_failed" };
-    }
-    try {
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, { ...receipt, phase: "committed" });
-      const owner = await this.checkedTrackingOwner(barePath, branch, incoming);
-      if (owner?.runId !== c.runId || owner.generation !== c.generation || owner.context !== this.contextName(c)) throw new Error("committed owner readback mismatch");
-    } catch (cause) {
-      // One best-effort invalidation after an indeterminate committed write/readback.
-      // No retries: if the disk remains unavailable the original owed pin still survives.
-      await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt)
-        .catch(() => undefined);
-      const abort = this.boundaryAbortError(cause);
-      if (abort) throw abort;
-      return { kind: "not_updated", reason: "receipt_commit_failed" };
-    }
-    return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
-      retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
+      try {
+        const key = `uzi-trackowner.${branch}.receiptversion`;
+        await this.runGit(barePath, ["config", "--local", "--replace-all", key, "1"]);
+        if (await this.checkedReceiptGovernance(barePath, branch) !== "governed") {
+          throw new Error("receipt governance readback mismatch");
+        }
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_pending_failed" };
+      }
+      try {
+        const cleared = await this.clearConflictingAncestorTrackingRefs(barePath, runnerTrackingRef(branch), opts);
+        if (!cleared) return { kind: "not_updated", reason: "ownership_unknown" };
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: preservationReason(cause) };
+      }
+      const receipt: TrackingReceipt = { version: 1, branch, runId: c.runId, generation: c.generation, context: this.contextName(c),
+        trackingSha: incoming, phase: "pending" };
+      try {
+        await this.writeOwedFile(barePath, `governed-${this.receiptName(branch)}.json`, { version: 1, branch });
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt);
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_pending_failed" };
+      }
+      try {
+        await this.runGit(barePath, ["update-ref", runnerTrackingRef(branch), incoming, observed.sha ?? "0".repeat(40)]);
+        if (await this.checkedTrackingSha(barePath, branch) !== incoming) throw new Error("tracking CAS readback mismatch");
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "tracking_update_failed" };
+      }
+      try {
+        await this.runGit(barePath, ["config", "--local", "--replace-all", runnerTrackingOwnerKey(branch), c.runId]);
+        if (await this.checkedOwnerStamp(barePath, branch, false) !== c.runId) throw new Error("owner stamp readback mismatch");
+      } catch (cause) {
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "owner_stamp_failed" };
+      }
+      try {
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, { ...receipt, phase: "committed" });
+        const owner = await this.checkedTrackingOwner(barePath, branch, incoming);
+        if (owner?.runId !== c.runId || owner.generation !== c.generation || owner.context !== this.contextName(c)) throw new Error("committed owner readback mismatch");
+      } catch (cause) {
+        // One best-effort invalidation after an indeterminate committed write/readback.
+        // No retries: if the disk remains unavailable the original owed pin still survives.
+        await this.writeOwedFile(barePath, `receipt-${this.receiptName(branch)}.json`, receipt)
+          .catch(() => undefined);
+        const abort = this.boundaryAbortError(cause);
+        if (abort) throw abort;
+        return { kind: "not_updated", reason: "receipt_commit_failed" };
+      }
+      return { kind: "updated", trackingRef: runnerTrackingRef(branch), candidateSha: incoming,
+        retainedShas: [...new Set(retainedShas)].sort(), displacedSha: observed.sha, divergence };
+    });
   }
 
   /** Strict restart enumeration; malformed metadata or pins throw rather than appearing empty. */

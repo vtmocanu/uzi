@@ -61,7 +61,7 @@ import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
+import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
@@ -9151,6 +9151,145 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
   describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
+  it("CI evidence survives fresh and resumed harness turns while real runner identities and fixed clone helpers deny bypasses", async () => {
+    const { runnerTeardownFixture, uidScript } = await import("./runner-teardown-fixtures.js");
+    const { exerciseCIEvidenceHarness } = await import("./fixtures/ci-artifacts-repair-e2e.js");
+    const { ensureCodexSharedDirectory } = await import("../src/codex/codex-executor.js");
+    const { Readable } = await import("node:stream");
+    await runnerTeardownFixture(async (root) => {
+      assert.equal(process.getuid!(), WORKER_UID);
+      assert.ok(process.getgroups!().includes(WORKER_UID));
+      assert.ok(process.getgroups!().includes(RUNNER_UID));
+      const rootStat = await fs.stat(root);
+      assert.equal(rootStat.uid, WORKER_UID);
+      assert.equal(rootStat.gid, RUNNER_UID);
+      assert.equal(rootStat.mode & 0o7777, 0o3775);
+      const privateHome = path.join(root, "sibling-home");
+      await fs.mkdir(privateHome, { mode: 0o700 });
+      const sentinel = path.join(privateHome, "private");
+      const canary = "worker-only-ci-evidence-canary";
+      await fs.writeFile(sentinel, canary, { mode: 0o600 });
+      // A DAC-readable sibling distinguishes sandbox confinement from file permissions.
+      const outside = path.join(root, "outside-readable");
+      await fs.writeFile(outside, canary, { mode: 0o644 });
+      const bytes = Buffer.from(canary + "\n");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const manifest_id = "22222222-2222-2222-2222-222222222222";
+      const artifact = { manifest_id, name: sha256 + ".txt", sha256, size: bytes.length };
+      // Four bounded adapter invocations; an assertion failure stops the matrix.
+      // Every child has a 10s deadline; the shared fixture also bounds each turn.
+      for (const harness of ["claude", "codex"] as const) {
+        const home = path.join(root, harness + "-home");
+        await ensureCodexSharedDirectory(home);
+        const homeStat = await fs.stat(home);
+        assert.equal(homeStat.uid, WORKER_UID);
+        assert.equal(homeStat.gid, RUNNER_UID);
+        assert.equal(homeStat.mode & 0o7777, 0o3770);
+        const clone = path.join(root, harness + "-clone");
+        await fs.mkdir(clone, { mode: 0o2770 });
+        await fs.chmod(clone, 0o2770);
+        await fs.writeFile(path.join(clone, "control.txt"), "clone-control", { mode: 0o644 });
+        const evidence = path.join(home, "ci-evidence");
+        const evidenceFile = path.join(evidence, "inputs", artifact.name);
+        await fs.symlink(evidenceFile, path.join(clone, "evidence-link"));
+        const privateTmp = path.join(root, harness + "-tmp");
+        uidScript(commandRootCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1],{mode:0o700});fs.chmodSync(process.argv[1],0o700)", privateTmp);
+        const syntheticClaim = {
+          ...makeClaim(), run_id: "11111111-1111-1111-1111-111111111111", kind: "prompt" as const,
+          claim_generation: 7, config: { ci_config_guard: true },
+          ci_repair: { input_files: [artifact], manifest: { entries: [{
+            artifact_id: "artifact", entry_ordinal: 0, label: "CI evidence", status: "kept" as const, ...artifact,
+          }] } },
+        };
+        let downloads = 0, active = 0, disposed = 0;
+        const options = {
+          harness, home, clone, claim: syntheticClaim,
+          expected: { manifest_id, text: canary, sha256, size: bytes.length },
+          client: { async downloadJobFile(run: string, id: string, generation: number, sink: (body: import("node:stream").Readable) => Promise<void>) {
+            assert.equal(run, syntheticClaim.run_id);
+            assert.equal(id, manifest_id);
+            assert.equal(generation, 7);
+            downloads++;
+            await sink(Readable.from([bytes]));
+          } },
+          beforeModel: async ({ prepared, file }: Parameters<NonNullable<import("./fixtures/ci-artifacts-repair-e2e.js").CIEvidenceHarnessOptions["beforeModel"]>>[0]) => {
+            active++;
+            assert.equal(file, evidenceFile);
+            assert.equal((await fs.stat(file)).uid, WORKER_UID);
+            assert.equal((await fs.stat(file)).mode & 0o7777, 0o400);
+            assert.equal((await prepared.read({ manifest_id })).text, canary);
+            for (const [wrap, uid] of [[runnerCommand, RUNNER_UID], [commandRootCommand, 10003]] as const) {
+              uidScript(wrap, `const fs=require('node:fs'),assert=require('node:assert/strict');
+                const [file,evidence,sentinel,clone,outside,uid,canary]=process.argv.slice(1);
+                assert.equal(process.getuid(),Number(uid));
+                assert.throws(()=>process.setuid(10001),e=>e.code==='EPERM');
+                assert.equal(fs.readFileSync(clone+'/control.txt','utf8'),'clone-control');
+                assert.equal(fs.readFileSync(outside,'utf8'),canary);
+                const denied=fn=>assert.throws(fn,e=>['EACCES','EPERM'].includes(e.code));
+                denied(()=>fs.readFileSync(file));
+                denied(()=>fs.readFileSync(clone+'/evidence-link'));
+                denied(()=>fs.readFileSync(sentinel));
+                denied(()=>fs.writeFileSync(file,'changed'));
+                denied(()=>fs.appendFileSync(file,'changed'));
+                denied(()=>fs.chmodSync(file,0o644));
+                const replacement=clone+'/replacement-'+uid;
+                fs.writeFileSync(replacement,'changed');
+                try{denied(()=>fs.renameSync(replacement,file));}finally{fs.unlinkSync(replacement);}
+                denied(()=>fs.unlinkSync(file));
+                denied(()=>fs.rmSync(evidence,{recursive:true}));
+                denied(()=>fs.renameSync(evidence,evidence+'-moved'));
+                denied(()=>fs.symlinkSync(sentinel,evidence+'/arbitrary-link'));
+                denied(()=>fs.symlinkSync(sentinel,file));`, file, evidence, sentinel, clone, outside, String(uid), canary);
+            }
+            const frames = ["control.txt", file, path.relative(clone, file), "evidence-link"]
+              .map((target, id) => ({ id: id + 1, op: "read", path: target }));
+            const fileop = commandRootCommand("/usr/local/bin/uzi-codex-fileop", ["--root", clone]);
+            const result = spawnSync(fileop.command, fileop.args, {
+              env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
+              input: frames.map(frame => JSON.stringify(frame) + "\n").join(""),
+            });
+            assert.equal(result.status, 0, result.stderr || result.error?.message);
+            const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
+            assert.equal(replies.length, frames.length);
+            assert.equal(replies[0].id, 1);
+            assert.equal(replies[0].ok, true);
+            assert.equal(Buffer.from(replies[0].data, "base64").toString(), "clone-control");
+            for (const [index, code] of ["E_ESCAPE", "E_ESCAPE", "E_SYMLINK"].entries()) {
+              assert.deepEqual(replies[index + 1], { id: index + 2, ok: false, code });
+            }
+            assert.ok(!result.stdout.includes(canary));
+            assert.ok(!result.stdout.includes(bytes.toString("base64")));
+            const sandbox = commandRootCommand("/usr/local/bin/uzi-codex-command-sandbox",
+              commandSandboxArgv(clone, clone, process.execPath, ["-e", `
+                const fs=require('node:fs'),assert=require('node:assert/strict');
+                assert.equal(process.getuid(),10003);
+                assert.equal(fs.readFileSync('control.txt','utf8'),'clone-control');
+                for(const file of process.argv.slice(1))assert.throws(()=>fs.readFileSync(file),e=>['EACCES','EPERM'].includes(e.code));
+                process.stdout.write('sandbox-control-ok');`, file, sentinel, outside, path.join(clone, "evidence-link")], privateTmp, "required"));
+            const confined = spawnSync(sandbox.command, sandbox.args, {
+              env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
+            });
+            assert.equal(confined.status, 0, confined.stderr || confined.error?.message);
+            assert.equal(confined.stdout, "sandbox-control-ok");
+            assert.equal(await fs.readFile(file, "utf8"), bytes.toString());
+            assert.equal(await fs.readFile(sentinel, "utf8"), canary);
+          },
+          afterDispose: async () => { disposed++; },
+        };
+        const fresh = await exerciseCIEvidenceHarness({ ...options, mode: "fresh" });
+        assert.equal(fresh.downloads, 1);
+        const resumed = await exerciseCIEvidenceHarness({ ...options, mode: "resume", previousGeneration: 7,
+          claim: { ...syntheticClaim, claim_generation: 8, plan_approved: true, plan_md: "approved",
+            session_id: "fixture-prior-session", resume_phase: "implementing" } });
+        assert.equal(resumed.downloads, 0);
+        assert.equal(resumed.generation, 8);
+        assert.equal(resumed.home, fresh.home);
+        assert.equal(downloads, 1);
+        assert.equal(active, 2);
+        assert.equal(disposed, 2);
+      }
+    });
+  });
 describe("production advice data teardown (#2324)", () => {
   it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async (t) => {
     const { runnerTeardownFixture, uidScript, seedRunnerRacedTree } = await import("./runner-teardown-fixtures.js");
@@ -20372,6 +20511,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
   let getsAtCancel = 0;
   let receiptsAtCancel = 0;
   proof.onShutdownReceipt((signal, generation) => {
+    assert.ok(signal, "the shutdown overlay retains its bounded publication signal");
     assert.equal(signal.aborted, false);
     assert.equal(generation, 1, "publication forwards the original still-bound claim generation");
     assert.ok(executor.safety);

@@ -847,6 +847,8 @@ export class Worker {
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
           // the api offers a guarded repair run only to a worker advertising it.
           "ci_config_guard_v1",
+          // Verified artifact files use Linux descriptor anchoring; other hosts remain logs-only.
+          ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does

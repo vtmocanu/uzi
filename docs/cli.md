@@ -117,7 +117,7 @@ uzi run discard <id> --hold <hold-id> [--yes]
 uzi run held <id> [--json]
 uzi run held expire <id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>
-                    | --ci-watch [--workflow <key|name> ...] [--prompt <text>])
+                    | --ci-watch [--workflow <key|name> ...] [--artifact <name|glob> ...] [--prompt <text>])
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
@@ -135,6 +135,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
                    [--harness claude|codex|""]
                    [--workflow <key|name> ... | --clear-workflows]   # ci_watch only
+                   [--artifact <name|glob> ... | --clear-artifacts]  # ci_watch only
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
@@ -496,7 +497,8 @@ A few worth knowing:
   it answers, so one written against a question the agent has already moved
   past is rejected rather than applied to the current one, and calling it
   against a run that isn't currently parked fails outright instead of
-  queuing.
+  queuing. Answers sent in one call may total at most 40,000 characters; a
+  larger set is rejected with an error and the question stays open.
   During approved, non-interactive issue implementation, use
   `uzi run answer <id> --message /park` to request a dependency pause.
   After validation and consumption, trimmed non-empty answers must each be
@@ -549,13 +551,25 @@ A few worth knowing:
   contributors. `--workflow` is rejected on other targets, and `--issue`, `--sweep`,
   `--label`, `--max-issues`, `--output` and `--guidance` are rejected with `--ci-watch`
   (exit 2). `schedule edit` takes `--workflow` (replace) or `--clear-workflows` (back to
-  all), mutually exclusive; omitting both keeps the stored selector. `schedule get`
-  shows the watched workflows, each workflow's episode state (state or halted reason,
-  attempts, run ids), the auto-approve note, and `next cursor: <c>` when more
+  all), mutually exclusive; omitting both keeps the stored selector.
+  Repeat `--artifact <name|glob>` to select up to 20 artifact names/globs;
+  no artifact selector fetches **none**, unlike no workflow selector (watch all).
+  GitHub fetches bounded UTF-8 text; GitLab and Forgejo stay logs-only (M2
+  deferred). `schedule edit --artifact` replaces the artifact selectors;
+  `--clear-artifacts` clears them without changing workflows. Those flags
+  are mutually exclusive and valid only for `ci_watch`, on default and
+  user-created schedules alike; omitting both preserves artifacts.
+  API edits likewise preserve an omitted `ci_artifacts`; `null` or `[]`
+  clears it. `schedule get` shows `Artifacts: none` or the saved selectors.
+  See [Artifact repair evidence](./scheduling.md#artifact-repair-evidence) for
+  selector validation, exact-execution provenance, limits, logs-only fallbacks,
+  retention and pending M1 acceptance.
+  `schedule get` shows the watched workflows, each workflow's episode state
+  (state or halted reason, attempts, run ids), the auto-approve note, and `next cursor: <c>` when more
   pages exist; `schedule get <id> --episodes-cursor <c>` prints the next page
   (`--json` prints it with `next_cursor`).
-  `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
-  gate); pass `--auto-approve=false` to keep the gate. **To start an
+  For issue, sweep and ordinary prompt targets, `--auto-approve` defaults
+  **on** (an off-hours run should proceed past the plan gate); pass `--auto-approve=false` to keep the gate. **To start an
   auto-approved run on one issue now**, use a disabled one-shot schedule:
   `run create` has no auto-approve flag, since auto-approval is reserved for
   unattended paths. Run `schedule create --repo <id> --issue <iid> --at <any

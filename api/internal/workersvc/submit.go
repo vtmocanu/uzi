@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -1033,7 +1034,8 @@ type AnswerBody struct {
 //     guard, and it is keyed on identity precisely because it must survive a requeue:
 //     a worker death re-queues and re-parks the run, so any clock- or arrival-ordinal
 //     key would reject an answer the user correctly submitted before the death.
-//  4. The text is scrubbed and bounded (D-G). #88 is the feature that makes the agent
+//  4. The text is scrubbed, and an oversized submission is rejected, not truncated
+//     (D-G, #3136). #88 is the feature that makes the agent
 //     ASK the user for information, which is exactly the prompt that elicits a
 //     credential paste — and the question text itself is attacker-influenceable, so an
 //     injected repo file can make the lead ask for a PAT "to continue". Slack's
@@ -1067,9 +1069,20 @@ func (s *Service) submitAnswer(ctx context.Context, run store.Run, body string) 
 		return SubmitInputResult{}, fmt.Errorf("%w: at most %d answers", ErrInvalidAnswer, maxAnswerCount)
 	}
 	answers := make([]string, 0, len(ab.Answers))
-	for _, a := range ab.Answers {
+	total, largest, largestRunes := 0, 0, -1
+	for i, a := range ab.Answers {
 		clean, _ := stripNUL(a)
-		answers = append(answers, truncateRunes(secretscrub.Scrub(clean), maxAnswerBodyRunes))
+		scrubbed := secretscrub.Scrub(clean)
+		n := utf8.RuneCountInString(scrubbed)
+		total += n
+		if n > largestRunes {
+			largest, largestRunes = i, n
+		}
+		answers = append(answers, scrubbed)
+	}
+	if total > maxAnswerTotalRunes {
+		return SubmitInputResult{}, fmt.Errorf("%w: answers total %d runes, over the %d-rune limit (largest is answer %d of %d); shorten and resend",
+			ErrInvalidAnswer, total, maxAnswerTotalRunes, largest+1, len(answers))
 	}
 	// Re-encode from the server's own validated values rather than storing the
 	// caller's raw text, the same rule submitApproval follows: what the worker reads

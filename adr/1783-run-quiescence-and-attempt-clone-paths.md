@@ -92,6 +92,28 @@ removes the tree.
    matrix as a negative probe, proving a sidecar container cannot read worker
    secrets through it.
 
+### Amendment 2026-10-19 — #3123: done-checkpoint settlement
+
+The reaped Codex done-checkpoint path with `executor.safety` starts its absolute
+60 s soft / 90 s hard allowance before gate admission and carries the remaining
+time through queue admission, reconciliation, quiescence and action. The existing
+fresh advisory snapshot request has an independent allowance. Neither a soft
+stop nor a forfeited queued callback proves quiescence or ownership. Owned work
+must settle before a sibling sink proceeds, and the Runner still requires exact
+positive producing-context, generation and committed-receipt proof.
+
+Shutdown stops active and queued done attempts across runs and blocks fresh
+snapshot admission. The actual shutdown sink retains
+[#3101's typed credential exception](1766-codex-vault-lock-park.md#amendment-3101-actual-graceful-shutdown-durability)
+and #3109's genuine installer-before-credential reconciliation within the original
+absolute grace (15 s default). Local content tests cover promptly settled
+predecessors and verify the latest receiver content within that grace. They are
+not hosted/shared-worker acceptance. Awaited storage settlement is unbounded,
+and unsafe cleanup may consume the grace and fail closed with source/custody
+retained. This changes no process proof, clone retirement or deletion authority;
+one private stage may remain per soft-stopped attempt without sweep or adoption
+authority. See [ADR-1597's residual boundaries](1597-midturn-checkpoint-durability.md#amendment-2026-10-19--3123-completion-budgets-and-safe-stops).
+
 ### M2 — attempt-unique clone paths on Docker-wired workers
 
 8. **Each execution attempt seeds a fresh path**,
@@ -279,7 +301,14 @@ removes the tree.
   registry admits this narrow capture lane with no provider turn, normal callback,
   admission reopen, credential reconciliation, refresh or release, PAT,
   credential-bearing environment or overlay. Incomplete settlement grants no
-  capture authority. The capture context mints neither a credentialed nor a
+  capture authority. #3132's clean cooperative normal checkpoint stops do not
+  replace this intentional poison. Normal boundary entry refuses poisoned or
+  disposed registries before queue side effects and checks again after the queue.
+  A previously queued checkpoint's expiry does not add poison to either state:
+  active capture retains its revision and full supervised-child settlement, and
+  exact completed evidence survives disposal. Healthy queue expiry still fails
+  closed; no deadline is extended. (AI-synced 2026-10-18)
+  The capture context mints neither a credentialed nor a
   completion permit; absence of that permit does not mean absence of a held
   capture boundary. [ADR-1106](1106-codex-harness.md#process-root-ownership)
   records the canonical empty helper/askpass launch policy and separate

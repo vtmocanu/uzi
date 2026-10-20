@@ -1075,6 +1075,7 @@ WITH claimant AS MATERIALIZED (
       -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
       -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
       AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1338,6 +1339,7 @@ WITH claimant AS MATERIALIZED (
                 -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
                 -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
                 AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
+                AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
                 -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
                 -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
@@ -9521,6 +9523,7 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol, ci_config_guard,
+       EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = runs.id AND af.direction = 'input' AND af.state = 'attached')::boolean AS ci_artifacts_attached,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -9782,6 +9785,7 @@ WHERE run.id = @run_id
   -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
   -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
   AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+  AND (NOT (run.kind = 'prompt' AND run.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = run.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
@@ -10230,6 +10234,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10431,6 +10436,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10502,6 +10508,7 @@ WHERE r.status = 'queued'
         -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
         -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
         AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'prompt' AND r.ci_config_guard AND EXISTS (SELECT 1 FROM job_files af WHERE af.run_id = r.id AND af.direction = 'input' AND af.state = 'attached')) OR 'ci_artifacts_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -11432,3 +11439,16 @@ WHERE run_id = @run_id
   AND COALESCE(payload->>'text', '') <> ''
 ORDER BY seq DESC
 LIMIT 1;
+
+-- name: CountOnlineWorkersSatisfyingCIArtifacts :one
+SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+ AND w.status = 'online'
+ AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+ AND NOT w.ephemeral AND NOT w.isolated_lane
+ AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
+ AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
+
+-- name: SaveCIArtifactAdmission :one
+UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description
+ WHERE id = @id AND kind = 'prompt' AND ci_config_guard
+RETURNING *;

@@ -506,6 +506,9 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
       let acks = 0;
       let firstReturned = false;
       let retryReturned = false;
+      const donePermits: unknown[] = [];
+      const doneOutcomes: unknown[] = [];
+      const progressSignals: Array<AbortSignal | undefined> = [];
       let turnFailure: unknown;
       let softSkipPost: ReturnType<typeof observeSoftSkipPost> | undefined;
       const holdSoftSkip = scenario.target === "pack" && scenario.sink === "milestone_checkpoint" && scenario.fire;
@@ -597,6 +600,22 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
           events.push("verified_rejection");
           throw error;
         },
+      });
+      const originalBoundary = rig.safety.withBoundary.bind(rig.safety);
+      rig.safety.withBoundary = (request, action) => {
+        if (request.sink !== "done_checkpoint") return originalBoundary(request, action);
+        return originalBoundary(request, permit => {
+          donePermits.push(permit);
+          return action(permit);
+        }).then(result => { doneOutcomes.push("ok"); return result; }, error => {
+          doneOutcomes.push((error as { checkpointBoundary?: unknown }).checkpointBoundary ?? error);
+          throw error;
+        });
+      };
+      const originalReport = client.reportState.bind(client);
+      t.mock.method(client, "reportState", (...args: Parameters<typeof client.reportState>) => {
+        if (args[1].milestones_completed?.includes("m1")) progressSignals.push(args[2]);
+        return originalReport(...args);
       });
       const originalScope = git.withBoundaryProcessSpawner;
       git.withBoundaryProcessSpawner = ((spawner, signal, action, hooks) =>
@@ -727,6 +746,14 @@ describe("RunRunner M2 positive rejected startup acceptance", () => {
       startupTimer.assertCancelled();
       assert.equal(firstReturned, true, `checkpoint returned after verified cleanup: ${String(turnFailure)}`);
       assert.equal(retryReturned, scenario.target !== "owed", `retry result: ${String(turnFailure)}`);
+      if (scenario.sink === "done_checkpoint") {
+        assert.deepEqual(doneOutcomes, ["soft", "ok"], "original attempt stays soft and next done attempt succeeds");
+        assert.equal(donePermits.length, 2);
+        assert.notStrictEqual(donePermits[0], donePermits[1]);
+        assert.ok(progressSignals.length >= 1, "local progress reaches the external report seam");
+        assert.ok(progressSignals[0], "soft DONE bookkeeping carries a cancellation signal");
+        assert.equal(progressSignals[0]!.aborted, false, "cooperative soft expiry never cancels progress");
+      }
       assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify({ states: api.states, logs: lines.filter((line) => (line as { level?: string }).level === "error") }));
       assert.ok(!statuses(claim.run_id).includes("failed"));
       assert.equal(rig.registry.isPoisoned(), false);

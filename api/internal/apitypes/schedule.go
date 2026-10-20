@@ -152,6 +152,8 @@ func (o OptionalInteger) IsZero() bool { return !o.Present }
 
 // OptionalCIWorkflows preserves PATCH presence: absent keeps selectors, null or
 // [] clears to all workflows. The handler validates at most 20 entries of 1..200 bytes.
+type OptionalCIArtifacts = OptionalCIWorkflows
+
 type OptionalCIWorkflows struct {
 	Present bool
 	Value   []string
@@ -217,6 +219,7 @@ type CIEpisodePage struct {
 // inherit the owner default (NULL in the DB). Validated later via agenttmpl.ValidateModel;
 // it carries the same "present, even to clear" replace-semantics on PATCH (see mergeSchedule).
 type ScheduleRequest struct {
+	CIArtifacts           OptionalCIArtifacts `json:"ci_artifacts,omitzero"`
 	CIWorkflows           OptionalCIWorkflows `json:"ci_workflows,omitzero"`
 	RemoveLabelOnDispatch *bool               `json:"remove_label_on_dispatch,omitempty"`
 	CapacityLimit         OptionalInteger     `json:"capacity_limit,omitzero"`
@@ -297,6 +300,7 @@ type ScheduleRequest struct {
 // (disconnected or no longer owned).
 type ScheduleDTO struct {
 	// CIWorkflows nil/empty means all; CIEpisodes is populated only on CI detail.
+	CIArtifacts           []string       `json:"ci_artifacts,omitempty"`
 	CIWorkflows           []string       `json:"ci_workflows,omitempty"`
 	CIEpisodes            *CIEpisodePage `json:"ci_episodes,omitempty"`
 	RemoveLabelOnDispatch bool           `json:"remove_label_on_dispatch"`

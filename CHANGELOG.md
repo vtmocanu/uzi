@@ -29,11 +29,6 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 ## [Unreleased]
 
-### Fixed
-
-- **Plan approval tolerates malformed superseded plan text ([#3072](https://github.com/vtmocanu/uzi/issues/3072)).**
-  Superseded plan history skips non-string and blank bodies while preserving valid text and submission order, so malformed earlier submissions no longer crash the approval panel.
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
@@ -240,6 +235,27 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Approving a changed milestone plan requires explicit owner consent to reset progress.**
   Owners can review the old and proposed milestones, then reset through `run approve --reset-milestones` or a separate web confirmation with a reason. Consent binds to the exact reviewed state; reset clears progress, scope and previous completion waivers, while paged before/after history remains available. Unchanged milestone approval preserves progress and scope. Reset requires a published recoverable checkpoint and generation fencing; reconciled runs require upgraded workers advertising `milestone_reconciliation_claim_v1`. Deploy the API before upgraded workers (see the CLI guide).
 
+- **The chart bundles the CNPG `cluster` subchart 0.8.1, and installs cleanly with Helm 4 server-side apply ([#448](https://github.com/vtmocanu/uzi/pull/448)).**
+  Install against a CNPG operator whose Cluster CRD declares `spec.monitoring.tls` (1.30.1 is tested); older operators need client-side apply.
+
+- **An opt-in worker memory guard interrupts eligible Codex shell commands and holds uncertain recovery for the owner ([#2396](https://github.com/vtmocanu/uzi/issues/2396)).**
+  One worker-wide monitor uses total cgroup usage and ranks enrolled model command trees by approximate RSS, acting through their exact registered supervisors. Compose and hosted workers relay the enable flag and six required numeric settings; the guard remains off by default, with no calibrated production thresholds. Deploy the feature-advertising API before enabling workers, or keep new workers disabled until the API is ready and then freshly register/restart enabled; unsupported APIs or invalid registration incarnations refuse enabled startup. Heartbeat feature growth creates no memory authority, and shrink revokes reservation/signalling while original settlement and source custody remain owed. Intervention allowance persists per memory episode across ordinary redispatch; exhaustion, uncertain drainage or unconfirmed outcome reporting invokes capture and an owner-held memory-pressure park attempt. Owner Resume starts a fresh memory episode under existing budget, custody and lifecycle fences; an available historical archive does not release retained custody or prove latest-work capture. Unconfirmed capture or park retains local source without an archive guarantee; OPEN memory-pressure and worker-requeue-exhaustion holds preserve owner attention ahead of archive readiness or capture progress. Operational disable preserves accounting and custody; migration 00342 Down destructively fails memory-held runs and drops memory history. Claude enrollment ([#2471](https://github.com/vtmocanu/uzi/pull/2471)), internal probes, provider/credential processes, boundary/checkpoint/capture operations and cross-checker authority remain outside the delivered adapter's scope; separately accounted DinD, allocation bursts, sampling stalls and node pressure can still cause OOM. No concurrency or process-authority expansion is introduced, and Codex command bounds and abort/cleanup ownership remain in force.
+
+- **Parallel PRs can author release notes in independent fragments ([#2957](https://github.com/vtmocanu/uzi/pull/2957)).**
+  Add a lowercase UUID-v4 fragment before opening a PR; release preparation combines it with legacy pending notes and consumes incorporated paths, while shipping identity coverage and frozen candidate blocks remain enforced.
+
+- **Agent unit test shards retain stable membership ([#3121](https://github.com/vtmocanu/uzi/pull/3121)).**
+  Hash ordinary test paths and pin selected heavy tests while preserving hermetic child execution, concurrency, reporting, and interruption cleanup.
+
+- **Hosted worker upgrades wait indefinitely for assigned runs to finish ([#3103](https://github.com/vtmocanu/uzi/pull/3103), [#3107](https://github.com/vtmocanu/uzi/pull/3107)).**
+  The existing 24h drain timeout and positive-only parsing remain compatible but now bound only independent nondrifted pressure/nix-size maintenance; busy image/template/generation drift and associated recycle wait for genuine idle, trading pool capacity turnover and security-fix latency for run preservation, while GLOBAL ForceRoll can interrupt runs and lose all capacity without bypassing custody-held data or independent DinD guards.
+
+- **Plan cross-check allows four automatic revisions by default ([#3091](https://github.com/vtmocanu/uzi/pull/3091)).**
+  The default and Compose fallback now permit five checked candidates, and the uncommented `.env.example` value is 4. Existing `.env` files copied from the old example keep `PLAN_CROSS_CHECK_MAX_REVISIONS=2` after upgrading until the operator removes the line or sets it to `4`; only installations without the line take the new default. Plan revisions carry evidence-backed dispositions and validation overrides are assessed by their effects; existing sequences retain their snapshots.
+
+- **Automatic runner artifact reclaim is disabled (Refs #1858, #3115).**
+  Attempts, shared residue and orphaned skills are retained on every worker; diagnostic thresholds replace cap deletion, trading storage accumulation and growing inventory work for avoiding unsafe automatic reclaim.
+
 ### Added
 
 - **Healthy busy workers no longer show custody attention.**
@@ -322,6 +338,9 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Filed incidental findings can request automatic work from uzi ([#2991](https://github.com/vtmocanu/uzi/issues/2991)).**
   Single and grouped finding drafts offer an unchecked Send to uzi checkbox, and `uzi findings file --send-to-uzi` adds the same configured run-eligibility and autopilot labels after explicit labels; omitting the option keeps filing unchanged. The next normal sync still requires existing owner opt-in and matching forge identity plus the usual run checks: filing requests labels, does not enable autopilot, and does not guarantee a run. Uncertain group filings without a confirmed issue show no queued confirmation and retain the existing recovery guidance.
+
+- **Codex subscription accounts can alert when their weekly limit resets early ([#3112](https://github.com/vtmocanu/uzi/pull/3112)).**
+  The existing default-on Slack setting compares the main weekly meter once per account across aliases; delivery is best effort without retries or durable redelivery and does not resume runs.
 
 ### Fixed
 
@@ -788,6 +807,63 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Lead guidance clarifies validation ownership and final milestone completion.**
   Guidance tells leads to assign expensive proofs one owner, check mandatory plan requirements, adjudicate weak regression pins and address conflicting follow-ups. Runtime guidance tells leads to run early static checks, avoid Codex dispatch probes, unchanged waiting updates and duplicate Claude polls, and finish a verified final milestone without an extra checkpoint turn. Customized lead templates receive the runtime appends but not the builtin lead template edits.
+
+- **Plan approval tolerates malformed superseded plan text ([#3072](https://github.com/vtmocanu/uzi/issues/3072)).**
+  Superseded plan history skips non-string and blank bodies while preserving valid text and submission order, so malformed earlier submissions no longer crash the approval panel.
+
+- **Owner pause remains actionable after a settled memory hold ([#2396](https://github.com/vtmocanu/uzi/pull/2396)).**
+  Memory preservation that yields to an owner pause now completes the existing pause workflow once its original work settles, while preserving retained source and session custody. Uncertain work keeps custody and prevents a competing park.
+
+- **Non-closing issue deliveries hold before publishing closing commits ([#3090](https://github.com/vtmocanu/uzi/pull/3090)).**
+  Interlocked partial and Stop deliveries now guard earlier-flight history, preserve declared intent across supported resumes, and show pending acceptance without claiming it passed; legacy workers and excluded lanes retain documented limits.
+
+- **Terminal code cross-check evidence survives worker cleanup ([#2927](https://github.com/vtmocanu/uzi/pull/2927)).**
+  Removing a worker from an otherwise unchanged terminal run preserves its cross-check outcome and evidence while custody changes still interrupt active attempts.
+
+- **Leads can request an owner decision before completion stalls ([#3089](https://github.com/vtmocanu/uzi/pull/3089)).**
+  Interlocked noninteractive issue runs on Claude and Codex open the existing decision window on an authoritative unmet result; formal decisions remain owner-only, and both API and worker upgrades are required to finalize from permit-authoritative scope.
+
+- **Retained commits recover across owner-only Git object permissions ([#3059](https://github.com/vtmocanu/uzi/pull/3059)).**
+  Recovery restores narrowly validated runner-group access, preserves existing hardlinks and retained sources on failure, and logs bounded redacted failure causes.
+
+- **Provider disposal separates genuine exit evidence from cleanup confirmation ([#2396](https://github.com/vtmocanu/uzi/pull/2396)).**
+  Ordinary advice cleanup completes after a valid drain even when the supervisor reports the primary exit during the outstanding disposal request. Unconfirmed disposal still fails the provider and retains its tree; unsolicited or invalid exit evidence remains a failure.
+
+- **Frame resumed work as unvalidated snapshots with optional interrupted-call context ([#3124](https://github.com/vtmocanu/uzi/pull/3124)).**
+  Show bounded prior-generation shell calls with no recorded result on the first owner implementation turn, while keeping recovery warnings independent of optional telemetry.
+
+- **Calibration churn workers avoid inherited TypeScript preloads ([#2396](https://github.com/vtmocanu/uzi/pull/2396)).**
+  Fixed CommonJS churn workers start without an unnecessary TypeScript loader.
+
+- **Codex shutdown checkpoints can preserve the latest work ([#3101](https://github.com/vtmocanu/uzi/pull/3101), [#3109](https://github.com/vtmocanu/uzi/pull/3109)).**
+  The actual graceful-shutdown sink reconciles within its original deadline while execution stays cancelled and existing authorization and quiescence checks remain required.
+
+- **Explain draining and maintenance owner holds consistently ([#3000](https://github.com/vtmocanu/uzi/pull/3000)).**
+  Queued runs show their affinity deadline without false capacity alarms, nudges or ordinary ephemeral provisioning until the owner hold releases.
+
+- **Concurrent PostgreSQL readers get shared memory headroom ([#296](https://github.com/vtmocanu/uzi/pull/296)).**
+  Give the rollup measurement and store integration PostgreSQL containers 1 GiB of shared memory for concurrent readers.
+
+- **Codex completion checkpoints stop optional work while preserving verified imports ([#3123](https://github.com/vtmocanu/uzi/pull/3123)).**
+  Each done checkpoint and existing fresh advisory snapshot request shares its own 60 s soft / 90 s hard clock across waits and actions; an unavailable exact candidate is disclosed as incomplete without a SHA, while shutdown retains its original grace and unsafe cleanup still fails closed.
+
+- **Plan approval waits for pending revision feedback ([#3080](https://github.com/vtmocanu/uzi/pull/3080)).**
+  Plain, selection and milestone reconciliation approvals refuse unsettled feedback for the current gate; approval writes and capability overrides commit atomically.
+
+- **Long clarification answers are no longer silently cut ([#3136](https://github.com/vtmocanu/uzi/pull/3136)).**
+  One answer submission may now total 40,000 characters, and a larger one is rejected with an error instead of being truncated.
+
+- **Disposing a Codex command retains its actual primary exit status ([#2396](https://github.com/vtmocanu/uzi/pull/2396)).**
+  The supervisor reports the primary exit exactly once even when disposal consumes its wait status, allowing ordinary command and pressure-result settlement to join without inventing a status or weakening cleanup authority. Calibration cleanup aborts remain isolated to each owned producer callback.
+
+- **Every coding actor receives safe mutation-test guidance ([#3118](https://github.com/vtmocanu/uzi/pull/3118), [#3119](https://github.com/vtmocanu/uzi/pull/3119)).**
+  Leads and subagents on both harnesses are told to isolate deliberate mutations from the shared candidate and bound large-comparison failure diagnostics without weakening test coverage; this is prompt guidance, not enforced memory containment.
+
+- **Recovery FINAL refusals retry with bounded delays and safer diagnostics ([#2494](https://github.com/vtmocanu/uzi/pull/2494), [#3108](https://github.com/vtmocanu/uzi/pull/3108)).**
+  Workers avoid repeated capture checks for proven nonmatching closed custody, keep unresolved requests eligible with per-record backoff, and retain source bytes until existing cleanup proofs permit removal.
+
+- **Codex compaction no longer invalidates otherwise complete run costs ([#3122](https://github.com/vtmocanu/uzi/pull/3122)).**
+  Recognize the pinned runtime's zero-detail context estimates without billing them, while retaining strict cumulative-usage validation and fail-closed pricing for missing responses.
 
 ### Security
 

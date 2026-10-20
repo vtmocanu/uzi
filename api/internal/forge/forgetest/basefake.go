@@ -204,6 +204,16 @@ func (*BaseFake) ListWorkflowRuns(context.Context, int64, forge.ListWorkflowRuns
 	return nil, notStubbed("ListWorkflowRuns")
 }
 
+// ListRunArtifacts implements forge.Forge.
+func (*BaseFake) ListRunArtifacts(context.Context, int64, int64) ([]forge.Artifact, error) {
+	return nil, notStubbed("ListRunArtifacts")
+}
+
+// DownloadArtifact implements forge.Forge.
+func (*BaseFake) DownloadArtifact(context.Context, int64, int64, int64) ([]byte, error) {
+	return nil, notStubbed("DownloadArtifact")
+}
+
 // GetWorkflowRun implements forge.Forge.
 func (*BaseFake) GetWorkflowRun(context.Context, int64, int64) (forge.WorkflowRun, error) {
 	return forge.WorkflowRun{}, notStubbed("GetWorkflowRun")

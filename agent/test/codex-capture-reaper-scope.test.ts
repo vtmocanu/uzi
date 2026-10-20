@@ -61,7 +61,7 @@ function rig(options: {
   };
   const safety = createCodexExecutionSafety(new ExecutionRegistry(newLocalExecutionEpoch(1)),
     async () => { throw new Error("legacy spawn forbidden"); }, undefined, undefined,
-    spawn, undefined, { reaperAttempt: () => attempt });
+    spawn, undefined, undefined, { reaperAttempt: () => attempt });
   const git = new GitCache(os.tmpdir(), nullLogger());
   return { safety, git, request, operations };
 }

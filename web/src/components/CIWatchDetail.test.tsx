@@ -239,10 +239,36 @@ describe("ScheduleListRow — ci_watch", () => {
     await waitFor(() => expect(mockApi.getSchedule).toHaveBeenCalledWith("sch-def-ci-uzi"));
   });
 
+  it("describes artifact and workflow reset on the CI row", () => {
+    row({ ...base, customized: true });
+    const reset = screen.getByRole("button", { name: /Reset Main CI/ });
+    expect(reset.title).toContain("clears artifact selectors (fetch none)");
+    expect(reset.title).toContain("workflow selectors (watch all)");
+  });
+
   it("offers no CI disclosure on a non-ci_watch row (control)", async () => {
     const sweep = (await realMockApi.listSchedules()).find((s) => s.target === "sweep")!;
     row(sweep);
     expect(screen.getAllByRole("button").length).toBeGreaterThan(0);
     expect(screen.queryByRole("button", { name: /CI state/ })).toBeNull();
   });
+});
+
+
+it("shows explicit no artifacts and sanitizes selector display without mutating identity", async () => {
+  mockApi.getSchedule.mockResolvedValue(base);
+  const view = renderDetail(base);
+  expect(screen.getByText("None — no artifacts fetched")).toBeTruthy();
+  const raw = "logs-\u0000\u202e" + "x".repeat(200);
+  const s = { ...base, ci_artifacts: [raw] };
+  view.rerender(<CIWatchDetail s={s} panelId="ci-watch-test" />);
+  const list = screen.getByRole("list", { name: "Artifact selectors" });
+  const item = within(list).getByRole("listitem");
+  expect(item.textContent).toBe("logs-" + "x".repeat(200));
+  expect(item.className).toContain("break-all");
+  for (const el of [item, ...item.querySelectorAll("*")]) {
+    for (const attr of el.attributes) expect(attr.value).not.toMatch(/[\p{Cc}\p{Cf}]/u);
+  }
+  expect(s.ci_artifacts).toEqual([raw]);
+  expect(mockApi.getSchedule).toHaveBeenCalledWith(base.id);
 });

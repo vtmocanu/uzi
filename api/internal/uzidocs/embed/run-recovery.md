@@ -80,7 +80,14 @@ Other custody attention decisions retain their existing ordering.
 The worker attempts preservation using its existing recovery path. Under the
 **slice A contract (Refs #2852) (AI-synced 2026-10-18)**, Codex credential-free capture keeps
 execution closed through capture and settlement of the supervised capture processes,
-including credential-free recovery and retained-source capture. Setup, auth and
+including credential-free recovery and retained-source capture. Clean cooperative
+normal checkpoint stops (#3132) do not replace capture's intentional poison.
+A normal checkpoint refuses an already poisoned or disposed registry before queue
+side effects; a previously queued checkpoint that later expires preserves that
+state's capture revision and active or completed evidence. Capture still waits for
+full supervised-child settlement; healthy queue expiry still fails closed, without
+extending the deadline. (AI-synced 2026-10-18)
+Setup, auth and
 executor-owned summary cleanup stay joined even after authority or summary delivery
 expires; unconfirmed cleanup blocks capture and credential continuation. If a
 healthy checkpoint fully stopped and cleaned up the prior Codex execution, then

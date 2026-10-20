@@ -6,7 +6,10 @@
 # NO --read-only, NO --user override, so the on-disk ownership this test must prove is the
 # real production posture. It drops to the untrusted RUNNER uid (10002) through the exact
 # production setpriv wrapper (agent/src/runner-uid.ts setprivRunnerArgs) wherever a control
-# must act as the untrusted uid. See README.md for what each control proves.
+# must act as the untrusted uid. kind=command roots run as the cap-less runner-cmd uid
+# (10003, a supplementary member of group runner; launcher.ts COMMAND_UID), so controls 1
+# and 4 act as THAT uid (setprivArgsForUid(COMMAND_UID)). See README.md for what each
+# control proves.
 #
 # It never edits the launcher/supervisor and bakes no test-only escape hatch into them;
 # every control drives the ACTUAL packaged launcher (launch-cli / launchCodexRoot) and the
@@ -26,6 +29,7 @@ TSX=/app/node_modules/.bin/tsx
 LAUNCH_CLI=/app/src/codex/launch-cli.ts
 SETPRIV=/bin/setpriv
 DATA=/data/runner/m3a
+CMD_UID=10003
 WTMP="${TMPDIR:-/tmp}"
 
 PASS=0
@@ -46,6 +50,15 @@ note() { printf '  [note] %s\n' "$*"; }
 # ambient caps (the bounding-set clear is a documented best-effort no-op without SETPCAP).
 as_runner() {
   "$SETPRIV" --reuid runner --regid runner --init-groups \
+    --bounding-set -all --inh-caps -all --ambient-caps -all -- "$@"
+}
+
+# The kind=command root identity: the same setpriv flags as as_runner, targeting uid
+# 10003 (agent/src/runner-uid.ts setprivArgsForUid(COMMAND_UID)). --init-groups grants
+# its supplementary runner group, which is what lets it create its own tree under the
+# group-writable $DATA (as production's /data/runner is).
+as_command() {
+  "$SETPRIV" --reuid "$CMD_UID" --regid "$CMD_UID" --init-groups \
     --bounding-set -all --inh-caps -all --ambient-caps -all -- "$@"
 }
 
@@ -90,11 +103,12 @@ dispose_cli() {
   rm -f "$FIFO" 2>/dev/null || true
 }
 
-# Poll (as runner) for a marker file to appear. $1 path, $2 max seconds.
+# Poll for a marker file to appear. $1 path, $2 max seconds, $3 actor (default as_runner).
 wait_marker() {
   _i=0
+  _actor="${3:-as_runner}"
   while [ "$_i" -lt "$2" ]; do
-    if as_runner test -e "$1"; then return 0; fi
+    if "$_actor" test -e "$1"; then return 0; fi
     sleep 1
     _i=$((_i + 1))
   done
@@ -150,20 +164,22 @@ EOF
 # ---- Control 1: channel nondumpability (fd3/fd4) + positive control ---------------------
 control_1() {
   hdr "Control 1: channel boundary (nondumpability of supervisor fd3/fd4) + positive control"
-  _md="$DATA/c1"; as_runner rm -rf "$_md" 2>/dev/null; as_runner mkdir -p "$_md"
-  _cwd="$DATA/c1-cwd"; as_runner mkdir -p "$_cwd"
+  # The command root runs as uid 10003, so its parent, markers and every same-uid probe
+  # use that identity: a runner-uid (10002) probe would be denied for the wrong reason.
+  _md="$DATA/c1"; as_command rm -rf "$_md" 2>/dev/null; as_command mkdir -p "$_md"
+  _cwd="$DATA/c1-cwd"; as_command rm -rf "$_cwd" 2>/dev/null; as_command mkdir -p "$_cwd"
 
-  # POSITIVE CONTROL: a default-dumpable runner process P holds fd 7 open on a readable
-  # file; ANOTHER same-uid runner process CAN read /proc/<P>/fd/7. This proves the later
+  # POSITIVE CONTROL: a default-dumpable command-uid process P holds fd 7 open on a
+  # readable file; ANOTHER same-uid process CAN read /proc/<P>/fd/7. This proves the later
   # denial is due to nondumpability, not a blanket /proc restriction.
   # P self-exits after a short sleep (no kill+wait, which would print a job "Terminated"
   # notice); it stays alive well past the immediate fd-read probe below.
-  as_runner sh -c 'exec 7</etc/os-release; echo "$$" > "$1/P.pid"; : > "$1/P.ready"; exec sleep 20' sh "$_md" &
-  if wait_marker "$_md/P.ready" 20; then
-    _P="$(as_runner cat "$_md/P.pid" 2>/dev/null)"
-    _pc="$(as_runner sh -c 'cat "/proc/$1/fd/7" 2>/dev/null | head -1' sh "$_P")"; _prc=$?
+  as_command sh -c 'exec 7</etc/os-release; echo "$$" > "$1/P.pid"; : > "$1/P.ready"; exec sleep 20' sh "$_md" &
+  if wait_marker "$_md/P.ready" 20 as_command; then
+    _P="$(as_command cat "$_md/P.pid" 2>/dev/null)"
+    _pc="$(as_command sh -c 'cat "/proc/$1/fd/7" 2>/dev/null | head -1' sh "$_P")"; _prc=$?
     if [ "$_prc" -eq 0 ] && [ -n "$_pc" ]; then
-      ok "positive control: same-uid runner READ /proc/$_P/fd/7 (default dumpable): '$_pc'"
+      ok "positive control: same-uid ($CMD_UID) READ /proc/$_P/fd/7 (default dumpable): '$_pc'"
     else
       bad "positive control failed to read /proc/$_P/fd/7 (rc=$_prc content='$_pc')"
     fi
@@ -178,21 +194,23 @@ control_1() {
   launch_cli "$_spec" c1
   if ! wait_ready; then
     bad "control 1: launch-cli did not reach ready"
-    note "launch-cli stderr: $(as_runner cat "$CLI_ERR" 2>/dev/null)"
+    note "launch-cli stderr: $(cat "$CLI_ERR" 2>/dev/null)"
     dispose_cli
-    [ -n "$_P" ] && as_runner kill "$_P" 2>/dev/null
+    [ -n "$_P" ] && as_command kill "$_P" 2>/dev/null
     return
   fi
   _sup="$("$NODE" "$EVQ" "$CLI_ERR" ready supervisorPid 2>/dev/null)"
+  _suid="$("$NODE" "$EVQ" "$CLI_ERR" ready started.uid 2>/dev/null)"
+  [ "$_suid" = "$CMD_UID" ] && ok "command root started as uid $_suid" || bad "command root uid=$_suid (want $CMD_UID)"
 
   # Stub-side probe (the untrusted child itself attempts the forge).
-  if wait_marker "$_md/probe-done" 20; then
-    _probe="$(as_runner cat "$_md/probe.txt" 2>/dev/null)"
+  if wait_marker "$_md/probe-done" 20 as_command; then
+    _probe="$(as_command cat "$_md/probe.txt" 2>/dev/null)"
     if printf '%s' "$_probe" | grep -q 'fd3 rc=1' \
       && printf '%s' "$_probe" | grep -q 'fd4 rc=1' \
       && printf '%s' "$_probe" | grep -qi 'permission denied' \
       && ! printf '%s' "$_probe" | grep -q 'rc=0'; then
-      ok "stub child (runner) DENIED /proc/$_sup/fd/{3,4}"
+      ok "stub child (uid $CMD_UID) DENIED /proc/$_sup/fd/{3,4}"
       note "$(printf '%s' "$_probe" | tr '\n' '|')"
     else
       bad "stub probe result unexpected: $(printf '%s' "$_probe" | tr '\n' '|')"
@@ -201,11 +219,11 @@ control_1() {
     bad "control 1: stub probe never completed"
   fi
 
-  # Independent side-probe as ANOTHER runner process (belt and braces).
-  _s3="$(as_runner sh -c 'cat "/proc/$1/fd/3" 2>&1 >/dev/null' sh "$_sup")"; _s3rc=$?
-  _s4="$(as_runner sh -c 'cat "/proc/$1/fd/4" 2>&1 >/dev/null' sh "$_sup")"; _s4rc=$?
+  # Independent side-probe as ANOTHER same-uid process (belt and braces).
+  _s3="$(as_command sh -c 'cat "/proc/$1/fd/3" 2>&1 >/dev/null' sh "$_sup")"; _s3rc=$?
+  _s4="$(as_command sh -c 'cat "/proc/$1/fd/4" 2>&1 >/dev/null' sh "$_sup")"; _s4rc=$?
   if [ "$_s3rc" -ne 0 ] && [ "$_s4rc" -ne 0 ] && printf '%s%s' "$_s3" "$_s4" | grep -qi 'permission denied'; then
-    ok "independent runner side-probe DENIED fd3 and fd4 (nondumpable supervisor /proc)"
+    ok "independent same-uid side-probe DENIED fd3 and fd4 (nondumpable supervisor /proc)"
     note "fd3='$_s3' fd4='$_s4'"
   else
     bad "side-probe not denied: fd3 rc=$_s3rc [$_s3] fd4 rc=$_s4rc [$_s4]"
@@ -332,26 +350,33 @@ control_3() {
 # ---- Control 4: disposal via ECHILD+__WALL reaps a differently-grouped grandchild --------
 control_4() {
   hdr "Control 4: disposal via ECHILD+__WALL reaps a differently-grouped grandchild"
-  _md="$DATA/c4"; as_runner rm -rf "$_md" 2>/dev/null; as_runner mkdir -p "$_md"
-  _cwd="$DATA/c4-cwd"; as_runner mkdir -p "$_cwd"
+  _md="$DATA/c4"; as_command rm -rf "$_md" 2>/dev/null; as_command mkdir -p "$_md"
+  _cwd="$DATA/c4-cwd"; as_command rm -rf "$_cwd" 2>/dev/null; as_command mkdir -p "$_cwd"
   _spec="$WTMP/spec4.json"
   write_spec "$_spec" command "$_md" grandchild "$_cwd" ""
   launch_cli "$_spec" c4
   if ! wait_ready; then
     bad "control 4: launch-cli did not reach ready"
-    note "launch-cli stderr: $(as_runner cat "$CLI_ERR" 2>/dev/null)"
+    note "launch-cli stderr: $(cat "$CLI_ERR" 2>/dev/null)"
     dispose_cli
     return
   fi
   _C="$("$NODE" "$EVQ" "$CLI_ERR" ready started.childPid 2>/dev/null)"
-  if ! wait_marker "$_md/grandchild.ready" 20; then bad "control 4: grandchild never started"; dispose_cli; return; fi
-  _G="$(as_runner cat "$_md/grandchild.pid" 2>/dev/null)"
-  _cpg="$(as_runner cat "$_md/child.pgid" 2>/dev/null)"
-  _gpg="$(as_runner cat "$_md/grandchild.pgid" 2>/dev/null)"
+  if ! wait_marker "$_md/grandchild.ready" 20 as_command; then bad "control 4: grandchild never started"; dispose_cli; return; fi
+  _G="$(as_command cat "$_md/grandchild.pid" 2>/dev/null)"
+  _cpg="$(as_command cat "$_md/child.pgid" 2>/dev/null)"
+  _gpg="$(as_command cat "$_md/grandchild.pgid" 2>/dev/null)"
   if [ -n "$_C" ] && [ -n "$_G" ] && [ "$_cpg" != "$_gpg" ]; then
     ok "child pid=$_C pgid=$_cpg ; grandchild pid=$_G pgid=$_gpg (DIFFERENT process groups)"
   else
     bad "process tree setup unexpected: C=$_C G=$_G childPgid=$_cpg grandchildPgid=$_gpg"
+  fi
+  # Liveness calibration: the same-uid kill -0 below must SEE both before dispose, so their
+  # absence after it means reaped, not an EPERM from probing as the wrong uid.
+  if [ -n "$_C" ] && [ -n "$_G" ] && as_command kill -0 "$_C" 2>/dev/null && as_command kill -0 "$_G" 2>/dev/null; then
+    ok "child and grandchild alive and visible to uid $CMD_UID before dispose"
+  else
+    bad "child $_C / grandchild $_G not visible to uid $CMD_UID before dispose"
   fi
 
   dispose_cli
@@ -365,8 +390,8 @@ control_4() {
   if in_set "$_C" "$_reaped"; then ok "reaped includes the child ($_C)"; else bad "child $_C NOT in reaped [$_reaped]"; fi
   if in_set "$_G" "$_reaped"; then ok "reaped includes the differently-grouped grandchild ($_G)"; else bad "grandchild $_G NOT in reaped [$_reaped]"; fi
   [ "$_clean" = "true" ] && ok "control 4 clean disposal (supervisor exit 0)" || bad "control 4 not clean"
-  if as_runner kill -0 "$_C" 2>/dev/null; then bad "child $_C survived dispose"; else ok "child $_C gone after dispose"; fi
-  if as_runner kill -0 "$_G" 2>/dev/null; then bad "grandchild $_G survived dispose"; else ok "grandchild $_G gone after dispose"; fi
+  if as_command kill -0 "$_C" 2>/dev/null; then bad "child $_C survived dispose"; else ok "child $_C gone after dispose"; fi
+  if as_command kill -0 "$_G" 2>/dev/null; then bad "grandchild $_G survived dispose"; else ok "grandchild $_G gone after dispose"; fi
 }
 
 # ---- Control 5: fresh per-launch HOME/CODEX_HOME/XDG/TMPDIR owned by runner 0700 + the
@@ -382,7 +407,7 @@ control_5() {
   launch_cli "$_spec" c5
   if ! wait_ready; then
     bad "control 5: launch-cli did not reach ready"
-    note "launch-cli stderr: $(as_runner cat "$CLI_ERR" 2>/dev/null)"
+    note "launch-cli stderr: $(cat "$CLI_ERR" 2>/dev/null)"
     dispose_cli
     return
   fi
@@ -493,7 +518,7 @@ control_5() {
   if grep -q '"event":"launch-failed"' "$CLI_ERR" 2>/dev/null && ! grep -q '"event":"ready"' "$CLI_ERR" 2>/dev/null; then
     ok "pre-existing ownedDataRoot rejected before supervisor launch"
   else
-    bad "pre-existing ownedDataRoot did not fail closed: $(as_runner cat "$CLI_ERR" 2>/dev/null)"
+    bad "pre-existing ownedDataRoot did not fail closed: $(cat "$CLI_ERR" 2>/dev/null)"
   fi
   dispose_cli
 }
@@ -502,7 +527,14 @@ preflight() {
   hdr "preflight (mode=$MODE uid=$(id -u) gid=$(id -g) split=${UZI_UID_SPLIT:-unset})"
   _u="$(as_runner id -u 2>/dev/null)"
   [ "$_u" = "10002" ] && ok "production setpriv drop to runner works (uid $_u)" || bad "cannot drop to runner (got '$_u')"
+  _c="$(as_command id -u 2>/dev/null)"
+  [ "$_c" = "$CMD_UID" ] && ok "production setpriv drop to command uid works (uid $_c)" || bad "cannot drop to command uid (got '$_c')"
+  # Group-writable setgid scratch like production /data/runner (2770, group runner), so the
+  # command uid can create its own control trees.
   as_runner mkdir -p "$DATA" 2>/dev/null || true
+  as_runner chmod 2770 "$DATA" 2>/dev/null || true
+  _dm="$(stat -c '%a %G' "$DATA" 2>/dev/null)"
+  [ "$_dm" = "2770 runner" ] && ok "fixture scratch $DATA is 2770 group runner" || bad "fixture scratch $DATA posture '$_dm' (want '2770 runner')"
   [ -x "$STUB" ] && ok "stub binary present ($STUB)" || bad "stub binary missing at $STUB"
   [ -x "$SUP" ]  && ok "static supervisor present ($SUP)" || bad "supervisor missing at $SUP"
   [ -x "$TSX" ]  && ok "tsx present ($TSX)" || bad "tsx missing at $TSX"
