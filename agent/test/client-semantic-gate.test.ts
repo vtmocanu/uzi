@@ -226,3 +226,26 @@ it("semantic human storage rejects absent, malformed and foreign ACK bindings", 
   assert.equal(malformed.semanticGateMalformed, true);
   assert.equal(malformed.semanticGate, undefined);
 });
+
+// PRD #1230 M4: the park reason the api records on the presented semantic payload rides the ACK.
+for (const park of ["coverage_incomplete", "coverage_uncertain", "coverage_unavailable", "maintainer_authorization"] as const) {
+  it("semantic hard ACK parses " + park + " on the presentation", async () => {
+    const f = await fixture();
+    (f.ack.semantic_presentation as { semantic_park?: string }).semantic_park = park;
+    const ack = await f.client.reportSemanticPlanGateState("run", f.body);
+    assert.equal(ack.semanticGateMalformed, undefined);
+    assert.equal(ack.semanticGate?.semantic_presentation.semantic_park, park);
+  });
+}
+for (const park of ["", "coverage_complete", "coverage_exhausted", 1, null]) {
+  it("semantic hard ACK refuses an out-of-vocabulary park " + JSON.stringify(park), async () => {
+    const f = await fixture();
+    (f.ack.semantic_presentation as { semantic_park?: unknown }).semantic_park = park;
+    await assert.rejects(f.client.reportSemanticPlanGateState("run", f.body), /malformed semantic presentation ACK/);
+  });
+}
+it("semantic hard ACK without a park stays valid", async () => {
+  const f = await fixture();
+  const ack = await f.client.reportSemanticPlanGateState("run", f.body);
+  assert.equal(ack.semanticGate?.semantic_presentation.semantic_park, undefined);
+});

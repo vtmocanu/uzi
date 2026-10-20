@@ -29,6 +29,9 @@ const presentation = z.strictObject({
   }), ...reviewFields,
   consumed_seconds: natural, remaining_seconds: natural, remaining_reviews: natural.max(3),
   maintainers: z.array(maintainer).max(256),
+  // Present only on a gate parked by the autopilot fallback; bounded to the server's vocabulary.
+  semantic_park: z.enum(["coverage_incomplete", "coverage_uncertain", "coverage_unavailable",
+    "maintainer_authorization"]).optional(),
 });
 const approval = z.strictObject({
   presentation_revision: positive, presentation_digest: digest,

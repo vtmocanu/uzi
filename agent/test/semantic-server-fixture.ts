@@ -20,13 +20,20 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   let denied = false;
   let replay = false;
   let reviewId: string | undefined;
+  // Test-controlled server verdict; the agent's own report-derived computation must not outrank it.
+  let forced: SemanticCoverageStatus["outcome"] | undefined;
+  let statusFailure: unknown;
+  let publishFailure: unknown;
   const requests: unknown[] = [];
   const deadline = new Date(Date.now() + 900000).toISOString();
-  const status = (): SemanticCoverageStatus => ({
-    ...compiled!.binding, outcome: persisted ? "complete" : "unavailable",
-    reviews, invocations: calls, charged_tokens: charged, remaining_tokens: 120000 - charged,
-    deadline, ...(persisted ? { report: persisted } : {}),
-  });
+  const status = (): SemanticCoverageStatus => {
+    const outcome = forced ?? (persisted ? "complete" : "unavailable");
+    return {
+      ...compiled!.binding, outcome,
+      reviews, invocations: calls, charged_tokens: charged, remaining_tokens: 120000 - charged,
+      deadline, ...(persisted && outcome !== "unavailable" ? { report: persisted } : {}),
+    };
+  };
   const report = (): Report => ({
     ...compiled!.binding,
     requirements: [{ requirement_id: "r1", status: "represented", criterion_ids: [criterionId],
@@ -52,7 +59,11 @@ export function semanticServer(client: WorkerClient, events: string[]) {
       criteria_digest: hash(JSON.stringify(candidate.criteria)) } };
     return compiled;
   };
-  client.semanticCoverageStatus = async () => { events.push("status"); return status(); };
+  client.semanticCoverageStatus = async () => {
+    events.push("status");
+    if (statusFailure !== undefined) throw statusFailure;
+    return status();
+  };
   client.reserveSemanticCoverage = async (_id, _gen, request): Promise<SemanticReservation> => {
     events.push("reserve"); requests.push(request);
     assert.deepEqual({ candidate_digest: request.candidate_digest, source_digest: request.source_digest, criteria_digest: request.criteria_digest }, compiled!.binding);
@@ -75,9 +86,11 @@ export function semanticServer(client: WorkerClient, events: string[]) {
     return status();
   };
   client.publishSemanticCoverage = async (_id, _gen, request) => {
-    events.push("publish"); persisted = request.report; return status();
+    events.push("publish");
+    if (publishFailure !== undefined) throw publishFailure;
+    persisted = request.report; return status();
   };
-  const gateAck = (generation: number, revision: number) => {
+  const gateAck = (generation: number, revision: number, park?: string) => {
     const evidence = status();
     const maintainers = compiled!.candidate.criteria.filter(c => c.kind === "maintainer")
       .map(c => ({ id: c.id, ...c.maintainer! }));
@@ -86,7 +99,7 @@ export function semanticServer(client: WorkerClient, events: string[]) {
       semantic_presentation: {
         candidate: compiled!.candidate, binding: compiled!.binding, claim_generation: generation,
         coverage: evidence, consumed_seconds: 0, remaining_seconds: 900, remaining_reviews: 3 - reviews,
-        maintainers,
+        maintainers, ...(park !== undefined ? { semantic_park: park } : {}),
       },
       semantic_approval: {
         presentation_revision: revision, presentation_digest: hash(JSON.stringify({ evidence, revision, generation })),
@@ -97,5 +110,9 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   };
   return { report, status, requests, gateAck, compiled: () => compiled!, sources: () => sources,
     deny: () => { denied = true; }, replay: () => { replay = true; },
+    force: (outcome: SemanticCoverageStatus["outcome"] | undefined) => { forced = outcome; },
+    failStatus: (error: unknown) => { statusFailure = error; },
+    failPublish: (error: unknown) => { publishFailure = error; },
+    reserveCount: () => requests.length,
     persisted: () => persisted };
 }

@@ -58,6 +58,7 @@
 import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
 import type { ClaimConfig, PrDescriptionSource } from "./protocol.js";
+import type { CompletionPending } from "./completion-pending.js";
 
 // ── Markers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1317,6 +1318,10 @@ export interface CompletionBlockInput {
   scopeCapped?: { completedCount: number; total?: number };
   /** Issue-only declaration; the caller redacts the reason before rendering. */
   nonClosing?: { reason: string };
+  /** PRD #1230 M4: server-sourced, human-authorized maintainer criteria that remain unverified.
+   *  The caller redacts every string field first; this renderer escapes them. Rendering never
+   *  marks anything satisfied and always suppresses `Closes`. */
+  completionPending?: CompletionPending;
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1361,9 +1366,28 @@ function stalenessLine(describedSha: string, headSha: string): string {
   ].join("\n");
 }
 
+/** The unchecked maintainer checklist (PRD #1230 M4), inside the issue arm's blockquote. A milestone
+ *  that is both owner-deferred and holds a maintainer criterion counts once in the outstanding line. */
+function pendingBlock(pending: CompletionPending, deferredMilestones: readonly string[]): string[] {
+  const criteria = [...pending.criteria].sort((a, b) => a.criterion_id < b.criterion_id ? -1 : a.criterion_id > b.criterion_id ? 1 : 0);
+  const outstanding = new Set([...deferredMilestones, ...criteria.map((c) => c.milestone_id)]).size;
+  return [
+    "> ⚠️ **Maintainer verification pending (PRD #1230).** The criteria below were authorized by the owner as",
+    "> requiring the maintainer, not this run. They are UNVERIFIED and this pull request does NOT close the source issue:",
+    "> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked.",
+    `> Outstanding milestones for the source issue: ${outstanding} (a deferred milestone that also holds a maintainer criterion counts once).`,
+    ...criteria.flatMap((c) => [
+      `> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)}) — ${escapeInline(c.text)}: ${escapeInline(c.reason)}`,
+      ...c.conditions.map((x) => `>   - Condition: ${escapeInline(x)}`),
+      ...c.verification_steps.map((x) => `>   - Verify: ${escapeInline(x)}`),
+    ]),
+  ];
+}
+
 function issueArm(input: CompletionBlockInput): string[] {
   const iid = input.issueIid;
   const deferred = input.completionScope?.deferred ?? [];
+  const pending = input.completionPending && input.completionPending.criteria.length > 0 ? input.completionPending : undefined;
   const accepted = input.completionScope?.accepted ?? [];
   const isOwnerPartial = deferred.length > 0;
   // Only the normal arm (last below) can render `Closes #N`, and a non-closing declaration
@@ -1391,13 +1415,14 @@ function issueArm(input: CompletionBlockInput): string[] {
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
           `Related to #${iid}.`,
-          ...(input.closes && !input.nonClosing ? ["", `Closes #${iid}`] : []),
+          ...(input.closes && !input.nonClosing && !pending ? ["", `Closes #${iid}`] : []),
         ];
   if (input.nonClosing) {
     const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>
       `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
     lines.push("", `> **Issue remains open.** ${reason}`);
   }
+  if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id)));
   if (accepted.length > 0) {
     lines.push(
       "",

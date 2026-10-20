@@ -2,7 +2,7 @@ import { beforeEach, it } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { Executor } from "../src/executor.js";
-import type { PlanCrossCheckCandidate } from "../src/client.js";
+import { RequestError, type PlanCrossCheckCandidate } from "../src/client.js";
 import { api, client, git, installHarness, runner, fakeGitlab } from "./runner-harness.js";
 import { freshClaim, gates, newApi, row, send } from "./gate-revision-harness.js";
 import { enrollment, proposal, boundedTransport, hash } from "./semantic-coverage-fixture.js";
@@ -28,7 +28,8 @@ function serverWithAck(events: string[]) {
     if (body.status !== "awaiting_approval") return undefined;
     assert.equal(body.candidate_digest, server.compiled().candidate.digest);
     assert.ok(body.presentation_id);
-    const ack = server.gateAck(body.claim_generation!, api.gateResumeFields(String(run.id)).resume_gate_revision!);
+    const ack = server.gateAck(body.claim_generation!, api.gateResumeFields(String(run.id)).resume_gate_revision!,
+      body.semantic_park);
     presentations.push(ack);
     return { status: 200, body: { run, ...ack } };
   };
@@ -224,12 +225,15 @@ it("M2 runner reports coverage exhaustion independently of remaining checker all
   const events: string[] = [];
   const server = serverWithAck(events); server.deny();
   const transport = await boundedTransport("claude", server.report, events);
+  // PRD #1230 M4: exhausted coverage no longer auto-approves; the owner decides.
+  api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
   const exec: Executor = { run: async ctx => {
-    await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.equal((await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid))).kind, "approve");
     return { branch: ctx.branch };
   } };
   await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
     planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(gates(c.run_id)[0]?.semantic_park, "coverage_unavailable");
   assert.equal(events.includes("invoke"), false);
   assert.ok(api.messages(c.run_id).some(m => m.payload.event === "semantic_plan_coverage" && m.payload.reason === "coverage_exhausted"), JSON.stringify(api.states));
 });
@@ -245,4 +249,271 @@ it("M2 runner structural production claims expose no semantic context or calls",
   } };
   await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport }).execute(c);
   assert.deepEqual(events, []);
+});
+
+// PRD #1230 M4 (D3/D4): the autopilot coverage park. The server's single coverage authority decides;
+// every non-complete outcome, and any maintainer criterion, takes the human gate with the exact
+// park reason the api validates, without a replan, a synthetic REVISE or a second coverage call.
+function maintainerProposal(issueIid: number | null) {
+  const p = submitted(issueIid);
+  Object.assign(p.criteria[0]!, { kind: "maintainer", maintainer: {
+    reason: "Owner observes the hosted rollout", conditions: ["Rollout reached the hosted cluster"],
+    verification_steps: ["Open the hosted dashboard and confirm the new revision"],
+  } });
+  return p;
+}
+const parkCases: [string, string, (s: ReturnType<typeof serverWithAck>) => void][] = [
+  ["incomplete", "coverage_incomplete", s => s.force("incomplete")],
+  ["uncertain", "coverage_uncertain", s => s.force("uncertain")],
+  ["unavailable", "coverage_unavailable", s => s.force("unavailable")],
+  ["exhausted", "coverage_unavailable", s => s.deny()],
+  ["status transport throw", "coverage_unavailable", s => s.failStatus(new RequestError("GET", "/semantic/coverage", 503, "down"))],
+  ["publish transport throw", "coverage_unavailable", s => s.failPublish(new RequestError("POST", "/semantic/coverage/publish", 502, "down"))],
+  ["network throw", "coverage_unavailable", s => s.failStatus(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } }))],
+];
+for (const harness of ["claude", "codex"] as const) {
+  for (const [name, park, arrange] of parkCases) {
+    it("M4 autopilot " + harness + " parks " + name + " coverage with " + park + " and no second coverage call", { skip: LINUX_CAPTURE }, async () => {
+      const c = semanticClaim();
+      const events: string[] = [];
+      const server = serverWithAck(events);
+      arrange(server);
+      const transport = await boundedTransport(harness, server.report, events);
+      api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+      const exec: Executor = { run: async ctx => {
+        const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+        assert.equal(verdict.kind, "approve");
+        assert.ok(verdict.kind === "approve" && verdict.approval === undefined, "a human, never the checker or auto-approval");
+        return { branch: ctx.branch };
+      } };
+      await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+        planApprovalTimeoutMs: 4000 }).execute(c);
+      const parked = gates(c.run_id);
+      assert.equal(parked.length, 1, JSON.stringify(api.states));
+      assert.equal(parked[0]!.semantic_park, park);
+      assert.equal(events.filter(e => e === "compile").length, 1, "no replan");
+      assert.ok(events.filter(e => e === "reserve").length <= 1, "no second coverage admission for the same candidate");
+      assert.ok(events.filter(e => e === "invoke").length <= 1);
+      assert.equal(api.crossCheckRequests.length, 0, "no synthetic checker round");
+      const planReports = api.states.filter(s => s.runId === c.run_id && s.body.status === "running" && s.body.plan_md !== undefined);
+      assert.equal(planReports.length, 0, "an autopilot plan write never precedes the human decision");
+      assert.ok(api.messages(c.run_id).some(m => m.payload.event === "semantic_plan_coverage"));
+    });
+  }
+  it("M4 autopilot " + harness + " parks a complete candidate with a maintainer criterion as maintainer_authorization", { skip: LINUX_CAPTURE }, async () => {
+    const c = semanticClaim();
+    const events: string[] = [];
+    const server = serverWithAck(events);
+    const transport = await boundedTransport(harness, server.report, events);
+    api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+    const exec: Executor = { run: async ctx => {
+      const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, maintainerProposal(c.issue_iid));
+      assert.equal(verdict.kind, "approve");
+      return { branch: ctx.branch };
+    } };
+    await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+      planApprovalTimeoutMs: 4000 }).execute(c);
+    assert.equal(server.status().outcome, "complete");
+    assert.equal(gates(c.run_id).length, 1, JSON.stringify(api.states));
+    assert.equal(gates(c.run_id)[0]!.semantic_park, "maintainer_authorization");
+    assert.equal(events.filter(e => e === "invoke").length, 1);
+  });
+}
+
+it("M4 a foreign or malformed coverage response stays fail-closed and never parks as unavailable", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim();
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  server.failStatus(new Error("Foreign semantic plan"));
+  const transport = await boundedTransport("claude", server.report, events);
+  let thrown: unknown;
+  const exec: Executor = { run: async ctx => {
+    try { await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid)); }
+    catch (error) { thrown = error; throw error; }
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.match(String(thrown), /Foreign semantic plan/);
+  assert.equal(gates(c.run_id).length, 0);
+});
+
+it("M4 a status verdict for another candidate is foreign, not a park", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim();
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  const transport = await boundedTransport("claude", server.report, events);
+  const real = client.semanticCoverageStatus.bind(client);
+  let calls = 0;
+  client.semanticCoverageStatus = async (...args) => {
+    const status = await real(...args);
+    // The review's own read passes; the authoritative post-review read names a different candidate.
+    return ++calls < 2 ? status : { ...status, candidate_digest: "f".repeat(64) };
+  };
+  let thrown: unknown;
+  const exec: Executor = { run: async ctx => {
+    try { await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid)); }
+    catch (error) { thrown = error; throw error; }
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.match(String(thrown), /Foreign semantic coverage status/);
+  assert.equal(gates(c.run_id).length, 0);
+});
+
+function checkerAnswering(server: ReturnType<typeof serverWithAck>, verdict: "approve" | "block") {
+  api.crossCheckHandler = ({ runId, body }) => {
+    const { stage: _stage, claim_generation: _generation, round = 1, ...candidate } = body;
+    const identity = server.compiled().candidate;
+    return { status: 200, body: {
+      result: "candidate", round, checker_run_id: "11111111-1111-4111-8111-111111111111",
+      candidate_digest: identity.digest, candidate_generation: 1,
+      candidate: { ...candidate, semantic_candidate: identity },
+      verdict, reason_class: verdict, findings: null,
+      automatic_revision_limit: 4, automatic_rounds_enabled: true,
+      deadline_at: new Date(Date.now() + 60000).toISOString(),
+      lead_last_seq: Math.max(0, ...api.messages(runId).map(m => m.seq)),
+      claim_generation: 1, plan_cross_check_settled: true, gate_revision: 0, current_plan_sha256: hash(""),
+    } };
+  };
+}
+
+it("M4 complete coverage, no maintainers and a checker that did not approve parks with NO semantic_park", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim({ plan_cross_check_required: true });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  checkerAnswering(server, "block");
+  const transport = await boundedTransport("claude", server.report, events);
+  api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+  const exec: Executor = { run: async ctx => {
+    const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.equal(verdict.kind, "approve");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(server.status().outcome, "complete");
+  const [gate] = gates(c.run_id);
+  assert.ok(gate, JSON.stringify(api.states));
+  assert.equal((gate as { plan_cross_check_gate_reason?: string }).plan_cross_check_gate_reason, "block");
+  assert.equal(Object.hasOwn(gate, "semantic_park"), false);
+});
+
+it("M4 complete coverage with a checker APPROVE and no maintainers still auto-approves", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim({ plan_cross_check_required: true });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  checkerAnswering(server, "approve");
+  const transport = await boundedTransport("claude", server.report, events);
+  const exec: Executor = { run: async ctx => {
+    const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.ok(verdict.kind === "approve" && verdict.approval === "cross_check");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(gates(c.run_id).length, 0, JSON.stringify(api.states));
+});
+
+it("M4 complete coverage without a required checker auto-approves and supplies no park", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim();
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  const transport = await boundedTransport("claude", server.report, events);
+  const exec: Executor = { run: async ctx => {
+    const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.equal(verdict.kind, "approve");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(gates(c.run_id).length, 0);
+  assert.ok(api.states.some(s => s.runId === c.run_id && s.body.status === "running" && s.body.plan_md !== undefined));
+});
+
+it("M4 a checker APPROVE never outranks incomplete coverage: it stays evidence and the human decides", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim({ plan_cross_check_required: true });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  server.force("incomplete");
+  checkerAnswering(server, "approve");
+  const transport = await boundedTransport("claude", server.report, events);
+  api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+  const exec: Executor = { run: async ctx => {
+    const verdict = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.ok(verdict.kind === "approve" && verdict.approval === undefined, "not a cross_check approval");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.equal(api.crossCheckRequests.length, 1, "the verdict is retained as historical evidence");
+  const [gate] = gates(c.run_id);
+  assert.equal(gate!.semantic_park, "coverage_incomplete");
+  assert.equal((gate as { plan_cross_check_gate_reason?: unknown }).plan_cross_check_gate_reason, undefined,
+    "the coverage reason is never recorded as checker provenance");
+  assert.equal(events.filter(e => e === "compile").length, 1);
+});
+
+it("M4 the human-gate latch survives a human REVISE: a later complete candidate re-parks and never auto-approves", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim();
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  server.force("incomplete");
+  const transport = await boundedTransport("claude", server.report, events);
+  let presentations = 0;
+  api.onState(c.run_id, body => {
+    if (body.status !== "awaiting_approval") return;
+    if (++presentations === 1) server.force(undefined);
+    send(c.run_id, row(presentations === 1 ? "revise_plan" : "approve_plan", "owner decision"));
+  });
+  const exec: Executor = { run: async ctx => {
+    const first = await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid));
+    assert.equal(first.kind, "revise");
+    const next = await ctx.gatePlan!("Implement A with tests", milestones, undefined,
+      first.kind === "revise" && !first.automatic ? first.inputId : undefined, submitted(c.issue_iid));
+    assert.equal(next.kind, "approve");
+    assert.ok(next.kind === "approve" && next.approval === undefined);
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  const parked = gates(c.run_id);
+  assert.equal(parked.length, 2, JSON.stringify(api.states));
+  assert.equal(parked[0]!.semantic_park, "coverage_incomplete");
+  assert.equal(Object.hasOwn(parked[1]!, "semantic_park"), false, "the api cleared auto_approve at the first park");
+  assert.equal(server.status().outcome, "complete", "the revised candidate itself had complete coverage");
+  assert.equal(events.filter(e => e === "compile").length, 2);
+});
+
+it("M4 a manual run never supplies semantic_park", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim({ auto_approve: false });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  server.force("incomplete");
+  const transport = await boundedTransport("claude", server.report, events);
+  api.onState(c.run_id, body => { if (body.status === "awaiting_approval") send(c.run_id, row("approve_plan")); });
+  const exec: Executor = { run: async ctx => {
+    assert.equal((await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid))).kind, "approve");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  const [gate] = gates(c.run_id);
+  assert.ok(gate);
+  assert.equal(Object.hasOwn(gate, "semantic_park"), false);
+});
+
+it("M4 a structural autopilot run never reads coverage status or supplies a park", { skip: LINUX_CAPTURE }, async () => {
+  const c = freshClaim(1, { kind: "issue", auto_approve: true });
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  const transport = await boundedTransport("claude", server.report, events);
+  const exec: Executor = { run: async ctx => {
+    assert.equal((await ctx.gatePlan!("Implement A", milestones)).kind, "approve");
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport }).execute(c);
+  assert.deepEqual(events, []);
+  assert.equal(gates(c.run_id).length, 0);
 });

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { COMPLETION_END } from "../src/pr-description.js";
 import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
@@ -935,4 +936,215 @@ describe("M3 publication-start completion guard", () => {
     await assert.rejects(client.recordCompletionAttempt(claim.run_id, { milestonesCompleted: [], head: null, worktreeFingerprint: null, claimGeneration: 7 }));
     assert.equal((await client.requestCompletionHold(claim.run_id, { head: "", claimGeneration: 7 })).status, "running");
   });
+});
+
+// PRD #1230 M4: frozen, human-authorized maintainer-pending criteria are a SEPARATE non-closing source.
+// They widen the closing guard and the non-closing delivery decision, are never merged into the legacy
+// deferred-milestone ids, and the permit must project exactly what the pre-push guard acted on.
+describe("M4 maintainer-pending publication", () => {
+  const CRIT = "00000000-0000-4000-8000-0000000000a1";
+  const CRIT2 = "00000000-0000-4000-8000-0000000000a2";
+  const criterion = (over: Record<string, unknown> = {}) => ({
+    criterion_id: CRIT, milestone_id: "m2", kind: "maintainer", text: "Observe the hosted rollout",
+    reason: "Only the owner can reach the cluster", conditions: ["The rollout reached the hosted cluster"],
+    verification_steps: ["Open the dashboard and confirm the new revision"], authorization_revision: 1,
+    status: "unverified", ...over,
+  });
+  const pending = (over: Record<string, unknown> = {}, criteria: unknown[] = [criterion()]) =>
+    ({ version: 1, contract_revision: 1, criteria, ...over });
+  const FEATURES = ["claim_generation_fence", "completion_non_closing_v1", "completion_semantic_publication_v1"];
+
+  async function arrange(opts: { ack?: unknown; permit?: unknown; features?: string[]; message?: string; deferred?: typeof DEFERRED }) {
+    api.setRegisterProtocolFeatures(opts.features ?? FEATURES);
+    await client.register("m4-pending");
+    const claim = claimFor("gitlab", opts.deferred ?? []);
+    api.setCompletionPermitResponse(true);
+    api.completionPermitScope = opts.deferred ? { deferred: opts.deferred } : {};
+    const forge = fakeGitlab();
+    followSuccessfulPush(git, forge.pr, true);
+    const probe = committing(opts.message ?? "Refs #3090", {}, () => {
+      api.stateAckWire = (body, run) => guardOnly(body as unknown as Record<string, unknown>) && opts.ack !== undefined
+        ? { status: 200, body: { run: { ...run, completion_pending: opts.ack } } } : undefined;
+      api.completionPermitWire = json => ({ granted: true, permit: {
+        id: "permit-m4", contract_revision: json.contract_revision, branch: json.branch, head: json.head,
+        issued_at: "2026-10-20T00:00:00Z", finding_ids: [], completion_scope: opts.deferred ? { deferred: opts.deferred } : {},
+        ...(opts.permit !== undefined ? { completion_pending: opts.permit } : {}),
+      } });
+    });
+    return { claim, forge, probe };
+  }
+
+  it("pending-only delivery is non-closing, unchecked and never touches the legacy deferred ids", async () => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending() });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(api.completionAttemptRequests.length, 0, "no synthetic attempt for a valid projection");
+    assert.doesNotMatch(forge.pr.description, /Closes #3090/);
+    assert.doesNotMatch(forge.pr.title, /\b(closes|fixes|resolves)\b/i);
+    assert.match(forge.pr.description, new RegExp(`- \\[ \\] \`${CRIT}\``));
+    assert.match(forge.pr.description, /Checking a box grants no completion or closure authority/);
+    assert.doesNotMatch(forge.pr.description, /Implements part of|Partial delivery — owner scope decision/,
+      "a pending-only run is not an owner partial: m2 is not in the legacy deferred set");
+  });
+
+  it("pending-only delivery refuses a closing commit through the early guard and holds without a push", async t => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending(), message: "Fixes #3090" });
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.equal(push.mock.callCount(), 0);
+    assert.equal(api.completionAttemptRequests.length, 1);
+    assert.equal(api.completionHoldRequests.length, 1);
+    noPublish(claim.run_id);
+  });
+
+  it("the exact-tip guard also refuses a closing commit that appears after the early scan", async t => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending() });
+    const real = git.publishedCommitMessages.bind(git);
+    let scans = 0;
+    t.mock.method(git, "publishedCommitMessages", async (bare: string, tip: string) => {
+      const messages = await real(bare, tip);
+      return ++scans < 2 || messages === null ? messages : [...messages, { sha: "e".repeat(40), message: "Fixes #3090" }];
+    });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(scans >= 2, "both guards scanned");
+    assert.doesNotMatch(forge.pr.description, /Closes #3090/);
+    assert.equal(terminal(claim.run_id).filter(s => s.body.status === "completed").length, 0);
+  });
+
+  it("an api that sent pending criteria without advertising the semantic publication feature holds before push", async t => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending(),
+      features: ["claim_generation_fence", "completion_non_closing_v1"] });
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.equal(push.mock.callCount(), 0);
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.equal(terminal(claim.run_id).length, 0, "a hold, never a failure");
+    noPublish(claim.run_id);
+  });
+
+  for (const [name, bad] of [
+    ["unknown field", pending({ extra: 1 })],
+    ["wrong version", pending({ version: 2 })],
+    ["null", null],
+    ["criteria not an array", pending({ criteria: {} })],
+    ["non-maintainer kind", pending({}, [criterion({ kind: "code" })])],
+    ["status satisfied", pending({}, [criterion({ status: "verified" })])],
+    ["authorization revision zero", pending({}, [criterion({ authorization_revision: 0 })])],
+    ["bad criterion id", pending({}, [criterion({ criterion_id: "not-a-uuid" })])],
+    ["empty conditions", pending({}, [criterion({ conditions: [] })])],
+    ["oversized text", pending({}, [criterion({ text: "x".repeat(2049) })])],
+    ["duplicate ids", pending({}, [criterion(), criterion()])],
+  ] as const) {
+    it(`malformed ACK projection (${name}) holds before push instead of degrading to legacy`, async t => {
+      const { claim, forge, probe } = await arrange({ ack: bad, permit: pending() });
+      const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+      await runner(probe.executor, forge.gitlab).execute(claim);
+      assert.equal(push.mock.callCount(), 0);
+      assert.equal(api.completionHoldRequests.length, 1);
+      noPublish(claim.run_id);
+    });
+  }
+
+  for (const [name, permit] of [
+    ["absent on the permit", undefined],
+    ["a different authorization revision only", pending({}, [criterion({ authorization_revision: 2 })])],
+    ["a different contract revision", pending({ contract_revision: 2 })],
+    ["an extra criterion", pending({}, [criterion(), criterion({ criterion_id: CRIT2 })])],
+    ["a different criterion id", pending({}, [criterion({ criterion_id: CRIT2 })])],
+    ["a malformed permit projection", { version: 1 }],
+  ] as const) {
+    it(`permit with ${name} holds instead of delivering`, async () => {
+      const { claim, forge, probe } = await arrange({ ack: pending(), permit });
+      await runner(probe.executor, forge.gitlab).execute(claim);
+      assert.equal(api.completionPermitRequests.length, 1);
+      assert.equal(api.completionHoldRequests.length, 1, JSON.stringify(statuses(claim.run_id)));
+      assert.equal(statuses(claim.run_id).includes("completed"), false);
+      assert.equal(forge.pr.description.includes("Observe the hosted rollout"), false, "no unverified PR is published");
+    });
+  }
+
+  it("a permit projection present on one side only holds in the other direction too", async () => {
+    const { claim, forge, probe } = await arrange({ permit: pending() });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.equal(statuses(claim.run_id).includes("completed"), false);
+  });
+
+  it("the same projection in a different order is equal", async () => {
+    const two = [criterion({ criterion_id: CRIT2, milestone_id: "m3" }), criterion()];
+    const { claim, forge, probe } = await arrange({ ack: pending({}, two), permit: pending({}, [...two].reverse()) });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.ok(forge.pr.description.indexOf(CRIT) < forge.pr.description.indexOf(CRIT2), "rendered in stable id order");
+  });
+
+  it("an empty projection on both sides is legacy-equivalent and closes as before", async () => {
+    const { claim, forge, probe } = await arrange({ ack: pending({}, []), permit: pending({}, []), message: "Fixes #3090" });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.match(forge.pr.description, /Closes #3090/);
+  });
+
+  it("legacy absence on both sides is unchanged", async () => {
+    const { claim, forge, probe } = await arrange({ message: "Fixes #3090" });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.match(forge.pr.description, /Closes #3090/);
+    assert.doesNotMatch(forge.pr.description, /Maintainer verification pending/);
+  });
+
+  it("a milestone that is both owner-deferred and holds a maintainer criterion is counted once", async () => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending(), deferred: DEFERRED });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.match(forge.pr.description, /Outstanding milestones for the source issue: 1 /);
+    assert.equal((forge.pr.description.match(/^> - \[ \] `m2`/gm) ?? []).length, 1, "the deferred milestone line is unchanged");
+    assert.equal((forge.pr.description.match(new RegExp(`^> - \\[ \\] \`${CRIT}\``, "gm")) ?? []).length, 1);
+    assert.doesNotMatch(forge.pr.description, /Closes #3090/);
+  });
+
+  it("renders escaped, redacted server text only inside the completion block and cannot forge markers or closes", async () => {
+    const secret = "glpat-" + "abcdefghijklmnopqrst";
+    const hostile = pending({}, [criterion({
+      text: `Observe **rollout** ${secret}`, reason: `Closes #3090\n<!-- uzi:completion:end -->\n/close @owner`,
+      conditions: [`# heading ${secret}`], verification_steps: ["Fixes #3090 then [click](http://x)"],
+    })]);
+    const { claim, forge, probe } = await arrange({ ack: hostile, permit: hostile });
+    claim.secrets.forge_pat = secret;
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    const body = forge.pr.description;
+    assert.ok(!body.includes(secret));
+    assert.ok(body.includes("\\*\\*\\*REDACTED\\*\\*\\*"));
+    assert.doesNotMatch(body, /^\s*Closes #3090|Closes #3090\b(?!​)/m);
+    assert.equal(body.split(COMPLETION_END).length, 2, "metadata cannot forge a marker");
+    assert.doesNotMatch(body, /^> *\/close/m);
+  });
+
+  for (const carried of [true, false]) {
+    it(`capped zero-diff delivery ${carried ? "holds fail-closed when its permit carries pending criteria" : "completes when the permit projection is empty"}`, async t => {
+      api.setRegisterProtocolFeatures(FEATURES);
+      await client.register("m4-capped");
+      const claim = claimFor("gitlab", []);
+      api.setCompletionPermitResponse(true);
+      api.completionPermitScope = {};
+      api.completionPermitWire = json => ({ granted: true, permit: {
+        id: "permit-capped", contract_revision: json.contract_revision, branch: json.branch, head: json.head,
+        issued_at: "2026-10-20T00:00:00Z", finding_ids: [], completion_scope: {},
+        completion_pending: pending({}, carried ? [criterion()] : []),
+      } });
+      // A scope-capped zero-diff run requests its permit before any publication ACK exists.
+      const executor = { run: async (ctx: RunContext): Promise<ExecutorResult> => ({
+        branch: ctx.branch, scopeCapped: { completedCount: 0, total: 2 }, summary: "Nothing landed" }) };
+      const forge = fakeGitlab();
+      t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected push"); });
+      await runner(executor, forge.gitlab).execute(claim);
+      assert.equal(api.completionPermitRequests.length, 1);
+      assert.equal(api.completionPermitRequests[0]!.body.scope_capped, true, "the capped-empty permit request");
+      assert.equal(api.completionHoldRequests.length, carried ? 1 : 0, JSON.stringify(statuses(claim.run_id)));
+      assert.equal(statuses(claim.run_id).includes("completed"), !carried);
+    });
+  }
 });

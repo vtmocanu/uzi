@@ -52,6 +52,8 @@ import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecovery
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
 import { SemanticPlanningGate } from "./semantic-planning-gate.js";
+import { expectedSemanticPark, type SemanticPark } from "./semantic-park.js";
+import { sameCompletionPending, type CompletionPending } from "./completion-pending.js";
 import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
 import type { PlanCrossCheckStateRequest, PlanCrossCheckDiffRefusal } from "./client.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, GracefulShutdownCheckpoint, SafeBoundary } from "./harness.js";
@@ -6761,6 +6763,10 @@ export class RunRunner {
     let completionScope = claim.config?.completion_scope;
     let publicationAck: StateAck | undefined;
     let publicationProjection: StateAck["completionProjection"];
+    // PRD #1230 M4: the publication-start ACK's maintainer-pending projection (undefined is legacy).
+    // It is kept apart from publicationProjection.deferredIds: criterion identities are never merged
+    // into the legacy deferred-milestone set.
+    let publicationPending: CompletionPending | undefined;
     // Both capped-empty and MR completion use the same bounded client retry and hold paths.
     const requireCompletionPermit = async (head: string | null, branch: string): Promise<boolean> => {
       const contractRevision = publicationProjection?.revision ?? flight.latestContractRevision ?? claim.config?.contract_revision;
@@ -6826,6 +6832,18 @@ export class RunRunner {
           await holdOrFailInterlocked("completion permit scope differs from publication guard");
           return false;
         }
+      }
+      // PRD #1230 M4: the permit's maintainer-pending projection must equal the one the pre-push
+      // guard acted on (presence on one side only included). Without a publication ACK there was
+      // no guard, so a non-empty projection cannot be delivered non-closing and holds instead.
+      if (permit.permit?.completionPendingMalformed) {
+        await holdOrFailInterlocked("completion permit pending projection malformed");
+        return false;
+      }
+      if (publicationProjection ? !sameCompletionPending(publicationPending, permit.permit?.completionPending)
+        : (permit.permit?.completionPending?.criteria.length ?? 0) > 0) {
+        await holdOrFailInterlocked("completion permit pending projection differs from publication guard");
+        return false;
       }
       return true;
     };
@@ -7476,6 +7494,10 @@ export class RunRunner {
     const effectiveDeclared = result.nonClosing ?? claim.config?.non_closing;
     const issuePublication = resolveRunKind(claim.kind) === "issue" && typeof claim.issue_iid === "number";
     let closingGateIid = issuePublication && effectiveDeclared ? claim.issue_iid! : undefined;
+    // PRD #1230 M4: set only from the publication-start ACK's non-empty maintainer-pending
+    // projection. It widens the closing guard and the non-closing delivery decision; it is neither a
+    // lead declaration (effectiveDeclared) nor a member of the legacy deferred-milestone set.
+    let pendingNonClosing = false;
     const closingBarePath = barePath;
     const closingRepoPath = repoPathFromUrl(claim.repo.url);
     // publishedCommitMessages scans default-branch..tip, including already-pushed history.
@@ -7727,7 +7749,18 @@ export class RunRunner {
         return;
       }
       publicationProjection = publicationAck.completionProjection;
-      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0)
+      // PRD #1230 M4: a malformed projection never degrades to legacy absence, and a non-empty one
+      // needs the negotiated semantic publication feature (an api that sends it advertises it).
+      // Both hold through the same zero-attempt admission path as an unconfirmed completion state.
+      if (publicationAck.completionPendingMalformed ||
+          ((publicationAck.completionPending?.criteria.length ?? 0) > 0 &&
+            !this.client.hasFeature("completion_semantic_publication_v1"))) {
+        await refusePrepush("unknown", publicationOriginalHead);
+        return;
+      }
+      publicationPending = publicationAck.completionPending;
+      pendingNonClosing = (publicationPending?.criteria.length ?? 0) > 0;
+      if (effectiveDeclared || result.scopeCapped || publicationProjection.deferredIds.length > 0 || pendingNonClosing)
         closingGateIid = claim.issue_iid!;
     }
 
@@ -8789,6 +8822,14 @@ export class RunRunner {
     const runKind = resolveRunKind(claim.kind);
     const declaration = runKind === "issue" ? (result.nonClosing ?? claim.config?.non_closing) : undefined;
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
+    // PRD #1230 M4: every server-sourced string is redacted BEFORE the renderer escapes it, so a
+    // registered secret cannot be split by inline escaping. The permit-verified projection only.
+    const pendingForRender: CompletionPending | undefined = publicationPending && publicationPending.criteria.length > 0
+      ? { ...publicationPending, criteria: publicationPending.criteria.map(c => ({
+        ...c, milestone_id: redactText(c.milestone_id), text: redactText(c.text), reason: redactText(c.reason),
+        criterion_id: redactText(c.criterion_id),
+        conditions: c.conditions.map(x => redactText(x)), verification_steps: c.verification_steps.map(x => redactText(x)),
+      })) } : undefined;
     const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
       mrCompletionBlock(
         claim,
@@ -8813,6 +8854,7 @@ export class RunRunner {
         opts,
         result.codeCrossCheckSummary,
         effectiveNonClosing,
+        pendingForRender,
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
@@ -8834,7 +8876,7 @@ export class RunRunner {
     // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
     // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
     // own completion block), and this flag set here rather than its own check at one of those sites.
-    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing;
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped || !!effectiveNonClosing || pendingNonClosing;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
     // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
@@ -11680,6 +11722,15 @@ export class RunRunner {
     let crossCheckSelected = false;
     let crossCheckRound = 1;
     let crossCheckDiscoveryDone = false;
+    // PRD #1230 M4 (D3/D4): the one-way, flight-scoped human-gate latch of a semantic run. Once
+    // coverage was not complete, a maintainer criterion exists, or the required checker did not
+    // APPROVE, this execution never auto-approves again, including a later (e.g. human-revised)
+    // candidate; no later complete report can clear it. It lives beside checkedHuman so it
+    // survives re-entry of the plan-gate closure.
+    let semanticHumanGate = false;
+    // The server accepts semantic_park only on the first awaiting_approval report of an
+    // auto_approve run (that report clears auto_approve), so later candidates never supply it.
+    let semanticParkOffered = false;
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
     const reportCheckedState = (body: StateRequest): Promise<StateAck> => {
@@ -12165,11 +12216,29 @@ export class RunRunner {
         }
         // Automatic checker REVISE returns above consume no coverage admission.
         // M3/M4 own rendering, exact freeze and the server approval park; M2 supplies evidence.
+        let semanticPark: SemanticPark | undefined;
         if (semanticGate && semanticCompiled && semanticSources) {
-          const coverage = await semanticGate.review(semanticCompiled, planMd, semanticSources.sources);
-          batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage } });
+          // The SERVER's coverage authority decides; the review result is display evidence only.
+          const { review: coverage, outcome } = await semanticGate.reviewForGate(semanticCompiled, planMd, semanticSources.sources);
+          batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_plan_coverage", ...coverage,
+            server_outcome: outcome } });
+          const maintainers = semanticCompiled.candidate.criteria.filter(c => c.kind === "maintainer").length;
+          const checkerMissing = claim.plan_cross_check_required === true && checkedApproval === undefined;
+          if (outcome !== "complete" || maintainers > 0 || checkerMissing) semanticHumanGate = true;
+          if (!semanticParkOffered) {
+            semanticParkOffered = true;
+            // Only an auto_approve report supplies it; a complete, maintainer-free candidate gated
+            // by the checker alone supplies none (the existing cross-check reason applies).
+            if (claim.auto_approve === true) semanticPark = expectedSemanticPark(outcome, maintainers);
+          }
+          if (semanticHumanGate && checkedApproval) {
+            // The checker verdict stays historical evidence only: it grants no approval here, and
+            // the state barrier it held must not outlive the decision to take the human gate.
+            checkedApproval = undefined;
+            releaseStateBarrier?.();
+          }
         }
-        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate &&
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !semanticHumanGate &&
           (!checkedHuman || checkedApproval !== undefined);
         // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
         // awaiting_approval before the inputs sent before the release are read (the replayed
@@ -12235,6 +12304,7 @@ export class RunRunner {
           } : undefined,
           (candidate) => this.prepareGateCheckpoint(claim, flight, steering.lifecycleSignal(), candidate),
           revisionRecovery,
+          semanticPark,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -19517,6 +19587,7 @@ export class RunRunner {
     retainCheckedStorage?: (resume: () => Promise<PlanVerdict>) => void,
     prepareCheckpoint?: (candidate: Milestone[] | undefined) => Promise<StateRequest["gate_checkpoint_witness"]>,
     revisionRecovery?: PlanRevisionRecovery,
+    semanticPark?: SemanticPark,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -19690,6 +19761,7 @@ export class RunRunner {
     const request: StateRequest = {
       ...checkedFields,
       ...(witness ? { gate_checkpoint_witness: witness } : {}),
+      ...(semanticPark !== undefined ? { semantic_park: semanticPark } : {}),
       status: "awaiting_approval",
       plan_md: planMd,
       ...presentation,
@@ -20472,6 +20544,8 @@ export function mrCompletionBlock(
   opts?: MrDescriptionOptions,
   codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary,
   nonClosing?: ExecutorResult["nonClosing"],
+  // PRD #1230 M4: the strictly decoded, caller-redacted maintainer-pending projection.
+  completionPending?: CompletionPending,
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
@@ -20490,6 +20564,7 @@ export function mrCompletionBlock(
     completionScope,
     scopeCapped,
     nonClosing: resolveRunKind(claim.kind) === "issue" ? nonClosing : undefined,
+    completionPending: resolveRunKind(claim.kind) === "issue" ? completionPending : undefined,
     repoAgents: agentSelection?.source === "repo",
     gatesUnverified,
     gatesDiscoveryTruncated,

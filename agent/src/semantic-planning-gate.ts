@@ -6,6 +6,7 @@ import { parseSemanticCandidate, semanticSourceCaptureSchema, type SemanticSubmi
 import { reviewPlanContract, type BoundedCoverageTestTransport,
   type CoverageReservation, type PlanContractReviewResult } from "./plan-contract-review.js";
 import type { SemanticBinding, SemanticReservation } from "./semantic-coverage-wire.js";
+import { isCoverageTransportFailure, type SemanticCoverageOutcome } from "./semantic-park.js";
 
 type Compiled = Awaited<ReturnType<WorkerClient["submitSemanticCandidate"]>>;
 const sameBinding = (a: SemanticBinding, b: SemanticBinding) =>
@@ -26,6 +27,38 @@ export class SemanticPlanningGate {
     if (compiled.plan !== Buffer.from(structural.plan_md).toString("base64")) throw new Error("Foreign semantic plan");
     parseSemanticCandidate(compiled.candidate, { sources: compiled.sources, milestoneIds: structural.milestones.map(m => (m as { id: string }).id) });
     return compiled;
+  }
+
+  /** The approval-point coverage decision. `outcome` is always the SERVER's single coverage
+   * authority (the status endpoint), read after review and publication; `review` is the agent's own
+   * computation and is display evidence only. A transport or server-availability failure of any
+   * coverage call is coverage-unavailable; an owner abort, a malformed or foreign response and a
+   * binding mismatch stay fail-closed (rethrown). A provider safety refusal never throws out of
+   * review: it settles as an uncertain result, which the server also reports unavailable. */
+  async reviewForGate(compiled: Compiled, plan: string, rawSources: readonly unknown[]):
+    Promise<{ review: PlanContractReviewResult; outcome: SemanticCoverageOutcome }> {
+    const { candidate, binding } = compiled;
+    let review: PlanContractReviewResult | undefined;
+    try {
+      review = await this.review(compiled, plan, rawSources);
+    } catch (error) {
+      if (!isCoverageTransportFailure(error, this.signal)) throw error;
+    }
+    const unavailable = (): PlanContractReviewResult => ({ outcome: "uncertain", reason: "coverage_unavailable",
+      candidate_digest: candidate.digest, report: null, invocations: 0, tokens: 0, elapsed_ms: 0 });
+    let status: Awaited<ReturnType<WorkerClient["semanticCoverageStatus"]>>;
+    try {
+      status = await this.client.semanticCoverageStatus(this.runId, this.generation, this.signal);
+    } catch (error) {
+      if (!isCoverageTransportFailure(error, this.signal)) throw error;
+      return { review: review ?? unavailable(), outcome: "unavailable" };
+    }
+    if (status.outcome === "unavailable") return { review: review ?? unavailable(), outcome: "unavailable" };
+    // A verdict about any other candidate, source set or criteria set is foreign, never partial.
+    if (!sameBinding(status, binding) || !status.report) throw new Error("Foreign semantic coverage status");
+    validateCoverageReport(JSON.stringify(status.report), candidate,
+      compiled.sources.map(s => semanticSourceCaptureSchema.parse(s)), binding);
+    return { review: review ?? unavailable(), outcome: status.outcome };
   }
 
   async review(compiled: Compiled, plan: string, _rawSources: readonly unknown[]): Promise<PlanContractReviewResult> {

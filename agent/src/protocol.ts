@@ -1003,6 +1003,9 @@ export interface ClaimConfig {
     deferred?: { milestone_id: string; title: string; reason: string }[];
     accepted?: { id: string; milestone_id: string; text: string; reason: string }[];
   };
+  /** PRD #1230 M4 (dormant): the frozen, human-authorized maintainer-pending projection, decoded
+   *  strictly by the claim parser (a malformed value fails the claim). Never completion evidence. */
+  completion_pending?: import("./completion-pending.js").CompletionPending;
 }
 
 /**
@@ -2017,6 +2020,8 @@ export interface CompletionPermitResponse {
     issued_at: string;
     finding_ids: string[];
     completion_scope?: ClaimConfig["completion_scope"];
+    /** Raw wire value; WorkerClient decodes it strictly before the runner sees it. */
+    completion_pending?: unknown;
   };
 }
 
@@ -2496,6 +2501,10 @@ export interface StateRequest {
   completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
   candidate_digest?: string;
+  /** PRD #1230 M4 (dormant): the autopilot coverage-park reason on a semantic awaiting_approval
+   *  report. The api requires exactly its own projection's reason on an auto_approve report and
+   *  refuses it on a manual one; omitted when the checker verdict is the only reason. */
+  semantic_park?: import("./semantic-park.js").SemanticPark;
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
@@ -2855,6 +2864,10 @@ export interface StateAck {
   /** Exact server presentation; malformed presence never becomes legacy absence. */
   semanticGate?: SemanticGateAck;
   semanticGateMalformed?: true;
+  /** PRD #1230 M4: the run's frozen maintainer-pending projection; absent is legacy. Presence that
+   *  fails the strict bounded decode sets completionPendingMalformed and never degrades to absence. */
+  completionPending?: import("./completion-pending.js").CompletionPending;
+  completionPendingMalformed?: true;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;

@@ -869,6 +869,12 @@ export class Worker {
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
           "cross_check_codex_lead_v1",
+          // PRD #1230 M4 (dormant): this image runs the semantic plan checker child and
+          // publishes maintainer-pending (completion_pending) delivery non-closing. Advertised
+          // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,
+          // so structural/legacy claims are unaffected.
+          "cross_check_semantic_plan_v1",
+          "completion_semantic_publication_v1",
           // Default-branch CI repair (issue #2865): this image enforces claim.config.ci_config_guard
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
           // the api offers a guarded repair run only to a worker advertising it.

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { decodeCompletionPending, type CompletionPending } from "./completion-pending.js";
 import { SEMANTIC_GATE_ACK_MAX_BYTES, semanticGateAckSchema } from "./semantic-gate-wire.js";
 import { decodeInterruptedCalls, interruptedRegistration, type InterruptedRegistration, type InterruptedCalls } from "./interrupted-calls.js";
 import { Readable } from "node:stream";
@@ -1044,6 +1045,10 @@ export interface CompletionPermit {
   issuedAt: string;
   findingIds: string[];
   completionScope?: ClaimConfig["completion_scope"];
+  /** PRD #1230 M4: strictly decoded; absent is legacy. */
+  completionPending?: CompletionPending;
+  /** The permit carried a completion_pending value that failed the strict decode (fail closed). */
+  completionPendingMalformed?: true;
 }
 
 /** The completion-permit endpoint's decision (PRD #1226 M4, D5), mapped from
@@ -1761,6 +1766,12 @@ export class WorkerClient {
           dedicated || marker === "cross_check" ? "claim" : undefined))
         : await res.json()) as ClaimResponse;
       if (isRecord(claim) && claim.semantic_planning !== undefined) claim.semantic_planning = parseSemanticEnrollment(claim.semantic_planning);
+      // PRD #1230 M4: a present-but-malformed maintainer-pending projection fails the claim closed.
+      if (isRecord(claim) && isRecord(claim.config) && Object.hasOwn(claim.config, "completion_pending")) {
+        const pending = decodeCompletionPending(claim.config.completion_pending);
+        if (pending.kind !== "ok") throw new Error("malformed completion_pending on claim");
+        claim.config.completion_pending = pending.pending;
+      }
       if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
         throw new Error("cross-check claim marker and kind disagree");
       }
@@ -2329,6 +2340,8 @@ export class WorkerClient {
             ack.sentClaimGeneration = body.claim_generation;
           if (fields.semanticGate !== undefined) ack.semanticGate = fields.semanticGate;
           if (fields.semanticGateMalformed) ack.semanticGateMalformed = true;
+          if (fields.completionPending !== undefined) ack.completionPending = fields.completionPending;
+          if (fields.completionPendingMalformed) ack.completionPendingMalformed = true;
           if (fields.completionProjection !== undefined)
             ack.completionProjection = fields.completionProjection;
           if (fields.completionAttempts !== undefined)
@@ -3641,6 +3654,9 @@ export class WorkerClient {
         ...(res.permit.completion_scope !== undefined
           ? { completionScope: res.permit.completion_scope } : {}),
       };
+      const pending = decodeCompletionPending(res.permit.completion_pending);
+      if (pending.kind === "ok") result.permit.completionPending = pending.pending;
+      else if (pending.kind === "malformed") result.permit.completionPendingMalformed = true;
     }
     return result;
   }
@@ -4607,6 +4623,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   applied?: boolean;
   semanticGate?: StateAck["semanticGate"];
   semanticGateMalformed?: true;
+  completionPending?: CompletionPending;
+  completionPendingMalformed?: true;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -4666,6 +4684,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         // Issue #1626: the frozen completion-contract revision (RunDTO.completion_revision).
         completion_revision?: unknown;
         completion_deferred?: unknown;
+        completion_pending?: unknown;
         completion_attempts?: unknown;
         budget_total_seconds?: unknown;
         budget_used_seconds?: unknown;
@@ -4690,6 +4709,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       applied?: boolean;
       semanticGate?: StateAck["semanticGate"];
       semanticGateMalformed?: true;
+      completionPending?: CompletionPending;
+      completionPendingMalformed?: true;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -4775,6 +4796,12 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         revision: out.contractRevision,
         deferredIds: [...new Set(deferred.map(entry => (entry as { milestone_id: string }).milestone_id))].sort(),
       };
+    }
+    // PRD #1230 M4: absence is legacy; presence (even null) that fails the strict decode is malformed.
+    if (isRecord(run) && Object.hasOwn(run, "completion_pending") && run.completion_pending !== undefined) {
+      const pending = decodeCompletionPending(run.completion_pending);
+      if (pending.kind === "ok") out.completionPending = pending.pending;
+      else out.completionPendingMalformed = true;
     }
     if (typeof run?.completion_attempts === "number" && Number.isSafeInteger(run.completion_attempts) && run.completion_attempts >= 0)
       out.completionAttempts = run.completion_attempts;
