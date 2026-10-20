@@ -35,6 +35,7 @@ import { ensureLive, handleInput, startNewRun } from "../engine";
 import { getRun, nextRunId, patchRun, state } from "../store";
 import { delay, mockScenario, requireSession } from "./shared";
 import { LEAD_NAME_RE, templates } from "./agents";
+import { appSettings } from "./settings";
 import { visibleCodexAccounts, visibleTokenMeters } from "./secrets";
 
 // Fixed at module load so refreshing usage does not reset the demo's elapsed clock.
@@ -115,6 +116,8 @@ function currentCustodyHolds(): RecoveryCustodyHold[] {
 
 function custodyResponse(): RecoveryCustodyHolds {
   const holds = currentCustodyHolds();
+  const parsedLimit = Number.parseInt(appSettings.custody_hold_limit, 10);
+  const custodyLimit = Number.isFinite(parsedLimit) ? parsedLimit : 8;
   const open = holds.filter((h) => h.state === "open");
   const decisionNeeded = open.filter(
     (h) => h.attention === "source_only" || h.attention === "needs_action",
@@ -123,10 +126,10 @@ function custodyResponse(): RecoveryCustodyHolds {
     aggregate: {
       open_holds: open.length,
       admission_counted_holds: open.filter((h) => h.counts_toward_admission === true).length,
-      custody_hold_limit: 8,
+      custody_hold_limit: custodyLimit,
       decision_needed: decisionNeeded,
       // Two queued code runs are wedged behind the owner limit in this scenario.
-      blocked_runs: open.length >= 8 ? 2 : 0,
+      blocked_runs: open.length >= custodyLimit ? 2 : 0,
     },
     holds,
   };

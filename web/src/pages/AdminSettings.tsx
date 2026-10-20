@@ -39,6 +39,7 @@ import {
   DEFAULT_DARK_THEME,
 } from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
+import { CustodyHoldLimitCard } from "./adminSettings/CustodyHoldLimitCard";
 import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
@@ -523,6 +524,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="hosted-worker-quota" className="scroll-mt-6">
           <HostedWorkerQuotaCard settings={saved} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="custody-hold-limit" className="scroll-mt-6">
+          <CustodyHoldLimitCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
 

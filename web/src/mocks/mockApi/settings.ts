@@ -144,6 +144,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
   hosted_worker_quota: "2",
+  custody_hold_limit: "8",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
   // switch and the escalation-banner switch). The Updates card reads the live values
   // off getReleaseCheck and writes them back here through updateSettings.
@@ -292,6 +293,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.default_typeface === "string" &&
     // Legacy demo settings inherit the quota seed; reject malformed non-string values.
     (a.hosted_worker_quota === undefined || typeof a.hosted_worker_quota === "string") &&
+    (a.custody_hold_limit === undefined || typeof a.custody_hold_limit === "string") &&
     // PRD #649: accept legacy blobs that predate this field (undefined), but reject a
     // malformed non-string so a bad localStorage blob can't violate the AppSettings contract.
     (a.ephemeral_workers_enabled === undefined || typeof a.ephemeral_workers_enabled === "string") &&
@@ -833,6 +835,16 @@ export const settingsApi = {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "custody_hold_limit") {
+        // Mirrors validateCustodyHoldLimit server-side: trim, digits only, 1..1000.
+        const t = value.trim();
+        const n = /^[0-9]+$/.test(t) ? Number(t) : NaN;
+        if (!(n >= 1 && n <= 1000)) {
+          throw new ApiError(400, "custody_hold_limit: must be a whole number between 1 and 1000");
+        }
+        nonSecret.custody_hold_limit = value;
         continue;
       }
       if (key === "hosted_worker_quota") {

@@ -146,6 +146,8 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     // PRD #1189: the extension cap — 0 (off) and an in-range value.
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "0" }, "0");
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "3600" }, "3600");
+    await check("custody_hold_limit", { custody_hold_limit: "12" }, "12");
+    await check("custody_hold_limit", { custody_hold_limit: " 1000 " }, " 1000 ");
   });
 
   it("still 400s on invalid values for those keys", async () => {
@@ -191,5 +193,11 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await expect(api.updateSettings({ run_extension_cap_seconds: "3599" })).rejects.toMatchObject({
       status: 400,
     });
+    for (const bad of ["0", "-1", "abc", "8.5", "+12", "1001", ""]) {
+      await expect(api.updateSettings({ custody_hold_limit: bad })).rejects.toMatchObject({
+        status: 400,
+        message: "custody_hold_limit: must be a whole number between 1 and 1000",
+      });
+    }
   });
 });
