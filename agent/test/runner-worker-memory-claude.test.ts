@@ -154,20 +154,24 @@ async function invalidatedRun(ending: (stop: Error) => Error) {
     ctx.onMemoryAuthorityLost!(stop => { told = stop; });
     ctx.capturedMemory!();
     client.revokeMemoryAuthority();
-    assert.ok(told, "the invalidation reached the executor");
-    throw ending(told);
+    // Asserted outside the run: an assertion thrown here would itself report `failed`, making the control vacuous.
+    throw ending(told ?? new Error("invalidation not delivered"));
   } };
   try {
     await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined, { memoryRuntime: f.memory }).execute(f.claim);
-    return { failed: api.states.some(s => s.body.status === "failed") };
+    return { failed: api.states.some(s => s.body.status === "failed"), told: told !== undefined };
   } finally { await f.memory.stop(); await monitoring.catch(() => undefined); }
 }
 
 test("a Claude executor that rejects with the carried retained stop lands in the retained-custody arm, not a failure", async () => {
   // The carrier rethrows exactly the stop the runner delivered.
-  assert.equal((await invalidatedRun(stop => stop)).failed, false, "the retained stop reports no model failure");
+  const r = await invalidatedRun(stop => stop);
+  assert.ok(r.told, "the invalidation reached the executor");
+  assert.equal(r.failed, false, "the retained stop reports no model failure");
 });
 
 test("a Claude executor that rebuilds the error after the invalidation is reported as a failure (the control)", async () => {
-  assert.equal((await invalidatedRun(() => new Error("rebuilt after the invalidation"))).failed, true);
+  const r = await invalidatedRun(() => new Error("rebuilt after the invalidation"));
+  assert.ok(r.told, "the invalidation reached the executor");
+  assert.equal(r.failed, true);
 });

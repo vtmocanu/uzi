@@ -551,7 +551,7 @@ command tool in place of native `Bash`; see
 scoped-only `Bash` roles). Enabling the guard also runs a launcher preflight at
 startup, and a worker that fails it refuses to register, including a
 Codex-only worker. If a Claude run loses memory authority mid-turn (for
-the API stops advertising `worker_memory_pressure_v1`, or the worker shuts
+example, the API stops advertising `worker_memory_pressure_v1`, or the worker shuts
 down), the turn is aborted and continues through the existing recovery/requeue
 policy. Restart the worker to regain authority, as for Codex: registration
 runs once at startup, and until then each new run claim on that worker, including a
