@@ -1022,7 +1022,9 @@ export class RecoveryCoordinator {
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
     this.writerExclusion = opts.writerExclusion;
     this.terminalSettlementConfirmed = opts.terminalSettlementConfirmed;
-    this.maintenance = opts.workerToken ? new RecoveryMaintenance({
+    // A coordinator built without a recovery root (a token-only unit fixture) has no ledger to
+    // place; admission then refuses as an invalid context, exactly as with no token.
+    this.maintenance = opts.workerToken && opts.recoveryRoot ? new RecoveryMaintenance({
       root: path.join(opts.recoveryRoot, "..", "recovery-maintenance"), workerToken: opts.workerToken,
     }) : undefined;
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
