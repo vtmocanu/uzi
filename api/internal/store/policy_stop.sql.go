@@ -418,6 +418,43 @@ func (q *Queries) GetPolicyStopCrossCheck(ctx context.Context, id uuid.UUID) (Cr
 	return i, err
 }
 
+const getPolicyStopRevisionInput = `-- name: GetPolicyStopRevisionInput :one
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported, settled_at, superseded_by_stop_input_id FROM run_user_inputs
+WHERE run_id = $1::uuid AND id = $2::bigint
+ AND kind = 'revise_plan'
+`
+
+type GetPolicyStopRevisionInputParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	InputID int64     `json:"input_id"`
+}
+
+// Exact finite receipt evidence, including application and inclusion provenance.
+func (q *Queries) GetPolicyStopRevisionInput(ctx context.Context, arg GetPolicyStopRevisionInputParams) (RunUserInput, error) {
+	row := q.db.QueryRow(ctx, getPolicyStopRevisionInput, arg.RunID, arg.InputID)
+	var i RunUserInput
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.Kind,
+		&i.Body,
+		&i.ConsumedAt,
+		&i.CreatedAt,
+		&i.QuestionID,
+		&i.Disposition,
+		&i.ConsumedClaimGeneration,
+		&i.ConsumedWorkerID,
+		&i.AppliedAt,
+		&i.GateBinding,
+		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
+		&i.SettledAt,
+		&i.SupersededByStopInputID,
+	)
+	return i, err
+}
+
 const hasPolicyCurrentGateApproval = `-- name: HasPolicyCurrentGateApproval :one
 SELECT (EXISTS (
     SELECT 1 FROM run_user_inputs

@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -233,31 +234,69 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		primary := source.PrimaryRevision != nil && source.PrimaryRevision.InputID != nil && *source.PrimaryRevision.InputID == stopDecimal(input.ID)
 		if input.GateBinding.Valid && input.GateBinding.String == "bound" && input.GateRevision.Valid {
 			if input.GateRevision.Int64 != r.GateRevision {
-				if primary {
+				if primary || input.GateRevision.Int64 <= 0 || input.GateRevision.Int64 > r.GateRevision {
 					return bad()
 				}
 				continue
 			}
 		} else {
+			if (input.GateBinding.Valid && input.GateBinding.String != "unbound") || (input.GateRevision.Valid && (input.GateRevision.Int64 < 0 || input.GateRevision.Int64 > r.GateRevision)) {
+				return bad()
+			}
 			// Source context alone cannot prove an unbound row was delivered at this gate.
 			if !primary || !input.ConsumedAt.Valid || !input.ConsumedWorkerID.Valid || !input.ConsumedClaimGeneration.Valid ||
 				input.ConsumedClaimGeneration.Int64 != r.PolicyLastSourceGeneration.Int64 {
 				return bad()
 			}
 		}
-		if input.ID <= 0 || input.IncludedAt.Valid || input.Disposition.Valid {
+		if input.ID <= 0 || input.IncludedAt.Valid || input.Disposition.Valid || input.SettledAt.Valid || input.SupersededByStopInputID.Valid {
 			return bad()
 		}
 		if primary {
 			primaryFound = true
 		}
-		m.HumanFeedback = append(m.HumanFeedback, apitypes.PolicyStopHumanFeedback{
-			InputID: stopDecimal(input.ID), Body: textPtr(input.Body), CreatedAt: stopTime(input.CreatedAt), GateBinding: textPtr(input.GateBinding), GateRevision: stopOptionalDecimal(input.GateRevision),
-			ConsumedAt: stopTime(input.ConsumedAt), ConsumedClaimGeneration: stopOptionalDecimal(input.ConsumedClaimGeneration), ConsumedWorkerID: stopUUID(input.ConsumedWorkerID),
-			AppliedAt: stopTime(input.AppliedAt), IncludedAt: stopTime(input.IncludedAt), InclusionReported: input.InclusionReported, Disposition: textPtr(input.Disposition),
-			SettledAt: stopTime(input.SettledAt), SupersededByStopInputID: stopOptionalDecimal(input.SupersededByStopInputID)})
+		m.HumanFeedback = append(m.HumanFeedback, policyStopHumanSnapshot(input))
 	}
+	var metadata struct {
+		Receipt *revisionRetryReceipt `json:"revision_retry_receipt"`
+	}
+	if !noGate {
+		if json.Unmarshal(r.GatePresentedPayload, &metadata) != nil {
+			return bad()
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(r.GatePresentedPayload, &fields) != nil {
+			return bad()
+		}
+		if _, present := fields["revision_retry_receipt"]; present && metadata.Receipt == nil {
+			return bad()
+		}
+	}
+	var historyID *apitypes.PolicyStopDecimal
 	if !primaryFound {
+		historyID = source.PrimaryRevision.InputID
+	} else if metadata.Receipt != nil {
+		id := stopDecimal(metadata.Receipt.RevisionInputID)
+		historyID = &id
+	}
+	if historyID != nil {
+		history, valid, err := policyStopHumanHistory(ctx, qtx, r, *historyID)
+		if err != nil {
+			return m, err
+		}
+		if !valid {
+			return bad()
+		}
+		for _, input := range history {
+			m.HumanFeedback = append(m.HumanFeedback, policyStopHumanSnapshot(input))
+		}
+	}
+	slices.SortFunc(m.HumanFeedback, func(a, b apitypes.PolicyStopHumanFeedback) int {
+		ai, _ := strconv.ParseInt(string(a.InputID), 10, 64)
+		bi, _ := strconv.ParseInt(string(b.InputID), 10, 64)
+		return cmp.Compare(ai, bi)
+	})
+	if !policyStopHumanSnapshotsValid(m) {
 		return bad()
 	}
 	refs := append([]apitypes.PolicyRevisionRef{}, source.AssociatedCrossChecks...)
@@ -279,7 +318,7 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		if err != nil {
 			return m, err
 		}
-		if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 ||
+		if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 || cc.LeadClaimGeneration > r.ClaimGeneration || cc.RevisionSupersededByStopInputID.Valid ||
 			(cc.Verdict != "revise" && cc.Verdict != "approve") || !cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid {
 			return bad()
 		}
@@ -291,10 +330,12 @@ func policyStopManifestLocked(ctx context.Context, qtx *store.Queries, r store.R
 		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
 			return bad()
 		}
-		projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
-		projected, err := projection.canonicalJSON()
-		if err != nil || !bytes.Equal(a, projected) {
-			return bad()
+		if selected != nil && *selected == id.String() {
+			projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}
+			projected, err := projection.canonicalJSON()
+			if err != nil || !bytes.Equal(a, projected) {
+				return bad()
+			}
 		}
 		if source.PrimaryRevision != nil && source.PrimaryRevision.CrossCheckID != nil && *source.PrimaryRevision.CrossCheckID == id.String() && cc.Verdict != "revise" {
 			return bad()
@@ -354,6 +395,110 @@ func policyStopManifestToken(m apitypes.PolicyStopManifest) (string, error) {
 	sum := sha256.Sum256(canonical)
 	return fmt.Sprintf("\"policy-stop-v1-%x\"", sum), nil
 }
+
+// policyStopHumanHistory reads only the active identity and its canonical finite
+// predecessor set. Each is attempted once; any bad proof stops sibling reads and
+// database errors abort the caller's transaction.
+func policyStopHumanHistory(ctx context.Context, q *store.Queries, r store.Run, active apitypes.PolicyStopDecimal) ([]store.RunUserInput, bool, error) {
+	id, err := strconv.ParseInt(string(active), 10, 64)
+	if err != nil || active.Validate() != nil {
+		return nil, false, nil
+	}
+	activeRow, err := q.GetPolicyStopRevisionInput(ctx, store.GetPolicyStopRevisionInputParams{RunID: r.ID, InputID: id})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return policyStopHumanHistoryFromActive(ctx, q, r, activeRow)
+}
+
+// Validate the already-read active proof before visiting its finite, ordered
+// predecessor set. A negative proof stops sibling reads; no identity is retried.
+func policyStopHumanHistoryFromActive(ctx context.Context, q *store.Queries, r store.Run, activeRow store.RunUserInput) ([]store.RunUserInput, bool, error) {
+	receipt, valid := policyStopHistoryReceipt(r.GatePresentedPayload, activeRow.ID, r.GateRevision)
+	if !valid || !policyStopHumanHistorySnapshot(policyStopHumanSnapshot(activeRow), stopDecimal(receipt.SourceRevision), stopDecimal(r.ClaimGeneration), true) {
+		return nil, false, nil
+	}
+	rows := make([]store.RunUserInput, 0, len(receipt.SupersededIDs)+1)
+	for _, inputID := range receipt.SupersededIDs {
+		row, err := q.GetPolicyStopRevisionInput(ctx, store.GetPolicyStopRevisionInputParams{RunID: r.ID, InputID: inputID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		snapshot := policyStopHumanSnapshot(row)
+		if !policyStopHumanHistorySnapshot(snapshot, stopDecimal(receipt.SourceRevision), stopDecimal(r.ClaimGeneration), false) {
+			return nil, false, nil
+		}
+		if row.ConsumedWorkerID != activeRow.ConsumedWorkerID || row.ConsumedClaimGeneration != activeRow.ConsumedClaimGeneration || !row.AppliedAt.Time.Equal(activeRow.AppliedAt.Time) {
+			return nil, false, nil
+		}
+		rows = append(rows, row)
+	}
+	return append(rows, activeRow), true, nil
+}
+
+// Receipt metadata is outside the gate digest, so validate its complete closed
+// structure independently. APPLIED alone never proves publication linkage.
+func policyStopHistoryReceipt(raw []byte, active, gate int64) (revisionRetryReceipt, bool) {
+	var receipt revisionRetryReceipt
+	if policyStopUniqueJSON(raw) != nil {
+		return receipt, false
+	}
+	var metadata map[string]json.RawMessage
+	if json.Unmarshal(raw, &metadata) != nil {
+		return receipt, false
+	}
+	encoded, ok := metadata["revision_retry_receipt"]
+	if !ok {
+		return receipt, false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(encoded, &fields) != nil || len(fields) < 2 || len(fields) > 3 {
+		return receipt, false
+	}
+	for key, value := range fields {
+		if key != "source_revision" && key != "revision_input_id" && key != "superseded_revision_input_ids" {
+			return receipt, false
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return receipt, false
+		}
+	}
+	if _, ok := fields["source_revision"]; !ok {
+		return receipt, false
+	}
+	if _, ok := fields["revision_input_id"]; !ok {
+		return receipt, false
+	}
+	if json.Unmarshal(encoded, &receipt) != nil || active <= 0 || active > maxSafeRevisionID ||
+		receipt.RevisionInputID != active || receipt.SourceRevision <= 0 || receipt.SourceRevision >= gate ||
+		len(receipt.SupersededIDs) > 1000 {
+		return receipt, false
+	}
+	previous := int64(0)
+	for _, id := range receipt.SupersededIDs {
+		if id <= previous || id >= active {
+			return receipt, false
+		}
+		previous = id
+	}
+	return receipt, true
+}
+
+func policyStopHumanSnapshot(input store.RunUserInput) apitypes.PolicyStopHumanFeedback {
+	return apitypes.PolicyStopHumanFeedback{
+		InputID: stopDecimal(input.ID), Body: textPtr(input.Body), CreatedAt: stopTime(input.CreatedAt),
+		GateBinding: textPtr(input.GateBinding), GateRevision: stopOptionalDecimal(input.GateRevision),
+		ConsumedAt: stopTime(input.ConsumedAt), ConsumedClaimGeneration: stopOptionalDecimal(input.ConsumedClaimGeneration), ConsumedWorkerID: stopUUID(input.ConsumedWorkerID),
+		AppliedAt: stopTime(input.AppliedAt), IncludedAt: stopTime(input.IncludedAt), InclusionReported: input.InclusionReported,
+		Disposition: textPtr(input.Disposition), SettledAt: stopTime(input.SettledAt), SupersededByStopInputID: stopOptionalDecimal(input.SupersededByStopInputID)}
+}
+
 func stopDecimal(v int64) apitypes.PolicyStopDecimal {
 	return apitypes.PolicyStopDecimal(strconv.FormatInt(v, 10))
 }

@@ -114,6 +114,9 @@ func (s *Service) confirmPolicyStop(ctx context.Context, owner, runID uuid.UUID,
 	// Validate IDs before the first write. No float conversion participates in identity.
 	humanIDs := make([]int64, 0, len(manifest.HumanFeedback))
 	for _, feedback := range manifest.HumanFeedback {
+		if feedback.AppliedAt != nil {
+			continue
+		}
 		if feedback.InputID.Validate() != nil {
 			return out, stopReviewConflict("policy_stop_review_unverifiable")
 		}
@@ -224,6 +227,9 @@ func policyStopReceipt(record policyStopResolutionV1, repeated bool) *apitypes.P
 	}
 	refs := make([]apitypes.PolicyRevisionRef, 0, len(record.Manifest.HumanFeedback)+len(record.Manifest.CrossCheckFeedback))
 	for _, human := range record.Manifest.HumanFeedback {
+		if human.AppliedAt != nil {
+			continue
+		}
 		id := human.InputID
 		refs = append(refs, apitypes.PolicyRevisionRef{Source: "run_user_input", InputID: &id})
 	}
@@ -277,6 +283,29 @@ func parsePolicyStopResolution(raw []byte, owner, runID uuid.UUID) (policyStopRe
 			return bad()
 		}
 	}
+	humanRaw := manifestFields["human_feedback"]
+	if bytes.Equal(bytes.TrimSpace(humanRaw), []byte("null")) {
+		return bad()
+	}
+	var humanFields []map[string]json.RawMessage
+	if json.Unmarshal(humanRaw, &humanFields) != nil {
+		return bad()
+	}
+	humanKeys := []string{"input_id", "body", "created_at", "gate_binding", "gate_revision", "consumed_at", "consumed_claim_generation", "consumed_worker_id", "applied_at", "included_at", "inclusion_reported", "disposition", "settled_at", "superseded_by_stop_input_id"}
+	for _, fields := range humanFields {
+		if len(fields) != len(humanKeys) {
+			return bad()
+		}
+		for _, key := range humanKeys {
+			if _, present := fields[key]; !present {
+				return bad()
+			}
+		}
+		reported := bytes.TrimSpace(fields["inclusion_reported"])
+		if !bytes.Equal(reported, []byte("true")) && !bytes.Equal(reported, []byte("false")) {
+			return bad()
+		}
+	}
 	selection, present := manifestFields["candidate_cross_check_id"]
 	var selected *string
 	if !present || json.Unmarshal(selection, &selected) != nil {
@@ -302,11 +331,131 @@ func parsePolicyStopResolution(raw []byte, owner, runID uuid.UUID) (policyStopRe
 		m.Execution.ProposedCeiling <= 0 || !policyStopConfirmationToken.MatchString(record.IfMatch) {
 		return bad()
 	}
+	if !policyStopHumanSnapshotsValid(m) {
+		return bad()
+	}
 	token, err := policyStopManifestToken(m)
 	if err != nil || token != record.IfMatch {
 		return bad()
 	}
 	return record, nil
+}
+
+// policyStopHumanHistorySnapshot validates persisted #3001 settlement shape.
+// An active row has no disposition; linked predecessors have exactly superseded.
+func policyStopHumanHistorySnapshot(h apitypes.PolicyStopHumanFeedback, origin, generation apitypes.PolicyStopDecimal, active bool) bool {
+	if h.InputID.Validate() != nil || h.CreatedAt == nil || h.CreatedAt.IsZero() ||
+		h.GateBinding == nil || *h.GateBinding != "bound" || h.GateRevision == nil || *h.GateRevision != origin ||
+		h.AppliedAt == nil || h.AppliedAt.IsZero() || h.IncludedAt != nil ||
+		h.SettledAt != nil || h.SupersededByStopInputID != nil || h.ConsumedAt == nil || h.ConsumedAt.IsZero() ||
+		h.ConsumedWorkerID == nil || h.ConsumedClaimGeneration == nil || h.ConsumedClaimGeneration.Validate() != nil {
+		return false
+	}
+	worker, err := uuid.Parse(*h.ConsumedWorkerID)
+	consumed, e1 := strconv.ParseInt(string(*h.ConsumedClaimGeneration), 10, 64)
+	current, e2 := strconv.ParseInt(string(generation), 10, 64)
+	if err != nil || worker == uuid.Nil || worker.String() != *h.ConsumedWorkerID || e1 != nil || e2 != nil || consumed > current {
+		return false
+	}
+	if active {
+		return h.Disposition == nil
+	}
+	return h.Disposition != nil && *h.Disposition == "superseded"
+}
+
+// Immutable retry parsing has no mutable reads. Distinguish pending waivers from
+// history by their complete snapshot shape, never by an APPLIED-only heuristic.
+func policyStopHumanSnapshotsValid(m apitypes.PolicyStopManifest) bool {
+	seen := map[apitypes.PolicyStopDecimal]bool{}
+	var active *apitypes.PolicyStopHumanFeedback
+	for i := range m.HumanFeedback {
+		h := &m.HumanFeedback[i]
+		if h.InputID.Validate() != nil || seen[h.InputID] || h.CreatedAt == nil || h.CreatedAt.IsZero() {
+			return false
+		}
+		seen[h.InputID] = true
+		if h.AppliedAt != nil && h.Disposition == nil {
+			if active != nil {
+				return false
+			}
+			active = h
+		}
+	}
+	primary := m.SourceContext.PrimaryRevision
+	if primary != nil && primary.InputID != nil && !seen[*primary.InputID] {
+		return false
+	}
+	if len(m.HumanFeedback) > 0 && m.Gate == nil {
+		return false
+	}
+	if active != nil && (active.GateRevision == nil || !policyStopHumanHistorySnapshot(*active, *active.GateRevision, m.ReviewGeneration, true)) {
+		return false
+	}
+	for _, h := range m.HumanFeedback {
+		isPrimary := primary != nil && primary.InputID != nil && *primary.InputID == h.InputID
+		if h.AppliedAt != nil {
+			if active == nil || active.GateRevision == nil || m.Gate == nil {
+				return false
+			}
+			origin, e1 := strconv.ParseInt(string(*active.GateRevision), 10, 64)
+			gate, e2 := strconv.ParseInt(string(m.Gate.Revision), 10, 64)
+			if e1 != nil || e2 != nil || origin <= 0 || origin >= gate ||
+				!policyStopHumanHistorySnapshot(h, *active.GateRevision, m.ReviewGeneration, h.InputID == active.InputID) {
+				return false
+			}
+			id, _ := strconv.ParseInt(string(h.InputID), 10, 64)
+			activeID, _ := strconv.ParseInt(string(active.InputID), 10, 64)
+			if h.InputID != active.InputID && (id >= activeID || !h.AppliedAt.Equal(*active.AppliedAt) ||
+				*h.ConsumedWorkerID != *active.ConsumedWorkerID || *h.ConsumedClaimGeneration != *active.ConsumedClaimGeneration) {
+				return false
+			}
+			if isPrimary && h.InputID != active.InputID {
+				return false
+			}
+			continue
+		}
+		if h.IncludedAt != nil || h.Disposition != nil || h.SettledAt != nil || h.SupersededByStopInputID != nil {
+			return false
+		}
+		if h.GateBinding != nil && *h.GateBinding == "bound" {
+			if h.GateRevision == nil || *h.GateRevision != m.Gate.Revision {
+				return false
+			}
+		} else {
+			if h.GateBinding != nil && *h.GateBinding != "unbound" {
+				return false
+			}
+			if !isPrimary || h.ConsumedAt == nil || h.ConsumedWorkerID == nil || h.ConsumedClaimGeneration == nil ||
+				*h.ConsumedClaimGeneration != m.SourceGeneration {
+				return false
+			}
+			if h.GateRevision != nil {
+				origin, err := strconv.ParseInt(string(*h.GateRevision), 10, 64)
+				gate, _ := strconv.ParseInt(string(m.Gate.Revision), 10, 64)
+				if err != nil || origin < 0 || origin > gate {
+					return false
+				}
+			}
+		}
+		// Nullable delivery provenance is an all-or-nothing tuple.
+		delivered := h.ConsumedAt != nil
+		if isPrimary && !delivered {
+			return false
+		}
+		if delivered != (h.ConsumedWorkerID != nil) || delivered != (h.ConsumedClaimGeneration != nil) {
+			return false
+		}
+		if delivered {
+			worker, err := uuid.Parse(*h.ConsumedWorkerID)
+			gen, e1 := strconv.ParseInt(string(*h.ConsumedClaimGeneration), 10, 64)
+			current, e2 := strconv.ParseInt(string(m.ReviewGeneration), 10, 64)
+			if h.ConsumedAt.IsZero() || err != nil || worker == uuid.Nil || worker.String() != *h.ConsumedWorkerID ||
+				h.ConsumedClaimGeneration.Validate() != nil || e1 != nil || e2 != nil || gen > current {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // policyStopUniqueJSON traverses only the supplied JSON bytes, once, without I/O.

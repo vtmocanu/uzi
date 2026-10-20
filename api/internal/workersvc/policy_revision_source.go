@@ -273,20 +273,27 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 			return false, nil
 		}
 		// Exact identity lookup, never the capped run-input history.
-		var valid bool
-		err = tx.QueryRow(ctx, `SELECT (
-   run_id=$2 AND kind='revise_plan' AND consumed_at IS NOT NULL
-   AND consumed_worker_id=$3 AND consumed_claim_generation=$4
-   AND applied_at IS NULL AND included_at IS NULL AND settled_at IS NULL
-   AND disposition IS NULL AND superseded_by_stop_input_id IS NULL
-   AND ((gate_binding='bound' AND gate_revision=$5 AND $5>0)
-     OR ((gate_binding IS NULL OR gate_binding='unbound')
-       AND (gate_revision IS NULL OR gate_revision=$5)))
-  ) IS TRUE FROM run_user_inputs WHERE id=$1`, id, r.ID, w.ID, r.ClaimGeneration, r.GateRevision).Scan(&valid)
+		q := store.New(tx)
+		row, err := q.GetPolicyStopRevisionInput(ctx, store.GetPolicyStopRevisionInputParams{RunID: r.ID, InputID: id})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
-		return valid, err
+		if err != nil {
+			return false, err
+		}
+		if !primary && row.AppliedAt.Valid {
+			_, valid, err := policyStopHumanHistoryFromActive(ctx, q, r, row)
+			return valid, err
+		}
+		bound := row.GateBinding.Valid && row.GateBinding.String == "bound" &&
+			row.GateRevision.Valid && row.GateRevision.Int64 == r.GateRevision && r.GateRevision > 0
+		unbound := (!row.GateBinding.Valid || row.GateBinding.String == "unbound") &&
+			(!row.GateRevision.Valid || row.GateRevision.Int64 == r.GateRevision)
+		return row.RunID == r.ID && row.Kind == "revise_plan" && row.ConsumedAt.Valid &&
+			row.ConsumedWorkerID.Valid && uuid.UUID(row.ConsumedWorkerID.Bytes) == w.ID &&
+			row.ConsumedClaimGeneration.Valid && row.ConsumedClaimGeneration.Int64 == r.ClaimGeneration &&
+			!row.AppliedAt.Valid && !row.IncludedAt.Valid && !row.SettledAt.Valid &&
+			!row.Disposition.Valid && !row.SupersededByStopInputID.Valid && (bound || unbound), nil
 	}
 	id, err := uuid.Parse(*ref.CrossCheckID)
 	if err != nil {
@@ -299,7 +306,7 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 	if err != nil {
 		return false, err
 	}
-	if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 ||
+	if cc.LeadRunID != r.ID || cc.Stage != "plan" || cc.Round < 1 || cc.LeadClaimGeneration <= 0 || cc.LeadClaimGeneration > r.ClaimGeneration ||
 		!cc.DecidedAt.Valid || cc.RevisionSettledAt.Valid || cc.RevisionDisposition.Valid ||
 		cc.RevisionSupersededByStopInputID.Valid || (cc.Verdict != "revise" && cc.Verdict != "approve") {
 		return false, nil
@@ -316,7 +323,7 @@ func policyRevisionWitness(ctx context.Context, tx pgx.Tx, r store.Run, w store.
 	if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
 		return false, nil
 	}
-	if r.GateRevision == 0 {
+	if !primary || r.GateRevision == 0 {
 		return true, nil
 	}
 	projection := gatePresentedPayload{PlanMd: textPtr(cc.PlanMd), Milestones: cc.Milestones, RequiredCapabilities: capability.Filter(cc.RequiredCapabilities), RequiredTools: capability.FilterTools(cc.RequiredTools), SizeClass: nonEmptyPtr(cc.SizeClass.String)}

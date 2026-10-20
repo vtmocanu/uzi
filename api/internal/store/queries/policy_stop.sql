@@ -88,6 +88,12 @@ WHERE run_id = $1 AND kind = 'revise_plan'
   AND disposition IS DISTINCT FROM 'superseded_by_stop'
 ORDER BY id;
 
+-- name: GetPolicyStopRevisionInput :one
+-- Exact finite receipt evidence, including application and inclusion provenance.
+SELECT * FROM run_user_inputs
+WHERE run_id = sqlc.arg(run_id)::uuid AND id = sqlc.arg(input_id)::bigint
+ AND kind = 'revise_plan';
+
 -- name: HasPolicyRevisionHistory :one
 -- The caller holds the parent run lock. Recorded revision history prevents an
 -- unknown source from regaining legacy approval after a plan frame or reclaim.
