@@ -462,3 +462,40 @@ for (const mutation of ["earlier source sibling", "earlier output sibling", "sou
     assert.equal(f.callbacks(), 0);
   });
 }
+
+// Issue #3031: directory listing order is filesystem-defined (ext4 hashes names per filesystem).
+// Pin both orders so a source control change is refused whether the walk reaches objects/info
+// before or after the change, not only in the order a given test filesystem happens to list.
+for (const order of ["info first", "info last"] as const) {
+  test("snapshot final proof refuses a source control change with " + order + " in the listing", async t => {
+    const f = await fixture(t);
+    const opendir = fs.opendir.bind(fs);
+    t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {
+      const dir = await opendir(...args);
+      const entries: Array<{ name: unknown }> = [];
+      for (let ent = await dir.read(); ent; ent = await dir.read()) entries.push(ent as { name: unknown });
+      const info = (e: { name: unknown }) => String(e.name) === "info";
+      entries.sort((a, b) => order === "info first" ? Number(info(b)) - Number(info(a)) : Number(info(a)) - Number(info(b)));
+      return { read: async () => entries.shift() ?? null, close: () => dir.close() } as unknown as Awaited<ReturnType<typeof fs.opendir>>;
+    });
+    let previous: string | undefined, changed = false;
+    const objects = path.join(f.clone, ".git", "objects");
+    f.hooks.open = (file, p) => {
+      if (!p.startsWith(path.join(f.git.recoveryRoot, "unit", "source") + "/")) return;
+      const write = file.write.bind(file);
+      t.mock.method(file, "write", async (...args: Parameters<typeof file.write>) => {
+        if (!changed && previous && previous !== p) {
+          await fs.mkdir(path.join(objects, "info"), { recursive: true });
+          await fs.writeFile(path.join(objects, "info", "alternates"), "");
+          changed = true;
+        }
+        previous = p;
+        return write(...args);
+      });
+    };
+    await assert.rejects(f.run(() => f.seam()), /maintenance_object_snapshot_refused/);
+    assert.equal(changed, true, "intended fixture mutation must complete before guard refusal");
+    assert.equal(f.requests.length, 0, "no rev-list, pack producer or verifier launch");
+    assert.equal(f.callbacks(), 0);
+  });
+}

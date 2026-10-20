@@ -12247,14 +12247,24 @@ try {
       }
       throw refused();
     };
+    // Omitted (tolerated) source controls are pinned at their first observation. Every later
+    // probe must see the same state, so a change is refused whether the walk lists objects/info
+    // before or after it: directory order is filesystem-defined (ext4 hashes names per filesystem).
+    const omittedControls = new Map<string, Stat | null>();
+    const sameOmitted = (key: string, now: Stat | null) => {
+      if (!omittedControls.has(key)) { omittedControls.set(key, now); return; }
+      const first = omittedControls.get(key)!;
+      if ((first === null) !== (now === null) || (first && now && !unchanged(first, now))) throw refused();
+    };
     const controlsAbsent = async (objects: Pin, omit = false) => {
       const p = child(objects, "info");
       let info: Stat;
       try { info = await stat(p, objects.output); }
       catch (error) {
         check();
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-        throw error;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        if (omit) for (const name of ["alternates", "http-alternates"]) sameOmitted(objects.absolute + "\0" + name, null);
+        return;
       }
       if (!info.isDirectory() || info.isSymbolicLink()) throw refused();
       // Pin even this preliminary control lookup: no symlink-following probe.
@@ -12263,13 +12273,15 @@ try {
         const control = child(d, name);
         if (!omit) { await absent(control, objects.output); continue; }
         // Non-authoritative metadata only: never open, readlink, read or follow it.
+        let s: Stat | null = null;
         try {
-          const s = await stat(control, false);
+          s = await stat(control, false);
           if (!s.isFile() && !s.isSymbolicLink() && !s.isFIFO()) throw refused();
         } catch (error) {
           check();
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
+        sameOmitted(objects.absolute + "\0" + name, s);
       }
     };
     const createDirectory = async (parent: Pin, name: string, absolute: string, source: Pin) => {
