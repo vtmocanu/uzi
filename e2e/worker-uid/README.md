@@ -146,10 +146,10 @@ subPath layout under real uids. Nothing is stubbed: the controller's golden runn
 (`controller/internal/kube/testdata/runner-shared-init.sh`, mounted read-only; only its
 `/data-seed` and marker paths are substituted) and the working-tree
 `agent/templates/entrypoint.sh` (its real root window, real `setpriv` drop and `tini`) run unmodified,
-and every other identity is made with `setpriv` as `agent/src/runner-uid.ts` does (`setprivArgsForUid`
+and every other identity is made with `setpriv` using the argv `agent/src/runner-uid.ts` builds (`setprivArgsForUid`
 for runner 10002 and runner-cmd 10003 with `--init-groups`, the entrypoint's own final drop for the
 split worker, a capless 10001 for the single-uid worker, uid 1000 with supplementary gid 10001 for the
-dind uid, uids 0 and 101000 for daemon-written content). The leaves are:
+dind uid, uids 0 and 101000 for daemon-written content). The argv is production's, but it is spawned from root (which holds SETPCAP), so the capability bounding set differs from production; no DAC outcome depends on it. The leaves are:
 
 - the image layout marker gate: a missing, empty, wrong or symlinked marker, or a directory in its
   place, makes runner-init refuse before any write (the seed volume is byte-for-byte unchanged);
@@ -175,11 +175,11 @@ dind uid, uids 0 and 101000 for daemon-written content). The leaves are:
   sequence and overlapping, one workload live while the other layout boots: neither re-owns, wipes or
   follows into the other's tree, and a hostile link between the layouts is refused;
 - foreign-owned run-directory content (uid 0, 1000 and 101000: directories holding files, a non-writable
-  directory, a sticky directory, loose files, and a live foreign writer) under the production retention delete
+  directory, a sticky directory, loose files in the non-sticky 0777 `out` directory, and a live foreign writer) under the production retention delete
   (`GitCache.deleteRetainedArtifact`) in split mode (the real `setpriv`-to-runner `rm -rf`) and single-uid
   mode (in-process `fs.rm`): with a vetoing writer guard nothing is touched and nothing is counted; with the
   guards open the artifact is retained, the undeletable counter rises by exactly one, the "could not delete
-  (not permitted)" diagnostic names the path and errno, and the foreign content keeps its owner, mode and inode.
+  (not permitted)" diagnostic names the path and errno, and the foreign content that cannot be removed (directories holding files, the non-writable and sticky directories, the live writer's file) keeps its owner, mode and inode; the loose files in the non-sticky 0777 `out` directory are removed.
 
 The container gets a 415-second watchdog plus five-second kill grace; each leaf has its own
 timeout of at most 115 seconds. Its results are checked against `shared-expected.json` like the

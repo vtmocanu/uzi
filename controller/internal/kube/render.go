@@ -873,7 +873,7 @@ echo "uzi-seed-nix: seeded"
 // runnerInitScript is the runner-init init container's program (issue #3153).
 //
 // It is golden-pinned byte for byte (testdata/runner-shared-init.sh). The single-uid
-// (non-root) branch and the refusal paths are executed by the host test in
+// (non-root) branch and its symlink/non-directory/marker refusals are executed by the host test in
 // runner_init_exec_test.go; the root (uid-split) branch needs the worker and runner
 // users and is exercised by the worker-uid lane (e2e/worker-uid). Nothing user- or
 // api-supplied is interpolated.

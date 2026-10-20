@@ -1091,7 +1091,7 @@ func TestLayoutMigrationTeardownOnlyForNonDesiredWorkers(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a desired custody-held old-layout worker is never torn down", func(t *testing.T) {
+	t.Run("teardown never reaches a desired worker (the desired-set filter is the guard, custody or not)", func(t *testing.T) {
 		for _, stale := range []bool{false, true} {
 			objs, w := lmObjects(t, lmOpts{id: "d1", custody: true, stale: stale, layout: "old"})
 			f := lmCluster(t, true, objs...)

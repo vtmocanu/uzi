@@ -138,7 +138,7 @@ func TestRunnerInitExecFreshVolumeCreatesStickyRunnerSharedAndTmp(t *testing.T) 
 		t.Errorf(".tmp not a directory: %v", err)
 	}
 	for _, p := range []string{repoFile, oldFile} {
-		if b, err := os.ReadFile(p); err != nil || string(b) != "data" {
+		if b, err := os.ReadFile(p); err != nil || string(b) != "data" { //nolint:gosec // G304: reads a path under the test temp volume.
 			t.Errorf("sibling %s changed: %q %v", p, b, err)
 		}
 	}

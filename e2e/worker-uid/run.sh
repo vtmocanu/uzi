@@ -165,7 +165,8 @@ run_single 3 profile:capBnd capBnd --security-opt no-new-privileges --cap-add CH
 # exactly the entrypoint's startup capability set (no FOWNER, no FSETID), no network, on tmpfs
 # /data and /nix. The working-tree entrypoint and the controller's golden runner-init script run
 # unmodified inside it; every other identity (worker split/single, runner, runner-cmd, the dind
-# uid, foreign daemon uids) is created with setpriv exactly as agent/src/runner-uid.ts does.
+# uid, foreign daemon uids) is created with setpriv using agent/src/runner-uid.ts's argv (spawned
+# from root, which holds SETPCAP, so CapBnd differs from production; no DAC outcome depends on it).
 shared_rc=0
 shared_checker_rc=0
 shared_name="$NAME-shared"

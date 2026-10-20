@@ -294,6 +294,7 @@ test("runner-init as root builds worker:runner 3775 with a worker:worker 0755 .t
   const seedBefore = snapshot(seed);
   const script = adaptedInit(base, seed, REAL_MARKER);
 
+  let tmpAfterFresh: string | undefined;
   for (const round of ["fresh", "second run"]) {
     const r = runInit(script);
     assert.equal(r.status, 0, `${round}: ${r.stderr}`);
@@ -304,6 +305,11 @@ test("runner-init as root builds worker:runner 3775 with a worker:worker 0755 .t
     assert.equal(owner(path.join(shared, ".tmp")), `${WORKER_UID}:${WORKER_UID}`, `${round}: .tmp is worker:worker`);
     assert.equal(mode(path.join(shared, ".tmp")).toString(8), "755", `${round}: .tmp mode`);
     assert.deepEqual(fs.readdirSync(shared), [".tmp"]);
+    // The second run must neither recreate nor re-own .tmp: same inode, owner and mode as after round 1.
+    const tmpStat = fs.lstatSync(path.join(shared, ".tmp"));
+    const tmpIdentity = `${tmpStat.ino}:${tmpStat.uid}:${tmpStat.gid}:${(tmpStat.mode & 0o7777).toString(8)}`;
+    if (tmpAfterFresh === undefined) tmpAfterFresh = tmpIdentity;
+    else assert.equal(tmpIdentity, tmpAfterFresh, `${round}: .tmp (ino:uid:gid:mode) is unchanged from the fresh run`);
     assertSame(snapshot(old), oldBefore, `${round}: the old root-owned runner directory`);
     assertSame(snapshot(sibling), siblingBefore, `${round}: sibling data`);
     const seedNow = snapshot(seed);
@@ -402,6 +408,17 @@ test("the runner, runner-cmd and dind uids cannot replace .tmp or runner-shared 
   ]);
   assert.deepEqual(made.results.map((r) => r.ok), [true, true, true]);
   assert.equal(owner(rundir), `${WORKER_UID}:${RUNNER_UID}`, "a worker-made run directory inherits group runner");
+  // A worker-owned empty directory and file directly in the sticky runner-shared: removing them
+  // is refused by the sticky bit (EPERM) for the runner group, and by the missing write bit on
+  // the parent (EACCES) for the fsGroup-only dind uid; neither can succeed, and neither is an
+  // EEXIST/ENOTEMPTY/EISDIR failure that a fully privileged caller would also see.
+  const topDir = path.join(shared, "worker-empty-dir");
+  const topFile = path.join(shared, "worker-top-file");
+  const topMade = probeAs(identities.workerSplit, [
+    { op: "mkdir", path: topDir, mode: 0o775 },
+    { op: "create", path: topFile },
+  ]);
+  assert.deepEqual(topMade.results.map((r) => r.ok), [true, true]);
 
   const before = { shared: snapshot(shared), data: snapshot(data) };
   const cases: [string, string[], number[], number[]][] = [
@@ -413,9 +430,10 @@ test("the runner, runner-cmd and dind uids cannot replace .tmp or runner-shared 
   for (const [name, who, present, absent] of cases) {
     const attempts: [string, object][] = [
       ["rename .tmp away", { op: "rename", from: tmp, to: tmp + ".moved" }],
-      ["rmdir .tmp", { op: "rmdir", path: tmp }],
-      ["unlink .tmp", { op: "unlink", path: tmp }],
-      ["plant a symlink at .tmp", { op: "symlink", target: "/", path: tmp }],
+      ["rmdir an empty worker-owned directory in sticky runner-shared", { op: "rmdir", path: topDir }],
+      ["unlink a worker-owned file in sticky runner-shared", { op: "unlink", path: topFile }],
+      // A new name inside .tmp (worker:worker 0755): nothing exists there, so only the permission check can fail.
+      ["plant a symlink at a new name inside .tmp", { op: "symlink", target: "/", path: path.join(tmp, "planted-link") }],
       ["rename a worker-owned run directory away", { op: "rename", from: rundir, to: rundir + ".moved" }],
       ["delete the worker's file inside .tmp", { op: "unlink", path: path.join(tmp, "worker-file") }],
       ["create inside .tmp", { op: "create", path: path.join(tmp, "planted") }],
@@ -434,7 +452,9 @@ test("the runner, runner-cmd and dind uids cannot replace .tmp or runner-shared 
     for (const group of present) assert.ok(effective.includes(group), `${name}: groups ${effective} lack ${group}`);
     for (const group of absent) assert.ok(!effective.includes(group), `${name}: groups ${effective} must not include ${group}`);
     for (const [index, [what]] of attempts.entries()) {
-      assert.notEqual(denied(outcome, index), undefined, `${name}: "${what}" must be denied`);
+      // EACCES (no write permission on the parent) or EPERM (sticky bit): a permission refusal,
+      // not EEXIST/ENOTEMPTY/EISDIR, which a fully privileged caller would also get.
+      assert.match(denied(outcome, index) ?? "ok", /^(EACCES|EPERM)$/, `${name}: "${what}" must be refused by permission`);
     }
   }
   assertSame(snapshot(shared), before.shared, "runner-shared after every replacement attempt");

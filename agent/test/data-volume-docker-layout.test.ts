@@ -56,6 +56,7 @@ describe("data-volume capacity under the Docker lane layout (#3153)", () => {
       `the production runner clone path ${worktree} lies under <dataDir>/runner`);
 
     const stat = layoutStat(config.dataDir);
+    // Fixture sanity checks (the fake stat maps every path under dataDir to VOLUME_DEV by construction); not production pins.
     assert.equal((await stat(config.dataDir)).dev, (await stat(path.join(config.dataDir, "runner"))).dev);
     assert.equal((await stat(worktree)).dev, VOLUME_DEV);
 

@@ -15,7 +15,9 @@ import (
 // worker holding a durable-recovery custody hold (DesiredWorker.CustodyHeld) is
 // custody-held run state. migrationHeld is the ONE predicate the controller's
 // pod-replacing roll and recycle paths ask; none of them may re-derive it. (Fenced
-// DinD maintenance and teardown are guarded by CustodyHeld directly instead.)
+// DinD maintenance is guarded by CustodyHeld directly instead; teardown has no
+// custody check of its own and relies on the api keeping a custody-held worker in
+// the desired set, see the teardown doc in materializer.go.)
 //
 // This is a narrow exception to the operator's emergency DrainPolicy.ForceRoll: a
 // force-roll is consent to requeue a busy run, not to discard custody-held state.
@@ -100,9 +102,11 @@ func migrationHeld(w protocol.DesiredWorker, layout runnerLayout) bool {
 const layoutMigrationReason = "layout_migration_custody"
 
 // surfaceEphemeralLayoutHold records a pacing outcome for a run-bound (ephemeral)
-// worker whose drifted template replacement the layout guard is withholding, so the
-// held state reaches the fleet report like any other worker's. planRoll skips
-// ephemeral workers, so without this a migration-held run-bound worker has no entry.
+// worker whose drifted template replacement the layout guard is withholding. The
+// held state reaches the fleet report only when the worker also has an observed
+// roll-health row (report() attaches pacing only to rows with a phase; ephemeral
+// workers get no synthetic row). planRoll skips ephemeral workers, so without this
+// a migration-held run-bound worker has no pacing entry.
 // It writes only t.outcomes: the worker joins no pool, takes no slot and is never
 // admitted. A worker that is not held, not drifted, not observed with a Deployment,
 // or whose template cannot be resolved gets no entry (the materializer's own drift
