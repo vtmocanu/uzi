@@ -94,6 +94,7 @@ timeout --kill-after=10s 120 docker run --rm --network none \
   --security-opt no-new-privileges \
   --read-only \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+  --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
   --name "$PROBE_NAME" \
   "$IMAGE" /usr/local/bin/uzi-codex-command-sandbox --probe > "$OUT/landlock-probe.log" 2>&1

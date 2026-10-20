@@ -11,6 +11,8 @@
 #   * read-only root filesystem (`--read-only`), read-only mounted fixtures,
 #   * exactly three explicit writable runtime mounts: runner-owned /nix, owned /data and
 #     per-uid /tmp (the entrypoint chowns/creates all three while the image root stays ro),
+#     plus the worker's dedicated command-cache carveout /var/cache/uzi-codex-cmd, which the
+#     entrypoint chowns to runner-cmd since #1619 (the same mount the m3b runner gained in #3114),
 #   * `--network none` (loopback only, for the localhost fake provider),
 #   * `--cap-drop ALL` + only the startup caps the A1 entrypoint needs, no-new-privileges.
 #
@@ -75,6 +77,7 @@ run_suites() {
     --security-opt no-new-privileges \
     --read-only \
     --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+    --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
     --entrypoint /usr/local/sbin/uzi-entrypoint \
     --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
     -e "UZI_TEST_REPORTERS=$REPORTERS" \

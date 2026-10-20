@@ -69,6 +69,10 @@ jobs:
       # One image per template; every leg reuses it. The agent-<t> packages are public, so the
       # release buildcache is read anonymously (no login, no packages permission), as in ci.yml.
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
+        env:
+          # No .dockerbuild record artifact: the run's artifacts are the proof verdicts only, so
+          # `gh run download` needs no per-artifact selection.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           file: agent/templates/${{ matrix.template }}/Dockerfile
