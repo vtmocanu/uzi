@@ -104,7 +104,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
+import { maintenanceEsbuildExecutable } from "./maintenance-bootstrap-executable.js";
 import { ATTEMPT_ID_RE, cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
 import { parseDockerTarget } from "./docker-wiring.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
@@ -606,17 +606,6 @@ export type QuiesceMode = "own" | "seed" | "capture";
 export interface MaintenanceBootstrapRoot extends RecordedRoot {
   parentPid: number;
   executable: string;
-}
-
-/** Resolve tsx's own native dependency without evaluating either package or
- * trusting PATH, .bin, argv, an override, or another top-level esbuild version. */
-function maintenanceEsbuildExecutable(): string {
-  if (process.env.ESBUILD_BINARY_PATH) throw new Error("maintenance bootstrap executable unproven");
-  const local = createRequire(import.meta.url);
-  const tsxManifest = local.resolve("tsx/package.json");
-  const esbuildManifest = createRequire(tsxManifest).resolve("esbuild/package.json");
-  if (process.arch !== "arm64" && process.arch !== "x64") throw new Error("maintenance bootstrap architecture unproven");
-  return fs.realpathSync(createRequire(esbuildManifest).resolve(`@esbuild/linux-${process.arch}/bin/esbuild`));
 }
 
 /** One synchronous snapshot at the FIRST statement of main, before any app
