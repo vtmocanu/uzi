@@ -9,6 +9,7 @@ import { deflateSync } from "node:zlib";
 import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
+import { formatResidueName } from "../src/attempt-path.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
@@ -1622,4 +1623,33 @@ test("pin: retained predecessor residue survives a simulated restart and is stil
   assert.ok(fs.existsSync(source.clonePath), "predecessor clone untouched by the restart");
   assert.ok(fs.existsSync(successor.path));
   assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+});
+
+// Issue #3153 (section 3a): the attempt ledger (the `uzi-attempts.<branch>.entry` values in the bare
+// repository) and a quarantined residue directory both live on the persistent runner volume, so a
+// fresh worker process must find them exactly as the predecessor left them. A restart reads and
+// reports them; it never rewrites a ledger entry or removes residue.
+test("pin: the attempt ledger and quarantined residue survive a simulated restart unchanged (#3153)", async () => {
+  const { successor } = await ready();
+  const ledgerKey = `uzi-attempts.${branch}.entry`;
+  const ledgerBefore = git(bare, ["config", "--get-all", ledgerKey]);
+  const entries = ledgerBefore.split("\n").map((line) => JSON.parse(line) as { attemptId: string; state: string; clonePath: string });
+  const live = entries.filter((e) => e.attemptId === aid(2));
+  assert.equal(live.at(-1)?.state, "live", "the successor attempt is journaled live before the restart");
+  assert.equal(live.at(-1)?.clonePath, successor.path);
+
+  const repoDir = path.dirname(source.clonePath);
+  const residue = path.join(repoDir, formatResidueName(key, "11111111-1111-4111-8111-111111111111"));
+  fs.mkdirSync(path.join(residue, "nested"), { recursive: true });
+  fs.writeFileSync(path.join(residue, "nested", "PRECIOUS"), "quarantined bytes\n");
+
+  for (let restart = 1; restart <= 2; restart++) {
+    const restarted = recreate();
+    const inventory = await restarted.readInventoryCloneHeads(bare, runId);
+    assert.equal(inventory.kind, "verified", `restart ${restart}`);
+    assert.equal(git(bare, ["config", "--get-all", ledgerKey]), ledgerBefore, `ledger untouched by restart ${restart}`);
+    assert.equal(fs.readFileSync(path.join(residue, "nested", "PRECIOUS"), "utf8"), "quarantined bytes\n", `residue survives restart ${restart}`);
+    assert.ok(fs.existsSync(source.clonePath), "predecessor clone untouched");
+    assert.ok(fs.existsSync(successor.path), "successor clone untouched");
+  }
 });

@@ -22,7 +22,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -1674,6 +1674,47 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
       assert.doesNotMatch(r.stderr, /per-uid scratch adopted/);
     } finally { fs.rmSync(h.root, { recursive: true, force: true }); }
   });
+
+  // Section 3b: a SEPARATE process keeps appending to a file inside a scratch leaf while the
+  // entrypoint runs (a lingering old pod, or a rootful daemon, shares the volume). An
+  // expected-owner 0700 leaf is adopted and preserved with the documented "writer exclusion not
+  // established" diagnostic: that is correct, not a defect. A leaf with a mismatched owner is
+  // refused with the contents untouched. Neither case may remove, re-own or re-mode anything.
+  for (const [name, env, expectStart] of [
+    ["adopts an expected-owner 0700 leaf under a live writer and preserves it", {}, true],
+    ["refuses a mismatched-owner leaf under a live writer and touches nothing", { STUB_OWNER_WORKER: "runner" }, false],
+  ] as const) {
+    it(name, async () => {
+      const l = lane((x) => { leaf(x.worker); leaf(x.runner); });
+      const writer = spawn(process.execPath, ["-e",
+        'setInterval(() => require("node:fs").appendFileSync("live.log", "tick\\n"), 10);'],
+        { cwd: l.worker, stdio: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+      const size = (): number => { try { return fs.statSync(path.join(l.worker, "live.log")).size; } catch { return 0; } };
+      const growsPast = async (n: number): Promise<number> => {
+        for (let i = 0; i < 250 && size() <= n; i++) await new Promise((r) => setTimeout(r, 20));
+        assert.ok(size() > n, "the live writer is appending");
+        return size();
+      };
+      try {
+        const first = await growsPast(0);
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve, ...env }); // blocks this process, not the writer
+        if (expectStart) {
+          assert.equal(r.status, 0, r.stderr);
+          assert.ok(r.stderr.includes(`uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): ${l.worker} entries=`), r.stderr);
+          assert.equal(r.env.get("TMPDIR"), l.worker);
+        } else {
+          assert.notEqual(r.status, 0);
+          assert.match(r.stderr, /owner is runner, expected worker/);
+        }
+        assert.deepEqual(touching(r.ops, l.worker, l.runner), [], "no op may touch either leaf");
+        assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0, "no rm");
+        assert.equal(fs.readFileSync(path.join(l.worker, "PRECIOUS"), "utf8"), "x");
+        assert.equal(fs.readFileSync(path.join(l.runner, "PRECIOUS"), "utf8"), "x");
+        assert.ok(fs.existsSync(path.join(l.worker, "nested")));
+        await growsPast(first); // still alive, still appending into the same leaf afterwards
+      } finally { writer.kill("SIGKILL"); cleanup(l); }
+    });
+  }
 
   it("(a2b) legacy migration re-owns runner children but skips the .tmp carve-out", () => {
     const l = lane((x) => { fs.mkdirSync(path.join(x.runnerRoot, "legacy-repo")); });
