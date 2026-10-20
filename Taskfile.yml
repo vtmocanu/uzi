@@ -348,6 +348,10 @@ tasks:
       # welded onto / bled into a db_psql scalar read is stripped (#1351). Tally-guarded like the two
       # siblings above so a gutted run cannot read green.
       - task: test:e2e-lib
+      # hermetic (~instant, fake docker, no daemon): the strict verdict of the scheduled Codex
+      # packaged proof (#3148), so a proof that skips, fails a control or loses its image identity
+      # cannot read green. Tally-guarded like test:e2e-lib.
+      - task: test:codex-proof-harness
       # Docker-free diagnostic regressions for the worker UID lane (#2397).
       - task: test:worker-uid-harness
       # hermetic (~instant): a fake `docker` on PATH, no daemon. Guards that
@@ -1055,6 +1059,28 @@ tasks:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
+
+  test:codex-proof-harness:
+    desc: hermetic regressions for the strict Codex packaged-proof verdict (TAP checker + run-proof.sh, no docker)
+    cmds:
+      # Real `node --test --test-reporter=tap` fixtures, so a reporter format change fails here.
+      - node --test e2e/codex-proof/check-node-tap.test.mjs
+      # Fake docker/timeout and fake legs; prints a mandatory `cases=N passed=N` tally.
+      - bash e2e/codex-proof/run-proof.test.sh
+
+  test:codex-proof:
+    desc: Opt-in strict packaged Codex O proof (M3b lifecycle, M3a profile + confinement suites) on base and jvm
+    # The maintainer and .github/workflows/codex-packaged-proof.yml entry point (#3148). Builds each
+    # real worker image once and runs every leg on it in strict mode (no skipped, todo or missing
+    # test passes); see e2e/codex-proof/run-proof.sh. Needs native linux/amd64, a docker daemon,
+    # Landlock available to containers, host node + go, and egress for a cold build. NOT wired
+    # into gate.
+    cmds:
+      - |
+        set -e
+        for template in base jvm; do
+          ./e2e/codex-proof/run-proof.sh "$template"
+        done
 
   test:forge-fake:
     desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
@@ -2688,10 +2714,16 @@ tasks:
       - ./scripts/deadcode-knip.sh agent
 
   typecheck:agent:
-    desc: tsc --noEmit over agent
+    desc: tsc --noEmit over agent plus the opt-in Codex M3a/M3b harnesses
     dir: agent
     cmds:
       - npm run typecheck
+      # The M3a/M3b packaged-proof harnesses run only in maintainer-opt-in targets
+      # (test:codex-m3a:*, test:codex-m3b:packaged), so CI never compiled them and their
+      # type drift surfaced only at native O-proof time (#3100). Each check takes under a
+      # second.
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3a/tsconfig.json
+      - ./node_modules/.bin/tsc --noEmit -p ../e2e/codex-m3b/tsconfig.json
 
   vulncheck:agent:
     desc: agent - npm audit at --audit-level=high over the FULL tree. NOT in `gate`

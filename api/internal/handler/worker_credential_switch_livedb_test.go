@@ -43,7 +43,7 @@ func TestWorkerCredentialSwitchSignalLiveDB(t *testing.T) {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetTxBeginner(pool) // REQUIRED: the fence opens a tx when a report carries a generation
 	h := &Handler{pool: pool, q: q, box: box, wsvc: wsvc}
 
@@ -167,7 +167,7 @@ func TestWorkerCredentialSwitchFailedAckLiveDB(t *testing.T) {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, wsvc: wsvc}
 

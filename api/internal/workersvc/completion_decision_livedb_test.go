@@ -141,7 +141,7 @@ func TestCompletionDecisionPausedResumesLiveDB(t *testing.T) {
 	}
 
 	// Exactly one completion_decision audit row, and the guidance follow_up enqueued unconsumed.
-	// The paused branch delivers guidance as a follow_up (the resumed claim's pullFollowUp drains
+	// The paused branch delivers guidance as a follow_up (the resumed claim's pullFollowUps drains
 	// it) — NOT an answer, which is the live-window delivery.
 	if got := e.countInputs(t, runID, "completion_decision"); got != 1 {
 		t.Fatalf("completion_decision audit rows = %d, want 1", got)

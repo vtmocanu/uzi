@@ -33,7 +33,7 @@ func TestSetCrossCheckWarnsPerCheckerDirectionLiveDB(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h, pool := secretsCRUDHandler(t)
-			h.wsvc = workersvc.New(h.q, nil, workersvc.Params{})
+			h.wsvc = workersvc.New(h.q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			user := mkSecretUser(t, pool)
 			exec := func(sql string, args ...any) {
 				t.Helper()

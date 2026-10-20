@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -80,7 +81,7 @@ func inputOutcome(kind string, serverSide bool) string {
 // updates could not be saved". The reasons need no change here: this block already
 // prints HEALTH_REASON and FAILURE_REASON generically, switching on no vocabulary,
 // so PRD #108's new reason strings flow through untouched.
-func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
+func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) error {
 	rows := [][]string{
 		{"ID", r.ID},
 		{"KIND", r.Kind},
@@ -363,7 +364,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// `paused` (so it shows on a running run AND on one involuntarily parked — limit_wait
 	// etc. — that still carries the request). Empty for every other run, so a run that was
 	// never paused is byte-for-byte unchanged.
-	rows = append(rows, pauseDetailRows(r, time.Now())...)
+	rows = append(rows, pauseDetailRows(r, time.Now(), origin...)...)
 	// MR_REWORK rides every run like WAIT_ON_LIMIT above, and is tri-state (PRD #841):
 	// "inherit" (nil → follow the owner's account default), "on" or "off". An always-present
 	// row keeps "inherit" distinguishable from an old CLI that does not know the field.
@@ -579,11 +580,11 @@ func credentialDisabledAction(r apitypes.RunDTO) string {
 // does that (PRD #1732 D14): a held run with a pending owner pause settles into that pause
 // (hold_reason null), and one whose wall budget is spent into budget_exhausted, so "resumed"
 // would be false there.
-func pausedHoldNotice(r apitypes.RunDTO) string {
+func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 	id := cellText(r.ID)
 	switch reason := strOr(r.HoldReason, ""); reason {
 	case "":
-		return "paused by its owner; resume with uzi run resume " + id
+		return pauseOriginLabel(r, false, origin...) + "; resume with uzi run resume " + id
 	case holdBudgetExhausted:
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
@@ -682,9 +683,13 @@ func limitWaitRows(r apitypes.RunDTO, now time.Time) [][]string {
 //     the request — matching the web's pending chip (shown whenever pause_requested_at is set).
 //
 // It takes now so the elapsed clocks unit-test deterministically, matching limitWaitRows.
-func pauseDetailRows(r apitypes.RunDTO, now time.Time) [][]string {
+func pauseDetailRows(r apitypes.RunDTO, now time.Time, origin ...string) [][]string {
 	if r.Status == statusPaused {
-		return [][]string{{"PAUSED", pausedSummary(r, now)}}
+		summary := pausedSummary(r, now)
+		if strOr(r.HoldReason, "") == "" {
+			summary = pauseOriginLabel(r, false, origin...) + " · " + summary
+		}
+		return [][]string{{"PAUSED", summary}}
 	}
 	if r.PauseRequestedAt != nil {
 		return [][]string{{"PAUSE_REQUESTED", pauseBoundaryClause(r)}}
@@ -764,7 +769,7 @@ func pauseBoundaryClause(r apitypes.RunDTO) string {
 // lead and is never dropped — it survives even if it alone overflows width (the caller's
 // final clamp handles that pathological narrow case). Empty clauses are skipped. This is the
 // TUI row-2 shedding idiom (PRD #1190 M4 / #1170): shed clauses whole rather than clamp
-// mid-word, so a narrow terminal drops "checkpoint" then "done" but keeps "paused by you".
+// mid-word, so a narrow terminal drops "checkpoint" then "done" but keeps the pause label.
 func joinSheddingClauses(width int, clauses ...string) string {
 	parts := make([]string, 0, len(clauses))
 	for _, c := range clauses {
@@ -787,10 +792,10 @@ func joinSheddingClauses(width int, clauses ...string) string {
 // pausedLine is the run detail's row-2 line for a PAUSED run (PRD #1190 M4), drawn in the
 // wait colour beside the rate-limit park line. One physical row: it sheds clauses from the
 // right (checkpoint first, then done) to fit width, never clamping mid-word, with
-// "‖ paused by you · since …" always surviving. Built off the same clauses as the CLI's
+// the pause label and since clause always surviving. Built off the same clauses as the CLI's
 // PAUSED row so the two surfaces read the same.
-func pausedLine(r apitypes.RunDTO, now time.Time, width int) string {
-	lead := "‖ paused by you · " + pauseSinceClause(r, now)
+func pausedLine(r apitypes.RunDTO, now time.Time, width int, origin ...string) string {
+	lead := "‖ " + tuiPauseLabel(r, width, origin...) + " · " + pauseSinceClause(r, now)
 	var doneClause string
 	if done, total, _ := milestoneProgress(r); total > 0 {
 		doneClause = fmt.Sprintf("%d/%d done", done, total)
@@ -2545,4 +2550,22 @@ func policyHoldAction(r apitypes.RunDTO) string {
 	return detail + "; resume same conversation: uzi run resume " + cellText(r.ID) +
 		" --guidance <text>; Cancel: uzi run cancel " + cellText(r.ID) +
 		"; holds retain worker/custody and can delay upgrades; if wall budget is exhausted, extend first"
+}
+
+// tuiPauseLabel keeps the pause clock and header duration visible in narrow views.
+func tuiPauseLabel(r apitypes.RunDTO, width int, origin ...string) string {
+	label := pauseOriginLabel(r, true, origin...)
+	if width < 60 && label == "paused by the run's lead" {
+		return "paused by lead"
+	}
+	return label
+}
+
+// pauseOriginLabel keeps callers without loaded evidence neutral, including follow notices.
+func pauseOriginLabel(r apitypes.RunDTO, personal bool, origin ...string) string {
+	value := ""
+	if r.Status == statusPaused && strOr(r.HoldReason, "") == "" && len(origin) > 0 {
+		value = origin[0]
+	}
+	return runpresentation.PauseLabel(value, personal)
 }

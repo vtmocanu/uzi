@@ -61,7 +61,7 @@ func newInventoryEnv(t *testing.T) *inventoryEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.svc = New(e.q, pool, box, Limits{MaxBundleBytes: 1 << 20, MaxCapturesPerClaim: 8, MaxCapturesPerOwner: 16, ReadyRetention: time.Hour, RequestDeadline: 10 * time.Second}, nil)
+	e.svc = New(e.q, pool, box, Limits{CustodyHoldLimit: fixedLimit(8), MaxBundleBytes: 1 << 20, MaxCapturesPerClaim: 8, MaxCapturesPerOwner: 16, ReadyRetention: time.Hour, RequestDeadline: 10 * time.Second}, nil)
 	return e
 }
 func (e *inventoryEnv) exec(sql string, args ...any) {

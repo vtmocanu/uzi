@@ -5,10 +5,12 @@
 // invalidates the cache. Compiled-in defaults mean a missing row (or an empty
 // table during a fresh boot) never breaks a read.
 //
-// The cache is per-process: correct for the single-api compose stack. A second
-// api replica would serve a stale value for up to the TTL after another
-// replica's PUT — a cache-invalidation-across-replicas problem noted for the
-// future k8s deployment, out of scope while there is exactly one api process.
+// The cache is per-process. The replica that serves an admin PUT invalidates its
+// own cache, so the change applies there on the next read; every other replica
+// keeps serving its snapshot until the TTL (SETTINGS_CACHE_TTL, default 5s)
+// expires and its next refresh succeeds, so a change reaches every replica within
+// one TTL without a restart. A replica whose refresh fails keeps serving its last
+// good snapshot (stale-on-error) until a read succeeds.
 package settings
 
 import (
@@ -513,6 +515,8 @@ func Validate(key, value string) error {
 		return validateHostedWorkerQuota(value)
 	case KeyJobMaxActivePerUser:
 		return validateJobMaxActivePerUser(value)
+	case KeyCustodyHoldLimit:
+		return validateCustodyHoldLimit(value)
 	case KeyDockerRepoAllowlist:
 		return validateRepoAllowlist(value)
 	case KeyPublicBaseURL:

@@ -81,7 +81,7 @@ func newBindHandler(t *testing.T, st *bindStore) *Handler {
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
-	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{})}
+	return &Handler{wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 }
 
 func patchWorkerReq(t *testing.T, user store.User, workerID uuid.UUID, body string) *http.Request {

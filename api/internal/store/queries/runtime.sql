@@ -1023,8 +1023,9 @@ WITH claimant AS MATERIALIZED (
       -- OWNER-scoped admission gate (D4: the instance byte ceiling must never become a
       -- global stop-claiming switch), placed alongside the existing eligibility checks. A
       -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
-      -- so it never blocks an ordinary claim; the production caller always passes the
-      -- configured positive default (workersvc.custodyHoldLimit, 8).
+      -- so it never blocks an ordinary claim; production passes the custody_hold_limit
+      -- admin setting (1..1000), except the cross_check claim lane, which passes an inert 0
+      -- because every row that lane can select is exempt (kind = 'cross_check').
       --
       -- Issue #1751 / ADR-1751: CONTINUATION EXEMPTION. A requeued run that was already
       -- claimed before (claim_generation >= 1) AND still holds its OWN open custody hold
@@ -4398,9 +4399,9 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_generation > 0)
   AND status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-  -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-  -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+  AND status <> 'paused'
+  -- All paused runs are protected above. Retain provider and policy protection through
+  -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
   AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
@@ -4453,9 +4454,9 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
-      -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
-      -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
+      AND status <> 'paused'
+      -- All paused runs are protected above. Retain provider and policy protection through
+      -- ResumePausedRun's queued interval; after ClaimRun, the service generation fence applies.
       AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
@@ -9185,7 +9186,7 @@ WITH pending AS (
     -- server-side transition, not a worker steering input). PRD #1226 M5 (D7) adds
     -- 'completion_decision' for the SAME reason: the owner continue-decision is a dedicated
     -- endpoint's AUDIT row — its control travels via a SEPARATE input the worker DOES drain
-    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUp reads, alongside the
+    -- (paused branch: a 'follow_up' the resumed claim's pullFollowUps reads, alongside the
     -- paused → queued transition through ResumePausedRun; live awaiting_input branch: an
     -- 'answer' that resolves the worker's completion-question await), never this raw row — so
     -- draining it would likewise hit the default arm. PRD #1189 adds 'extend' for the SAME

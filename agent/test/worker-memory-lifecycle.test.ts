@@ -47,7 +47,9 @@ function build(cfg: Config, client: WorkerClient, memory?: WorkerMemoryRuntime,
     nullLogger(), () => ({ ok: true, missing: [] }), outbox, undefined, undefined, undefined,
     undefined, undefined, undefined,
     (dataDir) => new StatsCollector({ dataDir, processRss: () => 1 }),
-    isolatedRunner, undefined, undefined, undefined, undefined, undefined, retainedSource, memory);
+    isolatedRunner, undefined, undefined, undefined, undefined, undefined, retainedSource, memory,
+    // issue #2471: these fixtures test the sampler, not the launcher; the real probe is covered elsewhere.
+    async () => ({ ok: true }));
 }
 function rig(overrides: object = {}, reader?: Pick<WorkerMemoryReader, "sample">) {
   let samples = 0;

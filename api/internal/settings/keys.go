@@ -134,6 +134,12 @@ const (
 	// at once; a create past it is refused (429 over_cap). An integer in [1, maxJobMaxActivePerUser],
 	// validated by validateJobMaxActivePerUser. Runtime-tunable from the Admin Settings API; no env var.
 	KeyJobMaxActivePerUser = "job_max_active_per_user"
+	// KeyCustodyHoldLimit (#3150; PRD #1296 D2/D4, ADR-2445) is the per-owner custody admission
+	// limit: once an owner holds this many admission-counted open recovery custody holds, new
+	// code-run admission pauses for that owner. One deployment-wide value applied to every owner.
+	// A whole number in [1, maxCustodyHoldLimit], validated by validateCustodyHoldLimit; there
+	// is no zero-as-disable. Read only through Cache.CustodyHoldLimit, which fails closed.
+	KeyCustodyHoldLimit = "custody_hold_limit"
 	// Docker-worker repo allowlist (PRD #89 M-allow): the set of repos a
 	// docker-enabled worker is permitted to CLAIM runs for. Stored as a
 	// comma-separated list of repo UUIDs. This is the accepted-risk likelihood
@@ -385,6 +391,10 @@ const (
 	DefaultHostedWorkerQuota = "2"
 	// PRD #1908: ten concurrent non-terminal job runs per user by default.
 	DefaultJobMaxActivePerUser = "10"
+	// #3150: the per-owner custody admission limit, formerly a compile-time constant in
+	// the workers service; every custody-admission consumer reads it through
+	// Cache.CustodyHoldLimit.
+	DefaultCustodyHoldLimit = "8"
 	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim
 	// gate reads as fail-closed — a docker worker claims no repo-bearing run until an
 	// admin lists the trusted repos. Empty is the safe default precisely because this
@@ -531,6 +541,8 @@ var Defaults = map[string]string{
 	KeyHostedWorkerQuota: DefaultHostedWorkerQuota,
 	// PRD #1908 per-user active job cap. Same no-seeded-row pattern as the quota above.
 	KeyJobMaxActivePerUser: DefaultJobMaxActivePerUser,
+	// #3150 per-owner custody admission limit. Same no-seeded-row pattern: unset reads as 8.
+	KeyCustodyHoldLimit: DefaultCustodyHoldLimit,
 	// PRD #89 M-allow docker repo allowlist. Same no-seeded-row pattern: an absent
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.

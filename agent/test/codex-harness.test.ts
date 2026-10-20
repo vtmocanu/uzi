@@ -1116,7 +1116,7 @@ describe("CodexHarness: resumed usage evidence", () => {
           onTokenUsageIncomplete: text => { notices.push(text); },
           launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }),
         });
-        // Pinned Codex 0.160.1, core/src/session/mod.rs::recompute_token_usage:
+        // Characterized at Codex 0.160.1, core/src/session/mod.rs::recompute_token_usage:
         // cumulative billing usage is unchanged; last is a context estimate with
         // all five detail buckets zero. The estimate need not fit the cumulative.
         const estimate = bd({ totalTokens: scenario === "live estimate" ? 50 : 5000 });

@@ -2,6 +2,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
+import { maintenanceBootstrapRoots, readMaintenancePosture, recordMaintenanceBootstrap, snapshotMaintenanceBootstrap, terminalMaintenanceProof } from "./run-quiescence.js";
+import { MaintenanceWriterExclusion } from "./maintenance-exclusion.js";
 import { WorkerClient, RequestError } from "./client.js";
 import { GitCache, type GitCacheOptions } from "./git.js";
 import { StubExecutor } from "./executor.js";
@@ -325,6 +327,9 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
 }
 
 async function main(): Promise<void> {
+  // #3031 E1: the FIRST statement, after the static import graph and before any app spawn or
+  // claim. It pins the exact tsx esbuild child (or none); nothing is ever enrolled later.
+  recordMaintenanceBootstrap(snapshotMaintenanceBootstrap());
   // PRD #51 M4: under the uid split, run the worker with umask 002 so (a) the runner-owned
   // /data subtrees the worker mkdirs (runner clone parents, per-run SDK HOME, provision)
   // are group-`runner`-writable — runner and runner-cmd children can then create/access their per-run
@@ -340,6 +345,10 @@ async function main(): Promise<void> {
   log.addSecret(config.workerToken);
   fatalLog = log;
   lifecyclePhase = "startup";
+  // #3031 E6: bounded, non-gating posture diagnostics; the producer never gates on them.
+  const bootstrap = maintenanceBootstrapRoots();
+  log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),
+    bootstrap: bootstrap === undefined ? "refused" : bootstrap.length });
 
   // Docker wiring keystone (PRD #83 M1): resolve ONCE at startup with a bounded liveness
   // probe (loadConfig can't — it's sync). The single result feeds the register capability
@@ -590,7 +599,18 @@ async function main(): Promise<void> {
   // issue #1786: the runner's stopped-source retention exits notify the operator channel (built below
   // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
   let notifyRetained: (() => void) | undefined;
+  // The claim gate and the late-bound worker are shared by the DinD prune, the operator retained
+  // channel and the #3031 terminal producer's writer exclusion (built here, before the runner).
+  let worker: Worker | undefined;
+  const dindGate = new DindPruneGate();
+  const maintenanceExclusion = new MaintenanceWriterExclusion({
+    gate: dindGate,
+    isIdle: () => worker?.isIdle() ?? false,
+    proof: scans => terminalMaintenanceProof(scans, config.dockerWiring.dockerHost),
+    log,
+  });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    maintenanceExclusion,
     memoryRuntime: memory,
     recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
@@ -771,8 +791,6 @@ async function main(): Promise<void> {
   // UZI_DIND_PRUNE_ENABLED=true. Server maintenance shares its gate even when cache prune is off. Its idle
   // probe reads the worker's own active sets, hence the late-bound `worker` reference: the
   // probe is called from the controller loops, which the worker itself starts.
-  let worker: Worker | undefined;
-  const dindGate = new DindPruneGate();
   const dindPrune = createDindPrune(config, {
     gate: dindGate,
     isIdle: () => worker?.isIdle() ?? false,

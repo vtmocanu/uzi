@@ -956,7 +956,7 @@ queued → claimed → running ⇄ awaiting_input (ask_user, PRD #88) → awaiti
    ↳ (auto lane, token pool empty) → pool_wait → queued, once a token is pooled (or resume-now)
    ↳ (resumed turn came back empty) → recovery_wait → queued, on a capped backoff, no lifetime cap
    ↳ (interactive task, clean signal_done) → awaiting_followup, no auto-resume — wound down by run stop or idle timeout
-   ↳ (owner pause) → paused → queued, resume on demand (no limit on count) → running
+   ↳ (owner or lead pause) → paused → queued, resume on demand (no limit on count) → running
    ↳ cancel with no live poller → cancelled directly (server-side)
 ```
 
@@ -1082,7 +1082,7 @@ chain in the diagram above, with no intervening `running`.
   auto-resume on its own**: it is wound down explicitly with `uzi run stop`,
   or by its worker-side idle timeout. See
   [docs/handoff.md](docs/handoff.md#interactive-mode).
-- **running → paused** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
+- **running → paused (owner request)** ([PRD #1190](prds/1190-run-pause-resume.md)) — the
   owner-requested twin of `limit_wait`: `pause` (default: after the milestone
   or turn in flight; `--now`: drop it) is a **flag** on the still-running run,
   and the worker parks only after it publishes a checkpoint — a failed
@@ -1099,7 +1099,13 @@ chain in the diagram above, with no intervening `running`.
   [adr/1190-run-pause-invariants.md](adr/1190-run-pause-invariants.md) for
   the negative-space rules — the run-status lists `paused` must never enter,
   and the guards that must not be relaxed — that a future edit could break
-  silently.
+  silently. Approved issue implementation can also enter an ordinary pause
+  through the lead's `park_run` tool or an owner's `/park` clarification
+  answer. Both share the lead-park execution path (`origin: lead_park`);
+  `uzi run pause` uses the owner path (`origin: owner`). Both paths wait for
+  owner resume. Current message evidence can distinguish these execution
+  paths in CLI/TUI/web run detail, not identify the requester; missing evidence
+  leaves the label neutral (see [pause labels](docs/run-pause.md#reading-the-pause-label)).
 
 - **running → paused (structural completion hold)** ([PRD #1226](prds/done/1226-structural-completion-interlock.md),
   rollout switch `completion_interlock_rollout`, **on by default** for a new `issue`
@@ -1452,14 +1458,18 @@ chain in the diagram above, with no intervening `running`.
   2026-08-23 overlay amendment, and why merge precedes rebase.
 - **Proactive worker memory guard** (#2396): off by default, with six explicit
   numeric settings and no calibrated production thresholds. One worker-wide
-  cgroup monitor ranks enrolled Codex model command trees by approximate RSS
-  and acts through exact registered supervisor identities. It adds no process
+  cgroup monitor ranks enrolled Codex and Claude model command trees by
+  approximate RSS and acts through exact registered supervisor identities. It adds no process
   authority or concurrency change. The API persists frozen episode allowance;
   uncertain/exhausted intervention takes the capture/owner-only memory-hold
   path, retaining source when disposition is unconfirmed. Register establishes
   authority; heartbeat growth cannot create it, and shrink revokes further
   reservation/signalling without erasing original settlement obligations.
-  Claude enrollment is deferred to #2471; separately accounted DinD, sudden
+  On a guard-bound Claude run native `Bash` is replaced by a worker-owned
+  in-process MCP command tool (foreground only, same-uid parity with native
+  `Bash`, not isolation), and startup preflight refuses to register a worker
+  whose launcher fails (ADR-2396 D8); a server-side Claude eligibility gate is
+  not built. Separately accounted DinD, sudden
   bursts, stalled sampling and node pressure remain limitations. Rollout,
   destructive schema rollback versus operational disable, and command deadline
   boundaries are recorded in [ADR-2396](adr/2396-worker-memory-guard.md);

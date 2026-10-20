@@ -48,6 +48,7 @@ type recoveryEnv struct {
 
 func recoveryTestLimits() recovery.Limits {
 	return recovery.Limits{
+		CustodyHoldLimit:       defaultCustodyLimitFunc(),
 		MaxBundleBytes:         64 << 20,
 		ReadyPayloadPerOwner:   1 << 30,
 		InstanceBytes:          4 << 30,
@@ -135,7 +136,7 @@ func (e *recoveryEnv) service(limits recovery.Limits) *recovery.Service {
 func (e *recoveryEnv) handler() *Handler {
 	return &Handler{
 		pool: e.pool, q: store.New(e.pool), cfg: recoveryTestCfg(), box: e.box,
-		wsvc: workersvc.New(store.New(e.pool), e.box, workersvc.Params{}),
+		wsvc: workersvc.New(store.New(e.pool), e.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 }
 
@@ -298,7 +299,7 @@ func TestRecoveryUploadOversizeHTTPLiveDB(t *testing.T) {
 	e := newRecoveryEnv(t)
 	h := e.handler()
 	h.cfg.RecoveryMaxBundleBytes = 1024
-	svc := e.service(recovery.Limits{MaxBundleBytes: 1024, ReadyPayloadPerOwner: 1 << 30, InstanceBytes: 4 << 30, MaxCapturesPerClaim: 16, MaxCapturesPerOwner: 256, RequestDeadline: 120 * time.Second, MaxConcurrentUploads: 2, MaxConcurrentDownloads: 2})
+	svc := e.service(recovery.Limits{CustodyHoldLimit: defaultCustodyLimitFunc(), MaxBundleBytes: 1024, ReadyPayloadPerOwner: 1 << 30, InstanceBytes: 4 << 30, MaxCapturesPerClaim: 16, MaxCapturesPerOwner: 256, RequestDeadline: 120 * time.Second, MaxConcurrentUploads: 2, MaxConcurrentDownloads: 2})
 	h.recoverySvc = svc // pin the small-ceiling service into the handler
 
 	upload := func(name string, contentLength int64) {

@@ -72,6 +72,7 @@ Every scene is rendered from the SHIPPED model, `-dark` and `-light`.
 | Frame | State it captures |
 |---|---|
 | `board-populated` / `board-empty` / `board-admin` / `board-filter` | the run board: mixed statuses/health, empty state, factory-wide admin (OWNER), and the `/` filter |
+| `board-done-failures` / `board-done-failures-selected` | failed and needs-landing state ink, red issue links, quiet human stops, and the failure count, with and without selection |
 | `board-done-age` | recent finishes from older runs, legacy finish fallback, and unchanged active age |
 | `detail-running` | detail, live, crew rail focused, ⇣ following |
 | `detail-milestones-attributed` | two in-progress milestones each attributed to its subagent; the D3 unique-match lane also shows live age (PRD #1224) |

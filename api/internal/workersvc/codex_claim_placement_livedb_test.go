@@ -200,7 +200,7 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 	t.Run("no codex-capable worker online -> reasonNoCodexCapableWorker", func(t *testing.T) {
 		e.seedWorker(t, nil) // one ONLINE worker with no protocol capabilities
 		runID := e.seedCodexQueuedRun(t)
-		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID))
+		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID), thWithLimit(testCustodyLimit))
 		if got != reasonNoCodexCapableWorker {
 			t.Fatalf("queuedReason = %q, want %q — a codex-indicating queued run with no codex-capable worker online must surface the Codex-capability block", got, reasonNoCodexCapableWorker)
 		}
@@ -213,7 +213,7 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 	t.Run("codex-capable worker online -> falls through", func(t *testing.T) {
 		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // an ONLINE codex-capable worker
 		runID := e.seedCodexQueuedRun(t)
-		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID))
+		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID), thWithLimit(testCustodyLimit))
 		if got != reasonWaitingWorker {
 			t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingWorker)
 		}
@@ -224,7 +224,7 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 		runID := e.seedQueuedRun(t, nil, nil)
 		row := e.codexIndicatingQueuedRow(runID)
 		row.Harness = harnessClaude // an ordinary Claude run is not codex-indicating
-		if got := svc.queuedReason(e.ctx, time.Now(), row); got != reasonWaitingWorker {
+		if got := svc.queuedReason(e.ctx, time.Now(), row, thWithLimit(testCustodyLimit)); got != reasonWaitingWorker {
 			t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingWorker)
 		}
 	})

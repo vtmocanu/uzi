@@ -54,7 +54,7 @@ func TestCompletionDecisionHandlerStatusMappingLiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	wsvc.SetTxBeginner(pool)            // partial/accept runs a transaction under the FOR UPDATE lock.
 	wsvc.SetBackground(func(func()) {}) // no detached goroutine may outlive the test's pool.
 	h := &Handler{

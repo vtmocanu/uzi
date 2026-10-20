@@ -558,11 +558,13 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
 		// PRD #1909 D2: recovery admission counts job-file bytes against the shared budget.
 		StoredFilesBudgetBytes: h.cfg.StoredFilesBudgetBytes,
-		// PRD #1349 M5 (D6/D10): the owner custody-hold aggregate reports the SAME admission
+		// PRD #1349 M5 (D6/D10), #3150: the owner custody-hold aggregate reports the SAME admission
 		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
-		// disagree with the claim path. Sourced from workersvc's exported constant rather than
-		// hardcoded here (a constant, so int32() is a compile-time conversion).
-		CustodyHoldLimit:     int32(workersvc.CustodyHoldLimit),
+		// disagree with the claim path: the custody_hold_limit admin setting, read through the
+		// settings cache. The method value is safe on a nil *settings.Cache (the accessor
+		// returns an error for a nil receiver), and a read failure fails the hold list with a
+		// 500 rather than reporting a guessed number.
+		CustodyHoldLimit:     h.settings.CustodyHoldLimit,
 		WorkerHeartbeatStale: h.cfg.WorkerHeartbeatStale,
 	}
 }

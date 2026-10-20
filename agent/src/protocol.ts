@@ -214,10 +214,11 @@ export type MessageKind =
    *  run_messages kind (the column carries no DB CHECK; the message-ingest route
    *  accepts any non-empty kind), reusing the plan_feedback emit machinery. */
   | "steer_ack"
-  /** PRD #1190 M2: the run PARKED on an owner-requested pause. Emitted by the runner's pause
-   *  park path (mirroring `limit_wait`) once the checkpoint published and the server ACKed
-   *  `paused`. Payload `{ completed: number, total?: number }` — the milestone position the
-   *  park landed at. A free-form run_messages kind (the column carries no DB CHECK). */
+  /** The run PARKED after its checkpoint published and the server ACKed `paused`.
+   *  Best-effort delivery follows recovery pin and inventory handling. Payload
+   *  `{ completed: number, total?: number, origin?: "lead_park" | "owner" }` carries the milestone
+   *  position and optional display-only source, never pause authority or persistence state.
+   *  A free-form run_messages kind (the column carries no DB CHECK). */
   | "paused"
   /** PRD #1190 M2: a pending pause could NOT park because its checkpoint failed to publish
    *  (Decision 8). Emitted by the runner instead of `paused`; the run stays running. Payload

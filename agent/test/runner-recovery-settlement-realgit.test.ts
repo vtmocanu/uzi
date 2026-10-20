@@ -495,8 +495,8 @@ async function bootAndSettle(
   onPromote?: (outbox: Outbox) => void,
   /** Issue #2020 hooks. `bundleGate` holds every recovery bundle the restarted worker's boot sweep
    *  produces until `release` resolves (`onStart` fires as each one is reached). `beforeDrain` runs
-   *  after the abort and before the background passes are drained, so a caller can observe a pass
-   *  still unfinished at the abort and then release the gate. `passes` collects every background
+   *  after the abort and before Worker.run (which joins them) and the drain settle, so a caller can
+   *  observe a pass still unfinished at the abort and then release the gate. `passes` collects every background
    *  recovery pass the worker started and counts those that settled. */
   opts: {
     bundleGate?: { onStart: () => void; release: Promise<void> };
@@ -536,8 +536,10 @@ async function bootAndSettle(
     outbox: outbox2,
   });
   // issue #2020: Worker.run starts the boot recovery sweep (resumePendingRecoveries) and the
-  // heartbeat-driven live re-drive (resumeLiveRecoveries) fire-and-forget, and aborting the signal
-  // does not wait for them. Each one journals under fx.dataDir/recovery, so one still running when
+  // heartbeat-driven live re-drive (resumeLiveRecoveries) fire-and-forget. Since #3031 Worker.run's
+  // shutdown aborts and joins the coordinator's passes; a pass step that ignores the abort can
+  // outlast the container grace and delay Worker.run() until it settles. Each one journals under
+  // fx.dataDir/recovery, so one still running when
   // this helper returns recreates that tree after the harness afterEach removed the fixture (a
   // leaked uzi-agent-test-* dir). Collect their promises here and await them before returning.
   const background: Promise<void>[] = [];
@@ -562,10 +564,12 @@ async function bootAndSettle(
     await pollUntil(async () => (await s2.settlement.listRun(runId)).length === 0, 10_000, "the sweep settled the hold");
   } finally {
     controller.abort();
-    await done;
+    // Issue #3031: Worker.run's shutdown now joins the coordinator's recovery passes, so `done`
+    // cannot settle while a gated pass is held; the hook observes and releases it before then.
     try {
       if (opts.beforeDrain) await opts.beforeDrain();
     } finally {
+      await done;
       // Even when the hook throws: a pass left running would write after the fixture is removed.
       await drainBackground(background);
     }

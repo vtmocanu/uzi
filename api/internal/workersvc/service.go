@@ -1400,8 +1400,12 @@ type Store interface {
 type Params struct {
 	PolicyStopNegotiated bool
 	// Policy hold activation is reserved for M2; tests explicitly negotiate the seam.
-	PolicyHoldNegotiated       bool
-	PolicyHoldSnapshotEnabled  bool
+	PolicyHoldNegotiated      bool
+	PolicyHoldSnapshotEnabled bool
+	// CustodyHoldLimit supplies the per-owner custody admission limit (the custody_hold_limit
+	// admin setting; see CustodyHoldLimitReader). Nil means no usable value: claims refuse
+	// and the health pill reports the setting unreadable, never a fallback number.
+	CustodyHoldLimit           CustodyHoldLimitReader
 	PlanCrossCheckMaxRevisions int32
 	// Presence distinguishes an explicitly disabled budget from an unwired service.
 	PlanCrossCheckMaxRevisionsSet bool
@@ -3274,6 +3278,25 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// A transaction-less adapter cannot select children: queued affinity is not a claim.
 		lane = "ordinary"
 	}
+	// Custody admission limit (#3150): read ONCE per claim, after the vault gate and the lane
+	// rewrite above, and reused for the whole claim. The cross_check lane skips the read and
+	// passes 0: ClaimRun's lane clause restricts that lane to kind='cross_check' rows, and the
+	// custody clause admits every cross_check row regardless of the limit
+	// (`@custody_hold_limit::int <= 0 OR r.kind = 'cross_check' OR ...`), so 0 is inert there
+	// and a settings outage cannot strand a child on the dedicated checker lane. Every other
+	// lane fails closed: an unreadable limit refuses the claim (the handler logs and answers
+	// 500; the run stays queued) rather than guessing a number. That includes a legacy
+	// plan-stage checker child claimed through the run lane, which the SQL cannot separate
+	// from custody-gated rows by parameter alone; it waits until the setting is readable
+	// (an accepted #3150 limit; its pill keeps the ordinary fleet reason).
+	var custodyLimit int32
+	if lane != "cross_check" {
+		n, lerr := s.custodyLimit(ctx)
+		if lerr != nil {
+			return nil, lerr
+		}
+		custodyLimit = n
+	}
 	claimNow := s.now()
 	params := store.ClaimRunParams{
 		Lane:                     lane,
@@ -3315,7 +3338,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		ClaimantDraining: wkr.DrainingSince.Valid,
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
-		//     >= this many admission-counted open holds (ADR-2445; owner-scoped, never global).
+		//     >= the custody_hold_limit setting's admission-counted open holds (ADR-2445;
+		//     owner-scoped, never global; 0 only on the cross_check lane, see custodyLimit above).
 		//     Hold-free cross-check children are exempt. Code-publishing continuations
 		//     are exempt only with a prior claim and 1..limit-1 own open holds.
 		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
@@ -3326,7 +3350,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		//     than falsely promised recovery.
 		//   - WorkerIdentity is the immutable provenance value recorded on the hold for a
 		//     later AAD-authenticated post-terminal recovery retry (never nulled).
-		CustodyHoldLimit: custodyHoldLimit,
+		CustodyHoldLimit: custodyLimit,
 		RecoveryCapable:  (slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV1) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryArchiveV2) || slices.Contains(wkr.ProtocolCapabilities, capability.RecoveryInventoryV1)),
 		WorkerIdentity:   workerIdentity(wkr),
 		// PRD #1390 M3: the three snapshot-dedupe params. @snapshot_fresh_cutoff bounds the

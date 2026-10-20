@@ -411,6 +411,32 @@ function validReceipt(receipt: InputReceipt | null | undefined, ids: number[]): 
   return receipt.inputs.every((input) => expected.delete(input.id)) && expected.size === 0;
 }
 
+/** Cap on the total size of one batch of owner follow-ups delivered in a single turn. Matches the
+ *  server's answer-submission limit (maxAnswerBodyRunes × maxAnswerCount in
+ *  api/internal/workersvc/service.go). Counted in Unicode code points (followUpRunes) over the trimmed
+ *  bodies as queued; the fence markup the prompt adds is excluded. A standalone TS constant: no
+ *  cross-language sharing. */
+export const MAX_FOLLOW_UP_BATCH_RUNES = 40000;
+
+/** Code points in `body`: the one counting rule for the follow-up batch cap, for the steering
+ *  channel and any executor-side batch fill (UTF-16 length would double-count astral characters). */
+export function followUpRunes(body: string): number {
+  return [...body].length;
+}
+
+/** Issue #3149: cap on the number of earlier owner follow-ups a reviewed-plan resume replays. The
+ *  rune budget (MAX_FOLLOW_UP_BATCH_RUNES) counts body text only, so without an entry cap 40000
+ *  one-character follow-ups would read "complete" yet render about 11M characters of per-entry
+ *  framing. With the 40000-rune body budget this bounds the rendered history at roughly body budget
+ *  + 100 x per-entry framing; chosen above the ~40 binding follow-ups in the #3149 incident run. */
+export const MAX_PRIOR_OWNER_HISTORY_ENTRIES = 100;
+
+/** Issue #3149: what a claim knows about the owner follow-ups earlier claims consumed. */
+export type PriorOwnerHistory =
+  | { status: "complete"; entries: readonly { id: number; body: string }[] }
+  | { status: "unavailable" }
+  | { status: "over_bound" };
+
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
@@ -434,6 +460,9 @@ export class SteeringChannel {
    *  constraints are then unknown, so operatorConstraints reports null and the Agent guard
    *  denies every dispatch for this claim. */
   private operatorConstraintsLost = false;
+  /** Issue #3149: the earlier-claim owner follow-ups that were consumed and need no re-delivery,
+   *  recorded once by recordPriorOwnerHistory; undefined until then. */
+  private priorHistory: { status: "complete"; entries: { id: number; body: string }[] } | { status: "over_bound" } | undefined;
   /** Issue #1673: the one input batch in flight. No newer GET replaces it until its ACK and
    *  applied receipts settle: "ack" retries the same ids, "routed" is serviced by the waiters
    *  on the tick that routed it, "applied" retries the applied receipt without rerouting. */
@@ -1308,7 +1337,7 @@ export class SteeringChannel {
   }
 
   /** issue #559 M2: the highest `follow_up` input id this channel has already handed to the
-   *  executor — via pullFollowUp or awaitFollowUp/serviceFollowUp. This is the wake-guard
+   *  executor — via pullFollowUp/pullFollowUps or awaitFollowUp/serviceFollowUp. This is the wake-guard
    *  watermark the runner reports at the interactive park (open_followup_id). Buffering a
    *  follow-up (route → push) does NOT advance it; only DELIVERY (takeFollowUp shift) does,
    *  which is what makes it race-free across the park report's DB round-trip: the value is
@@ -1928,9 +1957,34 @@ export class SteeringChannel {
 
   /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body
    *  so the executor can report the follow-up included (markFollowUpIncluded) once a prompt that
-   *  carried it has really started. */
+   *  carried it has really started. Policy resumes use selection to prioritize current narrowing;
+   *  ordinary executor turns take bounded batches via pullFollowUps. */
   pullFollowUp(selection?: { newestAfter: number }): { id: number; body: string } | undefined {
     return this.takeFollowUp(selection);
+  }
+
+  /** Dequeue all pending follow-ups, oldest first, up to `remainingRunes` code points in total
+   *  (followUpRunes over the trimmed, queued bodies). An oversized entry never blocks the queue:
+   *  when it heads the queue and `batchEmpty` is true (the caller has nothing in the batch yet)
+   *  it is taken alone; otherwise it, and everything after it, waits for the next turn (the
+   *  longest-prefix precedent in agent/src/batcher.ts). Every take goes through takeFollowUp, so
+   *  the delivered watermark covers only the ids actually returned. */
+  pullFollowUps(remainingRunes: number, batchEmpty: boolean): { id: number; body: string }[] {
+    const taken: { id: number; body: string }[] = [];
+    let remaining = remainingRunes;
+    for (;;) {
+      const head = this.followUps[0];
+      if (!head) break;
+      const runes = followUpRunes(head.body);
+      if (runes <= remaining) {
+        taken.push(this.takeFollowUp()!);
+        remaining -= runes;
+      } else {
+        if (batchEmpty && taken.length === 0) taken.push(this.takeFollowUp()!);
+        break;
+      }
+    }
+    return taken;
   }
 
   /** Issue #1800: the executor put follow-up `id` into a prompt whose turn reached the model. Queues an inclusion
@@ -1956,6 +2010,47 @@ export class SteeringChannel {
     }
   }
 
+  /** Issue #3149: snapshot the owner follow-ups earlier claims consumed (GET /follow-ups), for a
+   *  reviewed-plan resume that starts a fresh session. Call once, after requeueUnincludedFollowUps:
+   *  rows that requeue re-delivers to the lead are excluded (they arrive live), so what remains is
+   *  the consumed-and-included history. Non-blank follow_up rows only, trimmed, id order, one per
+   *  id. The bound is checked over the WHOLE snapshot; an over-bound history is recorded as such,
+   *  never as a truncated list. Only the first call records; later calls are ignored. */
+  recordPriorOwnerHistory(inputs: readonly UserInput[]): void {
+    if (this.priorHistory) return;
+    const byId = new Map<number, string>();
+    for (const i of [...inputs].sort((a, b) => a.id - b.id)) {
+      const body = i.body?.trim();
+      if (i.kind !== "follow_up" || !body || byId.has(i.id)) continue;
+      if (i.inclusion_reported === true && !i.included_at) continue; // requeued for the lead instead
+      byId.set(i.id, body);
+    }
+    const entries = [...byId].map(([id, body]) => ({ id, body }));
+    // The body budget reuses the per-turn owner-text budget (MAX_FOLLOW_UP_BATCH_RUNES), so the first
+    // turn can carry up to about twice that when a live batch rides along. A history over either
+    // bound is never truncated: it is recorded "over_bound" and the caller falls back to the human
+    // plan gate instead of replaying a partial record as if it were complete.
+    const runes = entries.reduce((n, e) => n + followUpRunes(e.body), 0);
+    this.priorHistory =
+      runes > MAX_FOLLOW_UP_BATCH_RUNES || entries.length > MAX_PRIOR_OWNER_HISTORY_ENTRIES
+        ? { status: "over_bound" }
+        : { status: "complete", entries };
+  }
+
+  /** Issue #3149: the recorded history, "unavailable" when the claim-time reload failed or was
+   *  never recorded. Copies, so a caller cannot rewrite the record. */
+  priorOwnerHistory(): PriorOwnerHistory {
+    if (this.operatorConstraintsLost || !this.priorHistory) return { status: "unavailable" };
+    if (this.priorHistory.status === "over_bound") return { status: "over_bound" };
+    return { status: "complete", entries: this.priorHistory.entries.map((e) => ({ ...e })) };
+  }
+
+  /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (queued by the live
+   *  drain or re-queued by requeueUnincludedFollowUps), so a history replay must not repeat it. */
+  isLiveDeliveryId(id: number): boolean {
+    return this.leadQueuedIds.has(id) || this.routedIds.has(id);
+  }
+
   /** PRD #1416 M2: arm (set/replace) the worker-authoritative safety steer. Called IN-PROCESS by
    *  the runner's divergence detection, never from route(). Latest-wins: a later arm overwrites an
    *  unconsumed one — the body is regenerated from the current tip, so the newest is the truthful
@@ -1967,7 +2062,7 @@ export class SteeringChannel {
 
   /** PRD #1416 M2: consume the worker-authoritative safety steer — return it and clear the slot,
    *  so it is delivered exactly once per arm. Both executors call this at their loop top ahead of
-   *  pullFollowUp, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
+   *  pullFollowUps, so the steer is rendered before any follow-up. undefined ⇒ none armed. */
   pullSafetySteer(): string | undefined {
     const steer = this.safetySteer;
     this.safetySteer = undefined;

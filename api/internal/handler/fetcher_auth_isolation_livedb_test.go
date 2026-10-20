@@ -39,7 +39,7 @@ func TestFetcherCredentialIsolationLiveDB(t *testing.T) {
 	}
 	q := store.New(e.pool)
 	box := newHandlerTestBox(t)
-	h := &Handler{pool: e.pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{}), settings: e.caps, hub: hub.New()}
+	h := &Handler{pool: e.pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}), settings: e.caps, hub: hub.New()}
 	h.SetHostedSvc(hostedsvc.New(q, box, time.Now, time.Hour))
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 	routers := map[string]http.Handler{

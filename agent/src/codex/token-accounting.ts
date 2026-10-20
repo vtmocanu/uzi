@@ -12,7 +12,7 @@
 //   - Each thread has a STARTING SNAPSHOT (baseline). A FRESH thread (thread/start) starts at
 //     zero, so its whole cumulative is this leg's work and a MISSED intermediate update is
 //     recovered by the later cumulative. A RESUMED thread needs proved replay: root usage with
-//     a historical turn id BEFORE the matching inbound turn/started boundary. Pinned 0.160.1
+//     a historical turn id BEFORE the matching inbound turn/started boundary. Version 0.160.1
 //     cold resume with excludeTurns:true was characterized in token-resume.test.ts: restored
 //     total and historical last precede that boundary even when consumption starts after the
 //     outbound turn/start. Baseline the FULL replay total; never price replay last. A shared

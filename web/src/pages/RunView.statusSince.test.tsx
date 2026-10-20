@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-// Issue #1727: a paused run's "Paused by you at" time and its header "· clock stopped" elapsed
+// Issue #1727: a paused run's "Paused at" time and its header "· clock stopped" elapsed
 // are measured to when the pause LANDED, status_since, not updated_at (which moves on unrelated
 // writes such as an extend). The fixtures carry NO budget fields, so extendBudgetView returns
 // null and PausedElapsed takes its plain-elapsed fallback branch, the one that reads the
@@ -172,8 +172,8 @@ function elapsedText(toIso: string): string {
 
 async function expectAnchoredOn(expectedIso: string, otherIso: string) {
   await screen.findByText("Add rate limiting");
-  const heading = screen.getByText(/Paused by you/);
-  expect(heading.textContent).toContain(`Paused by you at ${localTime(expectedIso)}`);
+  const heading = screen.getByText(/Paused(?: at|$)/);
+  expect(heading.textContent).toContain(`Paused at ${localTime(expectedIso)}`);
   expect(heading.textContent).not.toContain(localTime(otherIso));
   expect(screen.getByText(elapsedText(expectedIso))).toBeTruthy();
   expect(screen.queryByText(elapsedText(otherIso))).toBeNull();

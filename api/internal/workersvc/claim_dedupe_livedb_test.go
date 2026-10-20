@@ -42,7 +42,7 @@ func claimRunParams(wk store.Worker) store.ClaimRunParams {
 		WorkerProtocolCaps:    []string{},
 		IsEphemeral:           false,
 		ClaimantDraining:      false,
-		CustodyHoldLimit:      8,
+		CustodyHoldLimit:      testCustodyLimit,
 		RecoveryCapable:       false,
 		WorkerIdentity:        "test-identity",
 		// D3: the stale window plus one heartbeat interval (45s + 15s).

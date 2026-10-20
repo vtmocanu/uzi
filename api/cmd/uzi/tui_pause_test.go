@@ -64,7 +64,7 @@ func TestPausedDetailShowsGlyphAndWord(t *testing.T) {
 }
 
 // TestPauseRow2LinesPerStatus — the row-2 line drawn in the detail depends on status and the
-// pending-pause flag: a paused run draws the "‖ paused by you" line; a run that carries
+// pending-pause flag: a paused run without evidence draws the "‖ paused" line; a run that carries
 // pause_requested_at but has not yet parked into `paused` draws the "pause requested" line
 // (whether it is still running OR involuntarily parked, since a pending pause survives such a
 // park — PRD D6); a plain running run draws neither.
@@ -92,7 +92,7 @@ func TestPauseRow2LinesPerStatus(t *testing.T) {
 	}
 
 	pausedOut := render(pausedFixture())
-	if !strings.Contains(pausedOut, "‖ paused by you") {
+	if !strings.Contains(pausedOut, "‖ paused ·") {
 		t.Errorf("paused detail is missing the row-2 paused line:\n%s", pausedOut)
 	}
 	if strings.Contains(pausedOut, "pause requested ·") {
@@ -133,7 +133,7 @@ func TestPausedLineSheds(t *testing.T) {
 	now := time.Date(2026, 9, 8, 13, 42, 0, 0, time.UTC)
 
 	// Wide: every clause present.
-	wide := pausedLine(r, now, 100)
+	wide := pausedLine(r, now, 100, "owner")
 	if w := visualWidth(wide); w > 100 {
 		t.Errorf("wide line width %d exceeds budget 100: %q", w, wide)
 	}
@@ -144,7 +144,7 @@ func TestPausedLineSheds(t *testing.T) {
 	}
 
 	// Medium: checkpoint sheds first, done survives.
-	medium := pausedLine(r, now, 60)
+	medium := pausedLine(r, now, 60, "owner")
 	if w := visualWidth(medium); w > 60 {
 		t.Errorf("medium line width %d exceeds budget 60: %q", w, medium)
 	}
@@ -156,7 +156,7 @@ func TestPausedLineSheds(t *testing.T) {
 	}
 
 	// Narrow: both optional clauses shed, the lead survives.
-	narrow := pausedLine(r, now, 40)
+	narrow := pausedLine(r, now, 40, "owner")
 	if w := visualWidth(narrow); w > 40 {
 		t.Errorf("narrow line width %d exceeds budget 40: %q", w, narrow)
 	}

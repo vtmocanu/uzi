@@ -153,7 +153,7 @@ function makeCtx(
     config: null,
     sessionId: null,
     gatePlan: async () => verdict,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     // Spy on the checkpoint boundary. The loop's own iteration-boundary FALLBACK calls
     // this with reap:false; a COOPERATIVE (model-driven) checkpoint calls it with
     // reap:true. Tests discriminate on `reap`.
@@ -485,7 +485,7 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
     assert.doesNotMatch(text, /\(4\/3\)/, "the text must NOT print a reversed/nonsensical ratio");
   });
 
-  // Test 5. The advisory pullFollowUp path is untouched by the honor gate: with NO numeric
+  // Test 5. The advisory pullFollowUps path is untouched by the honor gate: with NO numeric
   // scopeCeiling served, the gate never fires, the follow-up is folded into the next turn
   // exactly as before, and the run completes on signal_done with scopeCapped absent.
   it("leaves the advisory follow-up path unchanged when no scope ceiling is served", async () => {
@@ -497,9 +497,9 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
     ]);
     let served = 0;
     const probe = makeCtx({
-      pullFollowUp: () => {
+      pullFollowUps: () => {
         const body = followUps.shift();
-        return body === undefined ? undefined : { id: 1, body };
+        return body === undefined ? [] : [{ id: 1, body }];
       },
       reportIteration: async (n) => {
         served++;

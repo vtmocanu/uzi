@@ -52,9 +52,13 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
 
     def test_command_identity_and_failures(self):
-        expected = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["real command"]}]
-        for file in ("/proof/e2e/worker-uid/memory-command-real.test.mts",
-                     "e2e/worker-uid/memory-command-real.test.mts"):
+        for name in ("memory-command-real", "claude-command-real", "single-uid-preflight"):
+            with self.subTest(file=name):
+                self.command_identity(name)
+
+    def command_identity(self, name):
+        expected = [{"file": f"e2e/worker-uid/{name}.test.mts", "names": ["real command"]}]
+        for file in (f"/proof/e2e/worker-uid/{name}.test.mts", f"e2e/worker-uid/{name}.test.mts"):
             case = f'<testcase name="real command" file="{file}"/>'
             self.assertEqual(check(expected, ET.fromstring(f"<testsuites>{case}</testsuites>")), [])
             for tag in ("skipped", "failure", "error"):

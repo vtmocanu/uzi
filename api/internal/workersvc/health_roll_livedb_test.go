@@ -51,7 +51,7 @@ func TestHealthRollSevenRungsLiveDB(t *testing.T) {
 			e.seedActiveRunOwnedBy(t, w) // saturation must not erase static suitability
 			e.exec(t, "UPDATE runs SET created_at=$2,status_since=$2 WHERE id=$1", runID, now.Add(-time.Hour))
 			row := e.healthRowFor(t, runID)
-			if got := svc.queuedReason(e.ctx, now, row); got != ReasonWorkersUpgrading {
+			if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got != ReasonWorkersUpgrading {
 				t.Fatalf("queuedReason=%q", got)
 			}
 			eligibility, err := svc.WorkerEligibilityForHealth(e.ctx, now, runID)
@@ -83,7 +83,7 @@ func TestHealthRollSevenRungsLiveDB(t *testing.T) {
 			if err != nil || stale.DrainingEligible != 0 || stale.LatestSuitableDrainingSince.Valid {
 				t.Fatalf("stale eligibility=%+v err=%v", stale, err)
 			}
-			if got := svc.queuedReason(e.ctx, now, row); got == ReasonWorkersUpgrading {
+			if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got == ReasonWorkersUpgrading {
 				t.Fatal("stale drainer retained upgrade diagnosis")
 			}
 			// Restore freshness, then remove precisely the capability under test.
@@ -112,7 +112,7 @@ func TestHealthRollSevenRungsLiveDB(t *testing.T) {
 			if err != nil || incomplete.DrainingEligible != 0 || incomplete.LatestSuitableDrainingSince.Valid {
 				t.Fatalf("missing gate=%+v err=%v", incomplete, err)
 			}
-			if got := svc.queuedReason(e.ctx, now, row); got == ReasonWorkersUpgrading {
+			if got := svc.queuedReason(e.ctx, now, row, thWithLimit(testCustodyLimit)); got == ReasonWorkersUpgrading {
 				t.Fatalf("missing %s falsely diagnosed roll", lane)
 			}
 			if lane == "job files" {
@@ -179,7 +179,7 @@ func TestHealthRollWholeWorkerNegativesLiveDB(t *testing.T) {
 				}
 			}
 			now := time.Now()
-			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, runID))
+			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, runID), thWithLimit(testCustodyLimit))
 			if (got == ReasonWorkersUpgrading) != wantRoll {
 				t.Fatalf("reason=%q want roll=%v", got, wantRoll)
 			}

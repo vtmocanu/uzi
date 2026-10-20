@@ -332,6 +332,7 @@ export interface RunTurnRequest {
   ownerDecisionRequested?: boolean;
   /** Worker-derived park admission; never supplied by the model. */
   parkRunSupported?: boolean;
+  /** Worker-derived, phase-independent run eligibility (issue kind, non-interactive); phase authority stays with the broker. */
   nonInteractiveIssue?: boolean;
   /** Opted-in root registration persists; the broker checks live repair authority per call. */
   codeCrossCheck?: CodeCrossCheckToolAccess;

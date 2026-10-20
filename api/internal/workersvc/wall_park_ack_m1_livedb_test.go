@@ -37,11 +37,24 @@ func TestWallHoldRejectsFailedStateReportsLiveDB(t *testing.T) {
         VALUES ($1,$2,'held-worker',$3,'online',now())`, workerID, userID, workerID[:])
 	svc := fenceSvc(env)
 	nextIID := int64(988000)
-	for _, hold := range []string{"budget_exhausted", "completion_blocked"} {
+	// Ordinary owner and lead pauses both persist a NULL hold_reason.
+	for _, pause := range []struct {
+		name string
+		hold string
+	}{
+		{"budget_exhausted", "budget_exhausted"},
+		{"completion_blocked", "completion_blocked"},
+		{"ordinary-owner-pause", ""},
+		{"ordinary-lead-pause", ""},
+	} {
+		var hold any
+		if pause.hold != "" {
+			hold = pause.hold
+		}
 		for _, planRejected := range []bool{false, true} {
-			name := hold + "/ordinary"
+			name := pause.name + "/ordinary"
 			if planRejected {
-				name = hold + "/plan-rejected"
+				name = pause.name + "/plan-rejected"
 			}
 			for _, stamped := range []bool{false, true} {
 				suffix := "/legacy"
@@ -59,8 +72,12 @@ func TestWallHoldRejectsFailedStateReportsLiveDB(t *testing.T) {
                     status,worker_id,started_at,status_since,hold_reason,claim_generation,stop_kind)
                     VALUES ($1,$2,$3,'issue',$4,'t','d','paused',$5,now()-interval '2 hours',now(),$6,1,$7)`,
 						runID, userID, repoID, nextIID, workerID, hold, stopKind)
+					var inputID int64
 					if planRejected {
-						env.exec(`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'reject_plan', 'no')`, runID)
+						if err := env.pool.QueryRow(env.ctx, `INSERT INTO run_user_inputs (run_id, kind, body, applied_at, consumed_at)
+                            VALUES ($1, 'reject_plan', 'no', NULL, NULL) RETURNING id`, runID).Scan(&inputID); err != nil {
+							t.Fatal(err)
+						}
 					}
 					reason := "late failure"
 					var reportedGen *int64
@@ -74,13 +91,20 @@ func TestWallHoldRejectsFailedStateReportsLiveDB(t *testing.T) {
 						t.Fatalf("SetState(failed) = (run %s status %q, applied %v, err %v), want (current paused row, false, nil)",
 							current.ID, current.Status, applied, err)
 					}
-					if got := mustRun(t, env, runID); got.Status != "paused" || got.HoldReason.String != hold {
-						t.Fatalf("late failure changed hold: status %q reason %q", got.Status, got.HoldReason.String)
+					wantHoldValid := pause.hold != ""
+					if current.HoldReason.Valid != wantHoldValid || current.HoldReason.String != pause.hold {
+						t.Fatalf("returned hold = %v, want reason %q valid %v", current.HoldReason, pause.hold, wantHoldValid)
+					}
+					if got := mustRun(t, env, runID); got.Status != "paused" || got.HoldReason.Valid != wantHoldValid || got.HoldReason.String != pause.hold {
+						t.Fatalf("late failure changed pause: status %q hold %v, want paused reason %q valid %v",
+							got.Status, got.HoldReason, pause.hold, wantHoldValid)
 					}
 					if planRejected {
-						var settled int
-						if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='reject_plan' AND applied_at IS NOT NULL`, runID).Scan(&settled); err != nil || settled != 0 {
-							t.Fatalf("late rejection settled input = %d, err %v; want 0", settled, err)
+						var unchanged bool
+						if err := env.pool.QueryRow(env.ctx, `SELECT kind='reject_plan' AND body='no'
+                            AND applied_at IS NULL AND consumed_at IS NULL
+                            FROM run_user_inputs WHERE id=$1 AND run_id=$2`, inputID, runID).Scan(&unchanged); err != nil || !unchanged {
+							t.Fatalf("late rejection input %d unchanged = %v, err %v; want true, nil", inputID, unchanged, err)
 						}
 					}
 				})

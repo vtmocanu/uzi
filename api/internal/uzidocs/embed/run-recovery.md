@@ -497,7 +497,7 @@ operator-configurable environment variable on the API:
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
-| Admission-counted recovery holds per owner | 8 | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1–7 of its own owner-scoped open holds remains exempt; at 8 it loses that exemption. This fixed admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past 8. Not yet an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
+| Admission-counted recovery holds per owner | 8 by default; the admin setting `custody_hold_limit` (1 to 1000) | Open holds count except at most one per run backing a healthy current claim without an owner decision. Total open custody stays protected. At the admission limit, uzi pauses admitting **new** runs subject to custody admission until the counted pressure falls. Hold-free Plan and Code checker children (`kind = 'cross_check'`, both harness families) are exempt; judges and jobs gain no exemption. A requeued run with 1 to limit-1 of its own owner-scoped open holds remains exempt; at the limit it loses that exemption. This admission gate is not a strict ceiling: concurrent claims and stale heartbeats can raise pressure past the limit. Admins change the limit in [Admin settings](./admin-settings.md#custody-hold-limit); it is not an environment variable. See [ADR-2445](../adr/2445-custody-admission-accounting.md). |
 
 A byte refusal keeps the source retained. The archive's **Needs action**
 reason can read `storage quota exceeded`; current workers preserve a typed
@@ -1075,15 +1075,16 @@ completed-run check above.
 
 ## Reviewing and resolving held work
 
-Once **8 admission-counted holds per owner** (the *Admission-counted recovery
-holds* limit above) accumulate, uzi pauses admitting **new** runs subject to
+Once the **admission-counted holds per owner** limit (the *Admission-counted
+recovery holds* limit above: default 8, the admin setting `custody_hold_limit`)
+is reached, uzi pauses admitting **new** runs subject to
 custody admission for you. Hold-free Plan and Code checker children
 (`kind = 'cross_check'`) in both harness families are exempt; judges and jobs
 gain no exemption. Checker claims still require eligible owner identity,
 current parent/generation/round, deadline, protocol, vault, credentials,
 checker slots and workers (see [Cross-check](./cross-check.md)).
-A run that was interrupted and requeued while it has 1 to 7 of its own open
-holds keeps resuming; once that one run alone holds 8, it loses the exemption.
+A run that was interrupted and requeued while it has 1 to limit-1 of its own open
+holds keeps resuming; once that one run alone holds the limit, it loses the exemption.
 When that happens, the dashboard shows a full-width alert beneath the page
 heading with your safety-slot use, how many held sources need a decision, how
 many runs are blocked, and a **Review held work** button; if you connected
@@ -1781,6 +1782,25 @@ refused with a 409 that names the refs (see
 for the body). The block lifts once each ref is deleted or settled. An
 acknowledged ref clears at its retention expiry, or sooner with
 `uzi run held expire`.
+
+## Resuming an approved run in a fresh attempt
+
+When a run whose plan was already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was already approved at the gate (by you, or automatically on an autopilot run). The new session is told what happened, so it does not mistake the plan for its own:
+
+- **An approval statement.** The first implement prompt says the current plan was approved at the plan gate in an earlier session. Approval of the plan does not prove that any step the plan describes as happening before the gate actually took place.
+- **The plan.** The persisted plan is carried over unchanged. No gate revision number is shown.
+- **Your earlier follow-ups.** Follow-ups you sent in the earlier session are included once, oldest first, ahead of any new follow-ups, as clearly fenced historical context. The model is told to treat them as untrusted background, not as new instructions. A follow-up you send after the resume is delivered normally and is never duplicated as history.
+
+The earlier follow-ups are bounded: at most 40000 characters of follow-up text and 100 entries in total. uzi never shortens a follow-up to fit.
+
+If uzi cannot restore your earlier follow-ups in full (the lookup failed or was unavailable, or the history is over either bound), the run does not use the reviewed resume. It plans again and waits for your approval at the plan gate, even on an autopilot run. The run's activity shows a status line saying the earlier follow-ups could not be restored. Autopilot is switched off for the run when it parks, so a later recovery of a lost working tree also asks for your approval.
+
+Notes:
+
+- On a deployment whose API predates the follow-up lookup, every such resume waits for your approval. Upgrade the API before the workers.
+- A run that started from a supplied plan (seeded) resumes as before: no history, no forced approval.
+- If a resume with earlier follow-ups cannot deliver its pending input, the run fails when the failure is definitive and parks when it is transient.
+- A Codex run whose resume attempt is rejected mid-claim and falls back to a fresh thread is not covered by this carry-over.
 
 ## Salvage copies
 

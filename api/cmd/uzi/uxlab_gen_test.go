@@ -14,6 +14,7 @@ package main
 // it instantly; it never runs in CI.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -99,6 +101,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-done-failures":               func(d bool) string { return boardDoneFailures(d, false) },
+		"board-done-failures-selected":      func(d bool) string { return boardDoneFailures(d, true) },
 		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
@@ -127,6 +131,15 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
 		"detail-focus-transcript":      func(d bool) string { return detailFocusTranscript(d, now) },
 		"detail-paused":                func(d bool) string { return detailPaused(d, now) },
+		"detail-pause-lead":            func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 120) },
+		"detail-pause-owner":           func(d bool) string { return detailPauseOrigin(d, now, "owner", 120) },
+		"detail-pause-neutral":         func(d bool) string { return detailPauseOrigin(d, now, "", 120) },
+		"detail-pause-lead-narrow":     func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60) },
+		"detail-pause-owner-narrow":    func(d bool) string { return detailPauseOrigin(d, now, "owner", 60) },
+		"detail-pause-neutral-narrow":  func(d bool) string { return detailPauseOrigin(d, now, "", 60) },
+		"detail-pause-lead-plain":      func(d bool) string { return detailPauseOrigin(d, now, "lead_park", 60, true) },
+		"detail-pause-owner-plain":     func(d bool) string { return detailPauseOrigin(d, now, "owner", 60, true) },
+		"detail-pause-neutral-plain":   func(d bool) string { return detailPauseOrigin(d, now, "", 60, true) },
 		"detail-memory-hold-known":     func(d bool) string { return detailMemoryHold(d, now, true) },
 		"detail-memory-hold-missing":   func(d bool) string { return detailMemoryHold(d, now, false) },
 		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
@@ -1617,5 +1630,37 @@ func boardWideTitleScene(dark bool, now time.Time, width int) string {
 	m.width = width
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
 	m = step(m, secretsMsg{count: 2, codexCount: 1})
+	return m.View().Content
+}
+
+// detailPauseOrigin drives the shipped model with a loaded current suffix.
+func detailPauseOrigin(dark bool, now time.Time, origin string, width int, plain ...bool) string {
+	run := pausedFixture()
+	run.ID = detailRunID
+	run.StatusSince = tp(now.Add(-5 * time.Minute))
+	run.StartedAt = tp(now.Add(-10 * time.Minute))
+	run.UpdatedAt = *run.StatusSince
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	m.width = width
+	m.renderer, _ = newTUIRenderer(m.transcriptWidth(), dark)
+	m = applyDetail(m, run, []apitypes.MessageDTO{pauseMarker(101, *run.StatusSince, origin)})
+	if len(plain) > 0 && plain[0] {
+		var output bytes.Buffer
+		m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+		writer := colorprofile.NewWriter(&output, []string{"NO_COLOR=1"})
+		_, _ = writer.Write([]byte(m.View().Content))
+		return output.String()
+	}
+	return m.View().Content
+}
+
+// boardDoneFailures shows both failure outcomes beside human stops and successful work.
+func boardDoneFailures(dark, selected bool) string {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	rows := append([]apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "active01", Status: "running", IssueTitle: "Active implementation"}}}, doneFailureRows()...)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	if selected {
+		m.board.cursor = 1
+	}
 	return m.View().Content
 }

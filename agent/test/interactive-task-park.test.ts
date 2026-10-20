@@ -214,7 +214,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       sessionId: null,
       onSessionId: () => {},
       gatePlan: async () => approve,
-      pullFollowUp: () => undefined,
+      pullFollowUps: () => [],
       reportIteration: (n) => {
         iterations.push(n);
       },

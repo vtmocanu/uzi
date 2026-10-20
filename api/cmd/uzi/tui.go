@@ -196,9 +196,11 @@ type brewInfoMsg struct{ owner string }
 // detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
 // crew-rail milestones/accounts and now-line render from it, before the transcript.
 type detailRunMsg struct {
-	runID string
-	run   apitypes.RunDTO
-	err   error
+	coverageGeneration uint64
+	pauseEpoch         uint64
+	runID              string
+	run                apitypes.RunDTO
+	err                error
 	// gen is the detail SESSION generation the request was issued under (detailState.gen).
 	// exitToBoard cannot cancel an in-flight command, and reopening the SAME run passes the
 	// runID guard, so a reply from the previous session is rejected on gen instead.
@@ -218,10 +220,12 @@ const (
 
 // detailPageMsg carries one page of transcript messages for the drilled-in run.
 type detailPageMsg struct {
-	runID string
-	kind  detailPageKind
-	msgs  []apitypes.MessageDTO
-	err   error
+	coverageRevision uint64
+	pageEpoch        uint64 // loadTailCmd/catchupCmd capture the local page failure epoch at dispatch.
+	runID            string
+	kind             detailPageKind
+	msgs             []apitypes.MessageDTO
+	err              error
 	// reqID is the catch-up chain generation this page belongs to (M7), used only by pageCatchup
 	// so a superseded chain's reply is dropped; pageTail/pageBackfill leave it zero.
 	reqID uint64
@@ -269,9 +273,11 @@ type pollFallbackMsg struct {
 // without this the milestone checklist is frozen at open-time — the board badge polls, the
 // detail did not.
 type detailMetaMsg struct {
-	runID string
-	run   apitypes.RunDTO
-	err   error
+	coverageGeneration uint64
+	pauseEpoch         uint64
+	runID              string
+	run                apitypes.RunDTO
+	err                error
 	// reqID is the per-run request-generation id this reply belongs to (PRD #1130 M1 D2). The
 	// detail honours it only when reqID == m.detail.metaWaitID AND runID matches the current
 	// run, so a stale/superseded meta poll cannot clear a newer poll's guard. metaSeq restarts
@@ -818,17 +824,22 @@ var (
 
 func (m tuiModel) loadRunCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	pauseEpoch := m.detail.pauseEpoch
+	// Capture at dispatch so a queued DTO cannot certify a later reconnect.
+	coverageGeneration := m.detail.pauseCoverageGeneration()
 	return func() tea.Msg {
 		run, err := c.GetRun(ctx, runID)
-		return detailRunMsg{runID: runID, run: run, err: err, gen: gen}
+		return detailRunMsg{coverageGeneration: coverageGeneration, pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, gen: gen}
 	}
 }
 
 func (m tuiModel) loadTailCmd(runID string) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	coverageRevision := m.detail.pauseCoverageRevision()
+	pageEpoch := m.detail.pausePageEpoch
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{Tail: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
+		return detailPageMsg{pageEpoch: pageEpoch, coverageRevision: coverageRevision, runID: runID, kind: pageTail, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -848,9 +859,11 @@ func (m tuiModel) backfillCmd(runID string, before int32) tea.Cmd {
 // the reply so a superseded chain is dropped.
 func (m tuiModel) catchupCmd(runID string, after int32, reqID uint64) tea.Cmd {
 	c, ctx, gen := m.client, m.ctx, m.detail.gen
+	coverageRevision := m.detail.pauseCoverageRevision()
+	pageEpoch := m.detail.pausePageEpoch
 	return func() tea.Msg {
 		msgs, err := c.RunLogsPage(ctx, runID, uzicli.LogsPageQuery{After: after, Limit: detailPageSize, PayloadMax: detailPayloadMax})
-		return detailPageMsg{runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
+		return detailPageMsg{pageEpoch: pageEpoch, coverageRevision: coverageRevision, runID: runID, kind: pageCatchup, reqID: reqID, msgs: msgs, err: err, gen: gen}
 	}
 }
 
@@ -868,13 +881,16 @@ func (m *tuiModel) startDetailCatchupReq() tea.Cmd {
 // milestone / health / duration fields the stream does not send.
 func (m tuiModel) refreshRunMetaCmd(runID string, reqID, gen uint64) tea.Cmd {
 	c, parent := m.client, m.ctx
+	pauseEpoch := m.detail.pauseEpoch
+	// Capture at dispatch so a queued DTO cannot certify a later reconnect.
+	coverageGeneration := m.detail.pauseCoverageGeneration()
 	return func() tea.Msg {
 		// Per-poll deadline (PRD #1130 D3): same short bound as the board poll, derived
 		// inside the closure so defer cancel() fires on return rather than immediately.
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
 		run, err := c.GetRun(ctx, runID)
-		return detailMetaMsg{runID: runID, run: run, err: err, reqID: reqID, gen: gen}
+		return detailMetaMsg{coverageGeneration: coverageGeneration, pauseEpoch: pauseEpoch, runID: runID, run: run, err: err, reqID: reqID, gen: gen}
 	}
 }
 
@@ -1373,7 +1389,14 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.detail.gen {
 			return m, nil // a reply from a detail session the user has since left (same run reopened)
 		}
-		m.detail.applyRun(msg.run, msg.err)
+		status := m.detail.run.Status
+		pauseLastSince := m.detail.pauseLastSince
+		m.detail.applyRun(msg.run, msg.err, msg.coverageGeneration)
+		if msg.pauseEpoch != m.detail.pauseEpoch {
+			m.detail.run.Status = status
+			m.detail.pauseLastSince = pauseLastSince
+			m.detail.pauseMetaReady = false
+		}
 		// The ownership probe + queue indicator and the in-progress-milestone blink both
 		// key off the run DTO, so they ride the run load (as the old full-load did).
 		return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), m.maybeArmBlink())
@@ -1394,7 +1417,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Any tail reply — success or error — releases the retry guard, so a failed retry
 			// re-enables the next `r` / fallback tick instead of wedging the stuck state.
 			m.detail.tailInFlight = false
-			m.detail.applyTailPage(msg.msgs, msg.err)
+			m.detail.applyTailPage(msg.msgs, msg.err, msg.coverageRevision, msg.pageEpoch)
 			// Raise the stream's replay floor to the highest seq now held, so a reconnect replays
 			// only frames after the tail rather than the whole history (PRD #1137 M7).
 			if s := m.detail.stream; s != nil {
@@ -1424,6 +1447,8 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil // a superseded / stale catch-up reply
 			}
 			if msg.err != nil {
+				m.detail.invalidatePausePage()
+				m.detail.pauseCatchupFailed = true
 				m.detail.catchupWaitID = 0 // chain ends; the next tick may retry
 				return m, nil
 			}
@@ -1436,6 +1461,19 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// hostile/broken server or an all-duplicate page — the mirror of the backfill
 			// did-not-advance guard), so the chain can never spin without clearing its guard.
 			if len(msg.msgs) == 0 || m.detail.highSeq <= before {
+				if len(msg.msgs) != 0 {
+					m.detail.invalidatePausePage()
+					m.detail.pauseCatchupFailed = true
+				} else if msg.pageEpoch == m.detail.pausePageEpoch {
+					// EOF proves the already loaded current suffix, including an empty run.
+					if !m.detail.pauseSuffixSet {
+						m.detail.pauseSuffixAfter = max(0, m.detail.lowSeq-1)
+						m.detail.pauseSuffixSet = true
+					}
+					m.detail.pauseTailReady = true
+					m.detail.pauseCatchupFailed = false
+					m.detail.notePauseRead(msg.coverageRevision)
+				}
 				m.detail.catchupWaitID = 0 // caught up (or cannot advance): chain done
 				return m, nil
 			}
@@ -1461,7 +1499,12 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, nil // failed poll: guard cleared above so the next tick retries (D2)
 		}
-		m.detail.applyMeta(msg.run)
+		pauseLastSince := m.detail.pauseLastSince
+		m.detail.applyMeta(msg.run, msg.coverageGeneration)
+		if msg.pauseEpoch != m.detail.pauseEpoch {
+			m.detail.pauseLastSince = pauseLastSince
+			m.detail.pauseMetaReady = false
+		}
 		// A poll that first reveals the drilled-in run's in-progress milestone arms the blink.
 		return m, m.maybeArmBlink()
 
@@ -1527,6 +1570,10 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// D8: a socket we cannot open is a degradation, not a crash — fall back to
 			// the same 2s REST poll `uzi run logs --follow` uses and say so on screen.
 			m.detail.streamErr = msg.err
+			m.detail.invalidatePausePage()
+			m.detail.pauseCatchupFailed = true
+			m.detail.pauseMetaReady = false
+			m.detail.pauseEpoch++
 			m.detail.polling = true
 			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}
@@ -1565,6 +1612,10 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.closed {
 			m.detail.stream = nil
 			m.detail.streamErr = msg.err
+			m.detail.invalidatePausePage()
+			m.detail.pauseCatchupFailed = true
+			m.detail.pauseMetaReady = false
+			m.detail.pauseEpoch++
 			m.detail.polling = true
 			return m, pollFallbackCmd(m.detail.runID, m.detail.gen)
 		}

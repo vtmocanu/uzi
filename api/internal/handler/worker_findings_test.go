@@ -208,7 +208,7 @@ func (s *notifyingSpyStore) PruneNotificationsForUser(context.Context, store.Pru
 }
 
 func newNotifyingWorkerHandler(st workersvc.Store, ns *notifyingSpyStore, slack *findingSlackerSpy) *Handler {
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	h.SetNotifier(notifysvc.New(ns, slack, 0, nil))
 	return h
 }

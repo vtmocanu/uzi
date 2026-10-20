@@ -83,7 +83,7 @@ func (f checkerCustodyFixture) seed(t *testing.T, n int) {
 func (f checkerCustodyFixture) assertCount(t *testing.T, n int) {
 	t.Helper()
 	adm, err := f.env.q.GetCustodyAdmissionForRun(f.env.ctx, store.GetCustodyAdmissionForRunParams{
-		UserID: f.owner, RunID: f.child, CustodyHoldLimit: custodyHoldLimit, HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
+		UserID: f.owner, RunID: f.child, CustodyHoldLimit: testCustodyLimit, HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
 	})
 	if err != nil {
 		t.Fatal(err)

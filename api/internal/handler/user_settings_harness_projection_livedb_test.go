@@ -31,7 +31,7 @@ func TestUserSettingsLegacyProjectionFollowsEffectiveHarnessLiveDB(t *testing.T)
 	}
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
-	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	userID := mkSecretUser(t, pool)
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO user_secrets (id, user_id, kind, label, ciphertext, sealed_with)

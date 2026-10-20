@@ -24,7 +24,7 @@ func TestClaimJobCustodyControlLiveDB(t *testing.T) {
 				VALUES($1,$2,'job','research','job control','prompt','queued',true)`, job, f.userID)
 			f.seedUnrelatedOpenHolds(holds)
 			adm, err := env.q.GetCustodyAdmissionForRun(env.ctx, store.GetCustodyAdmissionForRunParams{
-				UserID: f.userID, RunID: job, CustodyHoldLimit: custodyHoldLimit,
+				UserID: f.userID, RunID: job, CustodyHoldLimit: testCustodyLimit,
 				HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
 			})
 			if err != nil || adm.AdmissionCountedHolds != int64(holds) || adm.ContinuationExempt {
@@ -104,7 +104,7 @@ func TestClaimCrossCheckCustodyAggregateControlLiveDB(t *testing.T) {
 	aggregate := func() store.GetCustodyAggregateForOwnerRow {
 		t.Helper()
 		a, err := f.env.q.GetCustodyAggregateForOwner(f.env.ctx, store.GetCustodyAggregateForOwnerParams{
-			UserID: f.owner, CustodyHoldLimit: custodyHoldLimit, HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
+			UserID: f.owner, CustodyHoldLimit: testCustodyLimit, HeartbeatCutoff: pgconv.Time(time.Now().Add(-time.Minute)),
 		})
 		if err != nil {
 			t.Fatal(err)

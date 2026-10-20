@@ -139,7 +139,7 @@ func provenanceBox(title, body string, width int, pal palette) string {
 type palette struct {
 	dark     bool
 	title    lipgloss.Style // tungsten bold: wordmark, eyebrows, key-hint letters, pane focus bar
-	faint    lipgloss.Style // ids, ages, chrome, whole done rows
+	faint    lipgloss.Style // ids, ages, chrome, quiet terminal fields
 	sel      lipgloss.Style // tungsten accent: the ▸ cursor and the selected id
 	box      lipgloss.Style // structural boxes (quit modal, confirm) — bordered, never filled
 	boxTitle lipgloss.Style // tungsten bold box label
@@ -147,18 +147,19 @@ type palette struct {
 
 	// The ANDON semantic colours, held as raw color.Color so a caller can compose a
 	// foreground word, a spine glyph or (for the amber band alone) a fill on the fly.
-	// stateColor/stateToken resolve a run's colour from these; nothing else maps a status
-	// to a colour, so the board row, the board strip and the detail header cannot disagree.
-	tungsten color.Color // chrome / selection accent / eyebrows
-	amber    color.Color // andon attention: needs-you, the gate band, ⚑ ✎
-	alarm    color.Color // failed, judge "issues", high severity
-	stall    color.Color // stalled / looping / near-timeout health
-	sage     color.Color // running (deliberately dimmer — running is normal)
-	indigo   color.Color // planning
-	wait     color.Color // rate-limited, crew-waiting, reconnecting
-	faintC   color.Color // ids, ages, done, unknown states
-	selBg    color.Color // warm-tinted full-row cursor bar
-	bandFg   color.Color // near-bg ink drawn on the one filled surface (the amber band)
+	// stateColor/stateToken resolve a run's semantic colour from these. The board
+	// dims finished failure tokens with doneAlarm while retaining the failure signal.
+	tungsten  color.Color // chrome / selection accent / eyebrows
+	amber     color.Color // andon attention: needs-you, the gate band, ⚑ ✎
+	alarm     color.Color // failed, judge "issues", high severity
+	doneAlarm color.Color // dimmed failure ink for DONE row state tokens
+	stall     color.Color // stalled / looping / near-timeout health
+	sage      color.Color // running (deliberately dimmer — running is normal)
+	indigo    color.Color // planning
+	wait      color.Color // rate-limited, crew-waiting, reconnecting
+	faintC    color.Color // ids, ages, done, unknown states
+	selBg     color.Color // warm-tinted full-row cursor bar
+	bandFg    color.Color // near-bg ink drawn on the one filled surface (the amber band)
 }
 
 func newPalette(dark bool) palette {
@@ -167,6 +168,7 @@ func newPalette(dark bool) palette {
 	tungsten := ld(lipgloss.Color("#7c5200"), lipgloss.Color("#c9a061"))
 	amber := ld(lipgloss.Color("#b45309"), lipgloss.Color("#ffb454"))
 	alarm := ld(lipgloss.Color("#b91c1c"), lipgloss.Color("#f87171"))
+	doneAlarm := ld(lipgloss.Color("#a04444"), lipgloss.Color("#cf8585"))
 	stall := ld(lipgloss.Color("#c2410c"), lipgloss.Color("#fb923c"))
 	sage := ld(lipgloss.Color("#2f7d4f"), lipgloss.Color("#6fbf8f"))
 	indigo := ld(lipgloss.Color("#4f46e5"), lipgloss.Color("#818cf8"))
@@ -179,7 +181,7 @@ func newPalette(dark bool) palette {
 
 	p := palette{
 		dark:     dark,
-		tungsten: tungsten, amber: amber, alarm: alarm, stall: stall, sage: sage,
+		tungsten: tungsten, amber: amber, alarm: alarm, doneAlarm: doneAlarm, stall: stall, sage: sage,
 		indigo: indigo, wait: wait, faintC: faintC, selBg: selBg, bandFg: bandFg,
 	}
 	p.title = lipgloss.NewStyle().Bold(true).Foreground(tungsten)

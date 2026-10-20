@@ -167,7 +167,7 @@ func newMoveFixture(ctx context.Context, t *testing.T, stub *moveStub) moveFixtu
 		cfg:      config.Config{},
 		settings: settings.New(&settingsStore{}, time.Minute),
 		svc:      newZeroWaitForgeService(q, box),
-		wsvc:     workersvc.New(q, box, workersvc.Params{}),
+		wsvc:     workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 	return f
 }

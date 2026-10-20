@@ -44,7 +44,7 @@ func TestCreateRunInputGateRevisionMismatchLiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{PlanMaxRevisions: 3, WorkerHeartbeatStale: time.Minute})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanMaxRevisions: 3, WorkerHeartbeatStale: time.Minute})
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, wsvc: wsvc, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
