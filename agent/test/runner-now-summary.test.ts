@@ -132,7 +132,8 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     api.nowSummary.set(claim.run_id, true);
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
     try {
-      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0, 200), { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
+      // Publication ends the executor early; retain the helper's bounded allowance under CPU stalls.
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -268,7 +269,7 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     const sdkCalls: { options: unknown; prompt: unknown }[] = [];
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
     try {
-      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0, 250), { homeRoot, queryFn: summaryQuery(sdkCalls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery(sdkCalls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
