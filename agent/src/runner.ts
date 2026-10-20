@@ -1725,7 +1725,7 @@ export function evaluateRequiredBase(input: RequiredBaseInput): "planned" | "att
       case "unknown":
         throw new BaseProofError(`the planned commit ${input.plannedBase} could not be read; --require-base cannot be verified`);
       case "missing":
-        throw new BaseCommitDivergedError(`the seeded plan was written against commit ${input.plannedBase}, which does not exist in this repository; --require-base is set, so this run will not implement against a diverged base`);
+        throw new BaseCommitDivergedError(`${detail}, and the planned commit does not exist in this repository; --require-base is set, so this run will not implement against a diverged base`);
     }
     if (input.planned.sha !== identity) throw unvouched();
     rule = "planned";
