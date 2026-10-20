@@ -1195,7 +1195,11 @@ const ATTRIBUTED_REAP_DETAIL_PIDS = 5;
 function attributedReapCause(reap: RunProcessReap | { failure: string }): { state: "survivors" | "unverified"; detail: string } | undefined {
   if ("failure" in reap) return { state: "unverified", detail: `run HOME-attributed reap failed: ${reap.failure}` };
   if (reap.left.length > 0) {
-    const shown = reap.left.slice(0, ATTRIBUTED_REAP_DETAIL_PIDS).join(",");
+    const reasons = reap.leftReasons;
+    const shown = reap.left
+      .slice(0, ATTRIBUTED_REAP_DETAIL_PIDS)
+      .map((pid) => (reasons?.[pid] ? `${pid}(${reasons[pid]})` : String(pid)))
+      .join(",");
     const more = reap.left.length > ATTRIBUTED_REAP_DETAIL_PIDS ? `,+${reap.left.length - ATTRIBUTED_REAP_DETAIL_PIDS} more` : "";
     return { state: "survivors", detail: `run HOME-attributed reap left ${reap.left.length} process(es): pids ${shown}${more}` };
   }

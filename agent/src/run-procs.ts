@@ -284,20 +284,22 @@ if (mode === "scan") {
     let killed = 0;
     left = [];
     for (const [pid, why, pi] of found) {
-      if (why === "unreadable" || pi.ppid === workerPid) { left.push([pid, why]); continue; }
+      if (why === "unreadable") { left.push([pid, "unreadable"]); continue; }
+      if (pi.ppid === workerPid) { left.push([pid, "worker_child"]); continue; }
       // Re-verify immediately before the kill: the same process (start time), still the run's.
       const again = info(pid);
       if (again === undefined) continue;
-      if (again === "unknown" || again.start !== pi.start) { left.push([pid, "unreadable"]); continue; }
+      if (again === "unknown") { left.push([pid, "unreadable"]); continue; }
+      if (again.start !== pi.start) { left.push([pid, "restarted"]); continue; }
       const now = attribution(pid);
       if (now === "gone" || now === "none") continue;
-      if (now === "unreadable") { left.push([pid, now]); continue; }
+      if (now === "unreadable") { left.push([pid, "unreadable"]); continue; }
       try {
         process.kill(pid, "SIGKILL");
         killed++;
         w("K\\t" + pid + "\\t" + now);
       } catch (err) {
-        if (err.code !== "ESRCH") left.push([pid, "kill-failed"]);
+        if (err.code !== "ESRCH") left.push([pid, "kill_failed"]);
       }
     }
     if (killed === 0 || truncated) break;
@@ -339,8 +341,17 @@ export interface RunProcessReap {
   killed: number[];
   /** Attributed processes still there after the reap (unreadable ones are never killed). */
   left: number[];
+  /** Why each pid in `left` survived (diagnostics only; absent from fakes that do not classify).
+   *  A pid the helper did not classify is simply missing from the map. */
+  leftReasons?: Record<number, string>;
   complete: boolean;
 }
+
+/** The survivor classes the kill pass emits: `unreadable` (attribution could not be read, or the
+ *  process vanished into an unknown state), `worker_child` (a direct child of the worker, never
+ *  killed), `restarted` (the pid's start time changed between listing and kill), `kill_failed`
+ *  (SIGKILL failed other than ESRCH). */
+export type LeftReason = "unreadable" | "worker_child" | "restarted" | "kill_failed";
 
 /** The SDK executor's process attribution operations. Explicit executor options take precedence. */
 export interface RunProcessOps {
@@ -372,13 +383,14 @@ async function passes(
   worktree: string | undefined,
   spawnedPids: readonly number[],
   opts: RunProcsOptions,
-): Promise<{ attributed: number[]; killed: number[]; complete: boolean }> {
+): Promise<{ attributed: number[]; killed: number[]; complete: boolean; reasons: Record<number, string> }> {
   const budget = MaintenanceBudget.current();
   const wrappers = opts.wrappers ?? [runnerCommand];
   const budgetMs = opts.budgetMs ?? (mode === "scan" ? SCAN_BUDGET_MS : REAP_BUDGET_MS);
   const spawned = spawnedPids.filter((p) => Number.isSafeInteger(p) && p > 0).slice(0, MAX_SPAWNED);
   const attributed = new Set<number>();
   const killed = new Set<number>();
+  const reasons: Record<number, string> = {};
   let complete = true;
   for (const wrap of wrappers) {
     budget?.check();
@@ -423,12 +435,15 @@ async function passes(
         complete = false;
         continue;
       }
-      if (f[0] === "A") attributed.add(pid);
+      if (f[0] === "A") {
+        attributed.add(pid);
+        if (mode === "kill" && f[2] !== undefined && f[2] !== "") reasons[pid] = f[2];
+      }
       else if (f[0] === "K") killed.add(pid);
       else complete = false;
     }
   }
-  return { attributed: [...attributed], killed: [...killed], complete };
+  return { attributed: [...attributed], killed: [...killed], complete, reasons };
 }
 
 /**
@@ -467,8 +482,8 @@ export async function reapRunProcesses(
 ): Promise<RunProcessReap> {
   try {
     const r = await passes("kill", home, worktree, spawnedPids, opts);
-    return { killed: r.killed, left: r.attributed, complete: r.complete };
+    return { killed: r.killed, left: r.attributed, leftReasons: r.reasons, complete: r.complete };
   } catch {
-    return { killed: [], left: [], complete: false };
+    return { killed: [], left: [], leftReasons: {}, complete: false };
   }
 }

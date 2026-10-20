@@ -263,6 +263,7 @@ describe("run process attribution (PRD #1809 D4)", () => {
     // The second round no longer sees the killed job (its fake entry stays, but kill mode re-reads
     // it; the link it gave is kept across rounds either way).
     assert.deepStrictEqual(r.left, [linkedChild.pid], "a linked unreadable process is reported, never killed");
+    assert.deepStrictEqual(r.leftReasons, { [linkedChild.pid!]: "unreadable" }, "classified as unreadable");
     assert.strictEqual(await exited, "SIGKILL");
     for (const c of [linkedChild, unrelated]) {
       assert.strictEqual(c.exitCode, null);
@@ -298,6 +299,7 @@ fs.openSync = function (p, ...rest) {
     const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [recycling] });
     assert.deepStrictEqual(r.killed, [], "a recycled pid is never killed");
     assert.deepStrictEqual(r.left, [pid], "it is reported as unresolved instead");
+    assert.deepStrictEqual(r.leftReasons, { [pid]: "restarted" }, "a changed start time is classified restarted");
     assert.ok(fs.readFileSync(statPath, "utf8").includes(" 2000 "), "precondition: the start time did change mid-reap");
     assert.strictEqual(c.exitCode, null);
     assert.strictEqual(c.signalCode, null);
@@ -314,6 +316,41 @@ fs.openSync = function (p, ...rest) {
     const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 777 });
     assert.deepStrictEqual(r.killed, []);
     assert.strictEqual(c.exitCode, null);
+    assert.deepStrictEqual(r.left, [c.pid], "the worker's child survives the reap");
+    assert.deepStrictEqual(r.leftReasons, { [c.pid!]: "worker_child" }, "classified worker_child, not by its attribution");
+  });
+
+  it("a SIGKILL that fails other than ESRCH leaves the pid classified kill_failed", async () => {
+    const c = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+    children.push(c);
+    const pid = c.pid!;
+    fake(pid, { env: [`HOME=${runHome}`], cwd: "/tmp" });
+    // The helper never really signals: a preload makes its process.kill fail with EPERM.
+    const preload = path.join(root, "eperm.cjs");
+    fs.writeFileSync(
+      preload,
+      `const orig = process.kill;
+process.kill = function (pid, sig) {
+  if (sig === "SIGKILL") { const e = new Error("operation not permitted"); e.code = "EPERM"; throw e; }
+  return orig.call(this, pid, sig);
+};
+`,
+    );
+    const denying: CommandWrapper = (command, args) => ({ command, args: ["--require", preload, ...args] });
+    const r = await reapRunProcesses(runHome, worktree, [], { procRoot, workerPid: 1, wrappers: [denying] });
+    assert.deepStrictEqual(r.killed, []);
+    assert.deepStrictEqual(r.left, [pid]);
+    assert.deepStrictEqual(r.leftReasons, { [pid]: "kill_failed" });
+    assert.strictEqual(c.exitCode, null);
+    assert.strictEqual(c.signalCode, null);
+  });
+
+  it("a helper that cannot run reaps with an empty reason map", async () => {
+    const r = await reapRunProcesses(runHome, worktree, [], {
+      procRoot,
+      wrappers: [() => ({ command: path.join(root, "no-such-binary"), args: [] })],
+    });
+    assert.deepStrictEqual(r, { killed: [], left: [], leftReasons: {}, complete: false });
   });
 
   it("this host's real proc tree: a detached child with the run's HOME is found and reaped; another HOME is not", { skip: realTreeSkip("real proc tree: detached child with the run's HOME") }, async () => {

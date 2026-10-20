@@ -1192,6 +1192,7 @@ export class SdkExecutor implements Executor {
         run_home: this.homeDir,
         killed: r.killed,
         ...(r.left.length > 0 ? { left: r.left } : {}),
+        ...(r.left.length > 0 && r.leftReasons && Object.keys(r.leftReasons).length > 0 ? { left_reasons: r.leftReasons } : {}),
         ...(r.complete ? {} : { incomplete: true }),
       });
     }
