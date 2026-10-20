@@ -13697,11 +13697,12 @@ export class RunRunner {
   }
 
   private async heldPublicationStep(
-    _claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord,
+    claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord,
   ): Promise<{ pack: Buffer } | { reason: string }> {
     return prepareFrozenHeld({
       git: this.git, barePath: flight.barePath!, branch: record.branch, sourceSha: record.sourceSha,
       policy: record.heldPolicy!, deadlineMs: this.scanDeadlineMs(),
+      defaultBranch: claim.repo.default_branch ?? undefined,
       maxBytes: this.checkpointTestHooks?.heldPackMaxBytes,
       onScan: scan => {
         if (scan.trusted && scan.findings.length)
@@ -14303,6 +14304,7 @@ export class RunRunner {
       // Scan floors: the default branch, the last confirmed checkpoint ref tip, and confirmed
       // published real tips beneath overlays (already public). Local-only checkpointFloor is excluded.
       const range = await this.git.resolveCheckpointRange(barePath, branch, {
+        defaultBranch: flight.owedDefaultBranch,
         confirmedTip: flight.lastCheckpointRefTip,
         extraFloors: flight.publishedRealTips,
       });
@@ -14392,6 +14394,7 @@ export class RunRunner {
       flight.lastCheckpointRefTip,
     ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
     const range = await this.git.resolveCheckpointRange(barePath, branch, {
+      defaultBranch: flight.owedDefaultBranch,
       confirmedTip: flight.lastCheckpointRefTip,
       extraFloors: floorCandidates,
     });
@@ -15069,7 +15072,8 @@ export class RunRunner {
         // `attempted ?? confirmed`, unchanged #1086 behaviour.) GitHub only, like the overlay.
         flight.checkpointChainForge === true
           ? [flight.lastAttemptedCheckpointRefTip, flight.lastCheckpointRefTip]
-          : undefined);
+          : undefined,
+        { defaultBranch: flight.owedDefaultBranch, signal });
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
