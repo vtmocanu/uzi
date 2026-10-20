@@ -104,7 +104,7 @@ func TestBoardCardCarriesNoPauseIntent(t *testing.T) {
 		pgtype.Int8{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{}, pgtype.Text{},
 		"ok", pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Text{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 		pgtype.Text{}, pgtype.Text{}, 1,
-		pgtype.Timestamptz{Valid: true}, pgtype.Timestamptz{Valid: true}, uuid.New(), 0)
+		pgtype.Timestamptz{Valid: true}, pgtype.Timestamptz{Valid: true}, uuid.New(), 0, pgtype.Text{})
 	if card.IsMine {
 		t.Fatal("test setup: card should be a non-owner viewer's")
 	}

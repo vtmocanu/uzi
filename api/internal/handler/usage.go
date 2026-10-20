@@ -36,7 +36,7 @@ func numericToFloat(n pgtype.Numeric) float64 {
 // (PRD #1293). needsLanding is the server-computed sub-cut of failed (issue #1418), always
 // needs_landing <= failed. It guarantees a non-nil fail_origins so the field marshals as
 // {} rather than null, per the API contract — a nil map JSON-encodes to null.
-func runOutcomes(finished, completed, cancelled, planRejected, failed, needsLanding int64, origins map[string]int64) apitypes.RunOutcomesDTO {
+func runOutcomes(finished, completed, cancelled, planRejected, baseDiverged, failed, needsLanding int64, origins map[string]int64) apitypes.RunOutcomesDTO {
 	if origins == nil {
 		origins = map[string]int64{}
 	}
@@ -45,6 +45,7 @@ func runOutcomes(finished, completed, cancelled, planRejected, failed, needsLand
 		Completed:    completed,
 		Cancelled:    cancelled,
 		PlanRejected: planRejected,
+		BaseDiverged: baseDiverged,
 		Failed:       failed,
 		NeedsLanding: needsLanding,
 		FailOrigins:  origins,
@@ -138,10 +139,10 @@ func (h *Handler) SelfUsage(w http.ResponseWriter, r *http.Request) {
 		RunCount: row.RunCount,
 		Outcomes: apitypes.RunOutcomeWindowsDTO{
 			Lifetime: withFailureRecency(runOutcomes(outcomes.LifetimeFinished, outcomes.LifetimeCompleted,
-				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeFailed,
+				outcomes.LifetimeCancelled, outcomes.LifetimePlanRejected, outcomes.LifetimeBaseDiverged, outcomes.LifetimeFailed,
 				outcomes.LifetimeNeedsLanding, lifetimeOrigins), outcomes.LastFailedAt, outcomes.LastFailedRunID, outcomes.LastFailedOrigin, outcomes.CompletedSinceLastFailure, uuid.Nil),
 			Last7Days: runOutcomes(outcomes.Last7Finished, outcomes.Last7Completed,
-				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7Failed,
+				outcomes.Last7Cancelled, outcomes.Last7PlanRejected, outcomes.Last7BaseDiverged, outcomes.Last7Failed,
 				outcomes.Last7NeedsLanding, last7Origins),
 		},
 		// PRD #1429 M1 (D7): the per-window subscription/unreported run counts the store
@@ -246,13 +247,13 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Last7RunCount:             u.Last7RunCount,
 			Last7SubscriptionRunCount: u.Last7SubscriptionRunCount,
 			Last7UnreportedRunCount:   u.Last7UnreportedRunCount,
-			Last7Outcomes:             runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[u.UserID]),
+			Last7Outcomes:             runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7BaseDiverged, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[u.UserID]),
 			RunCount:                  u.RunCount,
 			// PRD #1429 M1 (D7): the user's lifetime subscription/unreported run counts, so the
 			// admin per-user breakdown discloses a non-metered component like the factory total.
 			SubscriptionRunCount: u.SubscriptionRunCount,
 			UnreportedRunCount:   u.UnreportedRunCount,
-			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.LifetimeBaseDiverged, oc.Failed,
 				oc.NeedsLanding, originsByUser[u.UserID]), oc.LastFailedAt, oc.LastFailedRunID, oc.LastFailedOrigin, oc.CompletedSinceLastFailure, uuid.Nil),
 		})
 	}
@@ -268,12 +269,12 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			Email:         oc.Email,
 			Usage:         apitypes.UsageDTO{},
 			Last7Days:     &apitypes.UsageDTO{},
-			Last7Outcomes: runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[oc.UserID]),
+			Last7Outcomes: runOutcomes(oc.Last7Finished, oc.Last7Completed, oc.Last7Cancelled, oc.Last7PlanRejected, oc.Last7BaseDiverged, oc.Last7Failed, oc.Last7NeedsLanding, last7OriginsByUser[oc.UserID]),
 			RunCount:      0,
 			// No usage row means no run_usage_totals rows, so both non-metered counts are zero.
 			SubscriptionRunCount: 0,
 			UnreportedRunCount:   0,
-			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.Failed,
+			Outcomes: withFailureRecency(runOutcomes(oc.Finished, oc.Completed, oc.Cancelled, oc.PlanRejected, oc.LifetimeBaseDiverged, oc.Failed,
 				oc.NeedsLanding, originsByUser[oc.UserID]), oc.LastFailedAt, oc.LastFailedRunID, oc.LastFailedOrigin, oc.CompletedSinceLastFailure, uuid.Nil),
 		})
 	}
@@ -296,10 +297,10 @@ func (h *Handler) AdminUsage(w http.ResponseWriter, r *http.Request) {
 			RunCount: totals.RunCount,
 			Outcomes: apitypes.RunOutcomeWindowsDTO{
 				Lifetime: withFailureRecency(runOutcomes(factoryOutcomes.LifetimeFinished, factoryOutcomes.LifetimeCompleted,
-					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected,
+					factoryOutcomes.LifetimeCancelled, factoryOutcomes.LifetimePlanRejected, factoryOutcomes.LifetimeBaseDiverged,
 					factoryOutcomes.LifetimeFailed, factoryOutcomes.LifetimeNeedsLanding, factoryLifetimeOrigins), factoryOutcomes.LastFailedAt, factoryOutcomes.LastFailedRunID, factoryOutcomes.LastFailedOrigin, factoryOutcomes.CompletedSinceLastFailure, factoryOutcomes.LastFailedUserID),
 				Last7Days: runOutcomes(factoryOutcomes.Last7Finished, factoryOutcomes.Last7Completed,
-					factoryOutcomes.Last7Cancelled, factoryOutcomes.Last7PlanRejected,
+					factoryOutcomes.Last7Cancelled, factoryOutcomes.Last7PlanRejected, factoryOutcomes.Last7BaseDiverged,
 					factoryOutcomes.Last7Failed, factoryOutcomes.Last7NeedsLanding, factoryLast7Origins),
 			},
 			// PRD #1429 M1 (D7): the factory-wide per-window subscription/unreported run

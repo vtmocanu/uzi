@@ -44,7 +44,7 @@ func TestMapLatestRunBranchAdvanceStopReason(t *testing.T) {
 				dto := mapLatestRun(runID, owner, "cancelled", kind, 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 					nullTxt(), txt("branch_moved"), txt(reason),
 					"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-					nullTxt(), nullTxt(), 1, tstamp(now), tstamp(now), viewer, 0)
+					nullTxt(), nullTxt(), 1, tstamp(now), tstamp(now), viewer, 0, pgtype.Text{})
 				if dto.Status != "cancelled" {
 					t.Fatalf("board status = %s, want cancelled", dto.Status)
 				}
@@ -75,7 +75,10 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "completed", "issue", 2, true, i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer, 0)
+			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer, 0, txt("base_diverged"))
+		if dto.FailOrigin == nil || *dto.FailOrigin != "base_diverged" {
+			t.Fatalf("shared fail_origin: %v", dto.FailOrigin)
+		}
 		if dto.IsPlanning {
 			t.Fatal("a completed run must not be is_planning")
 		}
@@ -116,7 +119,7 @@ func TestMapLatestRun(t *testing.T) {
 		// flows through so the board badge can render "Time limit reached".
 		dto := mapLatestRun(runID, viewer, "paused", "issue", 4, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{}, txt("budget_exhausted"), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		if dto.HoldReason == nil || *dto.HoldReason != "budget_exhausted" {
 			t.Fatalf("hold_reason should flow to the board DTO, got %v", dto.HoldReason)
 		}
@@ -132,7 +135,10 @@ func TestMapLatestRun(t *testing.T) {
 		dto := mapLatestRun(runID, otherOwner, "failed", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			txt("panic: raw agent internals"), txt("plan_rejected"), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, txt("base_diverged"))
+		if dto.FailOrigin == nil || *dto.FailOrigin != "base_diverged" {
+			t.Fatalf("shared fail_origin: %v", dto.FailOrigin)
+		}
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
 		}
@@ -166,7 +172,7 @@ func TestMapLatestRun(t *testing.T) {
 		mine := mapLatestRun(runID, viewer, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
 			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		if mine.StopReason == nil || *mine.StopReason != "wrong branch, my mistake" {
 			t.Fatalf("owner must see stop_reason, got %v", mine.StopReason)
 		}
@@ -178,7 +184,7 @@ func TestMapLatestRun(t *testing.T) {
 		theirs := mapLatestRun(runID, otherOwner, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
 			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		if theirs.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
 		}
@@ -193,7 +199,7 @@ func TestMapLatestRun(t *testing.T) {
 	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "queued", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		if dto.IsPlanning {
 			t.Fatal("a queued run is not running, so it must not be is_planning")
 		}
@@ -207,7 +213,7 @@ func TestMapLatestRun(t *testing.T) {
 		// The owner of a flagged run sees the enum, the since, AND the reason.
 		mine := mapLatestRun(runID, viewer, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		// This owner's run is running at iteration 0 with no persisted plan: the board card
 		// carries the issue #321 planning flag (kind issue is planning-capable).
 		if !mine.IsPlanning {
@@ -228,7 +234,7 @@ func TestMapLatestRun(t *testing.T) {
 		other := uuid.New()
 		theirs := mapLatestRun(runID, other, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
+			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0, pgtype.Text{})
 		if theirs.Health != "waiting_worker" {
 			t.Fatalf("non-owner health enum should still be exposed, got %q", theirs.Health)
 		}
@@ -257,7 +263,7 @@ func TestAssembleCards(t *testing.T) {
 	// issue_iid, so a positional/cross-keying bug would surface here.
 	runRows := []store.ListLatestRunsForRepoRow{
 		{IssueIid: i8(20), ID: run20, UserID: other, Status: "completed", Kind: "issue", IterationCount: 4, HasPlanMd: pgtype.Bool{Bool: true, Valid: true}, MrIid: i8(5), MrWebUrl: txt("https://forge.example/grp/repo/pulls/5"), MrState: txt("closed"),
-			FailureReason: txt("raw agent internals"), StopReason: txt("wrong branch, my mistake"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
+			FailOrigin: txt("base_diverged"), FailureReason: txt("raw agent internals"), StopReason: txt("wrong branch, my mistake"), OwnerName: nullTxt(), RunCount: 2, CreatedAt: tstamp(now), UpdatedAt: tstamp(now)},
 		{IssueIid: i8(10), ID: run10, UserID: viewer, Status: "running", Kind: "issue", IterationCount: 0, HasPlanMd: pgtype.Bool{Bool: false, Valid: true},
 			// PRD #1170: a running run with a frozen 8h budget and a set started_at, so the
 			// card carries a non-null deadline_at (non-vacuous — a null start would nil it).
@@ -313,6 +319,9 @@ func TestAssembleCards(t *testing.T) {
 	}
 	if byIID[20].LatestRun.MrWebURL == nil || *byIID[20].LatestRun.MrWebURL != "https://forge.example/grp/repo/pulls/5" {
 		t.Fatalf("issue 20: mr_web_url should flow through, got %v", byIID[20].LatestRun.MrWebURL)
+	}
+	if byIID[20].LatestRun.FailOrigin == nil || *byIID[20].LatestRun.FailOrigin != "base_diverged" {
+		t.Fatal("assembleCards dropped shared origin")
 	}
 	// Decision 5: another owner's failure_reason is withheld from this viewer.
 	if byIID[20].LatestRun.FailureReason != nil {

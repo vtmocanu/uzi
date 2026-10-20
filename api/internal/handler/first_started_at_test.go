@@ -77,7 +77,7 @@ func TestMapLatestRun_CarriesFirstStartedAtAndFinishedAt(t *testing.T) {
 	finished := started.Add(time.Hour)
 	dto := mapLatestRun(uuid.New(), uuid.New(), "completed", "issue", 1, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 		"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), tstamp(started), tstamp(first), tstamp(finished), pgtype.Int4{}, 0, 0, 0, false,
-		nullTxt(), nullTxt(), 1, tstamp(first), tstamp(finished), uuid.New(), 0)
+		nullTxt(), nullTxt(), 1, tstamp(first), tstamp(finished), uuid.New(), 0, pgtype.Text{})
 	if dto.FirstStartedAt == nil || !dto.FirstStartedAt.Equal(first) {
 		t.Fatalf("first_started_at = %v, want %v", dto.FirstStartedAt, first)
 	}
@@ -86,7 +86,7 @@ func TestMapLatestRun_CarriesFirstStartedAtAndFinishedAt(t *testing.T) {
 	}
 	live := mapLatestRun(uuid.New(), uuid.New(), "running", "issue", 1, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
 		"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
-		nullTxt(), nullTxt(), 1, tstamp(first), tstamp(first), uuid.New(), 0)
+		nullTxt(), nullTxt(), 1, tstamp(first), tstamp(first), uuid.New(), 0, pgtype.Text{})
 	if live.FirstStartedAt != nil || live.FinishedAt != nil {
 		t.Fatalf("unset columns must map to null, got %v / %v", live.FirstStartedAt, live.FinishedAt)
 	}
