@@ -375,11 +375,12 @@ itself is unchanged and is still `--audit-level=high`.
 #### Temporary Mermaid KaTeX override (#2456)
 
 [Issue #2456](https://github.com/vtmocanu/uzi/issues/2456) pins Mermaid's KaTeX
-dependency to `0.18.2` via the scoped `mermaid` override in `web/package.json`
-to address [GHSA-238p-pmpm-9mq7](https://github.com/advisories/GHSA-238p-pmpm-9mq7).
-Mermaid is a dev-only parser for the PR diagram browser tests; Mermaid 11.17.2
-still requires KaTeX `^0.16.47`, so the override upgrades this transitive dependency
-without changing direct dependency declarations or other KaTeX consumers.
+dependency via the scoped `mermaid` override in `web/package.json` to address
+[GHSA-238p-pmpm-9mq7](https://github.com/advisories/GHSA-238p-pmpm-9mq7), whose
+security floor is KaTeX `0.18.2`; read `web/package.json` for the current pin.
+Mermaid is a dev-only parser for the PR diagram browser tests; the locked Mermaid
+release still requires KaTeX `^0.16.47`, so the override upgrades this transitive
+dependency without changing direct dependency declarations or other KaTeX consumers.
 
 Remove the override once a Mermaid release allows KaTeX `>= 0.18.2`. Before
 removal, verify the release's dependency range, regenerate and inspect the
