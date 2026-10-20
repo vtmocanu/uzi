@@ -18684,6 +18684,8 @@ WHERE id = $3 AND worker_id = $4 AND (kind <> 'cross_check' OR claim_generation 
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE))
 `
 
 type SetRunAwaitingFollowupParams struct {
@@ -18742,6 +18744,8 @@ WHERE id = $4 AND worker_id = $5 AND (kind <> 'cross_check' OR claim_generation 
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Only provider_unavailable: every other hold reason keeps today's behaviour.
   AND NOT (status IN ('paused', 'queued') AND COALESCE(hold_reason = 'provider_unavailable', FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE))
 `
 
 type SetRunAwaitingInputParams struct {
@@ -21775,7 +21779,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = $2 AND runs.worker_id = $3 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
@@ -21820,7 +21824,7 @@ UPDATE runs SET
 WHERE runs.id = $2 AND runs.worker_id = $3 AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND COALESCE(runs.hold_reason = 'provider_unavailable', FALSE))
