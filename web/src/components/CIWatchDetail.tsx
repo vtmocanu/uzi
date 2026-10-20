@@ -10,6 +10,7 @@
 // Every workflow key and failure signature is forge-derived text: it is rendered as React
 // text children only, never as markup and never into an attribute.
 
+import { stripUnsafeChars } from "../lib/safeText";
 import { useEffect, useState } from "react";
 import { api, type CIEpisodeDTO, type Schedule } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
@@ -94,11 +95,27 @@ export function CIWatchDetail({ s, panelId }: { s: Schedule; panelId: string }) 
                 key={w}
                 className="break-all rounded-md border border-edge bg-raised px-2 py-0.5 font-mono text-[12px] text-fg"
               >
-                {w}
+                {stripUnsafeChars(w)}
               </li>
             ))}
           </ul>
         )}
+      </div>
+
+      <div>
+        <h4 className="text-[12px] font-medium text-muted">Artifact selectors</h4>
+        {(s.ci_artifacts?.length ?? 0) === 0 ? (
+          <p className="mt-1 text-[13px] text-fg">None — no artifacts fetched</p>
+        ) : (
+          <ul className="mt-1.5 flex min-w-0 flex-wrap gap-1.5" aria-label="Artifact selectors">
+            {s.ci_artifacts!.map((selector) => (
+              <li key={selector} className="min-w-0 break-all rounded-md border border-edge bg-raised px-2 py-0.5 font-mono text-[12px] text-fg">
+                {stripUnsafeChars(selector)}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-1 text-[11px] text-faint">Fetching is GitHub-only; unsupported providers remain logs-only.</p>
       </div>
 
       <div>
@@ -153,9 +170,9 @@ function EpisodeTable({ episodes }: { episodes: CIEpisodeDTO[] }) {
           return (
             <tr key={e.workflow_key} className="border-b border-edge/60 align-top last:border-b-0">
               <td className="py-2 pr-3">
-                <div className="break-all font-mono text-fg">{e.workflow_key}</div>
+                <div className="break-all font-mono text-fg">{stripUnsafeChars(e.workflow_key)}</div>
                 {e.last_signature && (
-                  <div className="mt-0.5 break-words text-[11.5px] text-muted">{e.last_signature}</div>
+                  <div className="mt-0.5 break-words text-[11.5px] text-muted">{stripUnsafeChars(e.last_signature)}</div>
                 )}
                 <div className="mt-0.5 text-[11px] text-faint sm:hidden">{formatStamp(e.updated_at)}</div>
               </td>

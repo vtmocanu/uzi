@@ -26,7 +26,8 @@ function read(repo: string, ...args: string[]): string {
 
 /** Local broker simulation, not real Go handler proof. Only the fixture default seed and
  * emitted packs can supply objects to receiver; receipt assertions run BEFORE each ACK. */
-export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: number) {
+export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: number, expectedRunId?: string,
+  publication: "overlay" | "park_marker" = "overlay") {
   const scratch = path.resolve(import.meta.dirname, "../../.uzi/scratch");
   fs.mkdirSync(scratch, { recursive: true });
   const dir = makeScratchRoot("3101-content-", scratch);
@@ -36,13 +37,16 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
   const publisherErrors: unknown[] = [];
   let commitC = "";
   let earlier = "";
-  let beforeAck: ((signal: AbortSignal, generation: number | undefined) => void) | undefined;
+  let beforeAck: ((signal: AbortSignal | undefined, generation: number | undefined) => void) | undefined;
   fs.mkdirSync(path.join(fx.originPath, path.dirname(WF)), { recursive: true });
   commitInTree(fx.originPath, WF, OLD_WORKFLOW);
   execFileSync("git", ["clone", "--bare", "--no-local", fx.originPath, receiver],
     { env: GIT_ENV, stdio: "pipe" });
   const original = client.publishCheckpoint;
   client.publishCheckpoint = async (_runId, tip, pack: Readable, signal, generation) => {
+    if (expectedRunId !== undefined && _runId !== expectedRunId) {
+      return original.call(client, _runId, tip, pack, signal, generation);
+    }
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of pack) chunks.push(Buffer.from(chunk));
@@ -54,15 +58,20 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
         earlier = tip;
         assert.equal(read(receiver, "show", `${ref}:${TRACKED}`), "tracked before C\n");
       } else {
-        assert.equal(tips.length, 1, "only earlier and shutdown publications");
+        assert.equal(tips.length, 1, "only earlier and latest preservation publications");
         assert.equal(read(receiver, "show", `${ref}:${COMMITTED}`), COMMITTED_BYTES);
         assert.equal(read(receiver, "show", `${ref}:${TRACKED}`), DIRTY_BYTES);
         assert.equal(read(receiver, "show", `${ref}:${UNTRACKED}`), UNTRACKED_BYTES);
-        assert.equal(read(receiver, "show", `${ref}:${WF}`), NEW_WORKFLOW);
+        assert.equal(read(receiver, "show", `${ref}:${WF}`), publication === "overlay" ? NEW_WORKFLOW : OLD_WORKFLOW,
+          "shutdown overlay and credential-free pause marker preserve their distinct workflow contracts");
         read(receiver, "merge-base", "--is-ancestor", earlier, tip);
         read(receiver, "merge-base", "--is-ancestor", commitC, tip);
-        assert.ok(signal, "shutdown broker publication carries its bounded boundary signal");
-        assert.equal(signal.aborted, false, "spent execution signals do not abort the publication permit");
+        if (publication === "overlay") {
+          assert.ok(signal, "shutdown broker publication carries its bounded boundary signal");
+          assert.equal(signal.aborted, false, "spent execution signals do not abort the publication permit");
+        } else {
+          assert.equal(signal, undefined, "existing credential-free owner pause does not mint a Codex boundary permit");
+        }
         beforeAck?.(signal, generation);
       }
       tips.push(tip);
@@ -75,7 +84,7 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
   return {
     tips,
     receiver,
-    onShutdownReceipt(fn: (signal: AbortSignal, generation: number | undefined) => void) { beforeAck = fn; },
+    onShutdownReceipt(fn: (signal: AbortSignal | undefined, generation: number | undefined) => void) { beforeAck = fn; },
     async prepare(ctx: RunContext) {
       commitInTree(ctx.worktreePath, TRACKED, "tracked before C\n");
       assert.ok(ctx.checkpoint);
@@ -104,19 +113,24 @@ export function shutdownContentProof(fx: Fixture, client: WorkerClient, iid: num
       // Runner may catch publisher failures; preserve their original assertion after
       // checking the latest received bytes and before checking ACK counts.
       if (publisherErrors.length > 0) throw publisherErrors[0];
-      assert.equal(tips.length, 2, "#3101 shutdown emitted a newer checkpoint");
+      assert.equal(tips.length, 2, "the preservation sink emitted a newer checkpoint");
       const tip = tips[1]!;
       const bare = local.barePathFor(fx.originPath);
       const marker = read(bare, "rev-parse", `refs/uzi-runner/agent/issue-${iid}`).trim();
       assert.deepEqual([COMMITTED, TRACKED, UNTRACKED].map(file => content(bare, marker, file)),
         [COMMITTED_BYTES, DIRTY_BYTES, UNTRACKED_BYTES], "worker bare tracking marker preserves exact local bytes");
-      assert.notEqual(marker, tip, "local tracking keeps the real marker, not overlay");
       assert.ok(read(bare, "log", "-1", "--format=%s", marker).startsWith(WIP_PARK_COMMIT_PREFIX));
-      assert.ok(read(receiver, "log", "-1", "--format=%s", tip).startsWith(OVERLAY_COMMIT_PREFIX));
-      assert.equal(read(receiver, "rev-parse", `${tip}^1`).trim(), earlier,
-        "overlay chains the previous acknowledged checkpoint first");
-      const parents = read(receiver, "rev-list", "--parents", "-n", "1", tip).trim().split(/\s+/).slice(1);
-      assert.equal(parents.at(-1), marker);
+      if (publication === "overlay") {
+        assert.notEqual(marker, tip, "local tracking keeps the real marker, not overlay");
+        assert.ok(read(receiver, "log", "-1", "--format=%s", tip).startsWith(OVERLAY_COMMIT_PREFIX));
+        assert.equal(read(receiver, "rev-parse", `${tip}^1`).trim(), earlier,
+          "overlay chains the previous acknowledged checkpoint first");
+        const parents = read(receiver, "rev-list", "--parents", "-n", "1", tip).trim().split(/\s+/).slice(1);
+        assert.equal(parents.at(-1), marker);
+      } else {
+        assert.equal(tip, marker, "owner pause publishes exactly its real WIP marker");
+        assert.ok(read(receiver, "log", "-1", "--format=%s", tip).startsWith(WIP_PARK_COMMIT_PREFIX));
+      }
       assert.equal(read(receiver, "rev-parse", `${marker}^1`).trim(), commitC);
       // A new cache and data directory cannot borrow the original worker's tracking objects.
       const dataDir = path.join(dir, "second-worker");

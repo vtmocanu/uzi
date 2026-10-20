@@ -1,3 +1,4 @@
+import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineError } from "../checkpoint-stop.js";
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production `CodexExecutor` and the
 // claim-aware DARK selection seam's Codex branch.
 //
@@ -56,6 +57,7 @@
 import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
 import { MaintenanceBudget } from "../maintenance-budget.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
+import { CI_EVIDENCE_READ, readCIEvidence, ciEvidencePrompt } from "../ci-evidence-tools.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -109,7 +111,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -913,7 +915,7 @@ export function createRunLaneInstallerReconcile(
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
         timer = chunkedTimeout(() => resolve(false), left(), { now: timeoutNow });
-        state.promise!.then(() => resolve(!signal?.aborted && left() > 0));
+        state.promise!.then(() => resolve(!signal?.aborted && left() > 0), () => resolve(false));
       });
     } finally {
       timer?.cancel();
@@ -921,21 +923,34 @@ export function createRunLaneInstallerReconcile(
     }
   };
   const reconcile: ReconcileBeforeBoundary = async (request, signal) => {
+    const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(Date.now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
+    const deadlineAt = Math.min(now() + Math.max(0, request.deadlineMs), cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
     const cancellation = AbortSignal.any([signal, authoritySignal,
+      ...[request.checkpointStop?.signal].filter((s): s is AbortSignal => s !== undefined),
       ...[cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
     const refused = (): ReconcileOutcome => ({ kind: "blocked", errors: [{
       category: cause ? (authoritySignal.aborted ? "authorization" : "timeout") : "protocol",
       message: cause && authoritySignal.aborted ? "codex dependency install reconcile refused: lifecycle cancelled"
         : "codex dependency install did not settle before reconcile",
     }] });
-    const remaining = () => Math.max(0, Math.min(deadlineAt - Date.now(),
+    const remaining = () => Math.max(0, Math.min(deadlineAt - now(),
       cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity));
     if (cause && cancellation.aborted) return refused();
-    if (!await settle(deadlineAt, cancellation, remaining)) return refused();
-    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - Date.now()) }, signal);
+    if (!await settle(deadlineAt, cancellation, remaining)) {
+      if (request.checkpointStop?.signal.aborted && !signal.aborted && remaining() > 0) {
+        // Cleanup ignores cooperative/lifecycle cancellation only; it grants no
+        // credential authority. The original hard deadline still bounds the join.
+        const cleanupSignal = AbortSignal.any([signal,
+          ...[cause?.stopSignal, cause ? MaintenanceBudget.signal() : undefined]
+            .filter((s): s is AbortSignal => s !== undefined)]);
+        if (!await settle(deadlineAt, cleanupSignal, remaining)) return refused();
+        return credentialReconcile({ ...request, deadlineMs: remaining() }, signal);
+      }
+      return refused();
+    }
+    return credentialReconcile({ ...request, deadlineMs: Math.max(0, deadlineAt - now()) }, signal);
   };
   return Object.assign(state, { settle, reconcile });
 }
@@ -979,12 +994,20 @@ export function buildRunLaneReconcile(
   let operation: { capability: string; operation_id: string; observed_generation: number } | undefined;
   let operationUncertain = false;
   return async (request: BoundaryRequest, boundarySignal: AbortSignal): Promise<ReconcileOutcome> => {
+    const now = request.checkpointStop?.now ?? Date.now;
     const cause = request.gracefulShutdownCheckpoint;
-    const deadlineAt = Math.min(Date.now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
+    const deadlineAt = Math.min(now() + request.deadlineMs, cause?.deadlineAt ?? Infinity);
     const authoritySignal = cause?.stopSignal ?? lifecycleSignal;
+    // Credential exchanges, like ownership mutations, must settle once sent.
+    // Cooperative checkpoint expiry is observed before a send and by safety
+    // after reconciliation; only hard/authority fences cancel the exchange.
     const signal = AbortSignal.any([boundarySignal,
       ...[authoritySignal, cause ? MaintenanceBudget.signal() : undefined].filter((s): s is AbortSignal => s !== undefined)]);
-    const expired = () => signal.aborted || Date.now() >= deadlineAt ||
+    const checkpointAuthorityExpired = () => {
+      try { checkCheckpointStop(request.checkpointStop); return false; }
+      catch (error) { return !(error instanceof CheckpointSoftDeadlineError); }
+    };
+    const expired = () => signal.aborted || checkpointAuthorityExpired() || now() >= deadlineAt ||
       (cause ? (MaintenanceBudget.current()?.remainingMs() ?? Infinity) : Infinity) <= 0;
     const blocked = (deferral?: "vault_locked" | "refresh_unknown" | "account_unavailable"): ReconcileOutcome => ({
       kind: "blocked",
@@ -993,8 +1016,16 @@ export function buildRunLaneReconcile(
         : `codex ${binding.authMode} boundary reconcile failed` }],
       ...(deferral ? { deferral } : {}),
     });
+    // Only a pre-exchange stop can be clean. A shutdown proof explains lifecycle
+    // cancellation for admission, never authorizes ordinary credential work.
+    const cleanStop = () => !cause && !operationUncertain && !boundarySignal.aborted &&
+      now() < deadlineAt && !isVaultLocked?.() &&
+      (binding.authMode !== "subscription" || (committed.value !== undefined &&
+        Number.isSafeInteger(committed.value) && committed.value >= binding.generation)) &&
+      cleanCheckpointAdmission(request.checkpointStop, lifecycleSignal);
+    if (cleanStop()) throw new CheckpointSoftDeadlineError();
     // Lifecycle cancellation wins even after an ambiguous send; the runner routes steering.
-    if (authoritySignal?.aborted) return blocked();
+    if (authoritySignal?.aborted) return blocked(operationUncertain ? "refresh_unknown" : undefined);
     // Issue #1789: the run already learned (mid-turn) that the owner vault is locked: defer at once
     // with NO credential call, instead of re-asking the api for a refresh/release it will refuse.
     if (isVaultLocked?.()) {
@@ -1004,6 +1035,7 @@ export function buildRunLaneReconcile(
       return { kind: "blocked", errors, deferral: "vault_locked" };
     }
     if (expired()) return blocked(operationUncertain ? "refresh_unknown" : undefined);
+    if (cleanStop()) throw new CheckpointSoftDeadlineError();
     try {
       if (binding.authMode === "subscription") {
         if (committed.value === undefined) {
@@ -1052,7 +1084,7 @@ export function buildRunLaneReconcile(
             }
             const failure = codexRefreshFailure(err);
             // The boundary deadline after a send cannot prove whether the provider spent the token.
-            if (failure === "cancelled" && boundarySignal.aborted) {
+            if (failure === "cancelled") {
               operationUncertain = true;
               return blocked("refresh_unknown");
             }
@@ -1402,6 +1434,7 @@ function codeCrossCheckAccess(ctx: RunContext): CodeCrossCheckToolAccess | undef
 }
 
 export interface CodexToolHandlerDeps {
+  readonly ciEvidence?: import("../ci-evidence.js").PreparedCIEvidence;
   readonly claimGeneration?: number;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly client: WorkerClient;
@@ -1438,6 +1471,12 @@ export interface CodexToolHandlerDeps {
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
   const { client, runId, log, emit, skills } = deps;
   const map = new Map<string, ToolHandler>();
+  if (deps.ciEvidence) map.set(CI_EVIDENCE_READ, async args => {
+    const reply = await readCIEvidence(deps.ciEvidence!, args);
+    if (reply.isError) throw new Error("CI evidence read denied or unavailable");
+    // The reply adapters stringify objects; preserve the already bounded text.
+    return reply.content[0]!.text;
+  });
   if (deps.codeCrossCheck) map.set(CODE_DISPOSITIONS_TOOL, async args => {
     await reportCodeDispositions(deps.codeCrossCheck!, args);
     return { content: [{ type: "text", text: "Code cross-check dispositions recorded." }] };
@@ -2569,6 +2608,9 @@ export class CodexExecutor implements Executor {
       this.deps.timeoutNow,
       installAbort,
     );
+    // Execution lifetime: planning, helper prompt evaluation and provider-epoch
+    // recreation cannot consume or reset the first ordinary owner dispatch.
+    let interruptedOwnerDispatched = false;
     this.depsInstall = installState;
     const settleInstall = async (): Promise<void> => { await this.settleDepsInstall(undefined, undefined, installState); };
     const forwardInstallAbort = (): void => {
@@ -2619,6 +2661,7 @@ export class CodexExecutor implements Executor {
         await fs.mkdir(this.provisionHomeDir, { recursive: true });
         await prepareCodexRunHome(this.homeRoot);
       }
+      ctx.ciEvidence = await ctx.prepareCIEvidence?.();
       // Provision the run's tool packages ONCE (PRD #18; SHARED across every epoch — the forge/
       // memory budget counters a per-epoch rebuild would reset). A tier-1 failure throws
       // REASON_PROVISION_FAILED, which this try's finally then cleans up after. Injected via
@@ -2685,6 +2728,7 @@ export class CodexExecutor implements Executor {
         log: this.log,
         emit: (msg) => ctx.emit(msg),
         skills: ctx.skills ?? [],
+        ciEvidence: ctx.ciEvidence,
         codeCrossCheck: codeCrossCheckAccess(ctx),
       });
 
@@ -3349,7 +3393,14 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined, undefined,
+            systemFollowUp === undefined && round === 0 ? (prompt) => {
+              if (interruptedOwnerDispatched) return prompt;
+              const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
+              const snapshot = interruptedSnapshotNote(ctx.interruptedSnapshot);
+              interruptedOwnerDispatched = true;
+              return [prompt, snapshot, calls].filter(Boolean).join("\n\n");
+            } : undefined);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -4121,6 +4172,7 @@ export class CodexExecutor implements Executor {
     // Issue #1800: called when the turn first yields an event evidencing the model processed the
     // prompt (evidencesModelProcessing), not on lifecycle events such as the claim init.
     onFirstEvent?: () => void,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
@@ -4202,11 +4254,12 @@ export class CodexExecutor implements Executor {
     // signal, and the harness reads an abort of it as an owner stop (watchdog/cancel), not as a
     // clean end of the turn. A separate controller cancels only the delegations.
     const effectsAbort = new AbortController();
-    const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
+      if (beforeDispatch) prompt = beforeDispatch(prompt);
+      const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
       let turn = harness.startTurn(request);
       let events = turn.events[Symbol.asyncIterator]();
       let first = await (async () => {
@@ -4417,6 +4470,7 @@ export class CodexExecutor implements Executor {
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
     idleOperation?: () => Promise<ReducedTurnResult>,
+    beforeDispatch?: (prompt: string) => string,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -4433,7 +4487,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent, beforeDispatch,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -4839,12 +4893,15 @@ export class CodexExecutor implements Executor {
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
     const request: RunTurnRequest = {
-      prompt,
+      ciEvidencePrepared: !!ctx.ciEvidence,
+      prompt: prompt + ciEvidencePrompt(ctx.ciEvidence),
       systemPrompt,
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
-      nonInteractiveIssue: parkRunEligible(ctx, phase),
+      // Phase-independent: the root vocabulary is registered once at thread/start and survives
+      // the approval thread/resume; the broker gates the phase.
+      nonInteractiveIssue: (ctx.kind ?? "issue") === "issue" && !ctx.interactive,
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,

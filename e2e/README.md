@@ -115,9 +115,12 @@ the script and `.github/workflows/ci.yml` in the same commit.
 
 The script runs each package in a separate Go invocation against the same DSN,
 appending to one log for the aggregate and per-package guards. Each invocation has
-a 10-minute timeout except `workersvc`, whose cumulative LiveDB runtime approaches
-600 seconds and gets a bounded 15 minutes (900 seconds). This adds timeout headroom,
-not a speedup; a failed invocation stops the sweep immediately.
+a 10-minute timeout except `handler` (20 minutes) and `workersvc` (30 minutes).
+With artifact admission coverage, the worker-service suite took nearly 18 minutes
+in isolation and integrated sweeps exhausted 20 minutes. The local helper's larger
+bounded deadline provides headroom; it changes no test selection, race checking,
+or skip guards and is not a speedup. CI retains its own configured deadlines.
+A failed invocation stops the sweep immediately.
 
 ## Recovery reset marker lifecycle
 

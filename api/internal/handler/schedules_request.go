@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/agenttmpl"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
@@ -116,6 +117,16 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 	}
 	if n.Target != "ci_watch" && len(n.CIWorkflows.Value) > 0 {
 		return n, http.StatusBadRequest, "ci_workflows is only valid for a ci_watch schedule"
+	}
+	if n.CIArtifacts.Present {
+		clean, status, msg := normalizeCIArtifacts(n.CIArtifacts.Value)
+		if status != 0 {
+			return n, status, msg
+		}
+		n.CIArtifacts.Value = clean
+	}
+	if n.Target != "ci_watch" && len(n.CIArtifacts.Value) > 0 {
+		return n, http.StatusBadRequest, "ci_artifacts is only valid for a ci_watch schedule"
 	}
 
 	switch n.Target {
@@ -292,7 +303,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		// PRD #1247 M6: a PRESENT credential_override (even an explicit inherit/null) makes
 		// this NOT an enabled-only PATCH, so it routes through the config path that validates
 		// and persists the override; `{enabled}` alone (override omitted) still short-circuits.
-		!req.CredentialOverride.Present && !req.CIWorkflows.Present &&
+		!req.CredentialOverride.Present && !req.CIWorkflows.Present && !req.CIArtifacts.Present &&
 		// PRD #1429 M4a: a PRESENT harness (even an explicit clear/null) likewise makes this
 		// NOT an enabled-only PATCH, mirroring credential_override above.
 		req.RemoveLabelOnDispatch == nil && !req.Harness.Present && !req.CapacityLimit.Present && !req.CapacityRoomNeeded.Present
@@ -424,6 +435,12 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	if !req.CIWorkflows.Present && m.Target == "ci_watch" {
 		if stored := ciWorkflowsFromColumn(cur.CiWorkflows); len(stored) > 0 {
 			m.CIWorkflows = apitypes.OptionalCIWorkflows{Present: true, Value: stored}
+		}
+	}
+	m.CIArtifacts = req.CIArtifacts
+	if !req.CIArtifacts.Present && m.Target == "ci_watch" {
+		if stored := ciArtifactsFromColumn(cur.CiArtifacts); len(stored) > 0 {
+			m.CIArtifacts = apitypes.OptionalCIArtifacts{Present: true, Value: stored}
 		}
 	}
 	if m.Target == "ci_watch" && cur.Target != "ci_watch" {
@@ -646,4 +663,36 @@ func ciWorkflowsFromColumn(b []byte) []string {
 		return nil
 	}
 	return out
+}
+
+func ciArtifactsColumn(m apitypes.ScheduleRequest) []byte {
+	if m.Target != "ci_watch" || len(m.CIArtifacts.Value) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(m.CIArtifacts.Value)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ciArtifactsFromColumn decodes the stored jsonb selector list; nil on NULL, empty or a
+// malformed value (the writer never produces one).
+func ciArtifactsFromColumn(b []byte) []string {
+	if len(b) == 0 {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(b, &out); err != nil || len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func normalizeCIArtifacts(in []string) ([]string, int, string) {
+	out, err := ciartifacts.NormalizeSelectors(in)
+	if err != nil {
+		return nil, http.StatusBadRequest, err.Error()
+	}
+	return out, 0, ""
 }

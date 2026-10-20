@@ -1,4 +1,6 @@
+import { m3Persist } from "./m3-projection-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { m3Calls } from "./m3-recovery-fixture.js";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { execFileSync } from "node:child_process";
@@ -7559,5 +7561,184 @@ describe("M2 replacement reviewed plan fresh context", () => {
     assert.match(prompt, /Historical completion or stop declarations.*not authority/);
     assert.equal(result.scopeCapped, undefined);
     assert.deepEqual(result.milestonesCompleted, ["M1"]);
+  });
+});
+
+describe("M3 SDK interrupted recovery delivery", () => {
+  const snapshot = { base: "interrupted", interruptedEdits: false, commits: 0 } as const;
+  it("M3 absent observations still consume the first-owner delivery latch", async () => {
+    let gets = 0;
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("working"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", interruptedSnapshot: snapshot,
+      getInterruptedCalls: () => ++gets === 1 ? undefined : m3Calls(),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(gets, 1);
+    assert.match(turns[0]!.promptText!, /temporary mutations/);
+    assert.doesNotMatch(turns[1]!.promptText!, /temporary mutations/);
+    turns.forEach(turn => assert.doesNotMatch(turn.promptText!, /interrupted_calls_/));
+  });
+
+  it("M3 completion rework is a system turn and never repeats first-owner commands", async () => {
+    let gets = 0, attempts = 0;
+    const { queryFn, turns } = fakeTurns([
+      [signalDone(), resultSuccess()],
+      [assistantText("completion rework"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", seeded: true, planApproved: true, approvedPlan: "approved",
+      frozenMilestones: [{ id: "m1", title: "work" }], completionInterlock: true,
+      config: { max_iterations: 6 }, interruptedSnapshot: snapshot,
+      getInterruptedCalls: () => { gets++; return m3Calls(); },
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(gets, 1);
+    assert.equal(turns.length, 3);
+    assert.match(turns[1]!.promptText!, /Completion check/);
+    for (const turn of turns.slice(1)) assert.doesNotMatch(turn.promptText!, /interrupted_calls_|temporary mutations/);
+  });
+
+  it("M3 lifecycle failure from delivery getter aborts before a provider query", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const lost = new Error("M3 claim superseded at delivery");
+    const { ctx } = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved",
+      getInterruptedCalls: () => { throw lost; },
+    });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), error => error === lost);
+    assert.equal(turns.length, 0);
+  });
+
+  for (const kind of ["issue", "self_improve", "ci_fix"] as const) {
+    it(`M3 ${kind} plans carry snapshots without telemetry; getter waits for approval/install`, async () => {
+      let approved = false, installed = false, gets = 0;
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        kind, interruptedSnapshot: snapshot,
+        pipeline: kind === "ci_fix" ? { ref: "main", web_url: "https://example.com", failed_jobs: [], id: 1, sha: "a".repeat(40) } : undefined,
+        getInterruptedCalls: () => { assert.ok(approved && installed); gets++; return undefined; },
+        gatePlan: async () => { assert.equal(gets, 0); approved = true; return { kind: "approve", selection: { status: "absent" } }; },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, {
+        queryFn, installDeps: async () => { installed = true; return { results: [], truncated: false }; },
+      }).run(probe.ctx);
+      assert.equal(gets, 1);
+      assert.match(turns[0]!.promptText!, /unvalidated interrupted snapshot/);
+      assert.match(turns[1]!.promptText!, /unvalidated interrupted snapshot/);
+      assert.ok(turns.every(t => !t.promptText!.includes("interrupted_calls_")));
+    });
+  }
+
+  it("M3 replans before first ordinary implementation do not consume evidence", async () => {
+    let gets = 0, gates = 0;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("first"), resultSuccess()],
+      [submitPlan("revised"), resultSuccess()],
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      interruptedSnapshot: snapshot, priorWork: { commits: 3 },
+      getInterruptedCalls: () => { assert.equal(gates, 2); gets++; return m3Calls(); },
+      gatePlan: async () => ++gates === 1 ? { kind: "revise", feedback: "revise" }
+        : { kind: "approve", selection: { status: "absent" } },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(gets, 1);
+    assert.equal(turns.length, 4);
+    assert.ok(turns.slice(0, 2).every(t => !t.promptText!.includes("interrupted_calls_")));
+    assert.match(turns[2]!.promptText!, /printf interrupted-observation/);
+    assert.doesNotMatch(turns[3]!.promptText!, /interrupted_calls_|temporary mutations/);
+    assert.ok(turns.every(t => !appendOf(t.options.systemPrompt).includes("interrupted_calls_")));
+  });
+
+  it("M3 preapproved resume after a gate replan keeps independent snapshot warning", async () => {
+    let gets = 0;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("revised"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: "old", resumePhase: "awaiting_approval",
+      takeResumedGateEvent: async () => ({ kind: "revise", feedback: "revise" }),
+      interruptedSnapshot: { base: "generic", interruptedEdits: true, commits: null },
+      getInterruptedCalls: () => { gets++; return undefined; },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(gets, 1);
+    for (const t of turns) assert.match(t.promptText!, /origin base has unknown provenance/);
+    assert.doesNotMatch(turns[1]!.promptText!, /and build on it|Do not redo/);
+  });
+
+  it("M3 first owner then clarification/system and later owner never replay commands", async () => {
+    let gets = 0;
+    const { queryFn, turns } = fakeTurns([
+      [askUserTurn("which?"), resultSuccess()],
+      [assistantText("answer processed"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const { ctx } = makeCtx({
+      seeded: true, planApproved: true, approvedPlan: "approved", priorWork: { commits: 3 }, interruptedSnapshot: snapshot,
+      getInterruptedCalls: () => { gets++; return m3Calls(); },
+      askUser: async () => ({ kind: "answer", answers: ["SYSTEM-ANSWER"] }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.equal(gets, 1);
+    assert.match(turns[0]!.promptText!, /interrupted_calls_/);
+    assert.match(turns[1]!.promptText!, /SYSTEM-ANSWER/);
+    assert.equal(turns.length, 3);
+    for (const t of turns) assert.doesNotMatch(t.promptText!, /and build on it|Do not redo/);
+    for (const t of turns.slice(1)) assert.doesNotMatch(t.promptText!, /interrupted_calls_|printf interrupted-observation/);
+  });
+
+  it("M3 cancellation while planning never evaluates the delivery getter", async () => {
+    let gets = 0;
+    const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()]]);
+    const { ctx } = makeCtx({ getInterruptedCalls: () => { gets++; return m3Calls(); } }, { kind: "cancel" });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /cancelled/);
+    assert.equal(gets, 0);
+  });
+});
+
+describe("M3 Claude producer projection compatibility", () => {
+  it("M3 actual Claude adapter/reducer/batcher preserves canonical Bash IDs and lead/subagent lanes", async () => {
+    const id = "m3-call-" + "x".repeat(150);
+    const scripts: SDKMessage[] = [];
+    for (const child of [false, true]) {
+      const attribution = child ? { parent_tool_use_id: "dispatch-m3", subagent_type: "coder", task_description: "child label" } : {};
+      scripts.push({
+        type: "assistant", session_id: "sess-1", ...attribution,
+        message: { content: [{ type: "tool_use", id, name: "Bash", input: { command: "printf projection-private-\u0000value" } }] },
+      } as unknown as SDKMessage, {
+        type: "user", session_id: "sess-1", ...attribution,
+        message: { content: [{ type: "tool_result", tool_use_id: id, content: "projection-private-\u0000value", is_error: false }] },
+      } as unknown as SDKMessage);
+    }
+    scripts.push(signalDone(), resultSuccess());
+    const { queryFn } = fakeTurns([scripts]);
+    const { ctx, emits } = makeCtx({ seeded: true, planApproved: true, approvedPlan: "approved" });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    const sent = await m3Persist(emits);
+    const starts = sent.filter(m => m.kind === "tool_use" && m.payload.name === "Bash");
+    assert.equal(starts.length, 2);
+    assert.deepEqual(starts.map(m => m.agent), ["lead", "coder"]);
+    assert.equal(starts[0]!.agent_instance, undefined);
+    assert.equal(starts[1]!.agent_instance, "dispatch-m3");
+    for (const start of starts) {
+      assert.equal(start.payload.id, id);
+      assert.equal((start.payload.input as { command: string }).command, "printf ***REDACTED***");
+      const results = sent.filter(m => m.kind === "tool_result" && m.agent === start.agent &&
+        m.agent_instance === start.agent_instance && m.payload.tool_use_id === id);
+      assert.equal(results.length, 1);
+      assert.deepEqual(results[0]!.payload, { tool_use_id: id, content: "***REDACTED***", is_error: false });
+    }
+    assert.doesNotMatch(JSON.stringify(sent), /projection-private-value|\\u0000/);
   });
 });

@@ -442,21 +442,29 @@ func toGitHubWorkflowRun(r *gh.WorkflowRun) WorkflowRun {
 	if r.GetWorkflowID() > 0 {
 		key = strconv.FormatInt(r.GetWorkflowID(), 10)
 	}
+	var attempt *int64
+	if r.RunAttempt != nil {
+		n := int64(*r.RunAttempt)
+		attempt = &n
+	}
 	return WorkflowRun{
-		WorkflowKey: key,
-		ID:          r.GetID(),
-		Name:        r.GetName(),
-		Number:      int64(r.GetRunNumber()),
-		Event:       r.GetEvent(),
-		Branch:      r.GetHeadBranch(),
-		SHA:         r.GetHeadSHA(),
-		Status:      r.GetStatus(),
-		Conclusion:  r.GetConclusion(),
-		Title:       r.GetDisplayTitle(),
-		Actor:       r.GetActor().GetLogin(),
-		WebURL:      r.GetHTMLURL(),
-		CreatedAt:   r.GetCreatedAt().Time,
-		UpdatedAt:   r.GetUpdatedAt().Time,
-		StartedAt:   r.GetRunStartedAt().Time,
+		RunAttempt:       attempt,
+		RepositoryID:     r.GetRepository().GetID(),
+		HeadRepositoryID: r.GetHeadRepository().GetID(),
+		WorkflowKey:      key,
+		ID:               r.GetID(),
+		Name:             r.GetName(),
+		Number:           int64(r.GetRunNumber()),
+		Event:            r.GetEvent(),
+		Branch:           r.GetHeadBranch(),
+		SHA:              r.GetHeadSHA(),
+		Status:           r.GetStatus(),
+		Conclusion:       r.GetConclusion(),
+		Title:            r.GetDisplayTitle(),
+		Actor:            r.GetActor().GetLogin(),
+		WebURL:           r.GetHTMLURL(),
+		CreatedAt:        r.GetCreatedAt().Time,
+		UpdatedAt:        r.GetUpdatedAt().Time,
+		StartedAt:        r.GetRunStartedAt().Time,
 	}
 }

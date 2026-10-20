@@ -172,6 +172,25 @@ root="github.com/vtmocanu/uzi/api/${pkg#./}"
 root="${root%/...}"
 name=TestSweepLiveDB
 case " $* " in
+  *" ^TestCIArtifactsRepairE2E$ "*)
+    name=TestCIArtifactsRepairE2E
+    if [ "$SCENARIO" = artifact-go-fail ]; then echo "artifact process failed"; exit 9; fi
+    if [ "$SCENARIO" != artifact-top-run ]; then echo "=== RUN   $name"; fi
+    for leaf in claude/fresh claude/resume codex/fresh codex/resume; do
+      if [ "$SCENARIO" != artifact-leaf-run ] || [ "$leaf" != codex/resume ]; then
+        echo "=== RUN   $name/$leaf"
+      fi
+      if [ "$SCENARIO" != artifact-leaf-pass ] || [ "$leaf" != codex/resume ]; then
+        echo "        --- PASS: $name/$leaf (0.01s)"
+      fi
+    done
+    if [ "$SCENARIO" != artifact-top-pass ]; then echo "--- PASS: $name (0.01s)"; fi
+    case "$SCENARIO" in
+      artifact-top-skip) echo "--- SKIP: $name (0.01s)" ;;
+      artifact-sub-skip) echo "            --- SKIP: $name/codex/resume (0.01s)" ;;
+    esac
+    printf 'ok\t%s\t0.01s\n' "$root"
+    exit 0 ;;
   *" ^TestCodexRefreshLostReplyE2E$ "*) name=TestCodexRefreshLostReplyE2E ;;
 esac
 if [ "$SCENARIO" = go-fail ] && [ "$pkg" = ./internal/forgesvc/... ]; then
@@ -212,7 +231,7 @@ for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; 
   if [ "$scenario" != success ]; then optional=1; fi
   rc=0
   PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" TMPDIR="$case_dir" \
-    UZI_STORE_IT_PG_WAIT_SECS=1 UZI_CODEX_REFRESH_LOSTREPLY_E2E="$optional" \
+    UZI_STORE_IT_PG_WAIT_SECS=1 UZI_CODEX_REFRESH_LOSTREPLY_E2E="$optional" UZI_CI_ARTIFACTS_E2E="" \
     bash "$SCRIPT" > "$case_dir/output" 2>&1 || rc=$?
 
   dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
@@ -224,7 +243,8 @@ for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; 
   : > "$case_dir/expected"
   for pkg in "${expected_pkgs[@]}"; do
     limit=10m
-    if [ "$pkg" = handler ] || [ "$pkg" = workersvc ]; then limit=20m; fi
+    if [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = workersvc ]; then limit=30m; fi
     printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
       "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
     if [ "$scenario" = go-fail ] && [ "$pkg" = forgesvc ]; then break; fi
@@ -277,6 +297,52 @@ for scenario in success optional go-fail no-tests missing-ok top-skip sub-skip; 
       esac
       ;;
   esac
+done
+
+# The artifact leg must prove each named case, not merely a green test process.
+for scenario in artifact-success artifact-disabled artifact-go-fail artifact-top-run artifact-top-pass artifact-leaf-run artifact-leaf-pass artifact-top-skip artifact-sub-skip; do
+  case_dir="$TMP/$scenario"
+  mkdir -p "$case_dir"
+  enabled=1
+  if [ "$scenario" = artifact-disabled ]; then enabled=2; fi
+  rc=0
+  PATH="$READYBIN:$PATH" CASE_DIR="$case_dir" SCENARIO="$scenario" TMPDIR="$case_dir" \
+    UZI_STORE_IT_PG_WAIT_SECS=1 UZI_CODEX_REFRESH_LOSTREPLY_E2E="" UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E="" \
+    UZI_CI_ARTIFACTS_E2E="$enabled" bash "$SCRIPT" > "$case_dir/output" 2>&1 || rc=$?
+  dsn="$(cut -f1 "$case_dir/go.log" | head -n 1)"
+  : > "$case_dir/expected"
+  for pkg in "${expected_pkgs[@]}"; do
+    limit=10m
+    if [ "$pkg" = handler ]; then limit=20m; fi
+    if [ "$pkg" = workersvc ]; then limit=30m; fi
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-timeout\t%s\t-run\tLiveDB$\t./internal/%s/...\n' \
+      "$dsn" "$limit" "$pkg" >> "$case_dir/expected"
+  done
+  if [ "$enabled" = 1 ]; then
+    printf '%s\ttest\t-buildvcs=false\t-count=1\t-v\t-race\t-p\t1\t-run\t^TestCIArtifactsRepairE2E$\t./internal/handler/...\n' \
+      "$dsn" >> "$case_dir/expected"
+  fi
+  assert_case "artifact opt-in exact selector, flags and shared DSN" cmp -s "$case_dir/expected" "$case_dir/go.log"
+  case "$scenario" in
+    artifact-success|artifact-disabled)
+      assert_case "valid or disabled proof permits success" test "$rc" -eq 0 ;;
+    artifact-go-fail)
+      assert_case "artifact Go failure survives tee" test "$rc" -eq 9 ;;
+    *) assert_case "missing proof or any skip rejects success" test "$rc" -ne 0 ;;
+  esac
+  if [ "$rc" -ne 0 ]; then
+    assert_case "failed artifact proof suppresses success banner" \
+      test "$(grep -cF 'Store integration tests passed.' "$case_dir/output" || true)" -eq 0
+  fi
+  proof_log="$(sed -n 's/^CI artifact repair proof:.* log=//p' "$case_dir/output")"
+  if [ "$enabled" = 1 ]; then
+    case "$proof_log" in
+      "$ROOT"/.uzi/scratch/ci-artifacts-repair-log.*)
+        assert_case "artifact transcript remains available" test -f "$proof_log"
+        rm -f "$proof_log" ;; # only this fake invocation's owned transcript
+      *) printf 'FAIL: artifact transcript path missing (%s)\n' "$scenario"; fails=$((fails + 1)) ;;
+    esac
+  else assert_case "non-1 value does not enable artifact proof" test -z "$proof_log"; fi
 done
 
 if [ "$fails" -eq 0 ]; then

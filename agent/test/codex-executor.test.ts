@@ -1,3 +1,5 @@
+import { m3Calls } from "./m3-recovery-fixture.js";
+import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
@@ -54,7 +56,7 @@ import { makeFixture } from "./fixture-repo.js";
 import { makeClaim, testGitCacheOptions, recordingLogger, withReceipts } from "./helpers.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
-import { WORKER_UID, RUNNER_UID, runnerCommand } from "../src/runner-uid.js";
+import { WORKER_UID, RUNNER_UID, runnerCommand, commandRootCommand } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
@@ -8881,6 +8883,145 @@ describe("CodexExecutor: provisioning + init target the SHARED provisioning HOME
       : "requires running as WORKER_UID with WORKER_UID + RUNNER_UID group membership";
 
   describe("real worker-UID initialization and session cleanup", { skip: INIT_SKIP }, () => {
+  it("CI evidence survives fresh and resumed harness turns while real runner identities and fixed clone helpers deny bypasses", async () => {
+    const { runnerTeardownFixture, uidScript } = await import("./runner-teardown-fixtures.js");
+    const { exerciseCIEvidenceHarness } = await import("./fixtures/ci-artifacts-repair-e2e.js");
+    const { ensureCodexSharedDirectory } = await import("../src/codex/codex-executor.js");
+    const { Readable } = await import("node:stream");
+    await runnerTeardownFixture(async (root) => {
+      assert.equal(process.getuid!(), WORKER_UID);
+      assert.ok(process.getgroups!().includes(WORKER_UID));
+      assert.ok(process.getgroups!().includes(RUNNER_UID));
+      const rootStat = await fs.stat(root);
+      assert.equal(rootStat.uid, WORKER_UID);
+      assert.equal(rootStat.gid, RUNNER_UID);
+      assert.equal(rootStat.mode & 0o7777, 0o3775);
+      const privateHome = path.join(root, "sibling-home");
+      await fs.mkdir(privateHome, { mode: 0o700 });
+      const sentinel = path.join(privateHome, "private");
+      const canary = "worker-only-ci-evidence-canary";
+      await fs.writeFile(sentinel, canary, { mode: 0o600 });
+      // A DAC-readable sibling distinguishes sandbox confinement from file permissions.
+      const outside = path.join(root, "outside-readable");
+      await fs.writeFile(outside, canary, { mode: 0o644 });
+      const bytes = Buffer.from(canary + "\n");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const manifest_id = "22222222-2222-2222-2222-222222222222";
+      const artifact = { manifest_id, name: sha256 + ".txt", sha256, size: bytes.length };
+      // Four bounded adapter invocations; an assertion failure stops the matrix.
+      // Every child has a 10s deadline; the shared fixture also bounds each turn.
+      for (const harness of ["claude", "codex"] as const) {
+        const home = path.join(root, harness + "-home");
+        await ensureCodexSharedDirectory(home);
+        const homeStat = await fs.stat(home);
+        assert.equal(homeStat.uid, WORKER_UID);
+        assert.equal(homeStat.gid, RUNNER_UID);
+        assert.equal(homeStat.mode & 0o7777, 0o3770);
+        const clone = path.join(root, harness + "-clone");
+        await fs.mkdir(clone, { mode: 0o2770 });
+        await fs.chmod(clone, 0o2770);
+        await fs.writeFile(path.join(clone, "control.txt"), "clone-control", { mode: 0o644 });
+        const evidence = path.join(home, "ci-evidence");
+        const evidenceFile = path.join(evidence, "inputs", artifact.name);
+        await fs.symlink(evidenceFile, path.join(clone, "evidence-link"));
+        const privateTmp = path.join(root, harness + "-tmp");
+        uidScript(commandRootCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1],{mode:0o700});fs.chmodSync(process.argv[1],0o700)", privateTmp);
+        const syntheticClaim = {
+          ...makeClaim(), run_id: "11111111-1111-1111-1111-111111111111", kind: "prompt" as const,
+          claim_generation: 7, config: { ci_config_guard: true },
+          ci_repair: { input_files: [artifact], manifest: { entries: [{
+            artifact_id: "artifact", entry_ordinal: 0, label: "CI evidence", status: "kept" as const, ...artifact,
+          }] } },
+        };
+        let downloads = 0, active = 0, disposed = 0;
+        const options = {
+          harness, home, clone, claim: syntheticClaim,
+          expected: { manifest_id, text: canary, sha256, size: bytes.length },
+          client: { async downloadJobFile(run: string, id: string, generation: number, sink: (body: import("node:stream").Readable) => Promise<void>) {
+            assert.equal(run, syntheticClaim.run_id);
+            assert.equal(id, manifest_id);
+            assert.equal(generation, 7);
+            downloads++;
+            await sink(Readable.from([bytes]));
+          } },
+          beforeModel: async ({ prepared, file }: Parameters<NonNullable<import("./fixtures/ci-artifacts-repair-e2e.js").CIEvidenceHarnessOptions["beforeModel"]>>[0]) => {
+            active++;
+            assert.equal(file, evidenceFile);
+            assert.equal((await fs.stat(file)).uid, WORKER_UID);
+            assert.equal((await fs.stat(file)).mode & 0o7777, 0o400);
+            assert.equal((await prepared.read({ manifest_id })).text, canary);
+            for (const [wrap, uid] of [[runnerCommand, RUNNER_UID], [commandRootCommand, 10003]] as const) {
+              uidScript(wrap, `const fs=require('node:fs'),assert=require('node:assert/strict');
+                const [file,evidence,sentinel,clone,outside,uid,canary]=process.argv.slice(1);
+                assert.equal(process.getuid(),Number(uid));
+                assert.throws(()=>process.setuid(10001),e=>e.code==='EPERM');
+                assert.equal(fs.readFileSync(clone+'/control.txt','utf8'),'clone-control');
+                assert.equal(fs.readFileSync(outside,'utf8'),canary);
+                const denied=fn=>assert.throws(fn,e=>['EACCES','EPERM'].includes(e.code));
+                denied(()=>fs.readFileSync(file));
+                denied(()=>fs.readFileSync(clone+'/evidence-link'));
+                denied(()=>fs.readFileSync(sentinel));
+                denied(()=>fs.writeFileSync(file,'changed'));
+                denied(()=>fs.appendFileSync(file,'changed'));
+                denied(()=>fs.chmodSync(file,0o644));
+                const replacement=clone+'/replacement-'+uid;
+                fs.writeFileSync(replacement,'changed');
+                try{denied(()=>fs.renameSync(replacement,file));}finally{fs.unlinkSync(replacement);}
+                denied(()=>fs.unlinkSync(file));
+                denied(()=>fs.rmSync(evidence,{recursive:true}));
+                denied(()=>fs.renameSync(evidence,evidence+'-moved'));
+                denied(()=>fs.symlinkSync(sentinel,evidence+'/arbitrary-link'));
+                denied(()=>fs.symlinkSync(sentinel,file));`, file, evidence, sentinel, clone, outside, String(uid), canary);
+            }
+            const frames = ["control.txt", file, path.relative(clone, file), "evidence-link"]
+              .map((target, id) => ({ id: id + 1, op: "read", path: target }));
+            const fileop = commandRootCommand("/usr/local/bin/uzi-codex-fileop", ["--root", clone]);
+            const result = spawnSync(fileop.command, fileop.args, {
+              env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
+              input: frames.map(frame => JSON.stringify(frame) + "\n").join(""),
+            });
+            assert.equal(result.status, 0, result.stderr || result.error?.message);
+            const replies = result.stdout.trim().split("\n").map(line => JSON.parse(line));
+            assert.equal(replies.length, frames.length);
+            assert.equal(replies[0].id, 1);
+            assert.equal(replies[0].ok, true);
+            assert.equal(Buffer.from(replies[0].data, "base64").toString(), "clone-control");
+            for (const [index, code] of ["E_ESCAPE", "E_ESCAPE", "E_SYMLINK"].entries()) {
+              assert.deepEqual(replies[index + 1], { id: index + 2, ok: false, code });
+            }
+            assert.ok(!result.stdout.includes(canary));
+            assert.ok(!result.stdout.includes(bytes.toString("base64")));
+            const sandbox = commandRootCommand("/usr/local/bin/uzi-codex-command-sandbox",
+              commandSandboxArgv(clone, clone, process.execPath, ["-e", `
+                const fs=require('node:fs'),assert=require('node:assert/strict');
+                assert.equal(process.getuid(),10003);
+                assert.equal(fs.readFileSync('control.txt','utf8'),'clone-control');
+                for(const file of process.argv.slice(1))assert.throws(()=>fs.readFileSync(file),e=>['EACCES','EPERM'].includes(e.code));
+                process.stdout.write('sandbox-control-ok');`, file, sentinel, outside, path.join(clone, "evidence-link")], privateTmp, "required"));
+            const confined = spawnSync(sandbox.command, sandbox.args, {
+              env: { PATH: "/usr/bin:/bin" }, timeout: 10_000, encoding: "utf8",
+            });
+            assert.equal(confined.status, 0, confined.stderr || confined.error?.message);
+            assert.equal(confined.stdout, "sandbox-control-ok");
+            assert.equal(await fs.readFile(file, "utf8"), bytes.toString());
+            assert.equal(await fs.readFile(sentinel, "utf8"), canary);
+          },
+          afterDispose: async () => { disposed++; },
+        };
+        const fresh = await exerciseCIEvidenceHarness({ ...options, mode: "fresh" });
+        assert.equal(fresh.downloads, 1);
+        const resumed = await exerciseCIEvidenceHarness({ ...options, mode: "resume", previousGeneration: 7,
+          claim: { ...syntheticClaim, claim_generation: 8, plan_approved: true, plan_md: "approved",
+            session_id: "fixture-prior-session", resume_phase: "implementing" } });
+        assert.equal(resumed.downloads, 0);
+        assert.equal(resumed.generation, 8);
+        assert.equal(resumed.home, fresh.home);
+        assert.equal(downloads, 1);
+        assert.equal(active, 2);
+        assert.equal(disposed, 2);
+      }
+    });
+  });
 describe("production advice data teardown (#2324)", () => {
   it("advice ownedDataRoot preserves every outside file during runner-uid swaps", async (t) => {
     const { runnerTeardownFixture, uidScript, seedRunnerRacedTree } = await import("./runner-teardown-fixtures.js");
@@ -18405,13 +18546,22 @@ describe("M3 Codex bounded park controls", () => {
       });
     }
   }
-  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
-    it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
+  const planning = { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } };
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, planning]) {
+    // An eligible planning root registers park_run at thread/start (the vocabulary survives the
+    // approval resume); only the broker withholds authority until implementation.
+    const advertised = overrides === planning;
+    it(`does not ${advertised ? "admit" : "advertise or admit"} illicit park ${JSON.stringify(overrides)}`, async () => {
       let parks = 0;
+      let sawPark = false;
       const rig = makeRig({ responder: (c) => {
         if (c.method === "thread/start" || c.method === "thread/resume") {
-          const tools = rec(c.params).dynamicTools as { name: string }[];
-          if (tools) assert.equal(tools.some((tool) => tool.name === "park_run"), false);
+          const tools = rec(c.params).dynamicTools as { name: string }[] | undefined;
+          if (tools) {
+            const has = tools.some((tool) => tool.name === "park_run");
+            if (advertised) sawPark ||= has;
+            else assert.equal(has, false);
+          }
           return { thread: { id: "th-1" } };
         }
         if (c.method !== "turn/start") return {};
@@ -18423,11 +18573,79 @@ describe("M3 Codex bounded park controls", () => {
         requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
       await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx));
       assert.equal(parks, 0);
+      assert.equal(sawPark, advertised);
       const response = rig.transport.responses.find((r) => r.requestId === 501);
       assert.ok(response, "the illicit tool received a reply");
       assert.equal(rec(rec(response.response).result).success, false);
+      if (advertised) assert.match(JSON.stringify(response.response), /park_run requires supported root issue implementation/);
     });
   }
+
+  it("eligible root registers park_run in planning, keeps it across the approval resume, and parks only in implementation", async () => {
+    let parks = 0;
+    let approved = false;
+    let parksAtApproval = -1;
+    const starts: { tools: { name: string }[] | undefined }[] = [];
+    const resumes: { tools: unknown; threadId: unknown }[] = [];
+    const prompts: string[] = [];
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start") {
+          starts.push({ tools: rec(c.params).dynamicTools as { name: string }[] | undefined });
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1"));
+          c.transport.push(toolCall(601, "park_run", {}, "th-1", "tn-1", "plan-park"));
+          c.transport.push(toolCall(602, "submit_plan", { plan_md: "the plan" }, "th-1", "tn-1", "c-plan"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      (c) => {
+        if (c.method === "thread/start") assert.fail("the implementation epoch must resume, not start");
+        if (c.method === "thread/resume") {
+          resumes.push({ tools: rec(c.params).dynamicTools, threadId: rec(c.params).threadId });
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "turn/start") {
+          prompts.push(JSON.stringify(c.params));
+          c.transport.push(toolCall(603, "park_run", {}, "th-1", "tn-2", "impl-park"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      },
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", parkRunSupported: true, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => {
+        approved = true; parksAtApproval = parks;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+      requestParkRun: async () => { assert.equal(approved, true, "park only after approval"); parks++; return { kind: "paused" }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan to park run");
+    assert.equal(starts.length, 1);
+    assert.ok(starts[0]!.tools?.some((t) => t.name === "park_run"), "planning thread/start registers park_run");
+    assert.equal(resumes.length, 1, "implementation resumed the planning thread");
+    assert.equal(resumes[0]!.tools, undefined, "thread/resume sends no dynamicTools");
+    assert.equal(resumes[0]!.threadId, "th-1");
+    const planReply = rig.epochs[0]!.transport.responses.find((r) => r.requestId === 601);
+    assert.ok(planReply);
+    assert.equal(rec(rec(planReply.response).result).success, false, "planning park is refused");
+    assert.equal(parksAtApproval, 0);
+    assert.equal(parks, 1);
+    assert.ok(result.pausedAt, "implementation park paused the run");
+    // The implementation turn carries the park continuation; the tool it asks for must be in the
+    // vocabulary persisted at the planning thread/start, since thread/resume registers none.
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0]!.includes(PARK_RUN_CONTINUATION), "implementation prompt carries the park continuation");
+    const requested = PARK_RUN_CONTINUATION.match(/call (\w+)/)?.[1];
+    assert.equal(requested, "park_run");
+    assert.ok(starts[0]!.tools?.some((t) => t.name === requested), "continuation's tool is in the persisted vocabulary");
+  });
 });
 
 // M1 uses bounded readiness and selective native delivery; unrelated idle watchdogs do not fire.
@@ -19510,6 +19728,7 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
   let getsAtCancel = 0;
   let receiptsAtCancel = 0;
   proof.onShutdownReceipt((signal, generation) => {
+    assert.ok(signal, "the shutdown overlay retains its bounded publication signal");
     assert.equal(signal.aborted, false);
     assert.equal(generation, 1, "publication forwards the original still-bound claim generation");
     assert.ok(executor.safety);
@@ -19551,4 +19770,188 @@ it("#3101 actual CodexExecutor completed installer preserves C through shutdown 
     try { await withTimeout(execution, 20_000, "actual executor cleanup"); }
     finally { proof.cleanup(); await api.close(); fx.cleanup(); }
   }
+});
+
+describe("M3 Codex interrupted recovery delivery", () => {
+  const turnTexts = (transport: FakeTransport): string[] => transport.requests
+    .filter(r => r.method === "turn/start")
+    .map(r => (r.params as { input: { text: string }[] }).input[0]!.text);
+  const approve = { kind: "approve", selection: { status: "absent" } } as const;
+  const snapshot = { base: "interrupted", interruptedEdits: true, commits: 0 } as const;
+  it("M3 absent observations consume the latch across later provider epochs", async () => {
+    let gets = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-check", (t, th, tn) => {
+        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-done", done),
+    ]);
+    const { ctx } = makeCtx({
+      checkpoint: async () => undefined, interruptedSnapshot: snapshot,
+      getInterruptedCalls: () => ++gets === 1 ? undefined : m3Calls(),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 absent across epochs");
+    assert.equal(gets, 1);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 2);
+    assert.match(texts[0]!, /temporary mutations/);
+    assert.doesNotMatch(texts[1]!, /temporary mutations/);
+    texts.forEach(text => assert.doesNotMatch(text, /interrupted_calls_/));
+  });
+
+  it("M3 complete prechange Codex G1 fixtures stay byte stable", () => {
+    const { ctx } = makeCtx({ ...m1Context(), getInterruptedCalls: () => assert.fail("helper evaluated delivery getter") });
+    delete ctx.reviewComments;
+    for (const branch of m1Branches) assert.equal(m1IssueNormalize(m1Prompt(branch, ctx)), m1BaselinePrompts[branch]);
+  });
+
+  it("M3 completion rework stays a system turn across provider recreation", async () => {
+    let gets = 0, attempts = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-first", done),
+      c => {
+        if (c.method === "thread/resume") return { thread: { id: "th-m3" } };
+        if (c.method !== "turn/start") return {};
+        const tn = `tn-rework-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(agentMessage("completion rework", "th-m3"))
+          .push(turnCompleted("completed", "th-m3", tn));
+        else done(c.transport, "th-m3", tn);
+        return { turn: { id: tn } };
+      },
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 6 },
+      frozenMilestones: [{ id: "m1", title: "work" }], checkpoint: async () => undefined,
+      interruptedSnapshot: snapshot, getInterruptedCalls: () => { gets++; return m3Calls(); },
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 completion");
+    assert.equal(gets, 1);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 3);
+    assert.match(texts[1]!, /Completion check/);
+    texts.slice(1).forEach(text => assert.doesNotMatch(text, /interrupted_calls_|temporary mutations/));
+  });
+
+  it("M3 lifecycle failure from delivery getter aborts before turn delivery", async () => {
+    const rig = makeRig();
+    const lost = new Error("M3 claim superseded at delivery");
+    const { ctx } = makeCtx({ getInterruptedCalls: () => { throw lost; } });
+    await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), error => error === lost);
+    assert.equal(rig.transport.turnStartCount, 0);
+  });
+
+  const done = (t: FakeTransport, th: string, tn: string) => {
+    t.push(toolCall(3130, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+  };
+  it("M3 first ordinary owner latch survives planning, iterations and provider epochs", async () => {
+    let gets = 0, approved = false, installed = false;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-m3", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(3131, "submit_plan", { plan_md: "plan" }, th, tn, "plan")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-check", (t, th, tn) => {
+        t.push(toolCall(3132, "checkpoint", {}, th, tn, "check")).push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-m3", "tn-done", done),
+    ]);
+    rig.deps = { ...rig.deps, installDeps: async () => { installed = true; return { results: [], truncated: false }; } };
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, interruptedSnapshot: snapshot,
+      checkpoint: async () => undefined,
+      gatePlan: async () => { assert.equal(gets, 0); approved = true; return approve; },
+      getInterruptedCalls: () => { assert.ok(approved && installed); gets++; return m3Calls(); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 epochs");
+    assert.equal(gets, 1);
+    assert.equal(rig.providerLaunches(), 3);
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(texts.length, 3);
+    assert.doesNotMatch(texts[0]!, /interrupted_calls_/);
+    assert.match(texts[1]!, /interrupted_calls_|temporary mutations/);
+    assert.match(texts[1]!, /printf interrupted-observation/);
+    assert.doesNotMatch(texts[2]!, /interrupted_calls_|temporary mutations/);
+  });
+
+  it("M3 helper evaluations never call getter or consume first dispatch", async () => {
+    let gets = 0;
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", done) });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const { ctx } = makeCtx({ interruptedSnapshot: snapshot, getInterruptedCalls: () => { gets++; return m3Calls(); } });
+    const helper = executor as unknown as { implementPrompt(ctx: RunContext): string; planPrompt(ctx: RunContext): string };
+    for (let i = 0; i < 2; i++) {
+      assert.doesNotMatch(helper.implementPrompt(ctx), /interrupted_calls_/);
+      assert.doesNotMatch(helper.planPrompt(ctx), /interrupted_calls_/);
+    }
+    assert.equal(gets, 0);
+    await executor.run(ctx);
+    assert.equal(gets, 1);
+    assert.match(turnTexts(rig.transport)[0]!, /printf interrupted-observation/);
+  });
+
+  for (const absent of [undefined, { ...m3Calls(), entries: [], unavailable: true, source_generation: null }]) {
+    it(`M3 independent snapshot warning with ${absent ? "unavailable" : "absent"} telemetry`, async () => {
+      const rig = makeRig({ responder: epochResponder("th-1", "tn-1", done) });
+      const { ctx } = makeCtx({
+        sessionId: null, priorWork: undefined, interruptedSnapshot: { base: "generic", interruptedEdits: true, commits: null },
+        getInterruptedCalls: () => absent,
+      });
+      await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      const prompt = turnTexts(rig.transport)[0]!;
+      assert.match(prompt, /origin base has unknown provenance/);
+      assert.match(prompt, /Separately, recovered uncommitted WIP edits/);
+      assert.doesNotMatch(prompt, /interrupted_calls_/);
+    });
+  }
+
+  it("M3 replan before implementation leaves evidence for first ordinary owner", async () => {
+    let gets = 0, gates = 0;
+    const plan: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-m3" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount, tn = `tn-plan-${n}`;
+      if (n === 1) c.transport.push(threadStarted("th-m3"));
+      c.transport.push(toolCall(3130 + n, "submit_plan", { plan_md: n === 1 ? "first" : "revised" },
+        "th-m3", tn, `plan-${n}`)).push(turnCompleted("completed", "th-m3", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeMultiEpochRig([plan, resumedEpochResponder("th-m3", "tn-done", done)]);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined, interruptedSnapshot: snapshot,
+      gatePlan: async () => ++gates === 1 ? { kind: "revise", feedback: "revise" } : approve,
+      getInterruptedCalls: () => { assert.equal(gates, 2); gets++; return m3Calls(); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 replan");
+    const texts = rig.epochs.flatMap(e => turnTexts(e.transport));
+    assert.equal(gets, 1);
+    assert.equal(texts.length, 3);
+    assert.ok(texts.slice(0, 2).every(text => !text.includes("interrupted_calls_")));
+    assert.match(texts[2]!, /printf interrupted-observation/);
+  });
+
+  it("M3 clarification system turn and later owner do not replay first owner evidence", async () => {
+    let gets = 0;
+    const rig = makeRig({ responder: c => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount, tn = `tn-${n}`;
+      if (n === 1) c.transport.push(threadStarted());
+      if (n === 1) c.transport.push(toolCall(n, "ask_user", { questions: [{ question: "which?" }] }, "th-1", tn, "ask"));
+      else if (n === 3) c.transport.push(toolCall(n, "signal_done", {}, "th-1", tn, "done"));
+      else c.transport.push(agentMessage("answer processed", "th-1"));
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    } });
+    const { ctx } = makeCtx({
+      getInterruptedCalls: () => { gets++; return m3Calls(); }, interruptedSnapshot: snapshot,
+      askUser: async () => ({ kind: "answer", answers: ["SYSTEM-ANSWER"] }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "M3 clarification");
+    assert.equal(gets, 1);
+    const texts = turnTexts(rig.transport);
+    assert.equal(texts.length, 3);
+    assert.match(texts[0]!, /interrupted_calls_/);
+    assert.match(texts[1]!, /SYSTEM-ANSWER/);
+    texts.slice(1).forEach(text => assert.doesNotMatch(text, /interrupted_calls_|temporary mutations/));
+  });
 });

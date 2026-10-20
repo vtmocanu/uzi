@@ -366,7 +366,7 @@ into `argo-apps:apps/uzi/values/dev-cluster.yaml` (re-verify if the cluster chan
   (`16.10` also mirrored; `16.3` is **not**). The CNPG cluster pins
   `registry.example.com/cloudnative-pg/postgresql:16.4` (also what a sibling app
   uses on the cluster). PG16 is a fleet-consistency choice, not an operator ceiling — the
-  dev-cluster CNPG operator 1.23.5 supports up to PG17.
+  dev-cluster CNPG operator 1.23.5 supported up to PG17 (the fleet now runs 1.30.1).
 
 - **Forge egress.** The api dials `gitlab.example.com` from the cluster (issue
   sync, MR creation); `FORGE_ALLOWED_BASE_URLS` is set to it. Confirm dev-cluster

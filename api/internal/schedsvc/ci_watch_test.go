@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 // overrides only the reads a fire makes. It also records whether every budgeted read carried
 // the per-fire CI read limits (forge.WithCIRepairReadLimits).
 type ciForge struct {
+	mu sync.Mutex
 	forgetest.BaseFake
 	runs      []forge.WorkflowRun
 	listErr   error
@@ -34,7 +36,16 @@ type ciForge struct {
 	unlimited []string // reads that ran without the per-fire read limits
 	// onList, when set, runs inside ListWorkflowRuns: a live test uses it to change the
 	// schedule or repo between discovery and the locked start.
-	onList func()
+	onList        func()
+	getCalls      []int64
+	getRun        func(context.Context, int64, int) (forge.WorkflowRun, error)
+	artifacts     []forge.Artifact
+	listArtifacts func(context.Context) ([]forge.Artifact, error)
+	download      func(context.Context, int64, int64) ([]byte, error)
+	artifactCalls int
+	downloadCalls []int64
+	onJobs        func()
+	onPath        func()
 }
 
 // hasCIReadLimits reports whether ctx carries the budget forge.WithCIRepairReadLimits installs.
@@ -45,10 +56,12 @@ func hasCIReadLimits(ctx context.Context) bool {
 }
 
 func (f *ciForge) ListWorkflowRuns(ctx context.Context, _ int64, opts forge.ListWorkflowRunsOptions) ([]forge.WorkflowRun, error) {
+	f.mu.Lock()
 	if !hasCIReadLimits(ctx) {
 		f.unlimited = append(f.unlimited, "ListWorkflowRuns")
 	}
 	f.listOpts = append(f.listOpts, opts)
+	f.mu.Unlock()
 	if f.onList != nil {
 		f.onList()
 	}
@@ -56,10 +69,17 @@ func (f *ciForge) ListWorkflowRuns(ctx context.Context, _ int64, opts forge.List
 }
 
 func (f *ciForge) ListPipelineJobs(ctx context.Context, _, pipelineID int64) ([]forge.Job, error) {
+	f.mu.Lock()
 	if !hasCIReadLimits(ctx) {
 		f.unlimited = append(f.unlimited, "ListPipelineJobs")
 	}
+	f.mu.Unlock()
+	if f.onJobs != nil {
+		f.onJobs()
+	}
+	f.mu.Lock()
 	f.jobCalls = append(f.jobCalls, pipelineID)
+	f.mu.Unlock()
 	return f.jobs[pipelineID], f.jobsErr
 }
 
@@ -68,14 +88,31 @@ func (f *ciForge) JobLogTail(_ context.Context, _, jobID int64, _ int) (string, 
 }
 
 func (f *ciForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	if f.onPath != nil {
+		f.onPath()
+	}
 	return "", f.pathErr
 }
 
-type ciBuilder struct{ f forge.Forge }
+type ciBuilder struct {
+	f        forge.Forge
+	scrub    func(string) string
+	scrubErr error
+}
 
 func (b *ciBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.Issue, string, string, bool) (store.Issue, error) {
 	panic("unexpected label removal")
 }
+func (b *ciBuilder) CIArtifactScrubber([]byte) (func(string) string, error) {
+	if b.scrubErr != nil {
+		return nil, b.scrubErr
+	}
+	if b.scrub != nil {
+		return b.scrub, nil
+	}
+	return func(s string) string { return s }, nil
+}
+
 func (b *ciBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) { return b.f, nil }
 
 func (f *fakeStore) GetCIWatchEpisode(_ context.Context, arg store.GetCIWatchEpisodeParams) (store.CiWatchEpisode, error) {
@@ -93,7 +130,9 @@ var ciT0 = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 // ciRun builds one completed default-branch execution. created offsets ciT0 in minutes.
 func ciRun(key string, id int64, createdMin int, status, conclusion string) forge.WorkflowRun {
+	attempt := int64(1)
 	return forge.WorkflowRun{
+		RunAttempt: &attempt, RepositoryID: 42, HeadRepositoryID: 42,
 		WorkflowKey: key, ID: id, Name: "wf-" + key, Number: id, Event: "schedule", Branch: "main", SHA: "sha" + key,
 		Status: status, Conclusion: conclusion, WebURL: fmt.Sprintf("https://forge.example/runs/%d", id),
 		CreatedAt: ciT0.Add(time.Duration(createdMin) * time.Minute), UpdatedAt: ciT0.Add(time.Duration(createdMin) * time.Minute),

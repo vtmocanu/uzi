@@ -826,7 +826,7 @@ describe("codex-m3b packaged lifecycle (injected fakes)", () => {
       approvedPlan: undefined,
       gatePlan: async () => {
         gated = true;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
       },
     });
     const log = recordingLog();
@@ -1350,7 +1350,7 @@ function recordLiveRequestIds(evidence: LiveLaunchEvidence, params: unknown, res
 }
 
 function recordLiveNoteIds(evidence: LiveLaunchEvidence, note: CodexNotification): void {
-  if (note.kind !== "activity") {
+  if (note.kind !== "activity" && note.kind !== "rate_limits_updated") {
     addLiveId(evidence.threadIds, note.threadId);
     if (note.kind !== "thread_started") addLiveId(evidence.turnIds, note.turnId);
   }
@@ -2319,7 +2319,7 @@ async function runLiveSubscription(): Promise<void> {
         worktreePath: worktree,
         planApproved: false,
         approvedPlan: undefined,
-        gatePlan: async () => ({ kind: "approve", selection: { source: "own", agents: [] } }) as never,
+        gatePlan: async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } }),
         agents,
         checkpoint: async () => {},
       });
@@ -2562,7 +2562,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
       approvedPlan: undefined,
       gatePlan: async () => {
         planGates += 1;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } };
       },
       agents,
       checkpoint: async () => {

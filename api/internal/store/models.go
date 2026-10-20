@@ -1081,6 +1081,7 @@ type Run struct {
 	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
 	MemoryPolicy                []byte             `json:"memory_policy"`
 	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
+	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 }
 
 type RunCompletionAttempt struct {
@@ -1301,6 +1302,7 @@ type RunSchedule struct {
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
+	CiArtifacts                []byte             `json:"ci_artifacts"`
 }
 
 type RunUsage struct {

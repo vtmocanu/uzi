@@ -6,10 +6,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -301,27 +303,131 @@ func TestSubmitAnswerScrubsSecretsInEveryAnswer(t *testing.T) {
 	}
 }
 
-// The length bound (D-G's second half). Runes, not bytes: a cap applied to bytes would
-// cut a multi-byte character in half and persist invalid UTF-8.
-func TestSubmitAnswerBoundsAnswerLength(t *testing.T) {
-	user, runID := uuid.New(), uuid.New()
-	qid := uuid.NewString()
-	fs := &answerStore{run: parkedRun(user, runID, qid)}
-	svc := New(fs, newBox(t), testParams())
-
-	long := strings.Repeat("é", maxAnswerBodyRunes+500)
-	if _, err := svc.SubmitInput(context.Background(), user, runID, "answer", answerBody(t, qid, long), nil); err != nil {
-		t.Fatalf("SubmitInput: %v", err)
+func persistedAnswers(t *testing.T, fs *answerStore) []string {
+	t.Helper()
+	if fs.created == nil {
+		t.Fatal("expected the answer to be persisted")
 	}
 	var got AnswerBody
 	if err := json.Unmarshal([]byte(fs.created.Body.String), &got); err != nil {
 		t.Fatalf("persisted body is not valid JSON: %v", err)
 	}
-	if n := len([]rune(got.Answers[0])); n > maxAnswerBodyRunes {
-		t.Fatalf("answer kept %d runes, want at most %d", n, maxAnswerBodyRunes)
+	return got.Answers
+}
+
+// The length bound (D-G's second half, #3136): the combined rune count of one
+// submission is capped and an over-limit submission is REJECTED, never truncated.
+// Runes, not bytes: the fixtures are multi-byte so a byte cap would misjudge them.
+func TestSubmitAnswerAcceptsLongAnswerUntruncated(t *testing.T) {
+	for name, n := range map[string]int{"4001": 4001, "exactly the total limit": 40000} {
+		t.Run(name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			qid := uuid.NewString()
+			fs := &answerStore{run: parkedRun(user, runID, qid)}
+			svc := New(fs, newBox(t), testParams())
+			in := strings.Repeat("é", n)
+			if _, err := svc.SubmitInput(context.Background(), user, runID, "answer", answerBody(t, qid, in), nil); err != nil {
+				t.Fatalf("SubmitInput: %v", err)
+			}
+			got := persistedAnswers(t, fs)
+			if len(got) != 1 || got[0] != in {
+				t.Fatalf("answer not stored byte-identical (got %d answers)", len(got))
+			}
+		})
 	}
-	if !strings.ContainsRune(got.Answers[0], 'é') || strings.ContainsRune(got.Answers[0], '�') {
-		t.Fatal("truncation must land on a rune boundary, not mid-character")
+}
+
+func TestSubmitAnswerAcceptsTenFullAnswers(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	qid := uuid.NewString()
+	fs := &answerStore{run: parkedRun(user, runID, qid)}
+	svc := New(fs, newBox(t), testParams())
+	in := make([]string, 10)
+	for i := range in {
+		in[i] = strings.Repeat("日", 4000)
+	}
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "answer", answerBody(t, qid, in...), nil); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	got := persistedAnswers(t, fs)
+	if len(got) != len(in) {
+		t.Fatalf("got %d answers, want %d", len(got), len(in))
+	}
+	for i := range in {
+		if got[i] != in[i] {
+			t.Fatalf("answer %d not byte-identical", i)
+		}
+	}
+}
+
+func TestSubmitAnswerRejectsOverLimitWithoutTouchingRun(t *testing.T) {
+	nine := func(big int, at int) []string {
+		out := make([]string, 0, 10)
+		for i := 0; i < 10; i++ {
+			n := 4000
+			if i == at {
+				n = big
+			}
+			out = append(out, strings.Repeat("é", n))
+		}
+		return out
+	}
+	cases := map[string]struct {
+		answers []string
+		largest string
+	}{
+		"single 40001":             {[]string{strings.Repeat("é", 40001)}, "answer 1 of 1"},
+		"nine 4000 plus 4001 last": {nine(4001, 9), "answer 10 of 10"},
+		"largest in the middle":    {nine(4001, 4), "answer 5 of 10"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			user, runID := uuid.New(), uuid.New()
+			qid := uuid.NewString()
+			fs := &answerStore{run: parkedRun(user, runID, qid)}
+			svc := New(fs, newBox(t), testParams())
+			_, err := svc.SubmitInput(context.Background(), user, runID, "answer", answerBody(t, qid, tc.answers...), nil)
+			if !errors.Is(err, ErrInvalidAnswer) {
+				t.Fatalf("err = %v, want ErrInvalidAnswer", err)
+			}
+			for _, want := range []string{"40001", "40000", tc.largest} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q lacks %q", err.Error(), want)
+				}
+			}
+			if fs.created != nil {
+				t.Fatal("an over-limit submission must not be persisted")
+			}
+			// The question stays open so the owner can shorten and resend: the fake
+			// embeds a nil Store, so any run-state write (a park settle, a status
+			// change) would have panicked here, and nothing was enqueued above.
+		})
+	}
+}
+
+// The bound is measured on the values that would be STORED, after stripNUL and the
+// secret scrub, not on the raw request. Here the raw answers exceed the limit only
+// through a token the scrub shortens and NULs stripNUL drops, so counting the raw
+// text would wrongly reject a submission whose stored form fits.
+func TestSubmitAnswerBoundMeasuredAfterScrub(t *testing.T) {
+	user, runID := uuid.New(), uuid.New()
+	qid := uuid.NewString()
+	fs := &answerStore{run: parkedRun(user, runID, qid)}
+	svc := New(fs, newBox(t), testParams())
+
+	token := "glpat-" + "AAAAAAAAAAAAAAAAAAAA" // assembled from parts so no contiguous glpat-<20> literal sits in source
+	raw := strings.Repeat("é", maxAnswerTotalRunes-20) + "\x00\x00\x00 " + token
+	clean, _ := stripNUL(raw)
+	stored := secretscrub.Scrub(clean)
+	if utf8.RuneCountInString(raw) <= maxAnswerTotalRunes || utf8.RuneCountInString(stored) > maxAnswerTotalRunes {
+		t.Fatalf("fixture precondition: raw %d runes must exceed and stored %d must fit the %d limit",
+			utf8.RuneCountInString(raw), utf8.RuneCountInString(stored), maxAnswerTotalRunes)
+	}
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "answer", answerBody(t, qid, raw), nil); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if got := persistedAnswers(t, fs); len(got) != 1 || got[0] != stored {
+		t.Fatalf("persisted answer is not the stripped, scrubbed value")
 	}
 }
 

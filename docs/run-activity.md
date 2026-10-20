@@ -175,9 +175,14 @@ A few things worth knowing:
   is instructed to never ask for one; a question that does is itself a red
   flag, wherever it reaches you. Question text is written by the agent from
   repository and issue content, so a hostile file in a repo can steer what
-  you're asked. Your answer is scrubbed of known credential patterns and
-  length-bounded regardless of which surface you answer from, but that's a
-  backstop, not a reason to test it.
+  you're asked. Your answer is scrubbed of known credential patterns
+  regardless of which surface you answer from, but that's a backstop, not a
+  reason to test it.
+- **One answer submission may total up to 40,000 characters** across all its
+  answers. A larger one is rejected with an error naming the size, and
+  nothing is sent, so the question stays open and you can shorten and
+  resend. A Slack thread reply is shorter still: anything past 2,000
+  characters is cut before it is sent, so answer long data on the web or CLI.
 - **Nobody answers ⇒ the run fails**, "clarification timed out", once the
   answer deadline passes (`QUESTION_TIMEOUT_SECONDS`, 24h by default) — there
   is no configurable default action. The timer is held by the worker, so if

@@ -149,13 +149,16 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-# Give handler and workersvc LiveDB suites 20m of timeout headroom on hosted workers.
-# This is not a speedup. Reset other packages to 10m on every iteration,
-# and stop on any failed pipeline before the next one.
+# Keep local LiveDB deadlines bounded per package. With artifact admission coverage,
+# workersvc takes nearly 18m in isolation and integrated sweeps exceeded 20m (#2866),
+# so give it 30m of headroom; handler retains 20m. This changes no test selection or
+# race/skip checks and is not a speedup. Reset other packages to 10m each iteration.
 for p in "${PKGS[@]}"; do
   timeout=10m
-  if [ "$p" = "./internal/handler/..." ] || [ "$p" = "./internal/workersvc/..." ]; then
+  if [ "$p" = "./internal/handler/..." ]; then
     timeout=20m
+  elif [ "$p" = "./internal/workersvc/..." ]; then
+    timeout=30m
   fi
   UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
     -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
@@ -209,6 +212,29 @@ if [ "${UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E:-}" = "1" ]; then
     exit 1
   fi
   rm -f "$E2E_LOG"
+fi
+
+# M1 composition proof: real GitHub collection, sealed storage and both worker
+# reader adapters, including an actually reclaimed generation. Keep this log.
+if [ "${UZI_CI_ARTIFACTS_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  E2E_LOG="$(mktemp "$ROOT/.uzi/scratch/ci-artifacts-repair-log.XXXXXX")"
+  printf 'CI artifact repair proof: revision=%s log=%s\n' "$(git -C "$ROOT" rev-parse HEAD)" "$E2E_LOG"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestCIArtifactsRepairE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  if grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "CI artifact repair proof skipped: $E2E_LOG" >&2
+    exit 1
+  fi
+  for proof_case in TestCIArtifactsRepairE2E \
+    TestCIArtifactsRepairE2E/claude/fresh TestCIArtifactsRepairE2E/claude/resume \
+    TestCIArtifactsRepairE2E/codex/fresh TestCIArtifactsRepairE2E/codex/resume; do
+    if ! grep -Fxq "=== RUN   $proof_case" "$E2E_LOG" ||
+      ! grep -Eq "^[[:space:]]*--- PASS: $proof_case \\(" "$E2E_LOG"; then
+      echo "CI artifact repair proof missing RUN/PASS for $proof_case: $E2E_LOG" >&2
+      exit 1
+    fi
+  done
 fi
 
 # Explicit opt-in only: the ordinary Go-only LiveDB sweep does not prove this Node composition.
