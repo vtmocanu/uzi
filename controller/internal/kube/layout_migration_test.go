@@ -338,16 +338,25 @@ func TestLayoutMigrationHeldWorkerWithIncompleteReservationDoesNotWedgePool(t *t
 	}
 }
 
-// Ephemeral (run-bound) workers get no pacing entry; the drift arm itself must hold.
-func TestLayoutMigrationHoldsEphemeralWorkerWithoutPacingEntry(t *testing.T) {
+// Ephemeral (run-bound) workers are outside the roll pools, but a migration-held one is
+// surfaced as pacing `held` (target image populated) so the fleet report counts it; the
+// drift arm itself still holds it.
+func TestLayoutMigrationHoldsEphemeralWorkerAndSurfacesPacingEntry(t *testing.T) {
 	for _, force := range []bool{false, true} {
 		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
 			f := lmSetup(t, "old", force, "20Gi")
 			w := lmWorker(true)
 			w.Ephemeral = true
 			f.tick(t, w)
-			if f.m.PacingOutcomes()[lmID] != nil {
-				t.Fatal("an ephemeral worker unexpectedly has a pacing entry")
+			p := f.m.PacingOutcomes()[lmID]
+			if p == nil || p.State != "held" || p.BlockingReason == nil || *p.BlockingReason != layoutMigrationReason {
+				t.Fatalf("pacing = %+v, want held/%s", p, layoutMigrationReason)
+			}
+			if p.TargetImage == "" || p.TargetVersion == "" {
+				t.Fatalf("held entry lacks its roll target: %+v", p)
+			}
+			if p.CanaryID != nil || p.BlockingWorkerID != nil {
+				t.Fatalf("an ephemeral worker must not be a canary or blocker: %+v", p)
 			}
 			if wasPatched(f.client) {
 				t.Fatal("an ephemeral custody-held old-layout worker was rolled")
@@ -355,15 +364,67 @@ func TestLayoutMigrationHoldsEphemeralWorkerWithoutPacingEntry(t *testing.T) {
 			if !strings.Contains(f.logs.String(), "layout-migration-held-custody worker="+lmID) {
 				t.Fatalf("hold not logged: %s", f.logs.String())
 			}
+			if !strings.Contains(f.logs.String(), "layout-migration-held-custody count=1 workers="+lmID) {
+				t.Fatalf("count line missing: %s", f.logs.String())
+			}
 		})
 	}
-	t.Run("positive control: migrated ephemeral worker rolls under ForceRoll", func(t *testing.T) {
+	t.Run("unknown layout is held too", func(t *testing.T) {
+		f := lmSetup(t, "unknown", false, "20Gi")
+		w := lmWorker(true)
+		w.Ephemeral = true
+		f.tick(t, w)
+		if p := f.m.PacingOutcomes()[lmID]; p == nil || p.State != "held" {
+			t.Fatalf("pacing = %+v, want held", p)
+		}
+	})
+	t.Run("positive control: migrated ephemeral worker rolls under ForceRoll and has no entry", func(t *testing.T) {
 		f := lmSetup(t, "new", true, "20Gi")
 		w := lmWorker(true)
 		w.Ephemeral = true
 		f.tick(t, w)
 		if !wasPatched(f.client) {
 			t.Fatal("a migrated custody-held worker must still roll")
+		}
+		if p := f.m.PacingOutcomes()[lmID]; p != nil {
+			t.Fatalf("migrated ephemeral worker has a pacing entry: %+v", p)
+		}
+	})
+	t.Run("non-custody old-layout ephemeral worker rolls and has no entry", func(t *testing.T) {
+		f := lmSetup(t, "old", true, "20Gi")
+		w := lmWorker(false)
+		w.Ephemeral = true
+		f.tick(t, w)
+		if !wasPatched(f.client) {
+			t.Fatal("a non-custody ephemeral worker must still roll")
+		}
+		if p := f.m.PacingOutcomes()[lmID]; p != nil {
+			t.Fatalf("non-custody ephemeral worker has a pacing entry: %+v", p)
+		}
+	})
+	t.Run("an undrifted held ephemeral worker has no entry", func(t *testing.T) {
+		objs, w := lmObjects(t, lmOpts{id: "d3", custody: true, layout: "old"})
+		w.Ephemeral = true
+		f := lmCluster(t, false, objs...)
+		f.tickAll(t, w)
+		if p := f.m.PacingOutcomes()["d3"]; p != nil {
+			t.Fatalf("an undrifted worker has a pacing entry: %+v", p)
+		}
+	})
+	t.Run("a held ephemeral worker takes no pool slot from a non-ephemeral peer", func(t *testing.T) {
+		hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old"})
+		h.Ephemeral = true
+		pObjs, peer := lmObjects(t, lmOpts{id: "d2", stale: true, layout: "new"})
+		f := lmCluster(t, false, append(hObjs, pObjs...)...)
+		f.tickAll(t, h, peer)
+		if lmRolled(t, f, "d1") {
+			t.Fatal("the held ephemeral worker was rolled")
+		}
+		if !lmRolled(t, f, "d2") {
+			t.Fatalf("the peer was not rolled (pacing %+v)", f.m.PacingOutcomes()["d2"])
+		}
+		if p := f.m.PacingOutcomes()["d2"]; p != nil && p.CanaryID != nil && *p.CanaryID == "d1" {
+			t.Fatal("the held ephemeral worker was chosen canary")
 		}
 	})
 }
@@ -913,4 +974,132 @@ func TestLayoutMigrationHeldUndecodableReservationFencesPool(t *testing.T) {
 			lmAssertCohortFenced(t, f, "d1", "d2")
 		})
 	}
+}
+
+// DinD maintenance stop (issue #3153 section 4). The fenced "stopping" phase deletes the
+// worker Deployment, which destroys an old-layout pod's run workdir. Every phase of the
+// maintenance state machine refuses to act on a custody-held worker, so a custody-held
+// old-layout worker is never stopped; the control proves the same fenced operation
+// deletes the Deployment once custody is released.
+func TestLayoutMigrationDinDMaintenanceStopNeverStopsCustodyHeldOldLayoutWorker(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		custody    bool
+		layout     string
+		wantDelete bool
+	}{
+		{"custody-held old layout is not stopped", true, "old", false},
+		{"custody-held new layout is not stopped", true, "new", false},
+		{"positive control: non-custody migrated worker is stopped", false, "new", true},
+		{"positive control: non-custody old layout is stopped (custody, not layout, is the guard)", false, "old", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			objs, w := lmObjects(t, lmOpts{id: "d1", custody: c.custody, layout: c.layout})
+			w.DiskPressureVolumes = []string{"dind"}
+			var dep *appsv1.Deployment
+			for _, o := range objs {
+				if d, ok := o.(*appsv1.Deployment); ok {
+					dep = d
+				}
+			}
+			f := lmCluster(t, true, objs...)
+			fake := &maintenanceFake{op: &protocol.DindMaintenance{ID: "operation", Nonce: "nonce", RegisterNonce: "registration",
+				DeploymentUID: string(dep.UID), PVCUID: dindDataPVCName(w.ID), Phase: "stopping", Fenced: true, ReadyACK: true}}
+			f.m.cordoner = fake
+			w.DindMaintenance = fake.op
+			f.client.ClearActions()
+			if err := f.tickErr(t, w); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			del := deletedSet(f.client)
+			if got := del["deployments/"+deploymentName(w.ID)]; got != c.wantDelete {
+				t.Fatalf("deployment deleted = %v, want %v (deletes %v)", got, c.wantDelete, keysOf(del))
+			}
+			if !c.wantDelete && len(del) != 0 {
+				t.Fatalf("a custody-held worker had objects deleted: %v", keysOf(del))
+			}
+		})
+	}
+}
+
+// Disk-pressure recycle (section 4). The existing TestDiskPressureRecycleSkippedForCustodyHeldWorker
+// pins the generic custody skip on a pod-less worker; this adds the old-layout pod case,
+// where the recycle would also replace the pod holding custody-held run state. Nothing
+// is deleted or patched and the custody deferral token is logged; the non-custody twin
+// is the positive control that the arm otherwise fires.
+func TestLayoutMigrationDiskPressureRecycleSkipsCustodyHeldOldLayoutWorker(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		custody bool
+	}{{"custody-held", true}, {"positive control: non-custody", false}} {
+		t.Run(c.name, func(t *testing.T) {
+			f := lmSetup(t, "old", false, "20Gi")
+			w := lmWorker(c.custody)
+			w.DiskPressure = true
+			// Not drifted: isolate the disk-pressure arm from the template-drift arm.
+			if _, err := f.client.AppsV1().Deployments(lmNS()).Update(context.Background(), currentDeployment(t, f, w), metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			f.client.ClearActions()
+			f.tick(t, w)
+			del := deletedSet(f.client)
+			if c.custody {
+				if len(del) != 0 || wasPatched(f.client) {
+					t.Fatalf("custody-held old-layout worker was recycled: deletes %v patched %v", keysOf(del), wasPatched(f.client))
+				}
+				if !strings.Contains(f.logs.String(), "disk-recycle-skipped-custody worker="+lmID) {
+					t.Fatalf("custody deferral token missing: %s", f.logs.String())
+				}
+				return
+			}
+			if len(del) == 0 {
+				t.Fatal("positive control failed: a non-custody worker under disk pressure was not recycled")
+			}
+		})
+	}
+}
+
+// currentDeployment returns the worker's stored Deployment re-stamped with the current
+// rendered hash and generation, so the worker no longer drifts.
+func currentDeployment(t *testing.T, f *lmFixture, w protocol.DesiredWorker) *appsv1.Deployment {
+	t.Helper()
+	d, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(w.ID), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := RenderDeployment(dockerTestConfig(), w, testSpec(t, "base", "m"))
+	d.Spec.Template.Annotations[AnnotationSpecHash] = want.Spec.Template.Annotations[AnnotationSpecHash]
+	d.Spec.Template.Annotations[AnnotationGeneration] = want.Spec.Template.Annotations[AnnotationGeneration]
+	return d
+}
+
+// Teardown (section 4). teardown runs only for workers the api removed from the desired
+// set, and the api keeps a custody-held worker desired (see the teardown doc comment), so
+// a desired custody-held old-layout worker is never reached by it. The controller-side
+// mechanism pinned here: a worker absent from the desired set is torn down (positive
+// control), while the same worker still desired and custody-held loses nothing.
+func TestLayoutMigrationTeardownOnlyForNonDesiredWorkers(t *testing.T) {
+	t.Run("positive control: a non-desired old-layout worker is torn down", func(t *testing.T) {
+		objs, _ := lmObjects(t, lmOpts{id: "d1", custody: false, layout: "old"})
+		f := lmCluster(t, false, objs...)
+		f.client.ClearActions()
+		f.tickAll(t) // empty desired set
+		del := deletedSet(f.client)
+		for _, want := range []string{"deployments/" + deploymentName("d1"), "persistentvolumeclaims/" + dataPVCName("d1")} {
+			if !del[want] {
+				t.Fatalf("expected %s deleted; deletes %v", want, keysOf(del))
+			}
+		}
+	})
+	t.Run("a desired custody-held old-layout worker is never torn down", func(t *testing.T) {
+		for _, stale := range []bool{false, true} {
+			objs, w := lmObjects(t, lmOpts{id: "d1", custody: true, stale: stale, layout: "old"})
+			f := lmCluster(t, true, objs...)
+			f.client.ClearActions()
+			f.tickAll(t, w)
+			if del := deletedSet(f.client); len(del) != 0 {
+				t.Fatalf("stale=%v: a desired custody-held worker had objects deleted: %v", stale, keysOf(del))
+			}
+		}
+	})
 }

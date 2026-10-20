@@ -91,6 +91,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	namespaces := map[string][]*rollEntry{}
 	for _, w := range desired {
 		if w.Ephemeral {
+			// Ephemeral workers are outside the roll pools and slots; only the layout
+			// migration hold is surfaced for them (pacing entry, no roll entry).
+			m.surfaceEphemeralLayoutHold(t, w, observed[w.ID])
 			continue
 		}
 		ns, err := m.cfg.Placement(w)

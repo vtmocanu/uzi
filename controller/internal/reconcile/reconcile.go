@@ -386,7 +386,10 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	// cannot add workers outside the poll, and each worker contributes at most one row.
 	for _, w := range desired {
 		pacing := outcomes[w.ID]
-		if reported[w.ID] || pacing == nil {
+		// An ephemeral worker never rolls (a held one carries a layout-migration
+		// pacing entry only), so it must not get a synthetic rolling row: the api
+		// stamps the upgrading_since ceiling anchor on the first non-terminal phase.
+		if reported[w.ID] || pacing == nil || w.Ephemeral {
 			continue
 		}
 		reported[w.ID] = true

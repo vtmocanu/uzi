@@ -98,3 +98,32 @@ func migrationHeld(w protocol.DesiredWorker, layout runnerLayout) bool {
 
 // layoutMigrationReason is the pacing BlockingReason of a held worker.
 const layoutMigrationReason = "layout_migration_custody"
+
+// surfaceEphemeralLayoutHold records a pacing outcome for a run-bound (ephemeral)
+// worker whose drifted template replacement the layout guard is withholding, so the
+// held state reaches the fleet report like any other worker's. planRoll skips
+// ephemeral workers, so without this a migration-held run-bound worker has no entry.
+// It writes only t.outcomes: the worker joins no pool, takes no slot and is never
+// admitted. A worker that is not held, not drifted, not observed with a Deployment,
+// or whose template cannot be resolved gets no entry (the materializer's own drift
+// arm independently refuses to patch a held worker).
+func (m *Materializer) surfaceEphemeralLayoutHold(t *rollTick, w protocol.DesiredWorker, obs reconcile.ObservedWorker) {
+	if !w.Ephemeral || !obs.HasDeployment || !migrationHeld(w, obs.RunnerLayout) {
+		return
+	}
+	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	if err != nil {
+		return
+	}
+	target := RenderDeployment(m.cfg, w, spec)
+	if obs.SpecHash == target.Spec.Template.Annotations[AnnotationSpecHash] && obs.Generation == w.Generation {
+		return
+	}
+	image := workerImage(target)
+	t.outcomes[w.ID] = &protocol.Pacing{
+		State:          "held",
+		TargetImage:    image,
+		TargetVersion:  targetVersion(m.cfg, image),
+		BlockingReason: pacingText(layoutMigrationReason),
+	}
+}

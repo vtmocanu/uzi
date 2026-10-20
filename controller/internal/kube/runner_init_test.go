@@ -14,8 +14,9 @@ import (
 
 const runnerInitGolden = "testdata/runner-shared-init.sh"
 
-// The rendered runner-init script is pinned byte for byte. The e2e harness executes this
-// same golden under real uids, so a drift here must be a deliberate, reviewed change.
+// The rendered runner-init script is pinned byte for byte. Drift here must be a
+// deliberate, reviewed change: runner_init_exec_test.go executes the rendered script
+// and the worker-uid lane (e2e/worker-uid) exercises it under real uids.
 // Regenerate with `UPDATE_GOLDEN=1 go test ./internal/kube/ -run RunnerInitScriptMatchesGolden`.
 func TestRunnerInitScriptMatchesGolden(t *testing.T) {
 	got := runnerInitScript()
