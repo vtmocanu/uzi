@@ -424,12 +424,12 @@ export function followUpRunes(body: string): number {
   return [...body].length;
 }
 
-/** Issue #3149: cap on the earlier-owner-follow-up history a reviewed-plan resume replays to the
- *  fresh session. Reuses the per-turn owner-text budget (MAX_FOLLOW_UP_BATCH_RUNES), so the first
- *  turn can carry up to about twice that when a live batch rides along. A history over the cap is
- *  never truncated: priorOwnerHistory reports it "over_bound" and the caller falls back to the
- *  human plan gate instead of replaying a partial record as if it were complete. */
-export const MAX_PRIOR_OWNER_HISTORY_RUNES = MAX_FOLLOW_UP_BATCH_RUNES;
+/** Issue #3149: cap on the number of earlier owner follow-ups a reviewed-plan resume replays. The
+ *  rune budget (MAX_FOLLOW_UP_BATCH_RUNES) counts body text only, so without an entry cap 40000
+ *  one-character follow-ups would read "complete" yet render about 11M characters of per-entry
+ *  framing. With the 40000-rune body budget this bounds the rendered history at roughly body budget
+ *  + 100 x per-entry framing; chosen above the ~40 binding follow-ups in the #3149 incident run. */
+export const MAX_PRIOR_OWNER_HISTORY_ENTRIES = 100;
 
 /** Issue #3149: what a claim knows about the owner follow-ups earlier claims consumed. */
 export type PriorOwnerHistory =
@@ -2015,8 +2015,15 @@ export class SteeringChannel {
       byId.set(i.id, body);
     }
     const entries = [...byId].map(([id, body]) => ({ id, body }));
+    // The body budget reuses the per-turn owner-text budget (MAX_FOLLOW_UP_BATCH_RUNES), so the first
+    // turn can carry up to about twice that when a live batch rides along. A history over either
+    // bound is never truncated: it is recorded "over_bound" and the caller falls back to the human
+    // plan gate instead of replaying a partial record as if it were complete.
     const runes = entries.reduce((n, e) => n + followUpRunes(e.body), 0);
-    this.priorHistory = runes > MAX_PRIOR_OWNER_HISTORY_RUNES ? { status: "over_bound" } : { status: "complete", entries };
+    this.priorHistory =
+      runes > MAX_FOLLOW_UP_BATCH_RUNES || entries.length > MAX_PRIOR_OWNER_HISTORY_ENTRIES
+        ? { status: "over_bound" }
+        : { status: "complete", entries };
   }
 
   /** Issue #3149: the recorded history, "unavailable" when the claim-time reload failed or was

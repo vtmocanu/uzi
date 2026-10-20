@@ -141,7 +141,8 @@ import {
   CredentialSwitchSignal,
   GateInputDeliveryError,
   PLAN_APPROVAL_TIMEOUT_REASON,
-  MAX_PRIOR_OWNER_HISTORY_RUNES,
+  MAX_FOLLOW_UP_BATCH_RUNES,
+  MAX_PRIOR_OWNER_HISTORY_ENTRIES,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -10940,7 +10941,7 @@ export class RunRunner {
       !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
     // Issue #3149: a fresh session resuming a reviewed plan must also get the earlier owner
     // follow-ups it never saw. When that history could not be restored (the GET /follow-ups reload
-    // failed, or the history is over MAX_PRIOR_OWNER_HISTORY_RUNES) the resume is not safe to run on
+    // failed, or the history is over MAX_FOLLOW_UP_BATCH_RUNES or MAX_PRIOR_OWNER_HISTORY_ENTRIES) the resume is not safe to run on
     // the old approval: fall back to the plan gate and force a human approval, even on autopilot.
     const priorOwnerHistory = steering.priorOwnerHistory();
     const ownerHistoryIncomplete = m4Candidate && priorOwnerHistory.status !== "complete";
@@ -12030,7 +12031,7 @@ export class RunRunner {
             kind: "status",
             agent: "worker",
             payload: {
-              text: `earlier owner follow-ups on this run could not be restored (unavailable or over the ${MAX_PRIOR_OWNER_HISTORY_RUNES}-character bound): this plan needs explicit owner approval, even on autopilot`,
+              text: `earlier owner follow-ups on this run could not be restored (unavailable or over the ${MAX_FOLLOW_UP_BATCH_RUNES}-code-point / ${MAX_PRIOR_OWNER_HISTORY_ENTRIES}-entry bound): this plan needs explicit owner approval, even on autopilot`,
             },
           });
         }
@@ -12893,6 +12894,16 @@ export class RunRunner {
       this.diskGovernor?.enterRun(flight.runId);
       nowSummary?.start();
       try {
+        // Issue #3149: the history dedup (isLiveFollowUpId) reads steering.isLiveDeliveryId when the
+        // first implement prompt is composed. A legacy consumed-but-unapplied follow-up is in the
+        // GET /follow-ups snapshot AND replayed live by the steering's first GET /inputs, which
+        // plan_approved=true would otherwise not wait for (awaitResumedDelivery is skipped on the
+        // reviewed path). Wait for that first read here, immediately before the executor owns the
+        // run, so the live set is complete before any implement turn composes its prompt. The wait
+        // shares the gate path's recovery handling (transient read failure parks, definitive fails).
+        if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
+        }
         try { result = await executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;

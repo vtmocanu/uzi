@@ -1390,7 +1390,40 @@ describe("RunRunner — M4 resume-reviewed-plan predicate (PRD #759 M4)", () => 
         (m) => m.kind === "status" && /earlier owner follow-ups on this run could not be restored/.test(String(m.payload.text)),
       );
       assert.strictEqual(notes.length, 1, "the forced-gate status line is emitted once per claim");
-      assert.match(String(notes[0]?.payload.text), /40000-character bound/);
+      assert.match(String(notes[0]?.payload.text), /40000-code-point \/ 100-entry bound/);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(i) a legacy consumed-but-unapplied follow-up is already live when the executor starts", async () => {
+    // The row is in GET /follow-ups (no inclusion_reported: an older api) AND replayed by the
+    // steering's first GET /inputs. The reviewed path skips the gate's awaitResumedDelivery, so
+    // without the wait before executor.run the history dedup could compose before that read.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-live-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e5";
+      const row = { id: 41, kind: "follow_up", body: "keep the API stable" } as const;
+      api.overrideFollowUps(runId, 200, { inputs: [row] });
+      api.setInputs(runId, [{ ...row }]);
+      api.delayInputGets(runId, 1500, 1); // the first GET /inputs is slow: only a wait makes the replay live in time
+      const liveAtStart: boolean[] = [];
+      const seen: RunContext[] = [];
+      const factory: ExecutorFactory = (id) => ({
+        homeDir: path.join(homeRoot, id),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            liveAtStart.push(ctx.isLiveFollowUpId?.(41) === true);
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      await runnerWith(factory, gitlab).execute(historyClaim(3105, runId));
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+      assert.deepStrictEqual(seen[0]?.priorOwnerFollowUps, [{ id: 41, body: "keep the API stable" }]);
+      assert.deepStrictEqual(liveAtStart, [true], "the live replay is known before the executor composes a prompt");
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
