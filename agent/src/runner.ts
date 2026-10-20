@@ -1710,7 +1710,8 @@ export interface RequiredBaseInput {
  */
 export function evaluateRequiredBase(input: RequiredBaseInput): "planned" | "attested" {
   const identity = input.identity.trim().toLowerCase();
-  const detail = `the seeded plan was written against commit ${input.plannedBase}, but this clone adopted ${identity}`;
+  // The genuine-divergence wording is the stable failure_reason #3164 classifies (base_diverged).
+  const detail = `the seeded plan was written against commit ${input.plannedBase}, but this clone's base commit is ${identity}`;
   const unvouched = () => input.continuation
     ? new BaseAttestationMissingError(`${detail}, and no checkpoint attests that this content was produced on the planned base; --require-base is set, so the run is held for a recovery decision instead of implementing`)
     : new BaseCommitDivergedError(`${detail}; --require-base is set, so this run will not implement against a diverged base`);
@@ -1725,7 +1726,7 @@ export function evaluateRequiredBase(input: RequiredBaseInput): "planned" | "att
       case "unknown":
         throw new BaseProofError(`the planned commit ${input.plannedBase} could not be read; --require-base cannot be verified`);
       case "missing":
-        throw new BaseCommitDivergedError(`${detail}, and the planned commit does not exist in this repository; --require-base is set, so this run will not implement against a diverged base`);
+        throw new BaseCommitDivergedError(`${detail}; --require-base is set, so this run will not implement against a diverged base`);
     }
     if (input.planned.sha !== identity) throw unvouched();
     rule = "planned";
