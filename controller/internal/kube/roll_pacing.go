@@ -173,10 +173,12 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		// Layout migration guard (issue #3153), BEFORE the ForceRoll override below: a
 		// held worker's template replacement would destroy custody-held run state, so
 		// it is never admitted, never a canary and never takes a roll slot. Not
-		// adding it to a pool is what keeps it out of all three.
-		if e.dep != nil && e.drift && migrationHeld(e.w, e.o.RunnerLayout) {
-			t.outcomes[e.w.ID].State = "held"
-			t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
+		// adding it to a pool is what keeps it out of all three. A failed roll
+		// snapshot leaves e.dep nil, so drift is then judged from the observation.
+		drifted := e.drift || (e.dep == nil && e.o.HasDeployment &&
+			(e.o.SpecHash != e.target.Spec.Template.Annotations[AnnotationSpecHash] || e.o.Generation != e.w.Generation))
+		if drifted && migrationHeld(e.w, e.o.RunnerLayout) {
+			m.holdForLayoutMigration(ctx, t, e)
 			continue
 		}
 		if !ok && e.blocked == "" {
@@ -239,6 +241,32 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	m.pacing = t.outcomes
 	return t, order
 }
+
+// holdForLayoutMigration reports the worker held and withdraws its own incomplete
+// roll reservation. The reservation must go because the held worker is outside the
+// pool: planPool's in-flight, promotion and pending accounting never sees it, so a
+// cohort could otherwise complete without it and wedge it (and every later drift in
+// the pool) behind a stale incomplete marker once custody releases. Cancelling is
+// metadata-only (no template or replicas change, no pod replaced) and is the same
+// cancellation planPool already applies to an obsolete marker; the worker simply
+// re-enters admission as a fresh drifted participant after the hold lifts.
+func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, e *rollEntry) {
+	t.outcomes[e.w.ID].State = "held"
+	t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
+	if e.blocked != "" || e.dep == nil || e.marker == nil || e.marker.Completed {
+		return
+	}
+	if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
+		if err := m.mirrorRoll(ctx, e, nil); err != nil {
+			e.blocked = "held reservation mirror cancellation unconfirmed"
+			return
+		}
+	}
+	if err := m.reserveRoll(ctx, e, nil); err != nil {
+		e.blocked = "held reservation cancellation unconfirmed"
+	}
+}
+
 func pacingText(s string) *string {
 	if s == "" {
 		return nil
@@ -810,6 +838,8 @@ func independentRebuild(e *rollEntry) bool {
 // Independent maintenance creates no image-roll participant. Existing image-roll
 // reservations are retained by the caller through the retained data claim.
 func (m *Materializer) reserveMaintenanceRoll(e *rollEntry) error {
+	// Defense in depth: its callers (recycleWorkerVolumes, fenced DinD stopping)
+	// already return for a held worker before reaching here.
 	if migrationHeld(e.w, e.o.RunnerLayout) {
 		return fmt.Errorf("layout migration custody hold; maintenance roll refused")
 	}
@@ -1327,7 +1357,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		if e.dep != nil {
 			failure = replicaFailureReason(e.dep)
 		}
-		e.o.RunnerLayout = observeRunnerLayout(e.pods, true)
+		e.o.RunnerLayout = observeRunnerLayout(e.pods)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health

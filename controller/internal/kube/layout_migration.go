@@ -13,8 +13,9 @@ import (
 // legacyRunWorkdirVolume; they now mount the `data` PVC subPath dindWorkdirSubPath
 // there. Replacing an old-layout pod destroys the in-pod run workdir, which for a
 // worker holding a durable-recovery custody hold (DesiredWorker.CustodyHeld) is
-// custody-held run state. migrationHeld is the ONE predicate every pod-replacing
-// write path asks; none of them may re-derive it.
+// custody-held run state. migrationHeld is the ONE predicate the controller's
+// pod-replacing roll and recycle paths ask; none of them may re-derive it. (Fenced
+// DinD maintenance and teardown are guarded by CustodyHeld directly instead.)
 //
 // This is a narrow exception to the operator's emergency DrainPolicy.ForceRoll: a
 // force-roll is consent to requeue a busy run, not to discard custody-held state.
@@ -35,14 +36,12 @@ const (
 	layoutOld     = reconcile.RunnerLayoutOld
 )
 
-// observeRunnerLayout classifies a worker's pods, terminating ones included. New
-// requires EVERY pod's worker and dind containers to mount the runner-shared
+// observeRunnerLayout classifies a worker's pods, terminating ones included. Callers
+// invoke it only after a successful pod list; a failed list leaves the observed
+// layout at its zero value, layoutUnknown. New requires EVERY pod's worker and dind containers to mount the runner-shared
 // subPath and NO pod to carry the legacy volume; any other non-empty set, mixed
 // ones included, is old.
-func observeRunnerLayout(pods []corev1.Pod, podsKnown bool) runnerLayout {
-	if !podsKnown {
-		return layoutUnknown
-	}
+func observeRunnerLayout(pods []corev1.Pod) runnerLayout {
 	if len(pods) == 0 {
 		return layoutNone
 	}

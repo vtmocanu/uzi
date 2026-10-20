@@ -428,7 +428,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		if o.Namespace == ns {
 			o.PodsKnown = true
 			// Terminating pods are in byWorker too: they still hold the workdir.
-			o.RunnerLayout = observeRunnerLayout(byWorker[o.ID], true)
+			o.RunnerLayout = observeRunnerLayout(byWorker[o.ID])
 		}
 	}
 	// Derive for every worker we have a DEPLOYMENT for, not merely for every worker we

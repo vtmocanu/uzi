@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -138,6 +140,15 @@ func TestObserveRecordsRunnerLayout(t *testing.T) {
 			}
 		})
 	}
+	t.Run("new-layout mounts plus a leftover run-workdir volume is old", func(t *testing.T) {
+		p := lmPod(t, "p-leftover", "new", false)
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{Name: legacyRunWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		f := lmSetup(t, "none", false, "20Gi", p)
+		obs, _ := f.m.Observe(context.Background())
+		if obs[0].RunnerLayout != reconcile.RunnerLayoutOld {
+			t.Fatalf("layout = %v, want old", obs[0].RunnerLayout)
+		}
+	})
 	t.Run("a pod missing the dind mount is old", func(t *testing.T) {
 		p := lmPod(t, "p-half", "new", false)
 		for i := range p.Spec.InitContainers {
@@ -217,34 +228,110 @@ func TestLayoutMigrationHeldWorkerIsNotAdmittedOrCanary(t *testing.T) {
 	}
 }
 
-// A held worker beside a rollable peer in one pool does not take the peer's slot and
-// the peer is not blocked by it.
+// A held worker beside a rollable peer in one pool does not take the peer's slot: the
+// held worker serves (Running pod), so the peer has coverage, is admitted and rolls.
 func TestLayoutMigrationHeldWorkerTakesNoRollSlot(t *testing.T) {
-	ns := lmNS()
-	peerNix := pvcNix("d2", "20Gi")
-	peerNix.Namespace = ns
-	peer := deployedWorkerNS("d2", ns, 0, "the-old-releases-hash")
-	f := lmSetup(t, "old", false, "20Gi", peer, peerNix, pvcForNS("d2", "data", ns), pvcForNS("d2", "dind-data", ns))
-	obs, err := f.m.Observe(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	held := lmWorker(true)
-	other := evidence(protocol.DesiredWorker{ID: "d2", Template: "base", Size: "m", Docker: true}, m5Now)
-	if err := f.m.Reconcile(context.Background(), []protocol.DesiredWorker{held, other}, obs); err != nil {
-		t.Fatal(err)
-	}
+	hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old"})
+	pObjs, peer := lmObjects(t, lmOpts{id: "d2", stale: true, layout: "new"})
+	f := lmCluster(t, false, append(hObjs, pObjs...)...)
+	f.tickAll(t, h, peer)
 	po := f.m.PacingOutcomes()
-	if po[lmID] == nil || po[lmID].State != "held" {
-		t.Fatalf("held worker pacing = %+v", po[lmID])
+	if po["d1"] == nil || po["d1"].State != "held" {
+		t.Fatalf("held worker pacing = %+v", po["d1"])
 	}
-	for _, name := range templatePatches(f.client) {
-		if name == deploymentName(lmID) {
-			t.Fatal("the held worker's deployment was patched")
+	if lmRolled(t, f, "d1") {
+		t.Fatal("the held worker's deployment was patched")
+	}
+	if !lmRolled(t, f, "d2") {
+		t.Fatalf("the peer was not rolled (pacing %+v)", po["d2"])
+	}
+	if po["d2"] != nil && po["d2"].CanaryID != nil && *po["d2"].CanaryID == "d1" {
+		t.Fatal("the held worker was chosen canary")
+	}
+}
+
+// With the pod list failing the roll snapshot fails too; under ForceRoll pacing must
+// still report the worker held rather than overridden.
+func TestLayoutMigrationHeldReportedWhenSnapshotFailsUnderForceRoll(t *testing.T) {
+	f := lmSetup(t, "unknown", true, "20Gi")
+	f.tick(t, lmWorker(true))
+	p := f.m.PacingOutcomes()[lmID]
+	if p == nil || p.State != "held" || p.BlockingReason == nil || *p.BlockingReason != layoutMigrationReason {
+		t.Fatalf("pacing = %+v, want held/%s", p, layoutMigrationReason)
+	}
+	if wasPatched(f.client) {
+		t.Fatal("rolled")
+	}
+}
+
+// Observe and the roll snapshot read the pods at different instants; the snapshot's
+// reading is the one admission uses.
+func TestLayoutMigrationRollSnapshotRefreshesLayout(t *testing.T) {
+	swap := func(t *testing.T, f *lmFixture, to string) {
+		t.Helper()
+		pods := f.client.CoreV1().Pods(lmNS())
+		list, _ := pods.List(context.Background(), metav1.ListOptions{})
+		for _, p := range list.Items {
+			if err := pods.Delete(context.Background(), p.Name, metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := pods.Create(context.Background(), lmPod(t, "p-swapped", to, false), metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if po["d2"] != nil && po["d2"].CanaryID != nil && *po["d2"].CanaryID == lmID {
-		t.Fatal("the held worker was chosen canary")
+	for _, c := range []struct {
+		observed, snapshot string
+		wantPatched        bool
+	}{{"old", "new", true}, {"new", "old", false}} {
+		t.Run(c.observed+" then "+c.snapshot, func(t *testing.T) {
+			f := lmSetup(t, c.observed, true, "20Gi")
+			obs, err := f.m.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			swap(t, f, c.snapshot)
+			if err := f.m.Reconcile(context.Background(), []protocol.DesiredWorker{lmWorker(true)}, obs); err != nil {
+				t.Fatal(err)
+			}
+			if wasPatched(f.client) != c.wantPatched {
+				t.Fatalf("patched = %v, want %v", wasPatched(f.client), c.wantPatched)
+			}
+		})
+	}
+}
+
+// B1: a held worker carrying its own incomplete reservation must not wedge its pool.
+// The hold withdraws the reservation (metadata only); once custody releases, the
+// worker is admitted afresh and rolls.
+func TestLayoutMigrationHeldWorkerWithIncompleteReservationDoesNotWedgePool(t *testing.T) {
+	for _, variant := range []string{"canary", "participant"} {
+		t.Run(variant, func(t *testing.T) {
+			hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: variant})
+			objs := hObjs
+			workers := []protocol.DesiredWorker{h}
+			if variant == "participant" {
+				cObjs, canary := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "canary", promoted: true})
+				objs, workers = append(objs, cObjs...), append(workers, canary)
+			}
+			f := lmCluster(t, false, objs...)
+			for i := 0; i < 3; i++ {
+				f.tickAll(t, workers...)
+				if lmRolled(t, f, "d1") {
+					t.Fatalf("tick %d: the held worker was rolled", i)
+				}
+			}
+			if d, _ := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName("d1"), metav1.GetOptions{}); d.Annotations[annotationRoll] != "" {
+				t.Fatal("the held worker kept its incomplete reservation")
+			}
+			workers[0].CustodyHeld = false
+			for i := 0; i < 8 && !lmRolled(t, f, "d1"); i++ {
+				f.tickAll(t, workers...)
+			}
+			if !lmRolled(t, f, "d1") {
+				t.Fatalf("after custody released the worker never rolled; pacing %+v", f.m.PacingOutcomes()["d1"])
+			}
+		})
 	}
 }
 
@@ -495,4 +582,102 @@ func TestDockerCustodyDriftRollMigratedRollsOldLayoutHeld(t *testing.T) {
 	if wasPatched(old.client) {
 		t.Fatal("an old-layout custody-held worker was rolled")
 	}
+}
+
+type lmOpts struct {
+	id       string
+	custody  bool
+	stale    bool   // deployed template carries a stale spec hash (drift)
+	layout   string // pod layout: "old" or "new"
+	marker   string // "", "canary" or "participant": an incomplete reservation
+	promoted bool   // the pod carries current-incarnation registration proof
+}
+
+const lmStaleHash = "the-old-releases-hash"
+
+// lmObjects renders a Docker worker's Deployment (with a real container template so
+// serving proof can hold), its volumes, ReplicaSet and one Running pod.
+func lmObjects(t *testing.T, o lmOpts) ([]runtime.Object, protocol.DesiredWorker) {
+	t.Helper()
+	cfg, ns := dockerTestConfig(), lmNS()
+	w := evidence(protocol.DesiredWorker{ID: o.id, Template: "base", Size: "m", Docker: true, CustodyHeld: o.custody}, m5Now)
+	dep := RenderDeployment(cfg, w, testSpec(t, "base", "m"))
+	dep.Namespace, dep.UID, dep.ResourceVersion = ns, types.UID("uid-"+dep.Name), "1"
+	if o.marker != "" {
+		dep = markedDeployment(t, cfg, w, false)
+		dep.Namespace, dep.UID, dep.ResourceVersion = ns, types.UID("uid-"+dep.Name), "1"
+		if o.marker == "participant" {
+			m, err := decodeRoll(dep.Annotations[annotationRoll])
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.Canary = false
+			raw, _ := json.Marshal(m)
+			dep.Annotations[annotationRoll] = string(raw)
+		}
+	}
+	if o.stale {
+		dep.Spec.Template.Annotations[AnnotationSpecHash] = lmStaleHash
+	}
+	yes := true
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "rs-" + o.id, Namespace: ns, UID: types.UID("rs-uid-" + o.id),
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: dep.Name, UID: dep.UID, Controller: &yes}}}}
+	spec := dep.Spec.Template.Spec.DeepCopy()
+	if o.layout == "old" {
+		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: legacyRunWorkdirVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		for _, list := range [][]corev1.Container{spec.Containers, spec.InitContainers} {
+			for i := range list {
+				for j, vm := range list[i].VolumeMounts {
+					if vm.MountPath == dindWorkdirDir {
+						list[i].VolumeMounts[j] = corev1.VolumeMount{Name: legacyRunWorkdirVolume, MountPath: dindWorkdirDir}
+					}
+				}
+			}
+		}
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-" + o.id, Namespace: ns, UID: types.UID("pod-uid-" + o.id), Labels: objectLabels(o.id),
+		Annotations:     map[string]string{AnnotationSpecHash: dep.Spec.Template.Annotations[AnnotationSpecHash]},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID, Controller: &yes}}},
+		Spec: *spec, Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: workerContainerName, Image: workerImage(dep), State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}}}
+	if o.promoted {
+		version, nonce, uid := "1.0.0", "new-"+o.id, string(pod.UID)
+		w.RollEvidence.RegisteredVersion, w.RollEvidence.RegisterNonce, w.RollEvidence.PodUID = &version, &nonce, &uid
+		at := m5Now
+		w.RollEvidence.HeartbeatAt = &at
+	}
+	nix := pvcNix(o.id, "20Gi")
+	nix.Namespace = ns
+	return []runtime.Object{dep, rs, pod, nix, pvcForNS(o.id, "data", ns), pvcForNS(o.id, "dind-data", ns)}, w
+}
+
+func lmCluster(t *testing.T, force bool, objs ...runtime.Object) *lmFixture {
+	t.Helper()
+	client := enforcingClient(t, objs...)
+	logs := &strings.Builder{}
+	cord := &fakeCordoner{}
+	m := New(client, dockerTestConfig(), testResolver(t), cord, DrainPolicy{Deadline: 24 * time.Hour, ForceRoll: force},
+		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, slog.New(slog.NewTextHandler(logs, nil)))
+	m.now = func() time.Time { return m5Now }
+	return &lmFixture{m: m, client: client, cord: cord, logs: logs}
+}
+
+func (f *lmFixture) tickAll(t *testing.T, ws ...protocol.DesiredWorker) {
+	t.Helper()
+	obs, err := f.m.Observe(context.Background())
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if err := f.m.Reconcile(context.Background(), ws, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+}
+
+// lmRolled reports that the worker's deployed template no longer carries the stale hash.
+func lmRolled(t *testing.T, f *lmFixture, id string) bool {
+	t.Helper()
+	d, err := f.client.AppsV1().Deployments(lmNS()).Get(context.Background(), deploymentName(id), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.Spec.Template.Annotations[AnnotationSpecHash] != lmStaleHash
 }
