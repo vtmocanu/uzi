@@ -4961,12 +4961,15 @@ it("issue3152 live_pass_cap is not logged for dropped records that are not inven
     // Legacy (unguarded) bundled records, served from memory: a journaled unguarded record cannot keep the guarded-only fields.
     const legacy = [a, b].map(r => ({ ...r, inventoryGuarded: false, coverageDigest: undefined, state: "bundled",
       bundlePath: "bundle", byteSize: 1, checksum: "c", chunkCount: 1 }) as RecoveryRecord);
+    // Unguarded records that FAIL the live filter: one whose run is executing, one that is already uploaded.
+    legacy.push({ ...legacy[0]!, runId: "run-exec", captureId: "cap-exec" } as RecoveryRecord);
+    legacy.push({ ...legacy[0]!, captureId: "cap-uploaded", state: "uploaded" } as RecoveryRecord);
     const c = f.coordinator as any;
     c.liveMaxPerPass = 1;
     c.snapshotBootRecords = async () => legacy;
     let steps = 0;
     c.liveStep = async () => { steps++; return "ok"; };
-    await issue3152LivePasses(f, c, 3);
+    await issue3152LivePasses(f, c, 3, (runId?: string) => runId === "run-exec");
     assert.equal(steps, 3, "the cap admitted exactly one record per pass, so the other was dropped");
     assert.deepEqual(lines, []);
   } finally { await f.close(); }
