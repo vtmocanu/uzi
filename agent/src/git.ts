@@ -11862,8 +11862,9 @@ try {
    * fresh exact custody, non-stopped family and original charged output history.
    * This seam grants neither publication nor preservation/release authority.
    */
-  // @ts-expect-error TS6133: dormant until the fresh integration binding is implemented.
-  private async withVerifiedMaintenancePack(
+  // Dormant until the producer transfer binding lands (#3031); protected so no unused-private
+  // diagnostic needs suppressing under every tsconfig that compiles this file.
+  protected async withVerifiedMaintenancePack(
     source: { clonePath: string; identity: string },
     tip: string,
     outDir: string,
