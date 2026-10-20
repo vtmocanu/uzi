@@ -237,6 +237,7 @@ func TestPolicyHoldArtifactPlacementLiveDB(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					f := newCRFix(t)
+					f.svc.SetHealthSettings(defaultHealthSettings())
 					f.svc.SetCapabilitySettings(fakeCapabilitySettings{on: capAware})
 					f.svc.SetJobFiles(NewJobFiles(f.env.pool, f.env.box, JobFileLimits{}, nil))
 					p := f.params(t, "placement", crObs(100, 0, 1), "S", 3)
@@ -316,7 +317,7 @@ func TestPolicyHoldArtifactPlacementLiveDB(t *testing.T) {
 					} else {
 						t.Logf("PASS WorkerEligibilityForHealth strict=%d", eligible.StrictEligible)
 					}
-					reason := f.svc.queuedReason(f.env.ctx, now, row)
+					reason := f.svc.queuedReason(f.env.ctx, now, row, f.svc.healthThresholds(f.env.ctx))
 					if tc.wantCount == 0 && reason != reasonNoPolicyHoldCapableWorker {
 						t.Errorf("queuedReason=%q want=%q", reason, reasonNoPolicyHoldCapableWorker)
 					} else if tc.wantCount > 0 && reason != reasonWaitingWorker {

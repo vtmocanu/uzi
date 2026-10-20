@@ -12,7 +12,8 @@ func TestPolicyHoldHealthCapabilityReason(t *testing.T) {
 		r.PolicyRefusalCount = 1
 		fs := &healthFakeStore{onlineWorkers: 1, freeSlotWorkers: 1, eligibleWorkers: 1, policyHoldCount: &count}
 		svc := healthSvc(fs, defaultHealthSettings())
-		got := svc.queuedReason(context.Background(), t0, r)
+		ctx := context.Background()
+		got := svc.queuedReason(ctx, t0, r, svc.healthThresholds(ctx))
 		if (got == reasonNoPolicyHoldCapableWorker) != (count == 0) {
 			t.Fatalf("count=%d reason=%q", count, got)
 		}

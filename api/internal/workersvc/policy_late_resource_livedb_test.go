@@ -1,12 +1,14 @@
 package workersvc
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -24,10 +26,18 @@ func TestPolicyLateHoldResourceProjectionLiveDB(t *testing.T) {
 	if err != nil || len(members) != 1 || !members[0].Counted || members[0].Reason != "run_not_live" {
 		t.Fatalf("members=%+v err=%v", members, err)
 	}
-	if CustodyHoldLimit != 8 {
-		t.Fatalf("default admission limit=%d", CustodyHoldLimit)
+	limit, err := e.svc.custodyLimit(e.ctx)
+	if err != nil {
+		t.Fatalf("read configured custody limit: %v", err)
 	}
-	aggregate, err := e.q.GetCustodyAggregateForOwner(e.ctx, store.GetCustodyAggregateForOwnerParams{UserID: e.userID, CustodyHoldLimit: CustodyHoldLimit, HeartbeatCutoff: cutoff})
+	defaultLimit, err := strconv.ParseInt(settings.DefaultCustodyHoldLimit, 10, 32)
+	if err != nil {
+		t.Fatalf("parse default custody limit: %v", err)
+	}
+	if defaultLimit != 8 || int64(limit) != defaultLimit {
+		t.Fatalf("configured custody limit=%d settings default=%d, want default 8", limit, defaultLimit)
+	}
+	aggregate, err := e.q.GetCustodyAggregateForOwner(e.ctx, store.GetCustodyAggregateForOwnerParams{UserID: e.userID, CustodyHoldLimit: limit, HeartbeatCutoff: cutoff})
 	if err != nil || aggregate.AdmissionCountedHolds != 1 || aggregate.OpenHolds != 1 {
 		t.Fatalf("aggregate=%+v err=%v", aggregate, err)
 	}
@@ -65,16 +75,15 @@ func TestPolicyLateHoldResourceProjectionLiveDB(t *testing.T) {
 	if !heldExists || idleExists {
 		t.Fatalf("reaper must retain the held worker and remove the unrelated idle worker: held=%t idle=%t", heldExists, idleExists)
 	}
-	for generation := 2; generation <= 8; generation++ {
+	for generation := int32(2); generation <= limit; generation++ {
 		latePolicyExec(t, e, `INSERT INTO recovery_custody_holds(user_id,repo_id,run_id,generation,state,original_worker_id,original_worker_identity)
  VALUES($1,$2,$3,$4,'open',$5,'policy-resource')`, e.userID, e.repoID, e.runID, generation, e.wkr.ID)
 	}
 	fresh := uuid.New()
 	latePolicyExec(t, e, `INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,claim_generation)
  VALUES($1,$2,$3,'issue',102,'fresh resource','d','queued',0)`, fresh, e.userID, e.repoID)
-	admission, err := e.q.GetCustodyAdmissionForRun(e.ctx, store.GetCustodyAdmissionForRunParams{UserID: e.userID, RunID: fresh, CustodyHoldLimit: CustodyHoldLimit, HeartbeatCutoff: cutoff})
-	if err != nil || admission.AdmissionCountedHolds != 8 || admission.ContinuationExempt {
+	admission, err := e.q.GetCustodyAdmissionForRun(e.ctx, store.GetCustodyAdmissionForRunParams{UserID: e.userID, RunID: fresh, CustodyHoldLimit: limit, HeartbeatCutoff: cutoff})
+	if err != nil || admission.AdmissionCountedHolds != int64(limit) || admission.ContinuationExempt {
 		t.Fatalf("default-eight fresh admission=%+v err=%v", admission, err)
 	}
-
 }
