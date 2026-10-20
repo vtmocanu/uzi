@@ -19193,7 +19193,8 @@ describe("2833 Codex inline summaries", () => {
     const { ctx, emitted } = makeCtx({ kind: "issue", planApproved: false, approvedPlan: undefined,
       summaryIntentPresent: true, gatePlan });
     const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
-      summaryRunner, summarySettleMs: 1,
+      // Test settled usage, not a 1 ms abandonment race against the abort callback under load.
+      summaryRunner,
     });
     const execution = executor.run(ctx);
     try {

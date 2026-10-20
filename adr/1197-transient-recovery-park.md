@@ -112,6 +112,46 @@ claim may encounter recovery again. Existing blocker-persistence failures
 remain reported as unavailable. No pre-launch marker or command-UID process
 scan is added, and the worker quarantine policy is unchanged.
 
+### Terminal-maintenance writer exclusion (issue #3031, 2026-10-19)
+
+The model-free terminal producer's private preparation runs only while the
+worker proves no untrusted writer exists, in both uid modes. It closes the
+existing claim gate under its own owner, requires an idle worker with no
+in-flight claims, and runs a deny-only process scan (worker-local, never
+signalling). That scan admits only the worker, its ancestors, the subtrees
+of roots the producer slot itself recorded, zombies, and the exact bootstrap
+set below; every other process, of any uid, readable or not, refuses. A
+proc mount with a hidepid restriction, or more than one mount at `/proc`,
+refuses. When Docker is wired, any running container refuses.
+
+The bootstrap set is taken once, at the first statement of `main()`: zero or
+one direct child of the worker, pinned by pid, start time, parent pid and
+the `exe` realpath of tsx's own native esbuild. It is never re-taken; a later
+descendant of an enrolled pid, PID reuse or an unreadable identity refuses.
+
+**Trust limit.** On single-uid workers, an enrolled esbuild, like the worker,
+its tsx ancestors and `/app`, is inside the documented same-uid trust limit
+(ADR-1786, ADR-2213). Exclusive-idle provides temporal closure only; the uid
+split is the boundary.
+
+**Staged.** The producer ships disabled: `TERMINAL_ORIGIN_ADMISSION_ENABLED`
+in `agent/src/recovery.ts` stops new-origin admission after saved-evidence
+replay, so production never charges the producer ledger, closes the exclusion
+gate or captures WIP. The bootstrap snapshot above is still taken at boot.
+The change that adds the verified transfer, archive handoff and boot
+rediscovery removes the guard.
+
+Reachable now, independently of the guard: after a run ends failed or
+blocked, the runner starts a pass that retries that run's saved custody
+FINAL under the existing replay proofs, and live re-drive waits while it
+holds the pass set. On shutdown the worker aborts every recovery pass and
+joins it. A pass step that ignores the abort (a git child, an RPC on its
+own timeout) still runs to its own limit, which can outlast the container
+grace. Before the join, such a step was neither aborted nor joined, and the
+handles it held could equally keep the process alive after `worker.run()`
+returned. Linking the pass abort into every git and RPC scope is owed
+before the guard is removed.
+
 ### Server-owned backoff
 
 `SetRunRecoveryWait` admits only the owning worker's running, non-judge run.
