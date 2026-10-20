@@ -1366,21 +1366,37 @@ function stalenessLine(describedSha: string, headSha: string): string {
   ].join("\n");
 }
 
+/** Character budget for the fully rendered maintainer items. The decoder admits 256 criteria of about
+ *  12 KB each, far over BODY_CAP_CHARS, and capBody never trims the completion block; items past the
+ *  budget render compactly (ids only), so the block stays bounded whatever the server sent. */
+const PENDING_ITEM_CHAR_BUDGET = 24_000;
+
 /** The unchecked maintainer checklist (PRD #1230 M4), inside the issue arm's blockquote. A milestone
- *  that is both owner-deferred and holds a maintainer criterion counts once in the outstanding line. */
-function pendingBlock(pending: CompletionPending, deferredMilestones: readonly string[]): string[] {
+ *  that is both owner-deferred and holds a maintainer criterion counts once in the outstanding line,
+ *  which is omitted under a scope cap because the inputs then cannot support a total. */
+function pendingBlock(pending: CompletionPending, deferredMilestones: readonly string[], scopeCapped: boolean): string[] {
   const criteria = [...pending.criteria].sort((a, b) => a.criterion_id < b.criterion_id ? -1 : a.criterion_id > b.criterion_id ? 1 : 0);
   const outstanding = new Set([...deferredMilestones, ...criteria.map((c) => c.milestone_id)]).size;
+  const full: string[] = [];
+  const brief: string[] = [];
+  let used = 0;
+  for (const c of criteria) {
+    const lines = [
+      `> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)}) — ${escapeInline(c.text)}: ${escapeInline(c.reason)}`,
+      ...c.conditions.map((x) => `>   - Condition: ${escapeInline(x)}`),
+      ...c.verification_steps.map((x) => `>   - Verify: ${escapeInline(x)}`),
+    ];
+    const size = lines.reduce((n, l) => n + l.length + 1, 0);
+    if (brief.length === 0 && used + size <= PENDING_ITEM_CHAR_BUDGET) { full.push(...lines); used += size; }
+    else brief.push(`> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)})`);
+  }
   return [
     "> ⚠️ **Maintainer verification pending (PRD #1230).** The criteria below were authorized by the owner as",
     "> requiring the maintainer, not this run. They are UNVERIFIED and this pull request does NOT close the source issue:",
     "> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked.",
-    `> Outstanding milestones for the source issue: ${outstanding} (a deferred milestone that also holds a maintainer criterion counts once).`,
-    ...criteria.flatMap((c) => [
-      `> - [ ] ${codeSpan(c.criterion_id)} (milestone ${codeSpan(c.milestone_id)}) — ${escapeInline(c.text)}: ${escapeInline(c.reason)}`,
-      ...c.conditions.map((x) => `>   - Condition: ${escapeInline(x)}`),
-      ...c.verification_steps.map((x) => `>   - Verify: ${escapeInline(x)}`),
-    ]),
+    ...(scopeCapped ? [] : [`> Outstanding milestones for the source issue: ${outstanding} (a deferred milestone that also holds a maintainer criterion counts once).`]),
+    ...full,
+    ...(brief.length > 0 ? [`> ${brief.length} more criteria are shown in brief; their full text is on the run page.`, ...brief] : []),
   ];
 }
 
@@ -1422,7 +1438,7 @@ function issueArm(input: CompletionBlockInput): string[] {
       `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
     lines.push("", `> **Issue remains open.** ${reason}`);
   }
-  if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id)));
+  if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id), !!input.scopeCapped));
   if (accepted.length > 0) {
     lines.push(
       "",

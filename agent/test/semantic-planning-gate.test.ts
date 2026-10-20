@@ -71,3 +71,19 @@ it("M2 settlement failure never publishes even a valid report", async () => {
   assert.equal((await gate.review(c, structural.plan_md, sources)).reason, "coverage_settlement_failed");
   assert.equal(events.includes("publish"), false);
 });
+
+it("M4 an owner abort during coverage is never classified as an unavailable-coverage park", async () => {
+  const client = {} as WorkerClient;
+  const events: string[] = [];
+  const server = semanticServer(client, events);
+  const transport = await boundedTransport("claude", server.report, events);
+  const owner = new AbortController();
+  const gate = new SemanticPlanningGate(client, "run", 1, owner.signal, transport);
+  const c = await gate.compile(structural, proposal(), sources);
+  const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+  server.failStatus(abort);
+  // Not aborted by the owner: an AbortError is a timeout-class transport failure.
+  assert.equal((await gate.reviewForGate(c, structural.plan_md, sources)).outcome, "unavailable");
+  owner.abort(new Error("owner cancelled"));
+  await assert.rejects(gate.reviewForGate(c, structural.plan_md, sources), error => error === abort || /owner cancelled|aborted/.test(String(error)));
+});

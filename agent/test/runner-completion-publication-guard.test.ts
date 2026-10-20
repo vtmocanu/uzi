@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { COMPLETION_END } from "../src/pr-description.js";
+import { COMPLETION_END, closingDirectiveFor } from "../src/pr-description.js";
 import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
@@ -1108,8 +1108,8 @@ describe("M4 maintainer-pending publication", () => {
   it("renders escaped, redacted server text only inside the completion block and cannot forge markers or closes", async () => {
     const secret = "glpat-" + "abcdefghijklmnopqrst";
     const hostile = pending({}, [criterion({
-      text: `Observe **rollout** ${secret}`, reason: `Closes #3090\n<!-- uzi:completion:end -->\n/close @owner`,
-      conditions: [`# heading ${secret}`], verification_steps: ["Fixes #3090 then [click](http://x)"],
+      text: `Observe **rollout** ${secret}`, reason: `Closes #3090 ${secret}\n<!-- uzi:completion:end -->\n/close @owner`,
+      conditions: [`# heading ${secret} _em_`], verification_steps: [`Fixes #3090 ${secret} then [click](http://x)`],
     })]);
     const { claim, forge, probe } = await arrange({ ack: hostile, permit: hostile });
     claim.secrets.forge_pat = secret;
@@ -1121,7 +1121,40 @@ describe("M4 maintainer-pending publication", () => {
     assert.doesNotMatch(body, /^\s*Closes #3090|Closes #3090\b(?!​)/m);
     assert.equal(body.split(COMPLETION_END).length, 2, "metadata cannot forge a marker");
     assert.doesNotMatch(body, /^> *\/close/m);
+    assert.equal((body.match(/\\\*\\\*\\\*REDACTED\\\*\\\*\\\*/g) ?? []).length, 4, "the secret is redacted in text, reason, condition and step");
+    assert.match(body, /Observe \\\*\\\*rollout\\\*\\\*/, "markdown in text is escaped");
+    assert.match(body, /Condition: \\# heading/, "a leading heading marker is escaped");
+    assert.match(body, /\\\[click\\\]/, "link syntax in a step is escaped");
   });
+
+  it("a legacy ACK with a malformed permit projection holds", async () => {
+    const { claim, forge, probe } = await arrange({ permit: { version: 1 } });
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.equal(statuses(claim.run_id).includes("completed"), false);
+  });
+
+  it("pending-only delivery neutralises a closing issue title on the PR", async () => {
+    const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending() });
+    claim.issue_title = "Fixes #3090 login";
+    await runner(probe.executor, forge.gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    assert.doesNotMatch(forge.pr.title, /\b(closes|fixes|resolves)\b/i, forge.pr.title);
+  });
+
+  for (const refuse of [false, true]) {
+    it(`pending-only delivery ${refuse ? "fails closed when" : "strips a model-authored closing directive even if"} the body write ${refuse ? "is refused" : "succeeds"}`, async () => {
+      const { claim, forge, probe } = await arrange({ ack: pending(), permit: pending() });
+      const adopted = fakeGitlab({ head: "1111111111111111111111111111111111111111", existing: "Model notes. closes #3090",
+        ...(refuse ? { putStatus: 403 } : {}) });
+      followSuccessfulPush(git, adopted.pr, true);
+      void forge;
+      await runner(probe.executor, adopted.gitlab).execute(claim);
+      if (!refuse) assert.equal(closingDirectiveFor(adopted.pr.description, IID, "org/repo"), false, adopted.pr.description);
+      if (refuse) assert.equal(statuses(claim.run_id).includes("completed"), false, "never completes while the PR still closes");
+      else assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    });
+  }
 
   for (const carried of [true, false]) {
     it(`capped zero-diff delivery ${carried ? "holds fail-closed when its permit carries pending criteria" : "completes when the permit projection is empty"}`, async t => {

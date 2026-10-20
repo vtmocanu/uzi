@@ -1064,3 +1064,32 @@ describe("maintainer-pending completion rendering", () => {
     assert.doesNotMatch(block, /Closes #7/);
   });
 });
+
+describe("maintainer-pending rendering under a scope cap and at the decoder maximum", () => {
+  const id = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+  const crit = (i: number, over: Record<string, unknown> = {}) => ({
+    criterion_id: id(i), milestone_id: "m" + (i % 7), kind: "maintainer" as const, text: "t" + i, reason: "r",
+    conditions: ["c"], verification_steps: ["v"], authorization_revision: 1, status: "unverified" as const, ...over,
+  });
+  it("prints no outstanding total next to a scope-cap count, and keeps the items", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, scopeCapped: { completedCount: 1, total: 3 },
+      completionPending: { version: 1, contract_revision: 1, criteria: [crit(1)] } });
+    assert.match(block, /1 of 3 approved milestone/);
+    assert.doesNotMatch(block, /Outstanding milestones/);
+    assert.match(block, new RegExp(id(1)));
+    assert.doesNotMatch(block, /Closes #7/);
+  });
+  it("256 maximal criteria keep the whole body under BODY_CAP_CHARS and every id present", () => {
+    const criteria = Array.from({ length: 256 }, (_, i) => crit(i, {
+      text: "x".repeat(2048), reason: "y".repeat(2048),
+      conditions: Array(8).fill("c".repeat(512)), verification_steps: Array(8).fill("v".repeat(512)),
+    }));
+    const completion = renderCompletionBlock({ issueIid: 7, branch: "b", closes: false,
+      completionPending: { version: 1, contract_revision: 1, criteria } });
+    const body = renderBody(undefined, completion);
+    assert.ok(body.length <= BODY_CAP_CHARS, String(body.length));
+    for (const c of criteria) assert.ok(body.includes(c.criterion_id), c.criterion_id);
+    assert.match(body, /more criteria are shown in brief; their full text is on the run page/);
+    assert.equal(body.split(COMPLETION_END).length, 2);
+  });
+});

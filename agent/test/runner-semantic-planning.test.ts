@@ -338,6 +338,24 @@ it("M4 a foreign or malformed coverage response stays fail-closed and never park
   assert.equal(gates(c.run_id).length, 0);
 });
 
+it("M4 a 403 from the coverage status endpoint stays fail-closed and never parks as unavailable", { skip: LINUX_CAPTURE }, async () => {
+  const c = semanticClaim();
+  const events: string[] = [];
+  const server = serverWithAck(events);
+  server.failStatus(new RequestError("GET", "/semantic/coverage", 403, "denied"));
+  const transport = await boundedTransport("claude", server.report, events);
+  let thrown: unknown;
+  const exec: Executor = { run: async ctx => {
+    try { await ctx.gatePlan!("Implement A", milestones, undefined, undefined, submitted(c.issue_iid)); }
+    catch (error) { thrown = error; throw error; }
+    return { branch: ctx.branch };
+  } };
+  await runner(exec, fakeGitlab().gitlab, undefined, { semanticCoverageTestTransport: transport,
+    planApprovalTimeoutMs: 4000 }).execute(c);
+  assert.ok(thrown instanceof RequestError && thrown.status === 403, String(thrown));
+  assert.equal(gates(c.run_id).length, 0);
+});
+
 it("M4 a status verdict for another candidate is foreign, not a park", { skip: LINUX_CAPTURE }, async () => {
   const c = semanticClaim();
   const events: string[] = [];
@@ -482,6 +500,7 @@ it("M4 the human-gate latch survives a human REVISE: a later complete candidate 
   assert.equal(parked.length, 2, JSON.stringify(api.states));
   assert.equal(parked[0]!.semantic_park, "coverage_incomplete");
   assert.equal(Object.hasOwn(parked[1]!, "semantic_park"), false, "the api cleared auto_approve at the first park");
+  assert.equal(parked[1]!.semantic_park, undefined, "the second gate report carries no semantic_park");
   assert.equal(server.status().outcome, "complete", "the revised candidate itself had complete coverage");
   assert.equal(events.filter(e => e === "compile").length, 2);
 });
