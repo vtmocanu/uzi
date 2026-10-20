@@ -56,6 +56,13 @@ func TestBaseAttestationHoldRefusesLateWorkerReportsLiveDB(t *testing.T) {
 			if n, err := report(control); err != nil || n != 1 {
 				t.Fatalf("control: %s on an owner pause = (%d, %v), want (1, nil)", name, n, err)
 			}
+			// Positive control: the ordinary current-worker transition from running, same worker,
+			// generation and --require-base shape, still applies.
+			live := fx.heldRun(worker, "")
+			mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status = 'running' WHERE id = $1`, live)
+			if n, err := report(live); err != nil || n != 1 {
+				t.Fatalf("control: %s on a running run = (%d, %v), want (1, nil)", name, n, err)
+			}
 		})
 	}
 }

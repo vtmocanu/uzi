@@ -146,6 +146,32 @@ func TestBaseAttestationHoldRefusesOwnerResumeVerbsLiveDB(t *testing.T) {
 			after.Status, after.HoldReason.String, after.BudgetExtensionSeconds, after.CredentialOverrideMode)
 	}
 
+	// Controls on an owner pause of the same shape (same worker, generation, --require-base): the
+	// refusals above come from the hold, not from a broken predicate. Resume applies; extend, stop
+	// and set-token never answer ErrBaseAttestationHeld (they keep their ordinary outcomes).
+	for i, allow := range []bool{false, true} {
+		ctl := seedRequireBaseRun(t, env, o, 31948+int64(i))
+		env.exec(`UPDATE runs SET status = 'paused', status_since = now() WHERE id = $1`, ctl)
+		if _, err := env.q.ResumePausedRun(env.ctx, store.ResumePausedRunParams{
+			ID: ctl, UserID: o.userID, AllowCompletionBlockedHold: allow, GlobalTimeoutSeconds: 3600,
+		}); err != nil {
+			t.Fatalf("control: ResumePausedRun(allow=%v) on an owner pause err = %v, want nil", allow, err)
+		}
+		if s := statusOf(t, env, ctl); s != "queued" {
+			t.Fatalf("control: status after resume = %q, want queued", s)
+		}
+	}
+	ctl := seedRequireBaseRun(t, env, o, 31950)
+	env.exec(`UPDATE runs SET status = 'paused', status_since = now() WHERE id = $1`, ctl)
+	for _, kind := range []string{"extend", "stop"} {
+		if _, err := svc.SubmitInputWithOptions(env.ctx, o.userID, ctl, kind, "3600", nil, SubmitInputOptions{}); errors.Is(err, ErrBaseAttestationHeld) {
+			t.Fatalf("control: %s on an owner pause was refused as a base-attestation hold", kind)
+		}
+	}
+	if _, err := svc.SetRunCredential(env.ctx, o.userID, ctl, CredentialOverrideModePinned, &o.altTok); errors.Is(err, ErrBaseAttestationHeld) {
+		t.Fatal("control: set-token on an owner pause was refused as a base-attestation hold")
+	}
+
 	res, err := svc.SubmitInputWithOptions(env.ctx, o.userID, id, "cancel", "owner cancel", nil, SubmitInputOptions{})
 	if err != nil || !res.ServerSide {
 		t.Fatalf("owner cancel = (%+v, %v), want a server-side cancel", res, err)
