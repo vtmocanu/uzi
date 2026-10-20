@@ -6655,8 +6655,10 @@ export class GitCache {
    * Thin bundles imported with local prerequisites are valid here; publication is separate. */
   async recordRecoveryCapture(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number, tip: string,
+    capturedSource?: string,
   ): Promise<void> {
     if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
+    if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
@@ -6667,8 +6669,18 @@ export class GitCache {
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
       await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
       if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      // issue #3194: what content the wrapper stands for. A nested capture (the captured source is
+      // itself the previous verified restoreTip) carries that episode's source forward; otherwise
+      // the source is the verified capture's own current tip. It must be covered by the wrapper;
+      // anything unprovable records no source, so --require-base refuses rather than guesses.
+      const prior = recovery.restoreTip !== undefined && recovery.restoreSource !== undefined
+        ? { tip: recovery.restoreTip, source: recovery.restoreSource } : undefined;
+      let restoreSource = capturedSource ?? tip;
+      if (prior && prior.tip === restoreSource) restoreSource = prior.source;
+      if (await this.ancestry(barePath, restoreSource, tip) !== "ancestor") restoreSource = "";
+      const { restoreSource: _stale, ...rest } = recovery;
       await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
-        recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
+        recovery: { ...rest, restoreTip: tip, ...(restoreSource ? { restoreSource } : {}), stage: "captured" } });
     });
   }
 
@@ -6756,7 +6768,8 @@ export class GitCache {
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
-      return { ...seeded, attemptId };
+      // issue #3194: hand the guard the content source this wrapper verifiably stands for.
+      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 

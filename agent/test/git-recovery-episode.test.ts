@@ -9,6 +9,7 @@ import { deflateSync } from "node:zlib";
 import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
+import { recoveryProgress } from "../src/recovery-progress.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
@@ -1592,3 +1593,52 @@ for (const settled of [false, true]) {
       assert.deepEqual(journal().retainedSources, before.retainedSources);
     });
 }
+
+// ── issue #3194: the episode journal binds a restore tip to the content it stands for ─────────
+
+function wrapperOver(parent: string, extraParent?: string): string {
+  const args = ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree", `${parent}^{tree}`, "-p", parent];
+  if (extraParent) args.push("-p", extraParent);
+  return git(bare, [...args, "-m", "uzi recovery coverage test"]);
+}
+
+test("issue #3194: a plain capture stands for itself and the successor carries that source", async () => {
+  const { successor, tip } = await ready();
+  assert.equal(journal().recovery.restoreSource, tip);
+  assert.equal(successor.adoptedContentSource, tip);
+  assert.equal(successor.adoptedSource, tip);
+});
+
+test("issue #3194: a coverage wrapper records the authenticated captured source, not the wrapper", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const wrapper = wrapperOver(tip, git(bare, ["rev-parse", `${tip}^`]));
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, tip);
+  assert.equal(journal().recovery.restoreTip, wrapper);
+  assert.equal(journal().recovery.restoreSource, tip);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedSource, wrapper, "the clone was cut from the wrapper");
+  assert.equal(successor.adoptedContentSource, tip, "the guard compares the content source");
+  assert.equal(journal().recovery.restoreSource, tip, "the source survives adopting -> ready-for-model");
+});
+
+test("issue #3194: a source the wrapper does not cover is not recorded (the guard then refuses)", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const unrelated = git(bare, ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree",
+    `${tip}^{tree}`, "-m", "unrelated root"]);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, tip, unrelated);
+  assert.equal(journal().recovery.restoreSource, undefined);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedContentSource, undefined);
+});
+
+test("issue #3194: the journal parser binds a restore source to a restore tip", async () => {
+  await ready();
+  const good = journal().recovery;
+  assert.equal(recoveryProgress(good).restoreSource, good.restoreSource, "a well-formed pair parses");
+  assert.throws(() => recoveryProgress({ ...good, restoreSource: "not-a-sha" }), /invalid retained recovery progress/);
+  const { restoreTip: _tip, ...withoutTip } = good;
+  assert.throws(() => recoveryProgress({ ...withoutTip, stage: "capturing", restoreSource: "a".repeat(40) }),
+    /invalid retained recovery progress/);
+});

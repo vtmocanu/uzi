@@ -19274,6 +19274,10 @@ export class RunRunner {
           let tip = resumed ? resumedTip : await this.git.revParse(bare, `refs/uzi-runner/${branch}`);
           await check();
           if (!tip) throw new Error("retained tracking tip unavailable");
+          // issue #3194: the content the restore tip stands for. Plain captures stand for themselves;
+          // a guarded coverage wrapper takes the authenticated capture record's current tip below; a
+          // resumed capture keeps its episode's recorded source (recordRecoveryCapture carries it).
+          let capturedSource: string | undefined = resumed ? undefined : tip;
 
           // Gate on the real guarded producer, including its verified thin fallback.
           // Upload ambiguity is separate from positively journaled local bundle facts.
@@ -19300,6 +19304,10 @@ export class RunRunner {
               if (outcome.reason === "bundle_failed" || outcome.reason === "capture_error") throw new Error("local bundle capture temporarily unavailable");
               blocker = "prerequisites_unavailable"; throw finalize;
             }
+            // issue #3194: the wrapper -> source mapping comes only from this exact authenticated
+            // record of this run and generation; a mismatch records no source (fail closed).
+            capturedSource = local!.runId === claim.run_id && local!.generation === options.context.generation &&
+              local!.inventoryCurrentSha === tip ? local!.inventoryCurrentSha : undefined;
             tip = local!.sourceSha;
             for (const prerequisite of local!.prerequisiteShas!) {
               if (!await this.git.verifyRecoveryClosure(bare, prerequisite)) {
@@ -19309,7 +19317,7 @@ export class RunRunner {
             }
           }
           await check();
-          await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip);
+          await this.git.recordRecoveryCapture(bare, branch, key, source, iteration.attempts, tip, capturedSource);
           await check();
           blocker = "adoption_failed";
           const attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
