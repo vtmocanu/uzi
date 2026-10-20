@@ -107,7 +107,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): RunContext {
     worktreePath: nonexistentWorktree(), branch: "agent/issue-5", emit: () => {},
     oauthToken: "dummy-oauth-token-do-not-scan-0000",
     agents: [], config: null, sessionId: null, onSessionId: () => {},
-    gatePlan: async () => approve, pullFollowUp: () => undefined, reportIteration: () => {},
+    gatePlan: async () => approve, pullFollowUps: () => [], reportIteration: () => {},
     checkpoint: async () => {}, worktreeFingerprint: async () => "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
     ...overrides,
   };
