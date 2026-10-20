@@ -121,7 +121,7 @@ interface CodexErrorInfoEntry {
   http?: boolean;
 }
 
-/** The CLOSED map of the pinned Codex 0.160.1 app-server `codexErrorInfo` enum (15 scalar + 5 tagged)
+/** The CLOSED map of the Codex 0.162.1 app-server `codexErrorInfo` known tags (15 scalar + 5 tagged)
  *  from the exact lower-camel wire tag to its {@link CodexErrorInfoEntry}. A tag ABSENT from
  *  this map, or present with a shape that does not match the wire form, collapses to the
  *  fixed `"unknown"` classification — an arbitrary/attacker-shaped provider tag is NEVER
