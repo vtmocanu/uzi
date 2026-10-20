@@ -16777,9 +16777,33 @@ export class RunRunner {
       });
       await batcher.flush().catch(() => undefined);
 
-      const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
-        held => this.handlePauseParkHeld(claim, flight, held));
-      if (result.kind === "observed_empty") return result.value;
+      // Only this invocation's exact paused ACK survives a later capture refusal.
+      // flight.parked may already be set by a different operation.
+      let pauseAcknowledged = false;
+      const retainAcknowledgedPause = (error?: unknown): true => {
+        flight.preserveRecoveryClone = true;
+        flight.preserveSession = true;
+        flight.keepGuardedInventoryOpen = true;
+        try {
+          flight.runLog.warn("recovery: acknowledged pause capture incomplete; custody retained", {
+            run_id: flight.runId,
+            diagnostic: error !== undefined && flight.redactText
+              ? redactThenSanitize(flight.redactText, codexBoundaryDiagnosticOf(error) ?? errMessage(error))
+              : "capture completion unverified",
+          });
+        } catch { /* Diagnostics cannot revoke an acknowledged pause. */ }
+        return true;
+      };
+      try {
+        const result = await this.runFreeCapture(claim, flight, deadlineAt, this.shutdownSignal.signal,
+          held => this.handlePauseParkHeld(claim, flight, held, () => { pauseAcknowledged = true; }));
+        if (result.kind === "observed_empty") return result.value;
+      } catch (error) {
+        if (!pauseAcknowledged) throw error;
+        // runFreeCapture has joined scope cleanup; this preserves the pause, not capture proof.
+        return retainAcknowledgedPause(error);
+      }
+      if (pauseAcknowledged) return retainAcknowledgedPause();
       flight.preserveRecoveryClone = true;
       flight.preserveSession = true;
       return this.reportPauseCaptureFailed(flight, true, "unverified");
@@ -16835,7 +16859,7 @@ export class RunRunner {
   }
 
   private async handlePauseParkHeld(
-    claim: ClaimResponse, flight: RunFlight, held: HeldFreeCapture,
+    claim: ClaimResponse, flight: RunFlight, held: HeldFreeCapture, onPausedAck: () => void,
   ): Promise<boolean> {
     this.assertHeldFreeCapture(flight, held);
     const { runLog, reportState } = flight;
@@ -17003,7 +17027,9 @@ export class RunRunner {
       });
       return false;
     }
+    onPausedAck();
     flight.parked = true;
+    this.assertHeldFreeCapture(flight, held);
     runLog.info("run paused at the owner's request; preserving its HOME for resume", {
       run_id: flight.runId,
     });
@@ -17012,19 +17038,25 @@ export class RunRunner {
     // stay credential-free even though issue #1783's gate reaped above (a pause never runs a PAT
     // git). Legacy custody remains pinned for resume. Guarded inventory capture below uses only
     // the trusted bare and join-token archive seam after the accepted park ACK.
+    this.assertHeldFreeCapture(flight, held);
+    const restoreHead = await this.currentRestorePointHead(flight);
+    this.assertHeldFreeCapture(flight, held);
     await this.pinRecoveryGeneration(
       claim,
       flight,
-      await this.currentRestorePointHead(flight),
-    ).catch(async (e) =>
+      restoreHead,
+    ).catch(async (e) => {
+      this.assertHeldFreeCapture(flight, held);
       runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
         run_id: flight.runId,
         error: errMessage(e),
         // PRD #1809 D6: name a pin that failed because the data volume is full.
         ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
-      }),
-    );
+      });
+    });
+    this.assertHeldFreeCapture(flight, held);
     if (claim.inventory_guarded === true) await this.settleGuardedInventory(claim, flight, undefined, undefined, held.signal, true);
+    this.assertHeldFreeCapture(flight, held);
     return true;
   }
 
