@@ -1,4 +1,5 @@
 import { m3Calls } from "./m3-recovery-fixture.js";
+import { PARK_RUN_CONTINUATION } from "../src/park-run.js";
 import { SummaryRunner, type IntentSummaryInput, type PlanSummaryInput } from "../src/summary-runner.js";
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
@@ -18545,13 +18546,22 @@ describe("M3 Codex bounded park controls", () => {
       });
     }
   }
-  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
-    it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
+  const planning = { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } };
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, planning]) {
+    // An eligible planning root registers park_run at thread/start (the vocabulary survives the
+    // approval resume); only the broker withholds authority until implementation.
+    const advertised = overrides === planning;
+    it(`does not ${advertised ? "admit" : "advertise or admit"} illicit park ${JSON.stringify(overrides)}`, async () => {
       let parks = 0;
+      let sawPark = false;
       const rig = makeRig({ responder: (c) => {
         if (c.method === "thread/start" || c.method === "thread/resume") {
-          const tools = rec(c.params).dynamicTools as { name: string }[];
-          if (tools) assert.equal(tools.some((tool) => tool.name === "park_run"), false);
+          const tools = rec(c.params).dynamicTools as { name: string }[] | undefined;
+          if (tools) {
+            const has = tools.some((tool) => tool.name === "park_run");
+            if (advertised) sawPark ||= has;
+            else assert.equal(has, false);
+          }
           return { thread: { id: "th-1" } };
         }
         if (c.method !== "turn/start") return {};
@@ -18563,11 +18573,79 @@ describe("M3 Codex bounded park controls", () => {
         requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
       await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx));
       assert.equal(parks, 0);
+      assert.equal(sawPark, advertised);
       const response = rig.transport.responses.find((r) => r.requestId === 501);
       assert.ok(response, "the illicit tool received a reply");
       assert.equal(rec(rec(response.response).result).success, false);
+      if (advertised) assert.match(JSON.stringify(response.response), /park_run requires supported root issue implementation/);
     });
   }
+
+  it("eligible root registers park_run in planning, keeps it across the approval resume, and parks only in implementation", async () => {
+    let parks = 0;
+    let approved = false;
+    let parksAtApproval = -1;
+    const starts: { tools: { name: string }[] | undefined }[] = [];
+    const resumes: { tools: unknown; threadId: unknown }[] = [];
+    const prompts: string[] = [];
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start") {
+          starts.push({ tools: rec(c.params).dynamicTools as { name: string }[] | undefined });
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-1"));
+          c.transport.push(toolCall(601, "park_run", {}, "th-1", "tn-1", "plan-park"));
+          c.transport.push(toolCall(602, "submit_plan", { plan_md: "the plan" }, "th-1", "tn-1", "c-plan"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+      (c) => {
+        if (c.method === "thread/start") assert.fail("the implementation epoch must resume, not start");
+        if (c.method === "thread/resume") {
+          resumes.push({ tools: rec(c.params).dynamicTools, threadId: rec(c.params).threadId });
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "turn/start") {
+          prompts.push(JSON.stringify(c.params));
+          c.transport.push(toolCall(603, "park_run", {}, "th-1", "tn-2", "impl-park"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-2"));
+          return { turn: { id: "tn-2" } };
+        }
+        return {};
+      },
+    ]);
+    const { ctx } = makeCtx({
+      kind: "issue", parkRunSupported: true, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => {
+        approved = true; parksAtApproval = parks;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+      requestParkRun: async () => { assert.equal(approved, true, "park only after approval"); parks++; return { kind: "paused" }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan to park run");
+    assert.equal(starts.length, 1);
+    assert.ok(starts[0]!.tools?.some((t) => t.name === "park_run"), "planning thread/start registers park_run");
+    assert.equal(resumes.length, 1, "implementation resumed the planning thread");
+    assert.equal(resumes[0]!.tools, undefined, "thread/resume sends no dynamicTools");
+    assert.equal(resumes[0]!.threadId, "th-1");
+    const planReply = rig.epochs[0]!.transport.responses.find((r) => r.requestId === 601);
+    assert.ok(planReply);
+    assert.equal(rec(rec(planReply.response).result).success, false, "planning park is refused");
+    assert.equal(parksAtApproval, 0);
+    assert.equal(parks, 1);
+    assert.ok(result.pausedAt, "implementation park paused the run");
+    // The implementation turn carries the park continuation; the tool it asks for must be in the
+    // vocabulary persisted at the planning thread/start, since thread/resume registers none.
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0]!.includes(PARK_RUN_CONTINUATION), "implementation prompt carries the park continuation");
+    const requested = PARK_RUN_CONTINUATION.match(/call (\w+)/)?.[1];
+    assert.equal(requested, "park_run");
+    assert.ok(starts[0]!.tools?.some((t) => t.name === requested), "continuation's tool is in the persisted vocabulary");
+  });
 });
 
 // M1 uses bounded readiness and selective native delivery; unrelated idle watchdogs do not fire.
