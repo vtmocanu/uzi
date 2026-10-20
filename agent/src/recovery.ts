@@ -3710,8 +3710,12 @@ export class RecoveryCoordinator {
     const pass = Promise.resolve().then(async () => {
       if (signal.aborted) return;
       try {
-        await this.passSignal.run(signal, () => MaintenanceBudget.runOwned(signal, () =>
-          this.git.withRecoveryOperation ? this.git.withRecoveryOperation(signal, Infinity, fn) : fn()));
+        await this.passSignal.run(signal, () => {
+          // Adopt a Git-inherited caller budget before owned cancellation is installed,
+          // so runOwned isolates it even when the budget scope is not yet active.
+          const run = () => MaintenanceBudget.runOwned(signal, fn);
+          return this.git.withRecoveryOperation ? this.git.withRecoveryOperation(signal, Infinity, run) : run();
+        });
       } catch (error) {
         if (!signal.aborted) throw error;
       }

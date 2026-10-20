@@ -322,3 +322,51 @@ it("pass shutdown joins the first response-body source cancellation", linux, asy
   assert.equal(paths.filter(url => url.endsWith("/reserve")).length, 1);
   assert.equal(paths.some(url => /\/(?:upload|release|ack)(?:\/|$)/.test(url)), false);
 });
+
+it("pass shutdown keeps a caller budget inherited only through Git independent", linux, async t => {
+  const f = await fixture(t);
+  const git = new GitCache(f.root, nullLogger());
+  const c = coordinator(f, new WorkerClient("http://unused.invalid", token, "fixture", nullLogger()), git);
+  const entered = deferred(), release = deferred();
+  let mono = 0, childBudget: MaintenanceBudget | undefined, settled = false;
+  const callerBudget = new MaintenanceBudget(600_000, () => mono);
+  let pass: Promise<void> | undefined, shutdown: Promise<void> | undefined;
+  try {
+    await MaintenanceBudget.runAttempt("foreground:1", () => callerBudget, async () => {
+      MaintenanceBudget.observeCancellation();
+      await git.withRecoveryOperation(callerBudget.signal, Infinity, () =>
+        MaintenanceBudget.runAttempt("independent:1", () => {
+          assert.fail("the independent caller must not create a new clock");
+        }, async () => {
+          assert.equal(MaintenanceBudget.current(), undefined, "the Git scope retains the caller clock across an inactive attempt");
+          pass = c["trackPass"](undefined, async () => {
+            childBudget = MaintenanceBudget.current();
+            entered.resolve();
+            await release.promise;
+          });
+          await within(entered.promise);
+          mono = 100_000;
+          shutdown = c.shutdown().then(() => { settled = true; });
+          try {
+            assert.equal(callerBudget.signal.aborted, false, "pass shutdown must not abort the Git-only caller budget");
+            assert.ok(childBudget);
+            assert.notEqual(childBudget, callerBudget);
+            assert.equal(childBudget.signal.aborted, true, "the owned pass still receives shutdown");
+            await new Promise<void>(resolve => setImmediate(resolve));
+            assert.equal(settled, false, "shutdown joins the owned action");
+          } finally {
+            release.resolve();
+            await pass;
+            await shutdown;
+          }
+          callerBudget.check();
+          assert.equal(callerBudget.remainingMs(), 500_000, "caller deadline and usability are unchanged");
+        }));
+    });
+  } finally {
+    release.resolve();
+    await pass?.catch(() => undefined);
+    await shutdown;
+    callerBudget.dispose();
+  }
+});
