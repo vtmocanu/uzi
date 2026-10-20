@@ -886,8 +886,9 @@ echo "uzi-seed-nix: seeded"
 // worker-owned directory inside it: the rootless daemon (uid 1000), the uid-split
 // runner (10002) and runner-cmd (10003) own neither, so rename/unlink of .tmp fail
 // with EPERM. That holds for the rootless posture only: a rootful (privileged) daemon,
-// or a root container it runs, can still replace .tmp, and since the PVC persists the
-// next boot then refuses here until an operator repairs the volume (ADR-3153). The
+// or a root container it runs, can still replace .tmp, and the PVC persists that: a
+// symlink or non-directory makes the next boot refuse here until an operator repairs
+// the volume (ADR-3153), while a real directory is re-owned under uid-split. The
 // -L/-d checks here only reject state a previous boot or an earlier principal left
 // behind.
 func runnerInitScript() string {

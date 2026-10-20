@@ -351,19 +351,54 @@ while [ "${TMPDIR_NORM%/}" != "$TMPDIR_NORM" ] && [ -n "${TMPDIR_NORM%/}" ]; do
 done
 RUNNER_ROOT="$DATA_DIR/runner"
 # Lane detection below is lexical, so a non-canonical spelling of a path under the runner root
-# (a doubled slash, a dot or dot-dot component) would miss it and fall into the non-Docker
-# branch, which recursively wipes per-uid scratch on the persistent volume. Fail closed instead.
+# (a doubled slash, a dot or dot-dot component, a relative path, or an alias through a symlinked
+# prefix) would miss it and fall into the non-Docker branch, which recursively wipes per-uid
+# scratch on the persistent volume. Fail closed instead. These refusals apply to EVERY lane, and
+# nothing is deleted or re-owned on refusal.
+case "$TMPDIR_NORM" in
+  '') ;;
+  /*) ;;
+  *)
+    echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM is not an absolute path" >&2
+    exit 1 ;;
+esac
 case "$TMPDIR_NORM" in
   *//*|*/./*|*/../*|*/.|*/..)
     echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM is not a canonical path (no //, ./ or ../ components)" >&2
     exit 1 ;;
 esac
+# Physical form of a path: resolve it whole with `cd -P` when it is an existing directory (so a
+# symlinked leaf is followed too), otherwise resolve the parent, since the leaf may not exist yet.
+phys_path() {
+  if [ -d "$1" ] && _pp_dir=$(cd -P "$1" 2>/dev/null && pwd -P); then
+    printf '%s\n' "$_pp_dir"
+    return 0
+  fi
+  _pp_parent="${1%/*}"
+  [ -n "$_pp_parent" ] || _pp_parent=/
+  if _pp_dir=$(cd -P "$_pp_parent" 2>/dev/null && pwd -P); then
+    case "$_pp_dir" in /) printf '/%s\n' "${1##*/}" ;; *) printf '%s/%s\n' "$_pp_dir" "${1##*/}" ;; esac
+  else
+    printf '%s\n' "$1"
+  fi
+}
 SCRATCH_DOCKER_LANE=
 SCRATCH_CARVEOUT=
 case "$TMPDIR_NORM" in
   "$RUNNER_ROOT") SCRATCH_DOCKER_LANE=1 ;;
   "$RUNNER_ROOT"/*) SCRATCH_DOCKER_LANE=1; SCRATCH_CARVEOUT="$TMPDIR_NORM" ;;
 esac
+if [ -n "$TMPDIR_NORM" ] && [ -z "$SCRATCH_DOCKER_LANE" ]; then
+  # Not lexically in the Docker lane: refuse when it PHYSICALLY resolves into the data volume
+  # (a symlinked prefix such as /alias -> / would otherwise reach the non-Docker wipe).
+  _phys_tmp=$(phys_path "$TMPDIR_NORM")
+  _phys_data=$(phys_path "$DATA_DIR")
+  case "$_phys_tmp" in
+    "$_phys_data"|"$_phys_data"/*)
+      echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM resolves to $_phys_tmp inside $_phys_data" >&2
+      exit 1 ;;
+  esac
+fi
 if [ -n "$SCRATCH_CARVEOUT" ]; then
   SCRATCH_CARVEOUT_NAME="${SCRATCH_CARVEOUT#"$RUNNER_ROOT"/}"
   case "$SCRATCH_CARVEOUT_NAME" in

@@ -1598,27 +1598,42 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
   });
 
   it("refuses a non-canonical TMPDIR spelling and deletes/re-owns/re-modes nothing", () => {
-    const l = lane((x) => { leaf(path.join(x.carve, "uzi-worker")); });
+    const l = lane((x) => {
+      leaf(path.join(x.carve, "uzi-worker"));
+      leaf(path.join(x.carve, "uzi-runner"));
+      // A non-.tmp child with the legacy sentinel absent: the one-time migration would
+      // `chown -R` it, so a refusal that ran after the migration would record that op.
+      fs.mkdirSync(path.join(x.runnerRoot, "fake-clone"));
+      fs.symlinkSync(x.h.data, path.join(x.h.root, "rootalias"));
+      // A symlinked LEAF (the parent is canonical): only a whole-path resolve catches it.
+      fs.symlinkSync(x.carve, path.join(x.h.root, "leafalias"));
+    });
     try {
       const rr = l.runnerRoot;
-      const variants = [
-        rr.replace("/runner", "//runner") + "/.tmp",
-        `${rr}//.tmp`,
-        `${rr}/./.tmp`,
-        `${rr}/x/../.tmp`,
-        `${rr}/.tmp/.`,
-        `${rr}/.tmp/..`,
+      const d = l.h.data;
+      const variants: Array<[string, RegExp]> = [
+        [`${d}//runner/.tmp`, /not a canonical path/],
+        [`${rr}//.tmp`, /not a canonical path/],
+        [`${rr}/./.tmp`, /not a canonical path/],
+        [`${rr}/x/../.tmp`, /not a canonical path/],
+        [`${rr}/.tmp/.`, /not a canonical path/],
+        [`${rr}/.tmp/..`, /not a canonical path/],
+        ["../data/runner/.tmp", /not an absolute path/],
+        [path.join(l.h.root, "rootalias", "runner", ".tmp"), /resolves to .* inside/],
+        [path.join(l.h.root, "leafalias"), /resolves to .* inside/],
       ];
-      for (const tmp of variants) {
+      for (const [tmp, msg] of variants) {
         const r = run(l.h, { STUB_NOOP: "1", TMPDIR: tmp });
         assert.notEqual(r.status, 0, `must refuse ${tmp}`);
-        assert.match(r.stderr, /uzi-entrypoint: refusing to start: TMPDIR .* is not a canonical path/);
+        assert.match(r.stderr, new RegExp(`uzi-entrypoint: refusing to start: TMPDIR .*${msg.source}`));
         // Earlier, unrelated boot steps still record ops on the data roots themselves; nothing may
         // rm anything or touch an entry BELOW the runner root.
         const bad = r.ops.filter((o) => o.startsWith("rm ") || o.includes(`${rr}/`));
         assert.deepEqual(bad, [], `no scratch ops for ${tmp}: ${bad.join(" | ")}`);
+        for (const u of ["uzi-worker", "uzi-runner"]) {
+          assert.ok(fs.existsSync(path.join(l.carve, u, "PRECIOUS")), `${u} survives ${tmp}`);
+        }
       }
-      assert.ok(fs.existsSync(path.join(l.carve, "uzi-worker", "PRECIOUS")));
     } finally { cleanup(l); }
   });
 
