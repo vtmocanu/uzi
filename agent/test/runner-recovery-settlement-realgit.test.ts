@@ -537,8 +537,9 @@ async function bootAndSettle(
   });
   // issue #2020: Worker.run starts the boot recovery sweep (resumePendingRecoveries) and the
   // heartbeat-driven live re-drive (resumeLiveRecoveries) fire-and-forget. Since #3031 Worker.run's
-  // shutdown aborts and joins the coordinator's passes, but a pass step that ignores the abort can
-  // still outlive it. Each one journals under fx.dataDir/recovery, so one still running when
+  // shutdown aborts and joins the coordinator's passes; a pass step that ignores the abort can
+  // outlast the container grace and delay Worker.run() until it settles. Each one journals under
+  // fx.dataDir/recovery, so one still running when
   // this helper returns recreates that tree after the harness afterEach removed the fixture (a
   // leaked uzi-agent-test-* dir). Collect their promises here and await them before returning.
   const background: Promise<void>[] = [];
