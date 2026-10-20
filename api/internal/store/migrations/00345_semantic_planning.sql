@@ -1,5 +1,7 @@
 -- +goose Up
 -- Dormant planning state only. No enrollment defaults, backfill, or contract ledger.
+-- The foreign keys briefly lock runs; time out rather than queue behind ClaimRun writers.
+SET LOCAL lock_timeout = '5s';
 CREATE TABLE semantic_planning (
  run_id uuid PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
  enrollment jsonb NOT NULL,
