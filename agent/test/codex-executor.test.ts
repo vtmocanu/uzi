@@ -21296,10 +21296,28 @@ describe("A capture lifecycle public run", () => {
   });
 
   for (const automatic of [false, true]) {
-    it(`A lifecycle repeated ${automatic ? "automatic" : "human"} changed-milestone capture revises on fresh epochs`, async () => {
+    it(`A lifecycle repeated ${automatic ? "automatic" : "human"} changed-milestone capture revises on fresh epochs`, async (t) => {
       const fx = await fixture([plan(1), plan(2), plan(3), done()]);
       let gates = 0, revisions = 0;
       let capturedSafety: CodexExecutor["safety"];
+      let latestPlanPair: { harness: unknown; registry: unknown } | undefined;
+      let capturedPlanPair: typeof latestPlanPair;
+      // Observe the arguments before the method can recreate an epoch as a backstop.
+      const boundary = fx.exec as unknown as { driveTurnWithWallPark: (...args: unknown[]) => Promise<unknown> };
+      const drive = boundary.driveTurnWithWallPark.bind(fx.exec);
+      const entrySpy = t.mock.method(boundary, "driveTurnWithWallPark", (...args: unknown[]) => {
+        if (args[4] === "plan") {
+          if (gates > 0) {
+            assert.ok(capturedPlanPair, "plan pair saved at the last capture gate");
+            t.diagnostic(`revision plan entry after gate ${gates}: fresh harness=${args[1] !== capturedPlanPair.harness}, registry=${args[2] !== capturedPlanPair.registry}, safety=${fx.exec.safety !== capturedSafety}`);
+            assert.notEqual(args[1], capturedPlanPair.harness, "fresh harness at revision plan entry before the backstop");
+            assert.notEqual(args[2], capturedPlanPair.registry, "fresh registry at revision plan entry before the backstop");
+            assert.notEqual(fx.exec.safety, capturedSafety, "fresh safety at revision plan entry before the backstop");
+          }
+          latestPlanPair = { harness: args[1], registry: args[2] };
+        }
+        return drive(...args);
+      });
       const controller = new AbortController();
       const { ctx } = makeCtx({ signal: controller.signal, planApproved: false, approvedPlan: undefined,
         beforePlanRevisionTurn: async () => {
@@ -21311,6 +21329,8 @@ describe("A capture lifecycle public run", () => {
           assert.equal(md, `# Plan ${n}`);
           assert.deepEqual(milestones?.map(m => m.id), [`m${n}`]);
           capturedSafety = fx.exec.safety;
+          assert.ok(latestPlanPair, "plan entry observed before capture");
+          capturedPlanPair = latestPlanPair;
           const captured = await fx.exec.withCredentialFreeCapture(1000, async () => {
             assert.match(await fx.saved(), new RegExp(`epoch-${n}`));
             await assert.rejects(fs.access(fx.homes[n - 1]!), { code: "ENOENT" });
@@ -21341,6 +21361,7 @@ describe("A capture lifecycle public run", () => {
       } finally {
         controller.abort(new Error("fixture cleanup"));
         await withTimeout(run.catch(() => undefined), 5000, "gate cleanup");
+        entrySpy.mock.restore();
         await fx.cleanup();
       }
     });
