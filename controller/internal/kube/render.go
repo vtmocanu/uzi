@@ -888,7 +888,8 @@ echo "uzi-seed-nix: seeded"
 // with EPERM. The -L/-d checks here only reject state a previous boot or an earlier
 // principal left behind.
 func runnerInitScript() string {
-	return fmt.Sprintf(`set -eu
+	return fmt.Sprintf(`#!/bin/sh
+set -eu
 # 1. Image gate, before any write: the image must carry the runner-shared entrypoint.
 M=%[1]s
 if [ -L "$M" ] || [ ! -f "$M" ] || [ "$(cat "$M")" != "%[2]s" ]; then
@@ -916,13 +917,22 @@ ensure_dir "$T"
 # 3. Ownership. Root (uid-split) can chown; the single-uid container cannot, so there it
 #    fails closed unless both entries are already owned by the current uid and R is sticky.
 if [ "$(id -u)" = 0 ]; then
-  chown -h worker:runner "$R"
+  # chown to root, chmod, THEN chown to the final owner: this container has no CAP_FSETID
+  #    and root is not in group runner, so a chmod after chown to worker:runner would have
+  #    the kernel clear S_ISGID (3775 -> 1775). Same order as the worker entrypoint.
+  chown -h 0:0 "$R"
   chmod 3775 "$R"
-  chown -h worker:worker "$T"
+  chown -h worker:runner "$R"
+  chown -h 0:0 "$T"
   chmod 0755 "$T"
+  chown -h worker:worker "$T"
 else
   chmod 3775 "$R" "$T" 2>/dev/null || true
-  if [ ! -O "$R" ] || [ ! -O "$T" ] || [ ! -k "$R" ]; then
+  # shellcheck disable=SC3065,SC3067 # busybox ash (the worker image shell) implements -k and -O
+  # Positive form: a shell lacking -O/-k errors (non-zero), which lands in the else branch.
+  if [ -O "$R" ] && [ -O "$T" ] && [ -k "$R" ]; then
+    :
+  else
     fail "$R and $T must be owned by uid $(id -u) with $R sticky, and could not be made so; see ADR-3153 for the operator remedy"
   fi
 fi
@@ -1292,8 +1302,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// daemon. It survives a pod replacement. Decision 3 (amended): dind mounts ONLY this
 		// subPath of data, never the whole volume, and none of token or /nix; the invariant
 		// test pins that. The worker's own whole-volume `data` mount at /data already covers
-		// /data/runner, so the worker gets this mount AFTER it and it shadows that
-		// subdirectory with the same bytes (the runner-shared subPath).
+		// /data/runner, so the worker gets this mount AFTER it and it shadows the
+		// PVC's old `runner/` directory (a different directory from `runner-shared/`).
 		workerMounts = append(workerMounts, runnerWorkdirMount())
 		volumes = append(volumes,
 			// The daemon's data root, mounted into `dind` ALONE (rootless HOME path or

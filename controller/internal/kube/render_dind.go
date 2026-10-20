@@ -42,7 +42,7 @@ const (
 	dindDataVolume   = "dind-data"
 )
 
-// The shared run workdir (PRD #89 M-workdir, amended by issue #3153). The `runner`
+// The shared run workdir (PRD #89 M-workdir, amended by issue #3153). The `runner-shared`
 // subtree of the worker's data PVC, mounted into BOTH the worker and the dind sidecar
 // at the SAME path, so a `docker run -v <src>:/x` / compose bind whose source is the
 // run's checkout resolves in the daemon's own filesystem. Without it the daemon mounts

@@ -1,3 +1,4 @@
+#!/bin/sh
 set -eu
 # 1. Image gate, before any write: the image must carry the runner-shared entrypoint.
 M=/etc/uzi-runner-layout
@@ -26,13 +27,22 @@ ensure_dir "$T"
 # 3. Ownership. Root (uid-split) can chown; the single-uid container cannot, so there it
 #    fails closed unless both entries are already owned by the current uid and R is sticky.
 if [ "$(id -u)" = 0 ]; then
-  chown -h worker:runner "$R"
+  # chown to root, chmod, THEN chown to the final owner: this container has no CAP_FSETID
+  #    and root is not in group runner, so a chmod after chown to worker:runner would have
+  #    the kernel clear S_ISGID (3775 -> 1775). Same order as the worker entrypoint.
+  chown -h 0:0 "$R"
   chmod 3775 "$R"
-  chown -h worker:worker "$T"
+  chown -h worker:runner "$R"
+  chown -h 0:0 "$T"
   chmod 0755 "$T"
+  chown -h worker:worker "$T"
 else
   chmod 3775 "$R" "$T" 2>/dev/null || true
-  if [ ! -O "$R" ] || [ ! -O "$T" ] || [ ! -k "$R" ]; then
+  # shellcheck disable=SC3065,SC3067 # busybox ash (the worker image shell) implements -k and -O
+  # Positive form: a shell lacking -O/-k errors (non-zero), which lands in the else branch.
+  if [ -O "$R" ] && [ -O "$T" ] && [ -k "$R" ]; then
+    :
+  else
     fail "$R and $T must be owned by uid $(id -u) with $R sticky, and could not be made so; see ADR-3153 for the operator remedy"
   fi
 fi

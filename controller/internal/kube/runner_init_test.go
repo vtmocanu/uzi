@@ -20,7 +20,7 @@ const runnerInitGolden = "testdata/runner-shared-init.sh"
 func TestRunnerInitScriptMatchesGolden(t *testing.T) {
 	got := runnerInitScript()
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.WriteFile(runnerInitGolden, []byte(got), 0o644); err != nil {
+		if err := os.WriteFile(runnerInitGolden, []byte(got), 0o600); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 	}
@@ -41,10 +41,10 @@ func TestRunnerInitScriptParses(t *testing.T) {
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "init.sh")
-	if err := os.WriteFile(path, []byte(runnerInitScript()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(runnerInitScript()), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command(sh, "-n", path).CombinedOutput(); err != nil {
+	if out, err := exec.Command(sh, "-n", path).CombinedOutput(); err != nil { //nolint:gosec // G204: sh from exec.LookPath, path under t.TempDir.
 		t.Fatalf("sh -n: %v\n%s", err, out)
 	}
 }
@@ -105,7 +105,7 @@ func TestRunnerInitContainerShape(t *testing.T) {
 				return -1
 			}
 			seed, ri, dind := idx(seedContainerName), idx(runnerInitContainerName), idx(dindContainerName)
-			if !(seed >= 0 && seed < ri && ri < dind) {
+			if seed < 0 || seed >= ri || ri >= dind {
 				t.Fatalf("[%s split=%v] order = %v, want seed-nix < runner-init < dind", p.name, split, names)
 			}
 			if di := idx(dindInitContainerName); di >= 0 && di < ri {
@@ -169,5 +169,20 @@ func TestPlainWorkerHasNoRunnerSharedSurface(t *testing.T) {
 				t.Errorf("plain worker template (uidSplit=%v) mentions %q", split, bad)
 			}
 		}
+	}
+}
+
+// The single-uid ownership check must fail CLOSED: positive tests joined by && with the
+// refusal in the else branch, so a shell lacking -O/-k (test errors) still refuses.
+func TestRunnerInitScriptOwnershipCheckFailsClosed(t *testing.T) {
+	got := runnerInitScript()
+	if !strings.Contains(got, `if [ -O "$R" ] && [ -O "$T" ] && [ -k "$R" ]; then`+"\n    :\n  else\n    fail ") {
+		t.Errorf("single-uid ownership check is not in the fail-closed positive form:\n%s", got)
+	}
+	if strings.Contains(got, `[ ! -O`) || strings.Contains(got, `[ ! -k`) {
+		t.Errorf("negated ownership tests fail open on a shell lacking -O/-k")
+	}
+	if !strings.Contains(got, "chown -h 0:0 \"$R\"\n  chmod 3775 \"$R\"\n  chown -h worker:runner \"$R\"") {
+		t.Errorf("uid-split must chmod 3775 before the final chown (no CAP_FSETID)")
 	}
 }
