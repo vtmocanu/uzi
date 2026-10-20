@@ -2074,6 +2074,8 @@ mockRuns.push(
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
     can_stop_at_provider_hold: true },
+  // Issue #3194: a --require-base run held because its adopted work is not attested to the base.
+  { ...pausedBase, id: "run-base-attestation-hold", hold_reason: "base_attestation_missing" },
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },

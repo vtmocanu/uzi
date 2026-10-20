@@ -158,6 +158,7 @@ const PARK_LABELS = {
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
   provider_unavailable: "provider unavailable: owner hold",
+  base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
 } as const;
@@ -189,6 +190,9 @@ export function effectiveRunStatus(
   },
 ): string {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
+  // Issue #3194: a --require-base run whose adopted work no checkpoint attests to the planned
+  // base. Server-held (raw status "paused"), so overlaid like the other holds.
+  if (run.status === "paused" && run.hold_reason === "base_attestation_missing") return "base_attestation_missing";
   if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
@@ -332,7 +336,7 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
-  if (status === "credential_disabled" || status === "provider_unavailable" || status === "provider_outage") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "base_attestation_missing" || status === "provider_outage") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -591,6 +595,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "provider_unavailable":
       return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
         title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
+    case "base_attestation_missing":
+      return { kind: "badge", label: PARK_LABELS.base_attestation_missing, tone: "warning", pulse: false,
+        title: "The retained work is not attested to the planned base commit, so the agent was not started. Open the run to recover the work or start a successor." };
     case "provider_outage":
       return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
         title: "Provider outage. Open the run for park count, streak start and next retry." };
@@ -950,6 +957,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingFollowup(status) ||
     status === "worker_requeue_exhausted" ||
     status === "worker_memory_pressure" ||
-    status === "provider_unavailable"
+    status === "provider_unavailable" ||
+    status === "base_attestation_missing"
   );
 }
