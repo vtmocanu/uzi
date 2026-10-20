@@ -215,11 +215,11 @@ func TestQueuedReasonJobFilesLiveDB(t *testing.T) {
 		e := setupJobLiveDB(t, 0)
 		u := e.seedJobUser(t)
 		e.seedWorkerRow(t, u, false, nil, jobCap)
-		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, true)); got != reasonNoJobCapableWorker {
+		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, true), thWithLimit(testCustodyLimit)); got != reasonNoJobCapableWorker {
 			t.Fatalf("queuedReason = %q, want %q", got, reasonNoJobCapableWorker)
 		}
 		e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
-		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, true)); got == reasonNoJobCapableWorker {
+		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, true), thWithLimit(testCustodyLimit)); got == reasonNoJobCapableWorker {
 			t.Fatalf("queuedReason still %q with a job_files_v1 worker online", got)
 		}
 	})
@@ -227,7 +227,7 @@ func TestQueuedReasonJobFilesLiveDB(t *testing.T) {
 		e := setupJobLiveDB(t, 0)
 		u := e.seedJobUser(t)
 		e.seedWorkerRow(t, u, false, nil, jobCap)
-		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, false)); got == reasonNoJobCapableWorker {
+		if got := e.svc.queuedReason(e.ctx, time.Now(), newRow(u, false), thWithLimit(testCustodyLimit)); got == reasonNoJobCapableWorker {
 			t.Fatalf("a pre-change job got %q although a job_runner_v1 worker can claim it", got)
 		}
 	})

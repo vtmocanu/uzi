@@ -185,7 +185,7 @@ func fileFindingLiveDB(t *testing.T) (*Handler, *pgxpool.Pool, *store.Queries, *
 			{Key: settings.KeyUziLabel, Value: "uzi"},
 		}}, time.Minute),
 		svc:  forgesvc.New(q, box, 5*time.Second, nil),
-		wsvc: workersvc.New(q, box, workersvc.Params{}),
+		wsvc: workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 	}
 	return h, pool, q, box, fs
 }

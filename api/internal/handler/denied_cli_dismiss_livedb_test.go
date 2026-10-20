@@ -44,7 +44,7 @@ func TestPostReviewAutoDismissesDeniedCLILiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	svc := workersvc.New(q, box, workersvc.Params{})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 
 	owner := uuid.New()
 	connID, repoID := uuid.New(), uuid.New()

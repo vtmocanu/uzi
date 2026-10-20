@@ -90,8 +90,8 @@ handoff is not an additional journal and preserves legacy /data self-heal.
 
 The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:
 
-- Current Deployment UID → ReplicaSet UID → pod controller ownership, with one
-  current nonterminating pod and the target template hash.
+- Current Deployment UID → ReplicaSet UID → pod controller ownership, with
+  one current non-terminating, non-terminal pod and the target template hash.
 - A running worker container on the target image in both pod spec and status.
 - API registration bound to that pod UID and the **exact** expected version.
 - A nonempty registration nonce changed from the reservation's prior nonce,
@@ -121,6 +121,44 @@ images and that label remain unchanged. Ordinary API heartbeat liveness remains
 independent of nonce-proven promotion evidence. It supports healthy retained old
 providers and fresh confirmation of an old worker's drain, including the first
 same-image template roll introducing pod UID transport.
+
+**#3161 amends D4's pod uniqueness boundary (2026-10-20).** The original
+wording, “one current nonterminating pod”, allowed terminal API residue to count
+against uniqueness and hold a healthy replacement's roll. D4 now requires
+“one current non-terminating, non-terminal pod”. `Failed` and `Succeeded` pods
+are excluded from promotion uniqueness in `promoted`, also used by
+`currentUsable` for serving capacity. This is a serving-evidence correction,
+not a change to the other decisions. Promotion still requires a Running
+replacement with a new pod UID bound through current Deployment/ReplicaSet
+ownership, the target template hash, target image in spec and running container
+status, exact target version, changed registration nonce and fresh heartbeat
+proof. Frozen coverage, maintenance, pressure and custody boundaries remain.
+
+Terminal phase is not proof that the old processes stopped. In particular,
+`Failed` with `ContainerStatusUnknown` after node loss can leave process death
+unproven. Registration snapshot/nonce checks prevent old proof from refreshing;
+they do not prevent every old heartbeat from refreshing ordinary liveness.
+`normalizeActiveSnapshot` rejects a mismatched registration nonce;
+`workersvc.Heartbeat` still refreshes liveness for an ignored snapshot and stamps
+roll evidence only after applying a snapshot. `StampWorkerRollHeartbeat` in
+`api/internal/store/queries/roll_evidence.sql` requires matching nonce and epoch.
+
+The ReadWriteOnce PVC and Recreate Deployment configuration in
+`controller/internal/kube/render.go` is neither process exclusion nor universal
+storage fencing. Same-node writers remain possible, and lost-node and driver
+attach/detach risks remain. This amendment does not establish that overlapping
+old and replacement processes cannot write storage.
+
+Custody and the ALL-pod DinD stop-before-delete fence are unchanged. Terminal
+pods remain in the `WorkerPodCount` observations in
+`controller/internal/kube/maintenance_observe.go` and
+`controller/internal/kube/materializer.go`; destructive transitions in
+`controller/internal/kube/maintenance.go` still require pod absence. The
+all-pod `len(e.pods) != 1` duplicate-canary cancellation check and
+`len(e.pods) == 0` first-provision check in
+`controller/internal/kube/roll_pacing.go` also remain unchanged. No live node-loss
+or storage-failure experiment is claimed; the hosted verification boundary below
+remains open.
 
 ### D5 — Target version is independently verified release identity
 

@@ -28,7 +28,7 @@ func TestHealthQueuedCrossCheckCapability(t *testing.T) {
 			fs, svc, r := capSvc(nil, 0, nil)
 			fs.crossCheckRun = store.Run{ID: r.ID, UserID: r.UserID, PlanCrossCheckRequired: true}
 			fs.crossCheckWorkers = []store.ListWorkersByUserRow{{Status: "online", ProtocolCapabilities: tc.caps}}
-			if got := svc.queuedReason(context.Background(), time.Now(), r); got != tc.want {
+			if got := svc.queuedReason(context.Background(), time.Now(), r, thWithLimit(testCustodyLimit)); got != tc.want {
 				t.Fatalf("queued reason = %q, want %q", got, tc.want)
 			}
 		})

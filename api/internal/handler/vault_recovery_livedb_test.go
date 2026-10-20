@@ -239,7 +239,7 @@ func TestVaultUnlockPromotionSynchronousAndFailuresLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			h.wsvc = workersvc.New(store.New(conn), e.box, workersvc.Params{})
+			h.wsvc = workersvc.New(store.New(conn), e.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			h.wsvc.SetVault(h.vault)
 			h.wsvc.SetBroadcaster(events)
 			h.wsvc.SetLifecycle(events)

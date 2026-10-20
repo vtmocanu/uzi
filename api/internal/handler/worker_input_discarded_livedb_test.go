@@ -41,7 +41,7 @@ func TestWorkerInputsDiscardedLiveDB(t *testing.T) {
 	}
 	defer pool.Close()
 	q := store.New(pool)
-	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(pool)
 	h := &Handler{q: q, wsvc: svc}
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))

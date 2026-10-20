@@ -42,7 +42,7 @@ func TestMilestoneReconciliationHTTPReclaimLiveDB(t *testing.T) {
 	t.Cleanup(pool.Close)
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	svc := workersvc.New(q, box, workersvc.Params{PlanMaxRevisions: 3, WorkerHeartbeatStale: time.Minute})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), PlanMaxRevisions: 3, WorkerHeartbeatStale: time.Minute})
 	svc.SetTxBeginner(pool)
 	svc.SetRetentionLockPool(pool)
 	svc.SetBackground(func(func()) {})

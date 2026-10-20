@@ -40,7 +40,7 @@ func diskStats(usedNixPct int64) *workersvc.WorkerStats {
 func TestPollDiskPressureDebouncesAtTwoLiveDB(t *testing.T) {
 	h, _, q, box, userID := hostedLiveDB(t, "5")
 	ctx := context.Background()
-	wsvc := workersvc.New(q, box, workersvc.Params{DiskPressureThreshold: diskPressureThreshold})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: diskPressureThreshold})
 	// A generous staleness bound: every heartbeat below stamps last_heartbeat_at=now(), so
 	// freshness is never the variable here — the streak is.
 	poll := hostedsvc.New(q, box, time.Now, time.Hour)
@@ -84,7 +84,7 @@ func TestPollDiskPressureDebouncesAtTwoLiveDB(t *testing.T) {
 func TestPollDiskPressureResetOnRegisterLiveDB(t *testing.T) {
 	h, _, q, box, userID := hostedLiveDB(t, "5")
 	ctx := context.Background()
-	wsvc := workersvc.New(q, box, workersvc.Params{DiskPressureThreshold: diskPressureThreshold})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: diskPressureThreshold})
 	poll := hostedsvc.New(q, box, time.Now, time.Hour)
 
 	wkr, err := h.provisionHostedWorker(ctx, userID, "register-reset", "base", "m", false, 5)
@@ -122,7 +122,7 @@ func TestPollDiskPressureResetOnRegisterLiveDB(t *testing.T) {
 func TestPollDiskPressureFreshnessGateLiveDB(t *testing.T) {
 	h, pool, q, box, userID := hostedLiveDB(t, "5")
 	ctx := context.Background()
-	wsvc := workersvc.New(q, box, workersvc.Params{DiskPressureThreshold: diskPressureThreshold})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: diskPressureThreshold})
 
 	wkr, err := h.provisionHostedWorker(ctx, userID, "freshness", "base", "m", false, 5)
 	if err != nil {
@@ -160,7 +160,7 @@ func TestPollDiskPressureFreshnessGateLiveDB(t *testing.T) {
 func TestPollDindFullNeverDiskPressureLiveDB(t *testing.T) {
 	h, pool, q, box, userID := hostedLiveDB(t, "5")
 	ctx := context.Background()
-	wsvc := workersvc.New(q, box, workersvc.Params{DiskPressureThreshold: diskPressureThreshold})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: diskPressureThreshold})
 	poll := hostedsvc.New(q, box, time.Now, time.Hour)
 
 	wkr, err := h.provisionHostedWorker(ctx, userID, "dind-full", "base", "m", false, 5)

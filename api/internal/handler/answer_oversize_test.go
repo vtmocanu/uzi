@@ -48,7 +48,7 @@ func TestCreateRunInputAnswerOverLimitIs400(t *testing.T) {
 		ID: runID, UserID: owner.ID, Status: "awaiting_input",
 		OpenQuestionID: pgtype.Text{String: qid, Valid: true},
 	}}
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	inner, err := json.Marshal(workersvc.AnswerBody{QuestionID: qid, Answers: []string{strings.Repeat("é", 40001)}})
 	if err != nil {

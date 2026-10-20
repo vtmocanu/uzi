@@ -37,7 +37,7 @@ func TestWorkerCodexRecoveryExactRepliesLiveDB(t *testing.T) {
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	wsvc := workersvc.New(q, box, workersvc.Params{})
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	h := &Handler{q: q, wsvc: wsvc}
 	router := h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
 

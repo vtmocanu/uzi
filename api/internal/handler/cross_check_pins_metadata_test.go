@@ -147,7 +147,7 @@ func TestCrossCheckMetadataCorpusLiveDB(t *testing.T) {
 	}
 	defer pool.Close()
 	q := store.New(pool)
-	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	str := func(s string) *string { return &s }
 	pin := json.RawMessage(`{"cross_check_pins":[{"stage":"plan","harness":"claude","model":"sonnet"},{"stage":"plan","harness":"codex","model":"gpt-6-astra"}]}`)
 	cases := []metadataCase{
@@ -238,7 +238,7 @@ func TestCrossCheckMetadataNativeLocaleDiscriminatorLiveDB(t *testing.T) {
 	}
 	defer pool.Close()
 	q := store.New(pool)
-	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{})}
+	h := &Handler{pool: pool, q: q, wsvc: workersvc.New(q, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	user := mkSecretUser(t, pool)
 	exec := func(sql string, args ...any) {
 		t.Helper()

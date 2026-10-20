@@ -7768,3 +7768,144 @@ describe("M3 Claude producer projection compatibility", () => {
     assert.doesNotMatch(JSON.stringify(sent), /projection-private-value|\\u0000/);
   });
 });
+
+describe("issue #3149 earlier owner follow-ups on a reviewed-plan resume", () => {
+  const reviewedResume = (extra: Partial<RunContext>) => makeCtx({
+    planApproved: true, seeded: false, reviewedPlanResume: true, sessionId: null,
+    approvedPlan: "zqx42 reviewed plan", config: { max_iterations: 5 }, ...extra,
+  });
+
+  it("places fenced history and the approval guidance on the first implement turn only", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("first pass"), resultSuccess()], [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({ priorOwnerFollowUps: [{ id: 7, body: "HIST-A" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const first = turns[0]!.promptText ?? "";
+    assert.match(first, /<owner_history_[0-9a-f]+>\nHIST-A\n<\/owner_history_[0-9a-f]+>/);
+    assert.match(first, /do not request plan approval again/);
+    assert.doesNotMatch(first, /you supplied/);
+    assert.ok(turns.length >= 2);
+    assert.ok(turns[1]!.promptText);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-A/);
+  });
+
+  it("drops a live id, keeps identical bodies under distinct ids, and issues no receipt for history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const included: number[] = [];
+    let pulled = false;
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [
+        { id: 3, body: "SAME-WORDS" }, { id: 4, body: "SAME-WORDS" },
+        { id: 5, body: "HIST-LIVE-CLAIM" }, { id: 7, body: "HIST-LIVE-RIDE" },
+      ],
+      isLiveFollowUpId: (id) => id === 5,
+      pullFollowUps: () => { if (pulled) return []; pulled = true; return [{ id: 7, body: "LIVE-RIDE" }]; },
+      followUpIncluded: (id) => { included.push(id); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    const p = turns[0]!.promptText ?? "";
+    assert.equal(p.split("SAME-WORDS").length - 1, 2);
+    assert.doesNotMatch(p, /HIST-LIVE-CLAIM/);
+    assert.doesNotMatch(p, /HIST-LIVE-RIDE/);
+    assert.match(p, /LIVE-RIDE/);
+    assert.ok(p.indexOf("LIVE-RIDE") > p.indexOf("SAME-WORDS"), "history reads before the live follow-up");
+    assert.deepEqual(included, [7], "only the live follow-up gets an inclusion receipt; history ids get none");
+  });
+
+  it("a non-reviewed seeded run places no history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = reviewedResume({ reviewedPlanResume: false, seeded: true, priorOwnerFollowUps: [{ id: 1, body: "HIST-X" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns[0]!.promptText);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-X/);
+  });
+
+  it("a session-resumed reviewed run places no history", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = reviewedResume({ sessionId: "sess-resumed", priorOwnerFollowUps: [{ id: 1, body: "HIST-S" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns[0]!.promptText);
+    assert.doesNotMatch(turns[0]!.promptText ?? "", /HIST-S/);
+  });
+
+  it("a first turn aborted before any model event re-composes the history on the restarted turn, and a turn after an evidenced one does not", async () => {
+    const { queryFn, turns } = fakeTurns([
+      () => (async function* () {
+        yield* [];
+        throw new CredentialSwitchSignal();
+      })(),
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-RESTART" }],
+      attemptCredentialSwitch: async () => "gave_up" as const,
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.match(turns[1]!.promptText ?? "", /HIST-RESTART/, "the restarted turn carries the history");
+    assert.ok(turns[2]!.promptText);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-RESTART/, "a later turn does not");
+  });
+
+  it("a turn aborted after a model event but before completing re-composes the history on its in-place restart", async () => {
+    const { queryFn, turns } = fakeTurns([
+      () => (async function* () {
+        yield assistantText("started");
+        throw new CredentialSwitchSignal();
+      })(),
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const included: number[] = [];
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-EVIDENCED" }],
+      attemptCredentialSwitch: async () => "gave_up" as const,
+      followUpIncluded: (id) => { included.push(id); },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.ok(turns[1]!.promptText);
+    const restarted = turns[1]!.promptText ?? "";
+    assert.equal(restarted.split("HIST-EVIDENCED").length - 1, 1);
+    assert.match(restarted, /<owner_history_[0-9a-f]+>\nHIST-EVIDENCED\n<\/owner_history_[0-9a-f]+>/);
+    assert.equal(turns[1]!.options.resume, undefined, "the restart is a fresh session");
+    assert.ok(turns[2]!.promptText);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-EVIDENCED/);
+    assert.deepEqual(included, []);
+  });
+
+  it("a completed turn with no model-processing evidence does not spend the history", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [resultNoTurns()],
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({ priorOwnerFollowUps: [{ id: 7, body: "HIST-UNSEEN" }] });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 3);
+    assert.match(turns[0]!.promptText ?? "", /HIST-UNSEEN/);
+    assert.ok(turns[1]!.promptText);
+    assert.equal((turns[1]!.promptText ?? "").split("HIST-UNSEEN").length - 1, 1, "the next turn carries the history once");
+    assert.ok(turns[2]!.promptText);
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /HIST-UNSEEN/, "spent once a model-processed turn completes");
+  });
+
+  it("a clarification answer turn does not carry history again", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [askUserTurn("which config?"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = reviewedResume({
+      priorOwnerFollowUps: [{ id: 7, body: "HIST-CLARIFY" }],
+      askUser: async () => ({ kind: "answer", answers: ["the default"] }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 2);
+    assert.match(turns[0]!.promptText ?? "", /HIST-CLARIFY/);
+    assert.match(turns[1]!.promptText ?? "", /the default/);
+    assert.ok(turns[1]!.promptText);
+    assert.doesNotMatch(turns[1]!.promptText ?? "", /HIST-CLARIFY/);
+  });
+});

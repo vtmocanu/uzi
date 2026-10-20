@@ -80,7 +80,7 @@ func registerReq(workerID uuid.UUID, authHash []byte) *http.Request {
 
 func newRegisterHandler(t *testing.T, kind string, ns hostedsvc.Store, rotatedHash []byte) *Handler {
 	t.Helper()
-	h := &Handler{wsvc: workersvc.New(&registerStore{kind: kind, rotatedHash: rotatedHash}, newHandlerTestBox(t), workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(&registerStore{kind: kind, rotatedHash: rotatedHash}, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	if ns != nil {
 		h.SetHostedSvc(hostedsvc.New(ns, newHandlerTestBox(t), time.Now, time.Hour))
 	}

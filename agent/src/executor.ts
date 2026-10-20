@@ -349,6 +349,15 @@ export interface RunContext {
    *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
    *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
+  /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
+   *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
+   *  absent: the runner leaves this undefined, and drops reviewedPlanResume, when the history
+   *  could not be restored in full. The executor renders them (selectPriorOwnerHistory +
+   *  renderPriorOwnerHistory) on the first implement turn as historical context. */
+  priorOwnerFollowUps?: readonly { id: number; body: string }[];
+  /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (steering
+   *  isLiveDeliveryId), so the history replay skips it by id and it is delivered once. */
+  isLiveFollowUpId?: (id: number) => boolean;
   /** PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
    *  reset --soft back to the working tree at adopt time), so the tree carries uncommitted
    *  mid-edit changes rather than a clean checkout. Set by the RUNNER from the runner clone.

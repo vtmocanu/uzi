@@ -23,9 +23,9 @@ func TestCrossWorkerRecoveredRunClaimsAtCapLiveDB(t *testing.T) {
 	              (user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity)
 	            VALUES ($1, $2, $3, 1, 'open', $4, 'crashed-worker-identity')`,
 		f.userID, f.repoID, run, otherWorker)
-	f.seedUnrelatedOpenHolds(custodyHoldLimit - 1)
-	if got := f.openHolds(t); got != custodyHoldLimit {
-		t.Fatalf("precondition: open holds = %d, want %d (owner at the cap)", got, custodyHoldLimit)
+	f.seedUnrelatedOpenHolds(testCustodyLimit - 1)
+	if got := f.openHolds(t); got != testCustodyLimit {
+		t.Fatalf("precondition: open holds = %d, want %d (owner at the cap)", got, testCustodyLimit)
 	}
 	got, gen := f.claim(t)
 	if got != run {

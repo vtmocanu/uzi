@@ -122,7 +122,7 @@ func newMergedPollEnv(t *testing.T) *mergedPollEnv {
 	e.exec("INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,enabled) VALUES($1,$2,42,$3,'https://forge.test/g/r',true)", e.repo, e.conn, e.repo.String())
 	e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_title,issue_description,status,worker_id,claim_generation,mr_iid,mr_state,created_at) VALUES($1,$2,$3,'prompt','t','d','running',$4,1,7,'merged','2020-01-01')", e.run, e.worker.UserID, e.repo, e.worker.ID)
 	e.addHold(e.hold, e.run, e.worker.ID, 1)
-	e.recovery = recovery.New(e.q, pool, box, recovery.Limits{MaxBundleBytes: 1 << 20, MaxCapturesPerClaim: 8, MaxCapturesPerOwner: 32, ReadyRetention: time.Hour, RequestDeadline: 10 * time.Second}, nil)
+	e.recovery = recovery.New(e.q, pool, box, recovery.Limits{CustodyHoldLimit: func(context.Context) (int32, error) { return 8, nil }, MaxBundleBytes: 1 << 20, MaxCapturesPerClaim: 8, MaxCapturesPerOwner: 32, ReadyRetention: time.Hour, RequestDeadline: 10 * time.Second}, nil)
 	e.engine = New(e.svc, mergedRepoStore{e.q, e.repo}, time.Minute, 10)
 	return e
 }

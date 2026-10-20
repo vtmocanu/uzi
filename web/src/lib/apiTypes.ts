@@ -1026,6 +1026,8 @@ export interface AppSettings {
   ephemeral_workers_enabled: string;
   // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
   hosted_worker_quota: string;
+  // Per-owner custody admission limit: whole number 1..1000, default "8". Lowering it blocks future claims only.
+  custody_hold_limit: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
   // "true"), round-tripping through GET/PUT /admin/settings like every other setting.
   // release_check_enabled is the master air-gap switch: when off, the api never calls

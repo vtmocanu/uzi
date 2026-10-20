@@ -17,7 +17,7 @@ import (
 // promotes on schedule and is re-claimed — by its owner while the owner is live, or by a live
 // sibling once the owner is stale-and-not-draining. EACH re-claim opens its OWN generation hold
 // with the parked generation already released, so the owner's OPEN-hold count never grows across
-// parks (SC2: parks do not accumulate holds toward the custodyHoldLimit admission ceiling).
+// parks (SC2: parks do not accumulate holds toward the custody-hold admission limit).
 //
 // These reuse the M1 forge-park scaffolding (forgeParkService / fpSeedRunning / fpRun /
 // fpHoldEvidence in forgepark_livedb_test.go, mhOpenHold in custody_multihold_livedb_test.go,
@@ -25,7 +25,7 @@ import (
 // through the real Service.SetState (forge_unreachable cause); promotion through the UNCHANGED
 // PromoteRecoveryWaitRuns; the re-claim through the real ClaimRun query with the SAME
 // recovery-capable wiring Service.Claim uses (recovery_archive_v1 -> RecoveryCapable, the worker
-// identity on the hold, the production custodyHoldLimit gate) so the claim opens a new-generation
+// identity on the hold, the custody-hold admission limit) so the claim opens a new-generation
 // custody hold in the same statement.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres (run via
@@ -33,7 +33,7 @@ import (
 
 // fpRecoveryClaimParams mirrors Service.Claim's ClaimRunParams for a RECOVERY-CAPABLE claim by
 // workerID: it advertises recovery_archive_v1 (RecoveryCapable), records the worker identity on
-// the hold, and passes the production custodyHoldLimit admission gate. That combination is what
+// the hold, and passes the custody-hold admission limit. That combination is what
 // makes ClaimRun open exactly one NEW-generation custody hold in the same statement (the hold CTE
 // fires only for a recovery-capable claim on a code-publishing kind), so a re-claim's hold
 // accounting is exercised, not stubbed. heartbeatCutoff decides owner-vs-sibling placement: a
@@ -54,7 +54,7 @@ func (e interlockLiveDB) fpRecoveryClaimParams(workerID uuid.UUID, heartbeatCuto
 		WorkerCaps:            []string{},
 		CapabilityAware:       false,
 		WorkerProtocolCaps:    []string{capability.RecoveryArchiveV1},
-		CustodyHoldLimit:      custodyHoldLimit,
+		CustodyHoldLimit:      testCustodyLimit,
 		RecoveryCapable:       true,
 		WorkerIdentity:        "w-" + workerID.String()[:8],
 	}
@@ -263,7 +263,7 @@ func TestForgeParkSiblingResumePlacementLiveDB(t *testing.T) {
 
 // TestForgeParkOpenHoldCountStableAcrossParksLiveDB is the SC2 invariant: across REPEATED
 // forge-park -> promote -> owner re-claim cycles, the owner's OPEN-hold count for the run holds at
-// exactly 1 — it never climbs toward the custodyHoldLimit admission ceiling, because each park
+// exactly 1 — it never climbs toward the custody-hold admission limit, because each park
 // releases the current generation's hold BEFORE the next claim opens the next one. The released
 // holds accumulate as state='released' history rows (one per park); the open holds do not.
 func TestForgeParkOpenHoldCountStableAcrossParksLiveDB(t *testing.T) {
@@ -315,10 +315,10 @@ func TestForgeParkOpenHoldCountStableAcrossParksLiveDB(t *testing.T) {
 		if n := e.fpOpenHoldCount(t, runID); n != 1 {
 			t.Fatalf("cycle %d: owner OPEN-hold count = %d, want exactly 1 (parks must not accumulate open holds)", cycle, n)
 		}
-		// The consequence the PRD names: the open count never climbs toward the custodyHoldLimit
+		// The consequence the PRD names: the open count never climbs toward the custody-hold admission limit
 		// admission ceiling, so a run that parks repeatedly is never blocked from re-claiming.
-		if n := e.fpOpenHoldCount(t, runID); n >= custodyHoldLimit {
-			t.Fatalf("cycle %d: open-hold count %d reached the custodyHoldLimit %d — parks are leaking holds", cycle, n, custodyHoldLimit)
+		if n := e.fpOpenHoldCount(t, runID); n >= testCustodyLimit {
+			t.Fatalf("cycle %d: open-hold count %d reached the testCustodyLimit %d — parks are leaking holds", cycle, n, testCustodyLimit)
 		}
 		// The re-claim's open hold is the NEXT generation.
 		if openGen, _, _ := e.fpOpenHold(t, runID); openGen != gen+1 {
@@ -336,7 +336,7 @@ func TestForgeParkOpenHoldCountStableAcrossParksLiveDB(t *testing.T) {
 	}
 
 	// Final: three parks left three released history rows and exactly one open hold — the open
-	// count held at 1 across every cycle, well under the custodyHoldLimit (8).
+	// count held at 1 across every cycle, well under the custody-hold admission limit (8).
 	if got := e.fpHoldCountByState(t, runID, "released"); got != cycles {
 		t.Fatalf("final released-hold rows = %d, want %d", got, cycles)
 	}

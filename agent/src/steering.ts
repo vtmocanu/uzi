@@ -424,6 +424,19 @@ export function followUpRunes(body: string): number {
   return [...body].length;
 }
 
+/** Issue #3149: cap on the number of earlier owner follow-ups a reviewed-plan resume replays. The
+ *  rune budget (MAX_FOLLOW_UP_BATCH_RUNES) counts body text only, so without an entry cap 40000
+ *  one-character follow-ups would read "complete" yet render about 11M characters of per-entry
+ *  framing. With the 40000-rune body budget this bounds the rendered history at roughly body budget
+ *  + 100 x per-entry framing; chosen above the ~40 binding follow-ups in the #3149 incident run. */
+export const MAX_PRIOR_OWNER_HISTORY_ENTRIES = 100;
+
+/** Issue #3149: what a claim knows about the owner follow-ups earlier claims consumed. */
+export type PriorOwnerHistory =
+  | { status: "complete"; entries: readonly { id: number; body: string }[] }
+  | { status: "unavailable" }
+  | { status: "over_bound" };
+
 export class SteeringChannel {
   private stopped = false;
   private loop: Promise<void> | undefined;
@@ -447,6 +460,9 @@ export class SteeringChannel {
    *  constraints are then unknown, so operatorConstraints reports null and the Agent guard
    *  denies every dispatch for this claim. */
   private operatorConstraintsLost = false;
+  /** Issue #3149: the earlier-claim owner follow-ups that were consumed and need no re-delivery,
+   *  recorded once by recordPriorOwnerHistory; undefined until then. */
+  private priorHistory: { status: "complete"; entries: { id: number; body: string }[] } | { status: "over_bound" } | undefined;
   /** Issue #1673: the one input batch in flight. No newer GET replaces it until its ACK and
    *  applied receipts settle: "ack" retries the same ids, "routed" is serviced by the waiters
    *  on the tick that routed it, "applied" retries the applied receipt without rerouting. */
@@ -1981,6 +1997,47 @@ export class SteeringChannel {
       this.leadQueuedIds.add(input.id);
       this.followUps.push({ id: input.id, body: input.body!.trim() });
     }
+  }
+
+  /** Issue #3149: snapshot the owner follow-ups earlier claims consumed (GET /follow-ups), for a
+   *  reviewed-plan resume that starts a fresh session. Call once, after requeueUnincludedFollowUps:
+   *  rows that requeue re-delivers to the lead are excluded (they arrive live), so what remains is
+   *  the consumed-and-included history. Non-blank follow_up rows only, trimmed, id order, one per
+   *  id. The bound is checked over the WHOLE snapshot; an over-bound history is recorded as such,
+   *  never as a truncated list. Only the first call records; later calls are ignored. */
+  recordPriorOwnerHistory(inputs: readonly UserInput[]): void {
+    if (this.priorHistory) return;
+    const byId = new Map<number, string>();
+    for (const i of [...inputs].sort((a, b) => a.id - b.id)) {
+      const body = i.body?.trim();
+      if (i.kind !== "follow_up" || !body || byId.has(i.id)) continue;
+      if (i.inclusion_reported === true && !i.included_at) continue; // requeued for the lead instead
+      byId.set(i.id, body);
+    }
+    const entries = [...byId].map(([id, body]) => ({ id, body }));
+    // The body budget reuses the per-turn owner-text budget (MAX_FOLLOW_UP_BATCH_RUNES), so the first
+    // turn can carry up to about twice that when a live batch rides along. A history over either
+    // bound is never truncated: it is recorded "over_bound" and the caller falls back to the human
+    // plan gate instead of replaying a partial record as if it were complete.
+    const runes = entries.reduce((n, e) => n + followUpRunes(e.body), 0);
+    this.priorHistory =
+      runes > MAX_FOLLOW_UP_BATCH_RUNES || entries.length > MAX_PRIOR_OWNER_HISTORY_ENTRIES
+        ? { status: "over_bound" }
+        : { status: "complete", entries };
+  }
+
+  /** Issue #3149: the recorded history, "unavailable" when the claim-time reload failed or was
+   *  never recorded. Copies, so a caller cannot rewrite the record. */
+  priorOwnerHistory(): PriorOwnerHistory {
+    if (this.operatorConstraintsLost || !this.priorHistory) return { status: "unavailable" };
+    if (this.priorHistory.status === "over_bound") return { status: "over_bound" };
+    return { status: "complete", entries: this.priorHistory.entries.map((e) => ({ ...e })) };
+  }
+
+  /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (queued by the live
+   *  drain or re-queued by requeueUnincludedFollowUps), so a history replay must not repeat it. */
+  isLiveDeliveryId(id: number): boolean {
+    return this.leadQueuedIds.has(id) || this.routedIds.has(id);
   }
 
   /** PRD #1416 M2: arm (set/replace) the worker-authoritative safety steer. Called IN-PROCESS by

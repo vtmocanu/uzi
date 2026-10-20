@@ -1228,7 +1228,8 @@ available when it is not.
 ### Reviewing and resolving held work: `uzi run recovery` / `uzi run discard`
 
 A run's custody hold protects its committed-but-unpublished work per claim generation.
-The fixed owner admission limit is 8 counted holds. `open_holds` is total open custody;
+The owner admission limit is the admin setting `custody_hold_limit` (default 8 counted
+holds; see [Admin settings](./admin-settings.md#custody-hold-limit)). `open_holds` is total open custody;
 `admission_counted_holds` excludes at most one hold per run backing a healthy, valid live
 current-generation claim without an owner decision. That requires exact owner/run/live-run
 and worker identity, an unreleased claim, a fresh non-null heartbeat (inclusive cutoff
@@ -1238,8 +1239,8 @@ released, terminal and old/future-generation claims remain counted, as do decisi
 `active` attention alone does not establish eligibility. The discount releases nothing
 and does not permit pruning or teardown of held source.
 
-New code runs wait at the admission limit. A previously claimed queued run with 1–7
-of its own total open holds can still resume; at 8 it loses that exemption. Concurrent
+New code runs wait at the admission limit. A previously claimed queued run with 1 to limit-1
+of its own total open holds can still resume; at the limit it loses that exemption. Concurrent
 claims and later heartbeat staleness can exceed the limit: it is a statement-snapshot
 admission gate, not a strict ceiling. To find what held work you have, start here before
 choosing a run to export or an exact hold to discard:
@@ -1257,7 +1258,9 @@ uzi run recovery [--json]
   Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
   `admission_counted_holds` against the limit for capacity, and `open_holds` for total
-  custody. `blocked_runs` excludes continuations eligible for the exemption. For each
+  custody. `blocked_runs` excludes continuations eligible for the exemption. If the
+  server cannot read a valid `custody_hold_limit`, the listing returns an error instead of
+  guessing a limit; an admin saves a valid value in Admin → Instance settings. For each
   `source_only` hold it reports retained source and archive availability independently.
   An available archive can be exported but may omit latest worker-local work; a latest
   preparing/uploading capture is reported as progress, without promising download or
@@ -1742,7 +1745,11 @@ A newer release is available.
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
   triage bands (NEEDS YOU, then ON THE FLOOR, then DONE) rather than one
-  flat table, and each row reads left to right as a `▌` andon strip and
+  flat table. DONE keeps failed and `needs landing` state tokens in dimmed red,
+  their issue links in full red, and their titles faint. Human-stopped runs
+  stay faint. When failures are present, the DONE heading adds a red
+  `K failed` count over the filtered rows. Each row reads left to right as a
+  `▌` andon strip and
   status glyph, the run id, the status WORD in its own colour (a stalled run
   reads `▲ stalled`, because health folds into the status token rather than
   a separate column), the AGE, the milestone micro-bar, the COST cell, and

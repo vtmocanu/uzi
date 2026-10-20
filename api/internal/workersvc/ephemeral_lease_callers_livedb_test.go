@@ -68,7 +68,7 @@ func TestQueuedReasonCountsLeasedEphemeralWorkerLiveDB(t *testing.T) {
 		}
 		for _, r := range rows {
 			if r.ID == follow {
-				return svc.queuedReason(e.ctx, time.Now(), r)
+				return svc.queuedReason(e.ctx, time.Now(), r, thWithLimit(testCustodyLimit))
 			}
 		}
 		t.Fatalf("run %s not listed for health", follow)

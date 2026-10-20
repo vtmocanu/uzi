@@ -479,7 +479,7 @@ func TestWorkerJobOutputIdempotentLiveDB(t *testing.T) {
 func rebuildRouterWithoutJobFiles(t *testing.T, e *jobFileRouteEnv) http.Handler {
 	t.Helper()
 	q := store.New(e.pool)
-	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(e.pool)
 	h := &Handler{q: q, wsvc: svc}
 	return h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))

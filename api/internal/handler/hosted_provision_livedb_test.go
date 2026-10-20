@@ -398,7 +398,7 @@ func TestDeleteHostedWorkerCascadesPendingTokenLiveDB(t *testing.T) {
 		t.Fatalf("token rows before delete = %d, want 1", before)
 	}
 
-	svc := workersvc.New(q, box, workersvc.Params{})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	if err := svc.DeleteWorker(ctx, userID, wkr.ID); err != nil {
 		t.Fatalf("DeleteWorker: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestDeleteHostedWorkerRefusedWhileBusyLiveDB(t *testing.T) {
 		t.Fatalf("seed run: %v", err)
 	}
 
-	svc := workersvc.New(q, box, workersvc.Params{})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	if err := svc.DeleteWorker(ctx, userID, wkr.ID); !errors.Is(err, workersvc.ErrWorkerHasActiveRuns) {
 		t.Fatalf("err = %v, want ErrWorkerHasActiveRuns (a hosted worker holding a non-terminal run must not be deleted)", err)
 	}

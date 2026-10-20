@@ -236,6 +236,48 @@ is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
+## Custody hold limit
+
+The recovery custody admission limit, how many [admission-counted
+holds](./run-recovery.md#reviewing-and-resolving-held-work) one owner may have
+before uzi stops admitting their **new** runs, is one setting:
+
+| Setting | Default | Controls |
+|---|---|---|
+| `custody_hold_limit` | 8 | The per-owner admission limit, a whole number from 1 to 1000. There is no zero or "unlimited" value. One deployment-wide value, applied separately to every owner. |
+
+Edit it in the **Custody hold limit** card on **Admin → Instance settings**. The
+settings API and the form refuse `0`, negatives, non-integers, signs such as `+12`
+and anything above 1000.
+
+- **Raising it admits more work; lowering it blocks future claims only.** Lowering
+  never cancels a run or releases or discards a hold, and prune, teardown and
+  release safeguards still see every open hold. How holds are counted, the checker
+  (`cross_check`) exemption and the statement-snapshot overshoot are unchanged; see
+  [Run recovery](./run-recovery.md#reviewing-and-resolving-held-work) and
+  [ADR-2445](../adr/2445-custody-admission-accounting.md).
+- **No restart.** The API replica that saves it applies it on the next read; other
+  replicas pick it up within one settings cache TTL (`SETTINGS_CACHE_TTL`, default
+  5s) once their refresh succeeds. If a refresh fails while a good value is cached,
+  the last good value keeps being used.
+- **Every consumer reads the same value:** claim admission, the continuation
+  exemption (a previously claimed queued run keeps resuming with 1 to limit-1 of its
+  own open holds), the queued-run health reason, the `custody_hold_limit` and
+  `blocked_runs` figures in `uzi run recovery`, the `custody.holds`
+  [health check](./admin-health.md), and the Slack custody-episode message.
+- **Unreadable fails closed.** With no usable value (unreadable right after boot or
+  right after a save on that replica, or a hand-edited invalid stored row), uzi never
+  substitutes 8 and never disables the limit:
+  - new run-lane claims are refused (the dedicated cross-check lane is unaffected,
+    but legacy checker children claimed through the ordinary run lane wait that cycle);
+  - queued runs show "new runs are paused: the custody hold limit setting could not
+    be read; an admin should check Admin → Instance settings";
+  - the held-work listing (`GET /api/recovery/holds`, `uzi run recovery`) returns a
+    generic error;
+  - the `custody.holds` health check reports `unknown` and names `custody_hold_limit`.
+
+  An admin saving a valid value clears it.
+
 ## Research fetch caps
 
 Five limits bound what one official-sources research run may download (see

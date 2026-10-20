@@ -1023,8 +1023,9 @@ WITH claimant AS MATERIALIZED (
       -- OWNER-scoped admission gate (D4: the instance byte ceiling must never become a
       -- global stop-claiming switch), placed alongside the existing eligibility checks. A
       -- non-positive @custody_hold_limit DISABLES the gate (limit "<= 0" means unlimited),
-      -- so it never blocks an ordinary claim; the production caller always passes the
-      -- configured positive default (workersvc.custodyHoldLimit, 8).
+      -- so it never blocks an ordinary claim; production passes the custody_hold_limit
+      -- admin setting (1..1000), except the cross_check claim lane, which passes an inert 0
+      -- because every row that lane can select is exempt (kind = 'cross_check').
       --
       -- Issue #1751 / ADR-1751: CONTINUATION EXEMPTION. A requeued run that was already
       -- claimed before (claim_generation >= 1) AND still holds its OWN open custody hold

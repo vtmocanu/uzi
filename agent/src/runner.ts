@@ -146,6 +146,8 @@ import {
   CredentialSwitchSignal,
   GateInputDeliveryError,
   PLAN_APPROVAL_TIMEOUT_REASON,
+  MAX_FOLLOW_UP_BATCH_RUNES,
+  MAX_PRIOR_OWNER_HISTORY_ENTRIES,
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
@@ -10090,6 +10092,8 @@ export class RunRunner {
         // delivered again by this claim (the same GET, so no extra request; a failed read above
         // re-queues nothing).
         steering.requeueUnincludedFollowUps(consumed);
+        // Issue #3149: keep the rest of that read as the history a reviewed-plan resume replays.
+        steering.recordPriorOwnerHistory(consumed);
         return;
       } catch (err) {
         lastErr = err;
@@ -10986,13 +10990,20 @@ export class RunRunner {
     const humanApproved = (claim.auto_approve ?? false) !== true; // false ⟺ a human saw the gate
     const recoveryFailed =
       runnerClone.seededFrom === "default" && runnerClone.wipRecovered !== true; // no tree AND no WIP
-    const m4ResumeReviewedPlan =
+    const m4Candidate =
       (claim.plan_approved ?? false) &&
       claim.plan_source === "agent" &&
       !!claim.plan_md?.trim() &&
       !sessionId &&
       !seeded && // the D4-row-3 dropped-session case
       !(humanApproved && recoveryFailed); // re-gate a human-approved run that lost its tree
+    // Issue #3149: a fresh session resuming a reviewed plan must also get the earlier owner
+    // follow-ups it never saw. When that history could not be restored (the GET /follow-ups reload
+    // failed, or the history is over MAX_FOLLOW_UP_BATCH_RUNES or MAX_PRIOR_OWNER_HISTORY_ENTRIES) the resume is not safe to run on
+    // the old approval: fall back to the plan gate and force a human approval, even on autopilot.
+    const priorOwnerHistory = steering.priorOwnerHistory();
+    const ownerHistoryIncomplete = m4Candidate && priorOwnerHistory.status !== "complete";
+    const m4ResumeReviewedPlan = m4Candidate && !ownerHistoryIncomplete;
 
     // PRD #1064 M1 (Decision 1): ONE per-run promise chain serializing EVERY `running`
     // report of the run — the immediate `reportProgress` pushes, the turn-boundary
@@ -11731,6 +11742,7 @@ export class RunRunner {
     // The server accepts semantic_park only on the first awaiting_approval report of an
     // auto_approve run (that report clears auto_approve), so later candidates never supply it.
     let semanticParkOffered = false;
+    let ownerHistoryGateNoted = false; // issue #3149: the forced-human-gate status line is emitted once per claim
     // Each strict operation freezes generation/session and the complete request before first send.
     const checkedReports = new WeakMap<StateRequest, PlanCrossCheckStateRequest>();
     const reportCheckedState = (body: StateRequest): Promise<StateAck> => {
@@ -11925,6 +11937,11 @@ export class RunRunner {
       // embeds the persisted plan body on the implement turn. Drives the relaxed
       // preApproved session guard and the embedSeededPlan reviewedResume term.
       reviewedPlanResume: m4ResumeReviewedPlan,
+      // Issue #3149: the earlier owner follow-ups a fresh reviewed-plan session never saw, and the
+      // predicate that keeps the ones this claim delivers live out of that replay.
+      priorOwnerFollowUps:
+        m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" ? priorOwnerHistory.entries : undefined,
+      isLiveFollowUpId: (id: number) => steering.isLiveDeliveryId(id),
       // PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park):
       // marker reset --soft back to the tree), so a cold resumed lead is told to treat
       // the dirty tree as mid-edit and reconcile it against the plan (R1).
@@ -12099,8 +12116,20 @@ export class RunRunner {
             planning_diff: semanticDiff.diff,
           }, semanticSubmission, semanticSources.sources);
         }
+        // Issue #3149: a resume whose earlier owner follow-ups could not be restored needs a human
+        // approval, even on autopilot (no cross-check, no auto-approve), for the whole claim.
+        if (ownerHistoryIncomplete && !ownerHistoryGateNoted) {
+          ownerHistoryGateNoted = true;
+          batcher.emit({
+            kind: "status",
+            agent: "worker",
+            payload: {
+              text: `earlier owner follow-ups on this run could not be restored (unavailable or over the ${MAX_FOLLOW_UP_BATCH_RUNES}-code-point / ${MAX_PRIOR_OWNER_HISTORY_ENTRIES}-entry bound): this plan needs explicit owner approval, even on autopilot`,
+            },
+          });
+        }
         const eligible = claim.auto_approve === true && claim.plan_cross_check_required === true &&
-          !seeded && !forceGate && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
+          !seeded && !forceGate && !ownerHistoryIncomplete && ["issue", "prompt", "self_improve", "ci_fix", "mr_rework"].includes(resolveRunKind(claim.kind));
         // Older api (no plan_cross_check_codex_lead): do not submit a Codex lead's check, park at
         // the human gate. This is a capability check, NOT a mapping of 409 refusals.
         const codexLeadUnsupported = !!claim.secrets.codex && claim.plan_cross_check_codex_lead !== true;
@@ -12238,7 +12267,7 @@ export class RunRunner {
             releaseStateBarrier?.();
           }
         }
-        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !semanticHumanGate &&
+        const effectiveAutoApprove = (claim.auto_approve ?? false) && !forceGate && !semanticHumanGate && !ownerHistoryIncomplete &&
           (!checkedHuman || checkedApproval !== undefined);
         // Issue #1604 (D3): a resumed claim with an unapproved persisted plan reports no
         // awaiting_approval before the inputs sent before the release are read (the replayed
@@ -12998,6 +13027,16 @@ export class RunRunner {
       this.diskGovernor?.enterRun(flight.runId);
       nowSummary?.start();
       try {
+        // Issue #3149: the history dedup (isLiveFollowUpId) reads steering.isLiveDeliveryId when the
+        // first implement prompt is composed. A legacy consumed-but-unapplied follow-up is in the
+        // GET /follow-ups snapshot AND replayed live by the steering's first GET /inputs, which
+        // plan_approved=true would otherwise not wait for (awaitResumedDelivery is skipped on the
+        // reviewed path). Wait for that first read here, immediately before the executor owns the
+        // run, so the live set is complete before any implement turn composes its prompt. The wait
+        // shares the gate path's recovery handling (transient read failure parks, definitive fails).
+        if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
+          await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
+        }
         try { result = await executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;

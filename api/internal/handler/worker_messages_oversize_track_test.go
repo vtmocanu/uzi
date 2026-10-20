@@ -64,7 +64,7 @@ func TestWorkerMessagesOversizeBatchIsCountedAgainstTheRun(t *testing.T) {
 	runID := uuid.New()
 	wkr := store.Worker{ID: uuid.New(), UserID: uuid.New()}
 	fake := &oversizeTrackStore{run: store.Run{ID: runID, Status: "running", LastSeq: 42}}
-	h := &Handler{wsvc: workersvc.New(fake, newHandlerTestBox(t), workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(fake, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages", strings.NewReader(oversizeBody(t)))
 	rctx := chi.NewRouteContext()
@@ -97,7 +97,7 @@ func TestWorkerMessagesMalformedBodyIsNotCountedAsOversize(t *testing.T) {
 	// toward being killed.
 	runID := uuid.New()
 	fake := &oversizeTrackStore{run: store.Run{ID: runID, Status: "running"}}
-	h := &Handler{wsvc: workersvc.New(fake, newHandlerTestBox(t), workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(fake, newHandlerTestBox(t), workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x/messages",
 		strings.NewReader(`{"messages":[{"seq":1,"kind":"text","payload":"unclosed`))

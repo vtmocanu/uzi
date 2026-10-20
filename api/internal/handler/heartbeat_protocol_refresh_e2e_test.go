@@ -64,7 +64,7 @@ func refreshRouter(t *testing.T, pool *pgxpool.Pool, counter *refreshQueryCounte
 	t.Helper()
 	q := store.New(pool)
 	box := newHandlerTestBox(t)
-	svc := workersvc.New(q, box, workersvc.Params{})
+	svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, wsvc: svc, now: time.Now, startedAt: time.Now(), version: "m3"}
 	h.cfg.ActiveSnapshotDisabled = true

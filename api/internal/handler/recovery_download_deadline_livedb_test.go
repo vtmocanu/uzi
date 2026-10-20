@@ -229,7 +229,7 @@ func TestRecoveryDownloadOutlivesServerWriteTimeoutLiveDB(t *testing.T) {
 			limits := recoveryTestLimits()
 			limits.RequestDeadline = tc.limit
 			h.cfg.RecoveryRequestDeadline = 100 * time.Millisecond
-			h.wsvc = workersvc.New(recoveryDeadlineRunStore{Store: store.New(pool), o: o}, e.box, workersvc.Params{})
+			h.wsvc = workersvc.New(recoveryDeadlineRunStore{Store: store.New(pool), o: o}, e.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			h.recoverySvc = recovery.New(
 				recoveryDeadlineStore{Store: store.New(pool), o: o, delay: tc.metadata},
 				recoveryDeadlineDB{DB: pool, o: o, delay: tc.producer}, e.box, limits, nil)

@@ -88,7 +88,7 @@ import { ResidueQuarantinedError, latchResidueQuarantine, resetResidueQuarantine
 import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
 import { scanSignals } from "../src/signals.js";
 import { detectRepoAgents } from "../src/repoagents.js";
-import { buildReviewCommentsContext, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
+import { buildReviewCommentsContext, REVIEWED_RESUME_APPROVAL_GUIDANCE, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, COMPLETION_CONTRACT_GUIDANCE, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
@@ -7400,6 +7400,30 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     assert.match(implement, /Canonical one/);
     assert.match(implement, /\\"keep\\":\[\]/, "nested values and explicit [] are serialized verbatim");
     assert.doesNotMatch(implement, /local plan 1/, "the lead's local plan is not the implementation instruction");
+  });
+
+  it("issue #3149: a checked approval keeps its own framing and is not double-framed as a reviewed resume", async () => {
+    const rig = planThenImplementRig();
+    const milestones = [{ id: "m1", title: "Canonical one" }];
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: "persisted reviewed plan",
+      reviewedPlanResume: true,
+      sessionId: undefined,
+      claimGeneration: 7,
+      gatePlan: async () => ({
+        kind: "approve", approval: "cross_check", selection: { status: "absent" },
+        canonical: { plan: "server canonical contract", milestones, candidate_digest: "a".repeat(64), claimGeneration: 7 },
+      }) as never,
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "checked approval on a reviewed resume");
+    const implement = turnTexts(rig, 1).join("\n");
+    assert.match(implement, /Your plan was cross-checked and the server contract above was approved/);
+    // turnTexts serializes params as JSON, so compare the JSON-escaped form of the multi-line constant.
+    const escapedGuidance = JSON.stringify(REVIEWED_RESUME_APPROVAL_GUIDANCE).slice(1, -1);
+    assert.ok(escapedGuidance.includes("\\n"), "the escaped form is the multi-line serialization");
+    assert.ok(!implement.includes(escapedGuidance), "no reviewed-resume approval framing on the checked branch");
+    assert.doesNotMatch(implement, /persisted reviewed plan/, "the persisted plan does not compete with the checked contract");
   });
 
   for (const [name, canonical, generation] of [
@@ -16142,6 +16166,167 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 task run");
     assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A));
     assert.deepEqual(seams.included, [1]);
+  });
+
+  // Issue #3149 M3: reviewed-plan resume framing and earlier-owner history on the Codex implement turn.
+  describe("reviewed-plan resume (issue #3149)", () => {
+    const H1 = "HISTORY-MARKER-ONE-CODEX-91ab";
+    const H2 = "HISTORY-MARKER-TWO-CODEX-77cd";
+    const resumeOverrides = (extra: Partial<RunContext> = {}): Partial<RunContext> => ({
+      sessionId: null, reviewedPlanResume: true, seeded: false, approvedPlan: "REVIEWED-PLAN-BODY-3149",
+      config: { max_iterations: 6 }, ...extra,
+    });
+    const historyCount = (t: string, marker: string): number => t.split(marker).length - 1;
+    const hasFence = (t: string): boolean => /<owner_history_[0-9a-f]{16}>/.test(t);
+
+    it("an eligible reviewed resume states the approval and fences the approved plan", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+      const { ctx } = makeCtx(resumeOverrides());
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 eligible run");
+      const [t] = turnTexts(rig.epochs[0]!.transport);
+      assert.ok(t!.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+      assert.ok(t!.includes("<approved_plan>\nREVIEWED-PLAN-BODY-3149\n</approved_plan>"));
+    });
+
+    for (const [name, extra] of [
+      ["a seeded resume", { seeded: true }],
+      ["a non-reviewed pre-approved resume", { reviewedPlanResume: undefined }],
+    ] as const) {
+      it(`${name} keeps the bare approved plan`, async () => {
+        const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+        const { ctx } = makeCtx(resumeOverrides(extra));
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 bare run");
+        const [t] = turnTexts(rig.epochs[0]!.transport);
+        assert.ok(t!.includes("REVIEWED-PLAN-BODY-3149"));
+        assert.ok(!t!.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
+        assert.ok(!t!.includes("<approved_plan>"));
+      });
+    }
+
+    it("history rides iteration 1 only, fenced, with no live follow-up and no inclusion receipt", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [spoke, (th, tn) => [done(21, th, tn)]])]);
+      const included: number[] = [];
+      const { ctx } = makeCtx(resumeOverrides({
+        priorOwnerFollowUps: [{ id: 5, body: H1 }, { id: 6, body: H2 }],
+        followUpIncluded: (id) => { included.push(id); },
+      }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 history run");
+      const texts = turnTexts(rig.epochs[0]!.transport);
+      assert.equal(texts.length, 2);
+      // Each history entry sits in its own nonce fence (renderPriorOwnerHistoryBlock).
+      const fenced = [...texts[0]!.matchAll(/<owner_history_([0-9a-f]{16})>\n([\s\S]*?)\n<\/owner_history_\1>/g)].map((m) => m[2]);
+      assert.deepEqual(fenced, [H1, H2], "iteration 1 carries both, each inside its own fence, in order");
+      assert.ok(!texts[1]!.includes(H1) && !texts[1]!.includes(H2) && !hasFence(texts[1]!), "iteration 2 carries none");
+      assert.deepEqual(included, [], "history ids never receipt");
+    });
+
+    it("history precedes the live follow-up block, drops a live id by id, and keeps identical bodies of distinct ids", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(21, th, tn)]])]);
+      const seams = followUpSeams([A]);
+      const { ctx } = makeCtx(resumeOverrides({
+        priorOwnerFollowUps: [{ id: 5, body: H1 }, { id: 6, body: H1 }, { id: 7, body: H2 }, { id: 99, body: "LIVE-DUP-BODY" }],
+        isLiveFollowUpId: (id) => id === 7 || id === 99,
+        pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded,
+      }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 dedup run");
+      const [t] = turnTexts(rig.epochs[0]!.transport);
+      assert.equal(historyCount(t!, H1), 2, "two ids with identical bodies are both kept");
+      assert.ok(!t!.includes(H2) && !t!.includes("LIVE-DUP-BODY"), "live ids are dropped");
+      assert.ok(t!.lastIndexOf(H1) < t!.indexOf("<follow_up_") && t!.includes(A), "history before the live block");
+      assert.deepEqual(seams.included, [1], "only the live id receipts");
+    });
+
+    it("a live follow-up with id equal to a history id drops the history entry (this turn's batch)", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(21, th, tn)]])]);
+      const seams = followUpSeams([A]); // live id 1
+      const { ctx } = makeCtx(resumeOverrides({
+        priorOwnerFollowUps: [{ id: 1, body: H1 }],
+        pullFollowUps: seams.pullFollowUps, followUpIncluded: seams.followUpIncluded,
+      }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 batch-id run");
+      const [t] = turnTexts(rig.epochs[0]!.transport);
+      assert.ok(!t!.includes(H1) && t!.includes(A));
+    });
+
+    it("a completion-rework turn never carries history; the history stays on the first ordinary turn", async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)]]),
+        script("th-1", [quiet, (th, tn) => [done(31, th, tn)]]),
+      ]);
+      let attempts = 0;
+      const { ctx } = makeCtx(resumeOverrides({
+        kind: "issue", completionInterlock: true,
+        frozenMilestones: [{ id: "m1", title: "Alpha" }],
+        checkpoint: async () => {},
+        recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
+        priorOwnerFollowUps: [{ id: 5, body: H1 }],
+      }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 rework run");
+      const [first] = turnTexts(rig.epochs[0]!.transport);
+      const [rework, next] = turnTexts(rig.epochs[1]!.transport);
+      assert.ok(first!.includes(H1), "the first ordinary turn carried it");
+      assert.ok(rework!.startsWith("Completion check (structural interlock)") && !rework!.includes(H1));
+      assert.ok(!next!.includes(H1), "spent on the first turn, not replayed");
+    });
+
+    it("a clarification answer turn never carries history, and history is not re-sent after it", async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [
+          toolCall(11, "checkpoint", {}, th, tn, "c-checkpoint"),
+          toolCall(12, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, th, tn, "c-ask"),
+        ]]),
+        script("th-1", [spoke, (th, tn) => [done(31, th, tn)]]),
+      ]);
+      const { ctx } = makeCtx(resumeOverrides({
+        checkpoint: async () => {},
+        askUser: async () => ({ kind: "answer", answers: ["the-answer"] }),
+        priorOwnerFollowUps: [{ id: 5, body: H1 }],
+      }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 clarification run");
+      const [first] = turnTexts(rig.epochs[0]!.transport);
+      const later = turnTexts(rig.epochs[1]!.transport);
+      assert.ok(first!.includes(H1));
+      assert.match(later[0]!, /A: the-answer/);
+      assert.ok(later.every((t) => !t.includes(H1)), "no later turn re-renders history");
+    });
+
+    it("history appears exactly once across the in-turn re-drive of an aborted first turn", async () => {
+      const controller = new AbortController();
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+      const { ctx } = makeCtx(resumeOverrides({
+        signal: controller.signal,
+        pauseModeRequested: () => "now",
+        parkForPause: async () => false,
+        priorOwnerFollowUps: [{ id: 5, body: H1 }],
+      }));
+      controller.abort(new PauseNowSignal());
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 dropped run");
+      const texts = turnTexts(rig.epochs[0]!.transport);
+      assert.equal(texts.length, 1);
+      assert.equal(historyCount(texts[0]!, H1), 1, "the re-driven turn carries it once");
+    });
+
+    it("an evidence-free first turn leaves the latch unspent: the next iteration re-carries history, then it is spent", async () => {
+      const bare: TurnScript = (th, tn) => [threadStarted(th), turnCompleted("completed", th, tn)];
+      const rig = makeMultiEpochRig([script("th-1", [bare, spoke, (th, tn) => [done(11, th, tn)]])]);
+      const { ctx } = makeCtx(resumeOverrides({ priorOwnerFollowUps: [{ id: 5, body: H1 }] }));
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#3149 latch run");
+      const texts = turnTexts(rig.epochs[0]!.transport);
+      assert.ok(texts.length >= 3, "evidence-free, evidenced, then a later turn");
+      assert.ok(texts[0]!.includes(H1) && texts[1]!.includes(H1), "re-composed until a model event");
+      assert.ok(!texts[2]!.includes(H1), "spent after the evidenced turn");
+    });
+
+    it("history is not placed when the session is not fresh or the resume is not reviewed", async () => {
+      for (const extra of [{ sessionId: "sess-existing" }, { reviewedPlanResume: undefined }] as Partial<RunContext>[]) {
+        const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+        const { ctx } = makeCtx(resumeOverrides({ ...extra, priorOwnerFollowUps: [{ id: 5, body: H1 }] }));
+        await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#3149 ineligible run");
+        const texts = turnTexts(rig.epochs[0]!.transport);
+        assert.ok(texts.length >= 1, "at least one turn text was captured");
+        assert.ok(texts.every((t) => !t.includes(H1)));
+      }
+    });
   });
 });
 

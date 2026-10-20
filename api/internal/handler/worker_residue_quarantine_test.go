@@ -233,7 +233,7 @@ func TestWorkerSurfacesOverlayQuarantine(t *testing.T) {
 	}
 	t.Run("user list", func(t *testing.T) {
 		st := &custodyListStore{ownerRows: []store.ListWorkersByUserRow{{ID: id}, {ID: other}}}
-		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 		h.wsvc.RecordResidueQuarantine(id, q)
 		rec := httptest.NewRecorder()
 		h.ListWorkers(rec, withUser())
@@ -241,7 +241,7 @@ func TestWorkerSurfacesOverlayQuarantine(t *testing.T) {
 	})
 	t.Run("admin list", func(t *testing.T) {
 		st := &custodyListStore{adminRows: []store.ListAllWorkersRow{{Worker: store.Worker{ID: id}}, {Worker: store.Worker{ID: other}}}}
-		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+		h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 		h.wsvc.RecordResidueQuarantine(id, q)
 		rec := httptest.NewRecorder()
 		h.AdminListWorkers(rec, withUser())

@@ -18,7 +18,7 @@ func TestTerminalRejectionRegisterHeartbeatLiveDB(t *testing.T) {
 			t.Run(path+"/"+scope, func(t *testing.T) {
 				e := newSettleEnv(t)
 				q, box := store.New(e.pool), newHandlerTestBox(t)
-				svc := workersvc.New(q, box, workersvc.Params{ActiveSnapshotMaxEntries: 256})
+				svc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), ActiveSnapshotMaxEntries: 256})
 				svc.SetTxBeginner(e.pool)
 				h := &Handler{pool: e.pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: svc}
 				lim := mw.NewLimiter(100000, time.Minute, nil)
