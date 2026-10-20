@@ -4,6 +4,7 @@
 **Date**: 2026-09-27
 **Deciders**: agent team (issue #1759 milestones + review waves)
 **Policy update**: issue #1760; maintainer decision 2026-10-04 (AI-synced 2026-10-05). D7-D9 supersede the original cache-only scope below.
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (dind now mounts the `runner-shared` subPath of `data` at `/data/runner`, so Decision 3's "mounts none of its own crown jewels" is narrowed to the mount view; DinD-only maintenance keeps `/data/runner`)
 **Related**: [ADR-837](0837-worker-disk-lifecycle.md) (the `/nix`/`/data` disk-observability and pressure-recycle design this one narrows the "Known gap" of)
 
 ## Decision (summary)
@@ -20,7 +21,7 @@ D1-D6 record the original #1759 metering/cache-prune design. D7-D9 define the cu
 
 ### D1 — Meter with a separate, unprivileged sidecar, not by mounting into the worker or the privileged daemon
 
-The daemon container (`dindContainer`) is either a userns-remapped rootless process or, on nodes that cannot run rootless DinD, real root (`prds/done/89-optional-nonrootless-dind.md`'s non-rootless posture) — Decision 3 of `prds/done/83-docker-capable-worker.md` (the separate-container mount namespace) is that the worker mounts none of its own crown jewels into that container's reach, and the inverse holds too: the worker must not gain a new mount into the privileged daemon's own data root either. So metering is a **third, purpose-built container** (`dindMeterContainer`): the worker's own uid, no privilege escalation, a read-only root filesystem, every capability dropped, `RuntimeDefault` seccomp, and exactly two mounts — `dind-data` read-only, and its own private emptyDir it writes its sample into. It has no startup probe, so it never gates the worker's own readiness; a missing or broken meter degrades to "no disk-dind gauge, no prune," never to a stalled pod.
+The daemon container (`dindContainer`) is either a userns-remapped rootless process or, on nodes that cannot run rootless DinD, real root (`prds/done/89-optional-nonrootless-dind.md`'s non-rootless posture) — Decision 3 of `prds/done/83-docker-capable-worker.md` (the separate-container mount namespace) is that the worker mounts none of its own crown jewels into that container's reach (amended by ADR-3153: the one exception is the `runner-shared` subPath of `data`, mounted at `/data/runner` in both containers), and the inverse holds too: the worker must not gain a new mount into the privileged daemon's own data root either. So metering is a **third, purpose-built container** (`dindMeterContainer`): the worker's own uid, no privilege escalation, a read-only root filesystem, every capability dropped, `RuntimeDefault` seccomp, and exactly two mounts — `dind-data` read-only, and its own private emptyDir it writes its sample into. It has no startup probe, so it never gates the worker's own readiness; a missing or broken meter degrades to "no disk-dind gauge, no prune," never to a stalled pod.
 
 Rejected: mounting `dind-data` (even read-only) directly into the worker, which would put the worker container in the position of reading a volume it does not otherwise touch and remove the clean "worker never mounts dind-data" invariant `render_test.go` pins. Rejected: `docker system df` over the daemon socket, which would need the client to be trusted with a broader surface than a plain statfs and ties the sample to the daemon being responsive rather than to the filesystem directly.
 
@@ -101,8 +102,7 @@ precondition, then **observes the Deployment and old pods actually gone**,
 including Terminating pods, before deleting the DinD PVC by its bound UID.
 It waits for the old PVC, including any Terminating object, to disappear
 before reminting. Only `dind-data` is recycled: nix/data PVCs, worker UUID
-and join Secret survive. Deployment replacement also loses **run-workdir
-emptyDir**. A replacement must have a Bound PVC, a ready pod and fresh
+and join Secret survive. Deployment replacement keeps `/data/runner` (a data-PVC subPath since ADR-3153; it formerly lost the run-workdir emptyDir). A replacement must have a Bound PVC, a ready pod and fresh
 replacement-worker registration heartbeat; the controller publishes
 readiness **before** completing the operation and opening the fence.
 Failed binding stays fenced with no rollback.
@@ -148,9 +148,9 @@ No new kind/SDK production E2E or paused-recycled-resumed result is claimed.
 
 ## Consequences
 
-- `dind-data` has a gauge and two reclaim paths: the original bounded cache prune and the stricter terminal-only maintenance path. Maintenance may delete the entire DinD PVC, while preserving `/nix`, `/data`, worker UUID and join Secret; Deployment replacement also loses run-workdir.
+- `dind-data` has a gauge and two reclaim paths: the original bounded cache prune and the stricter terminal-only maintenance path. Maintenance may delete the entire DinD PVC, while preserving `/nix`, `/data`, worker UUID and join Secret; Deployment replacement keeps `/data/runner` (ADR-3153).
 - **Residual: in the non-rootless posture, node root (an accepted residual of `prds/done/89-optional-nonrootless-dind.md`) can write the meter emptyDir's node-side backing directory, so it can, in principle, forge the meter's sample.** Mount-namespace separation only keeps the daemon's own mount namespace, and any container it runs, from reaching that file directly; it does not bound node root itself. What bounds the damage is the reader's strict validation (D2), D4's frozen allowlist, and D5's idle/custody gate together: a forged sample cannot bypass the strict maintenance gate; it can affect maintenance intent as well as the original cache-prune sequence. This is not a guarantee that forged pressure cannot cause scratch loss once the gate is satisfied.
 - **Residual: docker compose has no equivalent meter or automatic prune.** A compose docker worker's `dinddata` volume is reclaimed only by the existing manual path (`docker compose down -v`, or `docker volume rm`).
 - **Residual: a filesystem reporting zero total inodes yields no valid sample** — btrfs commonly reports `files=0` this way — since the reader's statfs-relation check requires `files > 0`; the gauge and the prune both silently degrade to "no sample" there (no sample, no prune, no gauge), not a crash or a false trigger.
-- **Destructive default on upgrade**: #1760 adds automated DinD-only recycling for eligible persistent hosted Docker workers. Named volumes and run-workdir are not preserved; store deliverables in git/checkpoints/capture. Operators must explicitly opt out before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; a stop already started finishes safely even if disabled.
+- **Destructive default on upgrade**: #1760 adds automated DinD-only recycling for eligible persistent hosted Docker workers. Named volumes are not preserved (`/data/runner` is kept since ADR-3153); store deliverables in git/checkpoints/capture. Operators must explicitly opt out before stop with `UZI_WORKER_DISK_RECYCLE_ENABLED=false`; a stop already started finishes safely even if disabled.
 - Flipping `UZI_WORKER_DISK_RECYCLE_ENABLED` now has one more visible effect beyond ADR-837's own two arms: it also gates whether a docker worker's DinD cache self-prunes, and toggling it rolls the **non-ephemeral** docker-tier fleet the same way toggling any other pod-template field does (an ephemeral worker's rendered value never changes, so its pod does not roll on the toggle alone).

@@ -289,7 +289,8 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 - **A tools cache smaller than the current size** (provisioned before a size
   bump, like the one above) gets reconciled to the current size automatically:
   only the `/nix` cache PVC is recycled, and the `/data` PVC is preserved.
-  On Docker workers, Deployment replacement still loses run-workdir emptyDir.
+  On Docker workers, Deployment replacement keeps `/data/runner` (a subPath of
+  the `/data` PVC since #3153) and loses DinD state only.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
   same cordon behavior as above — then **both** its volumes are deleted and
@@ -299,8 +300,9 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 
 A **persistent Docker-capable worker** also has a separate DinD-only
 pressure recycle. It preserves the `/nix` and `/data` PVCs, worker UUID,
-and join Secret, but **loses all DinD state, including named Docker volumes,
-and the shared run-workdir emptyDir** when the Deployment is replaced.
+and join Secret, but **loses all DinD state, including named Docker volumes,**
+when the Deployment is replaced; the shared run directory
+`/data/runner` is on the `/data` PVC and is kept.
 Deliverables belong in git, published checkpoints, or captured work.
 **This destructive behavior defaults on for existing installs on upgrade.**
 
@@ -338,6 +340,38 @@ near it, a run's own build caches are bounded and reclaimed on their own —
 see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
 the cache drop, in-run cache cap, periodic reclaim, admission stop, and the
 bounded `data_volume_full` park that exist to make this recycle rare.
+
+### Docker workers: run directory on the data volume (#3153)
+
+On a Docker-capable worker `/data/runner` is a subPath of the `/data` PVC, so
+replacing the pod keeps the run clones; deleting or recycling the PVC itself
+(the full-volume recycle above, or removing an ephemeral worker) still deletes
+them. Full detail, including the rootless limitation (the dind uid cannot
+write into run directories the worker created, so **run Docker workers in
+uid-split mode**), is in [Docker inside a
+worker](./worker-docker.md#run-directory-on-the-data-volume). In short:
+
+- **Upgrade order.** Roll a worker image that carries the runner-shared layout
+  before or with the controller. A new controller refuses an old image
+  (`runner-init` fails the pod in `Init:CrashLoopBackOff`) before touching
+  any data.
+- **Migration guard.** A Docker worker that holds recovery custody stays on
+  the old layout until custody releases. The controller logs
+  `layout-migration-held-custody count=N workers=...` and the worker shows
+  "Worker roll held ... layout_migration_custody". A forced roll does not
+  override it. Eviction, drain and manual pod deletion are not guarded.
+- **Rollback.** Drain custody first; the `runner-shared` content stays on the
+  volume.
+- **Availability.** Daemon-owned content is extra bytes that cannot always be
+  reclaimed (not parity with a non-Docker worker). It is counted in the
+  worker log and the existing volume-pressure reporting applies; there is no
+  privileged reclaim and no admission headroom promise (admission fails open
+  on an unknown sample and reopens after `UZI_DISK_ADMISSION_MAX_WAIT`). A
+  custody-held worker can fill its data PVC and then needs an operator: see
+  [Retained sources with no open
+  hold](./run-recovery.md#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+  and [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md). Pressure never
+  authorizes bypassing custody.
 
 ## Message outbox
 

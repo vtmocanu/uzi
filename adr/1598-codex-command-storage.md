@@ -11,6 +11,7 @@ adds), and states explicitly that the same never-a-`sizeLimit` rule binds it
 too, for the same reason: a `sizeLimit` is a kubelet eviction path of its own
 (issue #224 / `specs/ai.md` §480; issue #225 is unrelated node image
 accumulation, not this eviction rule).
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (the `run-workdir` emptyDir is gone: Docker-lane `/data/runner` is now a `runner-shared` subPath of the data PVC. `codex-cmd-cache` is unaffected and stays a worker-only emptyDir)
 **Related**: issue #1598, issue #224, issue #1597, issue #1582.
 
 ## Context: the evidence
@@ -162,7 +163,7 @@ the `worker` container, never into seed-nix, dind-init or dind), prepared
   command cache into it risks the cache leaking into what the run commits, or
   a `docker run -v`/compose bind resolving into cache contents it was never
   meant to see.
-- **Not the dind-shared run workdir** (`dindWorkdirDir`, `/data/runner`). That
+- **Not the dind-shared run workdir** (`dindWorkdirDir`, `/data/runner`, a data-PVC subPath since ADR-3153). That
   volume exists specifically so bind-mount sources under the run's checkout
   resolve inside the dind daemon; the command cache has no reason to be
   reachable from a docker-in-docker daemon, and putting it there would make it
@@ -172,7 +173,7 @@ the `worker` container, never into seed-nix, dind-init or dind), prepared
   reclaim path, and no growth surviving a pod roll the way the docker tier's
   `dindDataSize` PVC deliberately does for its own, differently-motivated
   reasons (issue #224 M-a).
-- No `sizeLimit` on this emptyDir, matching `run-workdir`'s existing rule and
+- No `sizeLimit` on this emptyDir, matching the rule `run-workdir` had while it was an emptyDir (since removed, ADR-3153) and
   for the identical reason: a `sizeLimit` is enforced by kubelet **evicting
   the pod**, which is itself an eviction trigger and defeats the point of a
   cache that exists to reduce ephemeral churn (issue #224 / `specs/ai.md`

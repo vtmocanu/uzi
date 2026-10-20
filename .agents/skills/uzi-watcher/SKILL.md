@@ -271,7 +271,7 @@ current tip at that path ends `failed` with
 `workflow_scope_missing` ("branch changes .github/workflows … failing early"), with a
 `preserved_patch` only when its secret scan is trusted and clean. The work is usually
 recoverable from the durable sources or the worker's bare tracking ref, not guaranteed: a
-Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a failed run's
+Docker worker's clone is lost with its pod only while the worker is on the old layout (an `emptyDir`; since #3153 a migrated worker keeps `/data/runner` on its data PVC). See *Recovering a failed run's
 work from the worker PVC* below.
 
 - **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base BRANCH`
@@ -338,7 +338,10 @@ no kube access:
 
 Fall back to the worker PVC only for a **persistent** hosted worker: the bare repository's
 `refs/uzi-runner/agent/issue-N` tracking ref survives a pod roll on its data PVC. On
-Docker-capable workers, the live working clone is on `/data/runner`, an `emptyDir` lost with
+Docker-capable workers, the live working clone is on `/data/runner`. On a worker running the
+runner-shared layout (#3153) that is a subPath of the data PVC and survives pod replacement
+(a data-PVC recycle or delete still removes it); on an old-layout, unmigrated worker (a
+custody-held worker stays old until custody releases) it is an `emptyDir` lost with
 the pod. A graceful shutdown first commits non-ignored WIP and fetches the branch into the
 bare ref. A hard kill or failed commit/fetch can lose work absent from that ref; ignored
 files are never captured. Plain workers keep the clone on the data PVC. Snapshot active runs
@@ -642,8 +645,9 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    rm` refuses while that worker holds the run. If cancellation remains queued, wait
    for the #1969 fix, or use the exceptional workaround below after confirming its
    worker-wide impact. Remove the workaround from this step once #1969 ships.
-   - Back up every flight on that worker first: a Docker worker's `/data/runner` is an
-     `emptyDir` lost with its pod.
+   - Back up every flight on that worker first: an old-layout Docker worker's `/data/runner`
+     is an `emptyDir` lost with its pod (a runner-shared worker keeps it on its data PVC, but
+     snapshot anyway).
    - Confirm the impact on the whole worker with the user.
    - Scale the worker's Deployment to 0.
    - Wait until `uzi worker list` shows it `offline`. The threshold is

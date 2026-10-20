@@ -5,6 +5,8 @@
 **Deciders**: Vlad + agent team (risk/correctness and testability review waves screened the PRD before implementation; the user overrode their default-OFF recommendation on D9, see below)
 **PRD**: [prds/done/837-worker-disk-observability-and-pressure.md](../prds/done/837-worker-disk-observability-and-pressure.md) (GitHub issue [vtmocanu/uzi#837](https://github.com/vtmocanu/uzi/issues/837)) — the PRD carries the milestones, the verified anchors, and the full Decision Log (D1-D9); this ADR carries the durable design shape and the rationale a future reader most needs and will not re-derive from the diff.
 
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (Docker-lane `/data/runner` moved from the `run-workdir` emptyDir to the `runner-shared` subPath of the data PVC; pod replacement no longer loses the run workdir).
+
 ## Decision (summary)
 
 A worker now reports its `/nix` and `/data` filesystem usage on the existing heartbeat (mirroring the PRD #49 CPU/memory plumbing), the web renders it as a Disk bar beside CPU/Memory, and the controller gained **two new drift arms** that both resolve to the same mechanism: delete the Deployment and the target PVC(s), then let the existing create-gate re-mint them at the current size. One arm fires when a worker's observed `/nix` PVC is smaller than the current `preset.nixSize` constant (the direct root-cause fix for the incident this PRD documents); the other fires when the api derives sustained disk pressure (>=90% used, debounced, fresh) and flags it on the controller poll wire. Both arms drain a busy worker first, exclude ephemeral (run-bound, PRD #529) workers, and share one `recycleWorkerVolumes` helper and an explicit multi-phase state machine that only recreates the Deployment once the target PVC is observed **live** at the desired size — never over a PVC still `Terminating`.
@@ -92,7 +94,7 @@ with no rollback. DinD cooldown reads its own PVC creation time.
 
 **Default-on upgrade warning:** the DinD PVC recycle loses containers,
 named/anonymous volumes, networks, images and build cache, and Deployment
-replacement loses run-workdir emptyDir. Nix/data PVCs, worker UUID and join
+replacement no longer loses the run workdir (amended by ADR-3153: `/data/runner` is a data-PVC subPath; a data-PVC recycle still removes it). Nix/data PVCs, worker UUID and join
 Secret survive. Deliverables use git/checkpoints/capture, with no
 preservation inventory or migration. Set
 `UZI_WORKER_DISK_RECYCLE_ENABLED=false` before stop to opt out; a started

@@ -147,7 +147,7 @@ that is realized differs by platform, and the two do **not** map 1:1:
 | Drop | root entrypoint + in-process `setpriv` per spawn | per-container `runAsUser` (10001 / 10002) set by the kubelet |
 | Caps | worker keeps ambient `CAP_SETUID` to spawn the runner | **no `CAP_SETUID`**, no in-process uid spawn (the kubelet assigns uids) |
 | `/proc` | same pid namespace; environ unreadable via `0400`-owner | `shareProcessNamespace: false` → the agent container cannot see worker pids at all |
-| Worker↔runner | in-process spawn + shared `/data` volume | an **IPC** boundary + a shared `emptyDir` worktree (the `(C)`/sidecar model) |
+| Worker↔runner | in-process spawn + shared `/data` volume | an **IPC** boundary + a shared data-PVC subPath worktree (the `(C)`/sidecar model) |
 
 Do **not** claim mechanism A1 maps onto k8s `runAsUser`: A1 needs `CAP_SETUID` and
 an in-process drop, which the k8s form deliberately does not use. The k8s form is

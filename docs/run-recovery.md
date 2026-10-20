@@ -680,9 +680,12 @@ server custody, and nothing about it appears in the feed or in `uzi run recovery
 as a hold:
 
 - A restart of the same worker pod keeps the retained clone.
-- Replacing the pod loses an `emptyDir` clone on the Docker tier, even though the
-  bare repository's ledger entry or marker survive on the data volume. Inspect
-  then reports the source as missing, never as empty.
+- Replacing the pod keeps the clone on a Docker-tier worker that runs the
+  runner-shared layout (`/data/runner` is a subPath of the data volume, #3153).
+  On a worker still on the old layout, pod replacement loses the `emptyDir`
+  clone even though the bare repository's ledger entry or marker survive on the
+  data volume; inspect then reports the source as missing, never as empty. A
+  custody-held Docker worker stays on the old layout until custody releases.
 - Tearing down the PVC loses both.
 
 A successor's release of the old hold is not proof that the old clone's dirty
@@ -1445,9 +1448,10 @@ What the channel does not promise:
   uid's existing write access to `/data/runner`. Under the uid split the runner uids
   cannot connect.
 - **Durability follows the clone's storage.** A same-pod worker process restart keeps
-  the clone. Pod replacement loses an `emptyDir` clone (the Docker-tier `/data/runner`)
-  even though the bare-config ledger and marker survive; inspect reports such a source as
-  missing, never as empty work. PVC teardown loses both.
+  the clone. Pod replacement keeps the clone on a Docker-tier worker with the
+  runner-shared layout (#3153); on an old-layout worker it loses the `emptyDir` clone
+  (`/data/runner`) even though the bare-config ledger and marker survive; inspect reports
+  such a source as missing, never as empty work. PVC teardown loses both.
 - **Gitignored files are not covered.** No capture covers them; coverage is `HEAD` plus
   tracked and untracked non-ignored bytes.
 
