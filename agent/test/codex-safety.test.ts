@@ -2268,6 +2268,70 @@ describe("R2 terminal disposal acquisition", () => {
       expire: () => { assert.ok(expire); expire(); }, cancels: () => cancels };
   }
 
+  for (const failure of [false, true]) {
+    it(`enters idle zero-budget disposal and joins cleanup (throws=${failure})`, async () => {
+      const disposing = defer<void>(), cleanup = defer<void>();
+      const primary = new Error("idle cleanup failed");
+      const budgets: number[] = [];
+      const f = fixture(async request => {
+        budgets.push(request.deadlineMs);
+        disposing.resolve();
+        await cleanup.promise;
+        if (failure) throw primary;
+        return { kind: "disposed" };
+      });
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 0 });
+      let settled = false;
+      const checked = disposal.then(
+        result => { settled = true; return { result }; },
+        error => { settled = true; return { error }; },
+      );
+      // A turn of the event loop also lets a refused disposal report its result.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      try {
+        assert.deepEqual(budgets, [0], "idle disposal must enter the cleanup owner without inflating its budget");
+        await disposing.promise;
+        let laterRan = false;
+        const later = f.safety.withBoundary(req("checkpoint"), async () => { laterRan = true; });
+        f.advance(100);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false);
+        assert.equal(laterRan, false, "later acquisition must join entered zero-budget cleanup");
+        cleanup.resolve();
+        assert.deepEqual(await checked, failure ? { error: primary } : { result: { kind: "disposed" } });
+        await later;
+        assert.equal(laterRan, true);
+      } finally {
+        cleanup.resolve();
+        await checked;
+      }
+    });
+  }
+
+  for (const order of ["predecessor-first", "deadline-first", "ready-after-deadline"] as const) {
+    it(`refuses queued disposal in the same-tick ${order} race`, async () => {
+      let disposals = 0;
+      const f = fixture(async () => { disposals++; return { kind: "disposed" }; });
+      const entered = defer<void>(), release = defer<void>();
+      const active = f.safety.withBoundary(req("checkpoint"), async () => {
+        entered.resolve(); await release.promise;
+      });
+      await entered.promise;
+      const disposal = f.safety.dispose({ boundary: "terminal", deadlineMs: 50 });
+      try {
+        if (order === "predecessor-first") release.resolve();
+        f.advance(50);
+        if (order !== "ready-after-deadline") f.expire();
+        if (order !== "predecessor-first") release.resolve();
+        await active;
+        assert.deepEqual(await disposal, { kind: "incomplete", errors: [{
+          category: "timeout", message: "codex disposal expired in the boundary queue",
+        }] });
+        assert.equal(disposals, 0);
+      } finally { release.resolve(); await active; }
+    });
+  }
+
   for (const mode of ["hook", "zero", "expired"] as const) {
     it(`returns incomplete on ${mode} acquisition expiry without releasing the real predecessor`, async () => {
       let disposals = 0;

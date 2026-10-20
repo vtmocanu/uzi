@@ -1225,8 +1225,18 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     let queued = true;
     let cancelDeadline: (() => void) | undefined;
     try {
+      // Only a tail already settled at entry makes disposal idle. Close the
+      // observation window after one microtask so a genuinely queued predecessor
+      // settling later cannot grant the zero-budget cleanup exception.
+      let idle = false;
+      let observing = true;
+      const ready = prior.then(() => {
+        if (observing) idle = true;
+        return "ready" as const;
+      });
+      queueMicrotask(() => { observing = false; });
       const turn = await Promise.race([
-        prior.then(() => "ready" as const),
+        ready,
         new Promise<"expired">(resolve => {
           const remaining = this.remainingMs(deadlineAt);
           if (remaining <= 0) { resolve("expired"); return; }
@@ -1236,7 +1246,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       ]);
       cancelDeadline?.();
       cancelDeadline = undefined;
-      if (turn === "expired" || this.remainingMs(deadlineAt) <= 0) {
+      if (!idle && (turn === "expired" || this.remainingMs(deadlineAt) <= 0)) {
         return { kind: "incomplete", errors: [{
           category: "timeout", message: "codex disposal expired in the boundary queue",
         }] };
