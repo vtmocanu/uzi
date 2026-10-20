@@ -10,6 +10,7 @@ import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError } from "../src/git.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
+import { BaseAttestationMissingError, evaluateRequiredBase } from "../src/runner.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
@@ -1641,4 +1642,29 @@ test("issue #3194: the journal parser binds a restore source to a restore tip", 
   const { restoreTip: _tip, ...withoutTip } = good;
   assert.throws(() => recoveryProgress({ ...withoutTip, stage: "capturing", restoreSource: "a".repeat(40) }),
     /invalid retained recovery progress/);
+});
+
+test("issue #3194: an unmapped coverage wrapper is held by the --require-base decision, never accepted", async () => {
+  const reservation = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const tip = await capture();
+  const wrapper = wrapperOver(tip, git(bare, ["rev-parse", `${tip}^`]));
+  // No authenticated mapping reached the capture: the journal records no source for the wrapper.
+  const unrelated = git(bare, ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit-tree",
+    `${tip}^{tree}`, "-m", "unrelated root"]);
+  await cache.recordRecoveryCapture(bare, branch, key, source, reservation.attempts, wrapper, unrelated);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, reservation.attempts, aid(2));
+  assert.equal(successor.adoptedContentSource, undefined);
+  const identity = successor.adoptedContentSource ?? successor.adoptedSource;
+  assert.equal(identity, wrapper, "the guard compares the raw wrapper");
+  // The run DID attest its real source; the wrapper still cannot be vouched for.
+  assert.throws(() => evaluateRequiredBase({
+    plannedBase: git(bare, ["rev-parse", `${tip}^`]),
+    identity,
+    attestedSource: tip,
+    continuation: successor.seededFrom === "tracking" || successor.seededFrom === "checkpoint",
+    wipCherryPicked: successor.wipCherryPicked === true,
+    planned: { kind: "resolved", sha: git(bare, ["rev-parse", `${tip}^`]) },
+    identityTree: git(bare, ["rev-parse", `${identity}^{tree}`]),
+    materializedTree: git(successor.path, ["write-tree"]),
+  }), BaseAttestationMissingError);
 });
