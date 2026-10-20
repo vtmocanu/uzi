@@ -56,6 +56,15 @@ Review the plan against the new base, then create a new run with the updated
 See [rollout compatibility](./run-activity.md#when-a-required-base-has-changed)
 for mixed API/worker versions and historical runs.
 
+With `--require-base`, the check is exact. The first claim must check out the
+planned commit itself. When the run later continues its own work (after a
+budget pause and `uzi run extend`, or on another worker), it may only pick up
+content that one of its own checkpoints recorded after the check had passed.
+If it cannot prove that, the agent never starts and the run is held
+(`base_attestation_missing`) with its work kept, for you to recover, export or
+start a successor. Without `--require-base` nothing changes: a mismatch only
+warns.
+
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
 non-hex value is a usage error (exit 2). The safe answer is always the full
 SHA of the commit you planned against: `--planned-commit $(git rev-parse
