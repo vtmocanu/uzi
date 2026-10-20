@@ -482,6 +482,27 @@ be reconstructed. Provenance travels with run-log retrieval and is deleted
 with run history. This addition leaves the recorded extraction and precedence
 rules below intact.
 
+### Negotiated root-refusal hold exception (#3068)
+
+[ADR-3068](../../adr/3068-provider-policy-hold.md) supersedes the terminal and
+pause/wall outcomes above for negotiated, eligible noninteractive Codex roots of
+kind `issue`, `task`, `prompt` or `self_improve`. Admission requires API feature
+`provider_policy_hold`, worker capability `provider_policy_hold_v1` and the
+ADR's snapshot, claim-generation and lease prerequisites. An admitted refusal
+preserves work and conversation evidence and parks `paused` with
+`hold_reason=provider_policy_refusal`; pending pause or wall expiry settles into
+that hold. Cancel and quiescence fences remain authoritative. The refusal sink
+cannot publish normal completion, fail the run or start another root turn.
+
+Preserving resume carries owner guidance into the retained conversation. An
+unavailable or rejected conversation re-parks `resume_rejected`; a fresh
+conversation requires explicit consent for the exact next claim. Reviewed Stop
+retains frozen execution scope and feedback provenance without approving a
+revision candidate. Its composed execution proof and owner surfaces remain open
+under the PRD; this contract update supplies no native-provider or M0 acceptance.
+Unnegotiated and ineligible runs retain #2321's terminal behavior, and children
+retain their independent `child_policy_refused` result.
+
 ### Event, reducer and error authority
 
 1. Each raw input becomes one neutral event, including `activity` for ignored
