@@ -6106,6 +6106,7 @@ export class GitCache {
   async normalizeRetainedSourceObjects(
     barePath: string, branch: string, key: string, expectedSource: RecoverySource,
   ): Promise<void> {
+    if (this.boundaryProcesses.getStore()?.capture) refuseCapture();
     const operation = this.recoveryOperations.getStore();
     if (!operation) throw new Error("retained_readiness_operation_required");
     // The lock may report an expired operation after its callback settles. Keep
