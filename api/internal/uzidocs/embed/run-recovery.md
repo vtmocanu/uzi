@@ -1725,6 +1725,25 @@ for the body). The block lifts once each ref is deleted or settled. An
 acknowledged ref clears at its retention expiry, or sooner with
 `uzi run held expire`.
 
+## Resuming an approved run in a fresh attempt
+
+When a run whose plan you already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was reviewed by a person. The new session is told what happened, so it does not mistake the plan for its own:
+
+- **An approval statement.** The first implement prompt says the current plan was approved at the plan gate in an earlier session. Approval of the plan does not prove that any step the plan describes as happening before the gate actually took place.
+- **The plan.** The persisted plan is carried over unchanged. No gate revision number is shown.
+- **Your earlier follow-ups.** Follow-ups you sent in the earlier session are included once, oldest first, ahead of any new follow-ups, as clearly fenced historical context. The model treats them as untrusted background, not as new instructions. A follow-up you send after the resume is delivered normally and is never duplicated as history.
+
+The earlier follow-ups are bounded: at most 40000 characters of follow-up text and 100 entries in total. uzi never shortens a follow-up to fit.
+
+If uzi cannot restore your earlier follow-ups in full (the lookup failed or was unavailable, or the history is over either bound), the run does not use the reviewed resume. It plans again and waits for your approval at the plan gate, even on an autopilot run. The run's activity shows a status line giving the reason. Autopilot is switched off for the run when it parks, so a later recovery of a lost working tree also asks for your approval.
+
+Notes:
+
+- On a deployment whose API predates the follow-up lookup, every such resume waits for your approval. Upgrade the API before the workers.
+- A run that started from a supplied plan (seeded) resumes as before: no history, no forced approval.
+- If a resume with earlier follow-ups cannot deliver its pending input, the run fails when the failure is definitive and parks when it is transient.
+- A Codex run whose resume attempt is rejected mid-claim and falls back to a fresh thread is not covered by this carry-over.
+
 ## Salvage copies
 
 Separate from the archive above, a **salvage copy** is a bounded, run-scoped
