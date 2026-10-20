@@ -1,6 +1,7 @@
 import type { CapturedMemoryContext, SpawnCommandOptions } from "./broker.js";
+import { setTimeout as delay } from "node:timers/promises";
 import { bindMemoryCallback, isBrokerModelCommand } from "./broker.js";
-import type { CodexRootHandle } from "./launcher.js";
+import type { CodexRootHandle, ObservationOutcome } from "./launcher.js";
 import type { ExecutionRegistry, RegisteredRoot, ReapOutcome } from "./registry.js";
 import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
 
@@ -17,6 +18,41 @@ export async function boundedCommandWait<T>(promise: Promise<T>, timeoutMs: numb
       timer = setTimeout(() => reject(new Error("command cleanup/outcome deadline")), Math.max(1, timeoutMs));
     })]);
   } finally { if (timer) clearTimeout(timer); }
+}
+
+const STALE_RETRY_MS = 20;
+const STALE_WINDOW_MS = 1000;
+
+/** Mirror the Claude adapter's initial-observation policy without changing either adapter's
+ * enrollment contract. Only stale samples can start another read, within min(1 s, deadline/4).
+ * Each read gets deadline/2, so the last in-flight read can finish after the retry-start window
+ * but before the outer deadline. Abort ends this wait and prevents further retries. */
+async function initialObservation(handle: CodexRootHandle, deadlineMs: number, signal?: AbortSignal) {
+  if (signal?.aborted) return undefined;
+  const windowEnd = performance.now() + Math.min(STALE_WINDOW_MS, deadlineMs / 4);
+  const observeBudgetMs = Math.max(1, deadlineMs / 2);
+  const stop = new AbortController();
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<undefined>(resolve => {
+    onAbort = () => resolve(undefined);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+  const observe = async (): Promise<ObservationOutcome | undefined> => {
+    for (;;) {
+      if (signal?.aborted || stop.signal.aborted) return undefined;
+      const sample = await handle.observe(observeBudgetMs);
+      if (sample.state !== "unavailable" || sample.reason !== "stale" || stop.signal.aborted ||
+          signal?.aborted || performance.now() + STALE_RETRY_MS >= windowEnd) return sample;
+      try { await delay(STALE_RETRY_MS, undefined, { signal: stop.signal }); }
+      catch { return sample; }
+    }
+  };
+  try {
+    return await boundedCommandWait(Promise.race([observe(), aborted]), deadlineMs);
+  } finally {
+    stop.abort();
+    if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 /** Adapt only broker-minted model calls to the already registered supervisor.
@@ -36,8 +72,8 @@ export async function enrollMemoryCommand(
   const current = () => commands.isCurrent(context, flight, lifecycleRevision);
   if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
   const startedAtMs = performance.now();
-  const initial = await boundedCommandWait(handle.observe(deadlineMs), deadlineMs);
-  if (!current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
+  const initial = await initialObservation(handle, deadlineMs, signal);
+  if (!initial || !current() || signal?.aborted || !commands.admitsCommands(context)) throw new Error("captured memory admission closed");
   // Read-only uncertainty prevents memory intervention, not ordinary execution.
   // The registered root still owns exit, abort, deadline and disposal handling.
   if (initial.state !== "complete") return undefined;
