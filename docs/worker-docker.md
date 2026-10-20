@@ -194,13 +194,13 @@ per-pod `emptyDir`.
   against the volume's existing pressure thresholds; there is no Docker-specific
   threshold, and the volume sizes are unchanged.
 - **Rootless dind cannot write into run directories the worker made.** The
-  rootless daemon's uid cannot create files at the top of `runner-shared` or
-  inside a run's checkout, so `docker run -v <checkout>:...` bind sources
-  that need to write back into the checkout fail with a permission error
-  unless the directory is made writable another way, in either mode. Under
-  the uid split this matches the old `emptyDir` behaviour; in single-uid mode
-  it is tighter than the old world-writable directory (by permission
-  arithmetic, not measured). uid-split does not fix writability. **Run
+  rootless daemon's uid cannot create files inside a run's checkout (in
+  either mode; measured under uid-split, by permission arithmetic for
+  single-uid), so `docker run -v <checkout>:...` bind sources that need to
+  write back into the checkout fail with a permission error unless the
+  directory is made writable another way. Under uid-split it also cannot
+  create entries at the top of `runner-shared`. Under the uid split this
+  matches the old `emptyDir` behaviour. uid-split does not fix writability. **Run
   Docker workers in uid-split mode** for a different reason: it closes the
   single-uid subPath re-resolution residual (a worker-uid process replacing
   `runner-shared` before a dind restart; see

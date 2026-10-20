@@ -788,8 +788,8 @@ recorded in `specs/ai.md`; this stays a pointer, not a duplicate.
    a run's working tree survives a pod restart (a data-PVC recycle or delete still
    removes it). A pod still on the old layout (an `emptyDir`, e.g. one held by
    recovery custody until it releases) still loses the working tree on restart.
-   Committed work is safe either way (the persistent bare repo at `/data/repos`
-   re-clones on resume); see
+   Work fetched back to the bare repo at `/data/repos` or checkpointed is safe
+   either way (it re-clones on resume); see
    [adr/3153-runner-shared-pvc-subpath.md](../adr/3153-runner-shared-pvc-subpath.md).
 4. **Rootless fsGroup workdir read (M4 runtime check).** The workdir is
    `fsGroup: 10001`; whether a future *rootless* cluster's uid-1000 dind sidecar

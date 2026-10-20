@@ -2269,7 +2269,7 @@ unconfirmed drain left behind, gated on a kernel process-table proof that fails
 closed. The cache is a storage/performance boundary, not a trust boundary; see
 [ADR-1598](adr/1598-codex-command-storage.md) for the full mechanism, the
 supersession of `specs/ai.md`'s "only remaining emptyDir" sentence (the
-cache is a worker-only emptyDir; since #3153 the docker lane adds none),
+cache is a worker-only emptyDir; since #3153 the docker lane no longer adds the run-workdir emptyDir),
 and the pending hosted-worker ephemeral-request
 measurement, which is issue #1598's own post-deploy check (issue #225 is
 unrelated node image accumulation).

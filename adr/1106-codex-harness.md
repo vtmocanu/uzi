@@ -423,8 +423,7 @@ handlers. M3 implements them; M4 exercises the full adversarial clause map.
 ### Docker-wired command confinement limit
 
 Docker-wired Codex commands can access DinD. On hosted Kubernetes workers, DinD
-shares all of `/data/runner` (a `runner-shared` subPath of the data PVC since ADR-3153; `controller/internal/kube/render_dind.go` `dindWorkdirDir`,
-`dindWorkdirDir`), so a Docker bind mount can read or write a sibling run's clone
+shares all of `/data/runner` (a `runner-shared` subPath of the data PVC since ADR-3153; `controller/internal/kube/render_dind.go` `dindWorkdirDir`), so a Docker bind mount can read or write a sibling run's clone
 even when Landlock confines the command to its own run. The shared workdir may
 contain sensitive repository files. This shared-clone, same-owner cross-run
 disclosure and integrity residual is accepted for the opt-in Docker tier: hosted

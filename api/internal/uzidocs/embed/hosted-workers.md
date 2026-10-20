@@ -289,10 +289,10 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 - **A tools cache smaller than the current size** (provisioned before a size
   bump, like the one above) gets reconciled to the current size automatically:
   only the `/nix` cache PVC is recycled, and the `/data` PVC is preserved.
-  On Docker workers, this recycle keeps `/data/runner` (a subPath of the
-  `/data` PVC since #3153) and the DinD data volume (images, named volumes and
-  build cache survive); running DinD containers and networks are lost with the
-  stopped pod.
+  On Docker workers, this recycle keeps the DinD data volume (images, named
+  volumes and build cache survive) and, on a worker already on the #3153
+  layout, `/data/runner` (a subPath of the `/data` PVC); running DinD
+  containers stop with the pod.
 - **A volume that fills up** (at or above 90% used, sustained across a couple
   of heartbeats) gets recycled: the worker is drained first if it's busy —
   same cordon behavior as above — then **both** its volumes are deleted and
@@ -351,8 +351,8 @@ depends on the data StorageClass supporting reattach, which has not been
 verified); deleting or recycling the PVC itself (the full-volume recycle
 above, or removing an ephemeral worker) still deletes them. A rootless dind
 container cannot write into worker-created run directories through bind
-mounts in either uid mode (in uid-split this matches the old `emptyDir`
-behaviour). **Run Docker workers in uid-split mode** for a different reason:
+mounts (measured under uid-split, where this matches the old `emptyDir`
+behaviour; by permission arithmetic in single-uid mode). **Run Docker workers in uid-split mode** for a different reason:
 it closes the single-uid subPath re-resolution residual. Upgrade order, the
 custody migration guard (surfaced as the fleet health warning
 `Worker roll held at <image>: layout_migration_custody`), rollback and the disk-full
