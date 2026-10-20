@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -209,6 +210,123 @@ func TestPolicyHoldCancelAndLostOwnershipLiveDB(t *testing.T) {
 	_, d, err = e.svc.ReportPolicyHold(e.ctx, e.wkr, e.runID, req)
 	if err != nil || d != PolicyHoldUnauthenticatedHistoricalOutcome {
 		t.Fatalf("released cancel without custody disposition=%s %v", d, err)
+	}
+}
+
+// TestPolicyHoldArtifactPlacementLiveDB exercises the production SQL predicates with
+// collector-attached job_files, rather than invented requested capabilities. Each
+// claim is rolled back so the same placement/custody/affinity applies to both workers.
+func TestPolicyHoldArtifactPlacementLiveDB(t *testing.T) {
+	for _, capAware := range []bool{true, false} {
+		mode := "scheduling_on"
+		if !capAware {
+			mode = "scheduling_off"
+		}
+		t.Run(mode, func(t *testing.T) {
+			for _, tc := range []struct {
+				name                       string
+				policy, artifact, combined bool
+				wantCount                  int64
+				claimA, claimB             bool
+			}{
+				{"split", true, true, false, 0, false, false},
+				{"combined", true, true, true, 1, true, false},
+				{"no_policy", false, true, false, 1, false, true},
+				{"no_artifact", true, false, false, 1, true, false},
+				{"ordinary", false, false, false, 2, true, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					f := newCRFix(t)
+					f.svc.SetCapabilitySettings(fakeCapabilitySettings{on: capAware})
+					f.svc.SetJobFiles(NewJobFiles(f.env.pool, f.env.box, JobFileLimits{}, nil))
+					p := f.params(t, "placement", crObs(100, 0, 1), "S", 3)
+					if tc.artifact {
+						p = artifactParams(t, f, []byte("attached policy placement evidence\n"))
+					}
+					run, err := f.svc.CreateCIRepairRun(f.env.ctx, p)
+					if err != nil {
+						t.Fatal(err)
+					}
+					refusals := 0
+					if tc.policy {
+						refusals = 1
+					}
+					f.env.exec("UPDATE runs SET harness='codex',policy_refusal_count=$2 WHERE id=$1", run.ID, refusals)
+					base := []string{capability.CIConfigGuardV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}
+					aCaps := append(append([]string{}, base...), capability.ProviderPolicyHoldV1)
+					if tc.combined {
+						aCaps = append(aCaps, capability.CIArtifactsV1)
+					}
+					a := f.guardWorker(t, 1, aCaps...)
+					b := f.guardWorker(t, 1, append(base, capability.CIArtifactsV1)...)
+					row := healthRowForRun(t, f.env, run.ID)
+					if row.Kind != "prompt" || !row.CiConfigGuard || row.CiArtifactsAttached != tc.artifact ||
+						row.PolicyRefusalCount != int32(refusals) || len(row.RequiredCapabilities) != 0 {
+						t.Fatalf("fixture must be a guarded Codex prompt with real attachment and no scheduling workaround: %+v", row)
+					}
+					t.Logf("fixture: attached=%v policy=%d required_capabilities=%v", row.CiArtifactsAttached, row.PolicyRefusalCount, row.RequiredCapabilities)
+					for _, worker := range []struct {
+						name string
+						w    store.Worker
+						want bool
+					}{{"workerA", a, tc.claimA}, {"workerB", b, tc.claimB}} {
+						func() {
+							tx, err := f.env.pool.Begin(f.env.ctx)
+							if err != nil {
+								t.Fatal(err)
+							}
+							defer func() { _ = tx.Rollback(f.env.ctx) }()
+							params := claimRunParamsFor(worker.w)
+							params.CapabilityAware = capAware
+							got, err := store.New(tx).ClaimRun(f.env.ctx, params)
+							if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+								t.Fatalf("%s ClaimRun: %v", worker.name, err)
+							}
+							claimed := err == nil
+							if claimed != worker.want || (claimed && got.ID != run.ID) {
+								t.Errorf("%s ClaimRun claimed=%v run=%s want claimed=%v run=%s", worker.name, claimed, got.ID, worker.want, run.ID)
+							} else {
+								t.Logf("PASS %s production ClaimRun claimed=%v (rolled back)", worker.name, claimed)
+							}
+						}()
+					}
+					now := time.Now()
+					n, err := f.env.q.CountOnlineWorkersSatisfyingPolicyHold(f.env.ctx, store.CountOnlineWorkersSatisfyingPolicyHoldParams{
+						RunID: run.ID, HeartbeatCutoff: pgconv.Time(now.Add(-f.svc.p.WorkerHeartbeatStale)),
+						AffinityCutoff:        pgconv.Time(now.Add(-f.svc.p.WorkerAffinityCeiling)),
+						CrossCheckEvaluatedAt: pgconv.Time(now), CrossCheckAffinityCutoff: pgconv.Time(now.Add(-f.svc.p.WorkerAffinityGrace)),
+						StaleRequeueCutoff:  StaleRequeueCutoff(now, f.svc.p.WorkerStaleRequeueGrace),
+						DockerRepoAllowlist: []uuid.UUID{}, CodexCuratedModels: codexCuratedModelsSlice(),
+						CapabilityAware: capAware, EphemeralLease: LeaseInterval(f.svc.ephemeralLease),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if n != tc.wantCount {
+						t.Errorf("production policy query count=%d want=%d (same worker must satisfy policy and attached input)", n, tc.wantCount)
+					} else {
+						t.Logf("PASS production policy query count=%d", n)
+					}
+					eligible, err := f.svc.WorkerEligibilityForHealth(f.env.ctx, now, run.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if eligible.StrictEligible != tc.wantCount {
+						t.Errorf("WorkerEligibilityForHealth strict=%d want=%d", eligible.StrictEligible, tc.wantCount)
+					} else {
+						t.Logf("PASS WorkerEligibilityForHealth strict=%d", eligible.StrictEligible)
+					}
+					reason := f.svc.queuedReason(f.env.ctx, now, row)
+					if tc.wantCount == 0 && reason != reasonNoPolicyHoldCapableWorker {
+						t.Errorf("queuedReason=%q want=%q", reason, reasonNoPolicyHoldCapableWorker)
+					} else if tc.wantCount > 0 && reason != reasonWaitingWorker {
+						t.Errorf("eligible worker queuedReason=%q want=%q", reason, reasonWaitingWorker)
+					} else {
+						t.Logf("PASS queuedReason=%q", reason)
+					}
+				})
+			}
+		})
 	}
 }
 
