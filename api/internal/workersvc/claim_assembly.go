@@ -193,7 +193,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
-	// repos → forge_connections and would treat a repo-less judge run as vanished)
+	// repos → forge_connections and returns no rows for a repo-less judge run, which
+	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
