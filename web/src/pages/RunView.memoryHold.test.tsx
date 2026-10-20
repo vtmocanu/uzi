@@ -42,7 +42,7 @@ function held(over: Partial<Run> = {}): Run {
 function view(run: Run, proof?: boolean, canSteer = true) {
   vi.mocked(useRunStream).mockReturnValue({ run, messages: [], connected: true, error: "",
     submit, refreshRun, inputs: [], refreshInputs: vi.fn(), canSteer,
-    confirmedOwner: proof } as ReturnType<typeof useRunStream>);
+    confirmedOwner: proof } as unknown as ReturnType<typeof useRunStream>);
   return <MemoryRouter initialEntries={["/runs/held"]}><Routes>
     <Route path="/runs/:id" element={<RunView />} />
   </Routes></MemoryRouter>;
