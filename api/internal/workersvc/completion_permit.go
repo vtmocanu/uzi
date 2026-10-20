@@ -490,8 +490,14 @@ func (s *Service) loadClaimedInterlockedRun(ctx context.Context, runID uuid.UUID
 // Every rejection is a NON-TERMINAL structured denial; a missing-milestones denial also records
 // a bounded completion attempt.
 func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker, runID uuid.UUID, req CompletionPermitRequest) (CompletionPermitResult, error) {
-	locked, _, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
+	locked, owned, tx, err := s.beginClaimMutation(ctx, wkr, runID, req.ClaimGeneration)
 	if err != nil {
+		// The unlocked fallback refuses semantic-looking authority. An unverifiable one is
+		// the same fail-closed hold as a corrupt structural contract, not an internal error;
+		// a valid semantic contract keeps the refusal.
+		if errors.Is(err, ErrSemanticCompletionAuthority) && unverifiableSemanticContract(owned) {
+			return CompletionPermitResult{DenyReason: CompletionDenyContractNotFrozen}, nil
+		}
 		return CompletionPermitResult{}, err
 	}
 	if tx != nil {
@@ -1168,4 +1174,16 @@ func permitToDTO(p store.RunCompletionPermit, scope *CompletionScopeConfig) *Com
 		FindingIDs:       findings,
 		CompletionScope:  scope,
 	}
+}
+
+// unverifiableSemanticContract reports a profile=semantic contract that fails strict decoding
+// or CompletionPending validation. Structural contracts carrying semantic fields are not
+// covered: they keep the unlocked-fallback refusal.
+func unverifiableSemanticContract(run store.Run) bool {
+	var c completionContract
+	if json.Unmarshal(run.CompletionContract, &c) != nil || c.Profile != "semantic" {
+		return false
+	}
+	_, err := CompletionPending(run)
+	return errors.Is(err, ErrSemanticCompletionAuthority)
 }
