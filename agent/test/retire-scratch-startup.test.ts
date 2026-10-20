@@ -56,7 +56,7 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     assert.equal(w.length, 1, "exactly one warning");
     assert.equal(w[0]!.count, 2);
     assert.deepEqual([...w[0]!.paths].sort(), [".retire-full", ".retire-full2"]);
-    assert.ok(path.resolve(root).startsWith(w[0]!.root.replace(/\.\.\.$/, "")), "root names the inspected runner root");
+    assert.equal(w[0]!.root, path.resolve(root));
   });
 
   it("skips a parent whose mtime is at or after process start, empty or not", async () => {

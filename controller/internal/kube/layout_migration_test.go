@@ -860,3 +860,57 @@ func TestLayoutMigrationSnapshotBlockedHeldWorkerFencesPool(t *testing.T) {
 		t.Fatalf("never rolled after release; pacing %+v", f.m.PacingOutcomes()["d1"])
 	}
 }
+
+// A held worker with no decodable marker still fences the pool when it carries
+// reservation metadata the withdrawal cannot attribute to a marker: an undecodable
+// Deployment annotation, or only a retained claim mirror.
+func TestLayoutMigrationHeldUndecodableReservationFencesPool(t *testing.T) {
+	cases := map[string]func(objs []runtime.Object){
+		"malformed deployment annotation": func(objs []runtime.Object) {
+			for _, o := range objs {
+				if d, ok := o.(*appsv1.Deployment); ok && d.Name == deploymentName("d1") {
+					d.Annotations[annotationRoll] = "{not-json"
+				}
+			}
+		},
+		"claim mirror only": func(objs []runtime.Object) {
+			for _, o := range objs {
+				switch v := o.(type) {
+				case *appsv1.Deployment:
+					if v.Name == deploymentName("d1") {
+						delete(v.Annotations, annotationRoll)
+					}
+				case *corev1.PersistentVolumeClaim:
+					if v.Name == dataPVCName("d1") {
+						v.Annotations = map[string]string{annotationRoll: "{not-json"}
+					}
+				}
+			}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			hObjs, h := lmObjects(t, lmOpts{id: "d1", custody: true, stale: true, layout: "old", marker: "participant"})
+			cObjs, canary := lmObjects(t, lmOpts{id: "d2", layout: "new", marker: "canary", promoted: true})
+			objs := append(hObjs, cObjs...)
+			mutate(objs)
+			// With no decodable marker the held worker's coverage comes from its API
+			// evidence, which grants Docker workers the "docker" scheduling capability;
+			// give the canary's marker the same coverage so both share one pool.
+			for _, o := range objs {
+				if d, ok := o.(*appsv1.Deployment); ok && d.Name == deploymentName("d2") {
+					m, err := decodeRoll(d.Annotations[annotationRoll])
+					if err != nil {
+						t.Fatal(err)
+					}
+					m.Coverage.Scheduling = []string{"docker"}
+					raw, _ := json.Marshal(m)
+					d.Annotations[annotationRoll] = string(raw)
+				}
+			}
+			f := lmCluster(t, false, objs...)
+			_ = f.tickErr(t, h, canary)
+			lmAssertCohortFenced(t, f, "d1", "d2")
+		})
+	}
+}
