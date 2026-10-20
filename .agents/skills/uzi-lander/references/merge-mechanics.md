@@ -47,7 +47,7 @@ stop rather than forcing.
 - **`BEHIND` after an earlier merge** is expected (main moved). `--admin` bypasses the
   strict check; otherwise `gh pr update-branch` the PR and re-wait for CI. A BEHIND PR that
   also carries a migration-number collision or a conflict needs `scripts/land-prep.sh`
-  (rebase + renumber + gates + lease push) first.
+  (rebase or merge + renumber + lease push) first.
 - Merging is **outward-facing**: unless the user pre-authorized it (they chose Auto mode,
   or said "merge as admin"), surface the MR + your review and get their OK first.
 - **Merge each PR the moment it is review-clean and CI-green — do NOT hold the whole
@@ -57,8 +57,8 @@ stop rather than forcing.
 - **`--admin` does NOT bypass a real git conflict.** It clears the ruleset gates (review,
   up-to-date, status checks), but a `gh pr merge` returning `Pull Request has merge
   conflicts` or `the merge commit cannot be cleanly created` is a git-level conflict —
-  resolve it locally (`scripts/land-prep.sh`, or `git merge origin/main` in the branch's
-  own worktree, fix, push), then merge.
+  resolve it locally with `scripts/land-prep.sh` (it merges `origin/main` in, rather than
+  rebasing, for a branch holding merge commits; `--merge` forces that), then merge.
 - **Parallel PRs collide on hand-edited shared files (ARCHITECTURE.md, a shared handler),
   and each merge re-conflicts the next.** A two-PR edit of DIFFERENT regions three-way-merges
   clean; only overlapping hunks conflict. `specs/ai.md` is frozen (issue #1317) and no

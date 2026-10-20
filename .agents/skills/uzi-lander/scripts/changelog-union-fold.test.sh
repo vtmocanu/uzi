@@ -315,4 +315,34 @@ RC=0; OUT=$(bash "$SCRIPT" "$WORK/plain.md" 2>&1) || RC=$?
 [ "$RC" -eq 1 ] || fail "plain: expected exit 1, got $RC: $OUT"
 cmp -s "$WORK/plain.md" "$WORK/plain.before" || fail "plain: a refusal must leave the file untouched"
 
-echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals, and a fold that only linkified a bare (#N) citation (tolerated; a reworded, mis-targeted or de-duplicated copy still refuses)"
+# 16. --merge-stages (land-prep merge mode: the base merged INTO the branch, so stage 2 is the
+#     branch and stage 3 the base). The happy-path shapes fold to the same result, the index
+#     is left as it was, and the same swapped stages read WITHOUT the flag do not fold (the
+#     flag is what maps them). A refusal shape still refuses under the flag.
+mkconflict_merge() { # NAME: as mkconflict, with stages 2 and 3 in merge orientation
+  local d="$WORK/$1" s1 s2 s3
+  git init -q -b main "$d"
+  s1=$(git -C "$d" hash-object -w "$WORK/$1.base.md")
+  s2=$(git -C "$d" hash-object -w "$WORK/$1.branch.md")
+  s3=$(git -C "$d" hash-object -w "$WORK/$1.main.md")
+  printf '100644 %s 1\tCHANGELOG.md\n100644 %s 2\tCHANGELOG.md\n100644 %s 3\tCHANGELOG.md\n' "$s1" "$s2" "$s3" |
+    git -C "$d" update-index --index-info
+  { echo '<<<<<<< origin/main'; cat "$WORK/$1.main.md"; echo '||||||| ancestor'; cat "$WORK/$1.base.md"; echo '======='
+    cat "$WORK/$1.branch.md"; echo '>>>>>>> branch'; } > "$d/CHANGELOG.md"
+}
+for f in base main branch want; do cp "$WORK/happy.$f.md" "$WORK/mhappy.$f.md"; cp "$WORK/happy.$f.md" "$WORK/mnoflag.$f.md"; done
+mkconflict_merge mhappy
+before_idx=$(git -C "$WORK/mhappy" ls-files -u)
+RC=0; OUT=$(cd "$WORK/mhappy" && bash "$SCRIPT" --merge-stages CHANGELOG.md 2>&1) || RC=$?
+[ "$RC" -eq 0 ] || fail "mhappy: --merge-stages fold failed, rc=$RC: $OUT"
+diff -u "$WORK/mhappy.want.md" "$WORK/mhappy/CHANGELOG.md" || fail "mhappy: wrong result"
+[ "$(git -C "$WORK/mhappy" ls-files -u)" = "$before_idx" ] || fail "mhappy: the index stages were rewritten"
+mkconflict_merge mnoflag; expect_refuse mnoflag
+for f in base main branch; do cp "$WORK/del.$f.md" "$WORK/mdel.$f.md"; done
+mkconflict_merge mdel
+before=$(cat "$WORK/mdel/CHANGELOG.md")
+RC=0; OUT=$(cd "$WORK/mdel" && bash "$SCRIPT" --merge-stages CHANGELOG.md 2>&1) || RC=$?
+[ "$RC" -eq 1 ] || fail "mdel: expected exit 1 under --merge-stages, got $RC: $OUT"
+[ "$(cat "$WORK/mdel/CHANGELOG.md")" = "$before" ] || fail "mdel: a refusal must leave the file untouched"
+
+echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals, and a fold that only linkified a bare (#N) citation (tolerated; a reworded, mis-targeted or de-duplicated copy still refuses); --merge-stages folds merge-oriented stages without rewriting the index, and they do not fold without it"
