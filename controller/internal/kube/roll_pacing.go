@@ -262,8 +262,11 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 // get roll budget only after the canary is promoted, and a promoted canary is on the
 // target template, so it is not drifted and cannot be held. This holds while the
 // pool's roll target is unchanged. A mid-cohort target change can re-drift a
-// promoted canary, which is then held only if its observed layout is still old (a
-// leftover old-layout pod); that case is not specially guarded.
+// promoted canary, which is then held only if it is custody-held and its observed
+// layout is old or unknown (a leftover old-layout pod, or a failed pod list); that
+// case is not specially guarded. With no decodable marker the fence keys on the
+// worker's current coverage, which can differ from a cohort reserved under older
+// capabilities.
 func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, e *rollEntry) {
 	t.outcomes[e.w.ID].State = "held"
 	t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
