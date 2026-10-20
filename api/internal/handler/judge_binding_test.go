@@ -93,7 +93,7 @@ func newJudgeBindHandler(t *testing.T, db *fakeUserDB, st *judgeBindStore) *Hand
 	if err != nil {
 		t.Fatalf("new box: %v", err)
 	}
-	return &Handler{q: store.New(db), wsvc: workersvc.New(st, box, workersvc.Params{})}
+	return &Handler{q: store.New(db), wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 }
 
 func judgeReq(user uuid.UUID, body string) *http.Request {

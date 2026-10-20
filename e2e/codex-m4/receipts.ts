@@ -26,14 +26,20 @@
 // THE DENY / ALLOW LISTS (classifyPath). The shipped codex guardrail RUNTIME is everything under
 // `agent/` EXCEPT `agent/test/` (agent/src is COPY'd to /app and run via tsx; agent/codex/supervisor
 // is go-built; agent/templates holds the Dockerfiles + entrypoint; agent/package*.json,
-// agent/tsconfig.json, agent/devbox-global, agent/bin are build inputs). Everything else that the
-// worker image does not run as a guardrail — agent/test/, e2e/, prds/, docs/, adr/, specs/, .claude/,
-// Taskfile.yml, and *.md — is EVIDENCE. The deny list (agent/ minus agent/test/) is checked FIRST so
-// a runtime path can never be mis-shelved into the allow list; an unrecognized path is `unclassified`
-// and rejects (fail closed — a new top-level path must be classified deliberately). receipts.test.ts
-// PINS these lists to the real Dockerfile COPY set, so they cannot silently drift from what the
-// worker image actually ships. A KEY invariant this encodes: `Taskfile.yml` (which merely names how
-// to BUILD/prove) never determines the shipped guardrail image identity, so it is `evidence`.
+// agent/tsconfig.json, agent/devbox-global, agent/bin are build inputs). The api module is runtime
+// too: the M3b proof builds its worker-route test server from the whole `api/` context and exercises
+// it as an executable component, so every `api/` path except a Go `*_test.go` is a runtime/build
+// input (#3148). The proof HARNESS, tests and documentation are EVIDENCE — agent/test/, e2e/, prds/,
+// docs/, adr/, specs/, .claude/, Taskfile.yml, *.md outside api/, any Go `*_test.go` outside agent/
+// (never compiled into a shipped or test-server binary) — and so are deploy/ (the Helm chart) and
+// scripts/ (repo tooling), which neither the image nor the proof builds or runs; they reach the
+// image only as the inert `COPY . /opt/uzi-src` source copy. The deny lists (agent/ minus agent/test/, then api/ minus Go tests) are
+// checked FIRST so a runtime path can never be mis-shelved into the allow list; an unrecognized path
+// is `unclassified` and rejects (fail closed — a new top-level path must be classified deliberately).
+// receipts.test.ts PINS these lists to the real Dockerfile COPY set and the M3b test-server build
+// context, so they cannot silently drift from what the worker image ships or the proof builds. A KEY
+// invariant this encodes: `Taskfile.yml` (which merely names how to BUILD/prove) never determines the
+// shipped guardrail image identity, so it is `evidence`.
 //
 // THE TRUST BOUNDARY. The gate TRUSTS the out-of-band manifest (the maintainer produced it from a
 // real `UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged` proof). It verifies the manifest's
@@ -172,19 +178,23 @@ export function parseManifest(raw: unknown): { manifest: CandidateManifest } | {
   return { manifest };
 }
 
-/** The three path classes the evidence-only-tail rule turns on. `runtime` — part of the shipped
- *  codex guardrail runtime; `evidence` — not shipped as a guardrail (tests/docs/e2e/tooling);
- *  `unclassified` — an unrecognized path that fails closed (a new top-level path must be classified
- *  deliberately). The deny list is checked FIRST so a runtime path can never fall into the allow
- *  list. Pinned to the real Dockerfile COPY set by receipts.test.ts (see the module header). */
+/** The three path classes the evidence-only-tail rule turns on. `runtime` — a runtime/build input:
+ *  the shipped codex guardrail runtime or the api test server the proof builds and exercises;
+ *  `evidence` — the proof harness, tests, documentation, chart and repo tooling; `unclassified` — an unrecognized path that
+ *  fails closed (a new top-level path must be classified deliberately). The deny lists are checked
+ *  FIRST so a runtime path can never fall into the allow list. Pinned to the real Dockerfile COPY set
+ *  and the M3b test-server build context by receipts.test.ts (see the module header). */
 export type PathClass = "evidence" | "runtime" | "unclassified";
 
 export function classifyPath(p: string): PathClass {
   if (p.startsWith("agent/") && !p.startsWith("agent/test/")) return "runtime";
+  if (p.startsWith("api/") && !p.endsWith("_test.go")) return "runtime";
   if (
     p.startsWith("e2e/") || p.startsWith("prds/") || p.startsWith("docs/") ||
     p.startsWith("adr/") || p.startsWith("specs/") || p.startsWith(".claude/") ||
-    p.startsWith("agent/test/") || p === "Taskfile.yml" || p.endsWith(".md")
+    p.startsWith("deploy/") || p.startsWith("scripts/") ||
+    p.startsWith("agent/test/") || p === "Taskfile.yml" || p.endsWith(".md") ||
+    p.endsWith("_test.go")
   ) return "evidence";
   return "unclassified";
 }

@@ -72,6 +72,7 @@ func (fx *ephemeralFixture) dockerClaimService(probe *dockerAllowlistProbe, tier
 	fx.t.Helper()
 	fx.sealDockerClaimCredentials()
 	svc := workersvc.New(fx.q, fx.box, workersvc.Params{
+		CustodyHoldLimit:     defaultCustodyLimit(),
 		WorkerHeartbeatStale: time.Minute, WorkerAffinityCeiling: time.Minute, WorkerSpreadGrace: time.Hour,
 	})
 	svc.SetTxBeginner(fx.pool)

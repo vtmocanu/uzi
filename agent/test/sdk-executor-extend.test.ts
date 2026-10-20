@@ -129,7 +129,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext } {
     sessionId: null,
     onSessionId: () => {},
     gatePlan: async () => approve,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: () => {},
     ...overrides,
   };

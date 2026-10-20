@@ -63,7 +63,7 @@ function mount(modeA: Mode = "ordinary", modeB: Mode = modeA) {
     run: runFor(delayedA ? "A" : id, id === "A" || delayedA ? modeA : modeB),
     messages: [], connected: true, error: "", submit, refreshRun,
     inputs: [], refreshInputs: vi.fn(), canSteer: true, confirmedOwner: owner,
-  } as ReturnType<typeof useRunStream>));
+  } as unknown as ReturnType<typeof useRunStream>));
   const tree = () => <MemoryRouter initialEntries={["/runs/A"]}><Controls />
     <Routes><Route path="/runs/:id" element={<RunView />} /></Routes>
   </MemoryRouter>;
@@ -178,7 +178,7 @@ it("provider Stop awaits scope then resumes the captured run", async () => {
   expect(api.submitRunInput).toHaveBeenCalledWith("A", "scope", "1");
   expect(api.resumeRun).toHaveBeenCalledWith("A");
   expect(refreshRun).toHaveBeenCalledOnce();
-  expect(screen.queryByText(/Paused by you/)).toBeNull();
+  expect(screen.queryByText(/Paused(?: at|$)/)).toBeNull();
   expect(screen.queryByText("Completion state")).toBeNull();
 });
 

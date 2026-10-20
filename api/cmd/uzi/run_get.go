@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -79,7 +80,25 @@ func newRunGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(run)
 			}
-			if err := renderRunDetail(p, run); err != nil {
+			origin := ""
+			if run.Status == statusPaused && strOr(run.HoldReason, "") == "" {
+				messages, readErr := c.RunLogsPage(cmd.Context(), args[0], uzicli.LogsPageQuery{Tail: 100})
+				ready := readErr == nil
+				if len(messages) > 0 {
+					low, high := messages[0].Seq, messages[0].Seq
+					for _, message := range messages {
+						if message.Seq < low {
+							low = message.Seq
+						}
+						if message.Seq > high {
+							high = message.Seq
+						}
+					}
+					ready = ready && low > 0 && runpresentation.ContiguousMessages(messages, low-1, high)
+				}
+				origin = runpresentation.PauseOrigin(run, messages, ready)
+			}
+			if err := renderRunDetail(p, run, origin); err != nil {
 				return err
 			}
 			// Metadata-only durable-recovery summary (PRD #1296 D7): best-effort, human-only,

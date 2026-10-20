@@ -109,7 +109,8 @@ export function applyFrame(
       agent_instance: frame.agent_instance ?? null,
       agent_label: frame.agent_label ?? null,
       payload: frame.payload,
-      created_at: frame.created_at ?? new Date().toISOString(),
+      // Missing server time is invalid evidence; never invent a receipt timestamp.
+      created_at: frame.created_at ?? "",
     };
     const r = ingest(state, msg);
     // A progress_note (PRD #2603) updates Run.progress.now_note, which only a run re-read

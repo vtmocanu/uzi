@@ -21,6 +21,9 @@ func TestHealthPlanCrossCheckWaitExcludedLiveDB(t *testing.T) {
 		rows, err := fx.q.ListWaitingWorkerRuns(fx.ctx)
 		var oldest pgtype.Timestamptz
 		for _, row := range rows {
+			if row.UserID == fx.userID && row.HealthReason.Valid && row.HealthReason.String == "waiting until 2026-07-12T12:07:00Z for code cross-check" {
+				t.Errorf("ListWaitingWorkerRuns included code wait %s", row.RunID)
+			}
 			if row.HealthSince.Valid && (!oldest.Valid || row.HealthSince.Time.Before(oldest.Time)) {
 				oldest = row.HealthSince
 			}
@@ -55,6 +58,8 @@ func TestHealthPlanCrossCheckWaitExcludedLiveDB(t *testing.T) {
 		return run
 	}
 	expected := seed("waiting for plan cross-check", since, true)
+	codeWait := seed("waiting until 2026-07-12T12:07:00Z for code cross-check", since.Add(-time.Hour), true)
+	mustExec(fx.ctx, t, fx.pool, "UPDATE runs SET code_cross_check_required=true WHERE id=$1", codeWait)
 	assertOldest := func(t *testing.T, want pgtype.Timestamptz) {
 		t.Helper()
 		got, err := oldestWaiting()
@@ -95,7 +100,7 @@ func TestHealthPlanCrossCheckWaitExcludedLiveDB(t *testing.T) {
 			}
 		}
 	}
-	t.Run("expected plan wait leaves global oldest and owner capacity unchanged", func(t *testing.T) {
+	t.Run("expected plan and code waits leave global oldest and owner capacity unchanged", func(t *testing.T) {
 		assertOldest(t, baseline)
 		assertCapacity(t, nil)
 	})

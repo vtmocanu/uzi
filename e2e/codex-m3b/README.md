@@ -63,7 +63,15 @@ UZI_CODEX_M3B_PACKAGED=1 task test:codex-m3b:packaged
 
 # Nested Docker only, when bridge-networked build steps have no egress:
 UZI_CODEX_M3B_PACKAGED=1 UZI_M3B_BUILD_NETWORK=host task test:codex-m3b:packaged
+
+# The full strict O proof (this suite + the M3a legs, one image per template):
+task test:codex-proof
 ```
+
+`.github/workflows/codex-packaged-proof.yml` runs `task test:codex-proof`'s script
+(`e2e/codex-proof/run-proof.sh`) nightly and on pull requests touching the Codex runtime, packaging or these harnesses.
+It sets `UZI_CODEX_PROOF_STRICT=1`, under which `run-lifecycle.sh` also fails on any skipped,
+todo or missing test, including a skipped `describe` that `node --test` never counts.
 
 `test:codex-m3b:packaged` runs the host `tsc` (always) and, when `UZI_CODEX_M3B_PACKAGED=1` is
 set with a working docker daemon, builds both `base` and `jvm` images and runs

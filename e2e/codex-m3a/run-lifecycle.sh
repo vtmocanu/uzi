@@ -11,6 +11,8 @@
 #   * read-only root filesystem (`--read-only`), read-only mounted fixtures,
 #   * exactly three explicit writable runtime mounts: runner-owned /nix, owned /data and
 #     per-uid /tmp (the entrypoint chowns/creates all three while the image root stays ro),
+#     plus the worker's dedicated command-cache carveout /var/cache/uzi-codex-cmd, which the
+#     entrypoint chowns to runner-cmd since #1619 (the same mount the m3b runner gained in #3114),
 #   * `--network none` (loopback only, for the localhost fake provider),
 #   * `--cap-drop ALL` + only the startup caps the A1 entrypoint needs, no-new-privileges.
 #
@@ -27,6 +29,10 @@
 #   UZI_M3A_DOCKERFILE  Dockerfile to build             (default: agent/templates/base/Dockerfile)
 #   UZI_M3A_SKIP_BUILD  set to 1 to reuse an existing image (skip docker build)
 #   UZI_M3A_TEST_TIMEOUT  outer watchdog seconds        (default: 600)
+#   UZI_CODEX_PROOF_STRICT  set to 1 to also fail on any skipped, todo or missing test: node
+#                         --test passes a skipped test or describe with rc 0, so the scheduled
+#                         proof (#3148) adds a TAP stream checked by e2e/codex-proof/check-node-tap.mjs
+#   UZI_CODEX_PROOF_TAP   strict mode's TAP file          (default: lifecycle-tap.<pid>.log here)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,6 +41,13 @@ IMAGE="${UZI_M3A_IMAGE:-uzi-agent-m3a:base}"
 DOCKERFILE="${UZI_M3A_DOCKERFILE:-agent/templates/base/Dockerfile}"
 TIMEOUT="${UZI_M3A_TEST_TIMEOUT:-600}"
 NAME="codex-m3a-lifecycle-$$"
+STRICT="${UZI_CODEX_PROOF_STRICT:-}"
+TAP_OUT="${UZI_CODEX_PROOF_TAP:-$HERE/lifecycle-tap.$$.log}"
+REPORTERS=""
+if [ "$STRICT" = "1" ]; then
+  # spec stays the human-readable stdout; TAP goes to stderr, which the host captures.
+  REPORTERS="--test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination=stderr"
+fi
 
 log() { printf '\n### %s\n' "$*"; }
 
@@ -54,25 +67,49 @@ fi
 #    drives installed supervisor/Codex.
 #    Type-only source imports are erased and cannot substitute the host tree at runtime.
 log "running lifecycle + isolation suites in $IMAGE under the confinement posture"
+# The single-quoted command is expanded by the inner container shell, not this host shell;
+# UZI_TEST_REPORTERS is empty unless strict mode is on.
+# shellcheck disable=SC2016
+run_suites() {
+  timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
+    --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --read-only \
+    --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+    --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
+    --entrypoint /usr/local/sbin/uzi-entrypoint \
+    --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
+    -e "UZI_TEST_REPORTERS=$REPORTERS" \
+    --name "$NAME" \
+    "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
+      ${UZI_TEST_REPORTERS:-} \
+      /work/e2e/codex-m3a/lifecycle.test.ts \
+      /work/e2e/codex-m3a/production-launcher.test.ts \
+      /work/e2e/codex-m3a/isolation.test.ts \
+      /work/e2e/codex-m3a/code-mode-host-run-posture.test.ts'
+}
 set +e
-timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
-  --cap-drop ALL \
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
-  --security-opt no-new-privileges \
-  --read-only \
-  --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
-  --entrypoint /usr/local/sbin/uzi-entrypoint \
-  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
-  --name "$NAME" \
-  "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
-    /work/e2e/codex-m3a/lifecycle.test.ts \
-    /work/e2e/codex-m3a/production-launcher.test.ts \
-    /work/e2e/codex-m3a/isolation.test.ts \
-    /work/e2e/codex-m3a/code-mode-host-run-posture.test.ts'
+if [ "$STRICT" = "1" ]; then
+  run_suites 2>"$TAP_OUT"
+else
+  run_suites
+fi
 rc=$?
 set -e
 # Best-effort removal of exactly this named container (never a broad sweep).
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
-log "RESULT: rc=$rc (0 = all suites passed; 124 = outer watchdog fired)"
-exit "$rc"
+rc_strict=0
+if [ "$STRICT" = "1" ]; then
+  log "strict mode: checking the TAP stream $TAP_OUT"
+  node "$REPO/e2e/codex-proof/check-node-tap.mjs" "$TAP_OUT" || rc_strict=$?
+  if [ "$rc" -ne 0 ] || [ "$rc_strict" -ne 0 ]; then
+    log "last TAP/stderr lines"
+    tail -n 40 "$TAP_OUT" || true
+  fi
+fi
+
+log "RESULT: rc=$rc strict=$rc_strict (0/0 = all suites passed; 124 = outer watchdog fired)"
+[ "$rc" -eq 0 ] || exit "$rc"
+exit "$rc_strict"

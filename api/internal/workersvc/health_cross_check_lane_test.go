@@ -51,7 +51,7 @@ func TestHealthQueuedCheckerCustodyExemption(t *testing.T) {
 				}
 				r.Kind = "issue"
 				fs.custodyCalls = nil
-				if got := svc.queuedReason(context.Background(), t0, r); got != reasonCustodyLimit || len(fs.custodyCalls) != 1 {
+				if got := svc.queuedReason(context.Background(), t0, r, thWithLimit(testCustodyLimit)); got != reasonCustodyLimit || len(fs.custodyCalls) != 1 {
 					t.Fatalf("ordinary code health=%s custody lookups=%d", got, len(fs.custodyCalls))
 				}
 			})

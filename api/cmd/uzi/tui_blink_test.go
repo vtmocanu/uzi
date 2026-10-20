@@ -628,7 +628,7 @@ func TestTUIRailEyebrowLongIDsKeepCount(t *testing.T) {
 }
 
 // GUARD (#1176): a TERMINAL run carrying a stale MilestonesInProgress draws NO in-progress cells
-// and does not flip with the blink phase — the row is faint end to end. Holds before and after m2
+// and does not flip with the blink phase; its progress cells stay faint. Holds before and after m2
 // (the `dim`/`!terminal` gate is unchanged). Rendered at blinkOn=true (the frame that would show
 // an in-progress ▰ if the gate were missing) and compared against the OFF frame.
 func TestTUIBoardMilestoneBarTerminalBlinksNothing(t *testing.T) {

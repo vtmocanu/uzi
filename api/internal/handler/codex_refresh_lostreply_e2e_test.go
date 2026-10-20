@@ -251,7 +251,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			delayed := &lostReplyStore{Queries: q, delay: variant == "pending-retention"}
 			box := newHandlerTestBox(t)
 			vlt := vault.New(box, q)
-			svc := workersvc.New(delayed, box, workersvc.Params{RunRecoveryParkBase: time.Second, RunRecoveryMaxPark: time.Second})
+			svc := workersvc.New(delayed, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunRecoveryParkBase: time.Second, RunRecoveryMaxPark: time.Second})
 			svc.SetTxBeginner(pool)
 			svc.SetVault(vlt)
 			svc.SetForges(settleForgeBuilder{f: &lostReplyForge{origin: origin}})

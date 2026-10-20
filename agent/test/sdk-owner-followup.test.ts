@@ -4,15 +4,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, fillOwnerBatch, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext, SecretRemediationDecision } from "../src/executor.js";
-import { PauseNowSignal } from "../src/steering.js";
+import { PauseNowSignal, SteeringChannel, followUpRunes, MAX_FOLLOW_UP_BATCH_RUNES } from "../src/steering.js";
+import type { WorkerClient } from "../src/client.js";
+import type { UserInput } from "../src/protocol.js";
 import type { AskUserQuestion } from "../src/protocol.js";
 import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // Issue #1800: the Claude executor's OWNER follow-up slot. A queued owner follow-up is pulled
-// (ctx.pullFollowUp) only immediately before an ordinary implement prompt is built, rides that
-// prompt, and is reported included (ctx.followUpIncluded) exactly once, when the turn carrying
+// (ctx.pullFollowUps, one batch of every pending follow-up up to the rune cap, issue #3137) only
+// immediately before an ordinary implement prompt is built, rides that
+// prompt, and each entry is reported included (ctx.followUpIncluded) exactly once, when the turn carrying
 // it first yields an event evidencing the model processed it (not init/lifecycle). A system text (completion rework, clarification answer, secret
 // remediation) owns its turn outright: the follow-up waits in its slot for the next ordinary
 // turn. A turn that is dropped before streaming (a declined `now` pause) keeps the follow-up.
@@ -106,14 +109,17 @@ function fakeTurns(scripts: ScriptedTurn[], queue: string[]): { queryFn: SdkQuer
 
 interface Probe {
   ctx: RunContext;
-  /** What each pullFollowUp call returned (undefined when the queue was empty). */
-  pulls: Array<string | undefined>;
+  /** The bodies each pullFollowUps call returned ([] when the queue was empty), one entry per call. */
+  pulls: string[][];
+  /** The (remainingRunes, batchEmpty) arguments of each pullFollowUps call, parallel to `pulls`. */
+  pullArgs: Array<{ remainingRunes: number; batchEmpty: boolean }>;
   /** Ids passed to ctx.followUpIncluded, in call order. */
   included: number[];
 }
 
 function makeCtx(queue: string[], overrides: Partial<RunContext> = {}): Probe {
-  const pulls: Array<string | undefined> = [];
+  const pulls: string[][] = [];
+  const pullArgs: Array<{ remainingRunes: number; batchEmpty: boolean }> = [];
   const included: number[] = [];
   let nextId = 1;
   const ctx: RunContext = {
@@ -129,17 +135,27 @@ function makeCtx(queue: string[], overrides: Partial<RunContext> = {}): Probe {
     config: null,
     sessionId: null,
     gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
-    pullFollowUp: () => {
-      const body = queue.shift();
-      pulls.push(body);
-      return body === undefined ? undefined : { id: nextId++, body };
+    // Honors the SteeringChannel.pullFollowUps contract: oldest first up to the rune cap, an
+    // oversized head taken alone only into an empty batch.
+    pullFollowUps: (remainingRunes, batchEmpty) => {
+      pullArgs.push({ remainingRunes, batchEmpty });
+      const taken: Array<{ id: number; body: string }> = [];
+      let remaining = remainingRunes;
+      while (queue.length > 0) {
+        const runes = followUpRunes(queue[0]!);
+        if (runes > remaining && !(batchEmpty && taken.length === 0)) break;
+        taken.push({ id: nextId++, body: queue.shift()! });
+        remaining -= runes;
+      }
+      pulls.push(taken.map((t) => t.body));
+      return taken;
     },
     followUpIncluded: (id) => included.push(id),
     checkpoint: async () => {},
     reportIteration: async () => undefined,
     ...overrides,
   };
-  return { ctx, pulls, included };
+  return { ctx, pulls, pullArgs, included };
 }
 
 const PLAN: ScriptedTurn = { messages: [submitPlan("# Plan"), resultSuccess()] };
@@ -311,7 +327,7 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
     // The dropped turn threw at driveTurn's trip guard before queryFn, so it consumed no script.
     assert.strictEqual(prompts.length, 2, "planning turn + the restarted implement turn");
     assert.ok(prompts[1]!.includes(A), "the restarted turn carries the follow-up the dropped turn held");
-    assert.deepStrictEqual(probe.pulls, [A], "pulled once, never re-pulled");
+    assert.deepStrictEqual(probe.pulls, [[A]], "pulled once, never re-pulled");
     assert.deepStrictEqual(probe.included, [1], "reported once, by the turn that really started");
   });
 
@@ -327,7 +343,7 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
     assert.ok(prompts[2]!.includes(SYSTEM_TEXT), "turn 2 is the remediation turn");
     assert.ok(!prompts[2]!.includes(A), "the remediation turn does not carry the follow-up");
     assert.ok(prompts[3]!.includes(A) && !prompts[3]!.includes(SYSTEM_TEXT), "the next ordinary turn carries it");
-    assert.deepStrictEqual(probe.pulls, [undefined, A], "one pull per ORDINARY turn: none while the system text owned turn 2");
+    assert.deepStrictEqual(probe.pulls, [[], [A]], "one pull per ORDINARY turn: none while the system text owned turn 2");
     assert.deepStrictEqual(probe.included, [1]);
   });
 
@@ -388,6 +404,217 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
   });
 });
 
+describe("issue #3137: the Claude executor batches pending owner follow-ups into one turn", () => {
+  const B = "FOLLOWUP-MARKER-BRAVO-2c9e";
+  const C = "FOLLOWUP-MARKER-CHARLIE-5d41";
+  const FENCE = /<follow_up_[0-9a-f]{16}>/;
+
+  it("delivers three queued follow-ups in one implement prompt, receipts them in that turn, and carries none on the next turn", async () => {
+    const queue = [A, B, C];
+    const { queryFn, prompts } = fakeTurns([PLAN, WORK, DONE], queue);
+    const reported: number[] = [];
+    const iterationAtReceipt: Array<number | undefined> = [];
+    const probe = makeCtx(queue, {
+      reportIteration: async (n) => {
+        reported.push(n);
+        return undefined;
+      },
+    });
+    const base = probe.ctx.followUpIncluded!;
+    probe.ctx.followUpIncluded = (id) => {
+      iterationAtReceipt.push(reported.at(-1));
+      base(id);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(prompts.length, 3, "planning turn + two implement turns");
+    const p = prompts[1]!;
+    assert.ok(p.includes(A) && p.includes(B) && p.includes(C), "the first implement prompt carries all three");
+    assert.ok(p.indexOf(A) < p.indexOf(B) && p.indexOf(B) < p.indexOf(C), "in FIFO order");
+    assert.deepStrictEqual(probe.included, [1, 2, 3], "every id receipted, in order");
+    assert.deepStrictEqual(iterationAtReceipt, [1, 1, 1], "all three receipts land while iteration 1 is the last one reported");
+    assert.deepStrictEqual(reported.slice(0, 2), [1, 2], "the next ordinary turn reports iteration 2");
+    assert.ok(!FENCE.test(prompts[2]!), "the next ordinary turn carries no follow-up fence");
+    assert.ok(![A, B, C].some((b) => prompts[2]!.includes(b)), "nor any of the bodies");
+    assert.deepStrictEqual(probe.pulls, [[A, B, C], []], "one batch pull, then an empty pull at the next loop top");
+  });
+
+  it("holds the batch when a dropped turn never streams, issues no receipts, and does not pull the channel again", async () => {
+    const queue = [A, B, C];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE], queue);
+    const cancel = new AbortController();
+    let aborted = false;
+    const receiptsAtDrop: number[][] = [];
+    const probe = makeCtx(queue, {
+      signal: cancel.signal,
+      parkForPause: async () => false,
+      reportIteration: async (n) => {
+        if (n === 1 && !aborted) {
+          aborted = true;
+          cancel.abort(new PauseNowSignal());
+        }
+        return { pauseRequested: false, completedCount: 0 };
+      },
+    });
+    const origParkForPause = probe.ctx.parkForPause!;
+    probe.ctx.parkForPause = async (...args) => {
+      receiptsAtDrop.push([...probe.included]);
+      return origParkForPause(...args);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(receiptsAtDrop, [[]], "no receipt while the dropped turn held the batch");
+    assert.strictEqual(prompts.length, 2, "planning turn + the restarted implement turn");
+    const p = prompts[1]!;
+    assert.ok(p.indexOf(A) >= 0 && p.indexOf(A) < p.indexOf(B) && p.indexOf(B) < p.indexOf(C), "the restarted turn carries the same entries in the same order");
+    assert.deepStrictEqual(probe.included, [1, 2, 3], "each receipted exactly once, by the turn that really started");
+    assert.deepStrictEqual(probe.pulls, [[A, B, C]], "the channel was pulled once: not while the slot was held");
+  });
+
+  it("keeps the batch across an init-only empty turn and receipts it once, from the retry that streamed output", async () => {
+    const queue = [A, B, C];
+    const { queryFn, prompts } = fakeTurns(
+      [PLAN, { messages: [initFrame(), resultZeroTurns()] }, { messages: [initFrame(), ...DONE.messages] }],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    const queriesAtReceipt: number[] = [];
+    const base = probe.ctx.followUpIncluded!;
+    probe.ctx.followUpIncluded = (id) => {
+      queriesAtReceipt.push(prompts.length);
+      base(id);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn, emptyTurnBackoffBaseMs: 0, emptyTurnMaxRetries: 2 }).run(probe.ctx);
+    for (const i of [1, 2]) {
+      const p = prompts[i]!;
+      assert.ok(p.indexOf(A) >= 0 && p.indexOf(A) < p.indexOf(B) && p.indexOf(B) < p.indexOf(C), `query ${i} carries the batch in order`);
+    }
+    assert.deepStrictEqual(probe.included, [1, 2, 3], "each receipted exactly once");
+    assert.deepStrictEqual(queriesAtReceipt, [3, 3, 3], "all by the third query (the retry), none by the init-only second");
+    assert.deepStrictEqual(probe.pulls, [[A, B, C]], "the channel was pulled once");
+  });
+
+  it("a single queued follow-up behaves as before: one fence, one receipt", async () => {
+    const queue = [A];
+    const { queryFn, prompts } = fakeTurns([PLAN, WORK, DONE], queue);
+    const probe = makeCtx(queue);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(new Set(prompts[1]!.match(/<follow_up_[0-9a-f]{16}>/g)).size, 1, "exactly one fence nonce");
+    assert.ok(!FENCE.test(prompts[2]!), "not replayed");
+    assert.deepStrictEqual(probe.included, [1]);
+  });
+
+  it("an interactive park delivers one message per park", async () => {
+    const queue: string[] = [];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE, DONE, DONE], queue);
+    const outcomes = [
+      { kind: "followup" as const, id: 77, body: A },
+      { kind: "followup" as const, id: 78, body: B },
+      { kind: "ended" as const, reason: "idle" as const },
+    ];
+    const probe = makeCtx(queue, { interactive: true, awaitFollowUp: async () => outcomes.shift()! });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "the first park's turn carries only its own message");
+    assert.ok(prompts[3]!.includes(B) && !prompts[3]!.includes(A), "the second park's turn carries only its own message");
+    assert.deepStrictEqual(probe.included, [77, 78]);
+  });
+
+  it("#3137 an oversized lone follow-up is pulled into an empty batch, delivered whole, and receipted", async () => {
+    const BIG = "x".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 1);
+    const queue = [BIG];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE], queue);
+    const probe = makeCtx(queue);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepStrictEqual(probe.pullArgs[0], { remainingRunes: MAX_FOLLOW_UP_BATCH_RUNES, batchEmpty: true });
+    assert.ok(prompts[1]!.includes(BIG), "the oversized body reaches the implement prompt whole");
+    assert.deepStrictEqual(probe.included, [1], "its id is receipted");
+  });
+
+  it("#3137 an interactive park's message does not absorb a channel follow-up queued meanwhile", async () => {
+    const queue: string[] = [];
+    const { queryFn, prompts } = fakeTurns([PLAN, DONE, DONE, DONE], queue);
+    const outcomes = [
+      { kind: "followup" as const, id: 77, body: A },
+      { kind: "ended" as const, reason: "idle" as const },
+    ];
+    const probe = makeCtx(queue, {
+      interactive: true,
+      awaitFollowUp: async () => {
+        if (outcomes[0]!.kind === "followup") queue.push(B);
+        return outcomes.shift()!;
+      },
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "the park's turn carries only its own message");
+    assert.deepStrictEqual(probe.included, [77], "only the park's message is receipted by its turn");
+  });
+
+  // queuedOwner only fills when an interactive park receives a follow-up while the owner slot is
+  // still held, which no public seam reaches today (a turn that parks has model evidence, which
+  // empties the slot). So the mixed-source fill is driven through fillOwnerBatch directly, with a
+  // real SteeringChannel behind ctx.pullFollowUps.
+  describe("fillOwnerBatch (queued park entries first, then the channel)", () => {
+    const channelWith = (entries: Array<{ id: number; body: string }>): SteeringChannel => {
+      const ch = new SteeringChannel({} as WorkerClient, "fill-run", 1, nullLogger(), new AbortController());
+      ch.requeueUnincludedFollowUps(
+        entries.map((e) => ({ id: e.id, kind: "follow_up", body: e.body, inclusion_reported: true }) as UserInput),
+      );
+      return ch;
+    };
+    const ctxFor = (ch: SteeringChannel, calls: Array<{ remainingRunes: number; batchEmpty: boolean }>): RunContext =>
+      ({
+        pullFollowUps: (remainingRunes: number, batchEmpty: boolean) => {
+          calls.push({ remainingRunes, batchEmpty });
+          return ch.pullFollowUps(remainingRunes, batchEmpty);
+        },
+      }) as unknown as RunContext;
+
+    it("does not take a channel head that overflows the capacity the queued entries left, and delivers it next turn", () => {
+      const ch = channelWith([{ id: 10, body: "h".repeat(10_001) }]);
+      const calls: Array<{ remainingRunes: number; batchEmpty: boolean }> = [];
+      const queued = [{ id: 1, body: "q".repeat(30_000) }];
+      const first = fillOwnerBatch(queued, ctxFor(ch, calls));
+      assert.deepStrictEqual(first?.map((f) => f.id), [1], "only the queued entry fits");
+      assert.deepStrictEqual(queued, [], "the queued entry was consumed");
+      assert.deepStrictEqual(calls, [{ remainingRunes: MAX_FOLLOW_UP_BATCH_RUNES - 30_000, batchEmpty: false }]);
+      assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "the overflowing channel entry was not taken");
+      const second = fillOwnerBatch(queued, ctxFor(ch, calls));
+      assert.deepStrictEqual(second?.map((f) => f.id), [10], "the head is delivered on the next ordinary turn");
+      assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10);
+    });
+
+    it("fills the batch from the queue in order and then appends the channel's entries", () => {
+      const ch = channelWith([{ id: 10, body: "c" }, { id: 11, body: "d" }]);
+      const calls: Array<{ remainingRunes: number; batchEmpty: boolean }> = [];
+      const queued = [{ id: 1, body: "a" }, { id: 2, body: "b" }];
+      const got = fillOwnerBatch(queued, ctxFor(ch, calls));
+      assert.deepStrictEqual(got?.map((f) => f.id), [1, 2, 10, 11]);
+      assert.deepStrictEqual(calls, [{ remainingRunes: MAX_FOLLOW_UP_BATCH_RUNES - 2, batchEmpty: false }]);
+    });
+
+    it("a queued entry left over stops the fill and the channel is not pulled", () => {
+      const ch = channelWith([{ id: 10, body: "c" }]);
+      const calls: Array<{ remainingRunes: number; batchEmpty: boolean }> = [];
+      const queued = [{ id: 1, body: "a".repeat(39_999) }, { id: 2, body: "bb" }];
+      const got = fillOwnerBatch(queued, ctxFor(ch, calls));
+      assert.deepStrictEqual(got?.map((f) => f.id), [1]);
+      assert.deepStrictEqual(queued.map((f) => f.id), [2], "the leftover stays queued, in order");
+      assert.deepStrictEqual(calls, [], "the channel is not pulled while queued entries remain");
+      assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0);
+    });
+
+    it("an oversized first queued entry is taken alone", () => {
+      const ch = channelWith([]);
+      const queued = [{ id: 1, body: "x".repeat(MAX_FOLLOW_UP_BATCH_RUNES + 5) }, { id: 2, body: "b" }];
+      const got = fillOwnerBatch(queued, ctxFor(ch, []));
+      assert.deepStrictEqual(got?.map((f) => f.id), [1]);
+      assert.deepStrictEqual(queued.map((f) => f.id), [2]);
+    });
+
+    it("returns undefined, never an empty batch, when nothing is pending", () => {
+      assert.strictEqual(fillOwnerBatch([], ctxFor(channelWith([]), [])), undefined);
+    });
+  });
+});
+
 // The stamp boundary: "included" means the turn carrying the follow-up reached the MODEL, so a
 // turn that starts and dies before any model output (init, rate_limit_event, a zero-turn result,
 // a throw) must leave the follow-up unreported and held for the next turn.
@@ -412,7 +639,7 @@ describe("issue #1800: a follow-up is stamped only once the model processed its 
     assert.ok(prompts[1]!.includes(A) && prompts[2]!.includes(A), "the empty turn and its retry both carry it");
     assert.deepStrictEqual(probe.included, [1], "stamped exactly once");
     assert.deepStrictEqual(invocationsAtStamp, [3], "stamped by the third query (the retry), not the init-only second");
-    assert.deepStrictEqual(probe.pulls, [A], "pulled once");
+    assert.deepStrictEqual(probe.pulls, [[A]], "pulled once");
   });
 
   it("an exhausted empty turn (init, rate_limit_event, zero turns) leaves the follow-up unreported", async () => {

@@ -883,3 +883,42 @@ never loosen refusal, isolation or retention to make an upgrade pass.
 
 The reusable procedure is [Coordinated Codex runtime upgrades](../docs/dev-conventions.md#coordinated-codex-runtime-upgrades).
 Broader runtime adaptations require their own verified cause and plan review.
+
+## Amendment: coordinated runtime 0.162.1 (2026-10-20)
+
+The native package advances from 0.160.1 to 0.162.1, source commit
+`092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`. The target was published on
+2026-10-09 and meets the seven-day stability policy; 0.163.0 does not yet.
+The lock, launcher, probe, active fixtures and M4 version evidence move together.
+
+The adoption read covers official notes for
+[0.161.0](https://github.com/openai/codex/releases/tag/rust-v0.161.0),
+[0.162.0](https://github.com/openai/codex/releases/tag/rust-v0.162.0) and
+[0.162.1](https://github.com/openai/codex/releases/tag/rust-v0.162.1), with the
+consumed protocol and trust paths checked against the target source:
+
+- Filesystem escalation and background permission inheritance do not replace
+  worker callback admission. Native effectful tools stay disabled, approvals
+  remain `never`, and unsupported server requests fail closed.
+- Multi-agent V2 and hooks stay disabled. Hook matcher compilation changes do
+  not give cloned-repository hooks authority; explicit project trust stays
+  `untrusted` and project instruction discovery stays off.
+- Managed worktree tools are TUI client tools, not app-server-native tools.
+  Their `worktrees` flag is default-on, but uzi runs no TUI client or its tool
+  registration. Ranked Code Mode tool search remains default-off.
+- Dynamic callback request/response shapes remain compatible. New subagent
+  model/effort metadata and thread goal provenance are additive. The upstream
+  error enum accepts unknown tags; uzi retains its closed normalization map.
+- Authoritative committed resume history and server retry guidance are runtime
+  improvements. Resume requests retain `excludeTurns: true`; existing replay
+  accounting and M4 resume checks remain required. The new partial-answer phase
+  does not change uzi's text accumulation or its `turn/completed` terminal boundary.
+- GPT-6.1 Sol becoming the bundled catalog default already matches uzi's worker
+  fallback. Uzi explicitly supplies its chosen model and retains its curated
+  picker, per-model pricing, and effort vocabulary. No model-policy change is
+  bundled with this runtime upgrade.
+
+The Docker-free coordinate tests failed all seven leaves on the lock-only
+candidate and passed after reconciliation. This proves agreement of pins, not
+execution of 0.162.1. Installed receipt/probe acceptance, real worker-UID and M4
+execution remain separate evidence required before accepting the upgrade.

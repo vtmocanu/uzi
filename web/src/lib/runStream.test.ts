@@ -69,6 +69,12 @@ describe("ingest", () => {
 });
 
 describe("applyFrame", () => {
+  it("preserves missing and malformed server timestamps as invalid evidence", () => {
+    for (const created_at of [undefined, "", "bad"]) {
+      const { state } = applyFrame(emptyStream(), { type: "message", seq: 1, kind: "paused", payload: { origin: "lead_park" }, created_at });
+      expect(state.messages[0].created_at).toBe(created_at ?? "");
+    }
+  });
   it("ingests a contiguous message frame with no replay", () => {
     const s = ingestMany(emptyStream(), [msg(1)]).state;
     const r = applyFrame(s, { type: "message", seq: 2, kind: "text", payload: "x" });

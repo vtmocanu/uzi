@@ -241,6 +241,13 @@ export interface RunContext {
    * An explicit accessor returning undefined refuses epoch startup, even when the
    * executor has a static capturedMemory option. */
   capturedMemory?(): CapturedMemoryContext | undefined;
+  /** Issue #2471: the run's redaction secrets, present with `capturedMemory`; the guarded Claude
+   *  command lane redacts its inline output windows against them. Never sent to the model. */
+  guardedCommandSecrets?: readonly string[];
+  /** Issue #2471: register a listener told, with the runner's own stop, when the worker memory
+   *  runtime invalidates this flight's memory authority mid-run. Present with `capturedMemory`.
+   *  Returns the unsubscribe. Not fired by epoch renewal, non-running reports or preservation. */
+  onMemoryAuthorityLost?(listener: (stop: Error) => void): () => void;
   /** Issue #2083: whether the server enabled the private decisions memo for this run (claim-
    *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
   decisionsMemoEnabled?: boolean;
@@ -341,6 +348,15 @@ export interface RunContext {
    *  (a bare planApproved flip leaves seededPlanBody undefined and the model falls back to
    *  the issue — the #209 M2 gap). Absent/false ⇒ today's behaviour, byte-for-byte. */
   reviewedPlanResume?: boolean;
+  /** Issue #3149: on a reviewedPlanResume the fresh session has none of the run's earlier owner
+   *  follow-ups. These are the ones earlier claims consumed (id order, trimmed), complete or
+   *  absent: the runner leaves this undefined, and drops reviewedPlanResume, when the history
+   *  could not be restored in full. The executor renders them (selectPriorOwnerHistory +
+   *  renderPriorOwnerHistory) on the first implement turn as historical context. */
+  priorOwnerFollowUps?: readonly { id: number; body: string }[];
+  /** Issue #3149: true when follow-up `id` reaches the lead live on this claim (steering
+   *  isLiveDeliveryId), so the history replay skips it by id and it is delivered once. */
+  isLiveFollowUpId?: (id: number) => boolean;
   /** PRD #759 M2: the reseed recovered an uncommitted WIP snapshot (a wip(park): marker
    *  reset --soft back to the working tree at adopt time), so the tree carries uncommitted
    *  mid-edit changes rather than a clean checkout. Set by the RUNNER from the runner clone.
@@ -434,27 +450,29 @@ export interface RunContext {
    * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
    */
   askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
-  /** M4: dequeue the next queued owner follow-up ({id, body}). Issue #1800: each executor pulls it
-   *  into a dedicated owner slot only immediately before it builds an ordinary implement prompt,
-   *  FIFO and one at a time, and carries it until a turn whose prompt held it yields its first
-   *  event evidencing the model processed it (not init or lifecycle), then reports it via {@link followUpIncluded}. The server's consumed_at ("Delivered")
+  /** M4: dequeue the pending owner follow-ups ({id, body}), oldest first. Issue #1800: each executor
+   *  pulls them into a dedicated owner slot only immediately before it builds an ordinary implement
+   *  prompt, as one batch up to the rune cap (see SteeringChannel.pullFollowUps for the cap and the
+   *  oversized-first-entry rule), and carries the batch until a turn whose prompt held it yields its
+   *  first event evidencing the model processed it (not init or lifecycle), then reports every id via
+   *  {@link followUpIncluded}. The server's consumed_at ("Delivered")
    *  records only the worker's receipt via the steering poll; included_at is the separate record
    *  that the turn carrying it reached the model (not that the model acted on it). */
-  pullFollowUp?(): { id: number; body: string } | undefined;
-  /** Issue #1800: follow-up `id` (from pullFollowUp or a park's `followup` outcome) was in a prompt
+  pullFollowUps?(remainingRunes: number, batchEmpty: boolean): { id: number; body: string }[];
+  /** Issue #1800: follow-up `id` (from pullFollowUps or a park's `followup` outcome) was in a prompt
    *  whose turn reached the model (a model-evidencing event arrived). Called once per follow-up; the runner reports
    *  it to the api (POST /inputs/included). Optional; absent (a stub) ⇒ nothing is reported. */
   followUpIncluded?(id: number): void;
   /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
    *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
-   *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
-   *  Distinct from pullFollowUp: it carries no server input id and never touches the follow-up
+   *  pullFollowUps — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).
+   *  Distinct from pullFollowUps: it carries no server input id and never touches the follow-up
    *  wake-guard watermark. Optional; absent (a stub/older wiring) ⇒ no steer. */
   pullSafetySteer?(): string | undefined;
   /** Issue #1660: every operator follow-up received so far (steering.operatorConstraints), read
    *  by the Agent guard at each dispatch and attached to the subagent's prompt, or null when the
    *  earlier ones could not be loaded this claim (the guard denies dispatch). Unlike
-   *  pullFollowUp it consumes nothing. Optional;
+   *  pullFollowUps it consumes nothing. Optional;
    *  absent ⇒ no constraints. */
   operatorConstraints?(): readonly string[] | null;
   /**
@@ -937,6 +955,13 @@ export interface Executor {
    * Codex executors.
    */
   reapAttributedProcesses?(): Promise<RunProcessReap>;
+  /**
+   * Issue #2471: dispose and confirm the model commands of a memory-guard-bound Claude flight
+   * within `deadlineMs`, and refuse new ones until the next turn. `confirmed: false` means a
+   * command's process tree could not be proven stopped. Resolves `{confirmed: true}` at once for
+   * an executor with no guarded lane. Absent on the stub/test and Codex executors.
+   */
+  settleWorkerCommands?(deadlineMs: number): Promise<{ confirmed: boolean }>;
   /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process

@@ -40,6 +40,11 @@
 #   UZI_M3B_TEST_TIMEOUT outer watchdog seconds            (default: 600 offline, 1200 live)
 #   CDR_M3B_PG_IMAGE     throwaway Postgres image          (default: postgres:17)
 #   CDR_M3B_API_PORT     port the api container binds/advertises (default: 8080)
+#   UZI_CODEX_PROOF_STRICT  set to 1 to also fail on any skipped, todo or missing test (offline
+#                        only): node --test passes a skipped test or describe with rc 0, so the
+#                        scheduled proof (#3148) adds a TAP stream checked by
+#                        e2e/codex-proof/check-node-tap.mjs
+#   UZI_CODEX_PROOF_TAP  strict mode's TAP file            (default: lifecycle-tap.<pid>.log here)
 #
 # LIVE mode (PRD #1106 M3b live-acceptance), strictly opt-in via env (set by live.sh --live):
 #   CODEX_M3B_LIVE       1 = run the SUBSCRIPTION lifecycle against the REAL Codex provider using a
@@ -69,6 +74,13 @@ PG_NAME="cdr-m3b-pg-$$"
 API_NAME="cdr-m3b-api-$$"
 API_IMAGE="cdr-m3b-api-img-$$:local"
 LIFECYCLE_OUT="$HERE/lifecycle-run.$$.log"
+STRICT="${UZI_CODEX_PROOF_STRICT:-}"
+TAP_OUT="${UZI_CODEX_PROOF_TAP:-$HERE/lifecycle-tap.$$.log}"
+REPORTERS=""
+if [ "$STRICT" = "1" ]; then
+  # spec stays the stdout the count parser reads; TAP goes to stderr, which the host captures.
+  REPORTERS="--test-reporter=spec --test-reporter-destination=stdout --test-reporter=tap --test-reporter-destination=stderr"
+fi
 
 # LIVE mode is strictly opt-in: with CODEX_M3B_LIVE unset, every array below is empty / --internal
 # and this run is byte-identical to the credential-free offline proof. In live mode the network is
@@ -87,6 +99,11 @@ if [ "$LIVE" = "1" ]; then
   LIVE_LIFECYCLE_ENV=(-e CODEX_M3B_LIVE=1 -e CODEX_M3B_LIVE_LOGIN_JSON -e CODEX_M3B_LIVE_BASE_URL -e CODEX_M3B_LIVE_SKIP_EXEC -e CODEX_M3B_LIVE_RELAX_TIMEOUTS -e CODEX_M3B_LIVE_REFRESH_PROBES -e CODEX_M3B_LIVE_ADVICE_TIMEOUT_MS -e CODEX_M3B_LIVE_RUN_TIMEOUT_MS)
   TIMEOUT="${UZI_M3B_TEST_TIMEOUT:-1200}"
   TEST_TIMEOUT_MS="${UZI_M3B_LIVE_TEST_TIMEOUT_MS:-1000000}"
+fi
+if [ "$STRICT" = "1" ] && [ "$LIVE" = "1" ]; then
+  # Live mode legitimately skips the api_key arm, so the zero-skip contract cannot hold there.
+  printf 'UZI_CODEX_PROOF_STRICT=1 is offline-only; unset CODEX_M3B_LIVE\n' >&2
+  exit 2
 fi
 
 log() { printf '\n### %s\n' "$*"; }
@@ -301,36 +318,45 @@ log "server up; contract origin=$CONTRACT_BASE_URL; internal worker route resolv
 #    B; the server-contract env points the real WorkerClient at the api container. Output is captured
 #    for the per-image count assertions.
 log "running the packaged lifecycle suite in $IMAGE under the confinement posture (network $NET)"
-set +e
 # The single-quoted command is expanded by the inner container shell, not this host shell.
 # Match the worker's dedicated command-cache carveout while keeping the root filesystem
 # read-only. The real entrypoint must still establish runner-cmd ownership and mode 0700.
 # shellcheck disable=SC2016
-timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
-  --cap-drop ALL \
-  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
-  --security-opt no-new-privileges \
-  --read-only \
-  --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
-  --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
-  --tmpfs /work/repo:rw,exec,nosuid,size=64m,uid=10001,gid=10002,mode=2770 \
-  --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src -e UZI_R2_COMMAND_ROOT_LINUX=1 \
-  -e "CODEX_M3B_WORKER_BASE_URL=$WORKER_BASE_URL" \
-  -e "CODEX_M3B_WORKER_TOKEN=$WORKER_TOKEN" \
-  -e "CODEX_M3B_SUB_RUN_ID=$SUB_RUN_ID" \
-  -e "CODEX_M3B_SUB_CAP=$SUB_CAP" \
-  -e "CODEX_M3B_SUB_ACCOUNT=$SUB_ACCOUNT" \
-  -e "CODEX_M3B_SUB_GEN=$SUB_GEN" \
-  -e "CODEX_M3B_APIKEY_RUN_ID=$APIKEY_RUN_ID" \
-  -e "CODEX_M3B_APIKEY_CAP=$APIKEY_CAP" \
-  -e "CODEX_M3B_TEST_TIMEOUT_MS=$TEST_TIMEOUT_MS" \
-  "${LIVE_LIFECYCLE_ENV[@]}" \
-  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
-  --mount "type=bind,src=$REPO/agent/test,dst=/app/test,readonly" \
-  --name "$LIFECYCLE_NAME" \
-  "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout="${CODEX_M3B_TEST_TIMEOUT_MS:-120000}" \
-    /app/test/codex-command-root-linux.test.ts /work/e2e/codex-m3b/lifecycle.test.ts' 2>&1 | tee "$LIFECYCLE_OUT"
+run_lifecycle() {
+  timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
+    --cap-drop ALL \
+    --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
+    --security-opt no-new-privileges \
+    --read-only \
+    --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
+    --tmpfs /var/cache/uzi-codex-cmd:rw,exec,nosuid,nodev,mode=0700 \
+    --tmpfs /work/repo:rw,exec,nosuid,size=64m,uid=10001,gid=10002,mode=2770 \
+    --entrypoint /usr/local/sbin/uzi-entrypoint \
+    -e CODEX_M3B_PACKAGED=1 -e CODEX_M3B_SRC=/app/src -e UZI_R2_COMMAND_ROOT_LINUX=1 \
+    -e "CODEX_M3B_WORKER_BASE_URL=$WORKER_BASE_URL" \
+    -e "CODEX_M3B_WORKER_TOKEN=$WORKER_TOKEN" \
+    -e "CODEX_M3B_SUB_RUN_ID=$SUB_RUN_ID" \
+    -e "CODEX_M3B_SUB_CAP=$SUB_CAP" \
+    -e "CODEX_M3B_SUB_ACCOUNT=$SUB_ACCOUNT" \
+    -e "CODEX_M3B_SUB_GEN=$SUB_GEN" \
+    -e "CODEX_M3B_APIKEY_RUN_ID=$APIKEY_RUN_ID" \
+    -e "CODEX_M3B_APIKEY_CAP=$APIKEY_CAP" \
+    -e "CODEX_M3B_TEST_TIMEOUT_MS=$TEST_TIMEOUT_MS" \
+    -e "UZI_TEST_REPORTERS=$REPORTERS" \
+    "${LIVE_LIFECYCLE_ENV[@]}" \
+    --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
+    --mount "type=bind,src=$REPO/agent/test,dst=/app/test,readonly" \
+    --name "$LIFECYCLE_NAME" \
+    "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout="${CODEX_M3B_TEST_TIMEOUT_MS:-120000}" \
+      ${UZI_TEST_REPORTERS:-} \
+      /app/test/codex-command-root-linux.test.ts /work/e2e/codex-m3b/lifecycle.test.ts'
+}
+set +e
+if [ "$STRICT" = "1" ]; then
+  run_lifecycle 2>"$TAP_OUT" | tee "$LIFECYCLE_OUT"
+else
+  run_lifecycle 2>&1 | tee "$LIFECYCLE_OUT"
+fi
 rc_lifecycle=${PIPESTATUS[0]}
 set -e
 docker rm -f "$LIFECYCLE_NAME" >/dev/null 2>&1 || true
@@ -450,5 +476,15 @@ else
   rc_counts=1
 fi
 
-log "RESULT: controls=$rc_controls lifecycle=$rc_lifecycle counts=$rc_counts (0/0/0 = pass; 124 = watchdog)"
-[ "$rc_controls" -eq 0 ] && [ "$rc_lifecycle" -eq 0 ] && [ "$rc_counts" -eq 0 ]
+rc_strict=0
+if [ "$STRICT" = "1" ]; then
+  log "strict mode: checking the TAP stream $TAP_OUT"
+  node "$REPO/e2e/codex-proof/check-node-tap.mjs" "$TAP_OUT" || rc_strict=$?
+  if [ "$rc_lifecycle" -ne 0 ] || [ "$rc_strict" -ne 0 ]; then
+    log "last TAP/stderr lines"
+    tail -n 40 "$TAP_OUT" || true
+  fi
+fi
+
+log "RESULT: controls=$rc_controls lifecycle=$rc_lifecycle counts=$rc_counts strict=$rc_strict (0/0/0/0 = pass; 124 = watchdog)"
+[ "$rc_controls" -eq 0 ] && [ "$rc_lifecycle" -eq 0 ] && [ "$rc_counts" -eq 0 ] && [ "$rc_strict" -eq 0 ]

@@ -1261,6 +1261,173 @@ describe("RunRunner — M4 resume-reviewed-plan predicate (PRD #759 M4)", () => 
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });
+  // ── Issue #3149: the earlier owner follow-ups a fresh reviewed-plan session never saw ──────────
+  // A resume on the old approval is only safe when the run's earlier owner follow-ups were restored
+  // in full. Each case below reddens on the base, where the resume ignored the follow-up history.
+  const historyClaim = (iid: number, runId: string, extra: Record<string, unknown> = {}) =>
+    gitlabClaim(iid, {
+      run_id: runId,
+      wait_on_limit: true,
+      session_id: M4_SID,
+      plan_approved: true,
+      plan_source: "agent",
+      plan_md: "# reviewed plan\n- ship it",
+      auto_approve: true, // autopilot: recovery of the (empty) tree cannot be what re-gates these
+      ...extra,
+    });
+
+  it("(e) a failed GET /follow-ups reload (4xx) does not resume the reviewed plan", async () => {
+    // Base: m4ResumeReviewedPlan ignored the follow-up reload, so planApproved/reviewedPlanResume were true.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-unavail-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e1";
+      api.overrideFollowUps(runId, 404, { error: "not found" });
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(historyClaim(3101, runId));
+      assert.strictEqual(seen[0]?.sessionId, undefined, "dropped session");
+      assert.strictEqual(seen[0]?.reviewedPlanResume, false);
+      assert.strictEqual(seen[0]?.planApproved, false, "unrestorable owner history re-gates the plan");
+      assert.strictEqual(seen[0]?.priorOwnerFollowUps, undefined);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(f) a history over the 40000-character bound does not resume the reviewed plan", async () => {
+    // Base: the oversized history was irrelevant to the resume decision.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-over-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e2";
+      api.overrideFollowUps(runId, 200, {
+        inputs: [
+          { id: 11, kind: "follow_up", body: "a".repeat(30000) },
+          { id: 12, kind: "follow_up", body: "b".repeat(10001) },
+        ],
+      });
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(historyClaim(3102, runId));
+      assert.strictEqual(seen[0]?.reviewedPlanResume, false);
+      assert.strictEqual(seen[0]?.planApproved, false);
+      assert.strictEqual(seen[0]?.priorOwnerFollowUps, undefined);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(g) a complete history resumes and carries the earlier follow-ups intact", async () => {
+    // Base: priorOwnerFollowUps did not exist on the RunContext.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-complete-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e3";
+      api.overrideFollowUps(runId, 200, {
+        inputs: [
+          { id: 21, kind: "follow_up", body: "  keep the API stable  " },
+          { id: 22, kind: "follow_up", body: "   " },
+          { id: 25, kind: "follow_up", body: "also update the docs" },
+        ],
+      });
+      const seen: RunContext[] = [];
+      await runnerWith(capturingM4(homeRoot, seen), gitlab).execute(historyClaim(3103, runId));
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+      assert.strictEqual(seen[0]?.planApproved, true);
+      assert.deepStrictEqual(seen[0]?.priorOwnerFollowUps, [
+        { id: 21, body: "keep the API stable" },
+        { id: 25, body: "also update the docs" },
+      ]);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(h) an autopilot resume with unrestorable history is gated by a human on every plan presentation", async () => {
+    // Base: the autopilot claim resumed (or auto-approved the gate) with no human and no cross-check.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-gate-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e4";
+      api.overrideFollowUps(runId, 404, { error: "not found" });
+      api.crossCheckHandler = () => ({ status: 409, body: { reason: "checker_unavailable" } });
+      // A human answers each plan presentation (revise, then approve), so a gate that auto-approved
+      // would show as a missing park.
+      let presentations = 0;
+      api.onState(runId, (body) => {
+        if (body.status !== "awaiting_approval") return;
+        api.appendInputs(runId, [presentations++ === 0 ? input("revise_plan", "Revise the plan") : input("approve_plan")]);
+      });
+      const seen: RunContext[] = [];
+      const gateErrors: unknown[] = [];
+      const verdicts: string[] = [];
+      const factory: ExecutorFactory = (id) => ({
+        homeDir: path.join(homeRoot, id),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            try {
+              const first = await ctx.gatePlan!("# reviewed plan\n- ship it");
+              verdicts.push(first.kind);
+              const second = await ctx.gatePlan!("# reviewed plan\n- ship it, revised");
+              verdicts.push(second.kind);
+            } catch (err) {
+              gateErrors.push(err);
+            }
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      await runnerWith(factory, gitlab).execute(
+        historyClaim(3104, runId, { plan_cross_check_required: true }),
+      );
+      assert.deepStrictEqual(gateErrors, []);
+      assert.deepStrictEqual(verdicts, ["revise", "approve"], "both verdicts come from the human");
+      assert.strictEqual(seen[0]?.reviewedPlanResume, false);
+      const awaiting = api.states.filter((s) => s.runId === runId && s.body.status === "awaiting_approval");
+      assert.ok(awaiting.length >= 2, `both plan presentations park for a human (saw ${awaiting.length})`);
+      assert.strictEqual(api.crossCheckRequests.filter((r) => r.runId === runId).length, 0, "no cross-check is submitted");
+      const notes = api.messages(runId).filter(
+        (m) => m.kind === "status" && /earlier owner follow-ups on this run could not be restored/.test(String(m.payload.text)),
+      );
+      assert.strictEqual(notes.length, 1, "the forced-gate status line is emitted once per claim");
+      assert.match(String(notes[0]?.payload.text), /40000-code-point \/ 100-entry bound/);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(i) a legacy consumed-but-unapplied follow-up is already live when the executor starts", async () => {
+    // The row is in GET /follow-ups (no inclusion_reported: an older api) AND replayed by the
+    // steering's first GET /inputs. The reviewed path skips the gate's awaitResumedDelivery, so
+    // without the wait before executor.run the history dedup could compose before that read.
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-3149-live-"));
+    try {
+      const runId = "31490000-0000-4000-8000-0000000031e5";
+      const row = { id: 41, kind: "follow_up", body: "keep the API stable" } as const;
+      api.overrideFollowUps(runId, 200, { inputs: [row] });
+      api.setInputs(runId, [{ ...row }]);
+      api.delayInputGets(runId, 1500, 1); // the first GET /inputs is slow: only a wait makes the replay live in time
+      const liveAtStart: boolean[] = [];
+      const seen: RunContext[] = [];
+      const factory: ExecutorFactory = (id) => ({
+        homeDir: path.join(homeRoot, id),
+        executor: {
+          run: async (ctx: RunContext): Promise<ExecutorResult> => {
+            seen.push(ctx);
+            liveAtStart.push(ctx.isLiveFollowUpId?.(41) === true);
+            return { branch: ctx.branch };
+          },
+        },
+      });
+      await runnerWith(factory, gitlab).execute(historyClaim(3105, runId));
+      assert.strictEqual(seen[0]?.reviewedPlanResume, true);
+      assert.deepStrictEqual(seen[0]?.priorOwnerFollowUps, [{ id: 41, body: "keep the API stable" }]);
+      assert.deepStrictEqual(liveAtStart, [true], "the live replay is known before the executor composes a prompt");
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── PRD #218 M2 — the reseed's per-leg base resolution (git level) ────────────

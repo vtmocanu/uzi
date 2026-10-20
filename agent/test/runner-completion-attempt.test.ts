@@ -204,7 +204,7 @@ function makeCompletionCtx(
     sessionId: null,
     onSessionId: () => {},
     gatePlan: async () => approve,
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: async (n) => {
       iterations.push(n);
       if (
@@ -449,7 +449,7 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
       budgetExhaustedFromIteration: 2,
     });
     Object.assign(probe.ctx, {
-      pullFollowUp: () => ({ id: 3089, body: "UNTRUSTED-OWNER-CORRECTION" }),
+      pullFollowUps: () => [{ id: 3089, body: "UNTRUSTED-OWNER-CORRECTION" }],
       kind: "issue", interactive: false, planApproved: true,
       approvedPlan: "plan", sessionId: "sess-1",
       frozenMilestones: [
@@ -691,11 +691,11 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     };
     let pulls = 0;
     const included: number[] = [];
-    probe.ctx.pullFollowUp = () => {
-      if (!queued) return undefined;
+    probe.ctx.pullFollowUps = () => {
+      if (!queued) return [];
       pulls++;
       queued = false;
-      return { id: 3089, body: "QUEUED-OWNER-INPUT" };
+      return [{ id: 3089, body: "QUEUED-OWNER-INPUT" }];
     };
     probe.ctx.followUpIncluded = id => included.push(id);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);

@@ -1426,8 +1426,8 @@ type ListOwnersOverCustodyLimitParams struct {
 // is the SAME predicate ClaimRun's custody-admission clause blocks on (ADR-2445), so a
 // notified owner is exactly one whose runs are (or can be) blocked. The reconciler then claims
 // at-most-once and reads GetCustodyAggregateForOwner for the exact DM facts, so this returns only
-// the user_id. The caller guards a non-positive @custody_hold_limit (the admission gate is then
-// disabled), so this is never called with one — a non-positive limit here would match every owner.
+// the user_id. Callers pass the custody_hold_limit admin setting (#3150), always 1..1000, and skip
+// the query when it cannot be read; a non-positive limit here would match every owner.
 func (q *Queries) ListOwnersOverCustodyLimit(ctx context.Context, arg ListOwnersOverCustodyLimitParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listOwnersOverCustodyLimit, arg.HeartbeatCutoff, arg.CustodyHoldLimit)
 	if err != nil {

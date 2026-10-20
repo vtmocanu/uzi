@@ -399,9 +399,16 @@ uzi version
   `codex_account_unavailable` is held on its Codex account until that account is usable
   again; cause `vault_locked` means a Codex credential refresh or release found the run
   owner's vault locked: an explicit vault unlock queues existing parks promptly;
-  `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused` (an owner-requested hold, `uzi
-  run pause`, resumed on demand from the run page or `uzi run resume <id>`;
-  it does not auto-resume). So to
+  `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
+  (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
+  lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;
+  ordinary pauses do not auto-resume). System holds also use `paused`; follow
+  their hold-specific remedy. Human `run get` may distinguish execution paths
+  using current pause evidence, otherwise it says `paused`. `park_run` and
+  the owner's `/park` answer share the lead-park execution path and can display
+  **paused by the run's lead**; `uzi run pause` uses the owner path and can
+  display **paused by its owner**. These labels do not identify the requester,
+  a person or reason; `--json` and `--field` are unchanged. So to
   wait for a plan gate or a clarification park, use **`uzi run wait <id>`** (see
   below) — relying on `--follow` there blocks until the run truly finishes, which
   may be never if it is waiting on you. (If you ever see a `status` outside this list,
@@ -432,7 +439,7 @@ uzi version
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
   `worker_requeue_exhausted`: timed limit and recovery waits retry on a timer, pool waits
-  need an available pooled token, and owner pauses need `uzi run resume`. A
+  need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
@@ -723,7 +730,8 @@ uzi version
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
   `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
   `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
-  `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
+  `blocked_runs` aggregate (the listing errors if the server cannot read a valid
+  `custody_hold_limit`; an admin saves one). Capacity uses admission count against the configured `custody_hold_limit` (default 8);
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
   an exact-owner/run/live-run, unreleased current-generation claim on a matching existing
   same-owner worker with a fresh non-null heartbeat (inclusive configured
@@ -732,7 +740,7 @@ uzi version
   Unknown/mismatched, old/future-generation, stale, released, terminal and other statuses
   remain counted; `active` attention alone is not eligibility. Accounting releases nothing
   and leaves open-hold cleanup safeguards intact. Previously claimed queued continuations
-  bypass owner admission with 1–7 own total open holds, losing that exemption at 8;
+  bypass owner admission with 1 to limit-1 own total open holds, losing that exemption at the limit;
   `blocked_runs` excludes exempt continuations. Concurrent claims and late staleness can
   exceed the limit under the statement-snapshot gate. The current API emits the new field
   even at zero; the CLI falls back to total only when an older API omits it, preserving

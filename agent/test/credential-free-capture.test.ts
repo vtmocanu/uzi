@@ -83,6 +83,30 @@ function rig(options: { drain?: Promise<void>; primary?: Promise<void>; output?:
 }
 
 describe("credential-free capture foundation (#2852)", () => {
+  it("refuses private maintenance and trusted spawn at capture entry before effects or decoration", async t => {
+    const r = rig();
+    let effects = 0, reads = 0;
+    const internal = r.git as any;
+    const result = await r.safety.withCredentialFreeCapture(1000, context =>
+      r.git.withCredentialFreeCapture(context, async () => {
+        t.mock.method(fs.promises, "lstat", async () => { reads++; throw new Error("unexpected filesystem read"); });
+        t.mock.method(fs.promises, "mkdir", async () => { effects++; throw new Error("unexpected filesystem effect"); });
+        await assert.rejects(internal.withVerifiedMaintenancePack(
+          { clonePath: "/capture/source", identity: "1:2" }, "a".repeat(40), "/capture/output",
+          async () => { effects++; }, async () => { effects++; }), { message: "capture private verification refused" });
+        await assert.rejects(internal.spawnGit("/capture/source", ["status"], undefined, {
+          trustedExecutable: true,
+          // This decoration passes the overlay guard, so refusal must precede
+          // beforeSpawn even without the maintenance environment overrides.
+          env: {},
+          beforeSpawn: async () => { effects++; },
+        }));
+        assert.equal(reads, 0);
+        assert.equal(effects, 0);
+        assert.equal(r.specs.length, 0);
+      }));
+    assert.equal(result.kind, "observed_empty");
+  });
   it("runner checkpoint overlay refuses capture before ownership, source or credential reads", async () => {
     const r = rig();
     let ownership = 0, sourceReads = 0, credentialReads = 0;

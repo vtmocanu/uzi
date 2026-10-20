@@ -56,7 +56,7 @@ func (d overrideContractDB) QueryRow(_ context.Context, sql string, _ ...any) pg
 }
 
 func overrideContractService(t *testing.T) *workersvc.Service {
-	return workersvc.New(store.New(overrideContractDB{t: t}), nil, workersvc.Params{})
+	return workersvc.New(store.New(overrideContractDB{t: t}), nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 }
 
 // TestResolveCredentialOverrideCodexRefused: an effective Codex harness refuses an Anthropic

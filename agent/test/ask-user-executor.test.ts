@@ -123,7 +123,7 @@ function makeCtx(
       call++;
       return a;
     },
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     ...overrides,
   };
   return { ctx, emits, asked };

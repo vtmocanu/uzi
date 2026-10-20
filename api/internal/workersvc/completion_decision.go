@@ -76,7 +76,7 @@ type CompletionDecisionInput struct {
 //   - paused with hold_reason='completion_blocked': the lead was reaped (or the owner already
 //     paused it), so the decision resumes THROUGH queued via ResumePausedRun (which banks the
 //     parked wall-clock into budget_paused_seconds). The guidance rides as a `follow_up` the new
-//     claim/session's pullFollowUp picks up (there is NO live await to resolve). The hold columns
+//     claim/session's pullFollowUps picks up (there is NO live await to resolve). The hold columns
 //     are DELIBERATELY LEFT SET here — D7 clears them on the first accepted running report
 //     (SetRunRunning), NOT prematurely in the resume — so a resumed run still carries
 //     hold_reason/hold_captured_head until it is running again.
@@ -93,7 +93,7 @@ type CompletionDecisionInput struct {
 //     (kind='answer', the question_id column). The answer is written UNCONDITIONALLY: an empty
 //     guidance still sends a non-empty continue sentinel (["continue"]) so the await resolves and
 //     the worker gets an unambiguous continue signal.
-//   - paused window: there is no live await; the resumed NEW claim's pullFollowUp drains the
+//   - paused window: there is no live await; the resumed NEW claim's pullFollowUps drains the
 //     guidance, so it rides as a `follow_up` (ConsumeRunInputs includes follow_up). Written only
 //     when guidance is non-empty; an empty guidance is a bare continue with nothing to inject.
 //
@@ -142,7 +142,7 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 //     never resolve, so it is refused like a non-blocked run.
 //   - paused + hold_reason='completion_blocked': the lead was reaped. The decision resumes THROUGH
 //     queued via ResumePausedRun; the guidance rides as a `follow_up` the resumed claim's
-//     pullFollowUp drains, written ONLY when non-empty (an empty guidance is a bare continue). The
+//     pullFollowUps drains, written ONLY when non-empty (an empty guidance is a bare continue). The
 //     hold columns are LEFT SET (SetRunRunning clears them on the first running report).
 //   - neither → ErrCompletionNotBlocked (the run never asked for a decision).
 //

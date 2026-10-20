@@ -299,7 +299,7 @@ func (t *prDescFakeTx) Rollback(context.Context) error {
 // prDescTestRouter mounts the four PR-description handlers behind a middleware that
 // authenticates the given worker, the way RequireWorker does on the real table.
 func prDescTestRouter(st *prDescFakeStore, wkr store.Worker) http.Handler {
-	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{})}
+	h := &Handler{wsvc: workersvc.New(st, nil, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})}
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {

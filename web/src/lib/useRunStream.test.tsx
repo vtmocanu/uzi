@@ -12,10 +12,11 @@
 // a live socket boundary — everything else stays in the pure runStream layer.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { api, ApiError, type Run, type RunMessage, type SteerInput } from "./api";
 import { useRunStream } from "./useRunStream";
 import { isRevisingRun } from "./runBadge";
+import { pauseOrigin } from "./pauseOrigin";
 
 // DeadSocket looks like a WebSocket to the hook but never fires onopen (or any
 // event): the exact failure mode of a broken proxy handshake.
@@ -729,5 +730,297 @@ describe("useRunStream milestone reset propagation", () => {
     await act(async () => result.current.submit("follow_up", "hello"));
     expect(submitted.mock.calls[2]).toEqual(["run-1", "follow_up", "hello", undefined]);
     unmount();
+  });
+});
+
+describe("obsolete socket callbacks", () => {
+  const since = "2026-10-16T12:00:00Z";
+  const marker = (origin: string) => ({
+    type: "message", seq: 1, kind: "paused", payload: { origin }, created_at: since,
+  });
+  const event = (frame: unknown) => ({ data: JSON.stringify(frame) } as MessageEvent);
+  const retain = (socket: LiveSocket) => ({
+    open: socket.onopen!, message: socket.onmessage!, close: socket.onclose!, error: socket.onerror!,
+  });
+  beforeEach(() => {
+    vi.stubGlobal("WebSocket", LiveSocket);
+    vi.spyOn(api, "getRun").mockImplementation(async id => ({
+      run: { ...fakeRun(), id, status: "paused", status_since: since },
+    }));
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+  });
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it.each([["b"], ["b", "a"]])("rejects retained callbacks after navigation through %j", async (...ids) => {
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "a" } });
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    const old = retain(LiveSocket.last!);
+    for (const id of ids) {
+      rerender({ id });
+      await waitFor(() => expect(result.current.run?.id).toBe(id));
+      await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    }
+    await act(async () => LiveSocket.last!.open());
+    const calls = [api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length);
+    await act(async () => {
+      old.message(event(marker("lead_park")));
+      old.message(event({ type: "state" }));
+      old.message(event({ type: "input" }));
+      old.open(); old.error(); old.close();
+    });
+    expect(result.current.messages).toEqual([]);
+    expect(result.current.pauseOriginReady).toBe(true);
+    expect(result.current.connected).toBe(true);
+    expect([api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length)).toEqual(calls);
+    await act(async () => LiveSocket.last!.deliver(marker("owner")));
+    expect(pauseOrigin(result.current.run!, result.current.messages, result.current.pauseOriginReady)).toBe("owner");
+    await act(async () => LiveSocket.last!.deliver({ ...marker("lead_park"), seq: 2 }));
+    expect(pauseOrigin(result.current.run!, result.current.messages, result.current.pauseOriginReady)).toBe("lead_park");
+  });
+
+  it("rejects inactive, replaced and unmounted socket callbacks without touching the replacement", async () => {
+    const { result, unmount } = renderHook(() => useRunStream("a"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    vi.useFakeTimers();
+    const socket = LiveSocket.last!;
+    const old = retain(socket);
+    act(() => socket.close());
+    const calls = [api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length);
+    await act(async () => { old.open(); old.message(event(marker("owner"))); old.error(); old.close(); });
+    expect(result.current.pauseOriginReady).toBe(false);
+    expect(result.current.messages).toEqual([]);
+    expect([api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length)).toEqual(calls);
+    await act(async () => vi.advanceTimersByTimeAsync(1500));
+    const current = LiveSocket.last!;
+    expect(current).not.toBe(socket);
+    const close = vi.spyOn(current, "close");
+    await act(async () => current.open());
+    expect(result.current.pauseOriginReady).toBe(true);
+    await act(async () => { old.close(); old.error(); old.open(); old.message(event(marker("lead_park"))); });
+    expect(close).not.toHaveBeenCalled();
+    expect(result.current.connected).toBe(true);
+    expect(result.current.pauseOriginReady).toBe(true);
+    expect(result.current.messages).toEqual([]);
+    await act(async () => current.deliver(marker("owner")));
+    expect(pauseOrigin(result.current.run!, result.current.messages, result.current.pauseOriginReady)).toBe("owner");
+    const retainedCurrent = retain(current);
+    unmount();
+    const afterUnmount = [api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length);
+    await act(async () => {
+      retainedCurrent.open(); retainedCurrent.message(event({ type: "state" }));
+      retainedCurrent.error(); retainedCurrent.close();
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect([api.getRun, api.getRunMessages, api.getRunInputs].map(fn => vi.mocked(fn).mock.calls.length)).toEqual(afterUnmount);
+    expect(LiveSocket.last).toBe(current);
+  });
+});
+
+// Pause attribution is local display evidence; transport scheduling stays unchanged.
+describe("pause origin readiness", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  }
+  beforeEach(() => {
+    cleanup();
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+    vi.spyOn(api, "getRun").mockResolvedValue({ run: { ...fakeRun(), status: "paused", status_since: "2026-10-16T12:00:00Z" } });
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+  });
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it("requires both mount reads, and resets immediately on run-id change", async () => {
+    const metadata = deferred<{ run: Run }>();
+    vi.mocked(api.getRun).mockReturnValueOnce(metadata.promise);
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-1" } });
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => {});
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => metadata.resolve({ run: fakeRun() }));
+    expect(result.current.pauseOriginReady).toBe(true);
+    const history = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(history.promise);
+    rerender({ id: "run-2" });
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => history.resolve({ messages: [] }));
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("failed reconnect catchup neutralizes cached evidence and fences older replay success", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    const old = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(old.promise);
+    act(() => LiveSocket.last!.open());
+    expect(result.current.pauseOriginReady).toBe(false);
+    vi.mocked(api.getRunMessages).mockRejectedValueOnce(new Error("offline"));
+    const retired = LiveSocket.last!;
+    act(() => retired.close());
+    await waitFor(() => expect(LiveSocket.last).not.toBe(retired), { timeout: 2500 });
+    await act(async () => LiveSocket.last!.open());
+    await act(async () => old.resolve({ messages: [] }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => LiveSocket.last!.open());
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("requires successful replay with every pending gap resolved", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    act(() => LiveSocket.last!.deliver({ type: "message", seq: 3, kind: "paused" }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await waitFor(() => expect(api.getRunMessages).toHaveBeenCalledTimes(2));
+    expect(result.current.pauseOriginReady).toBe(false);
+    act(() => LiveSocket.last!.deliver({ type: "message", seq: 1, kind: "text" }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    act(() => LiveSocket.last!.deliver({ type: "message", seq: 2, kind: "text" }));
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])("superseded replay gap fill cannot certify readiness (late metadata %s, repeated marker %s)", async (lateMetadata, repeatedMarker) => {
+    const old = deferred<{ messages: RunMessage[] }>();
+    const metadata = deferred<{ run: Run }>();
+    const paused = { ...fakeRun(), status: "paused", status_since: "2026-10-16T12:00:00Z" } satisfies Run;
+    const marker: RunMessage = { ...msg(3), kind: "paused", payload: { origin: "lead_park" }, created_at: paused.status_since };
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(old.promise)
+      .mockResolvedValueOnce({ messages: repeatedMarker ? [marker] : [] });
+    if (lateMetadata) vi.mocked(api.getRun).mockReturnValueOnce(metadata.promise);
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await act(async () => LiveSocket.last!.deliver({ type: "message", ...marker }));
+    await waitFor(() => expect(api.getRunMessages).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(result.current.pauseOriginReady).toBe(false);
+
+    await act(async () => old.resolve({ messages: [msg(1), msg(2)] }));
+    expect(result.current.messages.map(m => m.seq)).toEqual([1, 2, 3]);
+    expect(result.current.pauseOriginReady).toBe(false);
+    expect(pauseOrigin(paused, result.current.messages, result.current.pauseOriginReady)).toBe("");
+    if (lateMetadata) await act(async () => metadata.resolve({ run: paused }));
+    // Neither later metadata nor a current live commit may reuse the old success flag.
+    await act(async () => LiveSocket.last!.deliver({ type: "message", ...msg(4) }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    expect(pauseOrigin(paused, result.current.messages, result.current.pauseOriginReady)).toBe("");
+    expect(api.getRunMessages).toHaveBeenCalledTimes(2);
+
+    // An existing gap catch-up supplies fresh proof without changing read scheduling.
+    vi.mocked(api.getRunMessages).mockResolvedValueOnce({ messages: [msg(5)] });
+    act(() => LiveSocket.last!.deliver({ type: "message", ...msg(6) }));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    expect(pauseOrigin(paused, result.current.messages, result.current.pauseOriginReady)).toBe("lead_park");
+    expect(api.getRunMessages).toHaveBeenCalledTimes(3);
+  });
+
+  it("a current replay already in flight can certify after a superseded gap fill", async () => {
+    const old = deferred<{ messages: RunMessage[] }>();
+    const current = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    const { result } = renderHook(() => useRunStream("run-1"));
+    act(() => LiveSocket.last!.deliver({ type: "message", ...msg(3) }));
+    await waitFor(() => expect(api.getRunMessages).toHaveBeenCalledTimes(2));
+    await act(async () => old.resolve({ messages: [msg(1), msg(2)] }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => current.resolve({ messages: [msg(1), msg(2), msg(3)] }));
+    expect(result.current.pauseOriginReady).toBe(true);
+    expect(api.getRunMessages).toHaveBeenCalledTimes(2);
+  });
+
+  it("a duplicate superseded response preserves current valid readiness", async () => {
+    const old = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(old.promise)
+      .mockResolvedValueOnce({ messages: [msg(1), msg(2), msg(3)] });
+    const { result } = renderHook(() => useRunStream("run-1"));
+    act(() => LiveSocket.last!.deliver({ type: "message", ...msg(3) }));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    await act(async () => old.resolve({ messages: [msg(1), msg(2)] }));
+    expect(result.current.pauseOriginReady).toBe(true);
+    expect(result.current.messages.map(m => m.seq)).toEqual([1, 2, 3]);
+    expect(api.getRunMessages).toHaveBeenCalledTimes(2);
+  });
+
+  it("state-only invalidation rejects older metadata even after current replay", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    const old = deferred<{ run: Run }>();
+    const current = deferred<{ run: Run }>();
+    vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    let oldRead!: Promise<void>;
+    act(() => { oldRead = result.current.refreshRun(); });
+    act(() => LiveSocket.last!.deliver({ type: "state" }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await waitFor(() => expect(api.getRunMessages).toHaveBeenCalledTimes(2));
+    await act(async () => { old.resolve({ run: fakeRun() }); await oldRead; });
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => current.resolve({ run: { ...fakeRun(), status: "paused", status_since: "2026-10-16T12:01:00Z" } }));
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("a failed latest metadata read cannot be certified by an earlier successful read", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    const old = deferred<{ run: Run }>();
+    vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockRejectedValueOnce(new Error("offline"));
+    let oldRead!: Promise<void>;
+    act(() => { oldRead = result.current.refreshRun(); });
+    await act(async () => result.current.refreshRun());
+    await act(async () => { old.resolve({ run: fakeRun() }); await oldRead; });
+    expect(result.current.pauseOriginReady).toBe(false);
+  });
+
+  it("mount replay failure stays neutral even after metadata succeeds", async () => {
+    vi.mocked(api.getRunMessages).mockRejectedValueOnce(new Error("offline"));
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("paused"));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => LiveSocket.last!.open());
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("a changed status epoch from a refresh requires a fresh existing replay", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    vi.mocked(api.getRun).mockResolvedValue({ run: { ...fakeRun(), status: "paused", status_since: "2026-10-16T12:02:00Z" } });
+    await act(async () => result.current.refreshRun());
+    expect(result.current.pauseOriginReady).toBe(false);
+    // A health refresh alone cannot certify the old log against this new epoch.
+    await act(async () => LiveSocket.last!.deliver({ type: "health" }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    await act(async () => LiveSocket.last!.open());
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("an older metadata success after current success cannot replace certified metadata", async () => {
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.pauseOriginReady).toBe(true));
+    const old = deferred<{ run: Run }>();
+    vi.mocked(api.getRun).mockReturnValueOnce(old.promise);
+    let oldRead!: Promise<void>;
+    act(() => { oldRead = result.current.refreshRun(); });
+    await act(async () => result.current.refreshRun());
+    expect(result.current.pauseOriginReady).toBe(true);
+    await act(async () => { old.resolve({ run: fakeRun() }); await oldRead; });
+    expect(result.current.run?.status).toBe("paused");
+    expect(result.current.pauseOriginReady).toBe(true);
+  });
+
+  it("old run reads cannot certify an A → B → A generation", async () => {
+    const old = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(old.promise);
+    const { result, rerender } = renderHook(({ id }) => useRunStream(id), { initialProps: { id: "run-1" } });
+    rerender({ id: "run-2" });
+    const current = deferred<{ messages: RunMessage[] }>();
+    vi.mocked(api.getRunMessages).mockReturnValueOnce(current.promise);
+    rerender({ id: "run-1" });
+    await act(async () => old.resolve({ messages: [msg(1)] }));
+    expect(result.current.pauseOriginReady).toBe(false);
+    expect(result.current.messages).toEqual([]);
+    await act(async () => current.resolve({ messages: [] }));
+    expect(result.current.pauseOriginReady).toBe(true);
   });
 });

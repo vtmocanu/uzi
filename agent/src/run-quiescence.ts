@@ -142,6 +142,45 @@ export function assertClosedReaperRequest(request: BoundaryProcessRequest, signa
 }
 
 import { MaintenanceBudget } from "./maintenance-budget.js";
+import { MaintenanceResources } from "./recovery-maintenance.js";
+import type { Readable } from "node:stream";
+
+/** Reserve raw bytes before removing them from a scoped readable. No short-read refunds.
+ * Each callback retains the admitting scope even for injected emitters outside ALS.
+ * Failure pauses the stream and cancels its owner; settlement remains the owner's close. */
+function pullMaintenance(stream: Readable | null, cap: number, deliver: (chunk: Buffer) => void,
+  failure: () => void): void {
+  if (!stream) return;
+  const within = AsyncLocalStorage.snapshot();
+  let bytes = 0, stopped = false;
+  const pull = () => within(() => {
+    if (stopped) return;
+    try {
+      MaintenanceResources.checkIfActive();
+      while (stream.readableLength > 0) {
+        const length = Math.min(stream.readableLength, 64 * 1024, cap - bytes);
+        if (length <= 0) throw new Error("maintenance output envelope");
+        MaintenanceResources.consumeIfActive("metadataBytes", length);
+        bytes += length;
+        const chunk: unknown = stream.read(length);
+        if (chunk === null) return;
+        if (!Buffer.isBuffer(chunk)) throw new Error("maintenance raw stream required");
+        MaintenanceResources.checkIfActive();
+        deliver(chunk);
+      }
+      // A drained buffer needs one more zero-length read for the stream to observe EOF and
+      // emit 'end'; without it a complete response never settles and waits for its timeout.
+      stream.read(0);
+    } catch {
+      stopped = true;
+      stream.pause();
+      failure();
+    }
+  });
+  stream.on("readable", pull);
+  pull();
+}
+
 // issue #1783 (R0/R3/R5 + Docker teardown) — prove a run's clone is QUIESCENT before the worker
 // parks it, retires it, or finalizes from it.
 //
@@ -207,6 +246,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { maintenanceEsbuildExecutable } from "./maintenance-bootstrap-executable.js";
 import { ATTEMPT_ID_RE, cloneKeyOf, formatAttemptId, isWithinPath } from "./attempt-path.js";
 import { parseDockerTarget } from "./docker-wiring.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
@@ -342,23 +382,71 @@ export interface ProcTable {
   readEnviron(pid: number): string;
   readCwd(pid: number): string;
   readStat(pid: number): string;
+  /** Kernel executable identity, used only by exact bootstrap exemptions. */
+  readExecutable?(pid: number): string;
+  /** This table's own proc mountinfo, used only by the exclusive-idle proof: a hidepid-
+   *  restricted mount hides other processes, so it can never prove idle. */
+  readProcMountInfo?(): string;
 }
 
 const PROC_ROOT = path.join("/", "proc");
+const meteredProcTables = new WeakSet<ProcTable>();
+const helperMeteredProcTables = new WeakMap<ProcTable, HelperWork | undefined>();
+const HELPER_WORK_LIMITS = { adminEntries: 512, metadataBytes: 32 * 1024 * 1024 };
+type HelperWorkLimits = typeof HELPER_WORK_LIMITS;
+const PRODUCER_WORK_LIMITS = { adminEntries: 128, metadataBytes: 16 * 1024 * 1024 };
+/** Exclusive-idle rescans absorb a transient worker helper; all within the caller's envelope. */
+const EXCLUSIVE_IDLE_MAX_SCANS = 3;
+const EXCLUSIVE_IDLE_INTERVAL_MS = 250;
+
+function validateProducerWorkLimits(limits: unknown, mode: QuiesceMode, workerWide?: boolean, exclusiveIdle?: boolean): void {
+  if (limits === undefined) return;
+  if (!MaintenanceResources.active() || (MaintenanceResources.discoveryActive() && exclusiveIdle !== true) ||
+      mode !== "capture" || workerWide === true || !isHelperWorkLimits(limits) ||
+      limits.adminEntries <= 0 || limits.adminEntries > PRODUCER_WORK_LIMITS.adminEntries ||
+      limits.metadataBytes <= 0 || limits.metadataBytes > PRODUCER_WORK_LIMITS.metadataBytes)
+    throw new Error("invalid producer quiescence envelope");
+  if (exclusiveIdle === true) MaintenanceResources.checkIfActive();
+  else MaintenanceResources.check();
+}
+type HelperScanRequest = ScanRequest & { workLimits?: HelperWorkLimits };
+
+/** One sticky allowance for all raw proc work in one child invocation, including rescans.
+ * Failed reservations consume no more work; earlier reservations are never refunded. */
+class HelperWork {
+  private readonly left: HelperWorkLimits;
+  failed = false;
+  constructor(limits: HelperWorkLimits) { this.left = { ...limits }; }
+  check(): void { if (this.failed) throw new Error("helper work exhausted"); }
+  consume(resource: keyof HelperWorkLimits, amount: number): void {
+    this.check();
+    if (amount > this.left[resource]) {
+      this.failed = true;
+      this.check();
+    }
+    this.left[resource] -= amount;
+  }
+}
+const helperWork = new AsyncLocalStorage<HelperWork>();
 
 /** A procfs-shaped table rooted at `root`: `<root>/<pid>/{status,environ,cwd,stat}`. */
 export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; deadline: number }): ProcTable {
-  if (budget) {
+  const work = helperWork.getStore();
+  if (budget || MaintenanceResources.active() || work) {
     let total = 0;
     const check = () => {
-      budget.signal?.throwIfAborted();
-      if (Date.now() >= budget.deadline) throw new Error("process proof deadline");
+      work?.check();
+      MaintenanceResources.checkIfActive();
+      budget?.signal?.throwIfAborted();
+      if (budget && Date.now() >= budget.deadline) throw new Error("process proof deadline");
     };
-    const read = (pid: number, name: string, cap: number, encoding: BufferEncoding) => {
+    const read = (pid: number | "self", name: string, cap: number, encoding: BufferEncoding) => {
       check();
       const fd = fs.openSync(path.join(root, String(pid), name), fs.constants.O_RDONLY |
         fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       try {
+        work?.consume("metadataBytes", cap + 1);
+        MaintenanceResources.consumeIfActive("metadataBytes", cap + 1);
         const buf = Buffer.alloc(cap + 1);
         let length = 0;
         // Complete EOF, including at the cap; at most cap+1 nonempty reads.
@@ -374,7 +462,7 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
         return buf.toString(encoding, 0, length);
       } finally { fs.closeSync(fd); }
     };
-    return {
+    const table: ProcTable = {
       listPids: () => {
         check();
         const pids: number[] = [];
@@ -382,6 +470,8 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
         try {
           for (;;) {
             check();
+            work?.consume("adminEntries", 1);
+            MaintenanceResources.consumeIfActive("adminEntries", 1);
             const entry = directory.readSync();
             if (!entry) break;
             if (!/^[0-9]+$/.test(entry.name)) continue;
@@ -394,12 +484,31 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
       readStatus: pid => read(pid, "status", 64 * 1024, "utf8"),
       readStat: pid => read(pid, "stat", 64 * 1024, "utf8"),
       readEnviron: pid => read(pid, "environ", 256 * 1024, "latin1"),
-      readCwd: pid => { check(); return fs.readlinkSync(path.join(root, String(pid), "cwd")); },
+      readCwd: pid => {
+        check();
+        work?.consume("metadataBytes", 64 * 1024);
+        MaintenanceResources.consumeIfActive("metadataBytes", 64 * 1024);
+        const cwd = fs.readlinkSync(path.join(root, String(pid), "cwd"));
+        if (Buffer.byteLength(cwd) > 64 * 1024) throw new Error("process cwd budget");
+        return cwd;
+      },
+      readExecutable: pid => {
+        check();
+        work?.consume("metadataBytes", 64 * 1024);
+        MaintenanceResources.consumeIfActive("metadataBytes", 64 * 1024);
+        const executable = fs.readlinkSync(path.join(root, String(pid), "exe"));
+        if (Buffer.byteLength(executable) > 64 * 1024) throw new Error("process executable budget");
+        return executable;
+      },
+      readProcMountInfo: () => read("self", "mountinfo", 256 * 1024, "utf8"),
     };
+    meteredProcTables.add(table);
+    helperMeteredProcTables.set(table, work);
+    return table;
   }
   // Ordinary killing retains the shipped, unbounded legacy procfs reads.
   // Only the report-budget branch above changes the read policy.
-  return {
+  const table: ProcTable = {
     listPids: () =>
       fs
         .readdirSync(root)
@@ -409,7 +518,11 @@ export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; dea
     readEnviron: (pid) => fs.readFileSync(path.join(root, String(pid), "environ"), "latin1"),
     readCwd: (pid) => fs.readlinkSync(path.join(root, String(pid), "cwd")),
     readStat: (pid) => fs.readFileSync(path.join(root, String(pid), "stat"), "utf8"),
+    readExecutable: (pid) => fs.readlinkSync(path.join(root, String(pid), "exe")),
+    readProcMountInfo: () => fs.readFileSync(path.join(root, "self", "mountinfo"), "utf8"),
   };
+  helperMeteredProcTables.set(table, work);
+  return table;
 }
 
 /** The real process table (Linux procfs). */
@@ -490,7 +603,10 @@ function pidsInFile(file: string): number[] {
   let fd: number | undefined;
   try {
     fd = fs.openSync(file, "r");
-    const buf = Buffer.alloc(VIEW_PIDFILE_MAX_BYTES);
+    const work = helperWork.getStore();
+    const cap = VIEW_PIDFILE_MAX_BYTES + (work ? 1 : 0);
+    work?.consume("metadataBytes", cap);
+    const buf = Buffer.alloc(cap);
     let len = 0;
     for (;;) {
       const n = fs.readSync(fd, buf, len, buf.length - len, null);
@@ -498,9 +614,10 @@ function pidsInFile(file: string): number[] {
       len += n;
       if (len === buf.length) break;
     }
-    let text = buf.toString("utf8", 0, len);
+    work?.check();
+    let text = buf.toString("utf8", 0, Math.min(len, VIEW_PIDFILE_MAX_BYTES));
     // A file cut at the cap drops its last, possibly truncated, line (a cut "12345" is not "123").
-    if (len === buf.length) text = text.slice(0, text.lastIndexOf("\n") + 1);
+    if (len >= VIEW_PIDFILE_MAX_BYTES) text = text.slice(0, text.lastIndexOf("\n") + 1);
     return text
       .split("\n")
       .filter((l) => /^\d+$/.test(l.trim()))
@@ -519,14 +636,15 @@ function pidsInFile(file: string): number[] {
 /** The real procfs listing only `root`'s descendants (by the world-readable ppid), `extraPids` and
  *  the pids in `extraPidFiles` (re-read at every listing). */
 function descendantsTable(root: number, extraPids: readonly number[], extraPidFiles: readonly string[]): ProcTable {
+  const raw = helperWork.getStore() ? procfsTableAt(PROC_ROOT) : procfsTable;
   return {
-    ...procfsTable,
+    ...raw,
     listPids: () => {
-      const pids = procfsTable.listPids();
+      const pids = raw.listPids();
       const extra = new Set([...extraPids, ...extraPidFiles.flatMap(pidsInFile)]);
       const parentOf = new Map<number, number>();
       for (const pid of pids) {
-        const r = tryRead(() => procfsTable.readStat(pid));
+        const r = tryRead(() => raw.readStat(pid));
         const facts = r.ok ? parseStat(r.value) : undefined;
         if (facts) parentOf.set(pid, facts.ppid);
       }
@@ -538,6 +656,7 @@ function descendantsTable(root: number, extraPids: readonly number[], extraPidFi
         }
         return false;
       };
+      helperWork.getStore()?.check();
       return pids.filter((pid) => extra.has(pid) || under(pid));
     },
   };
@@ -632,6 +751,100 @@ function stripDeleted(cwd: string): string {
 export type QuiesceMode = "own" | "seed" | "capture";
 
 /** What the scan is looking for. JSON-serializable: it crosses into the runner-uid helper. */
+export interface MaintenanceBootstrapRoot extends RecordedRoot {
+  parentPid: number;
+  executable: string;
+}
+
+/** One synchronous snapshot at the FIRST statement of main, before any app
+ * spawn or claim. No later enrollment. Parameters are pure-table test seams;
+ * production calls this with defaults. Unknown bootstrap state grants nothing. */
+export function snapshotMaintenanceBootstrap(
+  table: ProcTable = procfsTableAt(PROC_ROOT, { deadline: Date.now() + 1_000 }),
+  expectedExecutable: () => string = maintenanceEsbuildExecutable,
+  workerPid: number = process.pid,
+): readonly MaintenanceBootstrapRoot[] | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const pids = table.listPids();
+    if (pids.length > 128 || new Set(pids).size !== pids.length ||
+        pids.some(pid => !Number.isSafeInteger(pid) || pid <= 0)) return undefined;
+    const children: Array<{ pid: number; startTime: number }> = [];
+    for (const pid of pids) {
+      const raw = table.readStat(pid), parsed = parseStat(raw);
+      if (!raw.startsWith(`${pid} (`) || !parsed || parsed.startTime === undefined) return undefined;
+      if (parsed.ppid === workerPid) children.push({ pid, startTime: parsed.startTime });
+    }
+    if (children.length === 0) return Object.freeze([]);
+    if (children.length !== 1 || !table.readExecutable) return undefined;
+    const expected = expectedExecutable();
+    if (!path.isAbsolute(expected) || path.resolve(expected) !== expected || Buffer.byteLength(expected) > 4096) return undefined;
+    const child = children[0]!, raw = table.readStat(child.pid), current = parseStat(raw);
+    if (!raw.startsWith(`${child.pid} (`) || current?.ppid !== workerPid || current.startTime !== child.startTime ||
+        table.readExecutable(child.pid) !== expected) return undefined;
+    return Object.freeze([Object.freeze({ ...child, parentPid: workerPid, executable: expected })]);
+  } catch { return undefined; }
+}
+
+// The worker's one bootstrap snapshot. Recorded once by main; never re-taken or widened later.
+let recordedBootstrap: { roots: readonly MaintenanceBootstrapRoot[] | undefined } | undefined;
+
+/** Record main's first-statement snapshot. A second call refuses: no later enrollment (E3). */
+export function recordMaintenanceBootstrap(roots: readonly MaintenanceBootstrapRoot[] | undefined): void {
+  if (recordedBootstrap !== undefined) throw new Error("maintenance bootstrap already recorded");
+  // A detached deep copy: neither the caller's array nor its entries can change the record.
+  recordedBootstrap = Object.freeze({ roots: roots === undefined ? undefined : Object.freeze(roots.map(root =>
+    Object.freeze({ pid: root.pid, startTime: root.startTime, parentPid: root.parentPid, executable: root.executable }))) });
+}
+
+/** The recorded exact bootstrap set, or undefined (unrecorded or refused): the producer fails closed. */
+export function maintenanceBootstrapRoots(): readonly MaintenanceBootstrapRoot[] | undefined {
+  return recordedBootstrap?.roots;
+}
+
+/** The #3031 writer-exclusion proof: the worker-local, deny-only, never-signalling process scan,
+ * then (when Docker is wired) the read-only running-container probe, both inside ONE accounting
+ * scope. One pass inside uncharged discovery (C2 pre-check), three inside the charged slot.
+ * Without a recorded bootstrap set it refuses. */
+export function terminalMaintenanceProof(scans: 1 | 3, dockerHost: string | undefined): Promise<boolean> {
+  const bootstrap = maintenanceBootstrapRoots();
+  if (bootstrap === undefined) return Promise.resolve(false);
+  const req: ScanRequest = {
+    mode: "capture", targetUid: process.getuid?.() ?? 0, targetKey: "", targetPaths: [], liveMarkers: [],
+    liveRoots: [], workerNonce: "", exclusiveIdle: true, exclusiveIdleScans: scans,
+    exclusiveIdleRoots: [], exclusiveIdleBootstrap: [...bootstrap],
+  };
+  const proof = async () => (await reapRunProcesses(req, { viaHelper: false })).state === "quiescent" &&
+    (dockerHost === undefined || await dockerRunningContainers(dockerHost, MaintenanceResources.signalIfActive()) === "none");
+  return scans === 1 ? MaintenanceResources.runDiscovery(proof) : proof();
+}
+
+/** Bounded, non-gating diagnostics (E6). A value it cannot read is null, never a guess. */
+export function readMaintenancePosture(root: string = PROC_ROOT): {
+  yamaPtraceScope: number | null; seccomp: number | null; capEff: string | null; uidSplit: boolean;
+} {
+  const small = (file: string): string | null => {
+    try {
+      const fd = fs.openSync(path.join(root, file), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      try {
+        const buf = Buffer.alloc(64 * 1024 + 1);
+        const length = fs.readSync(fd, buf, 0, buf.length, null);
+        return length > 64 * 1024 ? null : buf.toString("utf8", 0, length);
+      } finally { fs.closeSync(fd); }
+    } catch { return null; }
+  };
+  const yama = small("sys/kernel/yama/ptrace_scope")?.trim();
+  const status = small("self/status") ?? "";
+  const field = (name: string) => new RegExp(`^${name}:\\s*(\\S+)$`, "m").exec(status)?.[1];
+  const seccomp = field("Seccomp"), capEff = field("CapEff");
+  return {
+    yamaPtraceScope: yama !== undefined && /^[0-3]$/.test(yama) ? Number(yama) : null,
+    seccomp: seccomp !== undefined && /^[0-2]$/.test(seccomp) ? Number(seccomp) : null,
+    capEff: capEff !== undefined && /^[0-9a-f]{16}$/.test(capEff) ? capEff : null,
+    uidSplit: uidSplitActive(),
+  };
+}
+
 export interface ScanRequest {
   reportDeadline?: number;
   mode: QuiesceMode;
@@ -651,6 +864,16 @@ export interface ScanRequest {
    *  none is ever signalled: the scan only reports the runner-uid processes whose env and cwd
    *  cannot be read and that nothing ties to another live attempt. */
   workerWide?: boolean;
+  /** Deny-only terminal-maintenance proof. Unlike workerWide, every UID and
+   * readable orphan is in scope. Never shares ordinary mark/group exemptions. */
+  exclusiveIdle?: true;
+  /** Fixed scan count for {@link exclusiveIdle}: 1 for the uncharged pre-check, at most 3 in a slot. */
+  exclusiveIdleScans?: number;
+  /** Exact, trusted bootstrap/slot roots supplied by the worker, never inferred
+   * from a name, environment nonce, process group or current idle observation. */
+  exclusiveIdleRoots?: RecordedRoot[];
+  /** Bootstrap services are exact-only identities, never subtree exemptions. */
+  exclusiveIdleBootstrap?: MaintenanceBootstrapRoot[];
   /** Recorded roots (pid + start time) of every OTHER live attempt on this worker (Claude CLI
    *  groups, Codex provider supervisors), plus the long-lived runner-uid roots the worker itself
    *  launched. A root matches only while a live process has BOTH its pid and its start time. */
@@ -750,6 +973,7 @@ export function scanOnce(
   selfPid: number = process.pid,
   excludeAllDescendants = false,
 ): ScanResult {
+  if (req.exclusiveIdle === true) return scanExclusiveIdle(req, table, selfPid, excludeAllDescendants);
   const result: ScanResult = { kill: [], survivors: [], unverified: [] };
   let pids: number[];
   try {
@@ -874,6 +1098,174 @@ export function scanOnce(
   return result;
 }
 
+/** True only when mountinfo has exactly one complete proc mount at /proc with no hidepid restriction.
+ * `subset=pid` still lists every process; any hidepid other than 0/off hides some. */
+export function procMountShowsAllProcesses(mountinfo: string): boolean {
+  // Exactly one mount at /proc, a complete proc row. Stacked mounts are ambiguous: visibility
+  // follows mount-id/parent topology, not row order, so more than one refuses.
+  let options: string | undefined, mounts = 0;
+  for (const line of mountinfo.split("\n")) {
+    if (line === "") continue;
+    const parts = line.split(" - ");
+    if (parts.length !== 2) return false;
+    const left = parts[0]!.split(" "), right = parts[1]!.split(" ");
+    if (left.length < 6 || left.some(field => field === "") || right.length !== 3 || right.some(field => field === "")) return false;
+    if (left[4] !== PROC_ROOT) continue;
+    if (++mounts > 1) return false;
+    options = right[0] === "proc" ? right[2] : undefined;
+  }
+  if (options === undefined) return false;
+  return options.split(",").every(option => !option.startsWith("hidepid=") ||
+    option === "hidepid=0" || option === "hidepid=off");
+}
+
+/** Read-only exclusion proof for the new producer, independent of run attribution.
+ * Root enrollment is a separate trusted-worker obligation. This scanner only
+ * verifies current pid/start identities and actual parent chains. */
+function scanExclusiveIdle(req: ScanRequest, table: ProcTable, selfPid: number, helper: boolean): ScanResult {
+  const result: ScanResult = { kill: [], survivors: [], unverified: [] };
+  const roots = req.exclusiveIdleRoots;
+  const bootstrap = req.exclusiveIdleBootstrap ?? [];
+  if (req.mode !== "capture" || req.workerWide === true || req.targetKey !== "" ||
+      req.targetPaths.length !== 0 || req.ownMarker !== undefined || req.liveMarkers.length !== 0 ||
+      req.liveRoots.length !== 0 || req.mayKillUnreadableUnattributed === true ||
+      !Array.isArray(roots) || roots.length > 32 || roots.some(root => !root ||
+        !Number.isSafeInteger(root.pid) || root.pid <= 0 || !Number.isSafeInteger(root.startTime) || root.startTime < 0) ||
+      new Set(roots.map(root => root.pid)).size !== roots.length || !Array.isArray(bootstrap) || bootstrap.length > 1 ||
+      bootstrap.some(root => !root || !Number.isSafeInteger(root.pid) || root.pid <= 0 ||
+        !Number.isSafeInteger(root.startTime) || root.startTime < 0 || !Number.isSafeInteger(root.parentPid) || root.parentPid <= 0 ||
+        typeof root.executable !== "string" || Buffer.byteLength(root.executable) > 4096 ||
+        !path.isAbsolute(root.executable) || path.resolve(root.executable) !== root.executable ||
+        roots.some(other => other.pid === root.pid))) {
+    result.tableError = "exclusive idle request invalid";
+    return result;
+  }
+  // The active helper envelope, else the one this table was bound to. A wrapper table is
+  // not registered, so looking it up alone would leave per-read admin work uncharged.
+  const work = helperWork.getStore() ?? helperMeteredProcTables.get(table);
+  const readStat = (pid: number) => {
+    work?.consume("adminEntries", 1);
+    MaintenanceResources.consumeIfActive("adminEntries", 1);
+    return table.readStat(pid);
+  };
+  const readStatus = (pid: number) => {
+    work?.consume("adminEntries", 1);
+    MaintenanceResources.consumeIfActive("adminEntries", 1);
+    return table.readStatus(pid);
+  };
+  const readExecutable = (pid: number) => {
+    work?.consume("adminEntries", 1);
+    MaintenanceResources.consumeIfActive("adminEntries", 1);
+    if (!table.readExecutable) throw new Error("exclusive idle executable unavailable");
+    return table.readExecutable(pid);
+  };
+  const identities = new Map<number, number>();
+  // Enrolled pids observed as zombies: no exe link remains, start and parent still bind.
+  const exitedBootstrap = new Set<number>();
+  const facts = (pid: number) => {
+    const raw = readStat(pid), parsed = parseStat(raw);
+    // Do not let a malformed or substituted stat file manufacture a parent.
+    if (!raw.startsWith(`${pid} (`) || !parsed || parsed.startTime === undefined) throw new Error("exclusive idle identity unreadable");
+    if (identities.has(pid) && identities.get(pid) !== parsed.startTime) throw new Error("exclusive idle identity changed");
+    identities.set(pid, parsed.startTime);
+    return parsed;
+  };
+  try {
+    // A hidepid-restricted proc mount lists only some processes: never a proof of idle.
+    if (!table.readProcMountInfo) throw new Error("exclusive idle proc mount unproven");
+    work?.consume("adminEntries", 1);
+    MaintenanceResources.consumeIfActive("adminEntries", 1);
+    if (!procMountShowsAllProcesses(table.readProcMountInfo())) throw new Error("exclusive idle proc mount unproven");
+    const pids = table.listPids();
+    if (pids.length > 128 || new Set(pids).size !== pids.length ||
+        pids.some(pid => !Number.isSafeInteger(pid) || pid <= 0)) throw new Error("exclusive idle PID inventory refused");
+    const own = facts(selfPid);
+    // Only the current scanner and its positively observed ancestors are
+    // implicit exclusions. Other descendants of the worker do not qualify.
+    const excluded = new Set<number>([selfPid]);
+    let ancestor = own.ppid;
+    for (let depth = 0; ancestor > 0; depth++) {
+      if (depth >= 128 || excluded.has(ancestor)) throw new Error("exclusive idle ancestry refused");
+      const observed = facts(ancestor);
+      excluded.add(ancestor);
+      ancestor = observed.ppid;
+    }
+    if ([...roots, ...bootstrap].some(root => excluded.has(root.pid))) throw new Error("exclusive idle root overlaps worker ancestry");
+    const trusted = new Map(roots.map(root => [root.pid, root.startTime]));
+    // In the fixed scanner helper only, its current kernel identity anchors its
+    // own compiler/helper children. This never exempts worker-wide descendants.
+    if (helper) trusted.set(selfPid, own.startTime!);
+    const inTrustedSubtree = (pid: number): boolean => {
+      const seen = new Set<number>();
+      for (let depth = 0; pid > 0; depth++) {
+        if (depth >= 128 || seen.has(pid)) throw new Error("exclusive idle ancestry refused");
+        seen.add(pid);
+        const observed = facts(pid);
+        if (trusted.get(pid) === observed.startTime) return true;
+        pid = observed.ppid;
+      }
+      return false;
+    };
+    for (const pid of pids) {
+      if (excluded.has(pid)) continue;
+      // Bracket status with a stable kernel start identity. In particular, an
+      // old zombie status must never exempt a new live process reusing its PID.
+      const identity = tryRead(() => facts(pid));
+      if (!identity.ok) {
+        if (!identity.vanished) result.unverified.push({ pid, uid: -1, comm: "?", cwd: "not_read", reason: "exclusive_idle_identity_unreadable" });
+        continue;
+      }
+      const statusRead = tryRead(() => readStatus(pid));
+      if (!statusRead.ok) {
+        if (!statusRead.vanished) result.unverified.push({ pid, uid: -1, comm: "?", cwd: "not_read", reason: "exclusive_idle_status_unreadable" });
+        continue;
+      }
+      const status = parseStatus(statusRead.value);
+      if (!status) {
+        result.unverified.push({ pid, uid: -1, comm: "?", cwd: "not_read", reason: "exclusive_idle_status_unparsable" });
+        continue;
+      }
+      const boot = bootstrap.find(root => root.pid === pid);
+      if (status.zombie) {
+        const zombie = tryRead(() => facts(pid));
+        if (!zombie.ok && !zombie.vanished) result.unverified.push({ pid, uid: status.uid, comm: status.comm, cwd: "not_read", reason: "exclusive_idle_identity_unreadable" });
+        // A zombie cannot write; an enrolled pid still keeps its exact start and parent (E3).
+        else if (zombie.ok && boot && (zombie.value.startTime !== boot.startTime || zombie.value.ppid !== boot.parentPid))
+          throw new Error("exclusive idle bootstrap identity changed");
+        else if (zombie.ok && boot) exitedBootstrap.add(pid);
+        continue;
+      }
+      if (boot) {
+        const current = facts(pid);
+        if (current.startTime !== boot.startTime || current.ppid !== boot.parentPid || readExecutable(pid) !== boot.executable)
+          throw new Error("exclusive idle bootstrap identity changed");
+        continue;
+      }
+      const ancestry = tryRead(() => inTrustedSubtree(pid));
+      if (!ancestry.ok) {
+        if (!ancestry.vanished) result.unverified.push({ pid, uid: status.uid, comm: status.comm, cwd: "not_read", reason: "exclusive_idle_identity_unreadable" });
+      } else if (!ancestry.value) {
+        result.survivors.push({ pid, uid: status.uid, comm: status.comm, cwd: "not_read", reason: "exclusive_idle_writer_present" });
+      }
+    }
+    if (result.survivors.length || result.unverified.length) return result;
+    // A disappearing parent cannot hide a newly listed orphan. No positive
+    // answer from partial inventory, PID reuse or an unclassified new child.
+    const after = table.listPids();
+    if (after.length > 128 || new Set(after).size !== after.length ||
+        after.some(pid => !pids.includes(pid) || !identities.has(pid))) throw new Error("exclusive idle inventory changed");
+    for (const pid of after) {
+      const current = facts(pid), boot = bootstrap.find(root => root.pid === pid);
+      if (boot && (current.startTime !== boot.startTime || current.ppid !== boot.parentPid ||
+          (!exitedBootstrap.has(pid) && readExecutable(pid) !== boot.executable)))
+        throw new Error("exclusive idle bootstrap identity changed");
+    }
+  } catch {
+    result.tableError = "exclusive idle inventory incomplete";
+  }
+  return result;
+}
+
 // ─── Reap loop ─────────────────────────────────────────────────────────────────────────────
 
 export type ProcessQuiescenceState = "quiescent" | "survivors" | "unverified";
@@ -927,20 +1319,37 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
   const remaining = ambient?.cap(deps.deadlineMs ?? REAP_DEADLINE_MS);
   // A test view stands in for the real table only when the caller injected none.
   const view = deps.table === undefined && testView !== undefined ? viewReapDeps(testView) : undefined;
+  const scoped = MaintenanceResources.active();
   const reportBudget: { signal?: AbortSignal; deadline: number } | undefined = deps.reportBudget ??
-    (req.reportDeadline === undefined ? undefined : { deadline: req.reportDeadline });
+    (req.reportDeadline === undefined ? (scoped ? {
+      signal: MaintenanceResources.signalIfActive(),
+      deadline: Date.now() + MaintenanceResources.remainingMsIfActive(),
+    } : undefined) : { deadline: req.reportDeadline });
   const baseTable = deps.table ?? (reportBudget && testView && "procRoot" in testView
     ? procfsTableAt(testView.procRoot, reportBudget) : view?.table) ??
-    (reportBudget ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
+    (reportBudget || helperWork.getStore() ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
+  // procfsTableAt binds raw reservations at construction. Returned rows/strings cannot
+  // account for ignored directory entries, EOF or prebuffer reservations in another context.
+  const work = helperWork.getStore();
+  if (work && helperMeteredProcTables.has(baseTable) && helperMeteredProcTables.get(baseTable) !== work)
+    return { state: "unverified", processes: [], killed: [], detail: "proc table helper work context mismatch" };
   let tableFailure: unknown;
   let bytes = 0;
   const bounded = <T>(read: () => T, cap?: number): T => {
     try {
       ambient?.check();
+      MaintenanceResources.checkIfActive();
       reportBudget?.signal?.throwIfAborted();
       if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
       const result = read();
-      if (reportBudget && typeof result === "string" && cap !== undefined) {
+      if (typeof result === "string") {
+        const work = helperWork.getStore();
+        if (work && helperMeteredProcTables.get(baseTable) !== work)
+          work.consume("metadataBytes", Buffer.byteLength(result));
+        if (scoped && !meteredProcTables.has(baseTable))
+          MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(result));
+      }
+      if ((reportBudget || scoped) && typeof result === "string" && cap !== undefined) {
         const length = Buffer.byteLength(result);
         bytes += length;
         if (length > cap || bytes > 32 * 1024 * 1024) throw new Error("process input budget");
@@ -953,9 +1362,12 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       throw error;
     }
   };
-  const table: ProcTable = reportBudget || ambient ? {
+  const table: ProcTable = reportBudget || ambient || scoped ? {
     listPids: () => bounded(() => {
       const pids = baseTable.listPids();
+      const work = helperWork.getStore();
+      if (work && helperMeteredProcTables.get(baseTable) !== work) work.consume("adminEntries", pids.length);
+      if (!meteredProcTables.has(baseTable)) MaintenanceResources.consumeIfActive("adminEntries", pids.length);
       if (pids.length > 4096) throw new Error("process PID budget");
       return pids;
     }),
@@ -963,7 +1375,17 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     readStat: pid => bounded(() => baseTable.readStat(pid), 64 * 1024),
     readEnviron: pid => bounded(() => baseTable.readEnviron(pid), 256 * 1024),
     readCwd: pid => bounded(() => baseTable.readCwd(pid), 64 * 1024),
+    ...(baseTable.readExecutable ? { readExecutable: (pid: number) => bounded(() => baseTable.readExecutable!(pid), 64 * 1024) } : {}),
+    ...(baseTable.readProcMountInfo ? { readProcMountInfo: () => bounded(() => baseTable.readProcMountInfo!(), 256 * 1024) } : {}),
   } : baseTable;
+  // Exclusive-idle: a fixed small scan count, never kills, no inherited reap deadline loop.
+  const exclusiveScans = req.exclusiveIdle === true ? req.exclusiveIdleScans : undefined;
+  if (req.exclusiveIdle === true && (exclusiveScans === undefined || !Number.isSafeInteger(exclusiveScans) ||
+      exclusiveScans < 1 || exclusiveScans > EXCLUSIVE_IDLE_MAX_SCANS ||
+      // Uncharged discovery gets exactly one pass; rescans belong to a charged slot (C2).
+      (MaintenanceResources.discoveryActive() && exclusiveScans !== 1)))
+    return { state: "unverified", processes: [], killed: [], detail: "exclusive idle scan count invalid" };
+  let scans = 0;
   const kill = deps.kill ?? view?.kill ?? defaultKill;
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
@@ -976,9 +1398,19 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     if (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) {
       return { state: "unverified", processes: [], killed, detail: "maintenance deadline exhausted" };
     }
+    MaintenanceResources.checkIfActive();
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError || tableFailure || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
-      return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? "process proof deadline") };
+    if (last.tableError || tableFailure || helperWork.getStore()?.failed || (ambient && (ambient.signal.aborted || ambient.remainingMs() <= 0)) || (reportBudget && Date.now() >= reportBudget.deadline)) {
+      return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? (helperWork.getStore()?.failed ? "helper work exhausted" : "process proof deadline")) };
+    }
+    if (exclusiveScans !== undefined) {
+      if (last.kill.length > 0) return { state: "unverified", processes: [], killed, detail: "exclusive idle scan proposed a signal" };
+      // A transient worker helper may clear within the fixed count; nothing is ever signalled.
+      if ((last.survivors.length === 0 && last.unverified.length === 0) || ++scans >= exclusiveScans ||
+          (reportBudget ? Date.now() >= reportBudget.deadline : remaining ? remaining() <= 0 : false)) break;
+      if (ambient) await ambient.raceIO(() => sleep(Math.min(EXCLUSIVE_IDLE_INTERVAL_MS, remaining!())));
+      else await sleep(EXCLUSIVE_IDLE_INTERVAL_MS);
+      continue;
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
@@ -1145,7 +1577,11 @@ function runFixedAsRunner(
 ): Promise<{ status: number | null; stdout: string }> {
   if (uidSplitActive() && hasReaperCaptureScope()) return Promise.reject(new Error("raw scoped helper prelude refused"));
   const ambient = MaintenanceBudget.current();
+  const scoped = MaintenanceResources.active();
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
   ambient?.check();
+  MaintenanceResources.checkIfActive();
   const remaining = ambient?.cap(timeoutMs);
   if (budget) {
     budget.signal.throwIfAborted();
@@ -1157,6 +1593,7 @@ function runFixedAsRunner(
   if (remaining && duration <= 0) return Promise.reject(new Error("maintenance helper operation expired"));
   return new Promise((resolve, reject) => {
     let settled = false;
+    MaintenanceResources.consumeIfActive("launches", 1);
     const child = spawn(w.command, w.args, {
       env: workerSpawnEnv({ PATH: HELPER_PATH }),
       detached: true,
@@ -1168,48 +1605,56 @@ function runFixedAsRunner(
       cancellation = new Error("report helper setup cancelled");
       killRunnerGroup(child.pid);
     };
+    resourceSignal?.addEventListener("abort", cancel, { once: true });
     ambient?.signal.addEventListener("abort", cancel, { once: true });
     budget?.signal.addEventListener("abort", cancel, { once: true });
-    if (budget?.signal.aborted || ambient?.signal.aborted) cancel();
+    if (budget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancel();
     const timer = setTimeout(() => {
       if (settled) return;
       killRunnerGroup(child.pid);
-      if (budget || ambient) cancellation = new Error("report helper setup deadline");
+      if (budget || ambient || scoped) cancellation = new Error("report helper setup deadline");
       else {
         settled = true;
         reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
       }
     }, Math.min(duration, budget ? Math.max(1, Math.min(timeoutMs, budget.deadline - Date.now())) : timeoutMs));
     let out = "";
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (c: string) => {
-      if (budget && Buffer.byteLength(out) + Buffer.byteLength(c) > 64 * 1024) {
-        cancellation = new Error("report helper setup output overflow");
-        killRunnerGroup(child.pid);
-        return;
-      }
-      if (out.length < 64 * 1024) out += c;
-    });
+    const raw: Buffer[] = [];
+    if (scoped) {
+      pullMaintenance(child.stdout, 64 * 1024, chunk => { raw.push(chunk); }, cancel);
+    } else {
+      child.stdout?.setEncoding("utf8");
+      child.stdout?.on("data", (c: string) => {
+        if (budget && Buffer.byteLength(out) + Buffer.byteLength(c) > 64 * 1024) {
+          cancellation = new Error("report helper setup output overflow");
+          killRunnerGroup(child.pid);
+          return;
+        }
+        if (out.length < 64 * 1024) out += c;
+      });
+    }
     child.on("error", (err) => {
       if (settled) return;
-      if (budget || ambient) { cancellation = err; if (ambient) killRunnerGroup(child.pid); return; }
+      if (budget || ambient || scoped) { cancellation = err; if (ambient || scoped) killRunnerGroup(child.pid); return; }
       settled = true;
       clearTimeout(timer);
       reject(err);
     });
-    child.on("close", (status) => {
+    child.on("close", (status) => within(() => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      resourceSignal?.removeEventListener("abort", cancel);
       ambient?.signal.removeEventListener("abort", cancel);
       budget?.signal.removeEventListener("abort", cancel);
       try {
         ambient?.check();
+        MaintenanceResources.checkIfActive();
         if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
       } catch (error) { cancellation = error as Error; }
       if (cancellation) reject(cancellation);
-      else resolve({ status, stdout: out });
-    });
+      else resolve({ status, stdout: scoped ? Buffer.concat(raw).toString("utf8") : out });
+    }));
   });
 }
 
@@ -1267,6 +1712,8 @@ function helperArgv(): string[] {
 function isProcessQuiescence(v: unknown): v is ProcessQuiescence {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
+  if (Array.isArray(o.processes)) MaintenanceResources.consumeIfActive("adminEntries", o.processes.length);
+  if (Array.isArray(o.killed)) MaintenanceResources.consumeIfActive("adminEntries", o.killed.length);
   return (
     (o.state === "quiescent" || o.state === "survivors" || o.state === "unverified") &&
     Array.isArray(o.processes) &&
@@ -1320,14 +1767,23 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  * spawn timeout. Any failure to start, finish or answer is `unverified`.
  */
 async function reapProcessesViaHelper(
-  req: ScanRequest,
-  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
+  req: HelperScanRequest,
+  opts: { producerWorkLimits?: HelperWorkLimits; spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
   if (uidSplitActive() && hasReaperCaptureScope()) {
     return { state: "unverified", processes: [], killed: [], detail: "raw scoped helper refused" };
   }
+  if (req.exclusiveIdle === true)
+    return { state: "unverified", processes: [], killed: [], detail: "exclusive idle proof is worker-local" };
+  validateProducerWorkLimits(opts.producerWorkLimits, req.mode, req.workerWide, req.exclusiveIdle);
+  const limits = { ...(opts.producerWorkLimits ?? HELPER_WORK_LIMITS) };
   const ambient = MaintenanceBudget.current();
+  const scoped = MaintenanceResources.active();
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
   const remaining = ambient?.cap(opts.timeoutMs ?? HELPER_TIMEOUT_MS);
+  if (scoped) req = { ...req, reportDeadline: Math.floor(Math.min(req.reportDeadline ?? Infinity,
+    Date.now() + MaintenanceResources.remainingMsIfActive())) };
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
   try {
@@ -1339,6 +1795,7 @@ async function reapProcessesViaHelper(
   let tmpDir: string;
   try {
     ambient?.check();
+    MaintenanceResources.checkIfActive();
     opts.reportBudget?.signal.throwIfAborted();
     if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
     tmpDir = await helperTmp.make(opts.reportBudget);
@@ -1347,6 +1804,7 @@ async function reapProcessesViaHelper(
   }
   try {
     ambient?.check();
+    MaintenanceResources.checkIfActive();
     if (remaining && Math.floor(remaining()) <= 0) throw new Error("helper setup cap expired");
   } catch { return unverified("maintenance helper setup expired"); }
   // Report-proof temporary cleanup retains its separate wall-clock deadline: an aborted proof signal
@@ -1364,7 +1822,7 @@ async function reapProcessesViaHelper(
     }
   };
   if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
-    if (!ambient) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    if (!ambient && !scoped) await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
     return unverified("report helper setup expired");
   }
   const wrapped = runnerCommand(process.execPath, argv);
@@ -1376,14 +1834,16 @@ async function reapProcessesViaHelper(
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      resourceSignal?.removeEventListener("abort", cancelReport);
       opts.reportBudget?.signal.removeEventListener("abort", cancelReport);
       ambient?.signal.removeEventListener("abort", cancelReport);
-      if (ambient) {
+      if (ambient || scoped) {
         // Only admit private-temp cleanup while this attempt still has time; join it once admitted.
         try {
-          ambient.check();
+          ambient?.check();
+          MaintenanceResources.checkIfActive();
           Promise.resolve(helperTmp.remove(tmpDir, opts.reportBudget)).then(
-            () => { try { ambient.check(); resolve(r); } catch { resolve(unverified("maintenance helper cleanup expired")); } },
+            () => { try { ambient?.check(); MaintenanceResources.checkIfActive(); resolve(r); } catch { resolve(unverified("maintenance helper cleanup expired")); } },
             () => resolve(unverified("maintenance helper cleanup failed")));
         } catch { resolve(unverified("maintenance helper expired")); }
       } else if (opts.reportBudget) {
@@ -1404,6 +1864,18 @@ async function reapProcessesViaHelper(
     try {
       ambient?.check();
       if (remaining && Math.floor(remaining()) <= 0) throw new Error("maintenance helper operation expired");
+      if (scoped) {
+        // Reserve the whole child envelope before dispatch, without refunds even on partial failure.
+        if (req.exclusiveIdle === true && MaintenanceResources.discoveryActive()) {
+          MaintenanceResources.consumeIfActive("adminEntries", limits.adminEntries);
+          MaintenanceResources.consumeIfActive("metadataBytes", limits.metadataBytes);
+        } else {
+          MaintenanceResources.consume("adminEntries", limits.adminEntries);
+          MaintenanceResources.consume("metadataBytes", limits.metadataBytes);
+        }
+        req = { ...req, workLimits: { ...limits } };
+      }
+      MaintenanceResources.consumeIfActive("launches", 1);
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
         env: workerSpawnEnv(helperEnv),
@@ -1412,40 +1884,47 @@ async function reapProcessesViaHelper(
       done(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
       return;
     }
+    resourceSignal?.addEventListener("abort", cancelReport, { once: true });
     ambient?.signal.addEventListener("abort", cancelReport, { once: true });
     opts.reportBudget?.signal.addEventListener("abort", cancelReport, { once: true });
-    if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted) cancelReport();
+    if (opts.reportBudget?.signal.aborted || ambient?.signal.aborted || resourceSignal?.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper timed out");
+      if (opts.reportBudget || ambient || scoped) reportFailure = unverified("quiescence helper timed out");
       else done(unverified("quiescence helper timed out"));
     }, Math.min(remaining ? Math.max(1, remaining()) : opts.timeoutMs ?? HELPER_TIMEOUT_MS, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
       opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS));
     const out: Buffer[] = [];
     let outBytes = 0;
-    child.stdout?.on("data", (c: Buffer) => {
-      if (settled) return;
-      outBytes += c.length;
-      if (outBytes > HELPER_STDOUT_MAX) {
-        killRunnerGroup(child.pid);
-        if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
-        else done(unverified("quiescence helper output exceeded 1 MiB"));
-        return;
-      }
-      out.push(c);
-    });
-    child.stderr?.resume();
+    if (scoped) {
+      pullMaintenance(child.stdout, HELPER_STDOUT_MAX, c => { out.push(c); }, cancelReport);
+      pullMaintenance(child.stderr, HELPER_STDOUT_MAX, () => {}, cancelReport);
+    } else {
+      child.stdout?.on("data", (c: Buffer) => {
+        if (settled) return;
+        outBytes += c.length;
+        if (outBytes > HELPER_STDOUT_MAX) {
+          killRunnerGroup(child.pid);
+          if (opts.reportBudget || ambient) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+          else done(unverified("quiescence helper output exceeded 1 MiB"));
+          return;
+        }
+        out.push(c);
+      });
+      child.stderr?.resume();
+    }
     // A helper that dies before reading its request fails this write (EPIPE); the close handler
     // below reports that exit, so the write error itself is only swallowed here.
     child.stdin?.on("error", () => undefined);
     child.on("error", (err) => {
       const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
-      if (opts.reportBudget || ambient) { reportFailure = failure; if (ambient) killRunnerGroup(child.pid); }
+      if (opts.reportBudget || ambient || scoped) { reportFailure = failure; if (ambient || scoped) killRunnerGroup(child.pid); }
       else done(failure);
     });
-    child.on("close", (code, signal) => {
+    child.on("close", (code, signal) => within(() => {
       try {
         ambient?.check();
+        MaintenanceResources.checkIfActive();
         if (remaining && remaining() <= 0) throw new Error("maintenance helper operation expired");
       } catch { reportFailure = unverified("maintenance helper expired"); }
       if (reportFailure) { done(reportFailure); return; }
@@ -1453,13 +1932,19 @@ async function reapProcessesViaHelper(
         done(unverified(`quiescence helper exited ${code ?? signal ?? "abnormally"}`));
         return;
       }
-      done(parseHelperVerdict(Buffer.concat(out).toString("utf8")));
-    });
-    if (ambient) {
+      try { done(parseHelperVerdict(Buffer.concat(out).toString("utf8"))); }
+      catch { done(unverified("maintenance helper verdict exhausted")); }
+    }));
+    if (ambient || scoped) {
       try {
-        ambient.check();
-        if (remaining!() <= 0) throw new Error("helper input cap expired");
-        child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
+        ambient?.check();
+        MaintenanceResources.checkIfActive();
+        if (remaining && remaining() <= 0) throw new Error("helper input cap expired");
+        MaintenanceResources.consumeIfActive("adminEntries", req.targetPaths.length + req.liveMarkers.length + req.liveRoots.length);
+        const input = JSON.stringify(testView === undefined ? req : { ...req, view: testView });
+        if (Buffer.byteLength(input) > HELPER_REQUEST_MAX) throw new Error("helper request overflow");
+        MaintenanceResources.consumeIfActive("metadataBytes", Buffer.byteLength(input));
+        child.stdin?.end(input);
       } catch { cancelReport(); }
     } else child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
   });
@@ -1467,6 +1952,8 @@ async function reapProcessesViaHelper(
 
 /** Options for {@link reapRunProcesses}. */
 export interface ReapRunOptions extends ReapDeps {
+  /** Charged capture only; positive limits at most 16 MiB metadata and 128 admin entries. */
+  producerWorkLimits?: HelperWorkLimits;
   /** Run the scan in the runner-uid helper (default: when the uid split is active). */
   viaHelper?: boolean;
   spawnHelper?: HelperSpawn;
@@ -1484,17 +1971,25 @@ export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = 
   if (uidSplitActive() && hasReaperCaptureScope()) {
     return { state: "unverified", processes: [], killed: [], detail: "scoped reaper requires worker attempt construction" };
   }
-  const viaHelper = opts.viaHelper ?? uidSplitActive();
-  if (viaHelper) {
-    return reapProcessesViaHelper(req, {
+  // The exclusive-idle proof never signals or reads environ/cwd, and its bootstrap
+  // exe identity is readable only by the worker uid that owns it: always in-process.
+  if (req.exclusiveIdle === true && opts.viaHelper === true)
+    return { state: "unverified", processes: [], killed: [], detail: "exclusive idle proof is worker-local" };
+  const viaHelper = req.exclusiveIdle === true ? false : opts.viaHelper ?? uidSplitActive();
+  try {
+    validateProducerWorkLimits(opts.producerWorkLimits, req.mode, req.workerWide, req.exclusiveIdle);
+    if (viaHelper) {
+    return await reapProcessesViaHelper(req, {
       spawnHelper: opts.spawnHelper,
       timeoutMs: opts.helperTimeoutMs,
       helperTmp: opts.helperTmp,
       reportBudget: opts.reportBudget,
+      producerWorkLimits: opts.producerWorkLimits,
     });
   }
-  try {
-    return await reapProcesses(req, opts);
+    // In-process work keeps actual scoped parent metering and a sticky local envelope.
+    return await (opts.producerWorkLimits === undefined ? reapProcesses(req, opts) :
+      helperWork.run(new HelperWork(opts.producerWorkLimits), () => reapProcesses(req, opts)));
   } catch (err) {
     return { state: "unverified", processes: [], killed: [], detail: `reap failed: ${(err as Error).message}` };
   }
@@ -1556,6 +2051,7 @@ function dockerRequest(
   signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
   signal?.throwIfAborted();
+  if (MaintenanceResources.active()) return maintenanceDockerRequest(ep, method, urlPath, timeoutMs, maxBodyBytes, signal);
   return new Promise((resolve, reject) => {
     let settled = false;
     let res: http.IncomingMessage | undefined;
@@ -1603,15 +2099,87 @@ function dockerRequest(
   });
 }
 
+/** Read-only running-container probe for the exclusive-idle proof: one GET of the
+ * running list (never all=1, never a removal). Only an exact 200 empty array is "none". */
+export async function dockerRunningContainers(dockerHost: string, signal?: AbortSignal): Promise<"none" | "running" | "unknown"> {
+  const ep = parseDockerHost(dockerHost);
+  if (!ep) return "unknown";
+  try {
+    const list = await dockerRequest(ep, "GET", "/containers/json", 5_000, 1024 * 1024, signal);
+    if (list.status !== 200) return "unknown";
+    const parsed: unknown = JSON.parse(list.body);
+    if (!Array.isArray(parsed)) return "unknown";
+    return parsed.length === 0 ? "none" : "running";
+  } catch { return "unknown"; }
+}
+
+/** Scoped HTTP owns request and response through close, including quota-only cancellation. */
+function maintenanceDockerRequest(ep: Endpoint, method: string, urlPath: string, timeoutMs: number,
+  cap: number, signal?: AbortSignal): Promise<{ status: number; body: string }> {
+  MaintenanceResources.checkIfActive();
+  MaintenanceResources.consumeIfActive("rpcAttempts", 1);
+  const duration = Math.max(0, Math.min(timeoutMs, MaintenanceResources.remainingMsIfActive()));
+  const resourceSignal = MaintenanceResources.signalIfActive();
+  const within = AsyncLocalStorage.snapshot();
+  return new Promise((resolve, reject) => {
+    let response: http.IncomingMessage | undefined;
+    let requestClosed = false, responseClosed = false, ended = false, settled = false;
+    let failure: Error | undefined;
+    const chunks: Buffer[] = [];
+    const finish = () => within(() => {
+      if (settled || !requestClosed || (response && !responseClosed)) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", cancel);
+      resourceSignal?.removeEventListener("abort", cancel);
+      try {
+        MaintenanceResources.checkIfActive();
+        if (failure) throw failure;
+        if (!ended) throw new Error("maintenance docker incomplete");
+        resolve({ status: response?.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") });
+      } catch (error) { reject(error); }
+    });
+    const abort = (error: Error) => {
+      failure ??= error;
+      response?.destroy();
+      request.destroy();
+    };
+    const cancel = () => abort(new Error("maintenance docker cancelled"));
+    const request = http.request({ ...ep, method, path: urlPath, timeout: timeoutMs }, r => within(() => {
+      response = r;
+      r.on("close", () => { responseClosed = true; finish(); });
+      r.on("error", error => abort(error));
+      r.on("aborted", cancel);
+      r.on("end", () => { ended = true; });
+      if (failure) { r.destroy(); return; }
+      pullMaintenance(r, cap, chunk => chunks.push(chunk), cancel);
+    }));
+    const timer = setTimeout(cancel, duration);
+    timer.unref();
+    request.on("close", () => { requestClosed = true; finish(); });
+    request.on("timeout", cancel);
+    request.on("error", error => abort(error));
+    signal?.addEventListener("abort", cancel, { once: true });
+    resourceSignal?.addEventListener("abort", cancel, { once: true });
+    try {
+      MaintenanceResources.checkIfActive();
+      if (signal?.aborted || resourceSignal?.aborted) cancel();
+      else request.end();
+    } catch { cancel(); }
+  });
+}
+
 function boundContainers(body: string, targetPaths: string[]): string[] {
   const parsed: unknown = JSON.parse(body);
   if (!Array.isArray(parsed)) throw new Error("container listing is not an array");
+  MaintenanceResources.consumeIfActive("adminEntries", parsed.length);
   const ids: string[] = [];
   for (const c of parsed) {
     if (typeof c !== "object" || c === null) continue;
     const id = (c as { Id?: unknown }).Id;
     const mounts = (c as { Mounts?: unknown }).Mounts;
     if (typeof id !== "string" || !Array.isArray(mounts)) continue;
+    MaintenanceResources.consumeIfActive("adminEntries", mounts.length);
     const bound = mounts.some((m) => {
       const src = (m as { Source?: unknown } | null)?.Source;
       return typeof src === "string" && src !== "" && targetPaths.some((t) => isWithinPath(src, t));
@@ -1644,7 +2212,8 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   const reqTimeout = opts.requestTimeoutMs ?? 5_000;
   const ambient = MaintenanceBudget.current();
   const deadline = now() + (opts.deadlineMs ?? 15_000);
-  const remainingTime = ambient?.cap(opts.deadlineMs ?? 15_000) ?? (() => deadline - now());
+  const localRemaining = ambient?.cap(opts.deadlineMs ?? 15_000) ?? (() => deadline - now());
+  const remainingTime = () => Math.min(localRemaining(), MaintenanceResources.remainingMsIfActive());
   const interval = opts.intervalMs ?? 1_000;
   const removed = new Set<string>();
   const expired = (what: string): DockerTeardown => ({
@@ -1655,6 +2224,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
   let clean = 0;
   try {
     for (;;) {
+      MaintenanceResources.checkIfActive();
       let remaining = remainingTime();
       if (remaining <= 0) return expired("the container listing");
       const list = await dockerRequest(
@@ -1680,6 +2250,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
       } else {
         clean = 0;
         for (const id of ids) {
+          MaintenanceResources.checkIfActive();
           remaining = remainingTime();
           if (remaining <= 0) return expired("a container deletion");
           const del = await dockerRequest(
@@ -1708,6 +2279,8 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
 
 /** One quiescence request for a run's clone. */
 export interface QuiesceRunRequest {
+  /** Producer retained-family capture only; ordinary boundaries omit this option. */
+  producerWorkLimits?: HelperWorkLimits;
   reportBudget?: { signal: AbortSignal; deadline: number };
   mode: QuiesceMode;
   /** This attempt, when there is one (its marker is "own"). */
@@ -1866,6 +2439,16 @@ function reapScopedRunProcesses(
 /** The process reap (unless skipped), then the Docker teardown. Never throws. */
 export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRunDeps = {}): Promise<QuiesceRunOutcome> {
   let processResult: ProcessQuiescence | undefined;
+  const producerWorkLimits = req.producerWorkLimits === undefined ? deps.reap?.producerWorkLimits : req.producerWorkLimits;
+  try {
+    validateProducerWorkLimits(producerWorkLimits, req.mode, req.workerWide);
+    if (producerWorkLimits !== undefined && (!req.processes || req.site !== "retained_ops"))
+      throw new Error("invalid producer quiescence site");
+  } catch (err) {
+    return { process: { state: "unverified", processes: [], killed: [], detail: (err as Error).message },
+      docker: { state: "not_wired", removed: [], detail: "" } };
+  }
+  const reapOptions = { ...deps.reap, producerWorkLimits };
   if (req.processes) {
     const others = req.registry.others(req.attempt?.marker);
     const scan: ScanRequest = {
@@ -1893,14 +2476,18 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       workerNonce: workerSpawnNonce(),
     };
     if (uidSplitActive() && hasReaperCaptureScope()) {
+      if (producerWorkLimits !== undefined) return {
+        process: { state: "unverified", processes: [], killed: [], detail: "scoped producer work limits unsupported" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      };
       try {
         processResult = await reapScopedRunProcesses(req, scan, deps);
       } catch {
         processResult = { state: "unverified", processes: [], killed: [], detail: "scoped reaper refused or failed" };
       }
     } else processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
-      req.reportBudget ? { ...deps.reap, reportBudget: req.reportBudget,
-        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : deps.reap);
+      req.reportBudget ? { ...reapOptions, reportBudget: req.reportBudget,
+        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : reapOptions);
   }
   const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
     (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
@@ -1914,7 +2501,15 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
 
 // ─── Helper entry ──────────────────────────────────────────────────────────────────────────
 
-function isScanRequest(v: unknown): v is ScanRequest {
+function isHelperWorkLimits(v: unknown): v is HelperWorkLimits {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const o = v as Record<string, unknown>;
+  return Object.keys(o).length === 2 && (Object.keys(HELPER_WORK_LIMITS) as (keyof HelperWorkLimits)[])
+    .every(key => Object.hasOwn(o, key) && Number.isSafeInteger(o[key]) && (o[key] as number) >= 0 &&
+      (o[key] as number) <= HELPER_WORK_LIMITS[key]);
+}
+
+function isScanRequest(v: unknown): v is HelperScanRequest {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
   const strings = (x: unknown) => Array.isArray(x) && x.every((s) => typeof s === "string");
@@ -1929,6 +2524,20 @@ function isScanRequest(v: unknown): v is ScanRequest {
     strings(o.liveMarkers) &&
     (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
     (o.workerWide === undefined || typeof o.workerWide === "boolean") &&
+    (o.exclusiveIdle === undefined || o.exclusiveIdle === true) &&
+    (o.exclusiveIdleRoots === undefined || (Array.isArray(o.exclusiveIdleRoots) &&
+      o.exclusiveIdleRoots.length <= 32 && o.exclusiveIdleRoots.every(r => r && typeof r === "object" &&
+        Number.isSafeInteger((r as RecordedRoot).pid) && (r as RecordedRoot).pid > 0 &&
+        Number.isSafeInteger((r as RecordedRoot).startTime) && (r as RecordedRoot).startTime >= 0))) &&
+    (o.exclusiveIdle === true || o.exclusiveIdleRoots === undefined) &&
+    (o.exclusiveIdleBootstrap === undefined || (Array.isArray(o.exclusiveIdleBootstrap) &&
+      o.exclusiveIdleBootstrap.length <= 1 && o.exclusiveIdleBootstrap.every(r => r && typeof r === "object" &&
+        Number.isSafeInteger((r as MaintenanceBootstrapRoot).pid) && (r as MaintenanceBootstrapRoot).pid > 0 &&
+        Number.isSafeInteger((r as MaintenanceBootstrapRoot).startTime) && (r as MaintenanceBootstrapRoot).startTime >= 0 &&
+        Number.isSafeInteger((r as MaintenanceBootstrapRoot).parentPid) && (r as MaintenanceBootstrapRoot).parentPid > 0 &&
+        typeof (r as MaintenanceBootstrapRoot).executable === "string" &&
+        Buffer.byteLength((r as MaintenanceBootstrapRoot).executable) <= 4096))) &&
+    (o.exclusiveIdle === true || o.exclusiveIdleBootstrap === undefined) &&
     Array.isArray(o.liveRoots) &&
     o.liveRoots.every(
       (r) =>
@@ -1939,6 +2548,7 @@ function isScanRequest(v: unknown): v is ScanRequest {
     ) &&
     typeof o.workerNonce === "string" &&
     (o.reportDeadline === undefined || (Number.isSafeInteger(o.reportDeadline) && (o.reportDeadline as number) > 0)) &&
+    (o.workLimits === undefined || isHelperWorkLimits(o.workLimits)) &&
     (o.view === undefined || isQuiescenceView(o.view))
   );
 }
@@ -1964,8 +2574,11 @@ async function helperMain(): Promise<ProcessQuiescence> {
     return { state: "unverified", processes: [], killed: [], detail: "helper request unparsable" };
   }
   if (!isScanRequest(req)) return { state: "unverified", processes: [], killed: [], detail: "helper request invalid" };
-  const view = req.view === undefined ? {} : viewReapDeps(req.view);
-  return reapProcesses(req, { ...view, excludeAllDescendants: true });
+  const reap = () => {
+    const view = req.view === undefined ? {} : viewReapDeps(req.view);
+    return reapProcesses(req, { ...view, excludeAllDescendants: true });
+  };
+  return req.workLimits === undefined ? reap() : helperWork.run(new HelperWork(req.workLimits), reap);
 }
 
 if (process.argv[2] === HELPER_FLAG && process.argv[1] && path.resolve(process.argv[1]) === HELPER_FILE) {

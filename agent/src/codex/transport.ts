@@ -111,7 +111,7 @@ function fail(category: HarnessErrorCategory, message: string): CodexTransportEr
  */
 /**
  * One usage breakdown from a `thread/tokenUsage/updated` notification (PRD #1332 C4a / D5).
- * The pinned 0.160.1 app-server v2 protocol projects camelCase token counts (unchanged since the
+ * The 0.162.1 app-server v2 protocol projects camelCase token counts (unchanged since the
  * 0.160.0 source commit
  * `a956835d020762cb2b570053af06f643a11c0ecc`, `codex-rs/app-server-protocol/src/protocol/v2/
  * thread.rs`). Each field is a finite `>= 0` number; a missing/invalid field decodes to `0`
@@ -337,7 +337,7 @@ function parseUsageBreakdown(raw: Record<string, unknown> | undefined): CodexUsa
 }
 
 /** Resolve the object carrying the `total`/`last` breakdowns of a `thread/tokenUsage/updated`
- *  frame. VERIFIED against the 0.160.0 v2 protocol, unchanged in pinned 0.160.1 (commit
+ *  frame. VERIFIED against the 0.160.0 v2 protocol, unchanged in 0.162.1 (commit
  *  `a956835d020762cb2b570053af06f643a11c0ecc`, `codex-rs/app-server-protocol/src/protocol/v2/
  *  thread.rs`): the notification payload is `ThreadTokenUsageUpdatedNotification { thread_id,
  *  turn_id, token_usage: ThreadTokenUsage { total, last, model_context_window } }` under

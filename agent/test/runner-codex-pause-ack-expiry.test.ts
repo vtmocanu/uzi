@@ -5,7 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { setImmediate as tick } from "node:timers/promises";
 import { RecoveryCoordinator } from "../src/recovery.js";
-import { client, git, homeDir, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, git, homeDir, fakeGitlab, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { FakeCodexExecutor, codexRig, manualDeadline, trackedFile, statuses, spyCustodySettle, spyPublishLands } from "./runner-codex-sinks-fixture.js";
 import { JOIN_TOKEN } from "./runner-held-publication-fixture.js";
 
@@ -14,13 +14,14 @@ const bytes = "R1 exact owner source\n";
 type Window = "healthy" | "ACK" | "head" | "pin" | "cleanup";
 type Ack = "paused" | "missing" | "declined" | "uncertain" | "previous-park";
 
-for (const [window, ackMode] of [
-  ["healthy", "paused"], ["ACK", "paused"], ["head", "paused"],
-  ["pin", "paused"], ["cleanup", "paused"],
-  ["ACK", "missing"], ["ACK", "declined"], ["ACK", "uncertain"],
-  ["ACK", "previous-park"],
-] as const satisfies readonly (readonly [Window, Ack])[]) {
-  it(`R1 public pause ${ackMode} ACK / ${window} window`, async t => {
+for (const [window, ackMode, origin] of [
+  ["healthy", "paused", "owner"], ["ACK", "paused", "owner"], ["head", "paused", "owner"],
+  ["pin", "paused", "owner"], ["cleanup", "paused", "owner"],
+  ["ACK", "missing", "owner"], ["ACK", "declined", "owner"], ["ACK", "uncertain", "owner"],
+  ["ACK", "previous-park", "owner"],
+  ["healthy", "paused", "lead_park"], ["ACK", "paused", "lead_park"], ["ACK", "declined", "lead_park"],
+] as const satisfies readonly (readonly [Window, Ack, "owner" | "lead_park"])[]) {
+  it(`R1 public pause ${ackMode} ACK / ${window} window / ${origin}`, async t => {
     const deadline = manualDeadline("checkpoint");
     type Event = { phase: Window; release: () => void };
     const events: Event[] = [];
@@ -87,7 +88,9 @@ for (const [window, ackMode] of [
         assert.equal(await ctx.parkForPause!(at), true, "public first pause establishes parked");
         acked = false;
       }
-      try { result = await ctx.parkForPause!(at); }
+      try {
+        result = origin === "owner" ? await ctx.parkForPause!(at) : (await ctx.requestParkRun!(at)).kind === "paused";
+      }
       catch (error) { rejection = error; if (ackMode === "paused") throw error; }
       finally { returned = true; }
       assert.equal(rig.registry.state(), "poisoned", "accepted/refused capture keeps safety poisoned before terminal dispose");
@@ -99,6 +102,13 @@ for (const [window, ackMode] of [
     }, rig.settle, rig.capture);
     const runner = runnerWith(() => ({ executor: exec, homeDir }), fakeGitlab().gitlab, JOIN_TOKEN,
       undefined, { checkpointIntervalMs: 0 });
+    const internal = runner as any;
+    let captureFlight: any;
+    const capture = internal.runFreeCapture.bind(runner);
+    t.mock.method(internal, "runFreeCapture", async (...args: any[]) => {
+      captureFlight = args[1];
+      return capture(...args);
+    });
     const custody = spyCustodySettle(runner);
     const restorePublish = spyPublishLands();
     const recovery = (runner as unknown as { recovery: RecoveryCoordinator }).recovery;
@@ -106,6 +116,8 @@ for (const [window, ackMode] of [
       snapshot = await recovery.inspect(claim.run_id);
       assert.ok(Array.isArray(snapshot) && snapshot.length > 0, "real authenticated recovery journal exists before expiry");
     };
+    if (origin === "lead_park")
+      t.mock.method(client, "requestWorkerPause", async () => ({ applied: true, status: "running" as const }));
     const report = client.reportState.bind(client);
     t.mock.method(client, "reportState", async (...args: Parameters<typeof report>) => {
       if (args[1].status !== "paused") return report(...args);
@@ -154,6 +166,9 @@ for (const [window, ackMode] of [
         if (!event) continue;
         try {
           phases.push(event.phase);
+          if (ackMode !== "previous-park")
+            assert.equal(api.messages(claim.run_id).some(message => message.kind === "paused"), false,
+              "no paused display before ACK and capture custody handling complete");
           assert.equal(returned, false, "public pause stays pending behind external event");
           assert.equal(done, false, "execute tail stays pending behind external event");
           assert.ok(deadline.armed() > 0, "actual checkpoint capture deadline armed");
@@ -173,6 +188,8 @@ for (const [window, ackMode] of [
           "one accepted pause, no generic failure or second pause");
         assert.equal(requests, 1);
         if (window !== "healthy") {
+          assert.equal(captureFlight.parked, true, "accepted ACK keeps the run parked");
+          assert.equal(captureFlight.sourceJoinFailed, true, "incomplete capture cannot qualify as a normal source");
           assert.equal(fs.statSync(clone).ino, inode, "exact clone retained");
           assert.equal(fs.readFileSync(path.join(clone, "PUBLIC.txt"), "utf8"), bytes);
           assert.equal(fs.readFileSync(path.join(homeDir, "owner-session"), "utf8"), "R1 exact session");

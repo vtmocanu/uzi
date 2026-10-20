@@ -24,7 +24,7 @@ func TestWorkerMemoryRoutesLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := workersvc.New(fx.q, fx.box, workersvc.Params{})
+	svc := workersvc.New(fx.q, fx.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 	svc.SetTxBeginner(fx.pool)
 	h := &Handler{q: fx.q, wsvc: svc}
 	req := workersvc.MemoryReservationRequest{MemoryBinding: workersvc.MemoryBinding{

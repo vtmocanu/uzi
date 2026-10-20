@@ -538,11 +538,28 @@ reservation or signalling. Original settlement, feedback and source-custody
 obligations remain with the captured flight after revocation; an unconfirmed
 ACK does not establish release. Intervention uses the captured worker
 incarnation, claim generation and memory episode.
-The delivered adapter enrolls trusted Codex model shell commands through
-their exact registered supervisor handle and process start ticks.
-Claude enrollment (#2471), internal probes, provider/credential processes,
+The delivered adapters enroll trusted Codex and Claude model shell commands
+through their exact registered supervisor handle and process start ticks.
+Internal probes, provider/credential processes,
 boundary/checkpoint/capture operations and cross-checker authority are outside
-this adapter's scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+the adapters' scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
+
+With the guard enabled, a Claude run's shell is a worker-owned foreground
+command tool in place of native `Bash`; see
+[Worker setup](./worker-setup.md#proactive-memory-guard) for what changes
+(deadlines, an 8-command limit, output caps, unavailable `Monitor` and
+scoped-only `Bash` roles). Enabling the guard also runs a launcher preflight at
+startup, and a worker that fails it refuses to register, including a
+Codex-only worker. If a Claude run loses memory authority mid-turn (for
+example, the API stops advertising `worker_memory_pressure_v1`, or the worker shuts
+down), the turn is aborted and continues through the existing recovery/requeue
+policy. Restart the worker to regain authority, as for Codex: registration
+runs once at startup, and until then each new run claim on that worker, including a
+requeued run that lands back on it, fails with "Worker memory enrollment
+requires the full worker claim and registration" and is reported as a run
+failure. This now applies to Claude claims too. A server-side check that sends
+Claude guard-bound work only to capable workers is not built; it is tracked as
+[#3142](https://github.com/vtmocanu/uzi/issues/3142).
 
 After an intervention, another intervention/retry requires confirmed drain,
 a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
@@ -836,7 +853,7 @@ with that DSN.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.160.1 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.162.1 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides. See [Reasoning effort](worker-effort.md).

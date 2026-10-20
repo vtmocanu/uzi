@@ -463,7 +463,8 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
     phase: request.phase,
     allowedTools: sortedSet([
       ...fullVocabulary(true).filter((tool) => tool !== "park_run"
-        || (request.phase === "implement" && request.parkRunSupported === true && request.nonInteractiveIssue === true)),
+        // Registered from planning so the resumed implementation thread keeps it; the broker withholds authority until implement.
+        || (request.parkRunSupported === true && request.nonInteractiveIssue === true)),
       ...(request.codeCrossCheck ? [CODE_DISPOSITIONS_TOOL] : []),
       ...(request.ciEvidencePrepared ? [CI_EVIDENCE_READ] : []),
     ]),

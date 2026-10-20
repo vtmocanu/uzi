@@ -68,7 +68,7 @@ func TestCIWatchConfigEditSingleConnectionLiveDB(t *testing.T) {
 			t.Cleanup(pool.Close)
 			q := store.New(pool)
 			f.h.pool, f.h.q = pool, q
-			f.h.wsvc = workersvc.New(q, f.h.box, workersvc.Params{})
+			f.h.wsvc = workersvc.New(q, f.h.box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()})
 			req := userReq(http.MethodPatch, "/api/schedules/"+schedule.ID, string(raw), f.owner.ID, map[string]string{"id": schedule.ID})
 			requestCtx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
 			defer cancel()

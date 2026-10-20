@@ -35,7 +35,7 @@ func TestWorkerHeartbeatCarriesDiskPressureThreshold(t *testing.T) {
 			if err != nil {
 				t.Fatalf("new box: %v", err)
 			}
-			h := &Handler{wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{DiskPressureThreshold: c.threshold})}
+			h := &Handler{wsvc: workersvc.New(&protocolStore{}, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), DiskPressureThreshold: c.threshold})}
 			rec := httptest.NewRecorder()
 			h.WorkerHeartbeat(rec, workerReq(http.MethodPost, `{"version":"1"}`, uuid.Nil))
 			if rec.Code != http.StatusOK {

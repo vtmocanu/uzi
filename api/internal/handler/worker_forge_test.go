@@ -72,7 +72,7 @@ func newForgeBox(t *testing.T) *secretbox.Box {
 func newForgeHandler(t *testing.T, st workersvc.Store, box *secretbox.Box) *Handler {
 	t.Helper()
 	return &Handler{
-		wsvc: workersvc.New(st, box, workersvc.Params{}),
+		wsvc: workersvc.New(st, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit()}),
 		svc:  newZeroWaitForgeService(nil, box),
 	}
 }

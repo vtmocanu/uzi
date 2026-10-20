@@ -78,7 +78,7 @@ func TestHealthOwnerHoldBoundaryAndControls(t *testing.T) {
 			tc.mutate(&r)
 			svc, _ := pinSvc(&healthFakeStore{}, defaultHealthSettings())
 			svc.p.WorkerAffinityCeiling = time.Hour
-			_, reason := svc.healthTargetFor(context.Background(), tc.now, r, healthThresholds{queued: 10 * time.Minute})
+			_, reason := svc.healthTargetFor(context.Background(), tc.now, r, healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true})
 			if got := isStaleRequeuePinReason(reason); got != tc.held {
 				t.Fatalf("reason=%q held=%v want %v", reason, got, tc.held)
 			}
@@ -94,7 +94,7 @@ func TestHealthOwnerHoldDisabledAndPrecedence(t *testing.T) {
 				r.StatusSince = ago(age)
 				fs := &healthFakeStore{}
 				svc, _ := pinSvc(fs, defaultHealthSettings())
-				th := healthThresholds{queued: 10 * time.Minute}
+				th := healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true}
 				want := ""
 				switch block {
 				case "disabled":
@@ -103,7 +103,7 @@ func TestHealthOwnerHoldDisabledAndPrecedence(t *testing.T) {
 					svc.SetVault(vault.New(newBox(t), newMemVaultStore()))
 					want = reasonVaultLocked
 				case "custody":
-					fs.custodyHolds = int64(custodyHoldLimit)
+					fs.custodyHolds = int64(testCustodyLimit)
 					want = reasonCustodyLimit
 				case "Codex":
 					r.CodexAccountGated = true
@@ -137,7 +137,7 @@ func TestHealthOwnerHoldOverlapUsesCeilingBeyondShortStaleGrace(t *testing.T) {
 	svc.p.WorkerAffinityCeiling = time.Hour
 	svc.p.WorkerStaleRequeueGrace = 10 * time.Minute
 	for _, now := range []time.Time{t0, t0.Add(6 * time.Minute)} {
-		_, reason := svc.healthTargetFor(context.Background(), now, r, healthThresholds{queued: 10 * time.Minute})
+		_, reason := svc.healthTargetFor(context.Background(), now, r, healthThresholds{queued: 10 * time.Minute, custodyLimit: testCustodyLimit, custodyLimitOK: true})
 		want := "waiting until 2026-07-12T12:30:00Z for its previous worker w1 to finish draining or maintenance; another worker may take it after that"
 		if reason != want {
 			t.Fatalf("at %s reason=%q want %q", now, reason, want)

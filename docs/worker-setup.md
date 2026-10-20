@@ -585,12 +585,12 @@ feature growth creates no authority; shrink revokes reservation/signal authority
 while the original flight still owns settlement, feedback and source custody.
 
 One monitor shares the worker's cgroup budget across its configured
-concurrency. It can intervene in enrolled **Codex model shell commands**,
+concurrency. It can intervene in enrolled **Codex and Claude model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
 tree RSS ranks candidates while total cgroup usage determines pressure.
-It does not subtract file memory. Claude commands (#2471), internal probes,
+It does not subtract file memory. Internal probes,
 provider/credential processes, boundary/checkpoint/capture operations and
-cross-checker authority are outside the delivered adapter's scope. Enrollment
+cross-checker authority are outside the delivered adapters' scope. Enrollment
 adds no process authority and changes no concurrency setting; see
 [ADR-2396](../adr/2396-worker-memory-guard.md).
 
@@ -604,6 +604,51 @@ archive or a latest-work guarantee. An unconfirmed park ACK does not release
 custody. Codex command bounds stay 60 minutes, or 120 minutes with root-lead
 `long_running: true`; memory feedback does not extend those deadlines or
 supersede abort, output-cap or ordinary command cleanup ownership.
+
+### Claude runs with the guard enabled
+
+On a guard-bound Claude run (`RunRunner` runs: the issue, mr_rework, ci_fix, self_improve, prompt and task kinds, not task-review), the worker replaces
+native `Bash` with its own in-process command tool, `mcp__uzi_cmd__bash`, and
+disables native `Bash` and `Monitor`. What changes for those runs
+([ADR-2396 D8](../adr/2396-worker-memory-guard.md#d8-claude-adapter)):
+
+- Commands are foreground only. The deadline defaults to 2 minutes and the
+  maximum is 60 minutes (`timeout` in milliseconds); at the deadline the
+  command and every descendant are stopped. There is no background mode and no
+  automatic extension. Every call starts at the repository root.
+- At most 8 commands per run may be live; the 9th is refused with a visible
+  error.
+- Inline output is capped at 30000 characters (start and end preview). A
+  best-effort spill file under `.uzi/scratch/uzi-cmd/` is capped at 64 MiB and
+  truncated beyond that; it is bounded, not a promise of full output.
+- `Monitor` is unavailable, native `TaskStop` is unchanged, and a role whose
+  shell grants are all scoped `Bash(...)` entries is unavailable on that run.
+  Inherit-all roles are unchanged. With the guard disabled nothing changes.
+- Commands run at the runner uid with the CLI environment minus provider
+  credentials, the worker token, `UZI_API_URL` and the worker spawn mark. This
+  matches native `Bash`; it is not isolation.
+- On pressure the selected call receives a `worker_memory_pressure` tool
+  error. If the worker loses memory authority mid-turn (the API stops
+  advertising `worker_memory_pressure_v1`, or the worker shuts down), the turn
+  is aborted and follows the existing recovery/requeue policy. Restart the
+  worker to regain authority, as for Codex: registration runs once at startup,
+  and until then each new run claim on that worker, including a requeued run that
+  lands back on it, fails with "Worker memory enrollment requires the full
+  worker claim and registration" and is reported as a run failure.
+
+**Startup preflight.** With the guard enabled the worker launches the command
+supervisor with an inert child before registering, and requires it to start,
+answer one observation and drain cleanly within 15 seconds. On failure it logs
+`memory guard launcher preflight FAILED — refusing to register` with a
+reason (for a supervisor profile refusal, `profile:<field>`) and does not start. This applies to every
+guard-enabled worker, including Codex-only workers, and single-uid workers
+whose capability bounding set or NoNewPrivs fails the supervisor profile.
+
+**Not built.** The API does not check whether a worker can run Claude
+guard-bound work before dispatching it; that server-side eligibility gate is a
+maintainer follow-up, tracked as [#3142](https://github.com/vtmocanu/uzi/issues/3142). Until then, enable the guard fleet-wide only after
+checking that workers pass the preflight, and watch for refused startups
+after enabling it.
 
 This is proactive mitigation, not OOM prevention: allocation bursts,
 stalled sampling and node pressure can still kill the worker. A separate

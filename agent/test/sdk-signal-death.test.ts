@@ -159,7 +159,7 @@ function makeCtx(overrides: Partial<RunContext> = {}): { ctx: RunContext; emits:
       gated.push(planMd);
       return verdict;
     },
-    pullFollowUp: () => undefined,
+    pullFollowUps: () => [],
     reportIteration: () => {},
     ...overrides,
   };

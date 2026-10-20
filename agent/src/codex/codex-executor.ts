@@ -36,9 +36,9 @@ import { checkCheckpointStop, cleanCheckpointAdmission, CheckpointSoftDeadlineEr
 // live turn (a PauseNowSignal abort, or the re-armable ctx.onPauseNow interrupt) is honoured
 // too: in the implement phase through ctx.parkForPause (a declined park re-drives the turn), in
 // the plan phase by throwing a PauseNowSignal the runner parks.
-// Issue #1800: an owner follow-up (ctx.pullFollowUp) rides the base implement prompt of the next
-// ordinary turn in a <follow_up> fence and is reported included (ctx.followUpIncluded) when that
-// turn first yields an event evidencing the model processed it (evidencesModelProcessing; not
+// Issue #1800: the pending owner follow-ups (ctx.pullFollowUps, one batch up to the rune cap) ride the
+// base implement prompt of the next ordinary turn, each in its own <follow_up> fence, and every one is
+// reported included (ctx.followUpIncluded) when that turn first yields an event evidencing the model processed them (evidencesModelProcessing; not
 // thread/turn lifecycle notifications); a completion-rework or secret-remediation turn leaves it waiting.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
 // turns Codex-specific.
@@ -80,7 +80,7 @@ import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassi
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
-import { PauseNowSignal } from "../steering.js";
+import { PauseNowSignal, MAX_FOLLOW_UP_BATCH_RUNES } from "../steering.js";
 import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
@@ -119,7 +119,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { interruptedSnapshotNote, interruptedCallsNote, NON_CLOSING_REMINDER, COMPLETION_CONTRACT_GUIDANCE, CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBatch, REVIEWED_RESUME_APPROVAL_GUIDANCE, selectPriorOwnerHistory, renderPriorOwnerHistory } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -3922,12 +3922,13 @@ export class CodexExecutor implements Executor {
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
       let completionAnswered = false;
-      // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
+      // Issue #1800: the owner's follow-up batch (never empty; an empty pull stays undefined). Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
-      // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when it is reported included. A turn that
+      // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when every entry is reported included. A turn that
       // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
-      let ownerFollowUp: { id: number; body: string } | undefined;
+      let ownerBatch: Array<{ id: number; body: string }> | undefined;
+      let priorOwnerHistoryPlaced = false;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
       // run's gate, else (a pre-approved resume) the claim's frozen list.
       const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
@@ -4104,13 +4105,16 @@ export class CodexExecutor implements Executor {
         if (systemFollowUp !== undefined && completionAnswered && isIssueRun && ctx.completionInterlock && !ctx.interactive) {
           systemFollowUp += `\n\n${COMPLETION_CONTRACT_GUIDANCE}\n\n${NON_CLOSING_REMINDER}`;
         }
-        if (systemFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
-        const ownerRides = systemFollowUp === undefined ? ownerFollowUp : undefined;
+        if (systemFollowUp === undefined && ownerBatch === undefined) {
+          const pulled = ctx.pullFollowUps?.(MAX_FOLLOW_UP_BATCH_RUNES, true);
+          if (pulled !== undefined && pulled.length > 0) ownerBatch = pulled;
+        }
+        const ownerRides = systemFollowUp === undefined ? ownerBatch : undefined;
         const onOwnerFirstEvent = ownerRides
           ? () => {
-              if (ownerFollowUp?.id !== ownerRides.id) return;
-              ownerFollowUp = undefined;
-              ctx.followUpIncluded?.(ownerRides.id);
+              if (ownerBatch !== ownerRides) return;
+              ownerBatch = undefined;
+              for (const f of ownerRides) ctx.followUpIncluded?.(f.id);
             }
           : undefined;
         let depsNote = "";
@@ -4126,7 +4130,28 @@ export class CodexExecutor implements Executor {
         const ownerPrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts,
           checkedPlan ? { milestones: approvedMilestones } : undefined);
         const ownerBase = depsNote ? `${ownerPrompt}\n\n${depsNote}` : ownerPrompt;
-        const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
+        // Issue #3149: earlier owner follow-ups ride only the first implement turn of a reviewed-plan
+        // resume (never a system-text turn), deduped by id against this turn's live batch and the
+        // claim's live ids. The latch is spent only on the turn's first model event, so a turn that
+        // aborts before any event composes the history again. No inclusion receipt for a history id.
+        // The `systemFollowUp === undefined` term is defensive: every system-text turn follows an
+        // evidenced turn that already spent the latch, and a system-text body replaces basePrompt,
+        // so today it never changes the outcome; it keeps history off such a turn if that changes.
+        let historyBodies: string[] = [];
+        if (systemFollowUp === undefined && ctx.reviewedPlanResume === true && !ctx.sessionId && !priorOwnerHistoryPlaced) {
+          const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
+          historyBodies = selectPriorOwnerHistory(ctx.priorOwnerFollowUps, (id) => liveIds.has(id) || (ctx.isLiveFollowUpId?.(id) ?? false));
+        }
+        const historyRides = historyBodies.length > 0;
+        const firstEventHandler = ownerRides || historyRides
+          ? () => {
+              if (historyRides) priorOwnerHistoryPlaced = true;
+              onOwnerFirstEvent?.();
+            }
+          : undefined;
+        const basePrompt = ownerRides || historyRides
+          ? [ownerBase, ...renderPriorOwnerHistory(historyBodies), ...(ownerRides ? renderFollowUpBatch(ownerRides.map((f) => f.body)) : [])].join("\n")
+          : ownerBase;
         const implementBody = systemFollowUp !== undefined
           ? (completionAnswered ? systemFollowUp : withMilestoneNote(systemFollowUp, milestoneNote()))
           : basePrompt;
@@ -4147,7 +4172,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined, undefined,
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? firstEventHandler : undefined, undefined,
             systemFollowUp === undefined && round === 0 ? (prompt) => {
               if (interruptedOwnerDispatched) return prompt;
               const calls = interruptedCallsNote(ctx.getInterruptedCalls?.());
@@ -5793,7 +5818,9 @@ export class CodexExecutor implements Executor {
       phase,
       ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
       parkRunSupported: ctx.parkRunSupported,
-      nonInteractiveIssue: parkRunEligible(ctx, phase),
+      // Phase-independent: the root vocabulary is registered once at thread/start and survives
+      // the approval thread/resume; the broker gates the phase.
+      nonInteractiveIssue: (ctx.kind ?? "issue") === "issue" && !ctx.interactive,
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,
@@ -5847,8 +5874,9 @@ export class CodexExecutor implements Executor {
 
   /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
-   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
-   *  ctx.approvedPlan, unframed) or the issue fallback. Every body is then followed by the shared
+   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the persisted
+   *  ctx.approvedPlan, framed with REVIEWED_RESUME_APPROVAL_GUIDANCE on a reviewed-plan resume
+   *  (#3149), unframed otherwise) or the issue fallback. Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
    *  there is one and followed by the milestone tracker note when there is one.
    *
@@ -5881,6 +5909,19 @@ export class CodexExecutor implements Executor {
           "supersedes the issue text; do not re-plan or resubmit it.",
           "<approved_plan>",
           gatedPlan,
+          "</approved_plan>",
+        ].join("\n")
+      : approved && ctx.reviewedPlanResume === true && !ctx.sessionId && ctx.seeded !== true
+      ? [
+          // Issue #3149: a reviewed-plan resume states the approval. The seeded/no-session terms are
+          // defence in depth; the resume-eligibility rule already implies them.
+          REVIEWED_RESUME_APPROVAL_GUIDANCE,
+          "",
+          "The approved plan below, between the <approved_plan> and </approved_plan> tags, is your",
+          "authoritative instruction for this run and supersedes the issue text; do not re-plan or",
+          "resubmit it.",
+          "<approved_plan>",
+          approved,
           "</approved_plan>",
         ].join("\n")
       : approved ? approved : ctx.issueIid != null

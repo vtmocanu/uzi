@@ -783,6 +783,40 @@ func (q *Queries) GetCrossCheckByChild(ctx context.Context, childID pgtype.UUID)
 	return i, err
 }
 
+const getLiveCodeCrossCheckDeadline = `-- name: GetLiveCodeCrossCheckDeadline :one
+SELECT cc.deadline_at
+FROM runs lead
+JOIN cross_checks cc ON cc.lead_run_id = lead.id
+JOIN runs child ON child.id = cc.checker_run_id
+WHERE lead.id = $1 AND lead.status = 'running'
+ AND lead.code_cross_check_required AND NOT lead.report_only
+ AND lead.fix_verdict IS DISTINCT FROM 'not_code'
+ AND lead.claim_released_at IS NULL AND cc.lead_claim_generation = lead.claim_generation
+ AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
+ AND lead.harness IN ('claude','codex')
+ AND cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL
+ AND cc.deadline_at > $2::timestamptz
+ AND child.target_run_id = lead.id AND child.kind = 'cross_check'
+ AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
+ AND child.harness IN ('claude','codex') AND child.harness <> lead.harness
+ AND child.harness = cc.checker_harness
+ AND child.status IN ('queued','claimed','running')
+`
+
+type GetLiveCodeCrossCheckDeadlineParams struct {
+	LeadRunID uuid.UUID          `json:"lead_run_id"`
+	ServerNow pgtype.Timestamptz `json:"server_now"`
+}
+
+// Health only examines running leads; admission and settlement support additional states.
+// Read the persisted deadline without locks, writes, or worker-capacity dependencies.
+func (q *Queries) GetLiveCodeCrossCheckDeadline(ctx context.Context, arg GetLiveCodeCrossCheckDeadlineParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getLiveCodeCrossCheckDeadline, arg.LeadRunID, arg.ServerNow)
+	var deadline_at pgtype.Timestamptz
+	err := row.Scan(&deadline_at)
+	return deadline_at, err
+}
+
 const insertCodeCrossCheck = `-- name: InsertCodeCrossCheck :one
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head_commit,
  base_commit, candidate_digest, checker_run_id, checker_harness, deadline_at, verdict,

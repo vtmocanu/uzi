@@ -134,3 +134,107 @@ test("retained recovery inventory requires every literal real-UID permission pro
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+const claudeFile = "e2e/worker-uid/claude-command-real.test.mts";
+const claudeSuite = "real Claude guarded command lane";
+const claudeTitles = [
+  "stops a detached command and its descendants through a guard-style cancel and confirms the drain",
+  "expires a short explicit deadline on a command with a detached descendant and drains the whole tree",
+  "cancelling the selected run's command leaves a sibling run's command alive until it completes",
+  "lets another attempt's capture scan skip the live command's recorded root while the owner's own reap still kills it",
+  "rejects a candidate observation whose root start time differs from the enrolled one and cancels nothing",
+  "never selects a larger unattributed process tree",
+  "returns the exact worker_memory_pressure result as the selected command's tool error",
+  "refuses a registration whose source is not one of the two model-command literals",
+  "never enrolls unminted, cloned or foreign-context metadata, yet the command still runs",
+  "gives a command that declares its own worker marks no protection and no special enrollment",
+  "poisons the lane and kills the exact supervisor when a stopped supervisor cannot confirm disposal",
+  "keeps native Bash when the guard is off",
+];
+test("claude command real inventory requires the twelve literal leaves under one UID gate", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/claude-real-inventory."));
+  const api = new API({ cwd: scratch });
+  const declarations = claudeTitles.map(name => `it(${JSON.stringify(name)}, async () => {});`);
+  const wrap = (body: string, gate = true) =>
+    `describe(${JSON.stringify(claudeSuite)}, ${gate ? "{ skip: INIT_SKIP }, " : ""}() => { ${body} });`;
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: wrap(declarations.join("\n")) },
+      { name: "actual", source: readFileSync(path.join(repo, claudeFile), "utf8") },
+      { name: "duplicate", source: wrap([...declarations, declarations[0]!].join("\n")), error: /duplicate source leaf/ },
+      { name: "nested", source: wrap(`describe("nested", () => { ${declarations.join("\n")} });`), error: /missing required literal Claude command proof/ },
+      { name: "ungated", source: wrap(declarations.join("\n"), false), error: /expected one UID gate, found 0/ },
+      { name: "double-gated", source: wrap(declarations.join("\n")) + wrap(""), error: /expected one UID gate, found 2/ },
+      { name: "wrong-suite", source: declarations.join("\n").replace(/^/, `describe("other suite", { skip: INIT_SKIP }, () => {`) + "});", error: /missing required literal Claude command proof/ },
+    ];
+    for (let index = 0; index < declarations.length; index++) {
+      for (const mutation of ["missing", "renamed", "nonliteral"] as const) {
+        const changed = [...declarations];
+        if (mutation === "missing") changed.splice(index, 1);
+        else changed[index] = `it(${JSON.stringify(claudeTitles[index]! + (mutation === "renamed" ? " changed" : ""))}${mutation === "nonliteral" ? ' + ""' : ""}, async () => {});`;
+        fixtures.push({ name: `${mutation}-${index}`, source: wrap(changed.join("\n")),
+          error: mutation === "nonliteral" ? /nonliteral targeted/ : /missing required literal Claude command proof/ });
+      }
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = claudeTitles.map(name => ({ file: claudeFile, names: [claudeSuite, name] }));
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "claude-command-real");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const actual = JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs")], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(actual.filter((item: { file: string }) => item.file === claudeFile), wanted);
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+const singleFile = "e2e/worker-uid/single-uid-preflight.test.mts";
+const singleTitle = "single-uid launcher preflight matches the container posture";
+test("single-uid inventory requires the one literal top-level preflight leaf", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/single-inventory."));
+  const api = new API({ cwd: scratch });
+  const declaration = `test(${JSON.stringify(singleTitle)}, { timeout: 60000 }, async () => {});`;
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: declaration },
+      { name: "actual", source: readFileSync(path.join(repo, singleFile), "utf8") },
+      { name: "missing", source: "", error: /missing required literal single-uid proof/ },
+      { name: "changed", source: declaration.replace("launcher", "changed"), error: /missing required literal single-uid proof/ },
+      { name: "nonliteral", source: declaration.replace(JSON.stringify(singleTitle), JSON.stringify(singleTitle) + ' + ""'), error: /nonliteral targeted/ },
+      { name: "duplicate", source: declaration + declaration, error: /duplicate source leaf/ },
+      { name: "nested", source: `describe("nested", () => { ${declaration} });`, error: /missing required literal single-uid proof/ },
+    ];
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = [{ file: singleFile, names: [singleTitle] }];
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "single-uid-preflight");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const run = (lane: string) => JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs"), lane], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(run("single"), wanted);
+    // The single-uid leaf stays out of the other two lanes.
+    assert.equal(run("command").some((item: { file: string }) => item.file === singleFile), false);
+    assert.equal(run("worker").some((item: { file: string }) => item.file === singleFile), false);
+    assert.throws(() => execFileSync(process.execPath, [path.join(repo, "e2e/worker-uid/inventory.mjs"), "bogus"],
+      { cwd: repo, stdio: "pipe" }), /unknown lane/);
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

@@ -34,7 +34,7 @@ func TestCodexCurrentRuntimePlacementLiveDB(t *testing.T) {
 				t.Fatalf("blocked run status=%s", got)
 			}
 			svc := e.permitService(t)
-			if reason := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID)); reason != reasonNoCurrentCodexRuntime {
+			if reason := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID), thWithLimit(testCustodyLimit)); reason != reasonNoCurrentCodexRuntime {
 				t.Fatalf("queued reason=%q", reason)
 			}
 			current := append(oldCaps, capability.CodexRuntimeV2)
