@@ -74,10 +74,21 @@ func TestOwnerSemanticMaxRoundTripLiveDB(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("present gate applied=%v err=%v", applied, err)
 	}
-	srv := httptest.NewServer(router)
+	srv := httptest.NewUnstartedServer(router)
+	if !semanticOwnerRace {
+		// The non-instrumented proof keeps the production listener deadlines.
+		srv.Config.ReadTimeout = 15 * time.Second
+		srv.Config.WriteTimeout = 15 * time.Second
+	}
+	srv.Start()
 	defer srv.Close()
 	token := cliMintToken(t, pool, owner, clitoken.ScopeUser)
 	client := uzicli.NewHTTPClient(uzicli.Settings{URL: srv.URL, Token: token})
+	if semanticOwnerRace {
+		// Race instrumentation substantially slows the maximum-size JSON path;
+		// the normal build above still proves the real transport deadlines.
+		client.HTTP.Timeout = 2 * time.Minute
+	}
 	before, err := client.GetRun(ctx, id.String())
 	if err != nil || before.SemanticGate == nil {
 		t.Fatalf("owner GET: %v", err)
