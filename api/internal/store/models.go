@@ -1080,6 +1080,11 @@ type Run struct {
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 	CiConfigGuard               bool               `json:"ci_config_guard"`
+	MemoryEpisode               int64              `json:"memory_episode"`
+	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
+	MemoryPolicy                []byte             `json:"memory_policy"`
+	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
+	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 	PolicyRefusalCount          int32              `json:"policy_refusal_count"`
 	PolicyLastTag               pgtype.Text        `json:"policy_last_tag"`
 	PolicyLastPhase             pgtype.Text        `json:"policy_last_phase"`
@@ -1091,13 +1096,8 @@ type Run struct {
 	PolicyLastOutcomeID         pgtype.UUID        `json:"policy_last_outcome_id"`
 	PolicyLastSourceGeneration  pgtype.Int8        `json:"policy_last_source_generation"`
 	PolicyFreshClaimGeneration  pgtype.Int8        `json:"policy_fresh_claim_generation"`
-	MemoryEpisode               int64              `json:"memory_episode"`
-	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
-	MemoryPolicy                []byte             `json:"memory_policy"`
-	CompletionNonClosingReason  pgtype.Text        `json:"completion_non_closing_reason"`
 	PolicyStopResolution        []byte             `json:"policy_stop_resolution"`
 	PolicyRevisionSource        []byte             `json:"policy_revision_source"`
-	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 	PolicyCandidateCrossCheckID pgtype.UUID        `json:"policy_candidate_cross_check_id"`
 }
 

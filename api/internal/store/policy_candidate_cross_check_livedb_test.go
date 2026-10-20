@@ -93,7 +93,7 @@ func TestPolicyCandidateCrossCheckLiveDB(t *testing.T) {
 		if err := pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='runs' AND column_name='policy_candidate_cross_check_id')").Scan(&exists); err != nil || exists {
 			t.Fatalf("column survived clean Down: exists=%v err=%v", exists, err)
 		}
-		// Exercise the restored 343 function and its source-column watchlist
+		// Exercise the restored Stop-resolution function and its source-column watchlist
 		// before Up replaces them. A catalog name alone is not behavior proof.
 		legacy := newRun(t)
 		var legacyScope int64
@@ -104,7 +104,7 @@ func TestPolicyCandidateCrossCheckLiveDB(t *testing.T) {
 		_, legacyErr := pool.Exec(ctx, "UPDATE runs SET policy_revision_source='{\"changed\":true}' WHERE id=$1", legacy)
 		var legacyPG *pgconn.PgError
 		if !errors.As(legacyErr, &legacyPG) || legacyPG.Code != "P0001" || legacyPG.Message != "immutable policy stop resolution" {
-			t.Fatalf("restored 343 source immutability refused incorrectly: %v", legacyErr)
+			t.Fatalf("restored Stop-resolution source immutability refused incorrectly: %v", legacyErr)
 		}
 		exec(t, "DELETE FROM runs WHERE id=$1", legacy)
 		if err := MigrateTo(ctx, dsn, version); err != nil {
