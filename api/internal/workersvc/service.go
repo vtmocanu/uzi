@@ -3866,9 +3866,14 @@ type StateRequest struct {
 	// byte-identical to before. The field MUST exist here because httpx.DecodeJSON sets
 	// DisallowUnknownFields — a fence-capable worker that sends it would 400 otherwise. A negative
 	// value is invalid (ErrInvalidState). Ignored on every non-terminal report.
-	MessagesThroughSeq        *int64  `json:"messages_through_seq"`
-	CandidateDigest           string  `json:"candidate_digest,omitempty"`
-	PlanCrossCheckGateReason  *string `json:"plan_cross_check_gate_reason"`
+	MessagesThroughSeq       *int64  `json:"messages_through_seq"`
+	CandidateDigest          string  `json:"candidate_digest,omitempty"`
+	PlanCrossCheckGateReason *string `json:"plan_cross_check_gate_reason"`
+	// SemanticPark is the PRD #1230 D3 coverage-park reason an autopilot semantic run reports with
+	// its awaiting_approval park (coverage_incomplete|coverage_uncertain|coverage_unavailable|
+	// maintainer_authorization). Optional; the server compares it with its own coverage projection
+	// (see validateSemanticPark) and stores it only in the presented payload's semantic block.
+	SemanticPark              *string `json:"semantic_park"`
 	PlanCrossCheckDiffRefusal string  `json:"plan_cross_check_diff_refusal"`
 	PlanCrossCheckRefusal     string  `json:"plan_cross_check_refusal"`
 	PlanMd                    *string `json:"plan_md"`

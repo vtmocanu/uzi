@@ -61,16 +61,45 @@ func loadSemanticGate(ctx context.Context, q *store.Queries, run store.Run) (*ap
 		}
 	}
 	p := semanticGateProjection(c, run)
+	// A parked gate's stored presentation carries the validated semantic_park; carry it into the
+	// live projection so approval and replay compare the exact presentation the owner saw. Only a
+	// reason the live projection still requires on the same candidate is carried.
+	if run.Status == "awaiting_approval" {
+		if stored, ok, derr := decodeGatePresentedPayload(run.GatePresentedPayload); derr == nil && ok && stored.Semantic != nil &&
+			stored.Semantic.SemanticPark != "" && stored.Semantic.Candidate.Digest == p.Candidate.Digest &&
+			stored.Semantic.SemanticPark == expectedSemanticPark(&p) {
+			p.SemanticPark = stored.Semantic.SemanticPark
+		}
+	}
 	return &p, c, nil
 }
 
-func semanticGateProjection(c *semanticCoverageTx, run store.Run) apitypes.SemanticGatePresentation {
+// semanticCoverageEvaluation is the one server-side coverage verdict for the current candidate
+// and claim. semanticGateProjection (the gate presentation) and SemanticCoverageStatus (the
+// worker status the agent consults) both derive from it, so a stale success from a reclaimed
+// claim generation or another worker can never count complete in either.
+type semanticCoverageEvaluation struct {
+	Status           apitypes.SemanticCoverageStatus
+	ReviewID         string
+	InvocationID     string
+	ReportDigest     string
+	ConsumedSeconds  int
+	RemainingSeconds int
+	RemainingReviews int
+}
+
+// evaluateSemanticCoverage applies the single coverage rule set: a report counts only when its
+// binding is the current candidate's and one of its invocations succeeded on the run's CURRENT
+// claim generation and CURRENT worker; then represented/atomic/SourceOutcome decide complete,
+// incomplete or uncertain. With no counting report and a spent review, time or token budget the
+// outcome is exhausted; otherwise unavailable.
+func evaluateSemanticCoverage(c *semanticCoverageTx, run store.Run) semanticCoverageEvaluation {
 	binding := SemanticCoverageBinding(c.candidate)
-	p := apitypes.SemanticGatePresentation{Candidate: c.candidate, Binding: binding, ClaimGeneration: run.ClaimGeneration, Maintainers: []apitypes.SemanticMaintainerApproval{}}
-	p.Coverage = apitypes.SemanticCoverageStatus{Outcome: "unavailable", SemanticCoverageBinding: binding, Reviews: len(c.ledger.Reviews), ChargedTokens: c.charged(), RemainingTokens: max(0, c.policy.MaxTokens-c.charged())}
+	e := semanticCoverageEvaluation{}
+	e.Status = apitypes.SemanticCoverageStatus{Outcome: "unavailable", SemanticCoverageBinding: binding, Reviews: len(c.ledger.Reviews), ChargedTokens: c.charged(), RemainingTokens: max(0, c.policy.MaxTokens-c.charged())}
 	for _, r := range c.ledger.Reviews {
-		p.ConsumedSeconds += int(r.Deadline.Sub(r.Started) / time.Second)
-		p.Coverage.Invocations += len(r.Invocations)
+		e.ConsumedSeconds += int(r.Deadline.Sub(r.Started) / time.Second)
+		e.Status.Invocations += len(r.Invocations)
 		if r.Binding != binding || r.Report == nil {
 			continue
 		}
@@ -84,31 +113,40 @@ func semanticGateProjection(c *semanticCoverageTx, run store.Run) apitypes.Seman
 		if invocation == nil {
 			continue
 		}
-		p.ReviewID, p.InvocationID = r.ID, invocation.ID
+		e.ReviewID, e.InvocationID = r.ID, invocation.ID
 		raw, _ := json.Marshal(r.Report)
-		p.ReportDigest = semanticHash(raw)
-		p.Coverage.Report = r.Report
-		p.Coverage.Deadline = r.Deadline
-		p.Coverage.Outcome = "complete"
+		e.ReportDigest = semanticHash(raw)
+		e.Status.Report = r.Report
+		e.Status.Deadline = r.Deadline
+		e.Status.Outcome = "complete"
 		for _, v := range r.Report.Requirements {
 			if v.Status != "represented" {
-				p.Coverage.Outcome = "incomplete"
+				e.Status.Outcome = "incomplete"
 			}
 		}
 		for _, v := range r.Report.Criteria {
 			if !v.Atomic {
-				p.Coverage.Outcome = "incomplete"
+				e.Status.Outcome = "incomplete"
 			}
 		}
 		if c.candidate.SourceOutcome != "complete" {
-			p.Coverage.Outcome = "uncertain"
+			e.Status.Outcome = "uncertain"
 		}
 	}
-	p.RemainingSeconds = max(0, c.policy.MaxSeconds-p.ConsumedSeconds)
-	p.RemainingReviews = max(0, c.policy.MaxReviews-len(c.ledger.Reviews))
-	if p.Coverage.Report == nil && (p.RemainingSeconds == 0 || p.RemainingReviews == 0 || p.Coverage.RemainingTokens == 0) {
-		p.Coverage.Outcome = "exhausted"
+	e.RemainingSeconds = max(0, c.policy.MaxSeconds-e.ConsumedSeconds)
+	e.RemainingReviews = max(0, c.policy.MaxReviews-len(c.ledger.Reviews))
+	if e.Status.Report == nil && (e.RemainingSeconds == 0 || e.RemainingReviews == 0 || e.Status.RemainingTokens == 0) {
+		e.Status.Outcome = "exhausted"
 	}
+	return e
+}
+
+func semanticGateProjection(c *semanticCoverageTx, run store.Run) apitypes.SemanticGatePresentation {
+	binding := SemanticCoverageBinding(c.candidate)
+	e := evaluateSemanticCoverage(c, run)
+	p := apitypes.SemanticGatePresentation{Candidate: c.candidate, Binding: binding, ClaimGeneration: run.ClaimGeneration, Maintainers: []apitypes.SemanticMaintainerApproval{},
+		Coverage: e.Status, ReviewID: e.ReviewID, InvocationID: e.InvocationID, ReportDigest: e.ReportDigest,
+		ConsumedSeconds: e.ConsumedSeconds, RemainingSeconds: e.RemainingSeconds, RemainingReviews: e.RemainingReviews}
 	for _, v := range c.candidate.Criteria {
 		if v.Kind == "maintainer" && v.Maintainer != nil {
 			p.Maintainers = append(p.Maintainers, apitypes.SemanticMaintainerApproval{ID: v.ID, SemanticMaintainer: *v.Maintainer})
@@ -142,7 +180,70 @@ func semanticGateReport(ctx context.Context, q *store.Queries, run store.Run, re
 	if _, err = c.payload(ctx, run.ID); err != nil {
 		return nil, err
 	}
+	if req.State == "awaiting_approval" {
+		if err = validateSemanticPark(run, req, p); err != nil {
+			return nil, err
+		}
+	}
 	return p, nil
+}
+
+// Bounded coverage-park reasons (PRD #1230 D3, ADR-2149 amendment). They are stored only inside
+// the presented payload's semantic block, never in plan_cross_check_gate_reason.
+const (
+	semanticParkCoverageIncomplete  = "coverage_incomplete"
+	semanticParkCoverageUncertain   = "coverage_uncertain"
+	semanticParkCoverageUnavailable = "coverage_unavailable"
+	semanticParkMaintainerAuth      = "maintainer_authorization"
+)
+
+// expectedSemanticPark is the park reason the server's own projection requires: any coverage
+// outcome other than complete parks with its matching coverage reason (exhausted and unavailable
+// are one class), otherwise pending maintainer criteria need explicit human authorization, and a
+// complete, maintainer-free candidate needs no coverage park.
+func expectedSemanticPark(p *apitypes.SemanticGatePresentation) string {
+	switch p.Coverage.Outcome {
+	case "complete":
+		if len(p.Maintainers) > 0 {
+			return semanticParkMaintainerAuth
+		}
+		return ""
+	case "incomplete":
+		return semanticParkCoverageIncomplete
+	case "uncertain":
+		return semanticParkCoverageUncertain
+	default:
+		return semanticParkCoverageUnavailable
+	}
+}
+
+// validateSemanticPark checks the worker-reported park reason against the server projection and
+// records the accepted value on the presentation. An autopilot (auto_approve) report must carry
+// exactly the expected reason, or none only when the projection needs none. A human-gated run, or
+// one that already parked (SetRunAwaitingApproval clears auto_approve), may not supply a reason
+// except as an exact replay of the reason its stored presentation already carries.
+func validateSemanticPark(run store.Run, req StateRequest, p *apitypes.SemanticGatePresentation) error {
+	expected := expectedSemanticPark(p)
+	supplied := ""
+	if req.SemanticPark != nil {
+		supplied = *req.SemanticPark
+		if supplied == "" {
+			return ErrSemanticGateMismatch
+		}
+	}
+	if run.AutoApprove {
+		if supplied != expected {
+			return ErrSemanticGateMismatch
+		}
+	} else if supplied != "" {
+		stored, ok, err := decodeGatePresentedPayload(run.GatePresentedPayload)
+		if err != nil || !ok || stored.Semantic == nil || stored.Semantic.SemanticPark != supplied ||
+			stored.Semantic.Candidate.Digest != p.Candidate.Digest || supplied != expected {
+			return ErrSemanticGateMismatch
+		}
+	}
+	p.SemanticPark = supplied
+	return nil
 }
 
 // SemanticGateForOwner serves bytes from the stored presentation's immutable

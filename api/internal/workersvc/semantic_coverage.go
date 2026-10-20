@@ -351,34 +351,16 @@ func (c *semanticCoverageTx) reserve(ctx context.Context, runID, workerID uuid.U
 func (s *Service) SemanticCoverageStatus(ctx context.Context, workerID, runID uuid.UUID, generation int64) (apitypes.SemanticCoverageStatus, error) {
 	out := apitypes.SemanticCoverageStatus{Outcome: "unavailable"}
 	err := s.withSemanticCoverage(ctx, workerID, runID, generation, func(c *semanticCoverageTx) error {
-		out.SemanticCoverageBinding = SemanticCoverageBinding(c.candidate)
-		out.Reviews = len(c.ledger.Reviews)
-		out.ChargedTokens = c.charged()
-		out.RemainingTokens = max(0, c.policy.MaxTokens-out.ChargedTokens)
+		out = evaluateSemanticCoverage(c, c.run).Status
 		// A status deadline describes the latest review; it is never a run wall clock.
+		out.Deadline = time.Time{}
 		if len(c.ledger.Reviews) > 0 {
 			out.Deadline = c.ledger.Reviews[len(c.ledger.Reviews)-1].Deadline
 		}
-		for _, r := range c.ledger.Reviews {
-			out.Invocations += len(r.Invocations)
-			if r.Binding != out.SemanticCoverageBinding || r.Report == nil {
-				continue
-			}
-			out.Report = r.Report
-			out.Outcome = "complete"
-			for _, result := range r.Report.Requirements {
-				if result.Status != "represented" {
-					out.Outcome = "incomplete"
-				}
-			}
-			for _, assessment := range r.Report.Criteria {
-				if !assessment.Atomic {
-					out.Outcome = "incomplete"
-				}
-			}
-			if c.candidate.SourceOutcome != "complete" {
-				out.Outcome = "uncertain"
-			}
+		// The worker wire enumerates unavailable, complete, incomplete and uncertain; an exhausted
+		// budget is the same unavailable class there (the gate presentation keeps the finer value).
+		if out.Outcome == "exhausted" {
+			out.Outcome = "unavailable"
 		}
 		return nil
 	})

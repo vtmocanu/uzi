@@ -21,6 +21,11 @@ type SemanticGatePresentation struct {
 	RemainingSeconds int                          `json:"remaining_seconds"`
 	RemainingReviews int                          `json:"remaining_reviews"`
 	Maintainers      []SemanticMaintainerApproval `json:"maintainers"`
+	// SemanticPark is set only when an autopilot run parked here instead of auto-approving
+	// (PRD #1230 D3): coverage_incomplete, coverage_uncertain, coverage_unavailable or
+	// maintainer_authorization. It is server-validated against this projection and lives only in
+	// the presented payload, never in plan_cross_check_gate_reason.
+	SemanticPark string `json:"semantic_park,omitempty"`
 }
 
 // SemanticGateApproval must be echoed exactly from the server presentation.
