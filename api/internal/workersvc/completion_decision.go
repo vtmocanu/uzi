@@ -335,21 +335,25 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	case cur == req.ContractRevision:
 		// fresh apply — fall through to validation + write.
 	case cur == req.ContractRevision+1 && decisionAlreadyEncoded(locked, dec, cur):
-		// Idempotent repeat: nothing to write. The deferred Rollback releases the lock; the re-read
-		// runs owner-scoped on a separate pool connection (a plain SELECT does not block on the lock).
-		return s.GetRun(ctx, userID, runID)
+		// The locked row is already owner-checked. Deferred Rollback releases its
+		// connection before the caller receives this exact replay.
+		return locked, nil
 	default:
 		return store.Run{}, ErrCompletionRevisionConflict
 	}
 
 	// Validate the decision against the LOCKED contract/frozen list.
 	frozenMs, _ := DecodeMilestones(locked.MilestonesFrozen)
-	if err := validateDecision(locked, dec, frozenMs); err != nil {
+	prior, err := parseCompletionContract(locked.CompletionContract)
+	if err != nil {
+		return store.Run{}, ErrCompletionRevisionConflict
+	}
+	if err := validateDecisionFromContract(locked, prior, dec, frozenMs); err != nil {
 		return store.Run{}, err
 	}
 
 	newRev := cur + 1
-	revised, err := buildRevisedContract(locked.CompletionContract, dec, frozenMs, newRev)
+	revised, err := buildRevisedContractFromValidated(prior, dec, frozenMs, newRev)
 	if err != nil {
 		return store.Run{}, err
 	}
@@ -406,16 +410,23 @@ func validateDecision(locked store.Run, dec CompletionDecisionInput, frozenMs []
 		// transient split-state, not a client error — refuse as a conflict (retryable), not a 400.
 		return ErrCompletionRevisionConflict
 	}
+	return validateDecisionFromContract(locked, prior, dec, frozenMs)
+}
+
+func validateDecisionFromContract(locked store.Run, prior completionContract, dec CompletionDecisionInput, frozenMs []Milestone) error {
+	if _, err := completionPendingFromContract(locked, prior); err != nil {
+		return ErrCompletionRevisionConflict
+	}
 	if prior.Profile == "semantic" {
-		if _, err := CompletionPending(locked); err != nil {
-			return ErrCompletionRevisionConflict
-		}
 		if dec.Decision == "accept" {
 			return fmt.Errorf("%w: semantic criteria cannot be waived by accept", ErrCompletionDecisionInvalid)
 		}
 	}
 	if dec.Decision == "authorize_maintainer" {
-		return validateMaintainerDecision(prior, dec)
+		if prior.Profile != "semantic" {
+			return ErrCompletionDecisionInvalid
+		}
+		return validateMaintainerSelection(prior, dec)
 	}
 	frozen := make(map[string]bool, len(frozenMs))
 	for _, m := range frozenMs {
@@ -528,10 +539,11 @@ func decisionAlreadyEncoded(locked store.Run, dec CompletionDecisionInput, cur i
 	if err != nil {
 		return false
 	}
-	if c.Profile == "semantic" {
-		if _, err := CompletionPending(locked); err != nil || dec.Decision == "accept" {
-			return false
-		}
+	if _, err := completionPendingFromContract(locked, c); err != nil {
+		return false
+	}
+	if c.Profile == "semantic" && dec.Decision == "accept" {
+		return false
 	}
 	switch dec.Decision {
 	case "authorize_maintainer":
