@@ -109,6 +109,7 @@ import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
 import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type ClosedSourceObservation, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
+import { classifyRecoveryOrigin } from "./recovery-origin.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -1984,6 +1985,13 @@ interface RunFlight {
     acknowledged?: true;
   };
   sourceCleanupJoined?: boolean;
+  /** Notification receipts only; never cleanup, execution or producer authority. */
+  archiveAccepted?: boolean;
+  evidenceCommands?: { confirmed: boolean; failed: boolean };
+  evidenceJoinsConfirmed?: boolean;
+  evidenceAuxiliaries?: "pending" | "joined" | "failed";
+  evidenceProcessJoined?: Executor;
+  evidenceJoinFailed?: boolean;
   workerMemory?: MemoryFlight;
   cancellationBudget?: MaintenanceBudget;
   /** A raw cancellation response did not prove this flight's generation. Never a release authority. */
@@ -2740,6 +2748,7 @@ export class RunRunner {
   /** Whole-execution ownership, including factory setup, batcher close and every
    * finally cleanup. A promoted claim can arrive before an old park ACK returns. */
   private readonly inventoryReservations = new Set<string>();
+  private readonly commandSettlements = new WeakMap<Executor, { confirmed: boolean; failed: boolean }>();
   private readonly executionTails = new Map<string, Promise<ClosedSourceObservation | void>>();
   /** PRD #218 M1: set by `shutdown()`. Read when a run registers so a run that starts
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
@@ -3521,6 +3530,7 @@ export class RunRunner {
     let release!: (observation: ClosedSourceObservation | void) => void;
     const tail = new Promise<ClosedSourceObservation | void>((resolve) => { release = resolve; });
     let observation: ClosedSourceObservation | void = undefined;
+    let evidenceReady = false;
     let inherited: ClosedSourceObservation | void = undefined;
     // Install synchronously before factory work. A third claim must queue behind
     // the second even while the second is waiting for the first's cleanup.
@@ -3554,7 +3564,9 @@ export class RunRunner {
         if (!(await this.gateQueuedDuplicate(claim))) return;
         claim = await this.refreshQueuedClaimCursor(claim);
       }
-      observation = await this.executeClaim(claim, inherited || undefined);
+      const result = await this.executeClaim(claim, inherited || undefined);
+      observation = result.observation;
+      evidenceReady = result.evidenceReady;
     } finally {
       try {
         if (observation?.family && (observation.terminal === "normal_failed" || observation.terminal === "normal_blocked")) {
@@ -3569,6 +3581,15 @@ export class RunRunner {
         // Only callers that captured this pending tail can receive the observation.
         // Nothing survives in the map after the final reservation is released.
         release(observation);
+        if (evidenceReady && !this.shuttingDownGlobal && !this.shutdownSignal.signal.aborted) {
+          try {
+            void this.recovery.resumeTerminalEvidence(runId, tail, claim.claim_generation ?? 0, this.shutdownSignal.signal).catch(() => {
+              this.log.warn("recovery: terminal saved archive replay failed; evidence retained");
+            });
+          } catch {
+            this.log.warn("recovery: terminal saved archive replay failed; evidence retained");
+          }
+        }
       }
     }
   }
@@ -3737,7 +3758,7 @@ export class RunRunner {
     }
   }
 
-  private async executeClaim(claim: ClaimResponse, inherited?: ClosedSourceObservation): Promise<ClosedSourceObservation | void> {
+  private async executeClaim(claim: ClaimResponse, inherited?: ClosedSourceObservation): Promise<{ observation: ClosedSourceObservation | void; evidenceReady: boolean }> {
     let observedFlight: RunFlight | undefined;
     await MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
       if (!observedFlight) throw new Error("cancellation observed before flight initialization");
@@ -3745,10 +3766,20 @@ export class RunRunner {
     }, () => this.executeClaimInAttempt(claim, flight => {
       observedFlight = flight;
       flight.sourceInherited = inherited;
+      this.registerEvidenceExecutor(flight);
     }));
     // executeClaimInAttempt has now returned through its entire finally, including
     // HOME/cache/lifecycle cleanup. Catch selection and steering.stop alone are too early.
     const flight = observedFlight;
+    const observation = await this.closedSourceObservation(claim, flight);
+    const evidenceReady = !!flight && flight.archiveAccepted === true && flight.evidenceJoinsConfirmed === true &&
+      !flight.sourceJoinFailed && !flight.evidenceJoinFailed &&
+      flight.terminalResolved === true && !flight.parked && !flight.active?.shuttingDown &&
+      !this.shuttingDownGlobal && residueQuarantine() === undefined;
+    return { evidenceReady, observation };
+  }
+
+  private async closedSourceObservation(claim: ClaimResponse, flight?: RunFlight): Promise<ClosedSourceObservation | void> {
     const blocked = flight?.sourceNormalBlocked === true && flight.sourceFamilyMatched === true;
     const failed = flight?.sourceNormalFailure;
     const normalFailed = failed?.kind === "executor_failed" && failed.providerReaped === true &&
@@ -4800,6 +4831,8 @@ export class RunRunner {
         try {
           await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
           const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
+          if (disposal.kind === "disposed") flight.evidenceProcessJoined = executor;
+          else flight.evidenceJoinFailed = true;
           if (disposal.kind === "incomplete") {
             terminalDisposeUnproven = true;
             flight.sourceJoinFailed = true;
@@ -4808,6 +4841,7 @@ export class RunRunner {
           }
         } catch (e) {
           terminalDisposeUnproven = true;
+          flight.evidenceJoinFailed = true;
           flight.sourceJoinFailed = true;
           flight.preserveRecoveryClone = true;
           runLog.warn("codex terminal dispose failed; retaining runner clone", { error: errMessage(e) });
@@ -4832,7 +4866,8 @@ export class RunRunner {
       // time we reach here, so a later drainer retire never needs to re-arm it; any
       // still-pending segments are drained and simply not re-armed (a no-op).
       this.rearm?.delete(runId);
-      await steering.stop().catch(() => { flight.sourceJoinFailed = true; });
+      let steeringJoined = false;
+      await steering.stop().then(() => { steeringJoined = true; }).catch(() => { flight.sourceJoinFailed = true; });
       // PRD #41: drop this run's plan-approval deadline + gate-tracking (normally cleared
       // when the gate resolves terminally, but a run that ends by any other path must not
       // leak either).
@@ -5173,6 +5208,15 @@ export class RunRunner {
         sourceOwedJoined &&
         !!flight.barePath && !!flight.branch && !retireBlocked &&
         (ownAttemptRetired || flight.preserveRecoveryClone);
+      const commands = flight.evidenceCommands;
+      // A retained-recovery successor can replace the executor. The old runtime's
+      // terminal receipt never proves settlement of that new owner.
+      flight.evidenceJoinsConfirmed = flight.executor === executor && steeringJoined && flight.evidenceProcessJoined === executor &&
+        !flight.evidenceJoinFailed && !flight.sourceJoinFailed &&
+        (flight.evidenceAuxiliaries === undefined || flight.evidenceAuxiliaries === "joined") &&
+        (!executor.settleWorkerCommands || (commands === this.commandSettlements.get(executor) && commands?.confirmed === true && !commands.failed)) &&
+        !flight.workerMemory && !this.memoryRuntime?.sinkReceipts.some(receipt => receipt.context.flight === flight) &&
+        !batcher.isTripped() && !batcher.isSpilled() && batcher.bufferedCount() === 0;
     }
   }
 
@@ -6805,6 +6849,7 @@ export class RunRunner {
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
             const outcome = await this.recovery.captureAndUpload({
+              onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
               record: recoveryRecord,
               barePath: capBarePath,
@@ -11229,6 +11274,7 @@ export class RunRunner {
     // in-progress. Chaining every report through this single variable makes the reports
     // reach the api in the order they were made. The chain itself NEVER rejects (each link
     // is isolated below) so one failed report cannot break the ordering of later ones.
+    flight.evidenceAuxiliaries = "pending";
     let runningReportChain: Promise<unknown> = Promise.resolve();
     const enqueueRunningReport = <T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
       if (signal) {
@@ -13247,7 +13293,10 @@ export class RunRunner {
         // (never the call's own timeout) and never throws.
         await nowSummary?.stop();
         await runningReportChain;
+        if (flight.evidenceAuxiliaries !== "failed") flight.evidenceAuxiliaries = "joined";
       } catch (settlementError) {
+        flight.evidenceAuxiliaries = "failed";
+        flight.evidenceJoinFailed = true;
         executionRejection.rejected = false;
         throw settlementError;
       }
@@ -13266,6 +13315,9 @@ export class RunRunner {
         if (m4ResumeReviewedPlan && priorOwnerHistory.status === "complete" && priorOwnerHistory.entries.length > 0) {
           await this.awaitResumedDelivery(runId, steering, batcher, runLog, cancel.signal);
         }
+        // A prior quiescence/command receipt cannot settle newly admitted model work.
+        flight.evidenceProcessJoined = undefined;
+        if (flight.evidenceCommands) flight.evidenceCommands.confirmed = false;
         try { result = await executor.run(ctx); }
         catch (value) {
           executionRejection.executorRejected = true;
@@ -13664,6 +13716,10 @@ export class RunRunner {
       }
       MaintenanceBudget.current()?.check();
       outcome = fold(outcome);
+      if (!executor.safety) {
+        if (outcome.process?.state === "quiescent") flight.evidenceProcessJoined = executor;
+        else flight.evidenceJoinFailed = true;
+      }
       // Ordinary callers allow an absent process result. Private FAILED observation
       // requires explicit process proof, including the transfer's post-Git re-proof.
       if (flight.sourceNormalFailure && outcome.process?.state !== "quiescent") flight.sourceJoinFailed = true;
@@ -13981,6 +14037,7 @@ export class RunRunner {
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const input = {
+      onArchiveAccepted: (accepted: RecoveryRecord) => this.archiveAccepted(flight, accepted),
       onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
     };
@@ -16419,6 +16476,7 @@ export class RunRunner {
         (await this.git.defaultBranchName(barePath)) ||
         "main";
       const outcome = await this.recovery.captureAndUpload({
+        onArchiveAccepted: record => this.archiveAccepted(flight, record),
         onCancellationObserved: () => this.observeCancellation(flight),
         record,
         barePath,
@@ -16617,6 +16675,29 @@ export class RunRunner {
     return { kind: "unknown" };
   }
 
+  private registerEvidenceExecutor(flight: RunFlight): void {
+    if (flight.evidenceCommands?.failed) flight.evidenceJoinFailed = true;
+    const receipt = { confirmed: false, failed: false };
+    flight.evidenceCommands = receipt;
+    flight.evidenceProcessJoined = undefined;
+    this.commandSettlements.set(flight.executor, receipt);
+  }
+
+  private observeCommandSettlement(executor: Executor, confirmed: boolean): void {
+    const receipt = this.commandSettlements.get(executor);
+    if (!receipt) return;
+    receipt.confirmed = confirmed;
+    receipt.failed ||= !confirmed;
+  }
+
+  private archiveAccepted(flight: RunFlight, record: RecoveryRecord): void {
+    if (Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0 &&
+        flight.inventoryGuarded === true && record.inventoryGuarded === true && record.runId === flight.runId &&
+        Number.isSafeInteger(record.generation) && record.generation! > 0 && record.generation! <= flight.claimGeneration &&
+        classifyRecoveryOrigin(record.captureId) === "ordinary" &&
+        record.state === "uploaded" && !flight.parked) flight.archiveAccepted = true;
+  }
+
   /**
    * Issue #2471: before a sink that only calls killAgentTree acts, give a guard-bound Claude
    * executor the chance to dispose and confirm its model commands (a no-op for every other
@@ -16627,10 +16708,13 @@ export class RunRunner {
     if (!executor.settleWorkerCommands) return;
     const deadlineMs = Math.max(0, Math.min(GUARDED_COMMAND_SETTLE_MS, budgetMs ?? GUARDED_COMMAND_SETTLE_MS));
     try {
-      if (!(await executor.settleWorkerCommands(deadlineMs)).confirmed) {
+      const { confirmed } = await executor.settleWorkerCommands(deadlineMs);
+      this.observeCommandSettlement(executor, confirmed);
+      if (!confirmed) {
         this.log.warn("guarded worker commands were not confirmed settled before the sink");
       }
     } catch (err) {
+      this.observeCommandSettlement(executor, false);
       this.log.warn("guarded worker command settle failed", { error: errMessage(err) });
     }
   }
@@ -16648,6 +16732,7 @@ export class RunRunner {
     if (executor.settleWorkerCommands) {
       let confirmed = false;
       try { confirmed = (await executor.settleWorkerCommands(deadlineMs)).confirmed; } catch { /* unconfirmed */ }
+      this.observeCommandSettlement(executor, confirmed);
       if (!confirmed) {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "worker command settle unconfirmed" }] };
       }
@@ -19882,6 +19967,7 @@ export class RunRunner {
             await check();
             if (!record) { blocker = "preservation_failed"; throw finalize; }
             const outcome = await this.recovery.captureAndUpload({
+              onArchiveAccepted: record => this.archiveAccepted(flight, record),
               onCancellationObserved: () => this.observeCancellation(flight),
               record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
               signal,
@@ -19935,6 +20021,7 @@ export class RunRunner {
             await check();
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
             flight.executor = this.makeExecutor(claim.run_id, claim.secrets.codex).executor;
+            this.registerEvidenceExecutor(flight);
           }
           flight.batcher.emit({ kind: "status", agent: "worker", payload: {
             text: "retained work verified on a fresh local attempt; predecessor sources and custody retained",

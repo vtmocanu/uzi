@@ -370,6 +370,8 @@ export interface FrozenOperationOptions {
 }
 
 export interface CaptureInput {
+  /** Transient notification after actual upload and authenticated readback; never serialized. */
+  onArchiveAccepted?: (record: RecoveryRecord) => void;
   /** Foreground attempts hand their first observed cancellation back to the flight. Never serialized. */
   onCancellationObserved?: () => MaintenanceBudget;
   record: RecoveryRecord;
@@ -2706,7 +2708,9 @@ export class RecoveryCoordinator {
       }
       const outcome = await this.uploadJournaledBundle(record, input.signal, "capture");
       if (record.inventoryGuarded && outcome.state === "uploaded") {
-        const finalOutcome = await this.finalizeInventory(await this.requireRecord(record), false);
+        record = await this.requireRecord(record);
+        input.onArchiveAccepted?.(record);
+        const finalOutcome = await this.finalizeInventory(record, false);
         if (finalOutcome) return finalOutcome;
       }
       return outcome;
@@ -3275,37 +3279,56 @@ export class RecoveryCoordinator {
             Number.isSafeInteger(source.generation) && source.generation > 0 && source.generation <= generation && !!source.identity) ||
           !family.originals.some(source => source.generation === observation.genesis.generation &&
             source.clonePath === observation.genesis.clonePath && source.attemptId === observation.genesis.attemptId)) return;
-      const attempts = new Map<string, MaintenanceBudget>();
-      try {
-        await this.savedEvidenceOnly.run({ signal: passSignal, entries: 0, bytes: 0, exhausted: false }, async () => {
-          const records = await this.savedSourceCandidates(runId, passSignal);
-          // One bounded candidate snapshot, one attempt per record. Unreadable siblings
-          // may be skipped; shared exhaustion denies the rest of this pass.
-          // Discovery ends before fresh replay proofs.
-          for (const snap of records) {
-            if (this.savedEvidenceOnly.getStore()!.exhausted || passSignal.aborted ||
-                residueQuarantine() !== undefined || this.isExecuting(runId)) break;
-            if (!this.finalRetryReady(snap)) continue;
-            try {
-              await this.withCancellationAttempt(snap, async () =>
-                runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
-                  if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
-                  const current = await this.readRecord(this.recordPath(snap));
-                  if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
-                  await this.pendingStep(current, passSignal, "terminal_source");
-                }), attempts);
-            } catch {
-              this.log.warn("recovery: terminal saved evidence retained");
-            }
-          }
-        });
-      } finally { for (const budget of attempts.values()) budget.dispose(); }
+      await this.replayTerminalEvidence(runId, passSignal);
       // Replay gets the first opportunity. A separate COMPLETE view below decides
       // whether a new origin is admissible; the advisory saved snapshot never does.
       if (!this.terminalOriginAdmissionEnabled()) return;
       if (observation.originalContext) await M1MaintenanceResources.runDiscoveryPass(
         () => this.admitTerminalOrigin(observation, passSignal), { signal: passSignal });
     });
+  }
+
+  /** Saved evidence only: no source observation conveys producer eligibility here. */
+  resumeTerminalEvidence(runId: string, tail: Promise<ClosedSourceObservation | void>, generation: number,
+    signal?: AbortSignal): Promise<void> {
+    if (!this.enabled || this.passShutdown.signal.aborted || signal?.aborted ||
+        residueQuarantine() !== undefined) return Promise.resolve();
+    const passSignal = signal ? AbortSignal.any([signal, this.passShutdown.signal]) : this.passShutdown.signal;
+    return this.trackPass(passSignal, async () => {
+      await tail;
+      if (passSignal.aborted || residueQuarantine() !== undefined ||
+          !/^[a-zA-Z0-9_-]{1,128}(?![\s\S])/.test(runId) ||
+          !Number.isSafeInteger(generation) || generation <= 0) return;
+      await this.replayTerminalEvidence(runId, passSignal);
+    });
+  }
+
+  private async replayTerminalEvidence(runId: string, passSignal: AbortSignal): Promise<void> {
+    const attempts = new Map<string, MaintenanceBudget>();
+    try {
+      await this.savedEvidenceOnly.run({ signal: passSignal, entries: 0, bytes: 0, exhausted: false }, async () => {
+        const records = await this.savedSourceCandidates(runId, passSignal);
+        // One bounded candidate snapshot, one attempt per record. Unreadable siblings
+        // may be skipped; shared exhaustion denies the rest of this pass.
+        // Discovery ends before fresh replay proofs.
+        for (const snap of records) {
+          if (this.savedEvidenceOnly.getStore()!.exhausted || passSignal.aborted ||
+              residueQuarantine() !== undefined || this.isExecuting(runId)) break;
+          if (!this.finalRetryReady(snap)) continue;
+          try {
+            await this.withCancellationAttempt(snap, async () =>
+              runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+                if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
+                const current = await this.readRecord(this.recordPath(snap));
+                if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
+                await this.pendingStep(current, passSignal, "terminal_source");
+              }), attempts);
+          } catch {
+            this.log.warn("recovery: terminal saved evidence retained");
+          }
+        }
+      });
+    } finally { for (const budget of attempts.values()) budget.dispose(); }
   }
 
   /** Production always reads the fixed guard; only tests substitute this method to exercise the

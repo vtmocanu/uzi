@@ -138,16 +138,22 @@ split is the boundary.
 in `agent/src/recovery.ts` stops new-origin admission after saved-evidence
 replay, so production never charges the producer ledger, closes the exclusion
 gate or captures WIP. The bootstrap snapshot above is still taken at boot.
-The change that adds the verified transfer, archive handoff and boot
-rediscovery removes the guard.
+Guard removal belongs to a separate follow-up PR after the complete producer
+pipeline and composed measurement pass. That PR also requires the real-image
+PVC roll, live-producer process tree, writer exclusion and process-level
+shutdown checks on its branch-built image. This delivery keeps the guard off;
+merging ordinary recovery fixes does not enable the terminal producer.
 
 Reachable now, independently of the guard: after a run ends failed or
 blocked, the runner starts a pass that retries that run's saved custody
 FINAL under the existing replay proofs, and live re-drive waits while it
 holds the pass set. Each tracked pass owns an async-local signal combining
-its caller's cancellation with recovery shutdown. That signal reaches its
-Git operations and lock waits, cancellation budget (including a budget
-activated later), and every recovery HTTP attempt. Shutdown closes pass
+its caller's cancellation with recovery shutdown. The Git recovery scope
+first adopts any inherited caller budget; pass ownership then isolates it
+in a child with the same remaining clock. Scope ordering prevents late
+adoption from attaching pass shutdown to the caller's controller. That
+signal reaches its Git operations and lock waits, its cancellation budget
+(including a budget activated later), and every recovery HTTP attempt. Shutdown closes pass
 admission, aborts those owned operations and joins actual settlement; a Git
 child is reaped before its lock is released. An HTTP request interrupted
 after send retains the existing uncertain outcome and request identity;
@@ -157,6 +163,76 @@ This scope does not cancel foreground or run-lane preservation. Caller-owned
 cancellation, the graceful checkpoint/credential allowance and bounded
 imports keep their existing deadlines and joins. Process-level production
 image shutdown latency remains a separate maintainer acceptance check.
+
+After an ordinary guarded archive upload is accepted and read back from its
+authenticated journal, the runner also notifies a separate saved-evidence-only
+pass once its execution tail and exclusion have been released. Notification
+requires actual process, command, steering and auxiliary settlement; an
+executor replacement or new execution invalidates prior settlement receipts.
+Unconfirmed settlement, rejected uploads and shutdown suppress notification.
+This pass uses the existing FINAL and ACK proofs, admits no producer, charges
+no maintenance slot and adds no timer. Saved evidence remains available to the
+ordinary boot/live replay paths when notification is suppressed.
+
+### Terminal-producer delivery hold (issue #3031, 2026-10-20)
+
+The W0-H capture redesign and its dependent producer pipeline are not
+implemented in this delivery. The frozen design requires the clone's index
+identity and trailing checksum, pinned immediately after `add -A`, to remain
+unchanged before and after `commit` and through the post-capture proof.
+Trusted same-UID fixtures on Git 2.54.0 instead observed a legitimate
+cache-tree rebuild during commit, despite both `--no-optional-locks` and
+`GIT_OPTIONAL_LOCKS=0`. Dirty tracked/untracked, staged-only, unstaged and
+racy same-size cases all produced the expected single-parent commit and a
+clean worktree, but replaced the pinned index. In the ordinary dirty case,
+its size changed from 271 to 309 bytes and its `TREE` payload from 15 to 53
+bytes; inode and checksum changed while index entries stayed identical.
+The postcommit index remained stable through the later read-only checks.
+
+This is a material conflict with the required capture success path, not a
+capacity measurement or a protected over-cap success. Accepting a new
+postcommit pin or changing the capture commands needs an explicit contract
+revision. No such workaround, delta-transfer contract, producer freeze,
+archive handoff or durable producer rediscovery is shipped here. The
+composed resource gate remains unrun; capacity projections are unverified.
+Existing capture/transfer helpers and their tests remain in place.
+
+The intended W0-H proof hashes tracked and non-ignored untracked bytes,
+checks undeclared worktree/index differences and the exact final net delta,
+and retains in-clone, runner-UID, final-worktree `add -A` semantics. The
+stat-cache-only alternative was rejected because forged clean metadata can
+hide modified bytes. Conversion attributes remain a planned protected
+refusal. These are undelivered requirements, not guarantees of this release.
+
+The planned attempt-v1 lineage and table-v2 provenance writer are also
+undelivered. The maintenance table and HMAC stay at v1; no provenance write
+or initialization is added at attempt seeding. The accepted shortfall of
+the planned provenance scheme covers legacy/pre-upgrade or orphaned
+sources, canonical reseeds, adopted sources and seeds with unrecorded
+provenance: those categories have no new restart-preservation guarantee
+and retain their existing protected exits. The in-memory rediscovery aid,
+continuation phase table and boot/live materialization-order change remain
+unimplemented. No ledger history is translated, reset or exported.
+
+The existing dormant maintenance limits remain unchanged:
+
+| Dimension | Existing limit |
+|---|---|
+| Decoded bytes | Configured C, default 8 GiB, ceiling 64 GiB; 3 × C per cycle |
+| Slots and time | At most 3 × 120 s; 360 s aggregate; at least 180 s spacing; fixed 24 h eligibility window |
+| Closure/source entries | 65,536 each per slot |
+| Administrative entries | 4,096 per slot |
+| Source/artifact/metadata bytes | 256 MiB each per slot |
+| Sources / launches / RPC attempts | 128 / 512 / 32 per slot |
+| Discovery | 10 s, 32 MiB metadata, 4,096 administrative entries, 512 launches, 16 RPC attempts, 4 candidates |
+| Durable table / marker / index capacity | 16 MiB / 1 MiB / 4,096 entries |
+
+Existing authenticated ledger history is required for production allowance;
+missing, partial, tampered or wrong-key history grants none. Whole-root
+removal retains the existing first-initialization residual. This delivery
+adds no ledger backup/restore artifact or historical-reader format change,
+and does not expand ADR-1786 authority. Production-image/PVC and three-forge
+compose/k8s acceptance remain maintainer-owned and unperformed.
 
 ### Server-owned backoff
 
