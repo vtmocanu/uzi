@@ -1,3 +1,5 @@
+import type { CompletionPendingDTO } from "./apiTypes";
+
 // Owner transport mirrors api/internal/apitypes/semantic_{gate,plan,coverage}.go.
 // Display validation never rewrites the approval object or grants authority.
 export interface SemanticCitation { source_id: string; hash: string; start: number; end: number }
@@ -33,6 +35,8 @@ export interface SemanticGateDTO {
       };
     };
     review_id?: string; invocation_id?: string; report_digest?: string;
+    /** Why an autopilot run stopped for a human; unknown values are tolerated. */
+    semantic_park?: string;
     consumed_seconds: number; remaining_seconds: number; remaining_reviews: number;
     maintainers: MaintainerApproval[];
   };
@@ -79,7 +83,7 @@ const schema = object({
       criteria: array(object({ criterion_id: string, atomic: v => typeof v === "boolean", explanation: string })),
     }) }),
     consumed_seconds: integer, remaining_seconds: integer, remaining_reviews: integer, maintainers,
-  }, identity),
+  }, { ...identity, semantic_park: string }),
   approval: object({
     ...binding, presentation_revision: positive, presentation_digest: string,
     candidate_identity_version: v => v === "semantic_v1", candidate_revision: positive,
@@ -122,4 +126,27 @@ export function isSemanticGate(value: unknown): value is SemanticGateDTO {
       source.id === ref.id && source.kind === ref.kind && source.provenance === ref.provenance &&
       source.completeness === ref.completeness));
   } catch { return false; }
+}
+
+const PARK_REASONS: Record<string, string> = {
+  coverage_incomplete: "Autopilot stopped for a human: semantic coverage of the plan is incomplete.",
+  coverage_uncertain: "Autopilot stopped for a human: semantic coverage of the plan is uncertain.",
+  coverage_unavailable: "Autopilot stopped for a human: semantic coverage could not be checked.",
+  maintainer_authorization: "Autopilot stopped for a human: the plan has maintainer criteria that need an owner's authorization.",
+};
+/** Human wording for a semantic_park value; an unknown value falls back to a neutral line. */
+export function semanticParkReason(value: string): string {
+  return Object.prototype.hasOwnProperty.call(PARK_REASONS, value)
+    ? PARK_REASONS[value]
+    : "Autopilot stopped for a human to review this plan.";
+}
+
+// completion_pending is publication data: unverified maintainer criteria, never evidence of completion.
+const pendingCriterion = object({
+  criterion_id: string, milestone_id: string, kind: string, text: string, reason: string,
+  conditions: array(string), verification_steps: array(string), authorization_revision: integer, status: string,
+});
+const pendingSchema = object({ version: integer, contract_revision: integer, criteria: array(pendingCriterion) });
+export function isCompletionPending(value: unknown): value is CompletionPendingDTO {
+  return pendingSchema(value);
 }

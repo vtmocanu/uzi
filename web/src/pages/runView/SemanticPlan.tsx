@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { stripUnsafeChars } from "../../lib/safeText";
-import { decodeSemanticText, type SemanticGateDTO } from "../../lib/semanticGate";
+import { decodeSemanticText, semanticParkReason, type SemanticGateDTO } from "../../lib/semanticGate";
 
 // Decision log: reuse PlanPanel's tokens and Plex type; left-aligned criteria
 // disclosures retain the entire ledger. Quoted frozen text is the signature:
@@ -28,6 +28,7 @@ export function SemanticPlan({ gate }: { gate: SemanticGateDTO }) {
     <div>
       <h3 className="font-semibold">Semantic plan review</h3>
       <p className="text-muted">Review the frozen inputs, criteria and coverage before approving this candidate.</p>
+      {p.semantic_park !== undefined && <p className="mt-2 font-medium text-warn">{semanticParkReason(p.semantic_park)}</p>}
       <p className="mt-2 font-medium text-warn">Owner decision required. Coverage: {stripUnsafeChars(coverage.outcome)}.</p>
       <p className="text-muted">Maintainer authorization is pending. Approval authorizes the listed conditions; verification has not been performed.</p>
     </div>

@@ -942,6 +942,19 @@ export const mockRuns: Run[] = [
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
+    // PRD #1230 M4: unverified maintainer criteria published non-closing; every other mock run omits the field.
+    completion_pending: {
+      version: 1,
+      contract_revision: 1,
+      criteria: [{
+        criterion_id: "c7", milestone_id: "m2", kind: "maintainer",
+        text: "Release notes are approved by the maintainer.",
+        reason: "Only a maintainer can approve the wording.",
+        conditions: ["Release manager sign-off recorded"],
+        verification_steps: ["Read the published release notes"],
+        authorization_revision: 1, status: "unverified",
+      }],
+    },
     status: "completed",
     requeue_count: 0,
     iteration_count: 2,

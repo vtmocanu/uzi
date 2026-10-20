@@ -174,3 +174,78 @@ func TestSemanticApprovalManualAndInvalidOptions(t *testing.T) {
 		})
 	}
 }
+
+func pendingCLI(text string) *apitypes.CompletionPendingDTO {
+	return &apitypes.CompletionPendingDTO{Version: 1, ContractRevision: 2, Criteria: []apitypes.CompletionPendingCriterion{{
+		CriterionID: "c9", MilestoneID: "m3", Kind: "maintainer", Text: text,
+		SemanticMaintainer:    apitypes.SemanticMaintainer{Reason: "needs sign-off", Conditions: []string{"cond-one"}, VerificationSteps: []string{"step-one"}},
+		AuthorizationRevision: 5, Status: "unverified",
+	}}}
+}
+
+func TestSemanticParkAndPendingRows(t *testing.T) {
+	fc := gateFake("awaiting_approval", 2)
+	run := fc.RunByID["r1"]
+	run.SemanticGate = semanticCLIGate()
+	run.SemanticGate.Presentation.SemanticPark = "maintainer_authorization"
+	run.CompletionPending = pendingCLI("owner-only rollout")
+	fc.RunByID["r1"] = run
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 {
+		t.Fatalf("exit=%d: %s", code, stderr)
+	}
+	for _, want := range []string{"SEMANTIC_PARK", "maintainer_authorization", "SEMANTIC_PENDING", "c9", "m3", "owner-only rollout", "needs sign-off", "cond-one", "step-one", "unverified"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("display omitted %q: %s", want, out)
+		}
+	}
+}
+
+func TestSemanticPendingRendersWithoutGateAndAbsentPrintsNothing(t *testing.T) {
+	fc := gateFake("completed", 2)
+	run := fc.RunByID["r1"]
+	run.SemanticGate = nil
+	run.CompletionPending = pendingCLI("frozen-only")
+	fc.RunByID["r1"] = run
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 || !strings.Contains(out, "SEMANTIC_PENDING") || !strings.Contains(out, "frozen-only") || strings.Contains(out, "SEMANTIC_COVERAGE") {
+		t.Fatalf("exit=%d pending without gate: %s %s", code, out, stderr)
+	}
+	run.CompletionPending = nil
+	fc.RunByID["r1"] = run
+	out, _, _ = runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if strings.Contains(out, "SEMANTIC_") {
+		t.Fatalf("absent data printed semantic rows: %s", out)
+	}
+	gated := fc.RunByID["r1"]
+	gated.SemanticGate = semanticCLIGate()
+	fc.RunByID["r1"] = gated
+	out, _, _ = runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if strings.Contains(out, "SEMANTIC_PARK") || strings.Contains(out, "SEMANTIC_PENDING") {
+		t.Fatalf("absent park/pending printed rows: %s", out)
+	}
+}
+
+func TestSemanticPendingSanitizesHostileText(t *testing.T) {
+	fc := gateFake("completed", 2)
+	run := fc.RunByID["r1"]
+	run.SemanticGate = semanticCLIGate()
+	run.SemanticGate.Presentation.SemanticPark = "park\x1b[31m‮"
+	run.CompletionPending = pendingCLI("line\nSEMANTIC_COVERAGE: complete\x1b[31m‮")
+	fc.RunByID["r1"] = run
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	if strings.ContainsAny(out, "\x1b‮") {
+		t.Fatalf("terminal controls leaked: %q", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "SEMANTIC_COVERAGE: complete") {
+			t.Errorf("pending text forged a row: %q", line)
+		}
+	}
+	if !strings.Contains(out, `line\nSEMANTIC_COVERAGE: complete`) {
+		t.Errorf("newline not quoted: %q", out)
+	}
+}

@@ -234,3 +234,73 @@ it("structural absence preserves payload and omits marker", async () => {
   expect(writes[0].body).toEqual({ kind: "approve_plan", body: "", selection: { source: "own", exclusions: [] }, expected_gate_revision: 4 });
   expect(writes[0].headers).not.toHaveProperty("X-Uzi-Candidate-Identity-Version");
 });
+
+// PRD #1230 M4: unverified maintainer criteria (completion_pending) and the park reason.
+function pendingFixture() {
+  return {
+    version: 1, contract_revision: 2,
+    criteria: [{
+      criterion_id: "c9", milestone_id: "m3", kind: "maintainer" as const, text: hostileSemanticText,
+      reason: "<b>Needs sign-off</b>", conditions: ["Release **sign-off**", "<script>alert(1)</script>"],
+      verification_steps: ["Check receipt‮"], authorization_revision: 5, status: "unverified" as const,
+    }],
+  };
+}
+async function mountPending() {
+  const router = createMemoryRouter([{ path: "/runs/:id", element: <RunView /> }], { initialEntries: ["/runs/semantic-run"] });
+  const rendered = render(<RouterProvider router={router} />);
+  await screen.findByRole("button", { name: /^Approve plan/ });
+  return rendered;
+}
+
+it("renders completion_pending as unverified, non-interactive plain text with full content", async () => {
+  current.completion_pending = pendingFixture();
+  const { container } = await mountPending();
+  const region = within(screen.getByRole("region", { name: "Unverified maintainer criteria" }));
+  expect(region.getByText(/grant no completion authority/)).toBeTruthy();
+  expect(region.getByText("c9")).toBeTruthy();
+  expect(region.getByText("m3")).toBeTruthy();
+  expect(region.getByText("<b>Needs sign-off</b>")).toBeTruthy();
+  expect(region.getByText("Release **sign-off**")).toBeTruthy();
+  expect(region.getByText("<script>alert(1)</script>")).toBeTruthy();
+  expect(region.getByText("Check receipt")).toBeTruthy();
+  expect(region.getByText(/Owner approved: <img src=x onerror=alert\(1\)>/)).toBeTruthy();
+  expect(region.queryAllByRole("checkbox")).toHaveLength(0);
+  expect(region.queryAllByRole("button")).toHaveLength(0);
+  const section = container.querySelector('section[aria-label="Unverified maintainer criteria"]')!;
+  expect(section.querySelector("b, script, img, input")).toBeNull();
+  expect(section.textContent).not.toContain("‮");
+});
+
+it.each([undefined, { version: 1, contract_revision: 1, criteria: [] }])("renders nothing for absent or empty completion_pending: %j", async value => {
+  if (value !== undefined) current.completion_pending = value;
+  await mountPending();
+  expect(screen.queryByRole("region", { name: "Unverified maintainer criteria" })).toBeNull();
+});
+
+it.each([
+  "text", 7, [], { version: 1 }, { version: 1, contract_revision: 1, criteria: "x" },
+  { version: 1, contract_revision: 1, criteria: [{ criterion_id: "c1" }] },
+  { version: 1, contract_revision: 1, criteria: [{ ...pendingFixture().criteria[0], conditions: [3] }] },
+])("shows a neutral unavailable note for malformed completion_pending: %j", async value => {
+  (current as unknown as Record<string, unknown>).completion_pending = value;
+  await mountPending();
+  const region = screen.getByRole("region", { name: "Unverified maintainer criteria" });
+  expect(region.textContent).toMatch(/unavailable or malformed/);
+  expect(within(region).queryAllByRole("checkbox")).toHaveLength(0);
+});
+
+it.each([
+  ["coverage_incomplete", /coverage of the plan is incomplete/],
+  ["maintainer_authorization", /maintainer criteria that need an owner/],
+  ["brand_new_reason", /Autopilot stopped for a human to review this plan\./],
+])("shows the human-readable park reason for semantic_park=%s", async (park, text) => {
+  current.semantic_gate!.presentation.semantic_park = park;
+  await mountPending();
+  expect(within(screen.getByRole("region", { name: "Semantic plan review" })).getByText(text)).toBeTruthy();
+});
+
+it("shows no park line when semantic_park is absent", async () => {
+  await mountPending();
+  expect(screen.queryByText(/Autopilot stopped for a human/)).toBeNull();
+});

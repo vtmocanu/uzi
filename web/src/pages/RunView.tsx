@@ -88,6 +88,7 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
+import { CompletionPending } from "./runView/CompletionPending";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
@@ -2533,6 +2534,7 @@ export function RunView() {
       />
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      <CompletionPending run={run} />
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
