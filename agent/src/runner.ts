@@ -17,6 +17,7 @@ import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { GUARDED_LANE_JOIN_MS } from "./claude-command/lane.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { BaseAttestationHoldOutcome, MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
+import { BASE_ATTESTATION_HOLD_REASON } from "./protocol.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import { MaintenanceBudget } from "./maintenance-budget.js";
@@ -568,6 +569,9 @@ interface ExecutionRejection {
 
 /** PRD #1733: the `hold_reason` of a run held after repeated provider outages. */
 const PROVIDER_HOLD_REASON = "provider_unavailable";
+/** issue #3194: attempts (requests, each followed by an ownership read while unproven) before an
+ *  unconfirmed base-attestation hold ends the flight retained. */
+const BASE_ATTESTATION_HOLD_ATTEMPTS = 3;
 
 type RecoveryParkCause =
   | { kind: "transient" }
@@ -17930,11 +17934,15 @@ export class RunRunner {
    * issue #3194: hold a `--require-base` run whose preflight guard threw BaseAttestationMissingError.
    * The executor never ran, so there is nothing to reap or capture: the adopted source is already
    * the clone's HEAD. Retain-and-stop, like the ServerWallParkedError arm: the clone, the session
-   * HOME and the guarded inventory are kept on EVERY outcome, no terminal state is reported, and the
-   * request is never retried inside this flight. Only the server's positive ACK (`held`) lets the
-   * feed say the run is held; a fence refusal (`stale`) or an unproven answer (`unknown`: transport,
-   * 5xx, an older server's 404/400) ends the flight non-terminal with everything kept, for the
-   * server's own reclaim or the owner's recovery.
+   * HOME and the guarded inventory are kept on EVERY outcome and no terminal state is reported.
+   *
+   * An `unknown` answer (transport, 5xx, an unclassifiable body, an older server's 404/400) gets a
+   * bounded in-flight reconcile: up to BASE_ATTESTATION_HOLD_ATTEMPTS attempts within ONE deadline
+   * (completionHoldReconcileTimeoutMs, fixed at entry), each reading the run's ownership and, while
+   * that proves nothing, re-sending the identical idempotent request after a recoveryRetryMs backoff. Only the server's ACK or an ownership read showing this generation
+   * paused on base_attestation_missing is `held`; a read naming another generation, a released
+   * claim or a terminal run is `stale`. Only `held` lets the feed say the run is held. A flight
+   * still `unknown` after the attempts ends exactly like a stale one: retained, non-terminal.
    */
   private async enterBaseAttestationHold(
     claim: ClaimResponse,
@@ -17947,12 +17955,30 @@ export class RunRunner {
     flight.preserveSession = true;
     flight.keepGuardedInventoryOpen = true;
     const runId = flight.runId;
+    // ONE request identity for every attempt (this run, this generation, this captured head) and
+    // ONE absolute deadline fixed here: requests, ownership reads and backoffs all spend it, and no
+    // step starts a fresh timer.
+    const identity = { head: flight.runnerClone?.adoptedSource ?? "", claimGeneration: flight.claimGeneration };
+    const deadline = Date.now() + this.completionHoldReconcileTimeoutMs;
+    const remaining = () => deadline - Date.now();
     // The client classifies every answer and never throws; the catch keeps a defect there from
     // escaping into the dispatcher, which would skip the retain-and-stop below.
-    const ack = await this.client.requestBaseAttestationHold(runId, {
-      head: flight.runnerClone?.adoptedSource ?? "",
-      claimGeneration: flight.claimGeneration,
-    }).catch((e: unknown): BaseAttestationHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
+    const request = () => this.client.requestBaseAttestationHold(runId, identity, AbortSignal.timeout(Math.max(1, remaining())))
+      .catch((e: unknown): BaseAttestationHoldOutcome => ({ outcome: "unknown", detail: errMessage(e) }));
+    let ack = await request();
+    for (let attempt = 1; ack.outcome === "unknown" && attempt < BASE_ATTESTATION_HOLD_ATTEMPTS; attempt++) {
+      if (remaining() <= 0) break;
+      const proof = await this.observeBaseAttestationHold(flight, deadline, runLog);
+      if (proof) {
+        ack = proof;
+        break;
+      }
+      if (flight.active?.shuttingDown || this.shuttingDownGlobal || remaining() <= this.recoveryRetryMs) break;
+      await this.waitRecoveryRetry(flight, false);
+      ack = await request();
+    }
+    if (ack.outcome === "unknown" && remaining() > 0)
+      ack = (await this.observeBaseAttestationHold(flight, deadline, runLog)) ?? ack;
     if (ack.outcome === "held") {
       flight.parked = true;
       flight.holdOrWallParkConfirmed = true;
@@ -17984,6 +18010,29 @@ export class RunRunner {
       });
     }
     await batcher.close().catch(() => undefined);
+  }
+
+  /** issue #3194: what one ownership read proves about this flight's base-attestation hold:
+   *  `held` (this generation, live claim, paused on base_attestation_missing), `stale` (another
+   *  generation, a released claim, a terminal run), or undefined (no proof, including a failed read). */
+  private async observeBaseAttestationHold(
+    flight: RunFlight, deadline: number, runLog: Logger,
+  ): Promise<BaseAttestationHoldOutcome | undefined> {
+    try {
+      const own = await this.getObservedRunOwnership(flight, { deadline });
+      const generation = typeof own.claim_generation === "number" ? own.claim_generation : undefined;
+      if ((generation !== undefined && generation !== flight.claimGeneration) || own.claim_released === true ||
+          TERMINAL_RUN_STATUSES.has(own.status)) {
+        return { outcome: "stale", status: own.status };
+      }
+      if (generation === flight.claimGeneration && own.status === "paused" &&
+          own.hold_reason === BASE_ATTESTATION_HOLD_REASON) {
+        return { outcome: "held", status: own.status };
+      }
+    } catch (e) {
+      runLog.warn("base attestation hold: ownership read failed", { run_id: flight.runId, error: errMessage(e) });
+    }
+    return undefined;
   }
 
   /**

@@ -48,10 +48,33 @@ function landPublishes(branch: string): { tip: () => string | undefined; restore
   return { tip: () => tip, restore: () => { (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = orig; } };
 }
 
+/** The retained sources one fresh worker holds for the run: its clones (and whether each still has
+ *  leg 1's work in a git checkout), the run's tracking, recovery-episode and checkpoint refs, and
+ *  the owed-candidate inventory records. */
+interface RetainedSnapshot {
+  clones: string[];
+  cloneWork: boolean[];
+  refs: Map<string, string>;
+  owed: string[];
+}
+
 type HoldStub = (runId: string, args: { head: string; claimGeneration: number }) => Promise<BaseAttestationHoldOutcome>;
 
-/** Leg 1 commits work and parks at its wall; leg 2 is the next claim WITHOUT an attestation. */
-async function unattestedContinuation(iid: number, hold?: HoldStub) {
+interface ContinuationOptions {
+  /** Replace the client's hold request; absent = the real HTTP call (the fake api has no route: 404). */
+  hold?: HoldStub;
+  /** Reclaim cycles after leg 1, each a fresh claim generation (2, 3, ...) on the same fresh worker. */
+  cycles?: number;
+  /** The runner's completionHoldReconcileTimeoutMs: the one deadline the whole reconcile spends. */
+  reconcileMs?: number;
+  /** What the ownership read answers for the cycle at `generation`; default running at that generation. */
+  ownership?: (runId: string, generation: number) => void;
+}
+
+/** Leg 1 commits work and parks at its wall; each later cycle is the next claim WITHOUT an
+ *  attestation, as the server serves it after a requeue (the same run, the next generation). */
+async function unattestedContinuation(iid: number, opts: ContinuationOptions = {}) {
+  const cycles = opts.cycles ?? 1;
   const branch = `agent/issue-${iid}`;
   const { gitlab } = fakeGitlab();
   const planned = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
@@ -81,14 +104,13 @@ async function unattestedContinuation(iid: number, hold?: HoldStub) {
     runId: string, args: { head: string; claimGeneration: number },
   ) => {
     requests.push({ runId, ...args });
-    return hold ? hold(runId, args) : origHold(runId, args);
+    return opts.hold ? opts.hold(runId, args) : origHold(runId, args);
   };
-  // Leg 2 runs on a FRESH worker, so its clone is seeded by this flight alone (a same-worker reclaim
-  // would adopt leg 1's retained clone, kept by leg 1's park). Record the clone it seeds, so the
-  // assertions read the clone the held flight itself adopted.
+  // The continuations run on a FRESH worker, so the first held flight's clone is seeded by that
+  // flight alone (a same-worker reclaim would adopt leg 1's retained clone, kept by leg 1's park).
+  // Record the clones they seed, so the assertions read the clone a held flight itself adopted.
   const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), "cdr-3194-hold-"));
-  const freshGit = new GitCache(freshDir, nullLogger(),
-    undefined, testGitCacheOptions());
+  const freshGit = new GitCache(freshDir, nullLogger(), undefined, testGitCacheOptions());
   const clonePaths: string[] = [];
   for (const name of ["runnerCloneForBranch", "createOrAttachRunnerClone"] as const) {
     const g = freshGit as unknown as Record<string, (...a: unknown[]) => Promise<{ path: string }>>;
@@ -101,18 +123,38 @@ async function unattestedContinuation(iid: number, hold?: HoldStub) {
   }
   const landed = landPublishes(branch);
   let leg2States: typeof api.states = [];
+  /** Per reclaim cycle: every retained source on the fresh worker after that cycle. */
+  const retained: RetainedSnapshot[] = [];
+  const snapshot = (): RetainedSnapshot => {
+    const runnerRoot = path.join(freshDir, "runner");
+    const clones = fs.existsSync(runnerRoot) ? fs.readdirSync(runnerRoot).flatMap((repo) =>
+      fs.readdirSync(path.join(runnerRoot, repo)).filter((d) => d === `issue-${iid}` || d.startsWith(`issue-${iid}.`))
+        .map((d) => path.join(runnerRoot, repo, d))) : [];
+    const bare = freshGit.barePathFor(fx.originPath);
+    const refs = new Map(execFileSync("git", ["--git-dir", bare, "for-each-ref", "--format=%(refname) %(objectname)"],
+      { encoding: "utf8" }).trim().split("\n").filter(Boolean).map((l) => l.split(" ") as [string, string])
+      .filter(([name]) => /^refs\/uzi-(runner|recovery-episode|checkpoints)\//.test(name)));
+    const owedDir = path.join(bare, "uzi-owed");
+    const owed = fs.existsSync(owedDir) ? fs.readdirSync(owedDir).sort() : [];
+    return { clones, cloneWork: clones.map((c) => fs.existsSync(path.join(c, "leg1.txt")) && fs.existsSync(path.join(c, ".git"))), refs, owed };
+  };
   try {
     await runnerWith(factory, gitlab).execute(claim);
     assert.equal(legs.length, 1, "sanity: leg 1 ran");
-    const resumed = gitlabClaim(iid, {
-      ...claim, claim_generation: 2, checkpoint_tip: landed.tip() ?? null, checkpoint_attested_source: null,
-      // The server serves the persisted feed position, so leg 2's frames do not reuse leg 1's seqs.
-      last_seq: Math.max(0, ...api.messages(claim.run_id).map((m) => m.seq)),
-    });
-    api.setOwnershipStatus(claim.run_id, "running", 2);
     const before = api.states.length;
-    await new RunRunner(client, freshGit, factory, nullLogger(), 20, undefined,
-      { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, gitlab }).execute(resumed);
+    for (let cycle = 1; cycle <= cycles; cycle++) {
+      const generation = 1 + cycle;
+      const resumed = gitlabClaim(iid, {
+        ...claim, claim_generation: generation, checkpoint_tip: landed.tip() ?? null, checkpoint_attested_source: null,
+        // The server serves the persisted feed position, so later frames do not reuse earlier seqs.
+        last_seq: Math.max(0, ...api.messages(claim.run_id).map((m) => m.seq)),
+      });
+      (opts.ownership ?? ((runId, gen) => api.setOwnershipStatus(runId, "running", gen)))(claim.run_id, generation);
+      await new RunRunner(client, freshGit, factory, nullLogger(), 20, undefined,
+        { pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, recoveryRetryMs: 5, gitlab,
+          ...(opts.reconcileMs !== undefined ? { completionHoldReconcileTimeoutMs: opts.reconcileMs } : {}) }).execute(resumed);
+      retained.push(snapshot());
+    }
     leg2States = api.states.slice(before).filter((s) => s.runId === claim.run_id);
   } finally {
     landed.restore();
@@ -123,20 +165,20 @@ async function unattestedContinuation(iid: number, hold?: HoldStub) {
   const kept = fs.existsSync(path.join(clone, "leg1.txt"));
   fs.rmSync(freshDir, { recursive: true, force: true });
   const feed = api.messages(claim.run_id).map((m) => JSON.stringify(m.payload ?? {}));
-  return { runId: claim.run_id, legs, leg2States, requests, clone, kept, feed };
+  return { runId: claim.run_id, legs, leg2States, requests, clone, kept, feed, retained };
 }
 
-function assertRetainedAndStopped(r: Awaited<ReturnType<typeof unattestedContinuation>>): void {
+function assertRetainedAndStopped(r: Awaited<ReturnType<typeof unattestedContinuation>>, requests = 1): void {
   assert.equal(r.legs.length, 1, "the executor was never invoked on the unattested continuation");
   const terminal = r.leg2States.filter((s) => ["failed", "completed", "cancelled"].includes(s.body.status));
   assert.deepEqual(terminal.map((s) => s.body.status), [], "no terminal state was reported");
-  assert.equal(r.requests.length, 1, "exactly one hold request, never retried inside the flight");
-  assert.equal(r.requests[0]!.claimGeneration, 2, "the request is fenced by this flight's claim generation");
+  assert.equal(r.requests.length, requests, "the hold request count is bounded");
+  assert.ok(r.requests.every((q) => q.claimGeneration === 2), "every request is fenced by this flight's claim generation");
   assert.match(r.requests[0]!.head, /^[0-9a-f]{40}$/, "the request names the adopted source");
   assert.ok(r.kept, `the held flight's clone with the retained work is kept: ${r.clone}`);
 }
 
-/** The held report the feed carries only after the server's positive ACK. */
+/** The held report the feed carries only after the server's positive ACK or ownership proof. */
 const HELD = "The agent did not start and this worker keeps the work";
 
 function assertNotReportedHeld(r: Awaited<ReturnType<typeof unattestedContinuation>>): void {
@@ -144,36 +186,105 @@ function assertNotReportedHeld(r: Awaited<ReturnType<typeof unattestedContinuati
   assert.ok(r.feed.some((t) => t.includes("The hold could not be confirmed")), "the feed says the hold is unconfirmed");
 }
 
+const unknown: HoldStub = async () => ({ outcome: "unknown", detail: "socket hang up" });
+
 describe("--require-base base-attestation hold (issue #3194 M4)", () => {
   it("a confirmed hold stops before the executor, keeps the clone and tells the owner the next step", async () => {
-    const r = await unattestedContinuation(31950, async () => ({ outcome: "held", status: "paused" }));
+    const r = await unattestedContinuation(31950, { hold: async () => ({ outcome: "held", status: "paused" }) });
     assertRetainedAndStopped(r);
     assert.ok(r.feed.some((t) => t.includes(HELD) && t.includes(`uzi run recovery ${r.runId}`) &&
       t.includes(`uzi run export ${r.runId}`)), `the feed names the hold and the recovery verbs: ${r.feed.join(" | ")}`);
   });
 
-  for (const [name, outcome] of [
-    ["a fence refusal (stale ownership)", { outcome: "stale", status: "running" }],
-    ["an unknown transport outcome", { outcome: "unknown", detail: "socket hang up" }],
-  ] as const) {
-    it(`${name} retains everything and never reports the run held`, async () => {
-      const r = await unattestedContinuation(31951 + (outcome.outcome === "stale" ? 0 : 1),
-        async () => outcome as BaseAttestationHoldOutcome);
-      assertRetainedAndStopped(r);
-      assertNotReportedHeld(r);
+  it("a fence refusal (stale ownership) retains everything, never retries and never reports the run held", async () => {
+    const r = await unattestedContinuation(31951, { hold: async () => ({ outcome: "stale", status: "running" }) });
+    assertRetainedAndStopped(r, 1);
+    assertNotReportedHeld(r);
+  });
+
+  it("a persistently unknown outcome is reconciled at most three times, then retained, never held", async () => {
+    const r = await unattestedContinuation(31952, { hold: unknown });
+    assertRetainedAndStopped(r, 3);
+    assertNotReportedHeld(r);
+  });
+
+  it("the reconcile spends one deadline fixed at entry: a slow first answer leaves no time to retry", async () => {
+    const r = await unattestedContinuation(31959, {
+      reconcileMs: 200,
+      hold: async () => { await new Promise((resolve) => setTimeout(resolve, 300)); return { outcome: "unknown", detail: "slow" }; },
     });
-  }
+    assertRetainedAndStopped(r, 1);
+    assertNotReportedHeld(r);
+  });
+
+  it("an unknown outcome whose ownership read shows this generation held counts as held", async () => {
+    const r = await unattestedContinuation(31955, {
+      hold: unknown,
+      ownership: (runId, gen) => api.setOwnershipStatus(runId, "paused", gen, undefined, "base_attestation_missing"),
+    });
+    assertRetainedAndStopped(r, 1);
+    assert.ok(r.feed.some((t) => t.includes(HELD)), "the ownership proof lets the feed report the hold");
+  });
+
+  it("an unknown outcome whose ownership read names a newer generation is stale: no retry, never held", async () => {
+    const r = await unattestedContinuation(31956, {
+      hold: unknown,
+      ownership: (runId, gen) => api.setOwnershipStatus(runId, "running", gen + 1),
+    });
+    assertRetainedAndStopped(r, 1);
+    assertNotReportedHeld(r);
+  });
+
+  it("a paused row with another hold reason is not proof of this hold", async () => {
+    const r = await unattestedContinuation(31957, {
+      hold: unknown,
+      ownership: (runId, gen) => api.setOwnershipStatus(runId, "paused", gen, undefined, "budget_exhausted"),
+    });
+    assertRetainedAndStopped(r, 3);
+    assertNotReportedHeld(r);
+  });
 
   it("a hold request that throws is treated as unknown: retained, not failed", async () => {
-    const r = await unattestedContinuation(31953, async () => { throw new Error("client defect"); });
-    assertRetainedAndStopped(r);
+    const r = await unattestedContinuation(31953, { hold: async () => { throw new Error("client defect"); } });
+    assertRetainedAndStopped(r, 3);
     assertNotReportedHeld(r);
   });
 
   it("an older server without the route (real HTTP 404) neither executes nor fails the run", async () => {
     const r = await unattestedContinuation(31954);
-    assertRetainedAndStopped(r);
+    assertRetainedAndStopped(r, 3);
     assertNotReportedHeld(r);
+  });
+
+  // The residual: a server that never supports the hold. Each flight ends retained and non-terminal,
+  // the server's missing-run requeue reclaims the run, and the next flight re-asks. RUN_MAX_REQUEUES
+  // defaults to 3, so after the wall park's extend the run gets four held flights (generations 2-5)
+  // before the server's over-cap disposition (m4-unknown-residual.md, server side). This pins the
+  // worker half through that whole sequence.
+  it("through requeue exhaustion on a server without the hold, nothing executes and every retained source survives", async () => {
+    const r = await unattestedContinuation(31958, { cycles: 4 });
+    assert.equal(r.legs.length, 1, "the executor was never invoked on any reclaim");
+    const terminal = r.leg2States.filter((s) => ["failed", "completed", "cancelled"].includes(s.body.status));
+    assert.deepEqual(terminal.map((s) => s.body.status), [], "no flight reported a terminal state");
+    assert.deepEqual([...new Set(r.requests.map((q) => q.claimGeneration))], [2, 3, 4, 5], "each reclaim re-asked under its own generation");
+    assert.equal(r.requests.length, 12, "each flight's attempts stay bounded at three");
+    for (const gen of [2, 3, 4, 5]) {
+      const heads = new Set(r.requests.filter((q) => q.claimGeneration === gen).map((q) => q.head));
+      assert.equal(heads.size, 1, `generation ${gen} re-sent one request identity`);
+    }
+    assert.ok(!r.feed.some((t) => t.includes(HELD)), "no flight reported the run held");
+    // Every source retained by an earlier flight is still there, unchanged, after every later one.
+    const last = r.retained.at(-1)!;
+    assert.ok(last.clones.length >= 2, `sanity: several flights retained their own clone: ${last.clones.join(", ")}`);
+    assert.ok(last.refs.has(`refs/uzi-runner/agent/issue-31958`), "sanity: the tracking ref is retained");
+    for (const [i, snap] of r.retained.entries()) {
+      for (const later of r.retained.slice(i + 1)) {
+        for (const clone of snap.clones) assert.ok(later.clones.includes(clone), `clone ${clone} survives a later reclaim`);
+        for (const [ref, oid] of snap.refs) assert.equal(later.refs.get(ref), oid, `${ref} survives a later reclaim unchanged`);
+        for (const record of snap.owed) assert.ok(later.owed.includes(record), `owed record ${record} survives a later reclaim`);
+      }
+    }
+    assert.ok(last.cloneWork.every(Boolean), `every retained clone still holds the work: ${JSON.stringify(last)}`);
   });
 });
 
