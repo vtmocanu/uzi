@@ -218,7 +218,7 @@ func TestPolicyStopNoGateRefusalsLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				// Settlement is legal only for revise; preserve that database shape.
-				e.exec("UPDATE cross_checks SET verdict='revise' WHERE lead_run_id=$1", run)
+				e.exec("UPDATE cross_checks SET verdict='revise',reason_class='revise' WHERE lead_run_id=$1", run)
 				e.exec("UPDATE cross_checks SET revision_disposition='superseded_by_stop',revision_settled_at=now(),revision_superseded_by_stop_input_id=$2 WHERE lead_run_id=$1", run, scope.ID)
 			case "projection":
 				e.exec("UPDATE runs SET plan_md='different persisted plan' WHERE id=$1", run)
