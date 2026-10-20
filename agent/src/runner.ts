@@ -1661,6 +1661,83 @@ export function evaluateBaseStaleness(
 }
 
 /**
+ * issue #3194: the `--require-base` guard could not PROVE the comparison (an ambiguous planned
+ * prefix, an unreadable object or a git error). Distinct from BaseCommitDivergedError so a genuine
+ * divergence is never reported for what is really uncertainty.
+ */
+export class BaseProofError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseProofError";
+  }
+}
+
+/**
+ * issue #3194: a `--require-base` run adopted its own retained work, but no evidence shows that
+ * exact content was produced by a flight that accepted the planned base. The run must not execute;
+ * it is held for an owner recovery decision rather than failed.
+ */
+export class BaseAttestationMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BaseAttestationMissingError";
+  }
+}
+
+/** issue #3194: everything the `--require-base` decision reads, gathered by the runner. */
+export interface RequiredBaseInput {
+  plannedBase: string;
+  /** The adopted identity: the coverage content source when verified, else the raw adopted source. */
+  identity: string;
+  /** claim.checkpoint_attested_source. */
+  attestedSource: string | undefined;
+  /** The adopted source is this run's retained work (tracking/checkpoint/recovery leg). */
+  continuation: boolean;
+  /** The diverged-checkpoint WIP was cherry-picked onto a floor. */
+  wipCherryPicked: boolean;
+  planned: { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" };
+  identityTree: string | undefined;
+  materializedTree: string | undefined;
+}
+
+/**
+ * issue #3194: the strict `--require-base` decision. Accepts (returns) only when the adopted
+ * identity is exactly the planned commit (rule A) or exactly this run's attested source (rule B),
+ * AND the materialized tree is exactly that identity's tree. Otherwise throws:
+ * BaseAttestationMissingError for retained work it cannot vouch for, BaseProofError when the proof
+ * itself failed, BaseCommitDivergedError for a genuine divergence. No ancestry, no default-branch
+ * graph.
+ */
+export function evaluateRequiredBase(input: RequiredBaseInput): "planned" | "attested" {
+  const identity = input.identity.trim().toLowerCase();
+  const detail = `the seeded plan was written against commit ${input.plannedBase}, but this clone adopted ${identity}`;
+  const unvouched = () => input.continuation
+    ? new BaseAttestationMissingError(`${detail}, and no checkpoint attests that this content was produced on the planned base; --require-base is set, so the run is held for a recovery decision instead of implementing`)
+    : new BaseCommitDivergedError(`${detail}; --require-base is set, so this run will not implement against a diverged base`);
+  if (input.wipCherryPicked) throw unvouched();
+  let rule: "planned" | "attested";
+  if (input.attestedSource && input.attestedSource.trim().toLowerCase() === identity) {
+    rule = "attested";
+  } else {
+    switch (input.planned.kind) {
+      case "ambiguous":
+        throw new BaseProofError(`the planned commit ${input.plannedBase} is ambiguous in this repository; --require-base cannot be verified`);
+      case "unknown":
+        throw new BaseProofError(`the planned commit ${input.plannedBase} could not be read; --require-base cannot be verified`);
+      case "missing":
+        throw new BaseCommitDivergedError(`the seeded plan was written against commit ${input.plannedBase}, which does not exist in this repository; --require-base is set, so this run will not implement against a diverged base`);
+    }
+    if (input.planned.sha !== identity) throw unvouched();
+    rule = "planned";
+  }
+  if (!input.identityTree || !input.materializedTree) {
+    throw new BaseProofError(`the tree of adopted commit ${identity} could not be read; --require-base cannot be verified`);
+  }
+  if (input.identityTree !== input.materializedTree) throw unvouched();
+  return rule;
+}
+
+/**
  * What the per-run executor factory yields for one execution (PRD #42 Decisions
  * 4/5): a freshly-constructed executor plus the per-run HOME to clean on terminal.
  *  - `executor`: built anew for THIS run, so `SdkExecutor.spawnedPids` and
@@ -2049,6 +2126,10 @@ interface RunFlight {
    *  claim. lastPublishedTip separately tracks clone HEAD for hasNewWork and can remain
    *  unset after a failed fetch-back even when a checkpoint landed. */
   landedCheckpoint?: boolean;
+  /** issue #3194: this flight's `--require-base` guard strictly accepted its adopted base. False at
+   *  flight start, never seeded from the claim or from ownership; while true, checkpoint publishes
+   *  attest their packed source. */
+  baseAccepted?: boolean;
   /** Issue #1832: the PRD #1809 D6 operation ("preflight", "clone/fetch") whose data-volume
    *  reclaim wait a PauseNowSignal interrupted (an owner `now` or a sweep `wall` pause; a `disk`
    *  stop sets it too, but its arm never reads it). Set only pre-clone, by awaitDataVolumeReclaim;
@@ -10767,7 +10848,25 @@ export class RunRunner {
     // to emit (default) or, under --require-base (claim.require_base_match), THROWS
     // BaseCommitDivergedError BEFORE any implement work — the generic catch-all then
     // fails the run, so it never implements against a diverged base (Open Question 3).
-    const staleWarning = evaluateBaseStaleness(
+    // issue #3194: under --require-base the strict decision compares the raw adopted source (not
+    // the unwrapped effective base) exactly against the planned commit or this run's attested
+    // source, and checks the materialized tree. Warn-only runs keep the equality warning above.
+    const requireBase = claim.require_base_match === true && !!claim.planned_base_commit;
+    if (requireBase && barePath) {
+      const identity = runnerClone.adoptedContentSource ?? runnerClone.adoptedSource;
+      evaluateRequiredBase({
+        plannedBase: claim.planned_base_commit!,
+        identity,
+        attestedSource: claim.checkpoint_attested_source ?? undefined,
+        continuation: runnerClone.seededFrom === "tracking" || runnerClone.seededFrom === "checkpoint",
+        wipCherryPicked: runnerClone.wipCherryPicked === true,
+        planned: await this.git.resolveCommitUnique(barePath, claim.planned_base_commit!),
+        identityTree: await this.git.commitTreeOid(barePath, identity),
+        materializedTree: await this.git.indexTreeOid(runnerClone.path),
+      });
+      flight.baseAccepted = true;
+    }
+    const staleWarning = requireBase ? undefined : evaluateBaseStaleness(
       claim.planned_base_commit ?? undefined,
       runnerClone.baseCommit,
       claim.require_base_match ?? false,
@@ -15091,7 +15190,11 @@ export class RunRunner {
     };
     try {
       signal?.throwIfAborted();
+      // issue #3194: read the acceptance bit BEFORE the owned source snapshot, and freeze the
+      // attestation with it for every retry of this logical publish.
+      const attests = flight.baseAccepted === true;
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      const attestedSource = attests ? sourceSha : undefined;
       signal?.throwIfAborted();
       if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
         return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
@@ -15129,7 +15232,7 @@ export class RunRunner {
       for (let attempt = 1; attempt <= 3; attempt++) {
         signal?.throwIfAborted();
         onStep?.("checkpoint_upload");
-        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration);
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration, attestedSource);
         if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];

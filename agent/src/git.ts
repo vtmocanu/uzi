@@ -1778,6 +1778,19 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
+  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
+   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
+   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
+   *  `baseCommit`. */
+  adoptedSource: string;
+  /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
+   *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
+   *  guard compares it instead of `adoptedSource`. */
+  adoptedContentSource?: string;
+  /** issue #3194: true when the diverged-checkpoint `wip(park)` marker was cherry-picked onto a
+   *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
+   *  this shape. */
+  wipCherryPicked?: boolean;
 }
 
 /**
@@ -4068,7 +4081,8 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
     }
   }
 
@@ -13647,6 +13661,56 @@ try {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #3194: resolve a planned commit (full or abbreviated) to exactly one commit, without
+   *  replacement objects. "missing" when no commit matches, "ambiguous" when an abbreviation names
+   *  more than one, "unknown" on any git error or a malformed input — never coerced to a match. */
+  async resolveCommitUnique(barePath: string, ref: string): Promise<
+    { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" }> {
+    const prefix = ref.trim().toLowerCase();
+    if (!/^[0-9a-f]{4,40}$/.test(prefix)) return { kind: "unknown" };
+    let listed: string;
+    try {
+      listed = await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--disambiguate=" + prefix]);
+    } catch {
+      // rev-parse --disambiguate exits non-zero only on a git error; no match prints nothing.
+      return { kind: "unknown" };
+    }
+    const commits: string[] = [];
+    for (const oid of listed.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      if (!SHA40_RE.test(oid)) return { kind: "unknown" };
+      // The listed object exists, so a failed type read is an error, not absence.
+      let type: string;
+      try {
+        type = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", oid])).trim();
+      } catch {
+        return { kind: "unknown" };
+      }
+      if (type === "commit") commits.push(oid);
+    }
+    if (commits.length === 0) return { kind: "missing" };
+    if (commits.length > 1) return { kind: "ambiguous" };
+    return { kind: "resolved", sha: commits[0]! };
+  }
+
+  /** issue #3194: the tree OID of `sha` in the bare (no replacement objects), or undefined on any
+   *  failure. */
+  async commitTreeOid(barePath: string, sha: string): Promise<string | undefined> {
+    if (!SHA40_RE.test(sha)) return undefined;
+    const tree = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${sha}^{tree}`])).trim();
+    return SHA40_RE.test(tree) ? tree : undefined;
+  }
+
+  /** issue #3194: the tree the runner clone's INDEX holds (what the executor receives, staged WIP
+   *  included), or undefined on any failure. Run as the runner uid, like every clone read. */
+  async indexTreeOid(clonePath: string): Promise<string | undefined> {
+    try {
+      const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
+      return SHA40_RE.test(tree) ? tree : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** issue #1117: public delegate to {@link isAncestor} — true when `ancestorRef` is an

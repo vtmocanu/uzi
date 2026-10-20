@@ -2390,6 +2390,8 @@ export class WorkerClient {
     pack: Readable,
     boundarySignal?: AbortSignal,
     claimGeneration?: number,
+    /** issue #3194: the packed source this flight attests was produced on an accepted base. */
+    attestedSource?: string,
   ): Promise<PublishResult> {
     const query = claimGeneration !== undefined && claimGeneration > 0
       ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
@@ -2404,6 +2406,7 @@ export class WorkerClient {
         "X-Client-Version": this.version,
         "Content-Type": "application/octet-stream",
         "X-Uzi-Checkpoint-Tip": tipOid,
+        ...(attestedSource ? { "X-Uzi-Checkpoint-Attested-Source": attestedSource } : {}),
       },
       body: pack,
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it

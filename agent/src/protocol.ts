@@ -1412,6 +1412,9 @@ export interface ClaimResponse extends ClaimMemoryState {
   /** Resume: the tip THIS run last published to its checkpoint ref (owner-anchor).
    *  Adoption of refs/uzi-checkpoints/<branch> requires the remote tip to equal this. */
   checkpoint_tip?: string | null;
+  /** issue #3194: the source a flight of THIS run published after its `--require-base` guard
+   *  accepted (set-only server-side). A continuation may adopt exactly this content. */
+  checkpoint_attested_source?: string | null;
   /** High-water mark of run_messages.seq; the worker continues numbering here. */
   last_seq: number;
   /** The claim generation this claim was taken at (PRD #1349 M1, D2). The server already
