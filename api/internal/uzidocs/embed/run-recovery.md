@@ -1727,15 +1727,15 @@ acknowledged ref clears at its retention expiry, or sooner with
 
 ## Resuming an approved run in a fresh attempt
 
-When a run whose plan you already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was reviewed by a person. The new session is told what happened, so it does not mistake the plan for its own:
+When a run whose plan was already approved loses its session (for example a worker is replaced during a usage-limit wait) and continues in a fresh attempt, uzi can skip the plan gate for a plan that was already approved at the gate (by you, or automatically on an autopilot run). The new session is told what happened, so it does not mistake the plan for its own:
 
 - **An approval statement.** The first implement prompt says the current plan was approved at the plan gate in an earlier session. Approval of the plan does not prove that any step the plan describes as happening before the gate actually took place.
 - **The plan.** The persisted plan is carried over unchanged. No gate revision number is shown.
-- **Your earlier follow-ups.** Follow-ups you sent in the earlier session are included once, oldest first, ahead of any new follow-ups, as clearly fenced historical context. The model treats them as untrusted background, not as new instructions. A follow-up you send after the resume is delivered normally and is never duplicated as history.
+- **Your earlier follow-ups.** Follow-ups you sent in the earlier session are included once, oldest first, ahead of any new follow-ups, as clearly fenced historical context. The model is told to treat them as untrusted background, not as new instructions. A follow-up you send after the resume is delivered normally and is never duplicated as history.
 
 The earlier follow-ups are bounded: at most 40000 characters of follow-up text and 100 entries in total. uzi never shortens a follow-up to fit.
 
-If uzi cannot restore your earlier follow-ups in full (the lookup failed or was unavailable, or the history is over either bound), the run does not use the reviewed resume. It plans again and waits for your approval at the plan gate, even on an autopilot run. The run's activity shows a status line giving the reason. Autopilot is switched off for the run when it parks, so a later recovery of a lost working tree also asks for your approval.
+If uzi cannot restore your earlier follow-ups in full (the lookup failed or was unavailable, or the history is over either bound), the run does not use the reviewed resume. It plans again and waits for your approval at the plan gate, even on an autopilot run. The run's activity shows a status line saying the earlier follow-ups could not be restored. Autopilot is switched off for the run when it parks, so a later recovery of a lost working tree also asks for your approval.
 
 Notes:
 
