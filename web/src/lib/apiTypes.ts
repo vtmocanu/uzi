@@ -2881,9 +2881,45 @@ export interface CompletionPendingDTO {
   }[];
 }
 
+/** One source comparison inside a drift observation (Go SemanticDriftSource): hashes, refs
+ *  and enums only, never source text. `checkbox_only` marks an issue whose text differs only
+ *  in task-list checkbox state; it is still a contradiction. */
+export interface SemanticDriftSource {
+  source_id: string;
+  frozen_hash: string;
+  observed_hash?: string;
+  ref?: string;
+  outcome: "unchanged" | "changed" | "unknown";
+  reason?: "missing" | "truncated" | "unreadable" | "denied" | "invalid" | "timeout";
+  checkbox_only?: boolean;
+}
+
+/** A stored PRD #1230 D5 drift observation (Go SemanticDriftObservation). Detection only. */
+export interface SemanticDriftObservation {
+  phase: "presentation" | "publication";
+  candidate_digest?: string;
+  gate_revision?: number;
+  pushed_sha?: string;
+  observed_at: string;
+  issue: SemanticDriftSource;
+  prds: SemanticDriftSource[];
+  links_added: string[];
+  links_removed: string[];
+  links_truncated?: boolean;
+}
+
+/** Owner-only drift projection (Go SemanticDriftDTO). `contradiction` is true when any stored
+ *  source is changed or unknown; it never marks a criterion satisfied. */
+export interface SemanticDriftDTO {
+  observations: SemanticDriftObservation[];
+  dropped: number;
+  contradiction: boolean;
+}
+
 export interface Run {
   completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
+  semantic_drift?: SemanticDriftDTO;
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
   repo_id: string | null;
@@ -3780,7 +3816,7 @@ export type RunSummaryItem = Omit<
   RunListItem,
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
-  | "semantic_gate" | "completion_pending"
+  | "semantic_gate" | "completion_pending" | "semantic_drift"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

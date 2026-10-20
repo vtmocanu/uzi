@@ -13,6 +13,7 @@ import (
 var summaryOmitted = map[string]bool{
 	"completion_pending":        true, // Full owner/worker publication only.
 	"semantic_gate":             true, // Owner detail only; no raw snapshots in summaries.
+	"semantic_drift":            true, // Owner detail only (PRD #1230 D5); never on a list or summary.
 	"reset_state_digest":        true,
 	"milestone_reconciliations": true,
 	"milestone_reconciliations_next_before_gate_revision": true,
@@ -53,6 +54,7 @@ func TestRunSummaryItemRoundTrip(t *testing.T) {
 
 	want := full
 	want.SemanticGate = nil
+	want.SemanticDrift = nil
 	want.CompletionPending = nil
 	want.ResetStateDigest = ""
 	want.MilestoneReconciliations = nil

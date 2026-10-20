@@ -112,6 +112,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	}
 	rows = append(rows, semanticGateRows(r)...)
 	rows = append(rows, completionPendingRows(r)...)
+	rows = append(rows, semanticDriftRows(r)...)
 	rows = append(rows, planCrossCheckRows(r)...)
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)

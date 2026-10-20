@@ -54,3 +54,24 @@ func completionPendingRows(run apitypes.RunDTO) [][]string {
 	}
 	return rows
 }
+
+// semanticDriftRows prints PRD #1230 D5 source-drift observations for the run detail
+// render. One summary row carries the derived contradiction flag and the dropped count;
+// then each observation is one JSON-quoted row, so embedded newlines cannot forge rows.
+// Drift is a detector: these rows grant no authority and mark nothing satisfied.
+func semanticDriftRows(run apitypes.RunDTO) [][]string {
+	if run.SemanticDrift == nil {
+		return nil
+	}
+	summary, _ := json.Marshal(struct {
+		Contradiction bool  `json:"contradiction"`
+		Dropped       int64 `json:"dropped"`
+		Observations  int   `json:"observations"`
+	}{run.SemanticDrift.Contradiction, run.SemanticDrift.Dropped, len(run.SemanticDrift.Observations)})
+	rows := [][]string{{"SEMANTIC_DRIFT", sanitizeTTY(string(summary))}}
+	for _, observation := range run.SemanticDrift.Observations {
+		raw, _ := json.Marshal(observation)
+		rows = append(rows, []string{"SEMANTIC_DRIFT", sanitizeTTY(string(raw))})
+	}
+	return rows
+}

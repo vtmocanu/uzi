@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -150,4 +151,38 @@ func (h *Handler) WorkerSemanticCoverageSettle(w http.ResponseWriter, r *http.Re
 }
 func (h *Handler) WorkerSemanticCoveragePublish(w http.ResponseWriter, r *http.Request) {
 	h.workerSemanticCoverageWrite(w, r, "publish")
+}
+
+// WorkerSemanticObservation records one source-drift observation (PRD #1230 D5).
+// It is fenced by claim generation like the other semantic worker routes. Drift is a
+// detector: the response is the stored record (outcomes, hashes, refs, paths, times)
+// and nothing about the run's state, permits or contract changes.
+func (h *Handler) WorkerSemanticObservation(w http.ResponseWriter, r *http.Request) {
+	worker, ok := mw.WorkerFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "worker authentication required")
+		return
+	}
+	run, ok := httpx.PathUUID(w, r, "id", "run")
+	if !ok {
+		return
+	}
+	var req apitypes.SemanticObservationRequest
+	if !readSemanticWorkerBody(w, r, 16<<10, &req) {
+		return
+	}
+	if req.ClaimGeneration == nil || *req.ClaimGeneration < 1 {
+		httpx.Error(w, http.StatusBadRequest, "invalid semantic claim generation")
+		return
+	}
+	record, err := h.wsvc.ObserveSemanticDrift(r.Context(), worker, run, *req.ClaimGeneration, req)
+	if err != nil {
+		if errors.Is(err, workersvc.ErrSemanticObservationInvalid) {
+			httpx.Error(w, http.StatusBadRequest, "invalid semantic observation")
+			return
+		}
+		httpx.Error(w, http.StatusConflict, "semantic observation refused")
+		return
+	}
+	httpx.JSON(w, http.StatusOK, record)
 }

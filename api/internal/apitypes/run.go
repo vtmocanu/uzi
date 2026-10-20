@@ -207,6 +207,7 @@ type MemoryHoldDTO struct {
 type RunDTO struct {
 	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
 	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
+	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
 	ResetStateDigest                               string                `json:"reset_state_digest,omitempty"`
 	MilestoneReconciliations                       []json.RawMessage     `json:"milestone_reconciliations,omitempty"`
 	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`

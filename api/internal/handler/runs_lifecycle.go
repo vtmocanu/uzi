@@ -467,6 +467,12 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		dto.SemanticDrift, err = h.wsvc.SemanticDriftForOwner(r.Context(), user.ID, run)
+		if err != nil {
+			slog.Error("semantic drift projection", "run_id", run.ID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "semantic drift unavailable")
+			return
+		}
 		if run.Status == "awaiting_approval" {
 			if digest, err := workersvc.ResetStateDigest(run); err == nil {
 				dto.ResetStateDigest = digest

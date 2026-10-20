@@ -182,6 +182,46 @@
     ],
     "plan": "AQ=="
   },
+  "semantic_drift": {
+    "observations": [
+      {
+        "phase": "x",
+        "candidate_digest": "x",
+        "gate_revision": 1,
+        "pushed_sha": "x",
+        "observed_at": "2020-01-02T03:04:05Z",
+        "issue": {
+          "source_id": "x",
+          "frozen_hash": "x",
+          "observed_hash": "x",
+          "ref": "x",
+          "outcome": "x",
+          "reason": "x",
+          "checkbox_only": true
+        },
+        "prds": [
+          {
+            "source_id": "x",
+            "frozen_hash": "x",
+            "observed_hash": "x",
+            "ref": "x",
+            "outcome": "x",
+            "reason": "x",
+            "checkbox_only": true
+          }
+        ],
+        "links_added": [
+          "x"
+        ],
+        "links_removed": [
+          "x"
+        ],
+        "links_truncated": true
+      }
+    ],
+    "dropped": 1,
+    "contradiction": true
+  },
   "reset_state_digest": "x",
   "milestone_reconciliations": [
     {}

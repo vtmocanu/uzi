@@ -912,6 +912,7 @@ var wantRouteMounts = []routeMount{
 	// Semantic planning uses worker authentication and claim-generation fences.
 	// Candidate/status and bounded coverage accounting mount no per-user limiter.
 	{"POST", "/api/worker/runs/{id}/semantic/candidate", noLimiter},
+	{"POST", "/api/worker/runs/{id}/semantic/observation", noLimiter},
 	{"GET", "/api/worker/runs/{id}/semantic/coverage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/semantic/coverage/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/semantic/coverage/settle", noLimiter},

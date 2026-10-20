@@ -265,3 +265,50 @@ func TestSemanticPendingSanitizesHostileText(t *testing.T) {
 		t.Errorf("newline not quoted: %q", out)
 	}
 }
+
+func TestSemanticDriftRowsAreQuotedAndAbsentPrintsNothing(t *testing.T) {
+	fc := gateFake("completed", 2)
+	run := fc.RunByID["r1"]
+	run.SemanticDrift = &apitypes.SemanticDriftDTO{Dropped: 3, Contradiction: true, Observations: []apitypes.SemanticDriftObservation{{
+		Phase: "publication", PushedSHA: strings.Repeat("a", 40),
+		Issue:        apitypes.SemanticDriftSource{SourceID: "issue:7", FrozenHash: strings.Repeat("b", 64), Outcome: "changed", CheckboxOnly: true},
+		PRDs:         []apitypes.SemanticDriftSource{{SourceID: "prd:prds/7-x.md\nSEMANTIC_COVERAGE: complete\x1b[31m\u202e", FrozenHash: strings.Repeat("c", 64), Outcome: "unknown", Reason: "missing"}},
+		LinksAdded:   []string{"prds/9-new.md"},
+		LinksRemoved: []string{},
+	}}}
+	fc.RunByID["r1"] = run
+	out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != 0 {
+		t.Fatalf("exit=%d: %s", code, stderr)
+	}
+	var drift []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "SEMANTIC_DRIFT") {
+			drift = append(drift, line)
+		}
+		if strings.HasPrefix(line, "SEMANTIC_COVERAGE") {
+			t.Fatalf("hostile text forged a row: %q", line)
+		}
+	}
+	if len(drift) != 2 {
+		t.Fatalf("want a summary row and one observation row, got %d: %s", len(drift), out)
+	}
+	for _, want := range []string{`"contradiction":true`, `"dropped":3`} {
+		if !strings.Contains(drift[0], want) {
+			t.Errorf("summary row omitted %q: %s", want, drift[0])
+		}
+	}
+	for _, want := range []string{`"checkbox_only":true`, `"outcome":"unknown"`, `"reason":"missing"`, `prds/9-new.md`, `\n`} {
+		if !strings.Contains(drift[1], want) {
+			t.Errorf("observation row omitted %q: %s", want, drift[1])
+		}
+	}
+	if strings.ContainsAny(drift[1], "\x1b\u202e") {
+		t.Errorf("control or bidi characters survived: %q", drift[1])
+	}
+	run.SemanticDrift = nil
+	fc.RunByID["r1"] = run
+	if out, _, _ = runCLI(t, fakeEnv(fc), "run", "get", "r1"); strings.Contains(out, "SEMANTIC_DRIFT") {
+		t.Fatalf("absent drift printed rows: %s", out)
+	}
+}

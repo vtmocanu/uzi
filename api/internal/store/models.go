@@ -1401,12 +1401,13 @@ type SemanticCandidateHistory struct {
 }
 
 type SemanticPlanning struct {
-	RunID       uuid.UUID   `json:"run_id"`
-	Enrollment  []byte      `json:"enrollment"`
-	Revision    int64       `json:"revision"`
-	Fingerprint pgtype.Text `json:"fingerprint"`
-	Candidate   []byte      `json:"candidate"`
-	ReviewState []byte      `json:"review_state"`
+	RunID        uuid.UUID   `json:"run_id"`
+	Enrollment   []byte      `json:"enrollment"`
+	Revision     int64       `json:"revision"`
+	Fingerprint  pgtype.Text `json:"fingerprint"`
+	Candidate    []byte      `json:"candidate"`
+	ReviewState  []byte      `json:"review_state"`
+	Observations []byte      `json:"observations"`
 }
 
 type SemanticSnapshot struct {

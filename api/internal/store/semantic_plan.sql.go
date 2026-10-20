@@ -12,6 +12,37 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const appendSemanticObservation = `-- name: AppendSemanticObservation :one
+UPDATE semantic_planning SET observations = jsonb_build_object(
+    'dropped', (observations->>'dropped')::bigint
+        + GREATEST(jsonb_array_length(observations->'items') + 1 - 32, 0),
+    'items', (
+        SELECT COALESCE(jsonb_agg(t.e ORDER BY t.ord), '[]'::jsonb)
+        FROM jsonb_array_elements((observations->'items') || jsonb_build_array($1::jsonb))
+            WITH ORDINALITY AS t(e, ord)
+        WHERE t.ord > jsonb_array_length(observations->'items') + 1 - 32
+    )
+)
+WHERE run_id = $2
+RETURNING observations
+`
+
+type AppendSemanticObservationParams struct {
+	Observation []byte    `json:"observation"`
+	RunID       uuid.UUID `json:"run_id"`
+}
+
+// PRD #1230 D5. Appends one drift observation under the caller's run lock and
+// enforces the bound in this same statement: at most 32 items are kept, the oldest
+// are dropped and `dropped` counts them. Items are fixed-size records built by the
+// caller; this statement never reads or writes review_state, candidates or history.
+func (q *Queries) AppendSemanticObservation(ctx context.Context, arg AppendSemanticObservationParams) ([]byte, error) {
+	row := q.db.QueryRow(ctx, appendSemanticObservation, arg.Observation, arg.RunID)
+	var observations []byte
+	err := row.Scan(&observations)
+	return observations, err
+}
+
 const getSemanticCandidateByDigest = `-- name: GetSemanticCandidateByDigest :one
 SELECT candidate FROM semantic_candidate_history
 WHERE run_id=$1 AND candidate->>'digest'=$2::text
@@ -27,6 +58,17 @@ func (q *Queries) GetSemanticCandidateByDigest(ctx context.Context, arg GetSeman
 	var candidate []byte
 	err := row.Scan(&candidate)
 	return candidate, err
+}
+
+const getSemanticObservations = `-- name: GetSemanticObservations :one
+SELECT observations FROM semantic_planning WHERE run_id = $1
+`
+
+func (q *Queries) GetSemanticObservations(ctx context.Context, runID uuid.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getSemanticObservations, runID)
+	var observations []byte
+	err := row.Scan(&observations)
+	return observations, err
 }
 
 const getSemanticPlanning = `-- name: GetSemanticPlanning :one
