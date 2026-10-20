@@ -2609,18 +2609,14 @@ tasks:
         UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
 
   test:checkpoint-chain-bridge:
-    desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
+    desc: real agent checkpoint chaining and selective packs through pushbroker.Publish (needs Node and agent deps)
     preconditions:
       - sh: command -v node && node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
         msg: 'test:checkpoint-chain-bridge requires Node 24 or newer (the agent fixture runs under tsx)'
       - sh: command -v go
         msg: 'test:checkpoint-chain-bridge requires Go (the bridge is a Go test)'
     cmds:
-      - |
-        if ! task deps-check:agent; then
-          (cd agent && npm ci --ignore-scripts)
-          task deps-check:agent
-        fi
+      - task: deps-check:agent
       - |
         # The log lives under .uzi/scratch (inside the worktree, gitignored), not /tmp.
         # -buildvcs=false: a linked worktree cannot stamp VCS info. -race: the test's loopback
@@ -2629,19 +2625,26 @@ tasks:
         mkdir -p .uzi/scratch
         LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
         rc=0
-        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
-          -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
+        printf 'revision=%s\n' "$(git rev-parse HEAD)" >> "$LOG"
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 UZI_CHECKPOINT_SELECTIVE_PACK_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
+          -run '^TestAgentCheckpoint(Chain|SelectivePack)Bridge$' ./internal/pushbroker/) >> "$LOG" 2>&1 || rc=$?
         cat "$LOG"
         [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
         # A named RUN and PASS are mandatory and any SKIP fails: the test skips silently when its
         # gate variable is unset, which would read as green (same discipline as e2e/run-store-it.sh).
-        if ! grep -q '^=== RUN   TestAgentCheckpointChainBridge$' "$LOG" ||
-          ! grep -q '^--- PASS: TestAgentCheckpointChainBridge ' "$LOG" ||
-          grep -q -- '--- SKIP:' "$LOG"; then
-          echo "checkpoint chain bridge did not run and pass without skips: $LOG" >&2
+        for suite in TestAgentCheckpointChainBridge TestAgentCheckpointSelectivePackBridge; do
+          if ! grep -q "^=== RUN   $suite\$" "$LOG" ||
+            ! grep -q "^--- PASS: $suite " "$LOG"; then
+            echo "checkpoint bridge did not run and pass: $suite ($LOG)" >&2
+            exit 1
+          fi
+        done
+        if grep -q -- '--- SKIP:' "$LOG"; then
+          echo "checkpoint bridge unexpectedly skipped a test: $LOG" >&2
           exit 1
         fi
-        rm -f "$LOG"
+        # Retain revision-linked bridge evidence for review.
+        printf 'checkpoint bridge log: %s\n' "$LOG"
 
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)

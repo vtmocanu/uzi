@@ -3,8 +3,7 @@
 // checkpoint O, then a raw tick or iteration checkpoint N, and sends every publish through the REAL
 // WorkerClient.publishCheckpoint to the Go test's loopback server, which runs the real
 // pushbroker.Publish against the Go-owned bare origin. Every other worker RPC goes to the in-process
-// FakeApi. Only APIs that already existed before the chain fix are used, so the same file runs
-// against an older agent/src to show the failure there.
+// FakeApi. It also checks the current selective-pack server-name and pinned-default contract.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -19,8 +18,10 @@ import { defaultGitleaksShim } from "../gitleaks-shim.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "../helpers.js";
 import { fakeGitHub } from "../runner-harness.js";
 
-const cfg = JSON.parse(process.env.UZI_CHAIN_BRIDGE_FIXTURE ?? "") as {
-  url: string; token: string; origin: string; iid: number; boundary: "tick" | "iteration"; scratch: string;
+const raw = process.env.UZI_CHAIN_BRIDGE_FIXTURE ?? "";
+assert.ok(Buffer.byteLength(raw) <= 16 * 1024, "bounded fixture configuration");
+const cfg = JSON.parse(raw) as {
+  url: string; token: string; origin: string; iid: number; boundary: "tick" | "iteration"; scratch: string; defaultBranch: string;
 };
 assert.ok(path.isAbsolute(cfg.scratch));
 assert.ok(path.isAbsolute(cfg.origin));
@@ -36,7 +37,7 @@ const gitEnv = {
 };
 const ident = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 function gitIn(dir: string, args: string[]): string {
-  return execFileSync("git", ["-C", dir, ...args], { env: gitEnv, encoding: "utf8" }).trim();
+  return execFileSync("git", ["-C", dir, ...args], { env: gitEnv, encoding: "utf8", timeout: 20_000, maxBuffer: 1024 * 1024 }).trim();
 }
 function commitIn(tree: string, file: string, content: string): string {
   fs.mkdirSync(path.dirname(path.join(tree, file)), { recursive: true });
@@ -45,13 +46,15 @@ function commitIn(tree: string, file: string, content: string): string {
   gitIn(tree, [...ident, "commit", "-m", `work ${file}`]);
   return gitIn(tree, ["rev-parse", "HEAD"]);
 }
-/** Advance main's workflow in the Go-owned bare origin from a scratch clone, so the agent branch
+/** Advance the server-named default workflow in the Go-owned bare origin, so the agent branch
  *  is behind on .github/workflows and the overlay path runs. */
 function advanceOriginWorkflow(): void {
   const work = path.join(local, "origin-work");
-  execFileSync("git", ["clone", "-q", cfg.origin, work], { env: gitEnv });
+  execFileSync("git", ["clone", "-q", "--branch", cfg.defaultBranch, cfg.origin, work], { env: gitEnv, timeout: 20_000 });
+  // Match the run's only non-workflow change, so the real overlay has default's full tree.
+  commitIn(work, "r.txt", "R\n");
   commitIn(work, workflow, `name: ci\non: push\njobs: {}\n# advanced ${cfg.iid}\n`);
-  gitIn(work, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
+  gitIn(work, ["push", "-q", "origin", `HEAD:refs/heads/${cfg.defaultBranch}`]);
 }
 
 // The runner's worker client talks to the in-process FakeApi; only publishCheckpoint is delegated to
@@ -92,6 +95,30 @@ async function fireTick(): Promise<string> {
 
 const gitCache = new GitCache(path.join(local, "data"), nullLogger(), undefined,
   testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+const authorities: (string | undefined)[] = [];
+const defaults: (string | undefined)[] = [];
+const resolveRange = gitCache.resolveCheckpointRange.bind(gitCache);
+gitCache.resolveCheckpointRange = async (...args) => {
+  authorities.push(args[2]?.defaultBranch);
+  const range = await resolveRange(...args);
+  if (range) defaults.push(range.defaultBlobSha);
+  return range;
+};
+const packAuthorities: (string | undefined)[] = [];
+const packDefaults: string[] = [];
+const makePack = gitCache.checkpointPack.bind(gitCache);
+gitCache.checkpointPack = async (...args) => {
+  packAuthorities.push(args[8]?.defaultBranch);
+  // A pinned scan may precede the overlay's default fetch. Its original SHA stays authoritative.
+  const captured = args[3]?.defaultBlobSha ?? gitIn(args[0], ["rev-parse", `refs/remotes/origin/${cfg.defaultBranch}`]);
+  assert.match(captured, /^[0-9a-f]{40}$/);
+  const packed = await makePack(...args);
+  if (packed) {
+    if (args[3]) assert.equal(args[3].defaultBlobSha, captured, "overlay must retain scanned default authority");
+    packDefaults.push(captured);
+  }
+  return packed;
+};
 const { github } = fakeGitHub();
 const branch = `agent/issue-${cfg.iid}`;
 const summary: Record<string, unknown> = { branch, boundary: cfg.boundary };
@@ -107,10 +134,30 @@ const runner = new RunRunner(client, gitCache, () => ({
         await ctx.checkpoint!({ reap: true, progress });
         summary.overlay = tips[0];
         summary.overlayRef = gitIn(cfg.origin, ["rev-parse", "--verify", "--quiet", `refs/uzi-checkpoints/${branch}`]);
+        assert.equal(summary.overlayRef, summary.overlay, "overlay actually reached the broker ref");
+        const rows = (revision: string) => gitIn(cfg.origin, ["ls-tree", "-r", revision]).split("\n").filter(Boolean);
+        const expectedRows = new Set(rows(summary.realTip as string).filter(row => !row.endsWith(`\t${workflow}`)));
+        const defaultWorkflow = rows(`refs/heads/${cfg.defaultBranch}`).find(row => row.endsWith(`\t${workflow}`));
+        assert.ok(defaultWorkflow, "current default supplies workflow");
+        expectedRows.add(defaultWorkflow);
+        const overlayRows = rows(summary.overlay as string);
+        assert.equal(overlayRows.length, expectedRows.size);
+        assert.equal(overlayRows.find(row => !expectedRows.has(row)), undefined, "first overlay tree mismatch");
+        summary.overlayTree = gitIn(cfg.origin, ["rev-parse", `${summary.overlay}^{tree}`]);
         summary.rawTip = commitIn(ctx.worktreePath, "n.txt", "N\n");
         fakeNow += INTERVAL_MS + 1;
         if (cfg.boundary === "tick") summary.tickOutcome = await fireTick();
         else await ctx.checkpoint!({ reap: false, progress });
+        const final = gitIn(cfg.origin, ["rev-parse", `refs/uzi-checkpoints/${branch}`]);
+        assert.equal(gitIn(cfg.origin, ["show", "-s", "--format=%P", final]), `${summary.overlay} ${summary.rawTip}`,
+          "next checkpoint chains over overlay and raw work");
+        const chainedRows = rows(final);
+        const expectedChain = new Set([
+          ...rows(summary.rawTip as string).filter(row => !row.endsWith(`\t${workflow}`)),
+          defaultWorkflow,
+        ]);
+        assert.equal(chainedRows.length, expectedChain.size);
+        assert.equal(chainedRows.find(row => !expectedChain.has(row)), undefined, "first chained overlay tree mismatch");
         summary.tips = tips;
         summary.results = results;
       } catch (e) {
@@ -135,13 +182,23 @@ const runner = new RunRunner(client, gitCache, () => ({
 const claim = makeClaim({
   issue_iid: cfg.iid,
   issue_title: `Bridge ${cfg.iid}`,
-  repo: { id: "r1", url: "https://github.com/org/repo", clone_url: cfg.origin, forge_type: "github" },
+  repo: { id: "r1", url: "https://github.com/org/repo", clone_url: cfg.origin, forge_type: "github", default_branch: cfg.defaultBranch },
   secrets: { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
 });
 let code = 0;
 try {
   await runner.execute(claim);
   if (turnError !== undefined) throw turnError;
+  assert.ok(authorities.length >= 1, "runner must resolve the scanned checkpoint range");
+  assert.ok(packAuthorities.length >= 2, "runner must build the overlay and subsequent pack");
+  assert.ok(packAuthorities.every(name => name === cfg.defaultBranch), "all actual pack calls carry server authority");
+  assert.ok(authorities.every(name => name === cfg.defaultBranch), "exact server default threaded");
+  assert.ok(defaults.every(oid => /^[0-9a-f]{40}$/.test(oid ?? "")), "actual ranges capture default provenance");
+  summary.defaultAuthorities = authorities;
+  assert.ok(packDefaults.length >= 2, "overlay and subsequent pack both captured default");
+  summary.packAuthorities = packAuthorities;
+  summary.packDefaults = packDefaults;
+  summary.capturedDefaults = defaults;
   console.log("BRIDGE_SUMMARY " + JSON.stringify(summary));
 } catch (e) {
   console.error("bridge fixture failed:", e);

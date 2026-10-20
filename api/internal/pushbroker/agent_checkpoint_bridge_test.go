@@ -1,12 +1,9 @@
 package pushbroker_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,6 +82,8 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	branch := fmt.Sprintf("agent/issue-%d", iid)
 	ref := "refs/uzi-checkpoints/" + branch
 
+	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
+	defer cancel()
 	var mu sync.Mutex
 	var seen []bridgePublish
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -93,13 +92,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 			return
 		}
 		tip := r.Header.Get("X-Uzi-Checkpoint-Tip")
-		pack, err := io.ReadAll(r.Body)
+		pack, err := checkpointBridgePack(r.Body)
 		if err != nil {
+			cancel() // Join the child through cmd.Run before reporting the bounded-read failure.
 			http.Error(w, "read pack", http.StatusBadRequest)
 			return
 		}
-		// Simplified production mapping: ErrTipMissing, ErrPackTooLarge and ErrPackInvalid are 500 here
-		// but 200 skips in production; AlreadyCurrent ownership and the slot retry are not modelled.
+		// Match production's typed refusal tokens; service ownership/slot retry stays outside this bridge.
 		_, err = pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
 		})
@@ -107,10 +106,8 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		resp := map[string]any{"published": true, "ref": ref}
 		switch {
 		case err == nil:
-		case errors.Is(err, pushbroker.ErrNotDescendant):
-			rec.skipped = "not_descendant"
-		case errors.Is(err, pushbroker.ErrWorkflowScopeRejected):
-			rec.skipped = "workflow_scope"
+		case checkpointBridgeRefusal(err) != "":
+			rec.skipped = checkpointBridgeRefusal(err)
 		default:
 			rec.err = err.Error()
 			http.Error(w, "publish failed", http.StatusInternalServerError)
@@ -136,15 +133,17 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	}))
 	defer srv.Close()
 
+	scratch, err := os.MkdirTemp(filepath.Join(root, ".uzi/scratch"), "chain-bridge-")
+	if err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := json.Marshal(map[string]any{
 		"url": srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
-		"boundary": boundary, "scratch": t.TempDir(),
+		"boundary": boundary, "scratch": scratch, "defaultBranch": "main",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, node, "--import", "tsx", "test/fixtures/checkpoint-chain-bridge.ts")
 	cmd.Dir = filepath.Join(root, "agent")
 	cmd.WaitDelay = 10 * time.Second
@@ -154,9 +153,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		}
 	}
 	cmd.Env = append(cmd.Env, "UZI_CHAIN_BRIDGE_FIXTURE="+string(cfg))
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	stdout := &checkpointBridgeOutput{cancel: cancel}
+	stderr := &checkpointBridgeOutput{cancel: cancel}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
+	if stdout.overflow || stderr.overflow {
+		t.Fatal("fixture output exceeded one MiB; child cancelled and joined")
+	}
 
 	mu.Lock()
 	publishes := append([]bridgePublish(nil), seen...)
@@ -198,6 +201,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	subject := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "log", "-1", "--format=%s", summary.Overlay))
 	if !strings.HasPrefix(subject, "ckpt(overlay):") {
 		t.Fatalf("overlay subject = %q, want a ckpt(overlay): commit", subject)
+	}
+	// The fixture advances default with the same run file before changing workflows:
+	// the real overlay wrapper must therefore have exactly default's complete tree.
+	overlayTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", summary.Overlay+"^{tree}"))
+	defaultTree := strings.TrimSpace(run(t, "", "git", "-C", f.bare, "rev-parse", "refs/heads/main^{tree}"))
+	if overlayTree != defaultTree {
+		t.Fatalf("overlay tree %s differs from default tree %s", overlayTree, defaultTree)
 	}
 
 	// A lost acknowledgement is an HTTP 500 the agent retries once with the SAME overlay tip, so
