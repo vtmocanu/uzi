@@ -4216,6 +4216,11 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 }
 
 func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
+	return s.setStateWithTx(ctx, wkr, runID, req, gateRevisionOut, reconciliationOut, nil)
+}
+
+// setStateWithTx receives the actual parent transaction only from the claim-locked facade.
+func (s *Service) setStateWithTx(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation, parentTx pgx.Tx) (run store.Run, applied bool, err error) {
 	if err := validateRevisionRetry(req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4269,6 +4274,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if err := validateCappedReportOnly(owned, req); err != nil {
 		return owned, false, err
 	}
+	if s.txBeginner == nil && parentTx == nil && semanticCompletionRequiresLock(owned) &&
+		(stateUsesGenerationFence(req.State, owned) || req.State == "pause_failed" ||
+			((req.State == "credential_switch" || req.State == "credential_switch_failed") && req.ClaimGeneration != nil)) {
+		return owned, false, ErrSemanticCompletionAuthority
+	}
 	// Withdrawal/release helpers have their own short claim transaction; they must
 	// not nest beneath the generic state fence on another connection.
 	if s.txBeginner != nil && (req.State == "pause_failed" || req.State == "credential_switch" || req.State == "credential_switch_failed") {
@@ -4279,7 +4289,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		defer func() { _ = tx.Rollback(ctx) }()
 		locked.bcast = nil
 		locked.lifecycle = nil
-		current, applied, err := locked.SetState(ctx, wkr, runID, req)
+		current, applied, err := locked.setStateWithTx(ctx, wkr, runID, req, nil, nil, tx)
 		if err != nil {
 			return current, false, err
 		}
@@ -4401,9 +4411,6 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// adopt_gate_revision) must stamp claim_generation, because a refusal's accounting is fenced
 	// on it; a current worker always stamps it and an id-less report never refuses. Adoption
 	// always names the id it adopts with, and a revision is positive.
-	if s.txBeginner == nil && stateUsesGenerationFence(req.State, owned) && semanticCompletionRequiresLock(owned) {
-		return owned, false, ErrSemanticCompletionAuthority
-	}
 	if s.txBeginner == nil && (req.State == "running" || req.State == "awaiting_approval") {
 		if txq, ok := s.q.(*store.Queries); ok {
 			if semantic, err := semanticEnrollmentPresent(ctx, txq, runID); err != nil || semantic {

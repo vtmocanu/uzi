@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -126,6 +127,12 @@ func CompletionPending(run store.Run) (*apitypes.CompletionPendingDTO, error) {
 	if err != nil {
 		return nil, err
 	}
+	return completionPendingFromContract(run, c)
+}
+
+// completionPendingFromContract validates and projects this request's decoded
+// contract; it never retains authority beyond the caller's operation.
+func completionPendingFromContract(run store.Run, c completionContract) (*apitypes.CompletionPendingDTO, error) {
 	if c.Profile == contractProfileStructural {
 		if hasSemanticCompletionFields(c) {
 			return nil, ErrSemanticCompletionAuthority
@@ -234,11 +241,49 @@ func semanticUnmetMilestones(run store.Run, c completionContract) ([]string, boo
 // contamination before an outer mutation can enter the unlocked legacy fallback.
 // Locked inner helpers deliberately do not call this guard: their caller owns the tx.
 func semanticCompletionRequiresLock(run store.Run) bool {
-	var c completionContract
-	if json.Unmarshal(run.CompletionContract, &c) != nil {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(run.CompletionContract, &fields) != nil {
 		return false
 	}
-	return c.Profile == "semantic" || hasSemanticCompletionFields(c)
+	for key, raw := range fields {
+		switch {
+		case completionJSONNameIs(key, "profile"):
+			var profile string
+			if json.Unmarshal(raw, &profile) == nil && profile == "semantic" {
+				return true
+			}
+		case completionJSONNameIs(key, "semantic_approval", "semantic_presentation", "maintainer_authorizations",
+			"candidate_identity_version", "sources", "plan_hash", "source_outcome", "coverage"):
+			return true
+		case completionJSONNameIs(key, "criteria"):
+			var criteria []json.RawMessage
+			if json.Unmarshal(raw, &criteria) == nil {
+				for _, criterion := range criteria {
+					var cr map[string]json.RawMessage
+					if json.Unmarshal(criterion, &cr) != nil {
+						continue
+					}
+					for name := range cr {
+						if completionJSONNameIs(name, "kind", "maintainer", "done_when", "citations", "evidence_requirements") {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Match the legacy decoder's Unicode case folding conservatively when deciding
+// whether a transaction is required; this does not grant parsing authority.
+func completionJSONNameIs(name string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.EqualFold(name, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasSemanticCompletionFields(c completionContract) bool {

@@ -145,13 +145,22 @@ func parseCompletionContract(b []byte) (completionContract, error) {
 		return completionContract{}, fmt.Errorf("completion contract is empty")
 	}
 	var c completionContract
+	// Frozen semantic reads use one standard strict decode. The custom wire
+	// types and opaque audit values retain strictSemanticJSON's nested checks.
+	strictErr := decodeSemanticCompletionContract(b, &c)
+	if strictErr == nil && c.Profile == "semantic" {
+		if len(b) > 3*semanticProposalMaxBytes {
+			return completionContract{}, ErrSemanticCompletionAuthority
+		}
+		return c, nil
+	}
+	// Structural contracts retain encoding/json's historical read semantics.
+	c = completionContract{}
 	if err := json.Unmarshal(b, &c); err != nil {
 		return completionContract{}, fmt.Errorf("decode completion contract: %w", err)
 	}
 	if c.Profile == "semantic" {
-		if len(b) > 3*semanticProposalMaxBytes || strictSemanticJSON(b, &c) != nil {
-			return completionContract{}, ErrSemanticCompletionAuthority
-		}
+		return completionContract{}, ErrSemanticCompletionAuthority
 	}
 	return c, nil
 }
@@ -176,8 +185,18 @@ func buildRevisedContract(prior []byte, dec CompletionDecisionInput, frozenMs []
 	if err != nil {
 		return nil, err
 	}
-	c.Revision = newRev
+	if dec.Decision == "authorize_maintainer" {
+		if err := validateMaintainerDecision(c, dec); err != nil {
+			return nil, err
+		}
+	}
+	return buildRevisedContractFromValidated(c, dec, frozenMs, newRev)
+}
 
+// buildRevisedContractFromValidated constructs only; its caller validated the
+// decision against this same contract while holding the owner lock.
+func buildRevisedContractFromValidated(c completionContract, dec CompletionDecisionInput, frozenMs []Milestone, newRev int) ([]byte, error) {
+	c.Revision = newRev
 	switch dec.Decision {
 	case "partial":
 		keep := make(map[string]bool, len(dec.Keep))
@@ -207,9 +226,7 @@ func buildRevisedContract(prior []byte, dec CompletionDecisionInput, frozenMs []
 		sort.Slice(out, func(i, j int) bool { return out[i].MilestoneID < out[j].MilestoneID })
 		c.Scope = &scopeBlock{In: in, Out: out}
 	case "authorize_maintainer":
-		if err := authorizeMaintainers(&c, dec, newRev); err != nil {
-			return nil, err
-		}
+		authorizeMaintainers(&c, dec, newRev)
 	case "accept":
 		if c.Profile == "semantic" {
 			// Serialization carries semantic fields without manufacturing satisfaction.

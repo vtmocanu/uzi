@@ -1,10 +1,14 @@
 package workersvc
 
 import (
+	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -65,6 +69,100 @@ func TestSemanticCompletionOwnerAuthorizationReplayLiveDB(t *testing.T) {
 	dec.Maintainers[0].Conditions = []string{"different"}
 	if _, err := svc.DecideCompletion(e.ctx, e.userID, id, dec); !errors.Is(err, ErrCompletionRevisionConflict) {
 		t.Fatalf("changed replay: %v", err)
+	}
+}
+
+// TestSemanticCompletionSingleConnectionReplayLiveDB cancels only a nested
+// acquire while the transaction holds the pool's sole connection.
+func TestSemanticCompletionSingleConnectionReplayLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	id := e.seedFrozenRun(t, wid, []string{"m1"}, nil, false)
+	fixture := semanticCompletionTwoMaintainers(t)
+	e.exec(t, "UPDATE runs SET completion_contract=$2, milestones_frozen=$3 WHERE id=$1", id, fixture.CompletionContract, fixture.MilestonesFrozen)
+	e.parkCompletionBlocked(t, id)
+	c, err := parseCompletionContract(fixture.CompletionContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := CompletionDecisionInput{Decision: "authorize_maintainer", Maintainers: semanticMaintainers(c)[:1], Reason: "renew selected", ContractRevision: 1}
+	applied, err := e.permitService(t).DecideCompletion(e.ctx, e.userID, id, dec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := e.pool.Config()
+	cfg.MaxConns, cfg.MinConns = 1, 0
+	guard := &semanticReplayAcquireGuard{}
+	cfg.ConnConfig.Tracer = guard
+	pool, err := pgxpool.NewWithConfig(e.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	held, err := pool.Acquire(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Prove the guard cancels a second acquire from this same single-connection
+	// pool before relying on its zero count during replay.
+	extra, acquireErr := pool.Acquire(e.ctx)
+	if extra != nil {
+		extra.Release()
+	}
+	held.Release()
+	if !errors.Is(acquireErr, context.Canceled) || guard.nested.Load() != 1 {
+		t.Fatalf("guard control: acquire=%v nested=%d", acquireErr, guard.nested.Load())
+	}
+	guard.nested.Store(0)
+	single := e
+	single.pool, single.q = pool, store.New(pool)
+	replayed, err := single.permitService(t).DecideCompletion(e.ctx, e.userID, id, dec)
+	if err != nil {
+		t.Fatalf("replay: %v; nested acquires=%d", err, guard.nested.Load())
+	}
+	if guard.nested.Load() != 0 {
+		t.Fatal("replay borrowed another pool connection")
+	}
+	if replayed.ID != applied.ID || replayed.ContractRevision != applied.ContractRevision || replayed.Status != applied.Status {
+		t.Fatalf("replay row changed: %+v", replayed)
+	}
+	if n := e.countInputs(t, id, "completion_decision"); n != 1 {
+		t.Fatalf("replay wrote %d decisions", n)
+	}
+}
+
+type semanticReplayAcquireGuard struct{ nested atomic.Int32 }
+
+func (*semanticReplayAcquireGuard) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+func (*semanticReplayAcquireGuard) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+func (g *semanticReplayAcquireGuard) TraceAcquireStart(ctx context.Context, pool *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
+	if pool.Stat().AcquiredConns() > 0 {
+		g.nested.Add(1)
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		return cancelled
+	}
+	return ctx
+}
+func (*semanticReplayAcquireGuard) TraceAcquireEnd(context.Context, *pgxpool.Pool, pgxpool.TraceAcquireEndData) {
+}
+
+func TestSemanticCompletionPauseFailedParentTransactionLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	id := e.seedFrozenRun(t, wid, []string{"m1"}, nil, false)
+	fixture := semanticCompletionFixture(t, false)
+	e.exec(t, "UPDATE runs SET completion_contract=$2, milestones_frozen=$3, pause_requested_at=now(), pause_mode='now' WHERE id=$1", id, fixture.CompletionContract, fixture.MilestonesFrozen)
+	run, applied, _, err := e.permitService(t).SetStateReport(e.ctx, store.Worker{ID: wid, UserID: e.userID}, id, StateRequest{State: "pause_failed"})
+	if err != nil || !applied || run.Status != "running" || run.PauseRequestedAt.Valid {
+		t.Fatalf("parent transaction: status=%s applied=%v pause=%v err=%v", run.Status, applied, run.PauseRequestedAt.Valid, err)
+	}
+	persisted, err := e.q.GetRunByID(e.ctx, id)
+	if err != nil || persisted.PauseRequestedAt.Valid {
+		t.Fatalf("pause clear did not commit: %v", err)
 	}
 }
 

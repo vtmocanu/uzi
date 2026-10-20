@@ -5,7 +5,15 @@ import "github.com/vtmocanu/uzi/api/internal/apitypes"
 // Later decisions may renew exact existing classifications only. Changing their
 // conditions or kind requires the M3 human plan revision, not this decision.
 func validateMaintainerDecision(c completionContract, dec CompletionDecisionInput) error {
-	if validateSemanticCompletion(c) != nil || len(dec.Maintainers) == 0 || len(dec.Maintainers) > 256 ||
+	if validateSemanticCompletion(c) != nil {
+		return ErrCompletionDecisionInvalid
+	}
+	return validateMaintainerSelection(c, dec)
+}
+
+// validateMaintainerSelection checks the exact selection after contract validation.
+func validateMaintainerSelection(c completionContract, dec CompletionDecisionInput) error {
+	if len(dec.Maintainers) == 0 || len(dec.Maintainers) > 256 ||
 		len(dec.Keep) != 0 || len(dec.Criteria) != 0 {
 		return ErrCompletionDecisionInvalid
 	}
@@ -24,10 +32,7 @@ func validateMaintainerDecision(c completionContract, dec CompletionDecisionInpu
 	return nil
 }
 
-func authorizeMaintainers(c *completionContract, dec CompletionDecisionInput, revision int) error {
-	if err := validateMaintainerDecision(*c, dec); err != nil {
-		return err
-	}
+func authorizeMaintainers(c *completionContract, dec CompletionDecisionInput, revision int) {
 	selected := map[string]bool{}
 	for _, m := range dec.Maintainers {
 		selected[m.ID] = true
@@ -38,11 +43,10 @@ func authorizeMaintainers(c *completionContract, dec CompletionDecisionInput, re
 			c.MaintainerAuthorizations[i].DecisionReason = dec.Reason
 		}
 	}
-	return nil
 }
 
 func maintainerDecisionEncoded(c completionContract, dec CompletionDecisionInput, revision int) bool {
-	if validateMaintainerDecision(c, dec) != nil {
+	if c.Profile != "semantic" || validateMaintainerSelection(c, dec) != nil {
 		return false
 	}
 	want := map[string]bool{}
