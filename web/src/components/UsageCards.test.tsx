@@ -12,14 +12,14 @@ const bundle = (input: number, cache: number, output: number, cost: number) => (
   output_tokens: output, cost_usd: cost, cost_status: "metered" as const,
 });
 const outcomes = (overrides: Partial<RunOutcomes> = {}): RunOutcomes => ({
-  finished: 100, completed: 85, cancelled: 3, plan_rejected: 2, failed: 10,
+  finished: 100, completed: 85, cancelled: 3, plan_rejected: 2, base_diverged: 0, failed: 10,
   needs_landing: 4, fail_origins: { agent_failure: 6, run_timeout: 2, workflow_scope_missing: 2 },
   last_failed_at: "2026-10-07T06:00:00Z", last_failed_run_id: "self-failure",
   last_failed_origin: "agent_failure", last_failed_user_id: null,
   completed_since_last_failure: 14, ...overrides,
 });
 const emptyOutcomes = (): RunOutcomes => outcomes({
-  finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, failed: 0,
+  finished: 0, completed: 0, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0,
   needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null,
   last_failed_origin: null, completed_since_last_failure: null,
 });
@@ -30,7 +30,7 @@ function fixture(): { self: SelfUsage; admin: AdminUsage } {
     last7_subscription_run_count: 1, last7_unreported_run_count: 0,
     outcomes: {
       lifetime: outcomes(),
-      last_7_days: outcomes({ finished: 20, completed: 17, cancelled: 1, plan_rejected: 0,
+      last_7_days: outcomes({ finished: 20, completed: 17, cancelled: 1, plan_rejected: 0, base_diverged: 0,
         failed: 2, needs_landing: 1, fail_origins: { agent_failure: 1, run_timeout: 1 },
         last_failed_at: null, last_failed_run_id: null, last_failed_origin: null,
         completed_since_last_failure: null }),
@@ -41,7 +41,7 @@ function fixture(): { self: SelfUsage; admin: AdminUsage } {
       ...self, lifetime: bundle(2000, 4000, 1000, 2469.12),
       last_7_days: bundle(300, 600, 150, 37.02), run_count: 46,
       outcomes: {
-        lifetime: outcomes({ finished: 200, completed: 170, cancelled: 6, plan_rejected: 4,
+        lifetime: outcomes({ finished: 200, completed: 170, cancelled: 6, plan_rejected: 4, base_diverged: 0,
           failed: 20, needs_landing: 8, fail_origins: { agent_failure: 12, run_timeout: 4, workflow_scope_missing: 4 },
           last_failed_at: "2026-10-07T10:00:00Z", last_failed_run_id: "factory-failure", last_failed_user_id: "owner" }),
         last_7_days: { ...self.outcomes.last_7_days, finished: 40, completed: 34, cancelled: 2,
@@ -191,7 +191,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
   });
   it("computes a signed percentage-point difference from unrounded rates", () => {
     const { self } = fixture();
-    self.outcomes.lifetime = outcomes({ finished: 3, completed: 2, failed: 1, cancelled: 0, plan_rejected: 0, needs_landing: 0, fail_origins: { agent_failure: 1 } });
+    self.outcomes.lifetime = outcomes({ finished: 3, completed: 2, failed: 1, cancelled: 0, plan_rejected: 0, base_diverged: 0, needs_landing: 0, fail_origins: { agent_failure: 1 } });
     const view = mount({ self });
     expect(view.getByText("−23.3 pp vs all-time 33.3%")).toBeTruthy();
   });
@@ -212,7 +212,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
   });
   it("hides zero legend items and keeps the full failed bar unsplit (#1418)", () => {
     const view = mount(fixture()); const { you } = columns(view);
-    expect(you.queryByText(/^plan rejected/)).toBeNull();
+    expect(you.queryByText(/^rejected/)).toBeNull();
     const bar = you.getByRole("img");
     expect(bar.getAttribute("aria-label")).toBe("Finished runs: 17 completed, 1 cancelled, 2 failed");
     expect(bar.children).toHaveLength(3);
@@ -221,13 +221,13 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     // Paired with the positive replacement note and full failed bar assertions.
     expect(bar.getAttribute("aria-label")).not.toContain("need landing");
     fireEvent.click(view.getByRole("button", { name: "All time" }));
-    expect(you.getByText("plan rejected", { exact: false })).toBeTruthy();
+    expect(you.getByText("rejected", { exact: false })).toBeTruthy();
     expect(bar.children).toHaveLength(4);
     expect(you.getByText("4 failed runs with recoverable work. May include work already landed.")).toBeTruthy();
   });
   it("hides recoverability at zero and causes when no failures exist", () => {
     const { self } = fixture();
-    self.outcomes.last_7_days = outcomes({ finished: 20, completed: 20, cancelled: 0, plan_rejected: 0, failed: 0, needs_landing: 0, fail_origins: {} });
+    self.outcomes.last_7_days = outcomes({ finished: 20, completed: 20, cancelled: 0, plan_rejected: 0, base_diverged: 0, failed: 0, needs_landing: 0, fail_origins: {} });
     const view = mount({ self });
     expect(view.queryByText(/failed runs with recoverable work/)).toBeNull();
     expect(view.queryByText(/Top causes:/)).toBeNull(); expect(view.getByText("0.0%")).toBeTruthy();
@@ -388,11 +388,23 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(view.getByText("No finished runs yet")).toBeTruthy();
     cleanup();
     self.outcomes.lifetime = outcomes({ finished: 4, completed: 4, failed: 0, cancelled: 0,
-      plan_rejected: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null });
+      plan_rejected: 0, base_diverged: 0, needs_landing: 0, fail_origins: {}, last_failed_at: null, last_failed_run_id: null });
     expect(mount({ self }).getByText("No recorded failures · 4 completed runs, none failed")).toBeTruthy();
     cleanup();
     self.outcomes.lifetime.last_failed_at = "invalid";
     expect(mount({ self }).getByText("Latest failure: unavailable")).toBeTruthy();
   });
 
+});
+
+it.each([undefined, 3])("sums rejected outcomes with base_diverged=%s", (baseDiverged) => {
+  const { self } = fixture();
+  self.outcomes.last_7_days = outcomes({ finished: 20, completed: baseDiverged === undefined ? 8 : 5, cancelled: 0, plan_rejected: 2, base_diverged: baseDiverged });
+  if (baseDiverged === undefined) delete self.outcomes.last_7_days.base_diverged;
+  const view = mount({ self });
+  const bar = within(view.getByRole("region", { name: "Your usage" })).getByRole("img");
+  expect(bar.getAttribute("aria-label")).toBe(baseDiverged === undefined
+    ? "Finished runs: 8 completed, 2 rejected, 10 failed"
+    : "Finished runs: 5 completed, 5 rejected, 10 failed");
+  expect((bar.children[1] as HTMLElement).style.width).toBe(baseDiverged === undefined ? "10%" : "25%");
 });

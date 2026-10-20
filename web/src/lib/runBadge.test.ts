@@ -14,6 +14,7 @@ import {
   isPlanningRun,
   isRevisingRun,
   isStoppedRun,
+  isRejectedRun,
   milestoneBadge,
   milestoneBadgeText,
   mrChipState,
@@ -1355,5 +1356,24 @@ describe("runBadge — board card held on a disabled credential (PRD #1732)", ()
 it("usage-limit provider regression #2360: board projection stays neutral", () => {
   expect(runBadge(run({ status: "limit_wait" }), NOW)).toMatchObject({
     kind: "badge", title: "Paused on a usage limit. It resumes on its own when the window reopens.",
+  });
+});
+
+
+describe("base divergence rejection", () => {
+  it("requires failed status and the typed origin", () => {
+    expect(isRejectedRun("failed", "base_diverged")).toBe(true);
+    for (const status of ["running", "cancelled", "completed", "awaiting_approval"]) {
+      expect(isRejectedRun(status, "base_diverged")).toBe(false);
+    }
+    for (const origin of [null, undefined, "agent_failure", "plan_rejected"]) {
+      expect(isRejectedRun("failed", origin)).toBe(false);
+    }
+  });
+  it("uses neutral tone while ordinary failure remains danger", () => {
+    expect(runStatusTone("failed", null, "base_diverged")).toBe("neutral");
+    expect(runStatusTone("failed", null, "agent_failure")).toBe("danger");
+    expect(runBadge(run({ status: "failed", fail_origin: "base_diverged" }), 0)).toMatchObject({ label: "rejected", tone: "neutral" });
+    expect(runBadge(run({ status: "failed", fail_origin: "base_diverged", stop_kind: "plan_rejected" }), 0)).toMatchObject({ label: "stopped", tone: "neutral" });
   });
 });

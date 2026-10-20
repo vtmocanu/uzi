@@ -1527,3 +1527,18 @@ describe("IssueView run history — summary projection (#2661)", () => {
     );
   });
 });
+
+describe("IssueView history rejection presentation", () => {
+  it.each([
+    ["base_diverged", null, "rejected", "neutral"],
+    ["base_diverged", "plan_rejected", "stopped", "neutral"],
+    ["agent_failure", null, "failed", "danger"],
+  ] as const)("renders %s / %s as %s", async (fail_origin, stop_kind, label, tone) => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+    mockApi.listRuns.mockResolvedValue({ runs: [aRunItem({ status: "failed", fail_origin, stop_kind, landing_state: "needs_landing" })] });
+    renderIssueView();
+    const badge = await screen.findByText(label);
+    expect(badge.classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
+  });
+});
