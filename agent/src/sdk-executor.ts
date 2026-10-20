@@ -757,8 +757,8 @@ interface RunDrive {
    *  the transient and signal-death resume), recorded on every exit including a trip, so an
    *  in-place restart of an aborted turn can continue it. */
   lastTurnSessionId?: string;
-  /** Issue #3174: sessions that showed model evidence for the current logical implement turn,
-   *  across its attempts. The implement loop replaces it before each turn. */
+  /** Issue #3174: sessions that showed model evidence, across the attempts of one logical turn.
+   *  Plan-phase turns add to it too; the implement loop replaces it before each implement turn. */
   turnEvidencedSessions: Set<string>;
 }
 
@@ -3196,9 +3196,9 @@ export class SdkExecutor implements Executor {
         // Issue #2083: the memo rides the FIRST implement prompt only when this conversation has
         // not seen it: no session resumed (a resumed session already saw it in its plan prompt,
         // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
-        // carried it. The "injected" line is emitted only when the block is placed.
+        // carried it. The "injected" line is emitted only when the block is placed. Exception (issue
+        // #3174): an in-place replay of a turn no model processed re-sends it, status posted once.
         const firstImplementTurn = (iteration === 1 && !hasParked) || replay;
-        const turnCarriedFirst = firstImplementTurn;
         const firstOrdinaryOwner = (!interruptedOwnerDispatched || replay) && followUp === undefined && !reworkForTurn;
         const priorDecisionsMemo =
           firstImplementTurn &&
@@ -3232,10 +3232,11 @@ export class SdkExecutor implements Executor {
           historyRides = priorOwnerFollowUps !== undefined && priorOwnerFollowUps.length > 0;
         }
         // The history latch is spent only when the turn completes (below, with resumeId) AND the
-        // model processed it: an aborted turn's in-place restart (credential switch, pause-now, wall
-        // refusal) does not advance resumeId, so it begins a fresh session and must carry the history
-        // again, and a success terminal with no model-processing evidence never saw it. Live-id sets
-        // only grow (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
+        // model processed it, and a success terminal with no model-processing evidence never saw it.
+        // An aborted turn's in-place restart (credential switch, pause-now, wall refusal) continues the
+        // aborted session (prepareInPlaceRestart): the latch is spent there when that session processed
+        // the history, and the history is re-sent only when it did not. Live-id sets only grow
+        // (isLiveFollowUpId), so history can first ride only turn 1, which has no session.
         let historyProcessed = false;
         const onFirstEvent = () => {
           ownerFirstEvent?.();
@@ -3395,11 +3396,11 @@ export class SdkExecutor implements Executor {
         const prepareInPlaceRestart = (): void => {
           if (turnResume === undefined) resumeId = state.lastTurnSessionId;
           const processed = resumeId !== undefined && state.turnEvidencedSessions.has(resumeId);
-          if (turnResume === undefined || turnCarriedFirst) {
+          if (turnResume === undefined || firstImplementTurn) {
             if (processed) {
               if (historyRides && historyProcessed) priorOwnerHistoryPlaced = true;
             } else {
-              if (turnCarriedFirst) replayFirstTurn = true;
+              if (firstImplementTurn) replayFirstTurn = true;
               // An earlier attempt of this turn receipted and cleared the batch: it rides the replay.
               if (ownerBatch === undefined && ownerRides !== undefined) ownerBatch = ownerRides;
             }
@@ -4618,7 +4619,8 @@ export class SdkExecutor implements Executor {
     beforeDispatch?: (prompt: string) => string,
   ): Promise<TurnResult> {
     this.throwIfTerminal(ctx);
-    // Issue #3174: recorded before any trip check so a pre-dispatch trip still names the session.
+    // Issue #3174: recorded on entry so a pre-dispatch trip, which skips the finally below, leaves
+    // this attempt's requested session rather than an earlier attempt's.
     state.lastTurnSessionId = resumeId;
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);

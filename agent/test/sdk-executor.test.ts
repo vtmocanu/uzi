@@ -8156,4 +8156,21 @@ describe("issue #3174 in-place restart session continuity", () => {
     assert.equal(count(turns[1]!.promptText, "STEER-NEW"), 1);
     assert.equal(count(turns[1]!.promptText, "STEER-OLD"), 0);
   });
+  it("the interrupted notes ride a no-evidence replay, re-reading the calls getter", async () => {
+    const snapshot = { base: "interrupted", interruptedEdits: false, commits: 0 } as const;
+    let gets = 0;
+    const { queryFn, turns } = fakeTurns([
+      abort("pause"),
+      [assistantText("working", "S"), resultSuccess("S")],
+      [signalDone("S"), resultSuccess("S")],
+    ]);
+    const { probe } = seeded("pause", { interruptedSnapshot: snapshot, getInterruptedCalls: () => { gets++; return m3Calls(); } });
+    await run(queryFn, probe.ctx);
+    assert.equal(turns.length, 3);
+    assert.equal(gets, 2, "the getter is read again for the replay");
+    for (const [i, expected] of [[0, 1], [1, 1], [2, 0]] as const) {
+      assert.equal(count(turns[i]!.promptText, "temporary mutations"), expected, `snapshot note on turn ${i}`);
+      assert.equal(count(turns[i]!.promptText, "printf interrupted-observation"), expected, `calls note on turn ${i}`);
+    }
+  });
 });
