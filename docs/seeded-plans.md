@@ -62,8 +62,9 @@ budget pause and `uzi run extend`, or on another worker), it may only pick up
 content that one of its own checkpoints recorded after the check had passed.
 If it cannot prove that, the agent never starts and the run is held
 (`base_attestation_missing`) with its work kept, for you to recover, export or
-start a successor. Without `--require-base` nothing changes: a mismatch only
-warns.
+start a successor: `uzi run recovery <id>` shows the kept work and `uzi run
+export <id> --output <path>` downloads it. Resume and extend are refused for
+this hold. Without `--require-base` nothing changes: a mismatch only warns.
 
 `--planned-commit` must be a hex commit SHA, 7-64 characters — a shorter or
 non-hex value is a usage error (exit 2). The safe answer is always the full

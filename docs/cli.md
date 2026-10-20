@@ -2939,6 +2939,16 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run created with `--require-base` can also be **held because
+  its kept work is not attested** (`hold_reason: base_attestation_missing`):
+  it continued its own work, but no checkpoint proves that work was produced
+  on the planned commit, so the agent never started. The work stays on the
+  worker, and nothing resumes or extends it (`run resume`, `run extend`,
+  `run set-token` and Stop are refused). `run get` prints a `HOLD` row
+  reading `base not attested` with the next step: inspect custody with
+  `uzi run recovery <id>`, recover the work with `uzi run export <id>
+  --output <path>`, or start a successor run. See [Seeded
+  plans](seeded-plans.md).
 
 For an ordinary pause, human `run get` makes one supplemental message read
 (`tail=100`). Its pause detail reads **paused by the run's lead** for
@@ -3097,7 +3107,8 @@ built-in primitive for driving a gated run headless, replacing the hand-rolled
 `awaiting_followup`, `completed`, `failed`, `cancelled`) and waits through the
 rest (`queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/`recovery_wait`/`paused`),
 except a default wait also stops at `recovery_wait` with cause
-`worker_requeue_exhausted` for an owner decision:
+`worker_requeue_exhausted`, and at a `paused` run held on
+`base_attestation_missing`, for an owner decision:
 timed limit and recovery waits retry on a timer, pool waits need an available pooled token,
 and ordinary owner or lead pauses need `uzi run resume`. A bare `run wait` means
 "wait for the plan gate, a clarification, an interactive task's park,
