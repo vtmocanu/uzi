@@ -3380,6 +3380,9 @@ export class CodexExecutor implements Executor {
         // resume (never a system-text turn), deduped by id against this turn's live batch and the
         // claim's live ids. The latch is spent only on the turn's first model event, so a turn that
         // aborts before any event composes the history again. No inclusion receipt for a history id.
+        // The `systemFollowUp === undefined` term is defensive: every system-text turn follows an
+        // evidenced turn that already spent the latch, and a system-text body replaces basePrompt,
+        // so today it never changes the outcome; it keeps history off such a turn if that changes.
         let historyBodies: string[] = [];
         if (systemFollowUp === undefined && ctx.reviewedPlanResume === true && !ctx.sessionId && !priorOwnerHistoryPlaced) {
           const liveIds = new Set((ownerRides ?? []).map((f) => f.id));
@@ -4977,8 +4980,9 @@ export class CodexExecutor implements Executor {
 
   /** `gatedPlan` is the plan this run's in-process gate approved (#1586). When present it is
    *  the implementation instruction, framed as approved, and the queue-time issue text is left
-   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the raw persisted
-   *  ctx.approvedPlan, unframed) or the issue fallback. Every body is then followed by the shared
+   *  out so it cannot compete. Absent ⇒ the pre-approved resume (the persisted
+   *  ctx.approvedPlan, framed with REVIEWED_RESUME_APPROVAL_GUIDANCE on a reviewed-plan resume
+   *  (#3149), unframed otherwise) or the issue fallback. Every body is then followed by the shared
    *  PR_SUMMARY_GUIDANCE paragraph (PRD #1798 M2), preceded by the published-floor note when
    *  there is one and followed by the milestone tracker note when there is one.
    *

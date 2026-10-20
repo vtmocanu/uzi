@@ -7419,7 +7419,10 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "checked approval on a reviewed resume");
     const implement = turnTexts(rig, 1).join("\n");
     assert.match(implement, /Your plan was cross-checked and the server contract above was approved/);
-    assert.ok(!implement.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE), "no reviewed-resume approval framing on the checked branch");
+    // turnTexts serializes params as JSON, so compare the JSON-escaped form of the multi-line constant.
+    const escapedGuidance = JSON.stringify(REVIEWED_RESUME_APPROVAL_GUIDANCE).slice(1, -1);
+    assert.ok(escapedGuidance.includes("\\n"), "the escaped form is the multi-line serialization");
+    assert.ok(!implement.includes(escapedGuidance), "no reviewed-resume approval framing on the checked branch");
     assert.doesNotMatch(implement, /persisted reviewed plan/, "the persisted plan does not compete with the checked contract");
   });
 
@@ -16285,7 +16288,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       assert.ok(later.every((t) => !t.includes(H1)), "no later turn re-renders history");
     });
 
-    it("a first turn dropped before any model event re-carries history on the retry, once", async () => {
+    it("history appears exactly once across the in-turn re-drive of an aborted first turn", async () => {
       const controller = new AbortController();
       const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
       const { ctx } = makeCtx(resumeOverrides({
@@ -16318,6 +16321,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
         const { ctx } = makeCtx(resumeOverrides({ ...extra, priorOwnerFollowUps: [{ id: 5, body: H1 }] }));
         await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#3149 ineligible run");
         const texts = turnTexts(rig.epochs[0]!.transport);
+        assert.ok(texts.length >= 1, "at least one turn text was captured");
         assert.ok(texts.every((t) => !t.includes(H1)));
       }
     });
