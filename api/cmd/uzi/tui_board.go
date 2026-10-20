@@ -228,6 +228,16 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	return word
 }
 
+// doneRunFailed follows the displayed token, preserving human-stop precedence and
+// counting needs landing alongside plain failure. Shared by row ink and eyebrow counts.
+func doneRunFailed(r apitypes.RunListItemDTO) bool {
+	if runBandOf(r) != bandDone {
+		return false
+	}
+	word := runStateWord(r)
+	return word == "failed" || word == "needs landing"
+}
+
 // bandOrder concatenates NEEDS YOU → ON THE FLOOR → DONE. Active bands keep the
 // server's order; DONE uses the web archive's newest-finish-first order (#2098),
 // preserving server order when both the finish instant and status rank tie.
@@ -672,6 +682,7 @@ type boardItem struct {
 	kind   int
 	band   int // biEyebrow: which band
 	count  int // biEyebrow: how many runs in it
+	failed int // biEyebrow: displayed failures within the same filtered band
 	runIdx int // biRow: index into visible()
 }
 
@@ -686,9 +697,13 @@ const (
 // (no styling), so both the renderer and the key handler's syncedScroll can call it and agree
 // on line positions.
 func (m tuiModel) buildBoardItems(rows []apitypes.RunListItemDTO) []boardItem {
-	var counts [numBands]int
+	var counts, failures [numBands]int
 	for _, r := range rows {
-		counts[runBandOf(r)]++
+		band := runBandOf(r)
+		counts[band]++
+		if doneRunFailed(r) {
+			failures[band]++
+		}
 	}
 	items := make([]boardItem, 0, len(rows)+numBands*2)
 	prevBand := -1
@@ -697,7 +712,7 @@ func (m tuiModel) buildBoardItems(rows []apitypes.RunListItemDTO) []boardItem {
 			if prevBand != -1 {
 				items = append(items, boardItem{kind: biSpacer})
 			}
-			items = append(items, boardItem{kind: biEyebrow, band: b, count: counts[b]})
+			items = append(items, boardItem{kind: biEyebrow, band: b, count: counts[b], failed: failures[b]})
 			prevBand = b
 		}
 		items = append(items, boardItem{kind: biRow, runIdx: i})
@@ -736,13 +751,17 @@ func windowRunSpan(items []boardItem, start, end int) (lo, hi int) {
 }
 
 // boardEyebrow is a faint CAPS band label + count; NEEDS YOU is amber, because it is the one
-// band a human must act on.
+// active band a human must act on. DONE adds a red failure count when nonzero.
 func (m tuiModel) boardEyebrow(it boardItem) string {
 	name := bandNames[it.band]
 	if it.band == bandNeedsYou {
 		return " " + lipgloss.NewStyle().Foreground(m.pal.amber).Bold(true).Render(name) + m.pal.faint.Render(" · "+itoa(it.count))
 	}
-	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+	label := " " + m.pal.faint.Render(name+" · "+itoa(it.count))
+	if it.band == bandDone && it.failed > 0 {
+		label += m.pal.faint.Render(" · ") + paintSeg(m.pal.alarm, nil, false, itoa(it.failed)+" failed")
+	}
+	return label
 }
 
 // boardFooter preserves the unabridged legend for version-readout selection.

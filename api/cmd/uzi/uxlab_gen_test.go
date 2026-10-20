@@ -101,6 +101,8 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-done-failures":               func(d bool) string { return boardDoneFailures(d, false) },
+		"board-done-failures-selected":      func(d bool) string { return boardDoneFailures(d, true) },
 		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
@@ -1648,6 +1650,17 @@ func detailPauseOrigin(dark bool, now time.Time, origin string, width int, plain
 		writer := colorprofile.NewWriter(&output, []string{"NO_COLOR=1"})
 		_, _ = writer.Write([]byte(m.View().Content))
 		return output.String()
+	}
+	return m.View().Content
+}
+
+// boardDoneFailures shows both failure outcomes beside human stops and successful work.
+func boardDoneFailures(dark, selected bool) string {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	rows := append([]apitypes.RunListItemDTO{{RunDTO: apitypes.RunDTO{ID: "active01", Status: "running", IssueTitle: "Active implementation"}}}, doneFailureRows()...)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: rows})
+	if selected {
+		m.board.cursor = 1
 	}
 	return m.View().Content
 }

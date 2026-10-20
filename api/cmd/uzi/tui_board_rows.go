@@ -215,8 +215,8 @@ func (m tuiModel) boardEmptyState() string {
 // boardRow renders one run: the per-row ▌ andon strip and state glyph (state colour), the id,
 // the owner on the admin board, the status WORD (state colour, not a filled chip), AGE, the
 // milestone micro-bar, and the title, with an own-board-only judge marker flushed right. A
-// selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
-// faint end to end.
+// selected row rides the full-width warm selection bar with a ▸ cursor. DONE rows keep
+// faint titles; failures retain dimmed alarm state tokens and full alarm issue links.
 func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols, cols boardAccountCols) string {
 	unfocused := sel && m.splitDrawn() && m.view != viewBoard
 	if unfocused {
@@ -232,12 +232,16 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		bg = m.pal.selBg
 	}
 
-	// A DONE row drops to faint even for a failed run — the ✗ glyph plus faint says "finished,
-	// and it failed" without lighting an alarm the board can no longer act on (the detail
-	// header keeps the red). The judge marker keeps its own severity colour regardless.
+	// Finished failures, including needs landing, retain a quiet alarm on the state token.
+	// Human stops stay faint, as do other terminal outcomes. The judge marker keeps its
+	// own severity colour regardless.
+	failedDone := doneRunFailed(r)
 	stateC := tok.color
 	if terminal {
 		stateC = m.pal.faintC
+		if failedDone {
+			stateC = m.pal.doneAlarm
+		}
 	}
 	// Title colour by band: NEEDS YOU rows are amber (the one lit thing), the floor is default
 	// ink, DONE is faint.
@@ -324,7 +328,11 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	// boardRowPrefixWidth's fixed column set.
 	titlePrefix := ""
 	if r.IssueIID != nil {
-		styledIID := paintSeg(idC, bg, sel, "#"+itoa(int(*r.IssueIID)))
+		issueC := idC
+		if failedDone {
+			issueC = m.pal.alarm // also on the selected row; run ids keep their selection ink
+		}
+		styledIID := paintSeg(issueC, bg, sel, "#"+itoa(int(*r.IssueIID)))
 		titlePrefix = m.issueLink(r.RunDTO, styledIID) + paintSeg(nil, bg, false, " ")
 		avail -= visualWidth(titlePrefix)
 		avail = max(0, avail)
@@ -515,7 +523,7 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	// The in-progress cells (EVERY frozen id in progress, #1176) take the cells right after the
 	// done fill and blink ▰/▱ in the tungsten colour (via milestoneCell). The count is clamped to
 	// the remaining cells (defensive; the frozen-list helper already bounds it). Not on a DONE
-	// (terminal) row — its in-progress snapshot is stale and the row is faint end to end.
+	// (terminal) row: its in-progress snapshot is stale, so progress stays faint.
 	n := len(milestoneInProgressIDs(r.RunDTO))
 	if rem := total - done; n > rem {
 		n = rem
