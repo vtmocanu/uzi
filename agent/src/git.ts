@@ -10098,14 +10098,7 @@ export class GitCache {
     if (holding && opts.discard && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(holding, { recursive: true, force: true }).catch((e) => {
-        retainedUndeletable++;
-        this.log.warn("retireRunnerClone: holding dispose failed", {
-          path: holding,
-          error: gitErrorMessage(e),
-          retainedUndeletable,
-        });
-      });
+      await this.removeBestEffort(holding, "retire-holding-dispose");
     }
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
@@ -10125,25 +10118,37 @@ export class GitCache {
    *      populated it since the listing);
    *    - anything else (non-empty, symlink, non-directory, unreadable, rmdir failure) is retained.
    *      Entries inside a parent are only counted, never stat'ed or followed.
-   *  Retained parents are reported by ONE counted warning `runner retire scratch retained`
-   *  (bounded path list). Never recursive; never throws. */
+   *  Retained parents, parents skipped as recent, and an enumeration cut short by
+   *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
+   *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
   async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ removed: number; retained: number }> {
     const root = path.resolve(this.runnerRoot);
     const retained: string[] = [];
     let removed = 0;
+    let skippedRecent = 0;
+    let incomplete = false;
     try {
       const rst = await fs.lstat(root);
       if (rst.isSymbolicLink() || !rst.isDirectory()) return { removed, retained: 0 };
       const names: string[] = [];
-      for await (const entry of await fs.opendir(root)) {
-        if (entry.name.startsWith(".retire-")) names.push(entry.name);
-        if (names.length >= RETIRE_SCRATCH_ENUMERATION_BUDGET) break;
+      // The budget is charged on EVERY entry read (the runner can fill the persistent root with
+      // arbitrary names), and the directory handle is iterated, never slurped.
+      let entriesRead = 0;
+      const dir = await fs.opendir(root);
+      try {
+        for await (const entry of dir) {
+          if (entriesRead >= RETIRE_SCRATCH_ENUMERATION_BUDGET) { incomplete = true; break; }
+          entriesRead++;
+          if (entry.name.startsWith(".retire-")) names.push(entry.name);
+        }
+      } finally {
+        await dir.close().catch(() => undefined);
       }
       for (const name of names.sort()) {
         const p = path.join(root, name);
         try {
           const st = await fs.lstat(p);
-          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) continue;
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
           if (st.isSymbolicLink() || !st.isDirectory()) { retained.push(p); continue; }
           let empty = true;
           for await (const _entry of await fs.opendir(p)) { empty = false; break; }
@@ -10161,9 +10166,11 @@ export class GitCache {
       }
       return { removed, retained: retained.length };
     }
-    if (retained.length > 0) {
+    if (retained.length > 0 || skippedRecent > 0 || incomplete) {
       this.log.warn("runner retire scratch retained", {
         count: retained.length,
+        skippedRecent,
+        incomplete,
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(p, 157)),
         removedEmpty: removed,
       });

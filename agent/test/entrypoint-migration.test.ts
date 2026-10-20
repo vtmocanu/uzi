@@ -1454,13 +1454,13 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
     } finally { cleanup(l); }
   });
 
-  it("re-asserts the carve-out root every boot: reclaim, chmod 0755, hand-over to worker:worker (no recursion)", () => {
+  it("re-asserts the carve-out root every boot: reclaim, chmod 00755, hand-over to worker:worker (no recursion)", () => {
     const l = lane();
     try {
       const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.carve });
       assert.equal(r.status, 0, r.stderr);
       const reclaim = r.ops.indexOf(`chown -h 0:0 ${l.carve}`);
-      const chmod = r.ops.indexOf(`chmod 0755 ${l.carve}`);
+      const chmod = r.ops.indexOf(`chmod 00755 ${l.carve}`);
       const handover = r.ops.indexOf(`chown -h worker:worker ${l.carve}`);
       assert.ok(reclaim >= 0 && chmod > reclaim && handover > chmod, `ops: ${r.ops.join(" | ")}`);
     } finally { cleanup(l); }
@@ -1597,12 +1597,48 @@ describe("issue #3153: Docker-lane per-uid scratch adopt-or-refuse (portable, re
     } finally { cleanup(l); }
   });
 
+  it("refuses a non-canonical TMPDIR spelling and deletes/re-owns/re-modes nothing", () => {
+    const l = lane((x) => { leaf(path.join(x.carve, "uzi-worker")); });
+    try {
+      const rr = l.runnerRoot;
+      const variants = [
+        rr.replace("/runner", "//runner") + "/.tmp",
+        `${rr}//.tmp`,
+        `${rr}/./.tmp`,
+        `${rr}/x/../.tmp`,
+        `${rr}/.tmp/.`,
+        `${rr}/.tmp/..`,
+      ];
+      for (const tmp of variants) {
+        const r = run(l.h, { STUB_NOOP: "1", TMPDIR: tmp });
+        assert.notEqual(r.status, 0, `must refuse ${tmp}`);
+        assert.match(r.stderr, /uzi-entrypoint: refusing to start: TMPDIR .* is not a canonical path/);
+        // Earlier, unrelated boot steps still record ops on the data roots themselves; nothing may
+        // rm anything or touch an entry BELOW the runner root.
+        const bad = r.ops.filter((o) => o.startsWith("rm ") || o.includes(`${rr}/`));
+        assert.deepEqual(bad, [], `no scratch ops for ${tmp}: ${bad.join(" | ")}`);
+      }
+      assert.ok(fs.existsSync(path.join(l.carve, "uzi-worker", "PRECIOUS")));
+    } finally { cleanup(l); }
+  });
+
+  it("refuses a carve-out name other than .tmp (the legacy-loop skip hard-codes it) with no writes", () => {
+    const l = lane((x) => { fs.mkdirSync(path.join(x.runnerRoot, "scratch")); });
+    try {
+      const r = run(l.h, { STUB_NOOP: "1", TMPDIR: path.join(l.runnerRoot, "scratch") });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /uzi-entrypoint: refusing to start: TMPDIR carve-out .* must be .*\/\.tmp/);
+      const bad = r.ops.filter((o) => o.startsWith("rm ") || o.includes(`${l.runnerRoot}/`));
+      assert.deepEqual(bad, [], bad.join(" | "));
+    } finally { cleanup(l); }
+  });
+
   it("reverse skew: TMPDIR == /data/runner keeps the old root handling (no carve-out ops) and still never wipes leaves", () => {
     const l = lane((x) => { leaf(path.join(x.runnerRoot, "uzi-worker")); });
     try {
       const r = run(l.h, { STUB_NOOP: "1", TMPDIR: l.runnerRoot });
       assert.equal(r.status, 0, r.stderr);
-      assert.ok(!r.ops.some((o) => o.startsWith("chmod 0755")), "no carve-out re-assertion of the runner root");
+      assert.ok(!r.ops.some((o) => o.startsWith("chmod 00755")), "no carve-out re-assertion of the runner root");
       assert.ok(!r.ops.includes(`chown -h 0:0 ${l.runnerRoot}`), "the runner root itself is not reclaimed");
       assert.equal(r.ops.filter((o) => o.startsWith("rm ")).length, 0);
       assert.ok(r.stderr.includes(`${path.join(l.runnerRoot, "uzi-worker")} entries=2`), r.stderr);

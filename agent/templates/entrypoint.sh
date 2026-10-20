@@ -344,6 +344,41 @@ require_real_carveout_root "$DATA_DIR/jobs"
 #     uzi-review-/uzi-summary- mkdtemps, tombstones) is non-dot, so the run-HOME map above only
 #     ever needs the non-dot glob.
 #   * "$DATA_DIR"/provision (shared provisioning state, written by the runner): re-owned to runner.
+# Refusals below run BEFORE the one-time legacy migration so they delete/re-own nothing.
+TMPDIR_NORM="${TMPDIR:-}"
+while [ "${TMPDIR_NORM%/}" != "$TMPDIR_NORM" ] && [ -n "${TMPDIR_NORM%/}" ]; do
+  TMPDIR_NORM="${TMPDIR_NORM%/}"
+done
+RUNNER_ROOT="$DATA_DIR/runner"
+# Lane detection below is lexical, so a non-canonical spelling of a path under the runner root
+# (a doubled slash, a dot or dot-dot component) would miss it and fall into the non-Docker
+# branch, which recursively wipes per-uid scratch on the persistent volume. Fail closed instead.
+case "$TMPDIR_NORM" in
+  *//*|*/./*|*/../*|*/.|*/..)
+    echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM is not a canonical path (no //, ./ or ../ components)" >&2
+    exit 1 ;;
+esac
+SCRATCH_DOCKER_LANE=
+SCRATCH_CARVEOUT=
+case "$TMPDIR_NORM" in
+  "$RUNNER_ROOT") SCRATCH_DOCKER_LANE=1 ;;
+  "$RUNNER_ROOT"/*) SCRATCH_DOCKER_LANE=1; SCRATCH_CARVEOUT="$TMPDIR_NORM" ;;
+esac
+if [ -n "$SCRATCH_CARVEOUT" ]; then
+  SCRATCH_CARVEOUT_NAME="${SCRATCH_CARVEOUT#"$RUNNER_ROOT"/}"
+  case "$SCRATCH_CARVEOUT_NAME" in
+    ''|.|..|*/*)
+      echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM must be a direct child of $RUNNER_ROOT" >&2
+      exit 1 ;;
+    .tmp) ;;
+    *)
+      # The legacy-migration loop below skips exactly $DATA_DIR/runner/.tmp, so any other
+      # carve-out name would be re-owned to runner:runner there. Keep the two in lockstep.
+      echo "uzi-entrypoint: refusing to start: TMPDIR carve-out $TMPDIR_NORM must be $RUNNER_ROOT/.tmp" >&2
+      exit 1 ;;
+  esac
+fi
+
 LEGACY_SENTINEL="$DATA_DIR/.uzi-legacy-split-migrated"
 if [ ! -f "$LEGACY_SENTINEL" ]; then
   echo "uzi-entrypoint: one-time ownership-aware migration of legacy $DATA_DIR [PRD #1493 M2]" >&2
@@ -516,17 +551,6 @@ fi
 # Either way BOTH private per-uid tmpdirs live BENEATH TMPDIR (still one per uid, still 0700,
 # worker-/runner-owned) so bind sources stay inside the shared workdir. With TMPDIR unset
 # (compose, and plain-lane k8s), /tmp/uzi-worker + /tmp/uzi-runner are kept EXACTLY as before.
-TMPDIR_NORM="${TMPDIR:-}"
-while [ "${TMPDIR_NORM%/}" != "$TMPDIR_NORM" ] && [ -n "${TMPDIR_NORM%/}" ]; do
-  TMPDIR_NORM="${TMPDIR_NORM%/}"
-done
-RUNNER_ROOT="$DATA_DIR/runner"
-SCRATCH_DOCKER_LANE=
-SCRATCH_CARVEOUT=
-case "$TMPDIR_NORM" in
-  "$RUNNER_ROOT") SCRATCH_DOCKER_LANE=1 ;;
-  "$RUNNER_ROOT"/*) SCRATCH_DOCKER_LANE=1; SCRATCH_CARVEOUT="$TMPDIR_NORM" ;;
-esac
 if [ -n "$TMPDIR_NORM" ]; then
   WORKER_TMPDIR="$TMPDIR_NORM/uzi-worker"
   RUNNER_TMPDIR="$TMPDIR_NORM/uzi-runner"
@@ -552,12 +576,6 @@ require_real_carveout_dir() {
 if [ -n "$SCRATCH_CARVEOUT" ]; then
   # Exactly ONE level below the runner root, so the only parent ever traversed is the
   # runner root itself (already a real, sticky directory). No `mkdir -p` anywhere.
-  SCRATCH_CARVEOUT_NAME="${SCRATCH_CARVEOUT#"$RUNNER_ROOT"/}"
-  case "$SCRATCH_CARVEOUT_NAME" in
-    ''|.|..|*/*)
-      echo "uzi-entrypoint: refusing to start: TMPDIR $TMPDIR_NORM must be a direct child of $RUNNER_ROOT" >&2
-      exit 1 ;;
-  esac
   require_real_carveout_root "$RUNNER_ROOT"
   require_real_carveout_dir "$SCRATCH_CARVEOUT"
   [ -e "$SCRATCH_CARVEOUT" ] || "$MKDIR" "$SCRATCH_CARVEOUT"
@@ -570,7 +588,7 @@ if [ -n "$SCRATCH_CARVEOUT" ]; then
   # the root window has no CAP_FOWNER, so a chmod of a dir a prior boot handed to `worker`
   # would EPERM otherwise. `-h` keeps every chown from dereferencing.
   "$CHOWN" -h 0:0 "$SCRATCH_CARVEOUT"
-  "$CHMOD" 0755 "$SCRATCH_CARVEOUT"
+  "$CHMOD" 00755 "$SCRATCH_CARVEOUT"
   "$CHOWN" -h "$WORKER_OWNER" "$SCRATCH_CARVEOUT"
 fi
 

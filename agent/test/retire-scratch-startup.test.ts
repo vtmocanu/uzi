@@ -1,13 +1,14 @@
 // Issue #3153: the startup inspector for `<runnerRoot>/.retire-*` scratch parents and the counted
 // best-effort removal diagnostics. `<dataDir>/runner` persists across pod replacements on the
 // Docker lane, so a parent left by a crashed process is inspected once, never recursively wiped.
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { GitCache, retainedUndeletableCount } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { noProofReseed, recordingLogger, testGitCacheOptions } from "./helpers.js";
 
 const WARNING = "runner retire scratch retained";
 let fx: Fixture;
@@ -24,10 +25,10 @@ beforeEach(() => {
   lines = rec.lines;
   git = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions());
 });
-afterEach(() => fx.cleanup());
+afterEach(() => { mock.restoreAll(); fx.cleanup(); });
 
-const warnings = (): Array<{ count: number; paths: string[] }> =>
-  lines.filter((l) => (l as { msg?: string }).msg === WARNING) as Array<{ count: number; paths: string[] }>;
+type Diag = { count: number; paths: string[]; skippedRecent: number; incomplete: boolean };
+const warnings = (): Diag[] => lines.filter((l) => (l as { msg?: string }).msg === WARNING) as Diag[];
 
 describe("inspectRetireScratchAtStartup (#3153)", () => {
   it("removes an empty parent non-recursively and reports nothing", async () => {
@@ -65,7 +66,11 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     assert.deepEqual(await git.inspectRetireScratchAtStartup(0), { removed: 0, retained: 0 });
     assert.equal(fs.existsSync(fresh), true);
     assert.equal(fs.existsSync(freshFull), true);
-    assert.equal(warnings().length, 0);
+    const w = warnings();
+    assert.equal(w.length, 1, "the skip is reported, not silent");
+    assert.equal(w[0]!.skippedRecent, 2);
+    assert.equal(w[0]!.count, 0);
+    assert.equal(w[0]!.incomplete, false);
   });
 
   it("does not follow a symlink parent or a symlink entry", async () => {
@@ -91,6 +96,20 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     assert.equal(fs.existsSync(other), true);
     fs.rmSync(root, { recursive: true });
     assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 0, retained: 0 });
+  });
+
+  it("charges the budget on every entry: a flood of non-matching names stops the scan and reports it incomplete", async () => {
+    const flood = 4200; // above RETIRE_SCRATCH_ENUMERATION_BUDGET (4096)
+    for (let i = 0; i < flood; i++) fs.writeFileSync(path.join(root, `junk-${i}`), "x");
+    const empty = path.join(root, ".retire-empty");
+    fs.mkdirSync(empty);
+    const res = await git.inspectRetireScratchAtStartup(OLD);
+    assert.ok(res.removed <= 1 && res.retained === 0, JSON.stringify(res));
+    assert.equal(fs.readdirSync(root).filter((n) => n.startsWith("junk-")).length, flood, "nothing else deleted");
+    assert.equal(fs.existsSync(empty), res.removed === 0, "the empty parent is removed only if the scan reached it");
+    const w = warnings();
+    assert.equal(w.length, 1);
+    assert.equal(w[0]!.incomplete, true);
   });
 
   it("bounds the reported paths", async () => {
@@ -127,5 +146,26 @@ describe("counted best-effort removal (#3153)", () => {
     // an absent target is success and not counted
     assert.equal(await seam.removeBestEffort(path.join(root, "gone"), "test-site"), true);
     assert.equal(retainedUndeletableCount(), before + 1);
+  });
+});
+
+describe("retireRunnerClone holding disposal (#3153)", () => {
+  it("counts a failed holding-dir removal on the discard path", async () => {
+    const owner = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = "agent/issue-3153";
+    const clone = await git.createOrAttachRunnerClone(bare, 3153, noProofReseed, owner);
+    fs.writeFileSync(path.join(clone.path, "OWNER.txt"), "owner bytes\n");
+    await git.markRecoveryCapture(bare, clone.path, branch, owner);
+    const holdingRoot = path.join(fx.dataDir, "runner-quarantine");
+    const realRm = fsp.rm.bind(fsp);
+    mock.method(fsp, "rm", async (target: string, opts?: unknown) => {
+      if (String(target).startsWith(holdingRoot)) throw Object.assign(new Error("rm: permission denied"), { code: "EACCES" });
+      return realRm(target, opts as never);
+    });
+    const before = retainedUndeletableCount();
+    await git.retireRunnerClone(bare, clone.path, branch, owner, { discard: true });
+    assert.equal(retainedUndeletableCount(), before + 1);
+    assert.ok(lines.some((l) => (l as { msg?: string; site?: string }).site === "retire-holding-dispose"));
   });
 });
