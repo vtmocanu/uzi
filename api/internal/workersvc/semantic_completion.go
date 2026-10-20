@@ -230,8 +230,19 @@ func semanticUnmetMilestones(run store.Run, c completionContract) ([]string, boo
 	return unmet, true
 }
 
+// semanticCompletionRequiresLock recognizes frozen semantic authority and structural
+// contamination before an outer mutation can enter the unlocked legacy fallback.
+// Locked inner helpers deliberately do not call this guard: their caller owns the tx.
+func semanticCompletionRequiresLock(run store.Run) bool {
+	var c completionContract
+	if json.Unmarshal(run.CompletionContract, &c) != nil {
+		return false
+	}
+	return c.Profile == "semantic" || hasSemanticCompletionFields(c)
+}
+
 func hasSemanticCompletionFields(c completionContract) bool {
-	if c.SemanticApproval != nil || c.SemanticPresentation != nil || len(c.MaintainerAuthorizations) != 0 || c.CandidateIdentityVersion != "" || len(c.Sources) != 0 || c.PlanHash != "" || c.Coverage != nil {
+	if c.SemanticApproval != nil || c.SemanticPresentation != nil || len(c.MaintainerAuthorizations) != 0 || c.CandidateIdentityVersion != "" || len(c.Sources) != 0 || c.PlanHash != "" || c.SourceOutcome != "" || c.Coverage != nil {
 		return true
 	}
 	for _, cr := range c.Criteria {

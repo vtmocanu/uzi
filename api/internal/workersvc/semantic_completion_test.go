@@ -107,7 +107,8 @@ func TestSemanticCompletionPendingPermitBoundary(t *testing.T) {
 			before := append([]byte(nil), run.MilestonesCompleted...)
 			fs := &fakeStore{runOwned: run}
 			svc := New(fs, newBox(t), testParams())
-			out, err := svc.RequestCompletionPermit(context.Background(), worker(), run.ID, CompletionPermitRequest{ContractRevision: int(run.ContractRevision.Int32), Branch: "agent/issue-1", Head: "head"})
+			// Pure decision coverage only; public semantic success requires the LiveDB transaction tests.
+			out, err := svc.requestCompletionPermitLocked(context.Background(), worker(), run.ID, CompletionPermitRequest{ContractRevision: int(run.ContractRevision.Int32), Branch: "agent/issue-1", Head: "head"})
 			if err != nil || out.Granted != tc.grant || out.DenyReason != tc.deny || !reflect.DeepEqual(out.Unmet, tc.unmet) {
 				t.Fatalf("permit=%+v err=%v", out, err)
 			}

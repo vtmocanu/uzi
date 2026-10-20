@@ -138,7 +138,8 @@ func strictSemanticJSON(raw []byte, dst any) error {
 }
 
 func semanticText(s string, max int) bool {
-	return utf8.ValidString(s) && strings.TrimSpace(s) != "" && len(s) <= max
+	// Semantic text is persisted in JSONB, which cannot represent NUL.
+	return utf8.ValidString(s) && !strings.ContainsRune(s, '\x00') && strings.TrimSpace(s) != "" && len(s) <= max
 }
 func semanticIdentifier(s string, max int) bool {
 	if !semanticText(s, max) {

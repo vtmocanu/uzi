@@ -2859,7 +2859,25 @@ export interface RunPrDescription {
   diagram_published: boolean;
 }
 
+/** Frozen maintainer obligations; authorization does not verify completion. */
+export interface CompletionPendingDTO {
+  version: number;
+  contract_revision: number;
+  criteria: {
+    criterion_id: string;
+    milestone_id: string;
+    kind: "maintainer";
+    text: string;
+    reason: string;
+    conditions: string[];
+    verification_steps: string[];
+    authorization_revision: number;
+    status: "unverified";
+  }[];
+}
+
 export interface Run {
+  completion_pending?: CompletionPendingDTO;
   semantic_gate?: import("./semanticGate").SemanticGateDTO;
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
@@ -3757,7 +3775,7 @@ export type RunSummaryItem = Omit<
   RunListItem,
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
-  | "semantic_gate"
+  | "semantic_gate" | "completion_pending"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
