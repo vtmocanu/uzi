@@ -4876,18 +4876,17 @@ it("issue3152 two guarded records sharing a run and generation each log at most 
   try {
     const lines = issue3152Lines(f);
     const pinned = await issue3152Frozen(f);
-    const sibling = { ...pinned, captureId: "sibling-capture", coverageDigest: undefined } as RecoveryRecord;
+    const sibling = { ...pinned, captureId: "sibling-capture" } as RecoveryRecord;
     const file = path.join(f.root, "journal", pinned.runId, sibling.captureId + ".json");
     const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
     const { mac: _m, ...payload } = JSON.parse(await fs.readFile(path.join(f.root, "journal", pinned.runId, pinned.captureId + ".json"), "utf8"));
-    const body = { ...payload, captureId: sibling.captureId, coverageDigest: undefined };
-    delete body.coverageDigest;
+    const body = { ...payload, captureId: sibling.captureId };
     await fs.writeFile(file, JSON.stringify({ ...body, mac: createHmac("sha256", key).update(canonicalJson(body)).digest("hex") }));
     (f.coordinator as any).isExecuting = () => true;
     await issue3152LivePasses(f, f.coordinator, 4, () => true);
     const byCapture = new Map<string, number>();
     for (const l of lines) byCapture.set(l.capture_id, (byCapture.get(l.capture_id) ?? 0) + 1);
-    assert.ok(byCapture.size >= 1);
+    assert.deepEqual([...byCapture.keys()].sort(), [pinned.captureId, sibling.captureId].sort());
     for (const [capture, count] of byCapture) assert.equal(count, 1, `capture ${capture} logged ${count} times`);
   } finally { await f.close(); }
 });
@@ -4906,5 +4905,69 @@ it("issue3152 boot sweep reports a resumeInventory outcome through the restart s
     (c as any).resumeInventory = async () => ({ state: "needs_action", reason: "upload_transient" });
     await c.resumePending(undefined, [rec]);
     assert.deepEqual(sweeps, [{ run_id: rec.runId, generation: rec.generation, outcome: "needs_action", reason: "upload_transient" }]);
+  } finally { await f.close(); }
+});
+
+it("issue3152 the in-lock liveStep re-check logs its exit once on the live path", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    // Not executing when the pass filters, executing by the time liveStep re-checks under the lock.
+    const c = f.coordinator as any;
+    const realStep = c.liveStep.bind(c);
+    let inLock = false;
+    c.liveStep = async (...args: unknown[]) => { inLock = true; try { return await realStep(...args); } finally { inLock = false; } };
+    await issue3152LivePasses(f, c, 3, () => inLock);
+    issue3152Assert(lines, 0, { path: "live", reason: "executing" }, rec);
+  } finally { await f.close(); }
+});
+
+it("issue3152 a saved FINAL replay clears the logged exit so the same exit logs again", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    const saved = await issue3152SaveFinal(f, rec);
+    const c = f.coordinator as any;
+    c.isExecuting = () => true;
+    for (let i = 0; i < 3; i++) await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.equal(lines.length, 1);
+    // A pass that replays the saved FINAL (and fails again, keeping the saved request).
+    c.isExecuting = () => false;
+    f.state.finalError = new Error("FINAL rejected again");
+    const finalsBefore = f.finals.length;
+    await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.ok(f.finals.length > finalsBefore, "the pass replayed the saved FINAL");
+    assert.equal(lines.length, 1, "the replay itself logs no exit");
+    f.state.finalError = undefined;
+    c.finalRetry.clear();
+    c.isExecuting = () => true;
+    for (let i = 0; i < 3; i++) await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.equal(lines.length, 2, "the same exit after a FINAL replay is a new transition");
+    assert.deepEqual(lines[1], lines[0]);
+  } finally { await f.close(); }
+});
+
+it("issue3152 live_pass_cap is not logged for dropped records that are not inventory-guarded", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.status = "completed";
+    const lines = issue3152Lines(f);
+    const a = await issue3152Frozen(f);
+    const b = await f.coordinator.freezeInventory({ context: { ...f.context, runId: "run-2" }, currentSha: H, defaultBranch: "main" });
+    assert.ok(b);
+    // Legacy (unguarded) bundled records, served from memory: a journaled unguarded record cannot keep the guarded-only fields.
+    const legacy = [a, b].map(r => ({ ...r, inventoryGuarded: false, coverageDigest: undefined, state: "bundled",
+      bundlePath: "bundle", byteSize: 1, checksum: "c", chunkCount: 1 }) as RecoveryRecord);
+    const c = f.coordinator as any;
+    c.liveMaxPerPass = 1;
+    c.snapshotBootRecords = async () => legacy;
+    let steps = 0;
+    c.liveStep = async () => { steps++; return "ok"; };
+    await issue3152LivePasses(f, c, 3);
+    assert.equal(steps, 3, "the cap admitted exactly one record per pass, so the other was dropped");
+    assert.deepEqual(lines, []);
   } finally { await f.close(); }
 });

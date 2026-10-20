@@ -4016,7 +4016,7 @@ export class RecoveryCoordinator {
         })
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0));
       const candidates = eligible.slice(0, this.liveMaxPerPass);
-      for (const dropped of eligible.slice(this.liveMaxPerPass)) this.noteRedriveExit("live", dropped, "live_pass_cap");
+      for (const dropped of eligible.slice(this.liveMaxPerPass)) if (dropped.inventoryGuarded) this.noteRedriveExit("live", dropped, "live_pass_cap");
       // Archived-pin cleanups are local (no credential), so they run while credentials are blocked.
       // They take only the slots the upload candidates leave, and back off per record.
       const cleanupCandidates = !this.git.cleanupArchivedRecoveryPin ? [] : all
