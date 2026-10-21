@@ -62,8 +62,9 @@ func TestWorkerCredentialSwitchHoldAckDispositionLiveDB(t *testing.T) {
 	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 	      VALUES ($1, $2, $3, $4, 'https://forge.e2e/g/r', 'main', true)`,
 		repoID, connID, uniq(repoID), fmt.Sprintf("g/r-%s", repoID))
-	exec(`INSERT INTO workers (id, user_id, name, token_hash) VALUES ($1, $2, 'credswh', $3)`,
-		workerID, userID, append([]byte("credswh-"), workerID[:]...))
+	const nonce = "nonce-ack-wire"
+	exec(`INSERT INTO workers (id, user_id, name, token_hash, snapshot_register_nonce) VALUES ($1, $2, 'credswh', $3, $4)`,
+		workerID, userID, append([]byte("credswh-"), workerID[:]...), nonce)
 	exec(`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, status,
 	         status_since, worker_id, started_at, claim_generation,
 	         credential_switch_requested_at, credential_switch_generation)
@@ -72,14 +73,16 @@ func TestWorkerCredentialSwitchHoldAckDispositionLiveDB(t *testing.T) {
 		runID, userID, repoID, uniq(runID), workerID, gen)
 
 	wkr := store.Worker{ID: workerID, UserID: userID}
-	report := func(state string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x",
-			bytes.NewReader([]byte(fmt.Sprintf(`{"status":%q,"claim_generation":%d}`, state, gen))))
+	reportBody := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/worker/runs/x", bytes.NewReader([]byte(body)))
 		rctx := chi.NewRouteContext()
 		rctx.URLParams.Add("id", runID.String())
 		rec := httptest.NewRecorder()
 		h.WorkerRunState(rec, req.WithContext(context.WithValue(mw.ContextWithWorker(req.Context(), wkr), chi.RouteCtxKey, rctx)))
 		return rec
+	}
+	report := func(state string) *httptest.ResponseRecorder {
+		return reportBody(fmt.Sprintf(`{"status":%q,"claim_generation":%d,"register_nonce":%q}`, state, gen, nonce))
 	}
 	disposition := func(rec *httptest.ResponseRecorder) (string, bool) {
 		var body map[string]json.RawMessage
@@ -103,6 +106,14 @@ func TestWorkerCredentialSwitchHoldAckDispositionLiveDB(t *testing.T) {
 	}
 	if d, ok := disposition(rec); ok {
 		t.Fatalf("a not-applied 409 carries disposition %q, want none; body=%s", d, rec.Body.String())
+	}
+
+	// Wire contract: both reports REQUIRE register_nonce; omitting it is a 400 and changes nothing.
+	for _, state := range []string{"credential_switch_held", "credential_switch_hold_settled"} {
+		rec := reportBody(fmt.Sprintf(`{"status":%q,"claim_generation":%d}`, state, gen))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s without register_nonce = %d, want 400; body=%s", state, rec.Code, rec.Body.String())
+		}
 	}
 
 	rec = report("credential_switch_held")

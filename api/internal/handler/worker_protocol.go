@@ -447,7 +447,8 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		{"repo_agent_folder"},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
 		// Issue #3181: this api accepts {status:"credential_switch_held"} and
-		// {status:"credential_switch_hold_settled"} (each with claim_generation) and answers them
+		// {status:"credential_switch_hold_settled"} (each with claim_generation AND the reporting worker's
+		// register_nonce, a missing nonce being a 400) and answers them
 		// with disposition "held" / "hold_settled". Advertised UNCONDITIONALLY: a worker sends
 		// the two reports ONLY after seeing this token, because an older api 400s the unknown states.
 		{"credential_switch_hold"},

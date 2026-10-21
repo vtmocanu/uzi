@@ -141,8 +141,10 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		// processes refuses the switch up front, before the override is written. This pre-check is
 		// not atomic with the resume below: in a narrow race (the holder's heartbeat turns fresh
 		// between the pre-check and the resume) the owner's override is saved and the resume is
-		// then refused with ErrRunHoldSettling. The override is the owner's own choice and is
-		// spent at the next reclaim. A hold that settles or whose fence lifts resumes below.
+		// then refused with ErrRunHoldSettling. The same applies to the rarer resume -> reclaim ->
+		// new hold path: a resume that wins the race is reclaimed and may be held again before this
+		// pre-check's answer is used. The override is the owner's own choice and is spent at the
+		// next reclaim. A hold that settles or whose fence lifts resumes below.
 		if settling, serr := s.runHoldSettling(ctx, runID); serr != nil {
 			return SetRunCredentialResult{}, fmt.Errorf("set run credential: read hold fence: %w", serr)
 		} else if settling {

@@ -287,9 +287,12 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHeld)
 	}
+	if req.RegisterNonce == "" || len(req.RegisterNonce) > 128 {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchHeld)
+	}
 	gen := *req.ClaimGeneration
 	rows, err := s.q.HoldCredentialSwitchUnsettled(ctx, store.HoldCredentialSwitchUnsettledParams{
-		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen,
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, RegisterNonce: req.RegisterNonce,
 	})
 	if err != nil {
 		return store.Run{}, false, err
@@ -299,7 +302,13 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 		return store.Run{}, false, err
 	}
 	if rows == 0 {
-		return cur, isCredentialSwitchHold(cur, gen), nil
+		// Replay converges only for the CURRENT incarnation: a superseded nonce is refused even
+		// when the hold it would replay is already in place.
+		current, err := s.currentRegisterNonce(ctx, wkr.ID, req.RegisterNonce)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		return cur, current && isCredentialSwitchHold(cur, gen), nil
 	}
 	if s.bcast != nil {
 		s.bcast.PublishState(owned.ID, cur.Status)
@@ -317,9 +326,12 @@ func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Ru
 	if req.ClaimGeneration == nil {
 		return store.Run{}, false, fmt.Errorf("%w: %s requires claim_generation", ErrInvalidState, stateCredentialSwitchHoldSettled)
 	}
+	if req.RegisterNonce == "" || len(req.RegisterNonce) > 128 {
+		return store.Run{}, false, fmt.Errorf("%w: %s requires register_nonce", ErrInvalidState, stateCredentialSwitchHoldSettled)
+	}
 	gen := *req.ClaimGeneration
 	rows, err := s.q.SettleCredentialSwitchHold(ctx, store.SettleCredentialSwitchHoldParams{
-		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen,
+		ID: owned.ID, WorkerID: pgconv.UUID(wkr.ID), Generation: gen, RegisterNonce: req.RegisterNonce,
 	})
 	if err != nil {
 		return store.Run{}, false, err
@@ -329,13 +341,27 @@ func (s *Service) settleCredentialSwitchHold(ctx context.Context, owned store.Ru
 		return store.Run{}, false, err
 	}
 	if rows == 0 {
-		return cur, cur.Status == "paused" && cur.ClaimGeneration == gen &&
+		current, err := s.currentRegisterNonce(ctx, wkr.ID, req.RegisterNonce)
+		if err != nil {
+			return store.Run{}, false, err
+		}
+		return cur, current && cur.Status == "paused" && cur.ClaimGeneration == gen &&
 			cur.HoldReason.Valid && cur.HoldReason.String == holdReasonCredentialSwitchUnsettled, nil
 	}
 	if s.bcast != nil {
 		s.bcast.PublishState(owned.ID, cur.Status)
 	}
 	return cur, true, nil
+}
+
+// currentRegisterNonce reports whether nonce is the worker's current registration nonce
+// (workers.snapshot_register_nonce), read after the claim mutation's worker lock.
+func (s *Service) currentRegisterNonce(ctx context.Context, workerID uuid.UUID, nonce string) (bool, error) {
+	w, err := s.q.GetWorkerByID(ctx, workerID)
+	if err != nil {
+		return false, err
+	}
+	return w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String == nonce, nil
 }
 
 // isCredentialSwitchHold reports whether the run is paused in a credential-switch hold at gen

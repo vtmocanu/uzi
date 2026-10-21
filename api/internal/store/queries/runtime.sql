@@ -245,15 +245,18 @@ WITH prev AS (
         nix_pressure = false, data_pressure = false,
         -- Incarnation fence ordering (issue #3181): the floor is compared with runs.status_since of a
         -- credential_switch_settling hold (HoldCredentialSwitchUnsettled stamps clock_timestamp()
-        -- under this same worker row lock). now() is this transaction's START, so a registration
-        -- that began before a hold but queued behind its lock would stamp a floor EARLIER than the
-        -- hold it was serialized after, and the new incarnation would be mistaken for the hold's
-        -- writer. A settling hold committed under the lock before this statement is visible here,
-        -- so the floor is lifted just past the latest such hold. Otherwise it stays exactly now(),
-        -- which keeps it equal to the registration heartbeat (the dind maintenance contract) and
-        -- cannot reject a legitimate meter: only a worker with a settling hold sees it move, by the
-        -- microseconds between the hold and this registration, and the new incarnation samples its
-        -- meters after the register response.
+        -- under the worker row lock). now() is this transaction's START, so a registration that
+        -- began before a hold but queued behind its lock would stamp a floor EARLIER than the hold
+        -- it was serialized after. The subquery below lifts the floor just past the latest settling
+        -- hold, but it only SEES a hold committed during the lock wait if (1) the worker row lock
+        -- is taken in an EARLIER statement than this one (Service.Register's GetWorkerForUpdate)
+        -- and (2) the transaction is READ COMMITTED (Service.Register opens it with
+        -- beginReadCommitted), so this statement takes a fresh snapshot after the wait. Under
+        -- REPEATABLE READ or a single-statement lock the hold would be invisible. The hold and ack
+        -- reports additionally carry the registration nonce, which is the primary incarnation check;
+        -- this floor remains what lets a registration lift the fence for the owner's Resume. Without
+        -- a settling hold the floor is exactly now(), equal to the registration heartbeat (the dind
+        -- maintenance contract).
         dind_register_floor = GREATEST(now(), COALESCE(
             (SELECT max(r.status_since) + interval '1 microsecond' FROM runs r
              WHERE r.worker_id = workers.id AND r.status = 'paused'
@@ -4025,13 +4028,18 @@ UPDATE runs SET
     credential_switch_generation   = NULL,
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                     = now()
-WHERE id = @id AND worker_id = @worker_id
-  AND claim_generation = @generation
-  AND claim_released_at IS NULL
-  AND status = 'running'
-  AND kind NOT IN ('job', 'cross_check')
-  AND credential_switch_requested_at IS NOT NULL
-  AND credential_switch_generation = @generation;
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind NOT IN ('job', 'cross_check')
+  AND runs.credential_switch_requested_at IS NOT NULL
+  AND runs.credential_switch_generation = @generation
+  -- Incarnation: the reporting process must be the CURRENT registration. An old incarnation's
+  -- delayed hold, queued on the worker lock behind a re-registration that kept this run at the
+  -- same claim_generation, carries the superseded nonce and is refused here.
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = @register_nonce::text);
 
 -- name: SettleCredentialSwitchHold :execrows
 -- Issue #3181: the worker's acknowledgement that every process of the held run has stopped.
@@ -4040,6 +4048,9 @@ WHERE id = @id AND worker_id = @worker_id
 -- fence: the acknowledging worker must not have re-registered since the hold was written
 -- (workers.dind_register_floor <= runs.status_since), because a re-registration means the
 -- acknowledging process is a new incarnation that proves nothing about the old one's processes.
+-- The report must also carry the CURRENT registration nonce (workers.snapshot_register_nonce), so a
+-- delayed ack from a superseded incarnation is refused even if the floor ordering were ambiguous.
+-- Both conjuncts stay: the floor is what lets a registration lift the fence for the owner's Resume.
 UPDATE runs SET
     hold_reason = 'credential_switch_unsettled',
     updated_at  = now()
@@ -4048,7 +4059,8 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.status = 'paused'
   AND runs.hold_reason = 'credential_switch_settling'
   AND EXISTS (SELECT 1 FROM workers w
-              WHERE w.id = runs.worker_id AND w.dind_register_floor <= runs.status_since);
+              WHERE w.id = runs.worker_id AND w.dind_register_floor <= runs.status_since
+                AND w.snapshot_register_nonce = @register_nonce::text);
 
 -- name: CredentialSwitchHoldSettling :one
 -- Issue #3181: the settling fence as a read, the SAME predicate ResumePausedRun refuses on (true =

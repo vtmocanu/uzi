@@ -2536,7 +2536,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		return store.Worker(row), nonce, nil
 	}
 
-	tx, err := s.txBeginner.Begin(ctx)
+	// READ COMMITTED is explicit, not the pool default: RegisterWorker's dind_register_floor
+	// subquery must see a credential_switch_settling hold committed while the GetWorkerForUpdate
+	// below waited on the worker lock. That needs BOTH this isolation level (a fresh statement
+	// snapshot per statement) and the lock being taken by a statement EARLIER than RegisterWorker.
+	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2547,7 +2551,8 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 		}
 	}()
 	qtx := store.New(tx)
-	// (a) Lock the worker row FOR UPDATE — the canonical order that serialises Register against
+	// (a) Lock the worker row FOR UPDATE (keep this a separate statement before RegisterWorker; see
+	// the READ COMMITTED note above) — the canonical order that serialises Register against
 	// a concurrent heartbeat and the stale-worker passes (both of which lock the worker row).
 	prior, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {
