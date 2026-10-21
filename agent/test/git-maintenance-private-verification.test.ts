@@ -347,7 +347,8 @@ test("owned completion and raw stderr disposal both settle before continuation",
   const work = f.run(() => f.seam()).finally(() => { settled = true; });
   void work.catch(() => undefined);
   try {
-    await completed.promise;
+    // Surface admission failure immediately if no owned child can reach the hook.
+    await Promise.race([completed.promise, work.then(() => assert.fail("work completed before the owned child hook"))]);
     f.controller.abort(Error("cancel child"));
     await tick();
     assert.equal(settled, false, "actual child completion is still owned");
