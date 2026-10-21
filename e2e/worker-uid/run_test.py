@@ -15,6 +15,11 @@ import tool_image
 
 HARNESS = Path(__file__).resolve().parent
 SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
+# Hang guard for one fake-docker run.sh invocation, not a performance budget. A lane costs about 7 s
+# of CPU-bound interpreter starts (~90 fakes) on an idle host and scales with host load; the former
+# 20 s guard was only ~2.5x that and tripped on busy CI/dev hosts. A real hang is still bounded
+# by run.sh's own phase deadlines, which the tests assert.
+RUN_SH_LIMIT = 90
 EXPECTED = [{"file": "agent/test/example.test.ts", "names": ["suite", "leaf"]}]
 COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["command leaf"]}]
 SINGLE_EXPECTED = [{"file": "e2e/worker-uid/single-uid-preflight.test.mts", "names": ["single leaf"]}]
@@ -178,13 +183,18 @@ class RunnerTest(unittest.TestCase):
         self.repo = Path(self.temp.name)
         harness = self.repo / "e2e/worker-uid"
         harness.mkdir(parents=True)
-        for name in ("run.sh", "bounded.py", "check.py", "check_test.py", "tool_image.py", "tool-image.Dockerfile"):
+        for name in ("run.sh", "bounded.py", "check.py", "tool_image.py", "tool-image.Dockerfile"):
             shutil.copyfile(HARNESS / name, harness / name)
+        # run.sh starts with the checker's own self-test (~0.8 s of real CPU); check_test.py and the
+        # gate recipe already run it, and no lane test depends on its result, so the fake tree
+        # carries an inert stand-in that exits 0.
+        (harness / "check_test.py").write_text("")
         self.bin = self.repo / "bin"
         self.bin.mkdir()
         (self.bin / "python3").symlink_to(sys.executable)
         self.calls = self.repo / "calls.jsonl"
         self.stub("node", """
+from pathlib import Path
 if args[0] == "e2e/worker-uid/inventory.mjs":
     print(os.environ[{"command": "COMMAND_EXPECTED", "single": "SINGLE_EXPECTED", "shared": "SHARED_EXPECTED"}.get(args[1] if args[1:] else "", "EXPECTED")])
 elif args[0] == "e2e/worker-uid/pattern.mjs":
@@ -195,6 +205,7 @@ else:
     raise AssertionError(args)
 """)
         self.stub("docker", """
+from pathlib import Path
 state_path = Path("resources.json")
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
 if args[:2] == ["volume", "ls"]:
@@ -303,6 +314,7 @@ if args[0] == "rm":
     sys.exit(int(os.environ["CLEANUP_RC"]))
 """)
         self.stub("timeout", """
+import subprocess
 assert args[0] == "--kill-after=5s", args
 seconds = float(args[1].removesuffix("s"))
 if args[2] == "python3":
@@ -339,8 +351,10 @@ sys.exit(rc)
     def stub(self, name, body):
         script = self.bin / name
         script.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, subprocess, sys\nfrom pathlib import Path\n"
+            # -S skips site import; each fake costs one interpreter start and a lane spawns ~90 of them,
+            # so a fake imports only what its body needs (stdlib only, no site packages).
+            f"#!{sys.executable} -S\n"
+            "import json, os, sys\n"
             "args = sys.argv[1:]\n"
             "with open(os.environ['CALLS'], 'a', encoding='utf-8') as log:\n"
             f"    log.write(json.dumps([{name!r}, *args]) + '\\n')\n"
@@ -373,7 +387,7 @@ sys.exit(rc)
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
-                                env=env, capture_output=True, text=True, timeout=20, check=False)
+                                env=env, capture_output=True, text=True, timeout=RUN_SH_LIMIT, check=False)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         runs = [call for call in calls if call[:2] == ["docker", "run"]]
         # Every Docker operation, including failures before either lane, is bounded.
