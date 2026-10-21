@@ -11425,6 +11425,97 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     });
   }
 
+  it("pre-existing fault -> capture -> dispose => cache retained", async () => {
+    const c = cacheRig({ defer: true, holderResult: { state: "retained", reason: "undrained" } });
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    let captures = 0;
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => "now",
+      reportIteration: async () => ({ pauseRequested: false }),
+      parkForPause: async () => {
+        const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+        assert.ok(registry);
+        // Inject only the fault; the executor still owns capture and proof recording.
+        registry.poison({ category: "tool", message: "pre-existing cleanup uncertainty" });
+        assert.equal(registry.isPoisoned(), true);
+        const result = await exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          assert.deepEqual(c.holder.releases, [], "capture retains the live holder");
+          return true;
+        });
+        assert.equal(result.kind, "observed_empty");
+        const proof = exec["completedCaptures"].get(registry);
+        assert.ok(proof, "the real completed acquisition was recorded by the executor");
+        assert.equal(registry.acceptsCompletedCapture(proof), false,
+          "completion after a pre-existing fault cannot attest continuation cleanup");
+        assert.equal((exec.safety as CodexExecutionSafetyImpl).completedCaptureForTeardown(), undefined);
+        return true;
+      },
+    });
+    assert.ok((await withTimeout(exec.run(ctx), 3000, "pre-existing fault pause")).pausedAt);
+    assert.equal(captures, 1);
+    const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+    assert.ok(registry);
+    const proof = exec["completedCaptures"].get(registry);
+    assert.ok(proof);
+    assert.deepEqual(c.holder.releases, []);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(registry.state(), "disposed", "public terminal disposal actually ran");
+    assert.equal(exec["completedCaptures"].get(registry), proof, "no substitute proof");
+    assert.equal(registry.acceptsCompletedCapture(proof), false);
+    assert.deepEqual(c.holder.releases, [false], "public terminal settlement retains the cache");
+    assert.deepEqual(c.removals, []);
+  });
+
+  it("HeldRunCommandCache requires disposal after a genuine intentional capture", async () => {
+    const c = cacheRig({ defer: true });
+    const exec = makeExecutor(c.rig, bindingOf(SUBSCRIPTION));
+    let captures = 0;
+    const { ctx } = makeCtx({
+      pauseModeRequested: () => "now",
+      reportIteration: async () => ({ pauseRequested: false }),
+      parkForPause: async () => {
+        assert.equal((await exec.withCredentialFreeCapture(1000, async () => {
+          captures++;
+          return true;
+        })).kind, "observed_empty");
+        return true;
+      },
+    });
+    assert.ok((await withTimeout(exec.run(ctx), 3000, "intentional capture pause")).pausedAt);
+    assert.equal(captures, 1);
+    const registry = [...exec["epochSafeties"]].find(([, safety]) => safety === exec.safety)?.[0];
+    assert.ok(registry);
+    const proof = exec["completedCaptures"].get(registry);
+    assert.ok(proof, "use only the executor's actual recorded completion");
+    assert.equal((exec.safety as CodexExecutionSafetyImpl).completedCaptureForTeardown(), proof);
+    assert.equal(registry.isPoisoned(), true, "intentional capture fenced ordinary admission");
+    assert.equal(registry.state(), "poisoned");
+    assert.equal(registry.acceptsCompletedCapture(proof), true);
+    const foreign = new ExecutionRegistry(newLocalExecutionEpoch(285299));
+    assert.equal(foreign.acceptsCompletedCapture(proof), false, "proof belongs to the exact registry");
+
+    const observer = fakeHolder([]);
+    const cache = new HeldRunCommandCache(observer.holder,
+      watched => exec["completedCaptures"].get(watched));
+    cache.watchRegistry(registry);
+    assert.equal(cache.drained(), false, "accepted completion alone is insufficient before disposal");
+    assert.deepEqual(c.holder.releases, []);
+    await exec.safety!.dispose({ boundary: "terminal", deadlineMs: 1000 });
+    assert.equal(registry.state(), "disposed");
+    assert.equal(exec["completedCaptures"].get(registry), proof);
+    assert.equal(registry.acceptsCompletedCapture(proof), true);
+    assert.equal(cache.drained(), true, "verified disposal completes the false-to-true transition");
+    assert.deepEqual(c.holder.releases, [true], "the public terminal path also sees the exact proof");
+    await cache.settle(noopLog, async () => ({ state: "removed", reason: "" }),
+      { releaseMs: 100, removeMs: 100 });
+    assert.deepEqual(observer.releases, [true], "settle only after disposal; its result is cached");
+
+    registry.poison({ category: "tool", message: "new uncertainty after completed capture" });
+    assert.equal(registry.acceptsCompletedCapture(proof), false, "new poison invalidates the same proof");
+    assert.equal(cache.drained(), false);
+  });
+
   it("deferred mode with NO epoch built (setup failure) releases in run()'s finally", async () => {
     const c = cacheRig({ defer: true });
     c.rig.deps = {
