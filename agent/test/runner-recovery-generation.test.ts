@@ -784,14 +784,20 @@ describe("RunRunner — first-turn Codex failure reaps BEFORE the terminal repor
 // makes the run terminal it is refused, and a settle-then-report ordering would block the reap and
 // leak the exact-generation `source_only` hold. This reuses the SAME real Codex boundary + ordered
 // event log as #1531, drives the executor to a TransientRecoveryError (so handleRecoveryExhausted
-// owns it), fails recovery capture BEFORE its publish boundary (so capture runs no reconcile and the
-// loop keeps looping until the cancel lands), and asserts the split order `reconcile < failed <
-// settle`. MUTATION control: restore the old `reapThenSettleRecoveryGeneration` AFTER the report and
+// owns it), permits the required initial strict drain, then fails recovery capture BEFORE its
+// publish boundary (so capture adds no publish reconcile and the loop awaits cancellation).
+// It asserts `strict reconcile < fetch failure < cancel reap reconcile < failed < settle`.
+// MUTATION control: restore the old `reapThenSettleRecoveryGeneration` AFTER the report and
 // drop the pre-report reap → the 409-shaped reconcile blocks it → cases (a)/(b) redden.
 describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (PRD #1349 M2 D4.5 / #1539)", () => {
   /** A Codex-shaped executor (carries `.safety`, NO killAgentTree) that (optionally) commits, then
    *  throws a TransientRecoveryError — the recovery-hold entry that handleRecoveryExhausted owns. */
-  function codexTransientFactory(homeRoot: string, safety: CodexExecutionSafety, commit: boolean): ExecutorFactory {
+  function codexTransientFactory(
+    homeRoot: string,
+    safety: CodexExecutionSafety,
+    commit: boolean,
+    onContext: (ctx: RunContext) => void,
+  ): ExecutorFactory {
     return (runId) => {
       const runHome = path.join(homeRoot, runId);
       return {
@@ -801,6 +807,7 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
           run: async (ctx: RunContext): Promise<ExecutorResult> => {
             fs.mkdirSync(runHome, { recursive: true });
             if (commit) commitInTree(ctx.worktreePath, "WORK.txt", "committed before the codex cancel\n");
+            onContext(ctx);
             throw new TransientRecoveryError();
           },
         },
@@ -809,21 +816,34 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
   }
 
   /** Fail recovery capture at the fetch-back seam (BEFORE captureRecoveryRestorePoint's publish
-   *  boundary, so it never runs a reconcile), keeping the hold loop looping until the cancel lands.
+   *  boundary). The required initial strict drain still reconciles; capture never reaches publish.
+   *  The fetch failure waits for the real steering cancellation before returning to the hold loop.
    *  The settle transfer AFTER the failed report needs the SAME real-git seam to SUCCEED, so it is
    *  re-allowed the instant the terminal report lands (flipped inside the combined onState hook).
-   *  Returns a { flip } setter the hook calls and a `captureFailed` deferred that resolves once the
-   *  loop has reached (and failed) a capture — the cue to inject the cancel. */
-  function failCaptureUntilReport(): { armAllow: () => void; captureFailed: ReturnType<typeof deferred> } {
+   *  Returns an armAllow setter the hook calls and a `captureFailed` deferred that resolves once the
+   *  loop has reached the capture failure seam — the cue to inject the cancel. */
+  function failCaptureUntilReport(events: string[]): {
+    armAllow: () => void;
+    captureFailed: ReturnType<typeof deferred>;
+    onContext: (ctx: RunContext) => void;
+  } {
     let allowFetch = false;
+    let cancellation: Promise<void> | undefined;
+    const onContext = (ctx: RunContext): void => {
+      assert.ok(ctx.signal, "the real run context must supply the steering cancellation signal");
+      cancellation = waitAbort(ctx.signal);
+    };
     const realFetch = git.fetchAgentBranch.bind(git);
     const captureFailed = deferred();
     git.fetchAgentBranch = (async (...args: Parameters<typeof realFetch>) => {
       if (allowFetch) return realFetch(...args);
+      assert.ok(cancellation, "the executor must observe its run context before recovery capture");
+      events.push("capture-fetch-failed");
       captureFailed.resolve();
+      await cancellation;
       throw new Error("injected recovery-capture fetch failure (before publish)");
     }) as typeof git.fetchAgentBranch;
-    return { armAllow: () => { allowFetch = true; }, captureFailed };
+    return { armAllow: () => { allowFetch = true; }, captureFailed, onContext };
   }
 
   /** CAVEAT 1: api.onState keeps ONE hook per run. This single combined hook records `failed` into
@@ -852,9 +872,9 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-clean-home-"));
     try {
       fakeGit.alreadyPublished = true; // provably empty → RELEASE the exact hold
-      const { armAllow, captureFailed } = failCaptureUntilReport();
+      const { armAllow, captureFailed, onContext } = failCaptureUntilReport(events);
       armCancelMapping(claim.run_id, events, armAllow);
-      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false, onContext), gitlab, undefined, nullLogger(), {
         recovery: coord,
         recoveryRetryMs: 5,
       });
@@ -867,20 +887,26 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
       await execution;
 
       assert.ok(
+        events.indexOf("reconcile") < events.indexOf("capture-fetch-failed"),
+        `the strict drain must precede the first capture fetch; got ${JSON.stringify(events)}`,
+      );
+
+      assert.ok(
         api.states.some((s) => s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
         "the cancel is reported as a terminal failed(run cancelled)",
       );
-      // The reap's per-sink reconcile ran while still actively-claimed — BEFORE the report — so it
-      // was authorized (no 409); the settle then released AFTER the report.
+      // Both the initial strict drain and the separate cancel reap reconciled while actively
+      // claimed (no 409); the custody settle then released AFTER the report.
       assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
       assert.equal(
         events.filter((e) => e === "reconcile").length,
-        1,
-        `capture must NOT reach its publish boundary (which would add a reconcile); got ${JSON.stringify(events)}`,
+        2,
+        `strict drain and cancel reap must be the only reconciles; capture must NOT reach its publish boundary (which would add a reconcile); got ${JSON.stringify(events)}`,
       );
       assert.ok(
-        events.lastIndexOf("reconcile") < events.indexOf("failed"),
-        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+        events.indexOf("capture-fetch-failed") < events.lastIndexOf("reconcile")
+          && events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `both strict-drain and cancel-reap reconciles must precede the failed report; got ${JSON.stringify(events)}`,
       );
       assert.ok(
         events.indexOf("failed") < events.indexOf("release"),
@@ -904,9 +930,9 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-commit-home-"));
     try {
       fakeGit.alreadyPublished = false; // unpublished committed work → CAPTURE
-      const { armAllow, captureFailed } = failCaptureUntilReport();
+      const { armAllow, captureFailed, onContext } = failCaptureUntilReport(events);
       armCancelMapping(claim.run_id, events, armAllow);
-      const runner = runnerWith(codexTransientFactory(homeRoot, safety, true), gitlab, undefined, nullLogger(), {
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, true, onContext), gitlab, undefined, nullLogger(), {
         recovery: coord,
         recoveryRetryMs: 5,
       });
@@ -918,15 +944,21 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
       api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
       await execution;
 
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("capture-fetch-failed"),
+        `the strict drain must precede the first capture fetch; got ${JSON.stringify(events)}`,
+      );
+
       assert.ok(hasStatus(claim.run_id, "failed"), "the cancel is reported as a terminal failed");
       assert.equal(
         events.filter((e) => e === "reconcile").length,
-        1,
-        `capture must NOT reach its publish boundary; got ${JSON.stringify(events)}`,
+        2,
+        `strict drain and cancel reap must be the only reconciles; capture must NOT reach its publish boundary; got ${JSON.stringify(events)}`,
       );
       assert.ok(
-        events.lastIndexOf("reconcile") < events.indexOf("failed"),
-        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+        events.indexOf("capture-fetch-failed") < events.lastIndexOf("reconcile")
+          && events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `both strict-drain and cancel-reap reconciles must precede the failed report; got ${JSON.stringify(events)}`,
       );
       assert.ok(
         events.indexOf("failed") < events.indexOf("reserve"),
@@ -944,15 +976,16 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
     const { gitlab } = fakeGitlab();
     const events: string[] = [];
     const claim = gitlabClaim(4713, { claim_generation: 31 });
-    // alwaysBlock: the reconcile throws even while the run is still `running`, so the pre-report reap
-    // fails and the hold is retained (source_only) — but the cancel must still be reported.
-    const { coord, client, git: fakeGit, safety, root } = fixture(events, () => true);
+    // Allow the initial strict drain; contend only the cancellation reap after capture fails.
+    // That reap retains the source_only hold while the cancel must still be reported.
+    let blockCancelReap = false;
+    const { coord, client, git: fakeGit, safety, root } = fixture(events, () => blockCancelReap);
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-retain-home-"));
     try {
       fakeGit.alreadyPublished = true;
-      const { armAllow, captureFailed } = failCaptureUntilReport();
+      const { armAllow, captureFailed, onContext } = failCaptureUntilReport(events);
       armCancelMapping(claim.run_id, events, armAllow);
-      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false, onContext), gitlab, undefined, nullLogger(), {
         recovery: coord,
         recoveryRetryMs: 5,
       });
@@ -961,9 +994,21 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
         captureFailed.promise,
         execution.then(() => { throw new Error("execution exited before reaching the cancel branch"); }),
       ]);
+      blockCancelReap = true;
       api.setInputs(claim.run_id, [{ id: 1, kind: "cancel" }]);
       await execution;
 
+      assert.ok(
+        events.indexOf("reconcile") < events.indexOf("capture-fetch-failed"),
+        `the strict drain must precede the first capture fetch; got ${JSON.stringify(events)}`,
+      );
+
+      assert.equal(events.filter((e) => e === "reconcile").length, 2, "strict drain and blocked cancel reap both reconciled");
+      assert.ok(
+        events.indexOf("capture-fetch-failed") < events.lastIndexOf("reconcile")
+          && events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `the contended cancel reap must follow capture failure and precede the report; got ${JSON.stringify(events)}`,
+      );
       assert.equal(client.releaseCalls.length, 0, "a blocked reap retains the hold — never releases");
       assert.equal(client.reserveCalls.length, 0, "a blocked reap retains the hold — never captures");
       assert.ok(
@@ -993,7 +1038,7 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1539-statusless-home-"));
     try {
       fakeGit.alreadyPublished = true; // provably empty → RELEASE the exact hold
-      const { armAllow, captureFailed } = failCaptureUntilReport();
+      const { armAllow, captureFailed, onContext } = failCaptureUntilReport(events);
       // CAVEAT: ONE combined hook (fake-api keeps one per run). On the `failed` report it records the
       // event, re-allows the settle fetch, arms a STATUSLESS ack for THIS report (so the ack-terminal
       // branch is skipped), and sets a terminal `cancelled` ownership so the NEXT loop turn reaches
@@ -1007,7 +1052,7 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
           api.setOwnershipStatus(claim.run_id, "cancelled");
         }
       });
-      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false), gitlab, undefined, nullLogger(), {
+      const runner = runnerWith(codexTransientFactory(homeRoot, safety, false, onContext), gitlab, undefined, nullLogger(), {
         recovery: coord,
         recoveryRetryMs: 5,
       });
@@ -1020,13 +1065,23 @@ describe("RunRunner — recovery cancellation reaps BEFORE the terminal report (
       await execution;
 
       assert.ok(
+        events.indexOf("reconcile") < events.indexOf("capture-fetch-failed"),
+        `the strict drain must precede the first capture fetch; got ${JSON.stringify(events)}`,
+      );
+
+      assert.ok(
         api.states.some((s) => s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
         "the cancel is reported as a terminal failed(run cancelled)",
       );
-      assert.ok(events.indexOf("reconcile") >= 0, "the reap boundary ran the per-sink reconcile");
+      assert.equal(
+        events.filter((e) => e === "reconcile").length,
+        2,
+        `only the strict drain and cancel reap reconcile; capture never reaches publish; got ${JSON.stringify(events)}`,
+      );
       assert.ok(
-        events.lastIndexOf("reconcile") < events.indexOf("failed"),
-        `every reap reconcile must precede the failed report; got ${JSON.stringify(events)}`,
+        events.indexOf("capture-fetch-failed") < events.lastIndexOf("reconcile")
+          && events.lastIndexOf("reconcile") < events.indexOf("failed"),
+        `both strict-drain and cancel-reap reconciles must precede the failed report; got ${JSON.stringify(events)}`,
       );
       assert.ok(
         events.indexOf("failed") < events.indexOf("release"),
