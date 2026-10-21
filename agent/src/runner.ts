@@ -17516,10 +17516,11 @@ export class RunRunner {
       // The run CONTINUES (Decision 8), so a wip(park): marker we just made must not stay committed
       // at the clone HEAD: it would ride into the eventual MR and the restarted turn would build on a
       // throwaway commit. Restore its content to the uncommitted tree, the same shape the resume
-      // adopt gives a marker. Best-effort; only when we actually created one this call.
-      // The undo rewinds whatever HEAD names, so it runs only when HEAD names the run branch and
-      // that branch's tip is the marker; when the agent switched HEAD elsewhere, the marker stays
-      // where it is (the run branch is not touched) and the pause_failed below keeps the run going.
+      // adopt gives a marker. Best-effort; only when this call created a marker or refused to vet
+      // one (issue #3239). The undo rewinds whatever HEAD names, so it runs only when HEAD names the
+      // run branch and that branch's tip is a wip(park): commit; when the agent switched HEAD
+      // elsewhere or detached it, the marker stays where it is (the run branch is not touched) and
+      // the pause_failed below keeps the run going.
       if ((markerCreated || flight.wipMarkerUnsafe) && runnerClone) {
         if (branch && (await this.git.headOnBranchAtWipMarker(runnerClone.path, branch).catch(() => false))) {
           // issue #3239: a refused rollback leaves the unvetted marker at the run branch tip while

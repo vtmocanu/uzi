@@ -11373,8 +11373,10 @@ try {
    * SAME restore the resume adopt does (#759 M2, `reset --soft` on the adopted marker), run
    * inline here because a continuing run never reseeds. BEST-EFFORT: every error is caught
    * and logged — a failed restore must never propagate, exactly as `commitWipMarker` never
-   * propagates a commit failure (D4). Only ever called after `commitWipMarker` returned true,
-   * so HEAD^ is the marker's parent (the clone was checked out at a real base commit).
+   * propagates a commit failure (D4). Callers first check that HEAD's tip is a `wip(park):`
+   * commit (the pause park also requires HEAD to name the run branch, issue #3239), so HEAD^ is
+   * that marker's parent. A detached HEAD is never undone by the pause park: the marker stays
+   * committed there, matching the detached no-rollback rule.
    */
   async undoWipMarker(clonePath: string): Promise<void> {
     try {
