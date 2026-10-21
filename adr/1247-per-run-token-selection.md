@@ -90,6 +90,51 @@ What **is** implemented, so this gap is DB residue only — never a stuck run, a
 - A future promoter (park-time or duration-time) is obligated to consult `effectiveNextClaimMode`, never `anthropic_select_reason` (Seam 4).
 - Issue #1422 clears the `credential_switch_requested_at`/`credential_switch_generation` DB columns at the reclaimed generation's epoch write, so a same-run release-then-reclaim no longer leaves them set. Step A's read-side suppression stays as belt-and-braces for rows stamped and reclaimed before that landed (no backfill).
 
+## Amendment 2026-10-21 — #3181: a retained switch settles, then releases or holds for the owner
+
+Seam 2's release path assumed a switching flight's processes were stopped by the time
+the worker reports `credential_switch`. For a run that carries retained recovery
+authority, the worker now proves that first, in `enterRetainedCredentialSwitch`: a
+guarded command settle, a kill of the agent tree, a HOME-attributed reap and an
+own-mode quiescence proof, within one bounded allowance that is separate from the
+evidence-verification allowance. Two outcomes:
+
+- **Proven**: the switch releases exactly as in Seam 2.
+- **Unproven**: the worker reports `credential_switch_held` instead. The run goes
+  `paused` with `hold_reason = credential_switch_settling`; the claim is **not**
+  released, the switch stamp is cleared, nothing is banked, and the override, worker and
+  session are kept. Once the worker has finished stopping or joining its own operations
+  it reports `credential_switch_hold_settled`, which flips the hold to
+  `credential_switch_unsettled`. Survivor classes (`unreadable`, `worker_child`,
+  `restarted`, `kill_failed`) appear in diagnostics and the hold's feed message.
+
+**The settling fence.** While the hold is `credential_switch_settling`, Resume and
+set-token are refused with a 409 (`ErrRunHoldSettling`); Cancel always works. The fence
+lifts only on the worker's acknowledgement (fenced on worker, run, claim generation and
+registration nonce), the holder's heartbeat going stale, the worker row being removed, or
+the worker re-registering (`workers.dind_register_floor` moving past `runs.status_since`).
+It never lifts on elapsed time. From `credential_switch_unsettled`, Resume requeues the run
+on the chosen token (same worker preferred) and set-token saves the token and resumes. No
+other writer may rewrite `status_since` on a settling hold; the park-report statements
+refuse a paused credential-switch hold for that reason.
+
+**Not an exoneration.** The next claim still runs its fail-closed predecessor quiescence
+proof, and a survivor that stays unverified still ends the run `worker_residue_blocked`
+with custody kept ([ADR-2213](2213-worker-residue-quarantine.md)).
+
+**Named residuals**, each leaving the previous behaviour (the worker stops non-terminal,
+the next claim's proof stays fail-closed):
+
+1. An API without the `credential_switch_hold` protocol feature (rollout skew): the worker
+   sends neither hold report.
+2. A hold report that is refused, or unconfirmed after one retry and an ownership read.
+3. A retained flight whose ownership read shows `awaiting_*`.
+
+Also, `SetRunCredential` checks the fence before it writes the override and the resume
+that follows is not atomic with that check, so in a narrow race a refused set-token can
+still save the owner's chosen token; the override is the owner's own choice and is spent at
+the next reclaim.
+
 ## Linked from ARCHITECTURE.md
 
 Linked from ARCHITECTURE.md's run-lane credential paragraph (the `claimSecretID` description, just above the Run lifecycle section), per repo convention.

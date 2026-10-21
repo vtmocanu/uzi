@@ -120,6 +120,44 @@ still proceeds to the hold; stale claim ownership stops the flight while
 retaining its source. See [Completion holds](run-completion-hold.md) for scope
 decisions, plain-resume refusal and version limits.
 
+## Credential-switch holds
+
+When you switch the token of a run that still carries retained recovery work
+([Anthropic tokens](anthropic-token.md#where-you-can-pick-it)), the worker
+first proves the run's own processes stopped before it reports the switch:
+a guarded command settle, a kill of the agent's process tree, a reap of
+processes attributed to the run's HOME, and a quiescence check, all within a
+bounded allowance. If that is proven, the switch releases as usual. If it is
+not, the run is held for you. The hold is `paused` and keeps the run's work
+and custody on that worker:
+
+- **`credential_switch_settling`**: the worker is still stopping or joining its
+  own operations. **Resume** and `uzi run set-token` are refused with a 409
+  until the hold settles; **Cancel** always works. The CLI shows `credential
+  switch settling`, the web shows **stopping processes: token switch**.
+- **`credential_switch_unsettled`**: the worker has acknowledged and the run
+  is held for you. The CLI shows `credential switch unsettled`, the web shows
+  **held: token switch**. **Resume** requeues the run on the token you chose
+  (the same worker is preferred); `uzi run set-token` saves a token and
+  resumes. **Cancel** ends the run. The feed message and diagnostics name any
+  survivor class (`unreadable`, `worker_child`, `restarted`, `kill_failed`).
+
+Settling lifts only on the worker's acknowledgement (fenced on the worker,
+run, claim generation and registration nonce), the worker's heartbeat going
+stale, the worker's removal, or the worker re-registering. Elapsed time never
+lifts it. Resuming after a lift does not skip any check: the next claim still
+runs its fail-closed predecessor quiescence proof, and a survivor that stays
+unverified still ends the run `worker_residue_blocked` with custody kept.
+
+This does not cover every switch on a retained run. In three cases the worker
+stops non-terminal as before, without a hold: the API lacks the
+`credential_switch_hold` protocol feature, the hold report is refused or stays
+unconfirmed after one retry and an ownership read, or the retained flight's
+ownership reads `awaiting_*`. The next claim's proof stays fail-closed, so the
+worst case is the previous behaviour. In a narrow race, a refused `set-token`
+can still save the token you chose. Design rationale:
+[ADR-1247](../adr/1247-per-run-token-selection.md).
+
 ## When plan-revision retries expire
 
 After bounded inner retries exhaust a provider transient during a human plan
