@@ -6363,6 +6363,9 @@ type ForgeConn struct {
 	IssueIID       *int64
 	SavedTitle     string
 	SavedBody      string
+	// SavedBodyValid is true when the run captured a raw body (issue_saved_body not NULL); SavedBody
+	// otherwise falls back to the run's issue description.
+	SavedBodyValid bool
 	RawDigest      *string
 	InputReason    string
 }
@@ -6422,7 +6425,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 		BotForgeUserID:  row.BotForgeUserID,
 		MRIID:           mrIID,
 		ReviewComments:  run.ReviewComments,
-		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, RawDigest: digest, InputReason: run.IssueInputReason.String,
+		IssueIID:        issueIID, SavedTitle: run.IssueTitle, SavedBody: body, SavedBodyValid: run.IssueSavedBody.Valid, RawDigest: digest, InputReason: run.IssueInputReason.String,
 	}, nil
 }
 

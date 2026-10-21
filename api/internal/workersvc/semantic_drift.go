@@ -26,11 +26,14 @@ import (
 var ErrSemanticObservationInvalid = errors.New("invalid semantic observation")
 
 const (
-	semanticObservationMaxPRDs    = 8
-	semanticObservationMaxLinks   = 8
-	semanticObservationMaxRecord  = 32 * 1024
-	semanticIssueMaxBytes         = 64 * 1024
-	semanticIssueReadTimeout      = 10 * time.Second
+	semanticObservationMaxPRDs   = 8
+	semanticObservationMaxLinks  = 8
+	semanticObservationMaxRecord = 32 * 1024
+	semanticIssueMaxBytes        = 64 * 1024
+	// semanticIssueReadTimeout bounds the forge read well inside the agent's whole 10 s observation
+	// budget (up to 5 s of git reads come first), so a slow forge becomes unknown(timeout) on the
+	// record rather than the client aborting and dropping the observation.
+	semanticIssueReadTimeout      = 3 * time.Second
 	semanticObservationRefPattern = `^(?:[0-9a-f]{40}|[0-9a-f]{64})$`
 )
 
@@ -49,6 +52,19 @@ type currentIssue struct {
 	// Saved is the raw body captured at run creation (ForgeConn.SavedBody). It differs
 	// from the frozen issue text only for a composed (scheduled guidance) description.
 	Saved string
+	// SavedValid is true when the run captured a raw body (issue_saved_body is not NULL), which
+	// may legitimately be empty. Only then is Saved a baseline.
+	SavedValid bool
+}
+
+// issueBaseline returns the text the current raw forge body must be compared with. A composed
+// (scheduled guidance) run froze a text that is not the raw forge body, so its saved raw body is
+// the baseline whenever one was captured and differs from the frozen text, including an empty one.
+func issueBaseline(frozenText string, cur currentIssue) (baseline string, composed bool) {
+	if cur.SavedValid && cur.Saved != frozenText {
+		return cur.Saved, true
+	}
+	return frozenText, false
 }
 
 // readCurrentSemanticIssue reads the run's own issue with a bounded deadline. A
@@ -86,7 +102,7 @@ func (s *Service) currentSemanticIssue(ctx context.Context, wkr store.Worker, ru
 		return currentIssue{Reason: "unreadable"}, nil
 	}
 	cur := readCurrentSemanticIssue(ctx, f, conn.ForgeProjectID, *conn.IssueIID)
-	cur.Saved = conn.SavedBody
+	cur.Saved, cur.SavedValid = conn.SavedBody, conn.SavedBodyValid
 	return cur, nil
 }
 
@@ -184,9 +200,10 @@ func driftIssueSource(ref apitypes.SemanticSourceRef, frozenText string, cur cur
 		out.ObservedHash = semanticHash([]byte(cur.Text))
 		// A composed (scheduled guidance) frozen text is not the raw forge body; compare the
 		// current raw body against the saved raw body instead, as WorkerForgeGetIssue does.
-		baseline, baselineHash := frozenText, ref.Hash
-		if cur.Saved != "" && cur.Saved != frozenText {
-			baseline, baselineHash = cur.Saved, semanticHash([]byte(cur.Saved))
+		baseline, composed := issueBaseline(frozenText, cur)
+		baselineHash := ref.Hash
+		if composed {
+			baselineHash = semanticHash([]byte(baseline))
 		}
 		out.Outcome = apitypes.SemanticDriftUnchanged
 		if out.ObservedHash != baselineHash {
@@ -236,6 +253,44 @@ func driftLinks(frozen []apitypes.SemanticSourceRef, text string) (added, remove
 		}
 	}
 	return added, removed, truncated
+}
+
+// boundedPrdLinks returns the valid PRD paths of text inside the compiler's eight-path window,
+// flagging truncation when the window cut paths off or a path failed the shared predicates.
+func boundedPrdLinks(text string) (paths []string, truncated bool) {
+	found := FindSemanticPrdPaths(text)
+	if len(found) > semanticObservationMaxPRDs {
+		found, truncated = found[:semanticObservationMaxPRDs], true
+	}
+	for _, p := range found {
+		if !ValidSemanticPrdPath(p) || !semanticIdentifier("prd:"+p, 512) {
+			truncated = true
+			continue
+		}
+		paths = append(paths, p)
+	}
+	return paths, truncated
+}
+
+// driftLinksComposed is driftLinks for a composed run: the frozen PRD sources were captured from
+// the composed text (raw body plus schedule guidance), so they cannot be the baseline for the raw
+// body. The links of the saved raw body are, under the same validator, window and bounds.
+func driftLinksComposed(saved, text string) (added, removed []string, truncated bool) {
+	savedPaths, t1 := boundedPrdLinks(saved)
+	currentPaths, t2 := boundedPrdLinks(text)
+	diff := func(from, not []string) []string {
+		skip, out := map[string]bool{}, []string{}
+		for _, p := range not {
+			skip[p] = true
+		}
+		for _, p := range from {
+			if !skip[p] && len(out) < semanticObservationMaxLinks {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	return diff(currentPaths, savedPaths), diff(savedPaths, currentPaths), t1 || t2
 }
 
 // driftPRDSources validates the worker-reported PRD reads against the frozen
@@ -321,7 +376,11 @@ func (s *Service) ObserveSemanticDrift(ctx context.Context, wkr store.Worker, ru
 			rec.GateRevision = *req.GateRevision
 		}
 		if cur.Reason == "" {
-			rec.LinksAdded, rec.LinksRemoved, rec.LinksTruncated = driftLinks(c.candidate.Sources, cur.Text)
+			if saved, composed := issueBaseline(string(blob), cur); composed {
+				rec.LinksAdded, rec.LinksRemoved, rec.LinksTruncated = driftLinksComposed(saved, cur.Text)
+			} else {
+				rec.LinksAdded, rec.LinksRemoved, rec.LinksTruncated = driftLinks(c.candidate.Sources, cur.Text)
+			}
 		}
 		raw, err := json.Marshal(rec)
 		if err != nil {
@@ -345,9 +404,10 @@ type storedSemanticObservations struct {
 	Items        []apitypes.SemanticDriftObservation `json:"items"`
 }
 
-// driftRecordContradicts is true when any source of the record is changed or unknown.
+// driftRecordContradicts is true when any source of the record is changed or unknown, or a PRD
+// link was added to or removed from the issue. It mirrors the agent's hasDriftContradiction.
 func driftRecordContradicts(o apitypes.SemanticDriftObservation) bool {
-	if o.Issue.Outcome != apitypes.SemanticDriftUnchanged {
+	if o.Issue.Outcome != apitypes.SemanticDriftUnchanged || len(o.LinksAdded) > 0 || len(o.LinksRemoved) > 0 {
 		return true
 	}
 	for _, p := range o.PRDs {

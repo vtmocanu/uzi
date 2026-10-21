@@ -362,6 +362,15 @@ func (s *Service) SemanticCoverageStatus(ctx context.Context, workerID, runID uu
 		if out.Outcome == "exhausted" {
 			out.Outcome = "unavailable"
 		}
+		// PRD #1230 D5: the frozen PRD refs let a resumed process observe drift at publication.
+		// Added here, never in evaluateSemanticCoverage, so the gate presentation cannot carry them.
+		prds := []apitypes.SemanticSourceRef{}
+		for _, ref := range c.candidate.Sources {
+			if ref.Kind == "prd" {
+				prds = append(prds, ref)
+			}
+		}
+		out.PRDSources = &prds
 		return nil
 	})
 	if errors.Is(err, errCoverageUnavailable) {

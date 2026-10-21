@@ -426,10 +426,17 @@ server records drift observations when a gate is presented and again after
 the branch is pushed:
 
 - The server re-reads the current issue through the authorized forge
-  connection and hashes it the way the frozen issue source was hashed. The
+  connection and hashes it the way the frozen issue source was hashed. When
+  the run saved the raw issue body at creation and it differs from the frozen
+  text (a scheduled run whose issue text was composed with guidance), the
+  current raw body is compared with that saved body instead. The
   worker hashes each frozen PRD source at the exact commit through trusted bare
   git. Issue links to PRD paths that were added or removed are reported as
-  paths.
+  paths (for such a run, between the saved raw body and the current raw body);
+  an added or removed link counts as a contradiction, like a changed or unknown
+  source. A run resumed after a worker restart or reclaim still records the
+  publication observation: the worker fetches the frozen PRD source refs (ids
+  and hashes only) from the server's coverage status.
 - Each source comes out **unchanged**, **changed** or **unknown** with a reason
   (for example the forge was unreadable or timed out). Unknown counts as a
   contradiction, and a flip of only a task-list checkbox is recorded as
@@ -437,13 +444,14 @@ the branch is pushed:
 - At most 32 observations are kept; the number dropped is counted.
 - It is shown as the owner-only `semantic_drift` field on the run, a
   `SEMANTIC_DRIFT` row in `uzi run get`, and a short note in the pull request
-  body when the publication-time observation recorded a contradiction.
+  body when the publication-time observation recorded a contradiction. An
+  observation the run page cannot load is omitted rather than failing the page.
 
 Drift never holds, refuses, revises or satisfies anything, and it never
-replaces the approved contract; it asks you to look. Known limitation: a
-scheduled run whose frozen issue text was composed (for example with schedule
-guidance added to the issue body) is compared with the raw forge issue, so it
-shows **changed**.
+replaces the approved contract; it asks you to look. A scheduled run whose
+frozen issue text was composed (for example with schedule guidance added to the
+issue body) is compared against the raw body saved at creation, so it shows
+**unchanged** until the issue itself is edited.
 
 ## Not the same as an owner pause
 

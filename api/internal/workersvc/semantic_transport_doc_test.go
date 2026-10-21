@@ -21,7 +21,7 @@ func TestSemanticTransportLimitsDocumented(t *testing.T) {
 	}
 	read := func(rel string) string {
 		t.Helper()
-		raw, err := os.ReadFile(filepath.Join("..", "..", "..", rel))
+		raw, err := os.ReadFile(filepath.Join("..", "..", "..", rel)) //nolint:gosec // G304: fixed repo-relative doc paths from a literal list.
 		if err != nil {
 			t.Fatalf("%s unreadable: %v", rel, err)
 		}

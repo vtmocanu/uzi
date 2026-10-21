@@ -25,6 +25,11 @@ export const semanticCoverageStatusSchema = z.strictObject({
   charged_tokens: natural, remaining_tokens: natural,
   deadline: z.string().datetime({ offset: true }),
   report: coverageReportSchema.optional(),
+  // PRD #1230 D5: the frozen PRD source refs, filled by the worker status endpoint only. A resumed
+  // process reads them to observe drift at publication; the gate presentation never carries them.
+  prd_sources: z.array(z.strictObject({
+    id: z.string().min(1).max(512), kind: z.literal("prd"), provenance: z.string().min(1).max(2048), hash: digest, completeness: z.enum(["complete", "unknown"]),
+  })).max(8).optional(),
 });
 export const semanticReservationSchema = z.strictObject({
   outcome: z.enum(["reserved", "replay", "unavailable"]),

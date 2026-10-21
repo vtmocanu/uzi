@@ -24,7 +24,7 @@ export const semanticObservationRecordSchema = z.strictObject({
   phase: z.enum(["presentation", "publication"]),
   candidate_digest: hex64.optional(),
   gate_revision: z.number().int().safe().positive().optional(),
-  pushed_sha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+  pushed_sha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/).optional(),
   observed_at: z.string().datetime({ offset: true }),
   issue: driftSource,
   prds: z.array(driftSource).max(8),

@@ -132,7 +132,7 @@ The gate shows why autopilot stopped as a `semantic_park` reason (the web gate a
 
 | Reason | Meaning |
 |---|---|
-| `coverage_incomplete` | The review found a source requirement missing or a criterion that is not atomic. |
+| `coverage_incomplete` | The review found a source requirement missing, a requirement the reviewer marks uncertain, or a criterion that is not atomic. |
 | `coverage_uncertain` | The frozen source capture was not complete, so the review cannot give a complete verdict. |
 | `coverage_unavailable` | No usable review: a transport failure, a provider safety refusal of the coverage pass (not a policy hold), or exhausted coverage budgets. |
 | `maintainer_authorization` | Coverage is complete but the candidate lists maintainer criteria that need your explicit approval. |
@@ -142,7 +142,7 @@ The reason is stored only in the presented gate payload, never in the cross-chec
 Three further rules:
 
 - **One-way latch.** Once a semantic run has taken the human gate in an execution, no later candidate in that execution auto-approves, including one you revise.
-- **Exhaustion is a hard stop.** When the coverage budget is spent (at most three reviews and 15 minutes and 120,000 tokens per run, independent of the checker's allowance), the gate opens without another model call, whatever checker rounds remain, and shows the consumed and remaining budget.
+- **Exhaustion is a hard stop.** When the coverage budget is spent (at most three reviews and 15 minutes and 120,000 tokens per run, independent of the checker's allowance), the gate opens without another coverage model call (the plan checker, including its automatic revise rounds, still runs before the coverage step), and shows the consumed and remaining budget.
 - **No checker coverage fallback.** With no worker advertising `cross_check_semantic_plan_v1`, the check waits for its deadline and the lead takes the human gate; it never falls back to the structural check. See [Worker versions and upgrades](./worker-upgrades.md#semantic-completion-capabilities-dormant).
 
 ### Coverage transport limitation

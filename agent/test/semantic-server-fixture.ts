@@ -33,6 +33,8 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   let observationFailure: unknown;
   let issueDrift: Pick<SemanticObservationRecord["issue"], "outcome" | "reason" | "checkbox_only"> = { outcome: "unchanged" };
   let linksAdded: string[] = [];
+  let prdRefs = false;
+  let recordEdit: ((record: SemanticObservationRecord) => void) | undefined;
   const deadline = new Date(Date.now() + 900000).toISOString();
   const status = (): SemanticCoverageStatus => {
     const outcome = forced ?? (persisted ? "complete" : "unavailable");
@@ -70,7 +72,9 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   client.semanticCoverageStatus = async () => {
     events.push("status");
     if (statusFailure !== undefined) throw statusFailure;
-    return status();
+    // Only the worker status endpoint (never the gate presentation) carries the frozen PRD refs.
+    return prdRefs ? { ...status(), prd_sources: compiled!.candidate.sources.filter(x => x.kind === "prd")
+      .map(({ id, kind, provenance, hash, completeness }) => ({ id, kind: kind as "prd", provenance, hash, completeness })) } : status();
   };
   client.reserveSemanticCoverage = async (_id, _gen, request): Promise<SemanticReservation> => {
     events.push("reserve"); requests.push(request);
@@ -117,6 +121,7 @@ export function semanticServer(client: WorkerClient, events: string[]) {
         ...(r.observed_hash ? { observed_hash: r.observed_hash } : {}), ref: r.ref, outcome: r.outcome, ...(r.reason ? { reason: r.reason } : {}) })),
       links_added: linksAdded, links_removed: [],
     };
+    recordEdit?.(record);
     stored.push(record);
     return record;
   };
@@ -146,6 +151,8 @@ export function semanticServer(client: WorkerClient, events: string[]) {
     reserveCount: () => requests.length,
     observations, stored,
     failObservation: (error: unknown) => { observationFailure = error; },
+    prdRefs: (on: boolean) => { prdRefs = on; },
+    editRecord: (edit: (record: SemanticObservationRecord) => void) => { recordEdit = edit; },
     driftIssue: (drift: typeof issueDrift, added: string[] = []) => { issueDrift = drift; linksAdded = added; },
     persisted: () => persisted };
 }

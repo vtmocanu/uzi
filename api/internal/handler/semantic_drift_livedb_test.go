@@ -147,3 +147,23 @@ func TestWorkerSemanticObservationRouteLiveDB(t *testing.T) {
 		t.Fatalf("stored=%d err=%v", stored, err)
 	}
 }
+
+// PRD #1230 D5: the detector never blocks. A stored observation record that cannot be projected
+// omits semantic_drift; the owner's run view still answers 200 with the rest of the run.
+func TestGetRunSemanticDriftProjectionFailureOmitsLiveDB(t *testing.T) {
+	h, router, pool := cliLiveDB(t)
+	h.wsvc = workersvc.New(store.New(pool), h.box, workersvc.Params{})
+	h.wsvc.SetTxBeginner(pool)
+	owner := cliSeedUser(t, pool, false)
+	repo := rmSeedRepo(t, pool, rmSeedConn(t, pool, owner), 1997, true)
+	id := rmSeedRun(t, pool, owner, repo, "running")
+	cliMustExec(t, pool, `UPDATE runs SET completion_contract_version=1 WHERE id=$1`, id)
+	cliMustExec(t, pool, `INSERT INTO semantic_planning(run_id,enrollment,observations) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"sonnet","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}','{"dropped":0,"contradicted":false,"items":[1]}')`, id)
+	rec := bearerReq(router, http.MethodGet, "/api/runs/"+id.String(), cliMintToken(t, pool, owner, clitoken.ScopeUser))
+	var envelope struct {
+		Run apitypes.RunDTO `json:"run"`
+	}
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &envelope) != nil || envelope.Run.ID != id.String() || envelope.Run.SemanticDrift != nil || bytes.Contains(rec.Body.Bytes(), []byte(`"semantic_drift"`)) {
+		t.Fatalf("a drift projection failure must omit semantic_drift, not fail the run view: %d %s", rec.Code, rec.Body.String())
+	}
+}

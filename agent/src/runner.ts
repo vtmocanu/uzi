@@ -19568,11 +19568,19 @@ export class RunRunner {
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: `source drift observation (${target.phase}) not recorded: ${flight.redactText(text)}` } });
     };
     try {
-      const captured = flight.semanticDrift;
+      const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)]);
+      let captured = flight.semanticDrift;
+      // A resumed, already-approved run never ran gatePlan in this process, so it holds no frozen
+      // candidate. At publication the server's coverage status names the frozen PRD sources instead.
+      if (!captured && target.phase === "publication") {
+        const status = await this.client.semanticCoverageStatus(flight.runId, flight.claimGeneration, owned);
+        if (status.prd_sources === undefined) return void note("coverage status carries no frozen PRD sources");
+        if (!flight.barePath) return void note("no bare repository to read the sources from");
+        captured = { barePath: flight.barePath, headSha: "", sources: status.prd_sources };
+      }
       const sha = target.phase === "presentation" ? captured?.headSha : target.pushed_sha;
       if (!captured) return void note("no frozen semantic candidate in this process");
-      if (sha === undefined || !/^[0-9a-f]{40}$/.test(sha)) return void note("no exact commit to read the sources at");
-      const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)]);
+      if (sha === undefined || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return void note("no exact commit to read the sources at");
       const prd_sources = await observePrdSources(this.git, { barePath: captured.barePath, sha, sources: captured.sources, timeoutMs: 5000, signal: owned });
       const request: SemanticObservationRequest = { ...target, prd_sources };
       const record = await this.client.postSemanticObservation(flight.runId, flight.claimGeneration, request, owned);
@@ -19940,9 +19948,14 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
-    // PRD #1230 D5: record the source drift of the presentation just accepted. Detection only; it
-    // swallows every failure, so it can neither hold nor fail the gate.
-    await onSemanticPresented?.(ack);
+    // PRD #1230 D5: record the source drift of the presentation just accepted. Detection only: it is
+    // not awaited, so the git reads and the POST (bounded by observeSemanticDrift's own 10 s budget and
+    // the lifecycle signal) never delay the verdict wait, and its own catch keeps a failure from the gate.
+    if (onSemanticPresented) {
+      void Promise.resolve().then(() => onSemanticPresented(ack)).catch(error => {
+        runLog.warn("semantic drift presentation hook failed", { run_id: runId, error: errMessage(error) });
+      });
+    }
     // Human gates start advisory work only after a positive storage acknowledgement, and do
     // not await it: the verdict wait must not be delayed by the summary model or its POST.
     if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {

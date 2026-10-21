@@ -243,7 +243,8 @@ and your overlay is composed onto it at fire time, under a single guidance heade
 Guidance affects one dormant detector. On a semantic run (not enrolled in
 production until #1231), source-drift observations compare the current forge
 issue with the frozen issue text; a scheduled run whose frozen text was composed
-with guidance therefore shows **changed**. Drift only displays and never holds the
+with guidance is compared with the raw issue body saved at creation instead, so
+it shows **unchanged** until the issue is edited. Drift only displays and never holds the
 run; see [Completion holds](./run-completion-hold.md#source-drift-is-a-detector-only).
 
 ## Proposal output: MR or issues

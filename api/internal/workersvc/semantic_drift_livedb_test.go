@@ -264,3 +264,70 @@ func TestSemanticDriftComposedRunLiveDB(t *testing.T) {
 		t.Fatalf("edited composed run: %+v err=%v", rec, err)
 	}
 }
+
+// The worker status carries exactly the candidate's frozen PRD refs (so a resumed process can
+// observe drift at publication) and omits the field when the status is unavailable.
+func TestSemanticCoverageStatusPRDSourcesLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	want := []apitypes.SemanticSourceRef{}
+	for _, ref := range d.candidate.Sources {
+		if ref.Kind == "prd" {
+			want = append(want, ref)
+		}
+	}
+	if len(want) == 0 {
+		t.Fatal("fixture has no frozen prd source")
+	}
+	gotp := d.status(t).PRDSources
+	if gotp == nil {
+		t.Fatal("PRDSources absent on a frozen candidate")
+	}
+	got := *gotp
+	if len(got) != len(want) {
+		t.Fatalf("PRDSources=%+v want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] || got[i].Kind != "prd" {
+			t.Fatalf("PRDSources[%d]=%+v want %+v", i, got[i], want[i])
+		}
+	}
+
+	bare := d.e.seedActiveRunOwnedBy(t, d.worker)
+	d.e.exec(t, `UPDATE runs SET claim_generation=7,completion_contract_version=1 WHERE id=$1`, bare)
+	unavailable, err := d.svc.SemanticCoverageStatus(d.e.ctx, d.worker, bare, 7)
+	if err != nil || unavailable.Outcome != "unavailable" || unavailable.PRDSources != nil {
+		t.Fatalf("unavailable status: %+v err=%v", unavailable, err)
+	}
+	raw, err := json.Marshal(unavailable)
+	if err != nil || strings.Contains(string(raw), "prd_sources") {
+		t.Fatalf("an unavailable status must omit prd_sources: %s err=%v", raw, err)
+	}
+}
+
+// A composed run whose raw body is unedited reports no link drift even though the composed
+// text carried a PRD path the raw body never had (the frozen PRD source came from the guidance).
+func TestSemanticDriftComposedLinksLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	d.e.exec(t, `UPDATE runs SET issue_saved_body=$2 WHERE id=$1`, d.run, "raw forge body")
+	d.forge.issue.Description = "raw forge body"
+	rec, err := d.observe(t, 7, d.publication(sha40(11)))
+	if err != nil || rec.Issue.Outcome != "unchanged" || len(rec.LinksAdded) != 0 || len(rec.LinksRemoved) != 0 {
+		t.Fatalf("unedited composed run reports links: %+v err=%v", rec, err)
+	}
+	d.forge.issue.Description = "raw forge body\nsee prds/9-new.md"
+	if rec, err = d.observe(t, 7, d.publication(sha40(12))); err != nil || len(rec.LinksAdded) != 1 || rec.LinksAdded[0] != "prds/9-new.md" || len(rec.LinksRemoved) != 0 {
+		t.Fatalf("link added to the raw body: %+v err=%v", rec, err)
+	}
+}
+
+// An empty saved raw body (issue_saved_body = ”) is a real baseline: a composed run whose
+// raw body is still empty is unchanged, not changed forever.
+func TestSemanticDriftEmptySavedBodyLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	d.e.exec(t, `UPDATE runs SET issue_saved_body='' WHERE id=$1`, d.run)
+	d.forge.issue.Description = ""
+	rec, err := d.observe(t, 7, d.publication(sha40(13)))
+	if err != nil || rec.Issue.Outcome != "unchanged" {
+		t.Fatalf("empty saved body: %+v err=%v", rec, err)
+	}
+}
