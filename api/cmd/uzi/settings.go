@@ -13,7 +13,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(&cobra.Command{
-		Use: "get", Short: "Show account settings and cross-check pins", Args: cobra.NoArgs,
+		Use: "get", Short: "Show account settings, cross-check pins and model settings", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := env.client(gf)
 			if err != nil {

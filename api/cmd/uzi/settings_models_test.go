@@ -89,7 +89,7 @@ func TestSettingsGetModelSettingsTable(t *testing.T) {
 func TestSettingsGetModelSettingsUnknownAndHostile(t *testing.T) {
 	hostile := "evil\x1b]8;;https://evil.example\x07link\x1b]8;;\x07\u202e" + strings.Repeat("x", 10000)
 	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{JudgeModels: []apitypes.ModelSettingCellDTO{
-		{Harness: "claude", Model: &hostile, DefaultModel: hostile, ResolvedModel: hostile, Source: "from_the_future"},
+		{Harness: hostile, Model: &hostile, DefaultModel: hostile, ResolvedModel: hostile, Source: "from_the_future"},
 	}}}
 	out, _, code := runCLI(t, fakeEnv(fc), "settings", "get")
 	if code != 0 || strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Contains(out, strings.Repeat("x", 201)) ||

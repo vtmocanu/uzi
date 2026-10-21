@@ -137,8 +137,8 @@ Where to set each lane:
 
 - **Your Claude judge model:** **Settings → Run defaults → Run judge → Judge
   model**; leave it on **Inherit** to use the instance value.
-- **Your Codex judge model:** the `codex_judge_model` key of the user settings
-  API.
+- **Your Codex judge model:** the `codex_judge_model` field of
+  `PUT /api/me/settings` (a signed-in browser session; the CLI has no setter).
 - **Instance Claude judge model:** **Admin → Instance → Run judge**.
 - **Instance Codex judge model:** the `codex_judge_model` key of the admin
   settings API.
@@ -147,9 +147,10 @@ Where to set each lane:
 is stored, the default, what a judge run would resolve to, and where that came
 from; see [CLI](./cli.md#plan-cross-check-settings).
 
-**Migration.** A Codex id previously stored in `judge_model` (yours or the
-instance's) is copied into the Codex lane; the Claude key is left unchanged
-and is then skipped, with a note, by Claude judges.
+**Migration.** A curated Codex id previously stored in `judge_model` (yours or
+the instance's) is copied into the Codex lane; the Claude key is left unchanged
+and is then skipped, with a note, by Claude judges. Any other Codex id (such
+as `gpt-6-luna`) is not copied.
 
 The judge uses your [reasoning effort](./worker-effort.md) preference for its
 run's harness: Claude or Codex. An unset preference inherits `medium`.
