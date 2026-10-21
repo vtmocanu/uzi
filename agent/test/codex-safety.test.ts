@@ -53,7 +53,7 @@ for (const origin of ["deadline", "external", "both"] as const) {
       });
       assert.equal(Object.isFrozen(captureFailureOf(error)), true);
       assert.equal(captureFailureOf(JSON.parse(JSON.stringify(error))), undefined, "JSON cannot mint capture provenance");
-      assert.equal(error.errors[0]?.category, origin === "deadline" ? "timeout" : "authorization");
+      assert.deepEqual(error.errors, [{ category: "timeout", message: "codex capture deadline expired" }]);
       assert.equal(registry.state(), "poisoned");
       assert.equal(safety.completedCaptureForTeardown(), undefined);
       assert.equal(Object.keys(error).includes("deadlineExpired"), false, "provenance is not an error wire field");

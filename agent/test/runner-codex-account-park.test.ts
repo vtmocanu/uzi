@@ -345,10 +345,11 @@ describe("M2 account park W3-W6/W9", () => {
     } finally { restore(); }
   });
 
-  it("W5/W6 capture-discovered account deferral replaces cause/feed and freshly confirms/settles before retry park", async () => {
+  it("W5/W6 capture-discovered account deferral replaces cause/feed and freshly confirms/settles before retry park", async (t) => {
     client.protocolFeatures = [FEATURE, "claim_generation_fence"];
     const { gitlab, calls } = fakeGitlab();
-    const rig = codexRig({ accountUnavailable: () => true });
+    // This synchronous fake finishes its filesystem mutations and owns no provider work.
+    const rig = codexRig({ accountUnavailable: () => true, providerRoot: false });
     const claim = gitlabClaim(159512, { claim_generation: 3 });
     const events: string[] = [];
     let settled = 0;
@@ -359,7 +360,14 @@ describe("M2 account park W3-W6/W9", () => {
       fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "uncommitted edit\n");
       events.push("transient");
       throw new TransientRecoveryError();
-    }, undefined, async (ms, action, purpose, signal) => { settled++; events.push("settle"); return rig.capture(ms, action, purpose, signal); });
+    }, async () => {
+      events.push("legacy-settle");
+      assert.equal(rig.registry.rootCount(), 0);
+      assert.equal(rig.registry.pendingLaunchCount(), 0);
+      assert.equal(rig.registry.inFlightCallbackCount(), 0);
+      events.push("legacy-empty");
+      return { kind: "observed_empty" };
+    }, async (ms, action, purpose, signal) => { settled++; events.push("settle"); return rig.capture(ms, action, purpose, signal); });
     const { logger, lines } = recordingLogger();
     const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
       recoveryRetryMs: 1, checkpointIntervalMs: 0,
@@ -383,6 +391,8 @@ describe("M2 account park W3-W6/W9", () => {
         };
       },
     });
+    const shutdown = () => runner.shutdown();
+    t.signal.addEventListener("abort", shutdown, { once: true });
     const custody = spyCustodySettle(runner);
     const waits = observeWaits(runner);
     const report = client.reportState.bind(client);
@@ -416,6 +426,11 @@ describe("M2 account park W3-W6/W9", () => {
     const restore = spyPublishLands();
     try {
       await runner.execute(claim);
+      assert.equal(events.filter((event) => event === "legacy-settle").length, 1, "transient recovery invokes the legacy settlement facade");
+      assert.ok(events.indexOf("legacy-settle") > events.indexOf("transient"));
+      assert.equal(events.filter((event) => event === "legacy-empty").length, 1);
+      assert.ok(events.indexOf("legacy-empty") > events.indexOf("legacy-settle"));
+      assert.ok(events.indexOf("legacy-empty") < events.indexOf("settle"), "verified empty legacy settlement precedes real held capture");
       assert.ok(proofs > 8, "capture-discovered deferral survives old blocked cap");
       assert.equal(settled, 8, "seven refused proofs and the final capture each acquire their own scope");
       assert.deepEqual(blockedProofs, Array.from({ length: 7 }, (_, index) => ({
@@ -435,7 +450,11 @@ describe("M2 account park W3-W6/W9", () => {
       assert.equal(rig.refreshCalls(), 1);
       assert.equal(rig.releaseCalls(), 0);
       assert.doesNotMatch(JSON.stringify(lines), new RegExp(VAULT_BODY_SENTINEL));
-    } finally { restore(); }
+    } finally {
+      t.signal.removeEventListener("abort", shutdown);
+      runner.shutdown();
+      restore();
+    }
   });
 
   it("W5: incomplete settle and failed fetch-back retain running work and heartbeat before verified park", async () => {

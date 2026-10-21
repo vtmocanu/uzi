@@ -582,9 +582,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         }
         const childCleanupFailed = errors.length > 0;
         deadlineExpired ||= this.now() >= captureDeadlineAt;
-        if (signal?.aborted) {
-          errors.push({ category: "authorization", message: "codex capture authority revoked" });
-        } else if (deadlineExpired) {
+        if (signal?.aborted || deadlineExpired) {
           errors.push({ category: "timeout", message: "codex capture deadline expired" });
         }
         const completed = errors.length === 0 ? lane.complete() : undefined;
