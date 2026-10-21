@@ -3191,6 +3191,37 @@ describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => 
     assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 1);
   });
 
+  // Issue #3139: native command/file/MCP root items count as a lead tool call; dynamic tool calls
+  // are projected as main-origin tool frames (see "routes an item/tool/call to the broker") and are
+  // counted by the reducer, so the activity marker excludes them.
+  const leadToolCalls = (events: HarnessEvent[]): number =>
+    events.filter((e) => e.kind === "activity" && e.leadToolCall === true).length;
+
+  for (const type of ["commandExecution", "fileChange", "mcpToolCall"]) {
+    it(`a root-thread ${type} item/started carries leadToolCall (issue #3139)`, async () => {
+      const { harness, transport } = makeHarness();
+      transport.push(threadStarted()).push(itemNote("item/started", type, "th-1"))
+        .push(itemNote("item/completed", type, "th-1")).push(turnCompleted("completed")).end();
+      assert.equal(leadToolCalls(await collect(harness.startTurn(makeRequest()).events)), 1);
+    });
+  }
+
+  it("a root dynamicToolCall item/started is modelInitiated but not leadToolCall (issue #3139)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(itemNote("item/started", "dynamicToolCall", "th-1"))
+      .push(turnCompleted("completed")).end();
+    const events = await collect(harness.startTurn(makeRequest()).events);
+    assert.equal(modelInitiated(events), 1);
+    assert.equal(leadToolCalls(events), 0);
+  });
+
+  it("a child-thread commandExecution item/started carries no leadToolCall (issue #3139)", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(itemNote("item/started", "commandExecution", "child-thread"))
+      .push(turnCompleted("completed")).end();
+    assert.equal(leadToolCalls(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+
   it("a root-thread item/completed alone (no start this turn) is not marked modelInitiated", async () => {
     const { harness, transport } = makeHarness();
     transport
