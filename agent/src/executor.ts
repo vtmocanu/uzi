@@ -963,6 +963,14 @@ export interface Executor {
    */
   settleWorkerCommands?(deadlineMs: number): Promise<{ confirmed: boolean }>;
   /**
+   * issue #3181: wait, without bound and without starting, aborting or killing anything, for the
+   * operations this executor already owns and has running (the guarded lane disposal that
+   * killAgentTree started and the background JS-deps install). The runner calls it only on a
+   * flight whose retained credential switch could not prove those operations stopped, BEFORE the
+   * flight's shared slots are released. Never rejects. Absent on the stub/test and Codex executors.
+   */
+  joinOwnedOperations?(): Promise<void>;
+  /**
    * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
    * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process
    * and aborts nothing: the executor leaves out any subtree a still-running step needs (the

@@ -1072,6 +1072,13 @@ export class Worker {
         // coordinator single-flights, spaces and bounds the passes; `sampledAtMs` is this
         // heartbeat's send time, so a credential rejection newer than it keeps the pass closed. A
         // runner double without the method has nothing to re-drive.
+        // issue #3181: re-deliver a credential-switch hold-settled acknowledgement that failed at the
+        // end of its flight. Fire-and-forget and single-flight inside the runner.
+        if (typeof this.runner.retryPendingHoldSettled === "function") {
+          void this.runner.retryPendingHoldSettled().catch((err) => {
+            this.log.warn("credential switch hold acknowledgement retry failed", { error: errMessage(err) });
+          });
+        }
         if (sampledAtMs !== undefined && typeof this.runner.resumeLiveRecoveries === "function") {
           void this.runner.resumeLiveRecoveries(sampledAtMs, signal).catch((err) => {
             this.log.warn("recovery: live re-drive failed", { error: errMessage(err) });

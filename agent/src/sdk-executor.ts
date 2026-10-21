@@ -106,6 +106,7 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -834,6 +835,9 @@ interface DriveState {
   budget?: { asked: number };
 }
 
+/** issue #3181: a reap whose joins outlived the maintenance budget: nothing was proven, so it is incomplete. */
+const unconfirmedJoinReap = (): RunProcessReap => ({ killed: [], left: [], complete: false });
+
 export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
    *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
@@ -1171,17 +1175,22 @@ export class SdkExecutor implements Executor {
    * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
-    await this.closeAndSettlePlanSummary();
+    // issue #3181: under a MaintenanceBudget (the retained credential switch's settlement) the
+    // joins below are WAITS on operations this executor already runs, so they stop waiting when
+    // the budget is spent; nothing new is started and the operations keep running. Without a
+    // budget every join is unbounded, as before.
+    const budget = MaintenanceBudget.current();
+    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
-    await this.laneDisposal;
+    if (!joined || !await this.waitWithin(this.laneDisposal, budget)) return unconfirmedJoinReap();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
     const deps = this.activeDeps;
     if (deps && !this.depsJoined) {
       deps.abort.abort();
-      await deps.install;
+      if (!await this.waitWithin(deps.install, budget)) return unconfirmedJoinReap();
       this.depsJoined = true;
     }
     const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
@@ -1197,6 +1206,34 @@ export class SdkExecutor implements Executor {
       });
     }
     return r;
+  }
+
+  /**
+   * Wait for an executor-owned, already-running promise, giving up (false) once `budget` has no
+   * time left. A promise that already settled reads true even with no time left. The timer is
+   * always cleared and the awaited operation is never cancelled by the give-up.
+   */
+  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined): Promise<boolean> {
+    if (!pending) return true;
+    if (!budget) { await pending; return true; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(budget.remainingMs(), 2_147_483_647)); });
+    try { return await Promise.race([pending.then(() => true as const, () => true as const), expired]); }
+    finally { clearTimeout(timer); }
+  }
+
+  /**
+   * issue #3181: join, without bound, what this executor already runs: the guarded lane disposal
+   * killAgentTree started and the background deps install. Starts, aborts and kills nothing. Never
+   * rejects. Marks the deps joined, which re-enables the `.npm/_cacache` drop.
+   */
+  async joinOwnedOperations(): Promise<void> {
+    await this.laneDisposal?.catch(() => undefined);
+    const deps = this.activeDeps;
+    if (deps && !this.depsJoined) {
+      await deps.install.catch(() => undefined);
+      this.depsJoined = true;
+    }
   }
 
   /**

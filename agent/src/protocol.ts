@@ -60,6 +60,15 @@ export type RunState =
    *  release. Reported by enterCredentialSwitch's give-up path (runner.ts); the server clears the
    *  pending switch stamp on it. */
   | "credential_switch_failed"
+  /** issue #3181: a retained successor could not prove its run processes stopped before a
+   *  credential switch. Reported with `claim_generation` and the current `register_nonce` (the
+   *  client stamps it); the server pauses the run (hold_reason credential_switch_settling) and
+   *  keeps it from resuming until the worker acknowledges below. Requires the
+   *  `credential_switch_hold` feature. */
+  | "credential_switch_held"
+  /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
+   *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
+  | "credential_switch_hold_settled"
   | "completed"
   | "failed";
 
@@ -2956,6 +2965,10 @@ export interface StateAck {
    *  so enterCredentialSwitch treats the release as done off this flag, not off status === 'queued'
    *  (which missed the idempotent-after-reclaim success and gave up on a server-confirmed release). */
   credentialSwitchReleased?: boolean;
+  /** issue #3181: true when the 200 ack carried `disposition: "held"` (the hold report applied). */
+  credentialSwitchHeld?: boolean;
+  /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
+  credentialSwitchHoldSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent

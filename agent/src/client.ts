@@ -1178,6 +1178,9 @@ const COMPLETION_OBSERVATIONS_MAX = 2048;
 type CompletionTicket = { incarnation: number; runId?: string; exclusions: Set<string> };
 type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 
+/** issue #3181: the registration feature that lets a worker hold a credential switch it cannot settle. */
+export const CREDENTIAL_SWITCH_HOLD_FEATURE = "credential_switch_hold";
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
@@ -2045,6 +2048,16 @@ export class WorkerClient {
       return this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES,
         undefined, { incarnation, binding });
     }
+    if (body.status === "credential_switch_held" || body.status === "credential_switch_hold_settled") {
+      // issue #3181: fenced on the current registration. The nonce is the one the most recent
+      // register response returned; no generation send gate or strict-decode downgrade applies,
+      // because an api without the feature would misread a hold as an ordinary status.
+      const nonce = this.registerNonce;
+      if (!this.hasFeature(CREDENTIAL_SWITCH_HOLD_FEATURE) || !nonce ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0)
+        throw new Error("credential switch hold report requires the credential_switch_hold feature, a registration nonce and a positive claim_generation");
+      return this.reportStateOnce(runId, path, { ...body, register_nonce: nonce }, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
     if (hasRevisionSourceFields(body))
@@ -2304,6 +2317,9 @@ export class WorkerClient {
             ack.staleClaim = fields.staleClaim;
           if (fields.credentialSwitchReleased !== undefined)
             ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+          if (fields.credentialSwitchHeld !== undefined) ack.credentialSwitchHeld = fields.credentialSwitchHeld;
+          if (fields.credentialSwitchHoldSettled !== undefined)
+            ack.credentialSwitchHoldSettled = fields.credentialSwitchHoldSettled;
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
@@ -4506,6 +4522,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   credentialSwitch?: { generation: number };
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
+  credentialSwitchHeld?: boolean;
+  credentialSwitchHoldSettled?: boolean;
   gateRevision?: number;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
@@ -4585,6 +4603,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       credentialSwitch?: { generation: number };
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
+      credentialSwitchHeld?: boolean;
+      credentialSwitchHoldSettled?: boolean;
       gateRevision?: number;
       revisionInputId?: number;
       supersededRevisionInputIds?: number[];
@@ -4691,6 +4711,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // release after a reclaim (status 'running'), so enterCredentialSwitch accepts the release off
     // this flag rather than off status === 'queued' (which missed the idempotent case).
     if (parsed?.disposition === "released") out.credentialSwitchReleased = true;
+    // issue #3181: the credential-switch HOLD report applied (`held`), and its settling
+    // acknowledgement applied (`hold_settled`). Read only off the 200 ack, like `released`.
+    if (parsed?.disposition === "held") out.credentialSwitchHeld = true;
+    if (parsed?.disposition === "hold_settled") out.credentialSwitchHoldSettled = true;
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
