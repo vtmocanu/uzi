@@ -639,11 +639,24 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
   # chmod it): it is adopted only with no group/other WRITE bit (mode & 022 == 0), so an
   # fsGroup re-walk to 2770 still fails startup closed. A wrong owner, symlink or non-directory
   # fails startup closed with the contents untouched. An absent leaf is created fresh.
+  #
+  # RACE SAFETY: /data/runner is sticky, and in the reverse-skew layout (TMPDIR == $DATA_DIR/runner)
+  # the runner owns uzi-runner and can rename it and plant a symlink between validation and a
+  # path-following chmod. So validation also records the leaf's lstat identity (owner, device:inode),
+  # and every mutation goes through scratch_normalize: it cd's into the leaf (physical), re-checks
+  # that the directory it is IN still has the recorded identity, and then chowns/chmods "." only,
+  # never the leaf path. An identity mismatch refuses startup. A leaf absent at validation that exists
+  # (or is a symlink) at normalisation time is refused too. Residuals: a swap after the cd leaves the
+  # ORIGINAL (moved) leaf briefly root-owned with its mode unchanged, then handed back (a post-chown
+  # path check detects the swap and hands back at once); the worker leaf may already be 0700 when a
+  # later runner-leaf refusal fires; and a swap by the runner of its own leaf AFTER boot is out of scope.
   SCRATCH_REASON=
   SCRATCH_PREV_MODE=
-  scratch_check() { # $1 path, $2 expected owner name, $3 runner|worker; sets SCRATCH_REASON / SCRATCH_PREV_MODE
+  SCRATCH_PREV_ID=
+  scratch_check() { # $1 path, $2 expected owner name, $3 runner|worker; sets SCRATCH_REASON / SCRATCH_PREV_MODE / SCRATCH_PREV_ID
     SCRATCH_REASON=
     SCRATCH_PREV_MODE=
+    SCRATCH_PREV_ID=
     if [ -L "$1" ]; then SCRATCH_REASON="is a symlink"; return 0; fi
     [ -e "$1" ] || return 0
     if [ ! -d "$1" ]; then SCRATCH_REASON="is not a directory"; return 0; fi
@@ -658,12 +671,56 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
     elif [ "$3" = worker ] && [ $((0$sc_mode & 022)) -ne 0 ]; then
       SCRATCH_REASON="mode is $sc_mode, group/other write set"
     else
+      # lstat identity ("owner dev:inode") for scratch_normalize; "$1" is not a symlink here.
+      if ! sc_ident="$("$BUSYBOX" stat -c '%U %d:%i' "$1" 2>/dev/null)"; then
+        SCRATCH_REASON="identity could not be read"; return 0
+      fi
       SCRATCH_PREV_MODE="$sc_mode"
+      SCRATCH_PREV_ID="$sc_ident"
     fi
   }
   scratch_refuse() { # $1 path, $2 reason
     echo "uzi-entrypoint: refusing to start: per-uid scratch $1 cannot be safely adopted ($2); contents preserved; see ADR-3153 operator procedure" >&2
     exit 1
+  }
+  # Normalise ONE leaf without ever following a path after validation. $1 leaf, $2 owner spec to hand
+  # back, $3 expected "%U %d:%i" identity, $4 optional "verify" (check only, no mutation). Runs in a
+  # subshell, so every command carries its own `|| exit N` (set -e is inert on the caller's `||` side).
+  # Exit 0 ok; 3 identity mismatch / swap detected; 4 an operation failed.
+  scratch_normalize() {
+    (
+      cd -P -- "$1" || exit 3
+      sn_id="$("$BUSYBOX" stat -c '%U %d:%i' . 2>/dev/null)" || exit 3
+      [ "$sn_id" = "$3" ] || exit 3
+      sn_here="${sn_id#* }"
+      # True while the leaf NAME still resolves to the directory we are in.
+      sn_named() {
+        [ ! -L "$1" ] || return 1
+        sn_p="$("$BUSYBOX" stat -c '%d:%i' "$1" 2>/dev/null)" || return 1
+        [ "$sn_p" = "$sn_here" ]
+      }
+      if [ "${4:-}" = verify ]; then
+        sn_named "$1" || exit 3
+        exit 0
+      fi
+      # Leaf only, root has no CAP_FOWNER/FSETID semantics: reclaim to root, chmod, hand back; all on ".".
+      "$CHOWN" -h 0:0 . || exit 4
+      if ! sn_named "$1"; then
+        "$CHOWN" -h "$2" . || true
+        exit 3
+      fi
+      "$CHMOD" 00700 . || exit 4
+      "$CHOWN" -h "$2" . || exit 4
+    )
+  }
+  scratch_apply() { # same arguments as scratch_normalize; maps its exit code to startup behaviour
+    sc_rc=0
+    scratch_normalize "$@" || sc_rc=$?
+    case "$sc_rc" in
+      0) ;;
+      3) scratch_refuse "$1" "changed identity before normalisation" ;;
+      *) echo "uzi-entrypoint: refusing to start: could not normalise per-uid scratch $1" >&2; exit 1 ;;
+    esac
   }
   scratch_entries() { # top-level entry count, or "unknown" when root cannot list it
     if [ ! -r "$1" ] || [ ! -x "$1" ]; then echo unknown; return 0; fi
@@ -677,27 +734,37 @@ if [ -n "$SCRATCH_DOCKER_LANE" ]; then
   scratch_check "$WORKER_TMPDIR" worker worker
   [ -z "$SCRATCH_REASON" ] || scratch_refuse "$WORKER_TMPDIR" "$SCRATCH_REASON"
   sc_worker_prev="$SCRATCH_PREV_MODE"
+  sc_worker_id="$SCRATCH_PREV_ID"
   scratch_check "$RUNNER_TMPDIR" runner runner
   [ -z "$SCRATCH_REASON" ] || scratch_refuse "$RUNNER_TMPDIR" "$SCRATCH_REASON"
   sc_runner_prev="$SCRATCH_PREV_MODE"
-  for sc_pair in "$WORKER_TMPDIR|$WORKER_OWNER|$sc_worker_prev" "$RUNNER_TMPDIR|runner:runner|$sc_runner_prev"; do
+  sc_runner_id="$SCRATCH_PREV_ID"
+  for sc_pair in "$WORKER_TMPDIR|$WORKER_OWNER|$sc_worker_prev|$sc_worker_id" "$RUNNER_TMPDIR|runner:runner|$sc_runner_prev|$sc_runner_id"; do
     sc_leaf="${sc_pair%%|*}"
     sc_rest="${sc_pair#*|}"
     sc_owner="${sc_rest%%|*}"
-    sc_prev="${sc_rest#*|}"
-    if [ -e "$sc_leaf" ]; then
-      echo "uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): $sc_leaf entries=$(scratch_entries "$sc_leaf") previous_mode=$sc_prev" >&2
-      if [ "$sc_prev" != 700 ]; then
-        # Leaf only, root has no CAP_FOWNER/FSETID semantics: reclaim to root, chmod, hand back.
-        "$CHOWN" -h 0:0 "$sc_leaf"
-        "$CHMOD" 00700 "$sc_leaf"
-        "$CHOWN" -h "$sc_owner" "$sc_leaf"
-      fi
-    else
+    sc_rest="${sc_rest#*|}"
+    sc_prev="${sc_rest%%|*}"
+    sc_id="${sc_rest#*|}"
+    if [ -z "$sc_id" ]; then
+      # Absent at validation: anything there now (a leaf or a planted symlink) appeared since.
+      if [ -e "$sc_leaf" ] || [ -L "$sc_leaf" ]; then scratch_refuse "$sc_leaf" "appeared after validation"; fi
       "$MKDIR" "$sc_leaf"
       if [ -L "$sc_leaf" ]; then scratch_refuse "$sc_leaf" "became a symlink while being created"; fi
-      "$CHMOD" 00700 "$sc_leaf"
-      "$CHOWN" -h "$sc_owner" "$sc_leaf"
+      if ! sc_fresh="$("$BUSYBOX" stat -c '%U %d:%i' "$sc_leaf" 2>/dev/null)"; then
+        scratch_refuse "$sc_leaf" "owner and identity could not be read after creation"
+      fi
+      if [ "${sc_fresh%% *}" != root ]; then
+        scratch_refuse "$sc_leaf" "owner is ${sc_fresh%% *} after creation, expected root"
+      fi
+      scratch_apply "$sc_leaf" "$sc_owner" "$sc_fresh"
+    else
+      echo "uzi-entrypoint: per-uid scratch adopted (contents preserved, writer exclusion not established): $sc_leaf entries=$(scratch_entries "$sc_leaf") previous_mode=$sc_prev" >&2
+      if [ "$sc_prev" != 700 ]; then
+        scratch_apply "$sc_leaf" "$sc_owner" "$sc_id"
+      else
+        scratch_apply "$sc_leaf" "$sc_owner" "$sc_id" verify
+      fi
     fi
   done
 else
