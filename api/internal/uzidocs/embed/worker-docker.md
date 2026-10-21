@@ -193,18 +193,38 @@ per-pod `emptyDir`.
 - **The data volume now holds more.** Clones and daemon-owned bytes count
   against the volume's existing pressure thresholds; there is no Docker-specific
   threshold, and the volume sizes are unchanged.
-- **Rootless dind cannot write into run directories the worker made.** The
-  rootless daemon's uid cannot create files inside a run's checkout (in
-  either mode; measured under uid-split, by permission arithmetic for
-  single-uid), so `docker run -v <checkout>:...` bind sources that need to
-  write back into the checkout fail with a permission error unless the
-  directory is made writable another way. Under uid-split it also cannot
-  create entries at the top of `runner-shared`. Under the uid split this
-  matches the old `emptyDir` behaviour. uid-split does not fix writability. **Run
-  Docker workers in uid-split mode** for a different reason: it closes the
-  single-uid subPath re-resolution residual (a worker-uid process replacing
-  `runner-shared` before a dind restart; see
-  [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)).
+- **Rootless dind cannot write into run directories the worker made.** A
+  rootless dind container runs as host uid 1000 (100000+ for a non-root
+  container user) and, by inference, does not hold the pod's fsGroup 10001,
+  so it is judged on the "other" permission bits. By default it cannot create
+  files inside a run's checkout, in either uid mode, so
+  `docker run -v <checkout>:...` bind sources that need to write back into the
+  checkout fail with a permission error unless the directory is made writable
+  another way. This predates the `runner-shared` layout: checkout creation is
+  unchanged, and the old `emptyDir` behaved the same. After an fsGroup
+  re-walk the daemon, which holds 10001, can write there; the container still
+  cannot. Under the uid split nothing else changed.
+- **Single-uid only: rootless containers lost writes at the top of
+  `/data/runner` and in `TMPDIR`.** Owner decision 2026-10-21: accepted as a
+  documented single-uid regression; modes unchanged. The old `emptyDir` root
+  was mode `2777` and was also `TMPDIR`, so a rootless container could create,
+  rename and delete entries there. `runner-shared` and `.tmp` are now
+  `10001:10001` `3775` (sticky, other `r-x`). The broken pattern: a rootless
+  container that bind-mounts the `/data/runner` root or the `TMPDIR` root
+  (for example `-v "$TMPDIR":/x`) and writes into it now fails with a
+  permission error. A bind of a `mkdtemp` subdirectory (`0700`) was never
+  writable to the container. Rootful dind containers write everywhere in the
+  bind mount before and after. The daemon itself can still create at the top
+  and in `.tmp`, so bind sources it auto-creates still work. This is not a
+  rare pattern. Evidence is auditor code analysis only (base `dea3ba68` versus
+  this layout); no real rootless container was run, and the rootless
+  container/UID functional check remains an open validation item.
+  See [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md), Permissions.
+- **Run Docker workers in uid-split mode** for a different reason: it
+  closes the single-uid subPath re-resolution residual (a worker-uid process
+  replacing `runner-shared` before a dind restart; see
+  [ADR-3153](../adr/3153-runner-shared-pvc-subpath.md)). It does not restore
+  rootless-container writability.
 
 ### Upgrading and rolling back
 

@@ -350,9 +350,13 @@ replacing the pod keeps the run clones (a reschedule to another node also
 depends on the data StorageClass supporting reattach, which has not been
 verified); deleting or recycling the PVC itself (the full-volume recycle
 above, or removing an ephemeral worker) still deletes them. A rootless dind
-container cannot write into worker-created run directories through bind
-mounts (measured under uid-split, where this matches the old `emptyDir`
-behaviour; by permission arithmetic in single-uid mode). **Run Docker workers in uid-split mode** for a different reason:
+container cannot write into worker-created run checkouts through bind
+mounts by default; that predates this layout in both uid modes. In single-uid
+mode it also lost writes at the `/data/runner` and `TMPDIR` roots (owner
+decision 2026-10-21: accepted as a documented regression; code analysis only,
+no real rootless container run; see
+[Docker inside a worker](./worker-docker.md#run-directory-on-the-data-volume)).
+**Run Docker workers in uid-split mode** for a different reason:
 it closes the single-uid subPath re-resolution residual. Upgrade order, the
 custody migration guard (surfaced as the fleet health warning
 `Worker roll held at <image>: layout_migration_custody`), rollback and the disk-full
