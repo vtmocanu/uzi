@@ -135,11 +135,11 @@ func TestCodexJudgeModelMigrationUsersLiveDB(t *testing.T) {
 	}
 	var rows []seeded
 	for _, id := range curatedIDs() {
-		for _, padded := range []string{id, "  " + id + "  ", "\t" + id + "\n"} {
+		for _, padded := range []string{id, "  " + id + "  ", "\t" + id + "\n", id + "\v"} {
 			rows = append(rows, seeded{cjSeedUser(t, pool, padded), padded, id})
 		}
 	}
-	for _, notCurated := range []string{"gpt-6-luna", "opus", "", "gpt-7-x", "gpt-6-sol extra"} {
+	for _, notCurated := range []string{"gpt-6-luna", "opus", "", "gpt-7-x", "gpt-6-sol extra", "vgpt-6-sol"} {
 		rows = append(rows, seeded{cjSeedUser(t, pool, notCurated), notCurated, nil})
 	}
 	rows = append(rows, seeded{cjSeedUser(t, pool, nil), nil, nil})
@@ -181,7 +181,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 		for _, id := range curatedIDs() {
 			pool, dsn := codexJudgeMigrationDB(t, v-1)
 			admin := cjSeedUser(t, pool, nil)
-			raw := "\t" + id + " \n"
+			raw := "\t" + id + " \n\v"
 			cjExec(t, pool, `INSERT INTO app_settings (key, value, updated_by, updated_at) VALUES ('judge_model', $1, $2, $3)`, raw, admin, updatedAt)
 			if err := MigrateTo(ctx, dsn, v); err != nil {
 				t.Fatalf("MigrateTo(%d): %v", v, err)
@@ -203,7 +203,7 @@ func TestCodexJudgeModelMigrationInstanceLiveDB(t *testing.T) {
 		}
 	})
 
-	for _, notCopied := range []string{"gpt-6-luna", "opus", ""} {
+	for _, notCopied := range []string{"gpt-6-luna", "opus", "", "vgpt-6-sol"} {
 		t.Run("no Codex row for "+notCopied, func(t *testing.T) {
 			pool, dsn := codexJudgeMigrationDB(t, v-1)
 			cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('judge_model', $1)`, notCopied)
