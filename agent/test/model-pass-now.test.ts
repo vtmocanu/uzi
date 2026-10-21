@@ -15,7 +15,9 @@ import { buildJudgePrompt } from "../src/judge-runner.js";
 import type { AdviceUsageSnapshot } from "../src/harness.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
-import { portableTeardownTestDeps } from "./teardown-fixtures.js";
+import { portableTeardownTestDeps, testOwnedPassHomeRoot } from "./teardown-fixtures.js";
+
+const PASS_HOME_ROOT = testOwnedPassHomeRoot();
 
 function capturing(frames: unknown[]): { queryFn: SdkQueryFn; seen: { options?: SdkOptions } } {
   const seen: { options?: SdkOptions } = {};
@@ -248,7 +250,7 @@ describe("caller option policy", () => {
         yield success();
       })();
     }) as unknown as SdkQueryFn;
-    const runner = new SummaryRunner(nullLogger(), { queryFn, homeRoot: os.tmpdir(), modelTimeoutMs: 2000 });
+    const runner = new SummaryRunner(nullLogger(), { queryFn, homeRoot: PASS_HOME_ROOT, modelTimeoutMs: 2000 });
     const out = await runner.generateIntentSummary({ token: "t", model: "haiku", issueTitle: "t", issueBody: "b", prdText: "p" });
     assert.equal(out, "This run adds summaries.");
     const env = seen.options!.env as Record<string, string | undefined>;

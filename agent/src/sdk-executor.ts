@@ -106,6 +106,7 @@ import {
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, MAX_FOLLOW_UP_BATCH_RUNES, followUpRunes, type PlanVerdict } from "./steering.js";
 import { DiskParkSignal } from "./cache-cap.js";
+import { MaintenanceBudget, RetainedSwitchSettlement } from "./maintenance-budget.js";
 import { type RunProcessOps, type RunProcessReap, type RunProcessScan, defaultRunProcessOps } from "./run-procs.js";
 export type { RunProcessOps } from "./run-procs.js";
 import { buildMemoryServer, MEMORY_SERVER_NAME } from "./memory-tools.js";
@@ -625,6 +626,7 @@ interface TurnResult {
    *  ScannedSignals.rejectedMilestones). Sent on the gate report in place of `milestones` so the
    *  server rejects it; never used as the worker's own breakdown. */
   rejectedMilestones?: Milestone[];
+  semanticSubmission?: import("./semantic-plan.js").SemanticSubmission;
   /** PRD #122 M2: the latest milestone progress the lead reported via report_progress
    *  during this turn (last-wins within the turn). The loop carries it into the NEXT
    *  iteration's `running` report. */
@@ -838,6 +840,9 @@ interface DriveState {
   decisionsMemoPlaced?: boolean;
   budget?: { asked: number };
 }
+
+/** issue #3181: a reap whose joins outlived the maintenance budget: nothing was proven, so it is incomplete. */
+const unconfirmedJoinReap = (): RunProcessReap => ({ killed: [], left: [], complete: false });
 
 export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
@@ -1176,17 +1181,23 @@ export class SdkExecutor implements Executor {
    * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
-    await this.closeAndSettlePlanSummary();
+    // issue #3181: inside the retained credential switch's settlement (the RetainedSwitchSettlement
+    // marker, not merely any MaintenanceBudget: cancellation and terminal maintenance install one
+    // too) the joins below are WAITS on operations this executor already runs, so they stop waiting
+    // when the budget is spent; nothing new is started and the operations keep running. Every other
+    // caller joins without bound, as before.
+    const budget = RetainedSwitchSettlement.active() ? MaintenanceBudget.current() : undefined;
+    const joined = await this.waitWithin(this.closeAndSettlePlanSummary(), budget);
     // Issue #2471: join the lane disposal killAgentTree started, so the attributed reap sees
     // the model commands already stopped (it never rejects).
-    await this.laneDisposal;
+    if (!joined || !await this.waitWithin(this.laneDisposal, budget)) return unconfirmedJoinReap();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
     const deps = this.activeDeps;
     if (deps && !this.depsJoined) {
       deps.abort.abort();
-      await deps.install;
+      if (!await this.waitWithin(deps.install, budget)) return unconfirmedJoinReap();
       this.depsJoined = true;
     }
     const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
@@ -1197,10 +1208,39 @@ export class SdkExecutor implements Executor {
         run_home: this.homeDir,
         killed: r.killed,
         ...(r.left.length > 0 ? { left: r.left } : {}),
+        ...(r.left.length > 0 && r.leftReasons && Object.keys(r.leftReasons).length > 0 ? { left_reasons: r.leftReasons } : {}),
         ...(r.complete ? {} : { incomplete: true }),
       });
     }
     return r;
+  }
+
+  /**
+   * Wait for an executor-owned, already-running promise, giving up (false) once `budget` has no
+   * time left. A promise that already settled reads true even with no time left. The timer is
+   * always cleared and the awaited operation is never cancelled by the give-up.
+   */
+  private async waitWithin(pending: Promise<unknown> | undefined, budget: MaintenanceBudget | undefined): Promise<boolean> {
+    if (!pending) return true;
+    if (!budget) { await pending; return true; }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.min(budget.remainingMs(), 2_147_483_647)); });
+    try { return await Promise.race([pending.then(() => true as const, () => true as const), expired]); }
+    finally { clearTimeout(timer); }
+  }
+
+  /**
+   * issue #3181: join, without bound, what this executor already runs: the guarded lane disposal
+   * killAgentTree started and the background deps install. Starts, aborts and kills nothing. Never
+   * rejects. Marks the deps joined, which re-enables the `.npm/_cacache` drop.
+   */
+  async joinOwnedOperations(): Promise<void> {
+    await this.laneDisposal?.catch(() => undefined);
+    const deps = this.activeDeps;
+    if (deps && !this.depsJoined) {
+      await deps.install.catch(() => undefined);
+      this.depsJoined = true;
+    }
   }
 
   /**
@@ -1738,6 +1778,7 @@ export class SdkExecutor implements Executor {
     const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
       buildSignalMcpServer({
         ownerDecisionRequested: ctx.completionInterlock === true && isIssueRun && !ctx.interactive,
+        semanticPlanning: ctx.semanticPlanning,
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -2375,6 +2416,7 @@ export class SdkExecutor implements Executor {
         // entries, so the server drops the candidate to NULL rather than reading "no milestones"
         // (or a narrowed list) as the completion contract.
         let gateMilestones: Milestone[] | undefined;
+        let semanticSubmission: import("./semantic-plan.js").SemanticSubmission | undefined;
         // Issue #1604 (D3): a resumed, unapproved claim with a persisted plan (resume_phase
         // "awaiting_approval", with or without its session, or "" with none) first reads the inputs
         // the owner sent before the claim was released, and acts on them BEFORE offering any plan:
@@ -2472,6 +2514,7 @@ export class SdkExecutor implements Executor {
           // approves the breakdown. It is REPLACED on each revision round (Decision 2).
           candidateMilestones = plan.milestones;
           gateMilestones = plan.rejectedMilestones ?? plan.milestones;
+          semanticSubmission = plan.semanticSubmission;
         }
 
         // --- Plan gate (+ revision loop, PRD #41) -----------------------------
@@ -2498,7 +2541,7 @@ export class SdkExecutor implements Executor {
         else {
           const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
           const g0 = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted),
+            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted, undefined, semanticSubmission),
 
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -2559,7 +2602,7 @@ export class SdkExecutor implements Executor {
               },
             });
             const gExhausted = await this.runThroughSwitch(ctx, state, () =>
-              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles),
+              ctx.gatePlan!(approvedPlan, gateMilestones, undefined, settles, semanticSubmission),
               ctx.continueExistingPlanGate,
             );
             if ("released" in gExhausted) return { branch: ctx.branch, switchReleased: true };
@@ -2619,6 +2662,7 @@ export class SdkExecutor implements Executor {
           // Decision 2: the candidate is REPLACED across a revision round.
           candidateMilestones = turn.milestones;
           gateMilestones = turn.rejectedMilestones ?? turn.milestones;
+          semanticSubmission = turn.semanticSubmission;
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
           // the gate's onPlanPersisted callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
@@ -2629,6 +2673,7 @@ export class SdkExecutor implements Executor {
               gateMilestones,
               onPlanPersisted,
               settles,
+              semanticSubmission,
             ),
             ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
@@ -4724,6 +4769,7 @@ export class SdkExecutor implements Executor {
       }
       if (beforeDispatch) prompt = beforeDispatch(prompt);
       const request: RunTurnRequest = {
+        semanticPlanning: ctx.semanticPlanning,
         ownerDecisionRequested: ctx.completionInterlock === true && resolveRunKind(ctx.kind) === "issue" && !ctx.interactive,
         prompt,
         // The neutral fields below are carried as-is; the placeholders

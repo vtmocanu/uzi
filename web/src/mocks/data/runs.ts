@@ -942,6 +942,32 @@ export const mockRuns: Run[] = [
     pipeline_ref: null,
     pipeline_web_url: null,
     fix_verdict: null,
+    // PRD #1230 M4: unverified maintainer criteria published non-closing; every other mock run omits the field.
+    completion_pending: {
+      version: 1,
+      contract_revision: 1,
+      criteria: [{
+        criterion_id: "c7", milestone_id: "m2", kind: "maintainer",
+        text: "Release notes are approved by the maintainer.",
+        reason: "Only a maintainer can approve the wording.",
+        conditions: ["Release manager sign-off recorded"],
+        verification_steps: ["Read the published release notes"],
+        authorization_revision: 1, status: "unverified",
+      }],
+    },
+    // PRD #1230 D5: a detector's drift record (owner-only); every other mock run omits the field.
+    semantic_drift: {
+      observations: [{
+        phase: "publication", pushed_sha: "0123456789abcdef0123456789abcdef01234567",
+        observed_at: minsAgo(5),
+        issue: { source_id: "issue:18", frozen_hash: "a".repeat(64), observed_hash: "b".repeat(64), outcome: "changed" },
+        prds: [{ source_id: "prd:prds/11-run-view-ux.md", frozen_hash: "c".repeat(64), outcome: "unknown", reason: "missing",
+          ref: "0123456789abcdef0123456789abcdef01234567" }],
+        links_added: [], links_removed: [],
+      }],
+      dropped: 0,
+      contradiction: true,
+    },
     status: "completed",
     requeue_count: 0,
     iteration_count: 2,
@@ -2074,10 +2100,28 @@ mockRuns.push(
   { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
     provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
     can_stop_at_provider_hold: true },
+  // Issue #3194: a --require-base run held because its adopted work is not attested to the base.
+  { ...pausedBase, id: "run-base-attestation-hold", hold_reason: "base_attestation_missing" },
   { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
     recovery_wait_cause: "provider_outage", provider_park_count: 3,
     provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
 );
+// Issue #3181: the token-switch holds. The owner switched each run to console-key; its
+// processes could not be proven stopped. Open /runs/run-cred-switch-settling (the worker is
+// still finishing its own operations for the run, the live-worker case: Resume and Switch token
+// are offered and the mock refuses both with the server's 409 text, Cancel works) or
+// /runs/run-cred-switch-unsettled (held for the owner: Resume requeues on console-key).
+for (const [id, hold] of [
+  ["run-cred-switch-settling", "credential_switch_settling"],
+  ["run-cred-switch-unsettled", "credential_switch_unsettled"],
+] as const) {
+  mockRuns.push({
+    ...pausedBase, id, hold_reason: hold,
+    credential_override: { mode: "pinned", label: "console-key" },
+    status_since: minsAgo(hold === "credential_switch_settling" ? 2 : 14),
+    updated_at: minsAgo(hold === "credential_switch_settling" ? 2 : 14),
+  });
+}
 mockRuns.push(
   {
     // A Claude issue run pinned (per-run override) to the disabled token old-laptop: the

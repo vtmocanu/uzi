@@ -54,6 +54,7 @@
   "outbox_blocked_run_id": null,
   "residue_quarantined_at": null,
   "residue_quarantine_cause": null,
+  "memory_authority_lost_at": null,
   "owner_email": "",
   "disk_pressure_volumes": [],
   "cleanup_pending": false

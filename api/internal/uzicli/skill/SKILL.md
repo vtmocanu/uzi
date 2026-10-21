@@ -402,6 +402,13 @@ uzi version
   `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;
+  or a credential-switch hold, `hold_reason` `credential_switch_settling` (settlement could not
+  be proven at switch time and the worker is finishing its own operations; owner Resume and
+  `run set-token` are refused with a 409 until it finishes, is lost or re-registers, Cancel
+  always works) or `credential_switch_unsettled` (the worker finished its own operations
+  but the run's processes were not proven stopped; work and custody stay on that worker;
+  Resume requeues on the newly chosen token and the next claim re-proves quiescence fail
+  closed, or Cancel);
   ordinary pauses do not auto-resume). System holds also use `paused`; follow
   their hold-specific remedy. Human `run get` may distinguish execution paths
   using current pause evidence, otherwise it says `paused`. `park_run` and
@@ -438,14 +445,18 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted`: timed limit and recovery waits retry on a timer, pool waits
+  `worker_requeue_exhausted` or a paused credential-switch hold (`credential_switch_settling` /
+  `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
   scheduled retry provides the fallback.
+  Both credential-switch holds stop a wait, and a re-run wait against a run still in either
+  hold returns immediately (exit 0), including while `credential_switch_settling`: poll
+  `uzi run get <id>` for the hold to lift, or Cancel.
   So a bare
   `uzi run wait <id>` is "wait for the plan gate, a clarification, an
-  interactive park, worker recovery exhaustion, OR the end". It **exits 0** the
+  interactive park, worker recovery exhaustion, a credential-switch hold, OR the end". It **exits 0** the
   moment a target state is reached (including if the run is already in one),
   polls `GET /api/runs/:id` every `--interval` (default 3s) client-side, and
   prints each transition to **stderr**; `--json` prints the final run object (the
@@ -527,6 +538,9 @@ uzi version
   differ (the default branch moved since you planned) it warns into the run feed, naming
   both commits, and implements anyway. `--require-base` turns that divergence into a hard
   failure instead, so the run stops rather than implement against a base that has moved.
+  Under `--require-base` a continuation of the run's own work (after a pause and `uzi run
+  extend`, or on another worker) proceeds only from content its own checkpoint recorded after
+  the check passed; otherwise the run is held (`base_attestation_missing`) with its work kept.
   Both require `--plan-file`, and `--require-base` requires `--planned-commit` — either
   combination is a usage error.
 

@@ -1080,10 +1080,10 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
-	// fleet.quarantine (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, making 21 with agentsource.update after release.check.
+	// fleet.quarantine and issue #3142 adds fleet.memory_authority (workers); pricing.codex follows release.check, db.size follows db and
+	// recovery.storage follows custody.holds, making 22 with agentsource.update after release.check.
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "fleet.memory_authority", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
 		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}
@@ -1588,6 +1588,97 @@ func TestFleetCapacityMixedOwnersAndAges(t *testing.T) {
 			t.Errorf("%s=%s want=%s", label, values[label], want)
 		}
 	}
+}
+
+// ---- fleet.memory_authority ------------------------------------------------
+
+func TestFleetMemoryAuthority(t *testing.T) {
+	wid := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	worker := func(name string, hbAgo time.Duration) store.ListAllWorkersRow {
+		return store.ListAllWorkersRow{Worker: store.Worker{
+			ID: wid, Name: name,
+			LastHeartbeatAt: pgtype.Timestamptz{Time: fixedNow.Add(-hbAgo), Valid: true},
+		}}
+	}
+	gated := func(id uuid.UUID) (time.Time, bool) {
+		if id != wid {
+			return time.Time{}, false
+		}
+		return fixedNow.Add(-90 * time.Minute), true
+	}
+	tests := []struct {
+		name       string
+		lookup     func(uuid.UUID) (time.Time, bool)
+		worker     store.ListAllWorkersRow
+		wantSev    string
+		wantSubstr string
+	}{
+		{"ok when the seam is unwired", nil, worker("w", time.Second), sevOK, "No worker has lost memory authority"},
+		{"ok when nobody is gated", func(uuid.UUID) (time.Time, bool) { return time.Time{}, false }, worker("w", time.Second), sevOK, "No worker has lost memory authority"},
+		{"warn on a fresh gated worker", gated, worker("w", time.Second), sevWarn, "1 worker(s) have lost memory authority"},
+		{"stale heartbeat is skipped", gated, worker("w", 5*time.Minute), sevOK, "No worker has lost memory authority"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, MemoryAuthorityLost: tc.lookup})
+			c := svc.checkFleetMemoryAuthority(fixedNow, []store.ListAllWorkersRow{tc.worker})
+			if c.Severity != tc.wantSev || !strings.Contains(c.Summary, tc.wantSubstr) {
+				t.Fatalf("got %q %q, want %q containing %q", c.Severity, c.Summary, tc.wantSev, tc.wantSubstr)
+			}
+			if c.Scope != "owner" || c.Group != groupWorkers {
+				t.Fatalf("scope/group = %q/%q", c.Scope, c.Group)
+			}
+		})
+	}
+
+	t.Run("warn names the sanitized worker, age, since and the restart action", func(t *testing.T) {
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, MemoryAuthorityLost: gated})
+		c := svc.checkFleetMemoryAuthority(fixedNow, []store.ListAllWorkersRow{worker("evil\x1b[31m\u202ename\n", time.Second)})
+		if len(c.Evidence) != 1 || !strings.Contains(c.Evidence[0].Value, "1h30m") {
+			t.Fatalf("evidence = %+v", c.Evidence)
+		}
+		blob := c.Summary + c.Evidence[0].Value
+		for _, bad := range []string{"\x1b", "\u202e", "\n"} {
+			if strings.Contains(blob, bad) {
+				t.Fatalf("health text %q carries %q", blob, bad)
+			}
+		}
+		if c.Since == nil {
+			t.Fatal("since must carry the oldest gate time")
+		}
+		if c.Action == nil || !strings.Contains(*c.Action, "Restart the worker's container") || !strings.Contains(*c.Action, "memory_authority_lost_at") {
+			t.Fatalf("action = %v", c.Action)
+		}
+	})
+
+	t.Run("since is the oldest gate time across workers and evidence is capped", func(t *testing.T) {
+		var rows []store.ListAllWorkersRow
+		since := map[uuid.UUID]time.Time{}
+		for i := 0; i < maxQuarantineEvidence+2; i++ {
+			id := uuid.New()
+			rows = append(rows, store.ListAllWorkersRow{Worker: store.Worker{
+				ID: id, Name: fmt.Sprintf("w%d", i),
+				LastHeartbeatAt: pgtype.Timestamptz{Time: fixedNow.Add(-time.Second), Valid: true},
+			}})
+			// The second worker carries the oldest gate time; later ones are newer.
+			since[id] = fixedNow.Add(-time.Duration(10+i) * time.Minute)
+			if i == 1 {
+				since[id] = fixedNow.Add(-5 * time.Hour)
+			}
+		}
+		lookup := func(id uuid.UUID) (time.Time, bool) { at, ok := since[id]; return at, ok }
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, Now: func() time.Time { return fixedNow }, HeartbeatStale: 45 * time.Second, MemoryAuthorityLost: lookup})
+		c := svc.checkFleetMemoryAuthority(fixedNow, rows)
+		if want := *sincePtr(fixedNow.Add(-5 * time.Hour)); c.Since == nil || *c.Since != want {
+			t.Fatalf("since = %v, want the oldest gate time %s", c.Since, want)
+		}
+		if len(c.Evidence) != maxQuarantineEvidence {
+			t.Fatalf("evidence rows = %d, want the cap %d", len(c.Evidence), maxQuarantineEvidence)
+		}
+		if !strings.Contains(c.Summary, fmt.Sprintf("%d worker(s)", maxQuarantineEvidence+2)) {
+			t.Fatalf("summary = %q", c.Summary)
+		}
+	})
 }
 
 // ---- fleet.quarantine ------------------------------------------------------

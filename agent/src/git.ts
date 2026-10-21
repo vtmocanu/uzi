@@ -667,6 +667,12 @@ export interface CheckpointRange {
    *  every commit the pack `tipSha ^excludeSha` carries is either scanned now, reachable from a
    *  previously confirmed checkpoint publish, or reachable from the default branch. */
   scanFloorShas?: string[];
+  /** issue #3242: TRANSPORT-only pack exclusions, replacing `^excludeSha` in the pack (never the
+   *  scan, never the floor validation). Set only for a zero range (`tipSha === excludeSha`) with no
+   *  origin branch: the pack would otherwise be empty, and the broker cannot prove it will fetch the
+   *  tip (the default branch may have moved past it). Then it is the tip's literal parent OIDs, so
+   *  the pack carries exactly the declared commit; `[]` for a root commit (distinct from absent). */
+  packExcludeShas?: readonly string[];
 }
 
 /** issue #1597 M2: optional GitCache construction knobs. */
@@ -933,6 +939,8 @@ const PREPARED_ABORT_GRACE_MS = 5_000;
 
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
+  /** Preserve exact bounded stdout bytes for trusted source capture; text callers are unchanged. */
+  includeBytes?: boolean;
   /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
    *  Must be finite and non-negative; readBare throws otherwise. */
   maxBytes: number;
@@ -973,6 +981,7 @@ interface SpawnGitOptions {
 export interface BoundedRead {
   text: string;
   truncated: boolean;
+  bytes?: Uint8Array;
 }
 
 // PRD #1416 M3 — cap on the EXTRA parents (beyond the first) a worker-bridge marker candidate may
@@ -1569,6 +1578,30 @@ const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
 const RETAINED_RESIDUE_PER_KEY = 5;
 const RESIDUE_ENUMERATION_BUDGET = 4096;
 const RETENTION_WARNING_KEYS = 128;
+const RETIRE_SCRATCH_ENUMERATION_BUDGET = 4096;
+const RETIRE_SCRATCH_REPORTED_PATHS = 10;
+/** issue #3153 — `<dataDir>/runner` (and the TMPDIR under it) now lives on the persistent data
+ *  volume, so bytes that cannot be deleted accumulate across pod replacements instead of vanishing
+ *  with an emptyDir. This per-process counter counts FAILED REMOVAL ATTEMPTS (not distinct paths:
+ *  the same path failing on two attempts counts twice) that leave bytes retained, for any error
+ *  class except ENOENT. It is bumped, with a specific warning, by {@link GitCache.removeBestEffort}
+ *  and by `deleteRetainedArtifact`; the `retainedUndeletable` log fields carry this same count. It
+ *  confers no deletion authority and drives no reclaim. */
+let retainedUndeletable = 0;
+export function retainedUndeletableCount(): number {
+  return retainedUndeletable;
+}
+const UNDELETABLE_CODES = new Set(["EACCES", "EPERM", "ENOTEMPTY"]);
+/** The permission/occupancy class of a failed removal (errno code, else the rm stderr text), or undefined. */
+function undeletableCode(err: unknown): string | undefined {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (typeof code === "string" && UNDELETABLE_CODES.has(code)) return code;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/permission denied/i.test(msg)) return "EACCES";
+  if (/operation not permitted/i.test(msg)) return "EPERM";
+  if (/not empty/i.test(msg)) return "ENOTEMPTY";
+  return undefined;
+}
 const RETENTION_WARNING_INTERVAL_MS = 3600_000;
 /** The operator/canonical runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
@@ -1778,6 +1811,19 @@ export interface RunnerClone {
   /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
    *  Docker-wired or recovery-enabled worker); absent for a canonical-path seed. */
   attemptId?: string;
+  /** issue #3194: the raw adopted source the clone was cut from — the base AFTER the structural
+   *  overlay peel and BEFORE the `wip(park)` unwrap, so a recovered marker is its own identity and
+   *  covers the staged tree the executor receives. The `--require-base` guard compares this, not
+   *  `baseCommit`. */
+  adoptedSource: string;
+  /** issue #3194: the content source a recovery-coverage wrapper verifiably stands for (the
+   *  episode journal's restoreSource), set only on a verified recovery adoption. When present the
+   *  guard compares it instead of `adoptedSource`. */
+  adoptedContentSource?: string;
+  /** issue #3194: true when the diverged-checkpoint `wip(park)` marker was cherry-picked onto a
+   *  new floor, so the materialized content is no single adopted source. `--require-base` refuses
+   *  this shape. */
+  wipCherryPicked?: boolean;
 }
 
 /**
@@ -1977,9 +2023,11 @@ export class GitCache {
    *  A SIBLING of runnerRoot under the SAME dataDir PATH, but OUTSIDE the runner-writable
    *  `runner/<repo>` tree: a retired clone lands here where the untrusted runner uid
    *  cannot reach it. NOTE (issue #1354): sharing the dataDir path does NOT imply the same
-   *  device — on a docker-lane (dind) worker `runner/` is a separate emptyDir while this
-   *  quarantine sits on the `/data` PVC, so a rename from runnerRoot into here CAN hit
-   *  EXDEV; retireRunnerClone carries an intra-device fallback for exactly that. Terminal
+   *  device or the same mount — on a docker-lane (dind) worker `runner/` is a SEPARATE bind mount (a
+   *  `runner-shared` subPath of the `/data` PVC since issue #3153; formerly an emptyDir) while this
+   *  quarantine is on the PVC root mount, so a rename from runnerRoot into here still hits EXDEV
+   *  even though both sit on the same filesystem; retireRunnerClone carries an intra-device
+   *  fallback for exactly that. Terminal
    *  trash is disposed from here; a foreign quarantine is retained here for forensics. */
   private readonly runnerHoldingRoot: string;
   /** PRD #1296 M3 — the durable durable-recovery journal + verified-bundle store, a
@@ -3034,8 +3082,10 @@ export class GitCache {
   }
 
   /** issue #1783 M2 — lstat reconciliation: true when `p` exists (any type), false on ENOENT;
-   *  any other error propagates (fail closed). A pod restart makes the paths vanish while the
-   *  journal and ledger (on the PVC) survive, so every path they name is re-checked here. */
+   *  any other error propagates (fail closed). The journal and ledger (on the data PVC) can name paths
+   *  that are gone (removed by something else; on the Docker lane `<runnerRoot>` itself persists
+   *  since issue #3153, so a pod restart alone no longer removes them), so every path they name is
+   *  re-checked here. */
   private async pathPresent(p: string): Promise<boolean> {
     return fs.lstat(p).then(
       () => true,
@@ -3290,7 +3340,7 @@ export class GitCache {
     if (last !== undefined && now - last < RETENTION_WARNING_INTERVAL_MS) return;
     this.retentionWarnings.set(canonical, now);
     this.log.warn("runner clone retention: automatic reclaim disabled", {
-      key: sanitizeForLog(key, 157), attempts, residue, orphanedSkills,
+      key: sanitizeForLog(key, 157), attempts, residue, orphanedSkills, retainedUndeletable,
     });
   }
 
@@ -3329,6 +3379,19 @@ export class GitCache {
       this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: sanitizeForLog(why, 157) });
       return false;
     };
+    // issue #3153: EVERY failed removal attempt (any error class; ENOENT never reaches here) is
+    // counted (retainedUndeletable, failed-removal attempts) and the artifact stays retained. A
+    // permission/occupancy errno additionally gets the specific warning below; it returns false
+    // for any other failure class so the caller keeps its existing diagnostic.
+    const noteUndeletable = (err: unknown): boolean => {
+      retainedUndeletable++;
+      const code = undeletableCode(err);
+      if (code === undefined) return false;
+      this.log.warn("runner clone retention: could not delete (not permitted); keeping it", {
+        path: target, code, retainedUndeletable,
+      });
+      return true;
+    };
     const root = path.resolve(this.runnerRoot);
     if (path.dirname(parent) !== root || path.dirname(target) !== parent) return refuse("not a direct child of a runner repo dir");
     if (!isExpected(path.basename(target))) return refuse("not the expected retained artifact of this key");
@@ -3365,7 +3428,7 @@ export class GitCache {
         return true;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
-        refuse(gitErrorMessage(err));
+        if (!noteUndeletable(err)) refuse(gitErrorMessage(err));
         if (opts.strictValidation) throw err;
         return false;
       }
@@ -3376,7 +3439,9 @@ export class GitCache {
       // An rm that may still be alive: stop the whole sweep (the caller logs "nothing further
       // removed") rather than start another delete beside it.
       if (err instanceof RunnerDeleteUnsettledError) throw err;
-      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      if (!noteUndeletable(err)) {
+        this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
       if (opts.strictValidation) throw err;
       return false;
     }
@@ -4068,7 +4133,8 @@ export class GitCache {
       // marker's parent when a wip(park) marker was reset --soft'd back to uncommitted, and
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
-      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
+      return { path: clonePath, branch, publicationFloor, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered,
+        adoptedSource: baseSha, ...(recoveredCheckpointMarkerSha !== "" ? { wipCherryPicked: true } : {}) };
     }
   }
 
@@ -5140,7 +5206,7 @@ export class GitCache {
     } catch (err) {
       return `bundle verification failed: ${sanitizeForLog(gitErrorMessage(err), 120)}`;
     } finally {
-      if (dir !== undefined) await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      if (dir !== undefined) await this.removeBestEffort(dir, "bundle-verify");
     }
   }
 
@@ -6641,8 +6707,10 @@ export class GitCache {
    * Thin bundles imported with local prerequisites are valid here; publication is separate. */
   async recordRecoveryCapture(
     barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number, tip: string,
+    capturedSource?: string,
   ): Promise<void> {
     if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
+    if (capturedSource !== undefined && !SHA40_RE.test(capturedSource)) throw new Error("invalid recovery source");
     await this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const recovery = journal.recovery;
@@ -6653,8 +6721,18 @@ export class GitCache {
       if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
       await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
       if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      // issue #3194: what content the wrapper stands for. A nested capture (the captured source is
+      // itself the previous verified restoreTip) carries that episode's source forward; otherwise
+      // the source is the verified capture's own current tip. It must be covered by the wrapper;
+      // anything unprovable records no source, so --require-base refuses rather than guesses.
+      const prior = recovery.restoreTip !== undefined && recovery.restoreSource !== undefined
+        ? { tip: recovery.restoreTip, source: recovery.restoreSource } : undefined;
+      let restoreSource = capturedSource ?? tip;
+      if (prior && prior.tip === restoreSource) restoreSource = prior.source;
+      if (await this.ancestry(barePath, restoreSource, tip) !== "ancestor") restoreSource = "";
+      const { restoreSource: _stale, ...rest } = recovery;
       await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
-        recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
+        recovery: { ...rest, restoreTip: tip, ...(restoreSource ? { restoreSource } : {}), stage: "captured" } });
     });
   }
 
@@ -6742,7 +6820,8 @@ export class GitCache {
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
-      return { ...seeded, attemptId };
+      // issue #3194: hand the guard the content source this wrapper verifiably stands for.
+      return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
     });
   }
 
@@ -8618,8 +8697,10 @@ export class GitCache {
    * issue #1783 M2 review (N4, NB2, NB3) — bound one branch's attempt ledger, under the caller's bare
    * lock (the attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId
    * (in last-write order), dropping every unparseable value and every entry whose (absolute) path is
-   * gone (lstat ENOENT), whatever its state: after a pod roll `<runnerRoot>` is an emptyDir, so a
-   * gone path has nothing left for any reader to find. Two exceptions are always kept:
+   * gone (lstat ENOENT), whatever its state: a gone path has nothing left for any reader to
+   * find. (Before issue #3153 `<runnerRoot>` was an emptyDir that vanished with the pod; it now
+   * persists on the data volume, so an entry whose path is gone was removed by something else, and
+   * there is still nothing at that path for a reader to find. A surviving clone is NOT compacted.) Two exceptions are always kept:
    *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
    *     resolve through the ledger);
    *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
@@ -8893,15 +8974,18 @@ export class GitCache {
     replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
   } | null> {
     // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
-    const openProducer = async (source: string, candidate: string, floor: string) => {
+    const openProducer = async (source: string, candidate: string, floor: string, packExcludes?: readonly string[]) => {
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, source);
       if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
       await this.validateCheckpointFloor(barePath, floor, candidate);
       await beforePack?.(candidate);
       onStep?.("checkpoint_pack");
+      // issue #3242: a zero range packs the candidate over its literal parents instead of ^floor.
+      const excludes = candidate === floor && packExcludes !== undefined ? packExcludes : [floor];
       const { stdout, exited, cancel } = await this.spawnGit(
-        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n^${floor}\n`, { stdoutCategory: "artifactBytes" },
+        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n${excludes.map((x) => `^${x}\n`).join("")}`,
+        { stdoutCategory: "artifactBytes" },
       );
       return { pack: stdout, exited, cancel };
     };
@@ -8909,8 +8993,9 @@ export class GitCache {
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      const { tipSha, excludeSha } = pinned;
+      const { tipSha, excludeSha, packExcludeShas } = pinned;
       if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (packExcludeShas !== undefined && (tipSha !== excludeSha || !packExcludeShas.every((x) => SHA40_RE.test(x)))) ||
           (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
@@ -8933,7 +9018,7 @@ export class GitCache {
         }
       }
       const candidate = wanted;
-      const replay = () => openProducer(tipSha, candidate, excludeSha);
+      const replay = () => openProducer(tipSha, candidate, excludeSha, packExcludeShas);
       return { tipOid: wanted, ...await replay(), replay };
     }
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
@@ -8991,7 +9076,17 @@ export class GitCache {
     // The initial validation establishes the floor as a literal SHA before capturing it.
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     const floor = excludeSha!;
-    const replay = () => openProducer(realTip, wanted, floor);
+    let packExcludes: readonly string[] | undefined;
+    try {
+      packExcludes = wanted === floor ? await this.zeroRangePackExcludes(barePath, branch, wanted, floor) : undefined;
+    } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      throw new ScratchPublicationError("checkpoint parents cannot be resolved", e, {
+        kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
+      });
+    }
+    const replay = () => openProducer(realTip, wanted, floor, packExcludes);
     return { tipOid: wanted, ...await replay(), replay };
   }
 
@@ -9016,6 +9111,23 @@ export class GitCache {
     // base keeps the pack self-contained while the overlay aligns workflow trees.
     const base = (await this.runGit(barePath, ["merge-base", defaultRef, tip])).trim();
     return SHA40_RE.test(base) ? base : defaultRef;
+  }
+
+  /**
+   * issue #3242 — the transport exclusions for a zero range (`tip === floor`) with no origin branch.
+   * The pack `tip ^tip` would be empty, and the broker's depth-1 fetch holds the tip only while it is
+   * still the default branch's tip, which the worker cannot prove for the later fetch. So the pack
+   * excludes the tip's literal parents and carries the declared commit itself: all parents of a
+   * merge, `[]` for a root. Undefined when the range is not zero or origin carries the branch (the
+   * broker fetches that branch tip). Throws when the parents cannot be resolved.
+   */
+  private async zeroRangePackExcludes(barePath: string, branch: string, tip: string, floor: string): Promise<string[] | undefined> {
+    if (tip !== floor || await this.refExists(barePath, `refs/remotes/origin/${branch}`)) return undefined;
+    const [self, ...parents] = (await this.runGit(barePath, ["rev-list", "--parents", "-n", "1", tip, "--"])).trim().split(" ");
+    if (self !== tip || !parents.every((p) => SHA40_RE.test(p))) {
+      throw new Error("checkpoint tip parents are not 40-hex commit SHAs");
+    }
+    return parents;
   }
 
   /**
@@ -9077,7 +9189,8 @@ export class GitCache {
           scanFloorShas.push(floor);
         }
       }
-      return { tipSha, excludeSha, scanFloorShas };
+      const packExcludeShas = await this.zeroRangePackExcludes(barePath, branch, tipSha, excludeSha);
+      return { tipSha, excludeSha, scanFloorShas, ...(packExcludeShas !== undefined ? { packExcludeShas } : {}) };
     } catch (err) {
       this.log.warn("checkpoint range could not be resolved", { bare: barePath, error: gitErrorMessage(err) });
       return null;
@@ -9216,7 +9329,7 @@ export class GitCache {
     } catch (err) {
       return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
     } finally {
-      await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(scratch, "scan-scratch");
     }
   }
 
@@ -9667,8 +9780,8 @@ export class GitCache {
       ).trim();
       return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
     } finally {
-      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
-      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(tmpIdx, "ckpt-index", "file");
+      await this.removeBestEffort(tmpWork, "ckpt-worktree");
     }
   }
 
@@ -10020,8 +10133,10 @@ export class GitCache {
       }
       // 3. Worker-only 0700 holding destination: a SIBLING of runnerRoot under the same
       //    dataDir PATH — but NOT necessarily the same device: on a docker-lane worker
-      //    runnerRoot is an emptyDir and this quarantine is on the /data PVC, so the step-4
-      //    rename CAN hit EXDEV (issue #1354); the EXDEV branch below is that fallback. NOT
+      //    runnerRoot is a separate bind mount (a runner-shared subPath of the /data PVC since issue
+      //    #3153, formerly an emptyDir) and this quarantine is on the PVC root mount, so the step-4
+      //    rename CAN hit EXDEV (issue #1354) even on one filesystem; the EXDEV branch below is
+      //    that fallback and is kept. NOT
       //    under the runner-writable tree. Sanitized, generated components. Create-or-assert
       //    the parent 0700 BEFORE the rename, so a rename ENOENT below unambiguously means
       //    the SOURCE is missing.
@@ -10058,8 +10173,9 @@ export class GitCache {
         const e = err as NodeJS.ErrnoException;
         if (e.code === "EXDEV") {
           // issue #1354 — runnerRoot and the quarantine share a dataDir PATH but are on
-          // DIFFERENT devices on a docker-lane worker (emptyDir vs PVC), so the rename to
-          // holdingDest is a cross-device move that cannot happen. Free the canonical with
+          // DIFFERENT mounts on a docker-lane worker (the runner-shared subPath bind mount vs the
+          // PVC root; formerly an emptyDir), so the rename to holdingDest is a cross-mount move that
+          // cannot happen even when both sit on one filesystem. Free the canonical with
           // an intra-device atomic rename into a scratch parent under runnerRoot (SAME
           // device — never EXDEV, and it survives a daemon file-hold where a recursive rm
           // races). The #1315 invariant is preserved: the journaled canonical is freed ONLY
@@ -10099,7 +10215,7 @@ export class GitCache {
               // Remove ONLY the incomplete copy; the canonical + journal stay intact so a
               // retry can re-copy. No scratch parent exists yet (created below), so this
               // cleanup is scoped strictly to the copy.
-              await fs.rm(holdingDest, { recursive: true, force: true }).catch(() => undefined);
+              await this.removeBestEffort(holdingDest, "retire-incomplete-copy");
               throw copyErr;
             }
             // The completed off-tree copy is recorded. NOW free the canonical with the
@@ -10148,7 +10264,7 @@ export class GitCache {
         if (movedTo !== undefined) {
           await fs.rename(movedTo, clonePath).then(
             async () => {
-              if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+              if (scratch) await this.removeBestEffort(scratch, "retire-rollback-scratch");
             },
             (renameErr: unknown) =>
               this.log.warn("retireRunnerClone: worker residue quarantine latched mid-retire and the clone could not be moved back; it is retained at the holding path", {
@@ -10280,7 +10396,7 @@ export class GitCache {
                 await this.worktreeHead(movedTo) !== opts.completionSource.expectedHead)
               throw new Error("completion rollback source cannot be verified");
             await fs.rename(movedTo, clonePath);
-            if (scratch) await fs.rmdir(scratch).catch(() => undefined);
+            if (scratch) await this.removeBestEffort(scratch, "completion-rollback-scratch", "emptyDir");
           } catch (rollbackError) {
             this.log.warn("retireRunnerClone: completion rollback retained residue", {
               clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
@@ -10306,20 +10422,119 @@ export class GitCache {
     if (holding && opts.discard && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(holding, { recursive: true, force: true }).catch((e) => {
+      if (!(await this.removeBestEffort(holding, "retire-holding-dispose"))) {
         unproven();
-        this.log.warn("retireRunnerClone: holding dispose failed", {
-          path: holding,
-          error: gitErrorMessage(e),
-        });
-      });
+        this.log.warn("retireRunnerClone: holding dispose failed", { path: holding });
+      }
     }
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
       this.checkRecoveryInterruption();
-      await fs.rm(scratch, { recursive: true, force: true }).catch(() => { unproven(); });
+      if (!(await this.removeBestEffort(scratch, "retire-scratch"))) unproven();
     }
     return result.disposition;
+  }
+
+  /** issue #3153 — startup inspector for `<runnerRoot>/.retire-*` scratch parents (the intra-device
+   *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
+   *  replacements now, so a crash between the rename and the disposal leaves one behind that no
+   *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
+   *  before any retire or recovery path is reachable, and REMOVES NOTHING: reclaim needs the
+   *  retirement/custody/writer-exclusion proofs, and a surviving daemon container can still bind-mount
+   *  or hold its cwd in even an EMPTY parent, so emptiness is no evidence it is unused.
+   *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
+   *    - every other parent (empty, non-empty, symlink, non-directory, unreadable) is retained and
+   *      counted; `empty` counts the retained parents that held no entries. Entries inside a parent
+   *      are only probed for emptiness, never stat'ed or followed.
+   *  Retained parents, parents skipped as recent, and an enumeration cut short by
+   *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
+   *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
+  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ retained: number }> {
+    const root = path.resolve(this.runnerRoot);
+    const retained: string[] = [];
+    let empty = 0;
+    let skippedRecent = 0;
+    let incomplete = false;
+    try {
+      const rst = await fs.lstat(root);
+      if (rst.isSymbolicLink() || !rst.isDirectory()) return { retained: 0 };
+      const names: string[] = [];
+      // The budget is charged on EVERY entry read (the runner can fill the persistent root with
+      // arbitrary names), and the directory handle is iterated, never slurped.
+      let entriesRead = 0;
+      const dir = await fs.opendir(root);
+      try {
+        for await (const entry of dir) {
+          if (entriesRead >= RETIRE_SCRATCH_ENUMERATION_BUDGET) { incomplete = true; break; }
+          entriesRead++;
+          if (entry.name.startsWith(".retire-")) names.push(entry.name);
+        }
+      } finally {
+        await dir.close().catch(() => undefined);
+      }
+      for (const name of names.sort()) {
+        const p = path.join(root, name);
+        try {
+          const st = await fs.lstat(p);
+          if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
+          retained.push(p);
+          if (st.isSymbolicLink() || !st.isDirectory()) continue;
+          let isEmpty = true;
+          const pd = await fs.opendir(p);
+          try {
+            for await (const _entry of pd) { isEmpty = false; break; }
+          } finally {
+            await pd.close().catch(() => undefined);
+          }
+          if (isEmpty) empty++;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+          if (!retained.includes(p)) retained.push(p);
+        }
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        this.log.warn("runner retire scratch inspection failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
+      }
+      return { retained: retained.length };
+    }
+    if (retained.length > 0 || skippedRecent > 0 || incomplete) {
+      this.log.warn("runner retire scratch retained", {
+        count: retained.length,
+        empty,
+        skippedRecent,
+        incomplete,
+        // Names relative to the runner root: a long root would otherwise truncate away the
+        // distinguishing leaf.
+        root: sanitizeForLog(root, 157),
+        paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
+      });
+    }
+    return { retained: retained.length };
+  }
+
+  /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the
+   *  runner/TMPDIR tree (or its holding sibling). Never throws where the old `.catch(() => undefined)`
+   *  swallowed; a failure (ENOENT aside, which `force` already tolerates) is counted in
+   *  `retainedUndeletable` (failed-removal attempts) and logged with the path and errno so a
+   *  persistent-volume leak is visible.
+   *  Returns true when the target is gone. `emptyDir` is a non-recursive rmdir. */
+  private async removeBestEffort(target: string, site: string, kind: "tree" | "file" | "emptyDir" = "tree"): Promise<boolean> {
+    try {
+      if (kind === "emptyDir") await fs.rmdir(target);
+      else await fs.rm(target, kind === "tree" ? { recursive: true, force: true } : { force: true });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      retainedUndeletable++;
+      this.log.warn("runner scratch removal failed; keeping it", {
+        path: target,
+        site,
+        code: (err as NodeJS.ErrnoException).code ?? undeletableCode(err) ?? "unknown",
+        retainedUndeletable,
+      });
+      return false;
+    }
   }
 
   /** issue #1354 — create an intra-device scratch parent directly under runnerRoot (the
@@ -10343,8 +10558,8 @@ export class GitCache {
   private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string,
     guard?: () => Promise<void>): Promise<boolean> {
     if (residueQuarantine() !== undefined) {
-      await fs.rm(scratchParent, { recursive: true, force: true }).catch(() => undefined);
-      if (copy) await fs.rm(copy, { recursive: true, force: true }).catch(() => undefined);
+      await this.removeBestEffort(scratchParent, "retire-latched-scratch-parent");
+      if (copy) await this.removeBestEffort(copy, "retire-latched-copy");
       throw new CloneRetainedByQuarantineError();
     }
     if (guard) await guard();
@@ -11235,8 +11450,9 @@ try {
       const text = (truncated: boolean): BoundedRead => {
         // StringDecoder.write holds back an incomplete trailing sequence: a cut through a
         // multi-byte character drops that character instead of rendering U+FFFD.
-        const decoded = new StringDecoder("utf8").write(Buffer.concat(chunks, bytes));
-        return { text: decoded, truncated };
+        const raw = Buffer.concat(chunks, bytes);
+        const decoded = new StringDecoder("utf8").write(raw);
+        return { text: decoded, truncated, ...(opts.includeBytes ? { bytes: raw } : {}) };
       };
       const onData = (chunk: Buffer | string): void => {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -11382,7 +11598,7 @@ try {
     } catch {
       return { trusted: false, findings: [] };
     } finally {
-      if (scratch) await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      if (scratch) await this.removeBestEffort(scratch, "patch-scan-scratch");
     }
   }
 
@@ -11641,8 +11857,8 @@ try {
       });
       return { trusted, findings };
     } finally {
-      await fs.rm(configPath, { force: true }).catch(() => undefined);
-      await fs.rm(reportPath, { force: true }).catch(() => undefined);
+      await this.removeBestEffort(configPath, "gitleaks-config", "file");
+      await this.removeBestEffort(reportPath, "gitleaks-report", "file");
     }
   }
 
@@ -13647,6 +13863,56 @@ try {
    *  wins the "strictly descends" branch. */
   private async isAncestor(barePath: string, ancestorRef: string, descendantRef: string): Promise<boolean> {
     return (await this.tryGit(barePath, ["merge-base", "--is-ancestor", ancestorRef, descendantRef])) === 0;
+  }
+
+  /** issue #3194: resolve a planned commit (full or abbreviated) to exactly one commit, without
+   *  replacement objects. "missing" when no commit matches, "ambiguous" when an abbreviation names
+   *  more than one, "unknown" on any git error or a malformed input — never coerced to a match. */
+  async resolveCommitUnique(barePath: string, ref: string): Promise<
+    { kind: "resolved"; sha: string } | { kind: "missing" } | { kind: "ambiguous" } | { kind: "unknown" }> {
+    const prefix = ref.trim().toLowerCase();
+    if (!/^[0-9a-f]{4,40}$/.test(prefix)) return { kind: "unknown" };
+    let listed: string;
+    try {
+      listed = await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--disambiguate=" + prefix]);
+    } catch {
+      // rev-parse --disambiguate exits non-zero only on a git error; no match prints nothing.
+      return { kind: "unknown" };
+    }
+    const commits: string[] = [];
+    for (const oid of listed.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      if (!SHA40_RE.test(oid)) return { kind: "unknown" };
+      // The listed object exists, so a failed type read is an error, not absence.
+      let type: string;
+      try {
+        type = (await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-t", oid])).trim();
+      } catch {
+        return { kind: "unknown" };
+      }
+      if (type === "commit") commits.push(oid);
+    }
+    if (commits.length === 0) return { kind: "missing" };
+    if (commits.length > 1) return { kind: "ambiguous" };
+    return { kind: "resolved", sha: commits[0]! };
+  }
+
+  /** issue #3194: the tree OID of `sha` in the bare (no replacement objects), or undefined on any
+   *  failure. */
+  async commitTreeOid(barePath: string, sha: string): Promise<string | undefined> {
+    if (!SHA40_RE.test(sha)) return undefined;
+    const tree = (await this.tryGitStdout(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${sha}^{tree}`])).trim();
+    return SHA40_RE.test(tree) ? tree : undefined;
+  }
+
+  /** issue #3194: the tree the runner clone's INDEX holds (what the executor receives, staged WIP
+   *  included), or undefined on any failure. Run as the runner uid, like every clone read. */
+  async indexTreeOid(clonePath: string): Promise<string | undefined> {
+    try {
+      const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
+      return SHA40_RE.test(tree) ? tree : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** issue #1117: public delegate to {@link isAncestor} — true when `ancestorRef` is an

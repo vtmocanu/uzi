@@ -73,6 +73,10 @@ IID_CLI="$(apipost "/api/repos/$REPO_ID/issues" \
 { [ -n "$IID_CLI" ] && [ "$IID_CLI" != null ]; } || fail "could not create the cli-approve issue"
 RUN_CLI="$(create_run "$REPO_ID" "$IID_CLI")" || fail "cli-leg run was not created"
 wait_status "$RUN_CLI" awaiting_approval
+CLI_GATE_JSON="$(uzi_cli run get "$RUN_CLI" --json)" || fail "could not read CLI plan gate"
+printf '%s\n' "$CLI_GATE_JSON" | jq -e --arg run "$RUN_CLI" \
+  '.id == $run and .status == "awaiting_approval" and (has("semantic_gate") | not) and (has("completion_pending") | not)' >/dev/null \
+  || fail "production CLI gate was inconsistent or exposed dormant semantic data"
 uzi_cli run approve "$RUN_CLI" >/dev/null || fail "uzi run approve failed (exit $?)"
 wait_status "$RUN_CLI" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
 pass "uzi run approve drove RUN_CLI past the gate to completed (CLI approve route/DTO intact)"

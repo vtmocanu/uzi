@@ -13,6 +13,9 @@
 # Assertions read results.tsv with `awk -F'\t'` on exact fields (not tab-in-regex
 # patterns): this host's grep is ugrep, so keeping field logic in awk is robust.
 set -euo pipefail
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRIVER="$REPO_ROOT/e2e/driver.sh"

@@ -45,6 +45,8 @@ pass "issue #$IID_AP: poller created an unattended auto_approve run ($RUN_AP) â€
 
 wait_autopilot_done "$RUN_AP" completed 120
 AP="$(apiget "/api/runs/$RUN_AP")"
+echo "$AP" | jq -e '(.run | has("completion_pending")) | not' >/dev/null \
+  || fail "structural autopilot unexpectedly published semantic pending work"
 # The plan is recorded as a run MESSAGE (kind:"plan"), emitted+flushed before the
 # auto-approve verdict â€” NOT in run.plan_md, which only the awaiting_approval report
 # sets and autopilot deliberately skips (so the run never parks at the gate).

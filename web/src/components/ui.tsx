@@ -541,7 +541,13 @@ export const RUN_STATUS_TONES: Record<
   credential_disabled: { tone: "warning" },
   // Provider holds are parked: owner attention and outage retry share a static warning.
   provider_unavailable: { tone: "warning" },
+  // Issue #3194: a --require-base run held because its adopted work is not attested to the planned base.
+  base_attestation_missing: { tone: "warning" },
   provider_outage: { tone: "warning" },
+  // Issue #3181: token-switch holds (raw "paused", overlaid from hold_reason). Static warning:
+  // the owner's decision is pending (unsettled) or waits on the worker finishing (settling).
+  credential_switch_settling: { tone: "warning" },
+  credential_switch_unsettled: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -596,7 +602,11 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   credential_disabled: "waiting: credential disabled",
   // Kept in step with runBadge's parked wording by the label-agreement test.
   provider_unavailable: "provider unavailable: owner hold",
+  base_attestation_missing: "base unverified: owner hold",
   provider_outage: "waiting for provider",
+  // Issue #3181: kept in step with runBadge's parked wording by the label-agreement test.
+  credential_switch_settling: "settling: token switch",
+  credential_switch_unsettled: "held: token switch",
 };
 
 // A running or live completion row may attach its server estimate to the status pill.

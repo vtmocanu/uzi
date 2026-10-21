@@ -12,7 +12,7 @@ import {
   isRetainedArtifactName,
   parseRetainedArtifactName,
 } from "../src/attempt-path.js";
-import { AttemptReleaseError, GitCache, PendingRecoveryCaptureError, gitEnv, type AttemptLedgerState, type AttemptSeedOptions } from "../src/git.js";
+import { AttemptReleaseError, GitCache, PendingRecoveryCaptureError, gitEnv, retainedUndeletableCount, type AttemptLedgerState, type AttemptSeedOptions } from "../src/git.js";
 import { screenToolPath } from "../src/guardrails.js";
 import { deriveCloneKey } from "../src/run-kind.js";
 import { mintAttemptId } from "../src/run-quiescence.js";
@@ -863,6 +863,27 @@ describe("issue #1783 M2 final review (NB4): deleteRetainedArtifact's re-validat
     assert.equal(await del(linkedParent, path.join(linkedParent, "victim")), false);
     assert.equal(fs.existsSync(path.join(victim, "PRECIOUS")), true);
     assert.ok(refusedWith("the runner repo dir is not a real directory"));
+  });
+
+  it("issue #3153: a not-permitted delete is kept, counted and logged with its errno", async () => {
+    const s = await keyFixture();
+    const target = realDir(path.join(s.parent, `${s.key}.attempt-${idAt(1)}`));
+    const rec = recordingLogger();
+    const denying = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(),
+      retentionDelete: { split: true, run: async () => { throw Object.assign(new Error("rm: permission denied"), { code: "EACCES" }); } },
+    }));
+    const before = retainedUndeletableCount();
+    const deleted = await (denying as unknown as DeleteSeam).deleteRetainedArtifact(s.parent, target, () => true);
+    assert.equal(deleted, false);
+    assert.equal(fs.existsSync(path.join(target, "PRECIOUS")), true, "kept");
+    assert.equal(retainedUndeletableCount(), before + 1);
+    const line = rec.lines.find((l) => (l as { msg?: string }).msg === "runner clone retention: could not delete (not permitted); keeping it") as
+      { path?: string; code?: string; retainedUndeletable?: number } | undefined;
+    assert.ok(line, "the specific warning is logged");
+    assert.equal(line.path, target);
+    assert.equal(line.code, "EACCES");
+    assert.equal(line.retainedUndeletable, before + 1);
   });
 });
 

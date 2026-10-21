@@ -243,7 +243,25 @@ WITH prev AS (
         -- increment/reset CASE: this is reset-on-action, unconditional.)
         stats_disk_pressure_streak = 0,
         nix_pressure = false, data_pressure = false,
-        dind_register_floor = now(), dind_meter_epoch = 0, dind_meter_at = NULL,
+        -- Incarnation fence ordering (issue #3181): the floor is compared with runs.status_since of a
+        -- credential_switch_settling hold (HoldCredentialSwitchUnsettled stamps clock_timestamp()
+        -- under the worker row lock). now() is this transaction's START, so a registration that
+        -- began before a hold but queued behind its lock would stamp a floor EARLIER than the hold
+        -- it was serialized after. The subquery below lifts the floor just past the latest settling
+        -- hold, but it only SEES a hold committed during the lock wait if (1) the worker row lock
+        -- is taken in an EARLIER statement than this one (Service.Register's GetWorkerForUpdate)
+        -- and (2) the transaction is READ COMMITTED (Service.Register opens it with
+        -- beginReadCommitted), so this statement takes a fresh snapshot after the wait. Under
+        -- REPEATABLE READ or a single-statement lock the hold would be invisible. The hold and ack
+        -- reports additionally carry the registration nonce, which is the primary incarnation check;
+        -- this floor remains what lets a registration lift the fence for the owner's Resume. Without
+        -- a settling hold the floor is exactly now(), equal to the registration heartbeat (the dind
+        -- maintenance contract).
+        dind_register_floor = GREATEST(now(), COALESCE(
+            (SELECT max(r.status_since) + interval '1 microsecond' FROM runs r
+             WHERE r.worker_id = workers.id AND r.status = 'paused'
+               AND r.hold_reason = 'credential_switch_settling'), now())),
+        dind_meter_epoch = 0, dind_meter_at = NULL,
         dind_pressure_streak = 0, dind_meter_over = false, dind_below_threshold = false,
         maintenance_ready_ack = false, maintenance_ack_at = NULL,
         maintenance_phase = CASE WHEN maintenance_phase = 'ready' THEN 'requested' ELSE maintenance_phase END,
@@ -1104,6 +1122,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(@worker_protocol_caps::text[]))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1360,6 +1382,10 @@ WITH claimant AS MATERIALIZED (
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(p.protocol_capabilities))
+      AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(p.protocol_capabilities))
+      AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+           OR 'completion_semantic_publication_v1' = ANY(p.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -1499,6 +1525,19 @@ WITH claimant AS MATERIALIZED (
            OR r.released_worker_id <> @worker_id
            OR r.released_worker_nonce IS DISTINCT FROM
                 (SELECT ow.snapshot_register_nonce FROM workers ow WHERE ow.id = @worker_id))
+      -- Issue #3142: claim-time memory-authority gate. @memory_authority_lost is true when the
+      -- claimant's request says (or, for a capable worker, omits) that it no longer holds memory
+      -- authority; it then claims only the kinds that never reach a memory runtime. This mirrors
+      -- agent/src/worker.ts dispatch, where only the final `this.runner.execute(claim)` arm
+      -- reaches RunRunner (the only runner with a memory runtime); the exempt arms are
+      -- cross_check, judge, job, review_target_run_id and an egress_profile_id (isolated_fetch)
+      -- run. A new kind defaults to guard-bound (fail closed). Deliberately NOT mirrored into the
+      -- spread-peer clause, CountOnlineWorkersClaimableForRun or the ephemeral provisioner
+      -- queries, because the state is per-request, not a property of the worker row.
+      AND (NOT @memory_authority_lost::boolean
+           OR r.kind IN ('judge', 'job', 'cross_check')
+           OR r.review_target_run_id IS NOT NULL
+           OR r.egress_profile_id IS NOT NULL)
     -- Three-level sort (PRD #320 D3): (1) resume affinity — a re-queued run
     -- prefers its prior worker, exactly as before; (2) priority rank —
     -- fn_run_priority slots BETWEEN affinity and FIFO, so an interactive run
@@ -2088,6 +2127,21 @@ UPDATE runs SET
                ELSE 0 END,
     updated_at       = now()
 WHERE runs.id = @id AND worker_id = @worker_id
+  -- Semantic freeze has no structural fallback when cross-check is disabled.
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR (COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)->>'profile' = 'semantic'
+           AND COALESCE(runs.completion_contract, sqlc.narg('completion_contract')::jsonb)
+               ->'semantic_presentation'->'candidate' =
+               (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id))
+       OR (runs.completion_contract IS NULL AND runs.plan_md IS NULL
+           AND runs.milestones_frozen IS NULL AND runs.milestones_candidate IS NULL
+           AND sqlc.narg('milestones_frozen')::jsonb IS NULL))
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR runs.status <> 'awaiting_approval'
+       OR EXISTS (SELECT 1 FROM run_user_inputs i WHERE i.run_id = runs.id
+           AND i.kind = 'approve_plan' AND i.gate_binding = 'bound'
+           AND i.gate_revision = runs.gate_revision AND i.applied_at IS NOT NULL
+           AND i.disposition IS DISTINCT FROM 'superseded'))
   AND status NOT IN ('completed', 'failed', 'cancelled')
   -- limit_wait is excluded EXPLICITLY, and note that the negative guard above does
   -- NOT cover it (PRD #35): a parked run is inside 'NOT IN (terminal)', so without
@@ -2333,9 +2387,12 @@ UPDATE runs SET
     -- auto_approve short-circuits the executor's preApproved path, skipping the gate
     -- with NO human in the loop, and the worker's ciFixHumanApproved initializer then
     -- reads that as approved. Clearing auto_approve here makes the resume re-gate.
-    -- Manual runs already carry auto_approve=false (no-op), and a normal autopilot run
-    -- never reaches this statement (it short-circuits in gatePlan and never parks), so
-    -- the ONLY run this newly affects is the forceGate ci_fix case — the intent.
+    -- Manual runs already carry auto_approve=false (no-op). An autopilot run parks here
+    -- only when something forces the human gate: the forceGate ci_fix case, an
+    -- auto-approved plan cross-check lead whose checker did not APPROVE (ADR-2149), and,
+    -- since PRD #1230 D3, a semantic-enrolled autopilot run whose server coverage projection is not
+    -- complete or which carries maintainer criteria: it parks here from `running` (the
+    -- semantic coverage park) and the cleared auto_approve makes any resume re-gate.
     auto_approve = false,
     -- Invalidate a published gate when any approval-bearing value changes. Compare
     -- the effective values written below, so an exact retry retains its snapshot.
@@ -2626,6 +2683,9 @@ UPDATE runs SET
     plan_source = 'agent',
     updated_at  = now()
 WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+       OR EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id
+           AND sp.candidate->>'digest' = encode(sqlc.arg('candidate_digest')::bytea, 'hex')))
   AND runs.status IN ('claimed', 'running')
   AND runs.auto_approve = true
   AND runs.plan_source = 'agent'
@@ -3690,6 +3750,10 @@ RETURNING runs.*;
 --     released_worker_* pair ParkRunsAtWall captured is PRESERVED (never re-read here — the park
 --     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 --     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
+-- Issue #3181: a 'credential_switch_unsettled' hold (the worker finished its own operations; processes were not proven stopped)
+-- resumes like an owner pause and keeps worker_id for the same-worker resume. A
+-- 'credential_switch_settling' hold is REFUSED (0 rows) while the settling fence holds
+-- (CredentialSwitchHoldSettling is the same predicate as a read); both reasons are cleared on resume.
 -- All guards use IS DISTINCT FROM / OR so a NULL hold_reason (an owner pause) always resumes.
 WITH candidates AS MATERIALIZED (
     SELECT runs.id, runs.kind FROM runs
@@ -3698,7 +3762,13 @@ WITH candidates AS MATERIALIZED (
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND runs.hold_reason IS DISTINCT FROM 'provider_policy_refusal'
   AND runs.policy_refusal_count = 0
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND (@stale_cutoff::timestamptz IS NULL OR w.last_heartbeat_at >= @stale_cutoff::timestamptz)
+                        AND w.dind_register_floor <= runs.status_since))
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
        OR (COALESCE(runs.budget_wall_seconds, @global_timeout_seconds::int) + runs.budget_extension_seconds + runs.budget_finalize_seconds)
           - (GREATEST(0, EXTRACT(EPOCH FROM (runs.status_since - runs.started_at))::int) - runs.budget_paused_seconds) > 0)
@@ -3747,7 +3817,8 @@ UPDATE runs SET
     -- D19: drop worker affinity for a server-side park; keep it for a worker-side park.
     worker_id = CASE WHEN runs.claim_released_at IS NOT NULL THEN NULL ELSE runs.worker_id END,
     -- D7: a resumed budget_exhausted row leaves the wall hold behind.
-    hold_reason = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_reason END,
+    -- Issue #3181: a resumed credential-switch hold (settling once its fence lifted, or unsettled) is cleared too.
+    hold_reason = CASE WHEN runs.hold_reason IN ('budget_exhausted', 'credential_switch_settling', 'credential_switch_unsettled') THEN NULL ELSE runs.hold_reason END,
     hold_captured_head = CASE WHEN runs.hold_reason = 'budget_exhausted' THEN NULL ELSE runs.hold_captured_head END,
     -- PRD #1733: the owner's resume of a provider hold is the decision to try again, so the open
     -- provider-park streak is cleared in this same statement (a refused resume changes nothing).
@@ -3765,8 +3836,18 @@ WHERE runs.id = @id AND runs.user_id = @user_id
   AND runs.hold_reason IS DISTINCT FROM 'credential_disabled'
   AND runs.hold_reason IS DISTINCT FROM 'provider_policy_refusal'
   AND runs.policy_refusal_count = 0
+  -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
+  AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
   -- D6: refuse a completion hold unless the completion decision endpoint opts in.
   AND (runs.hold_reason IS DISTINCT FROM 'completion_blocked' OR @allow_completion_blocked_hold::boolean)
+  -- Issue #3181: refuse a credential_switch_settling hold while its worker is still finishing its own
+  -- operations for the run (a fresh heartbeat from the SAME incarnation that wrote the hold). The fence
+  -- lifts when the worker settles it (credential_switch_unsettled), goes stale or vanishes, or
+  -- re-registers (dind_register_floor then moves past status_since).
+  AND (runs.hold_reason IS DISTINCT FROM 'credential_switch_settling'
+       OR NOT EXISTS (SELECT 1 FROM workers w
+                      WHERE w.id = runs.worker_id AND (@stale_cutoff::timestamptz IS NULL OR w.last_heartbeat_at >= @stale_cutoff::timestamptz)
+                        AND w.dind_register_floor <= runs.status_since))
   -- D7: refuse a budget_exhausted park with no remaining budget (extend is the way back).
   -- Remaining = three-term total - (elapsed active run-time) = total - ((status_since - started_at) - budget_paused_seconds).
   AND (runs.hold_reason IS DISTINCT FROM 'budget_exhausted'
@@ -3974,6 +4055,81 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
         AND cc.lead_run_id = runs.target_run_id AND lead.user_id = runs.user_id
   ));
 
+-- name: HoldCredentialSwitchUnsettled :execrows
+-- Issue #3181: the worker's HOLD report for a pending held-state credential switch whose local
+-- release could not be proven settled (the run's processes may still be alive). running -> paused,
+-- hold_reason 'credential_switch_settling', NON-TERMINAL. Unlike ReleaseCredentialSwitch it does
+-- NOT release the claim (claim_released_at stays NULL), does NOT requeue, does NOT bank budget
+-- (ResumePausedRun banks the paused gap once, from the status_since written here) and KEEPS the
+-- credential override, worker_id and session_id so the later resume spends the override on the
+-- same worker. The switch stamp IS cleared (the PRD #1190 pause-clear pattern: the pending request
+-- has been consumed by this hold), so a reclaim's epoch write finds nothing to settle.
+--
+-- THE WHERE IS THE FENCE: the reporting worker, the reported generation, an UNRELEASED claim, a
+-- running run of a kind that can hold (no job or cross_check), and a switch stamp actually pending
+-- AT THAT generation. Health is reset for SetRunPaused's allowlist reason.
+UPDATE runs SET
+    status                         = 'paused',
+    -- clock_timestamp(), not now(): status_since is compared with workers.dind_register_floor
+    -- (RegisterWorker), and both writers serialize on the worker row lock. now() is the transaction
+    -- START, so a hold whose transaction began before a re-registration but took the lock after it
+    -- would stamp a status_since EARLIER than the floor, reading as written by the old incarnation
+    -- and lifting the fence. clock_timestamp() is read when this UPDATE runs, which is after
+    -- beginClaimMutation's worker lock, so status_since orders with the lock.
+    status_since                   = clock_timestamp(),
+    hold_reason                    = 'credential_switch_settling',
+    credential_switch_requested_at = NULL,
+    credential_switch_generation   = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                     = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind NOT IN ('job', 'cross_check')
+  AND runs.credential_switch_requested_at IS NOT NULL
+  AND runs.credential_switch_generation = @generation
+  -- Incarnation: the reporting process must be the CURRENT registration. An old incarnation's
+  -- delayed hold, queued on the worker lock behind a re-registration that kept this run at the
+  -- same claim_generation, carries the superseded nonce and is refused here.
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = @register_nonce::text);
+
+-- name: SettleCredentialSwitchHold :execrows
+-- Issue #3181: the worker's acknowledgement that it finished joining its own operations (lane
+-- disposal, deps install). It does NOT prove the run's processes stopped.
+-- credential_switch_settling -> credential_switch_unsettled; status and status_since are NOT
+-- touched (status_since anchors the incarnation fence and the banked paused gap). The incarnation
+-- fence: the acknowledging worker must not have re-registered since the hold was written
+-- (workers.dind_register_floor <= runs.status_since), because a re-registration means the
+-- acknowledging process is a new incarnation that proves nothing about the old one's processes.
+-- The report must also carry the CURRENT registration nonce (workers.snapshot_register_nonce), so a
+-- delayed ack from a superseded incarnation is refused even if the floor ordering were ambiguous.
+-- Both conjuncts stay: the floor is what lets a registration lift the fence for the owner's Resume.
+UPDATE runs SET
+    hold_reason = 'credential_switch_unsettled',
+    updated_at  = now()
+WHERE runs.id = @id AND runs.worker_id = @worker_id
+  AND runs.claim_generation = @generation
+  AND runs.status = 'paused'
+  AND runs.hold_reason = 'credential_switch_settling'
+  AND EXISTS (SELECT 1 FROM workers w
+              WHERE w.id = runs.worker_id AND w.dind_register_floor <= runs.status_since
+                AND w.snapshot_register_nonce = @register_nonce::text);
+
+-- name: CredentialSwitchHoldSettling :one
+-- Issue #3181: the settling fence as a read, the SAME predicate ResumePausedRun refuses on (true =
+-- the owner's resume / set-token must be refused). A paused run in 'credential_switch_settling'
+-- whose worker row still exists, heartbeats at or after the stale cutoff and has not re-registered
+-- since the hold was written. A missing run or worker reads false.
+SELECT (count(*) > 0)::boolean AS settling
+FROM runs r
+JOIN workers w ON w.id = r.worker_id
+WHERE r.id = sqlc.arg('run_id')::uuid AND r.status = 'paused'
+  AND r.hold_reason = 'credential_switch_settling'
+  AND (sqlc.arg('stale_cutoff')::timestamptz IS NULL OR w.last_heartbeat_at >= sqlc.arg('stale_cutoff')::timestamptz)
+  AND w.dind_register_floor <= r.status_since;
+
 -- name: StampHeldCredentialSwitch :execrows
 -- PRD #1247 M5 (D4, BLOCKING-1 rework): the held-state credential switch for the owner's
 -- `uzi run set-token` verb on a run a worker currently holds (running/awaiting_*), written in ONE
@@ -4094,7 +4250,12 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Provider availability and policy holds retain this protection through owner resume.
-  AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)));
+  AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: ClearRunMilestonesCompleted :execrows
 -- PRD #628 M4: the ONLY non-union writer of milestones_completed. milestones_completed
@@ -4206,7 +4367,12 @@ WHERE id = @id AND worker_id = @worker_id AND (kind <> 'cross_check' OR claim_ge
   -- into a question/follow-up park, including ResumePausedRun's queued interval with its
   -- retained marker and old generation. ClaimRun increments the generation before fresh reports.
   -- Provider availability and policy holds retain this protection through owner resume.
-  AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)));
+  AND NOT (status IN ('paused', 'queued') AND (policy_refusal_count > 0 OR COALESCE(hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
+  -- Issue #3181: a credential-switch hold (settling or unsettled) leaves paused only by the owner's
+  -- resume/cancel, and a late park report must not rewrite its status_since (the incarnation fence).
+  AND NOT (status = 'paused' AND COALESCE(hold_reason IN ('credential_switch_settling', 'credential_switch_unsettled'), FALSE))
+  -- issue #3194: nor may one leave the base-attestation hold, which keeps this claim.
+  AND NOT (status = 'paused' AND COALESCE(hold_reason = 'base_attestation_missing', FALSE));
 
 -- name: SetRunCompleted :execrows
 -- completed is the terminal MR-opened event → Human Review. move_pending_since is
@@ -4743,7 +4909,7 @@ WITH candidates AS MATERIALIZED (
     WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND (runs.policy_refusal_count > 0 OR COALESCE(runs.hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
@@ -4788,7 +4954,7 @@ UPDATE runs SET
 WHERE runs.id = @id AND runs.worker_id = @worker_id AND (runs.kind <> 'cross_check' OR runs.claim_generation > 0)
   AND runs.claim_released_at IS NULL
   AND runs.status NOT IN ('completed', 'failed', 'cancelled')
-  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked'), FALSE))
+  AND NOT (runs.status = 'paused' AND COALESCE(runs.hold_reason IN ('budget_exhausted', 'completion_blocked', 'base_attestation_missing'), FALSE))
   -- Protect ResumePausedRun's retained-marker queued interval; after ClaimRun, the
   -- service fence rejects reports carrying the old generation. Other holds stay paused-only.
   AND NOT (runs.status IN ('paused', 'queued') AND (runs.policy_refusal_count > 0 OR COALESCE(runs.hold_reason IN ('provider_unavailable', 'provider_policy_refusal'), FALSE)))
@@ -8702,6 +8868,16 @@ WITH selected AS (
     WHERE runs.id = @run_id
       AND runs.policy_stop_resolution IS NULL
       AND (runs.milestones_frozen IS NULL OR runs.milestones_candidate IS NOT DISTINCT FROM runs.milestones_frozen)
+      AND (NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = runs.id)
+           OR (runs.status = 'awaiting_approval'
+               AND sqlc.narg('expected_gate_revision')::bigint = runs.gate_revision
+               AND sqlc.narg('completion_contract')::jsonb->>'profile' = 'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation' =
+                   runs.gate_presented_payload->'semantic'
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_presentation'->'candidate' =
+                   (SELECT sp.candidate FROM semantic_planning sp WHERE sp.run_id = runs.id)
+               AND sqlc.narg('completion_contract')::jsonb->'semantic_approval'->>'presentation_digest' =
+                   encode(runs.gate_payload_digest, 'hex')))
       -- PRD #1795 M2 (D5): a verdict sent against a revision the run no longer shows writes
       -- NOTHING — no selection, no milestone/contract/budget freeze, no input row.
       AND (sqlc.narg('expected_gate_revision')::bigint IS NULL
@@ -9493,7 +9669,12 @@ WHERE id = @id;
 -- PRD #1190: also stamp checkpoint_tip_at (a separate timestamp, not updated_at) so the
 -- pause UI can name the age of the last checkpoint — the "work since the last checkpoint"
 -- a `now` pause discards. It is written on every publish alongside checkpoint_tip.
-UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHERE id = @id;
+--
+-- Issue #3194: checkpoint_attested_source is set-only, inside this same write and only from the
+-- publish's own frozen non-NULL value; a NULL (legacy or unattested publish) leaves it unchanged.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now(),
+    checkpoint_attested_source = COALESCE(sqlc.narg(attested_source)::text, checkpoint_attested_source)
+WHERE id = @id;
 
 -- Run health detector (PRD #47) ----------------------------------------------
 
@@ -9844,6 +10025,10 @@ WHERE run.id = @run_id
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
            OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+      AND (NOT (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
+           OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+      AND (run.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = run.id)
+           OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (run.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = run.id
@@ -10308,6 +10493,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10512,6 +10701,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -10586,6 +10779,10 @@ WHERE r.status = 'queued'
              OR 'cross_check_v1' = ANY(w.protocol_capabilities))
         AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
              OR 'cross_check_codex_lead_v1' = ANY(w.protocol_capabilities))
+        AND (NOT (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.target_run_id) AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
+             OR 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))
+        AND (r.kind = 'cross_check' OR NOT EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = r.id)
+             OR 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))
       AND (r.kind <> 'cross_check' OR EXISTS (
           SELECT 1 FROM cross_checks protocol_check JOIN runs protocol_lead ON protocol_lead.id = protocol_check.lead_run_id
           WHERE protocol_check.checker_run_id = r.id
@@ -11502,6 +11699,30 @@ SELECT count(*) FROM workers w WHERE w.user_id = @user_id
  AND NOT w.ephemeral AND NOT w.isolated_lane
  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
  AND 'ci_artifacts_v1' = ANY(w.protocol_capabilities);
+
+-- name: GetRunSemanticHealth :one
+-- PRD #1230: the queued-reason inputs for a semantic-enrolled run. lead_enrolled marks a lead
+-- run with a semantic_planning row; plan_checker_enrolled marks a plan-stage cross-check child
+-- whose target run has one. The two counts are the owner's online, non-draining, non-ephemeral
+-- workers advertising the capability each ClaimRun clause requires, so the pill and the claim
+-- gate agree. The checker count does not repeat the cross_check_v1 conjunct, which every
+-- semantic-capable checker advertises; a worker with only the semantic token never claims.
+SELECT
+  EXISTS (SELECT 1 FROM semantic_planning sp WHERE sp.run_id = @run_id) AS lead_enrolled,
+  EXISTS (SELECT 1 FROM runs c
+            JOIN semantic_planning sp ON sp.run_id = c.target_run_id
+            JOIN cross_checks pc ON pc.checker_run_id = c.id AND pc.stage = 'plan'
+           WHERE c.id = @run_id AND c.kind = 'cross_check') AS plan_checker_enrolled,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'completion_semantic_publication_v1' = ANY(w.protocol_capabilities))::bigint AS publication_capable,
+  (SELECT count(*) FROM workers w WHERE w.user_id = @user_id
+     AND w.status = 'online'
+     AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+     AND NOT w.ephemeral AND NOT w.isolated_lane
+     AND 'cross_check_semantic_plan_v1' = ANY(w.protocol_capabilities))::bigint AS plan_checker_capable;
 
 -- name: SaveCIArtifactAdmission :one
 UPDATE runs SET ci_artifact_manifest = @manifest::jsonb, issue_description = @description

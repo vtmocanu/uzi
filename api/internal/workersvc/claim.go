@@ -24,13 +24,14 @@ import (
 // structured templates (PRD #3 provides several subagents that map to
 // programmatic SDK AgentDefinitions), not a single `template`.
 type ClaimPayload struct {
-	PolicyHoldResume        bool                 `json:"policy_hold_resume,omitempty"`
-	PolicyHoldFreshSession  bool                 `json:"policy_hold_fresh_session,omitempty"`
-	MemoryEpisode           int64                `json:"memory_episode"`
-	MemoryInterventionCount int32                `json:"memory_intervention_count"`
-	MemoryPolicy            *MemoryPolicy        `json:"memory_policy"`
-	CrossCheck              *ClaimPlanCrossCheck `json:"cross_check,omitempty"`
-	RunID                   string               `json:"run_id"`
+	PolicyHoldResume        bool                         `json:"policy_hold_resume,omitempty"`
+	PolicyHoldFreshSession  bool                         `json:"policy_hold_fresh_session,omitempty"`
+	SemanticPlanning        *apitypes.SemanticEnrollment `json:"semantic_planning,omitempty"`
+	MemoryEpisode           int64                        `json:"memory_episode"`
+	MemoryInterventionCount int32                        `json:"memory_intervention_count"`
+	MemoryPolicy            *MemoryPolicy                `json:"memory_policy"`
+	CrossCheck              *ClaimPlanCrossCheck         `json:"cross_check,omitempty"`
+	RunID                   string                       `json:"run_id"`
 	// Kind is the run kind (one of the runkind values; PRD #6). The worker branches on it: an
 	// issue run works IssueIID's card; a ci_fix run diagnoses + fixes Pipeline.
 	Kind string `json:"kind"`
@@ -55,9 +56,14 @@ type ClaimPayload struct {
 	Branch         *string                 `json:"branch"`                   // resume: attach existing branch
 	SessionID      *string                 `json:"session_id"`               // resume: continue SDK session
 	CheckpointTip  *string                 `json:"checkpoint_tip,omitempty"` // resume: own-checkpoint anchor (owner-anchor guard)
-	LastSeq        int32                   `json:"last_seq"`                 // resume: continue message numbering
-	IterationCount int32                   `json:"iteration_count"`
-	RequeueCount   int32                   `json:"requeue_count"`
+	// CheckpointAttestedSource (issue #3194) is the source OID a flight of THIS run published
+	// after its --require-base guard strictly accepted (runs.checkpoint_attested_source, set-only).
+	// A continuation may adopt exactly this source. nil (omitted) for legacy, unattested and
+	// warn-only runs, so their claim stays byte-identical.
+	CheckpointAttestedSource *string `json:"checkpoint_attested_source,omitempty"`
+	LastSeq                  int32   `json:"last_seq"` // resume: continue message numbering
+	IterationCount           int32   `json:"iteration_count"`
+	RequeueCount             int32   `json:"requeue_count"`
 	// ClaimGeneration is the general claim-lane counter (PRD #1296 M1, D2), incremented
 	// atomically in the ClaimRun transaction that produced this payload and read straight
 	// off the returned run row. The worker binds its durable source-journal identity to
@@ -706,10 +712,11 @@ type ClaimConfig struct {
 	// accepted set (a legacy, non-interlocked, or revision-1 run), so a non-reduced run's claim is
 	// byte-identical to today's. Unlike CompletionContractVersion/ContractRevision (scalars read
 	// straight off a column) this is derived from the completion_contract jsonb by
-	// CompletionScopeClaim; it carries milestone TITLES (looked up from the contract's criteria),
+	// CompletionScopeClaim; it carries milestone TITLES (structural criterion text or frozen semantic milestones),
 	// which the owner-facing CompletionScopeView DTO does not.
-	CompletionScope *CompletionScopeConfig `json:"completion_scope,omitempty"`
-	NonClosing      *CompletionNonClosing  `json:"non_closing,omitempty"`
+	CompletionScope   *CompletionScopeConfig         `json:"completion_scope,omitempty"`
+	CompletionPending *apitypes.CompletionPendingDTO `json:"completion_pending,omitempty"`
+	NonClosing        *CompletionNonClosing          `json:"non_closing,omitempty"`
 	// JobInputFileMaxBytes, JobInputsMaxFiles and JobInputsMaxBytes are the server's job-input
 	// limits (PRD #1909 D1: one file, files per job, total bytes per job), delivered on a JOB
 	// claim only so the worker can refuse an oversized manifest before it downloads anything. The

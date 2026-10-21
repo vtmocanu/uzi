@@ -77,5 +77,6 @@
   "outbox_blocked": "x",
   "outbox_blocked_run_id": "x",
   "residue_quarantined_at": "2020-01-02T03:04:05Z",
-  "residue_quarantine_cause": "x"
+  "residue_quarantine_cause": "x",
+  "memory_authority_lost_at": "2020-01-02T03:04:05Z"
 }

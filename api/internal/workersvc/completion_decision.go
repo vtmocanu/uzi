@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -43,8 +44,11 @@ const maxCompletionReasonBytes = 8 * 1024
 // unmet criteria by criterion id). Keep is the milestone-id set a partial keeps in scope; Criteria
 // is the criterion-id set an accept accepts; Reason is required for partial/accept; ContractRevision
 // is the revision the caller believes it is deciding against (the optimistic fence).
+// authorize_maintainer renews exact existing semantic maintainer UUIDs and their
+// frozen reason/conditions/verification steps; it never reclassifies or verifies work.
 type CompletionDecisionInput struct {
 	ActionIfMatch    string `json:"-"`
+	Maintainers      []apitypes.SemanticMaintainerApproval
 	Decision         string
 	Guidance         string
 	Keep             []string
@@ -238,6 +242,7 @@ func (s *Service) resumeCompletionBlocked(ctx context.Context, q Store, run stor
 			UserID:                     userID,
 			AllowCompletionBlockedHold: true,
 			GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+			StaleCutoff:                s.staleWorkerCutoff(),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCompletionNotBlocked
@@ -285,7 +290,7 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	case "continue":
 		// Owner-only, as #1226 apart from the #1728 NUL strip (ContinueCompletionDecision's GetRun is owner-scoped).
 		return s.ContinueCompletionDecision(ctx, userID, runID, req.Guidance, req.ActionIfMatch)
-	case "partial", "accept":
+	case "partial", "accept", "authorize_maintainer":
 		// handled below
 	default:
 		return store.Run{}, fmt.Errorf("%w: unknown decision", ErrCompletionDecisionInvalid)
@@ -368,21 +373,25 @@ func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID 
 	case cur == req.ContractRevision:
 		// fresh apply — fall through to validation + write.
 	case cur == req.ContractRevision+1 && decisionAlreadyEncoded(locked, dec, cur):
-		// Idempotent repeat: nothing to write. The deferred Rollback releases the lock; the re-read
-		// runs owner-scoped on a separate pool connection (a plain SELECT does not block on the lock).
-		return s.GetRun(ctx, userID, runID)
+		// The locked row is already owner-checked. Deferred Rollback releases its
+		// connection before the caller receives this exact replay.
+		return locked, nil
 	default:
 		return store.Run{}, ErrCompletionRevisionConflict
 	}
 
 	// Validate the decision against the LOCKED contract/frozen list.
 	frozenMs, _ := DecodeMilestones(locked.MilestonesFrozen)
-	if err := validateDecision(locked, dec, frozenMs); err != nil {
+	prior, err := parseCompletionContract(locked.CompletionContract)
+	if err != nil {
+		return store.Run{}, ErrCompletionRevisionConflict
+	}
+	if err := validateDecisionFromContract(locked, prior, dec, frozenMs); err != nil {
 		return store.Run{}, err
 	}
 
 	newRev := cur + 1
-	revised, err := buildRevisedContract(locked.CompletionContract, dec, frozenMs, newRev)
+	revised, err := buildRevisedContractFromValidated(prior, dec, frozenMs, newRev)
 	if err != nil {
 		return store.Run{}, err
 	}
@@ -438,6 +447,24 @@ func validateDecision(locked store.Run, dec CompletionDecisionInput, frozenMs []
 		// A frozen run at a valid revision should have a non-null contract; a NULL/corrupt one is a
 		// transient split-state, not a client error — refuse as a conflict (retryable), not a 400.
 		return ErrCompletionRevisionConflict
+	}
+	return validateDecisionFromContract(locked, prior, dec, frozenMs)
+}
+
+func validateDecisionFromContract(locked store.Run, prior completionContract, dec CompletionDecisionInput, frozenMs []Milestone) error {
+	if _, err := completionPendingFromContract(locked, prior); err != nil {
+		return ErrCompletionRevisionConflict
+	}
+	if prior.Profile == "semantic" {
+		if dec.Decision == "accept" {
+			return fmt.Errorf("%w: semantic criteria cannot be waived by accept", ErrCompletionDecisionInvalid)
+		}
+	}
+	if dec.Decision == "authorize_maintainer" {
+		if prior.Profile != "semantic" {
+			return ErrCompletionDecisionInvalid
+		}
+		return validateMaintainerSelection(prior, dec)
 	}
 	frozen := make(map[string]bool, len(frozenMs))
 	for _, m := range frozenMs {
@@ -550,7 +577,15 @@ func decisionAlreadyEncoded(locked store.Run, dec CompletionDecisionInput, cur i
 	if err != nil {
 		return false
 	}
+	if _, err := completionPendingFromContract(locked, c); err != nil {
+		return false
+	}
+	if c.Profile == "semantic" && dec.Decision == "accept" {
+		return false
+	}
 	switch dec.Decision {
+	case "authorize_maintainer":
+		return maintainerDecisionEncoded(c, dec, cur)
 	case "partial":
 		if c.Scope == nil {
 			return false
@@ -604,6 +639,15 @@ func decisionAlreadyEncoded(locked store.Run, dec CompletionDecisionInput, cur i
 // JSON recorded on the run's input history. For a partial the deferred list is the full
 // out-of-scope set (frozen − keep), sorted; for an accept the accepted criterion ids.
 func decisionAuditBody(dec CompletionDecisionInput, frozenMs []Milestone, newRev int) (string, error) {
+	if dec.Decision == "authorize_maintainer" {
+		b, err := json.Marshal(struct {
+			Decision    string                                `json:"decision"`
+			Maintainers []apitypes.SemanticMaintainerApproval `json:"maintainers"`
+			Reason      string                                `json:"reason"`
+			Revision    int                                   `json:"revision"`
+		}{dec.Decision, dec.Maintainers, dec.Reason, newRev})
+		return string(b), err
+	}
 	switch dec.Decision {
 	case "partial":
 		keep := make(map[string]bool, len(dec.Keep))

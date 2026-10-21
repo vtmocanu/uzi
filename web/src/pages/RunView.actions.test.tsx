@@ -245,6 +245,19 @@ it.each(["queued", "paused"] as const)("provider Stop Resume error refreshes act
   }
 });
 
+it("base attestation hold shows recovery next steps and offers no Resume or Extend (issue #3194)", () => {
+  runOverrides = { hold_reason: "base_attestation_missing", budget_extension_cap_seconds: 3600, health: "slow" };
+  mount("ordinary");
+  expect(screen.getByText("Base unverified: waiting for owner")).toBeTruthy();
+  expect(screen.getAllByText("base unverified: owner hold").length).toBeGreaterThan(0);
+  expect(screen.getByText("uzi run recovery A")).toBeTruthy();
+  expect(screen.getByText("uzi run export A --output <path>")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /Resume/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /Extend/ })).toBeNull();
+  expect(screen.queryByText(/Completion state/)).toBeNull();
+  expect(screen.getAllByRole("button", { name: /^Cancel$/ }).length).toBeGreaterThan(0);
+});
+
 it("provider Stop preserves unknown Resume outcome when error refresh fails", async () => {
   vi.mocked(api.resumeRun).mockRejectedValueOnce(new ApiError(500, "Response lost"));
   refreshRun.mockRejectedValueOnce(new Error("Read failed"));
