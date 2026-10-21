@@ -120,9 +120,13 @@ if (cfg.mode === "MirrorHeadsOnly") git(["update-ref", "-d", `refs/remotes/origi
 if (cfg.mode === "ConflictingOriginHEAD") git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/other"]);
 const cache = new GitCache(local, nullLogger(), undefined, testGitCacheOptions({
   gitleaksBin: defaultGitleaksShim(),
-  checkpointPackBounds: cfg.mode === "LiveCapFallback" || cfg.mode === "CapExpiredParent" ? { bytes: 1 } : undefined,
+  checkpointPackBounds: cfg.mode.includes("Cap") ? { bytes: 1 } : undefined,
 }));
 type Packed = NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>;
+// Independent bounded fixture oracle: enumerate default closure only in this test process.
+const defaultObjects = git(["rev-list", "--objects", defaultTip]).split("\n").map(row => row.split(" ")[0]!);
+const eligibleDefaultBlobs = git(["cat-file", "--batch-check=%(objectname) %(objecttype)"], defaultObjects.join("\n") + "\n")
+  .split("\n").filter(row => row.endsWith(" blob")).sort();
 const artifacts: { name: string; file: string; tip: string; inventory: string[]; reconstructed: number }[] = [];
 async function save(name: string, packed: Pick<Packed, "pack" | "exited" | "cancel">, oid: string) {
   const file = path.join(local, name + ".pack");
@@ -158,6 +162,7 @@ let capturedDefault: string | undefined, capturedFloor: string | undefined;
 const calls: string[] = [];
 const preparationChildren = new Set<ReturnType<typeof spawn>>();
 let fallbackSettled = true;
+let replaying = false;
 const parent = new AbortController();
 const realNow = Date.now;
 let clockOffset = 0;
@@ -181,7 +186,7 @@ const spawner: BoundaryProcessSpawner = async request => {
     child.once("error", reject);
     child.once("close", code => {
       if (preparation) preparationChildren.delete(child);
-      if (injectPreparation && cfg.mode === "CapExpiredParent") clockOffset = 120_000;
+      if (injectPreparation && (cfg.mode === "CapExpiredParent" || (replaying && cfg.mode === "ReplayCapExpired"))) clockOffset = 120_000;
       resolve({ code: code ?? -1 });
     });
   });
@@ -232,6 +237,22 @@ if (["ExpiredParent", "CancelledParent", "PreparationAbort", "PreparationDeadlin
       git(["push", "-q", "--force", "origin", `${next}:refs/heads/${defaultName}`]);
     }
     git(["update-ref", `refs/uzi-runner/${branch}`, floor]);
+    git(["update-ref", `refs/remotes/origin/${branch}`, tip]);
+    assert.equal(git(["rev-parse", `refs/remotes/origin/${branch}`]), tip, "live floor moved after capture");
+    const callsBefore = calls.length;
+    replaying = true;
+    if (cfg.mode === "ReplayDeadline") clockOffset = 120_000;
+    if (cfg.mode === "ReplayAbort") parent.abort(new Error("injected replay abort"));
+    if (parent.signal.aborted || Date.now() >= options.deadline) {
+      await assert.rejects(packed.replay());
+      assert.equal(calls.length, callsBefore, "expired replay starts no child or producer");
+      assert.equal(preparationChildren.size, 0, "replay stop joins cleanup before returning");
+    } else if (cfg.mode === "ReplayCapExpired") {
+      await assert.rejects(packed.replay());
+      assert.equal(calls.slice(callsBefore).some(call => call.includes("pack-objects")), false,
+        "cap cleanup cannot start fallback after original deadline");
+      assert.equal(preparationChildren.size, 0, "expired cap cleanup joined");
+    } else {
     const replay = await packed.replay();
     await save("replay", replay, packed.tipOid);
     const replayInventory = artifacts.at(-1)!.inventory;
@@ -244,6 +265,7 @@ if (["ExpiredParent", "CancelledParent", "PreparationAbort", "PreparationDeadlin
       return hash.digest("hex");
     };
     assert.equal(await digest(artifacts.at(-1)!.file), await digest(artifacts.at(-2)!.file));
+    }
   }
 }
 Date.now = realNow;
@@ -252,4 +274,4 @@ const settled = preparationChildren.size === 0;
 assert.equal(fallbackSettled, true);
 console.log("SELECTIVE_SUMMARY " + JSON.stringify({ local, branch, defaultName, tip, floor, x, d,
   defaultTip, publicBlobs, privateBlob, candidateTree, protectedChanged, protectedBase,
-  stopped, calls, settled, capturedDefault, capturedFloor, historicalBlob, historicalBlobAbsentDepthOne, artifacts }));
+  stopped, calls, settled, capturedDefault, capturedFloor, historicalBlob, historicalBlobAbsentDepthOne, eligibleDefaultBlobs, artifacts }));

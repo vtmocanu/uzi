@@ -25,6 +25,7 @@ type bridgePublish struct {
 	tip     string
 	skipped string
 	err     string
+	result  pushbroker.Result
 }
 
 // TestAgentCheckpointChainBridge is the issue #2733 binding bridge. It runs the REAL agent
@@ -81,6 +82,13 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	f.pushMain()
 	branch := fmt.Sprintf("agent/issue-%d", iid)
 	ref := "refs/uzi-checkpoints/" + branch
+	// The origin branch pins the old floor; default gains then deletes a bounded historical blob.
+	run(t, "", "git", "-C", f.work, "push", "origin", "HEAD:refs/heads/"+branch)
+	f.commit("historical.txt", "historical default content\n", "historical default blob")
+	historicalBlob := strings.TrimSpace(run(t, "", "git", "-C", f.work, "rev-parse", "HEAD:historical.txt"))
+	run(t, "", "git", "-C", f.work, "rm", "historical.txt")
+	run(t, "", "git", "-C", f.work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "remove historical default blob")
+	f.pushMain()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
 	defer cancel()
@@ -99,10 +107,10 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 			return
 		}
 		// Match production's typed refusal tokens; service ownership/slot retry stays outside this bridge.
-		_, err = pushbroker.Publish(r.Context(), pushbroker.Options{
+		result, err := pushbroker.Publish(r.Context(), pushbroker.Options{
 			CloneURL: f.cloneURL(), Branch: branch, DefaultBranch: "main", DeclaredTip: tip, Pack: pack,
 		})
-		rec := bridgePublish{tip: tip}
+		rec := bridgePublish{tip: tip, result: result}
 		resp := map[string]any{"published": true, "ref": ref}
 		switch {
 		case err == nil:
@@ -137,9 +145,10 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("chain evidence=%s", scratch)
 	cfg, err := json.Marshal(map[string]any{
 		"url": srv.URL, "token": "tkn-bridge-123456", "origin": f.bare, "iid": iid,
-		"boundary": boundary, "scratch": scratch, "defaultBranch": "main",
+		"boundary": boundary, "scratch": scratch, "defaultBranch": "main", "historicalBlob": historicalBlob,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -244,7 +253,15 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		}
 	}
 
-	for _, p := range publishes {
+	for i, p := range publishes {
+		want := pushbroker.PublishAdvanced
+		already := lostAck && i == 1
+		if already {
+			want = pushbroker.PublishUnclassified
+		}
+		if p.result.Disposition != want || p.result.AlreadyCurrent != already {
+			t.Fatalf("publish %d result=%+v want disposition=%v alreadyCurrent=%t", i, p.result, want, already)
+		}
 		if p.skipped != "" || p.err != "" {
 			t.Fatalf("a publish was not accepted (tip %s skipped=%q err=%q)\n%s", p.tip, p.skipped, p.err, describe())
 		}

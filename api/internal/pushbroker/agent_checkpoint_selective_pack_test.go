@@ -87,6 +87,7 @@ type selectiveSummary struct {
 	X                            string              `json:"x"`
 	D                            string              `json:"d"`
 	DefaultTip                   string              `json:"defaultTip"`
+	EligibleDefaultBlobs         []string            `json:"eligibleDefaultBlobs"`
 	PublicBlobs                  []string            `json:"publicBlobs"`
 	PrivateBlob                  string              `json:"privateBlob"`
 	CandidateTree                string              `json:"candidateTree"`
@@ -194,7 +195,8 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 		"NoDefaultMerge", "EqualDefault", "RevertDefault", "AbsentServerName", "UnresolvedDefault",
 		"MirrorHeadsOnly", "ConflictingOriginHEAD", "ReplayAdvance", "ReplayRewrite", "ReplayDelete",
 		"FrozenHeld", "ProtectedDifference", "UnprotectedDifference", "ExpiredParent", "CancelledParent",
-		"PreparationAbort", "PreparationDeadline", "CapExpiredParent", "LiveCapFallback"}
+		"PreparationAbort", "PreparationDeadline", "CapExpiredParent", "LiveCapFallback",
+		"ReplayDeadline", "ReplayAbort", "ReplayCapExpired", "ReplayCapLive"}
 	t.Run("OutputBounds", testCheckpointBridgeOutputBounds)
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
@@ -218,7 +220,7 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				t.Fatal("historical omitted blob must be absent from depth-one bases and present at origin")
 			}
 			legacyMode := mode == "AbsentServerName" || mode == "UnresolvedDefault" || mode == "MirrorHeadsOnly" ||
-				mode == "ConflictingOriginHEAD" || mode == "LiveCapFallback"
+				mode == "ConflictingOriginHEAD" || mode == "LiveCapFallback" || strings.HasPrefix(mode, "ReplayCap")
 			if legacyMode && !equalCheckpointInventory(legacy.Inventory, selected.Inventory) {
 				t.Fatal("legacy fallback inventory changed")
 			}
@@ -230,6 +232,11 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				}
 				return false
 			}
+			eligible := s.EligibleDefaultBlobs
+			if legacyMode {
+				eligible = nil
+			}
+			assertCheckpointInventory(t, legacy.Inventory, selected.Inventory, eligible)
 			selectedSet, legacySet := make(map[string]bool), make(map[string]bool)
 			for _, row := range selected.Inventory {
 				selectedSet[row] = true
@@ -245,8 +252,8 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 					t.Fatalf("selective pack added an object outside original walk: %s", row)
 				}
 			}
-			if mode == "ExactLinearHistory" && s.DefaultTip != s.D {
-				t.Fatal("exact linear default must be D")
+			if mode == "ExactLinearHistory" && (s.DefaultTip != s.D || s.CapturedFloor != s.Floor || selected.Tip != s.Tip) {
+				t.Fatal("exact linear range must be C^B with default D")
 			}
 			if mode == "AbsentOriginBranch" {
 				base := strings.TrimSpace(run(t, "", "git", "-C", filepath.Join(s.Local, "worker.git"), "merge-base", s.DefaultTip, s.Tip))
@@ -269,8 +276,19 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 			}
 			opts := pushbroker.Options{CloneURL: f.cloneURL(), Branch: s.Branch, DefaultBranch: s.DefaultName, DeclaredTip: s.Tip}
 			publish := func(a selectiveArtifact) error {
+				before := f.originRef("refs/uzi-checkpoints/" + s.Branch)
 				opts.Pack = selectiveArtifactPack(t, s, a)
-				_, err := pushbroker.Publish(caseCtx, opts)
+				result, err := pushbroker.Publish(caseCtx, opts)
+				want := pushbroker.PublishUnclassified
+				if err == nil && before != a.Tip {
+					want = pushbroker.PublishAdvanced
+				}
+				if result.Disposition != want || result.AlreadyCurrent != (err == nil && before == a.Tip) {
+					t.Fatalf("artifact=%s result=%+v err=%v want disposition=%v", a.Name, result, err, want)
+				}
+				if err != nil && f.originRef("refs/uzi-checkpoints/"+s.Branch) != before {
+					t.Fatal("ref changed on refusal")
+				}
 				t.Logf("artifact=%s tip=%s wire=%d reconstructed=%d outcome=%s err=%v",
 					a.Name, a.Tip, len(opts.Pack), a.Reconstructed, checkpointBridgeRefusal(err), err)
 				return err
@@ -310,7 +328,7 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 					t.Fatalf("legacy actual Publish: %v", err)
 				}
 			}
-			if mode == "LiveCapFallback" {
+			if mode == "LiveCapFallback" || strings.HasPrefix(mode, "ReplayCap") {
 				producers := 0
 				for _, call := range s.Calls {
 					if strings.Contains(call, "pack-objects") {
@@ -320,8 +338,12 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 						}
 					}
 				}
-				if producers != 1 {
-					t.Fatalf("fallback producers=%d want=1", producers)
+				wantProducers := 1
+				if mode == "ReplayCapLive" {
+					wantProducers = 2
+				}
+				if producers != wantProducers {
+					t.Fatalf("fallback producers=%d want=%d", producers, wantProducers)
 				}
 			}
 			err := publish(selected)
@@ -334,7 +356,7 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 			if err != nil {
 				t.Fatalf("selective actual Publish must succeed: %v", err)
 			}
-			if legacyMode && mode != "LiveCapFallback" && s.CapturedDefault != "" {
+			if legacyMode && mode != "LiveCapFallback" && !strings.HasPrefix(mode, "ReplayCap") && s.CapturedDefault != "" {
 				t.Fatal("untrusted or unavailable default captured blob-exclusion authority")
 			}
 			if !legacyMode && mode != "FrozenHeld" && s.CapturedDefault != s.DefaultTip {
@@ -362,6 +384,16 @@ func TestAgentCheckpointSelectivePackBridge(t *testing.T) {
 				}
 			}
 			if strings.HasPrefix(mode, "Replay") {
+				wantArtifacts := 3
+				if mode == "ReplayDeadline" || mode == "ReplayAbort" || mode == "ReplayCapExpired" {
+					wantArtifacts = 2
+				}
+				if len(s.Artifacts) != wantArtifacts {
+					t.Fatalf("replay artifacts=%d want=%d", len(s.Artifacts), wantArtifacts)
+				}
+			}
+			if strings.HasPrefix(mode, "Replay") && len(s.Artifacts) == 3 {
+				assertCheckpointInventory(t, legacy.Inventory, s.Artifacts[2].Inventory, eligible)
 				if !equalCheckpointInventory(selected.Inventory, s.Artifacts[2].Inventory) {
 					t.Fatal("replay inventory drift")
 				}
@@ -429,6 +461,39 @@ func testCheckpointBridgeOutputBounds(t *testing.T) {
 					t.Fatal("overflow failed to cancel before deadline")
 				}
 			})
+		}
+	}
+}
+
+// Check the entire bounded inventory: only eligible blobs may be omitted.
+// Git's bounded walk may retain some eligible blobs; it need not traverse their history.
+func assertCheckpointInventory(t *testing.T, legacy, actual, eligible []string) {
+	t.Helper()
+	omit := make(map[string]bool, len(eligible))
+	for _, row := range eligible {
+		omit[row] = true
+	}
+	present := make(map[string]bool, len(actual))
+	for _, row := range actual {
+		present[row] = true
+	}
+	expected := make([]string, 0, len(legacy))
+	for _, row := range legacy {
+		if !omit[row] || present[row] {
+			expected = append(expected, row)
+		}
+	}
+	for i := 0; i < len(expected) || i < len(actual); i++ {
+		want, got := "<end>", "<end>"
+		if i < len(expected) {
+			want = expected[i]
+		}
+		if i < len(actual) {
+			got = actual[i]
+		}
+		if want != got {
+			t.Errorf("inventory row %d: got %s want %s (lengths %d/%d)", i, got, want, len(actual), len(expected))
+			return
 		}
 	}
 }
