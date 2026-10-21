@@ -66,9 +66,9 @@ type Options struct {
 	BaseURL  string
 	Branch   string
 	// DefaultBranch is the repo's default branch (from the run claim context). Its
-	// objects are the exclude-boundary base a first-checkpoint delta pack was built
-	// against, so we fetch them into the storer alongside the branch's own refs — but
-	// we fetch ONLY these named refs, never every head (Rule: bounded fetch).
+	// named fetch supplies the current default snapshot for validation, alongside
+	// the branch's own refs (Rule: bounded fetch). The forge already holds historical
+	// default-reachable blobs omitted by the worker; we forward its pack verbatim.
 	DefaultBranch string
 	Username      string
 	PAT           string
