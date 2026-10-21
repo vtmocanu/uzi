@@ -240,7 +240,10 @@ export async function captureSemanticSources(
   let outcome: "complete" | "unknown" = issue.completeness;
   if (!validPlan || !safeRef || !safeRepo || !safeTimeout || paths.length > 8 || total > limits.total) outcome = "unknown";
   // Overflow cannot return a passing prefix: retain bounded identities but clear
-  // every captured source when the requested source set cannot fit.
+  // every captured source when the requested source set cannot fit. Too many PRD
+  // links is not such a case: none of the eight retained PRDs was read, and the
+  // exact issue capture must survive, since the server refuses issue bytes that
+  // differ from the frozen run (the outcome is already unknown).
   for (const path of paths.slice(0, 8)) {
     let raw: Uint8Array | undefined;
     const remaining = deadline - Date.now();
@@ -260,7 +263,7 @@ export async function captureSemanticSources(
     if (source.completeness === "unknown") outcome = "unknown";
     sources.push(source);
   }
-  if (paths.length > 8 || !validPlan || total > limits.total || !safeRef || !safeRepo || !safeTimeout) {
+  if (!validPlan || total > limits.total || !safeRef || !safeRepo || !safeTimeout) {
     for (const source of sources) { source.completeness = "unknown"; source.bytes = ""; }
   }
   return { sources, source_outcome: outcome };

@@ -334,10 +334,18 @@ test("snapshot size limits are inclusive and overflow never captures a passing p
   }
   const issueLimit = await captureSemanticSources(git, input("x".repeat(64 * 1024)));
   assert.equal(issueLimit.source_outcome, "complete");
-  const tooMany = await captureSemanticSources(git, input(Array.from({ length: 9 }, (_, i) => "prds/" + i + "-a.md").join(" ")));
+  // Too many links reads no PRD but keeps the exact issue capture: the server refuses
+  // issue bytes that differ from the frozen run, so a cleared issue would fail the
+  // candidate before unknown coverage could reach the human gate.
+  const nineLinks = Array.from({ length: 9 }, (_, i) => "prds/" + i + "-a.md").join(" ");
+  const { git: tooManyGit, calls: tooManyCalls } = reader();
+  const tooMany = await captureSemanticSources(tooManyGit, input(nineLinks));
   assert.equal(tooMany.sources.length, 9);
   assert.equal(tooMany.source_outcome, "unknown");
-  assert.ok(tooMany.sources.every(s => s.completeness === "unknown" && s.bytes === ""));
+  assert.equal(tooManyCalls.length, 0);
+  assert.equal(tooMany.sources[0]!.completeness, "complete");
+  assert.equal(Buffer.from(tooMany.sources[0]!.bytes, "base64").toString("utf8"), nineLinks);
+  assert.ok(tooMany.sources.slice(1).every(s => s.completeness === "unknown" && s.bytes === ""));
   const totalOverflow = await captureSemanticSources(git, { ...input("prds/1-a.md prds/2-b.md"), planBytes: Buffer.alloc(256 * 1024, 0x61) });
   assert.equal(totalOverflow.source_outcome, "unknown");
   assert.equal(totalOverflow.sources[2]!.bytes, "");
