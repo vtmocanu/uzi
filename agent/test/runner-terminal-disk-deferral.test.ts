@@ -164,12 +164,31 @@ describe("terminal execution disk deferral", () => {
     it(`Codex supervisor ${mode} must affirmatively enter a successful boundary`, async () => {
       let markers = 0;
       git.commitWipMarker = async () => { markers++; return false; };
-      const f = fixture({ safety: supervisedSafety(mode),
+      let boundaries = 0;
+      const safety = supervisedSafety(mode);
+      const boundary = safety.withBoundary.bind(safety);
+      safety.withBoundary = async (request, action) => {
+        boundaries++;
+        return boundary(request, action);
+      };
+      const f = fixture({ safety,
         runner: { quiesceRun: async () => ({ ...QUIESCENT, process: undefined }) } });
       await f.runner.execute(f.claim);
       assert.equal(parks().length, mode === "empty" ? 1 : 0);
       assert.equal(markers, mode === "empty" ? 3 : 0);
       assert.equal(fs.existsSync(f.clone()), true);
+      if (mode !== "empty") {
+        assert.equal(boundaries, 5, "incomplete settlement consumes the bounded unsafe-proof budget");
+        const failed = api.states.filter(s => s.body.status === "failed");
+        assert.equal(failed.length, 1);
+        assert.equal(failed[0]!.body.fail_origin, "worker_residue_blocked");
+        assert.equal(api.states.some(s => s.body.status === "completed"), false);
+        assert.equal(f.forge.calls.length, 0, "no finalize/MR");
+        assert.equal(api.completionPermitRequests.length, 0);
+        assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
+        assert.equal(fs.readFileSync(path.join(f.clone(), "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+        assert.equal(fs.readFileSync(path.join(f.clone(), "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+      }
     });
   }
 
@@ -288,7 +307,8 @@ describe("terminal execution disk deferral", () => {
         assert.equal(f.reclaims(), 1, "canonical redispatch never re-enters disk admission");
         assert.equal(settles, 5, "each verification attempt has its own capture scope");
         assert.equal(unverified, 5, "credential deferrals outlive the three-attempt disk capture budget");
-        assert.deepEqual(boundaries, ["shutdown"]);
+        // Post-WIP deferral follows both the strict drain prerequisite and the source proof.
+        assert.deepEqual(boundaries, location === "post-WIP proof" ? ["shutdown", "shutdown"] : ["shutdown"]);
         assert.equal(custodySettles, 0, "custody is retained");
         assert.equal(parks().length, 1);
         assert.equal(parks()[0]!.body.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);

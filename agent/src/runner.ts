@@ -16957,14 +16957,19 @@ export class RunRunner {
               // its own boundary. Neither step acquires a credential-free capture callback.
               const settlement = await this.settleForCredentialCapture(executor, undefined, "capture", "authenticated");
               if (settlement.kind !== "observed_empty") {
-                // Incomplete settlement retains custody until lifecycle exit; it does
-                // not consume the bounded failed-process-proof attempts below.
-                await retryWait();
-                continue;
+                if (!opts.terminalDisk) {
+                  await retryWait();
+                  continue;
+                }
+                // Incomplete settlement grants no source permission; use the existing
+                // bounded unsafe-proof refusal while retaining clone, session and custody.
+                attempt = { verified: false, published: false, residueBlocked: true,
+                  residueDetail: "terminal disk capture: authenticated settlement incomplete" };
+              } else {
+                attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
+                  terminalDisk: opts.terminalDisk,
+                });
               }
-              attempt = await this.captureRecoveryRestorePoint(claim, flight, runLog, "recovery_capture", {
-                terminalDisk: opts.terminalDisk,
-              });
             }
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
