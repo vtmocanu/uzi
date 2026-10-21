@@ -189,8 +189,9 @@ export function SwitchTokenAction({
   // its first claim.
   // A run held on credential_disabled (PRD #1732) holds no claim either: its claim was
   // never delivered, so switching interrupts nothing.
-  // An unsettled token-switch hold (issue #3181) is held for its owner with nothing running:
-  // a switch there requeues it on the chosen token instead of interrupting anything.
+  // A token-switch hold (issue #3181) continues no model execution, but its processes may still
+  // be alive. A permitted switch requeues it on the chosen token; the next claim must re-prove
+  // quiescence before continuing.
   const willInterrupt = run.status !== "queued" && run.hold_reason !== "credential_disabled" && switchHold === null;
   // A pinned choice with no resolved id cannot be sent (the server 400s it), so block
   // the confirm until the user picks a real token. A pin to a DISABLED token is refused

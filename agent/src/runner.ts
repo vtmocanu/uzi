@@ -1995,9 +1995,10 @@ interface RunFlight {
   retainedEpisodeCustody?: boolean;
   /** issue #3181: a retained credential switch could not prove this flight's run processes stopped.
    *  `held`: the server confirmed the switch hold, so the finally joins this executor's owned
-   *  operations and then acknowledges the hold settled. `unproven`: no hold was confirmed; the
-   *  finally still joins them before releasing the shared slots, and sends nothing. */
-  retainedSwitchSettlement?: "held" | "unproven";
+   *  operations and then acknowledges the hold settled. `hold_pending`: a report may have applied
+   *  without local confirmation, so the same post-join acknowledgement is owed (a server no-op if
+   *  no hold applied). `unproven`: no hold report is outstanding; join without acknowledging. */
+  retainedSwitchSettlement?: "held" | "hold_pending" | "unproven";
   completedRetainedSuccessor?: RecoveryJournalEntry;
   retainedLocalCustody?: boolean;
   /** Retries spent by discoverRetained on confirmed operational errors; in-memory, per claim. */
@@ -4819,7 +4820,7 @@ export class RunRunner {
       // issue #3181: a flight whose retained credential switch could not prove its run processes
       // stopped joins the operations its executor still owns BEFORE the snapshot entry and the
       // execution tail release (the successor claim must not start next to them), and a confirmed
-      // hold is then acknowledged settled. Ordinary flights never take this step.
+      // or possibly applied hold is then acknowledged settled. Ordinary flights never take this step.
       if (flight.retainedSwitchSettlement) await this.joinRetainedSwitchOperations(flight, runLog);
       // PRD #1390 M2a: drop the active-run snapshot entry. Reaching this finally means the
       // run reached a terminal report OR parked-and-returned for a requeue — either way it is
@@ -19467,9 +19468,9 @@ export class RunRunner {
 
   /**
    * issue #3181: wait for the operations this flight's executor still owns (no kill, no abort, no
-   * new work), then acknowledge a confirmed hold settled. A worker shutdown stops the wait and the
-   * acknowledgement: the process exit ends those operations and the server lifts the hold on the
-   * stale heartbeat. Never throws.
+   * new work), then acknowledge a confirmed or possibly applied hold settled. A worker shutdown
+   * stops the wait and the acknowledgement: the process exit ends those operations and the server
+   * lifts the hold on the stale heartbeat. Never throws.
    */
   private async joinRetainedSwitchOperations(flight: RunFlight, runLog: Logger): Promise<void> {
     try {
@@ -19490,7 +19491,8 @@ export class RunRunner {
           return;
         }
       }
-      if (flight.retainedSwitchSettlement !== "held" || flight.claimGeneration === undefined) return;
+      if ((flight.retainedSwitchSettlement !== "held" && flight.retainedSwitchSettlement !== "hold_pending") ||
+          flight.claimGeneration === undefined) return;
       const outcome = await this.sendHoldSettled(flight.runId, flight.claimGeneration);
       if (outcome === "unknown") {
         this.pendingHoldSettled.set(`${flight.runId}:${flight.claimGeneration}`, { runId: flight.runId, generation: flight.claimGeneration, attempts: 1 });
@@ -19602,8 +19604,9 @@ export class RunRunner {
    * report `credential_switch_held` when the server supports it. Confirmed by a positive ACK or, when
    * the report throws (one identical retry first), by an ownership read showing the run paused on a
    * switch-settling hold at this generation. An unconfirmed or refused hold is a residual
-   * non-terminal stop; either way the flight is marked so executeClaim's finally joins its owned
-   * operations before releasing its slots.
+   * non-terminal stop. A possibly applied report still owes a post-join acknowledgement, even if
+   * guard's deadline or a transport failure prevents confirmation; only a definitive refusal clears
+   * that obligation. Neither the owner feed nor `parked` claims a hold without confirmation.
    */
   private async holdRetainedSwitch(
     flight: RunFlight, runLog: Logger, signal: AbortSignal, guard: () => void, detail: string, survivors: string,
@@ -19629,14 +19632,19 @@ export class RunRunner {
       return unconfirmed("hold unsupported by the api");
     }
     guard();
+    // Record the obligation BEFORE the report: it can apply server-side before its ACK is lost or
+    // guard's deadline expires. The existing join/heartbeat path settles it at this generation and
+    // registration, without claiming the run held or lifting the fence before owned operations join.
+    flight.retainedSwitchSettlement = "hold_pending";
     let confirmed = false;
     let refused = false;
     for (let attempt = 0; attempt < 2 && !confirmed && !refused; attempt++) {
       try {
         const ack = await flight.reportState({ status: "credential_switch_held" }, signal);
+        refused = ack.applied === false;
+        if (refused) flight.retainedSwitchSettlement = "unproven";
         guard();
         if (ack.credentialSwitchHeld === true) confirmed = true;
-        else refused = true;
       } catch (error) {
         guard();
         runLog.warn("retained credential switch hold report failed", { run_id: flight.runId, attempt, error: errMessage(error) });

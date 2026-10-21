@@ -542,7 +542,7 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     it("an unapplied hold the ownership read cannot confirm is a residual stop, not a hold", TIMEOUT, async () => {
       const env = await scenario({ iid: 31862, survivor: "permanent", settleConfirmed: false, holdTransport: "throw-twice-unapplied" });
       await env.run;
-      assert.equal(env.flight().retainedSwitchSettlement, "unproven");
+      assert.equal(env.flight().retainedSwitchSettlement, "hold_pending");
       assert.equal(env.flight().parked, false);
       assert.ok(env.log.lines.some(l => (l as { msg: string }).msg === "retained credential switch hold unconfirmed"));
       assert.equal(api.holdState(env.claim.run_id), undefined);
@@ -671,6 +671,100 @@ describe("issue #3181 m3: retained credential switch settles before it reports",
     assert.equal(env.counts.models3, 0, "gen 3 never reaches the model");
     assertCustodyKept(env, false);
   });
+});
+
+describe("issue #3181: an uncertain hold report still owes its post-join acknowledgement", () => {
+  for (const failure of ["verification deadline", "lost hold ACKs and ownership read", "unapplied hold and failed ownership read"] as const) {
+    it(`${failure} preserves the post-join acknowledgement obligation`, TIMEOUT, async () => {
+      const runId = gitlabClaim(31910).run_id;
+      const applied = failure !== "unapplied hold and failed ownership read";
+      client.protocolFeatures = ["credential_switch_hold"];
+      (client as any).registerNonce = NONCE;
+      api.setOwnershipStatus(runId, "running", 2);
+      const { gitlab } = fakeGitlab();
+      const r = runnerWith(() => { throw new Error("no model executor may start"); }, gitlab);
+      const log = recordingLogger();
+      const pending = gate();
+      cleanups.push(pending.open);
+      const events: string[] = [];
+      const feed: string[] = [];
+      let expired = false;
+      let holdAttempts = 0;
+      let settledAttempts = 0;
+      const settledAcks: Array<{ applied?: boolean; credentialSwitchHoldSettled?: boolean }> = [];
+      const report = client.reportState.bind(client);
+      // The first settled acknowledgement is also lost, so the existing heartbeat retry
+      // must carry the obligation after the flight's owned operations have joined.
+      client.reportState = async (...args) => {
+        if (args[1].status === SETTLED) {
+          events.push("acknowledge");
+          if (++settledAttempts === 1) throw new Error("settled transport down");
+        }
+        const ack = await report(...args);
+        if (args[1].status === SETTLED) settledAcks.push(ack);
+        return ack;
+      };
+      client.getRunOwnership = async () => { throw new Error("ownership transport down"); };
+      const flight: any = {
+        runId, claimGeneration: 2, retainedSwitchSettlement: "unproven", parked: false,
+        executor: { joinOwnedOperations: async () => {
+          events.push("join:start");
+          await pending.promise;
+          events.push("join:end");
+        } },
+        batcher: { emit: (message: { payload: { text: string } }) => feed.push(message.payload.text), close: async () => {} },
+        reportState: async (body: Parameters<WorkerClient["reportState"]>[1], signal?: AbortSignal) => {
+          if (body.status === HOLD) {
+            holdAttempts++;
+            if (!applied) throw new Error("hold request never arrived");
+          }
+          const ack = await report(runId, { ...body, claim_generation: 2 }, signal);
+          if (body.status === HOLD) {
+            // The server applied the report at this unchanged generation. Only local
+            // confirmation fails: guard's verification deadline, or both transport ACKs.
+            if (failure === "verification deadline") expired = true;
+            else throw new Error("hold ACK lost");
+          }
+          return ack;
+        },
+      };
+      const seam = r as any;
+      const guard = () => { if (expired) throw new Error("retained credential switch deadline exhausted"); };
+      const holding = seam.holdRetainedSwitch(flight, log.logger, new AbortController().signal, guard, "fixture", "unverified");
+      if (failure === "verification deadline") await assert.rejects(holding, /deadline exhausted/);
+      else assert.equal(await holding, "stopped");
+      assert.equal(holdAttempts, failure === "verification deadline" ? 1 : 2);
+      assert.equal(api.holdState(runId), applied ? "settling" : undefined);
+      assert.equal(flight.parked, false, "the flight must not claim a confirmed hold");
+      assert.ok(!feed.some(line => line.startsWith("credential switch held:")), "the owner feed remains honest");
+      const joining = seam.joinRetainedSwitchOperations(flight, log.logger);
+      try {
+        await until("the owned-operation join", () => events.includes("join:start"));
+        assert.equal(settledAttempts, 0, "never acknowledge before the owned operations join");
+        if (applied) assert.equal(api.ownerResume(runId, 3), "refused");
+        pending.open();
+        await joining;
+        assert.equal(settledAttempts, 1, "an uncertain applied hold still gets an acknowledgement after the join");
+        assert.ok(events.indexOf("acknowledge") > events.indexOf("join:end"));
+        assert.equal(api.holdState(runId), applied ? "settling" : undefined);
+        await r.retryPendingHoldSettled();
+        assert.equal(settledAttempts, 2);
+        if (applied) {
+          assert.equal(api.holdState(runId), "unsettled", "a live worker no longer strands its settling fence");
+          assert.equal(api.ownerResume(runId, 3), "resumed");
+        } else {
+          assert.equal(settledAcks[0]?.applied, false, "if the hold never applied, its acknowledgement is a server no-op");
+          assert.equal(api.holdState(runId), undefined);
+        }
+        await r.retryPendingHoldSettled();
+        assert.equal(settledAttempts, 2, "an applied or definitively refused acknowledgement is no longer retried");
+        assert.deepEqual(api.holdRequests.filter(h => h.status === SETTLED).map(h => [h.claim_generation, h.register_nonce]), [[2, NONCE]]);
+      } finally {
+        pending.open();
+        await joining;
+      }
+    });
+  }
 });
 
 describe("issue #3181 m3: the wire contract", () => {

@@ -328,12 +328,15 @@ regardless of the worker.
   you** instead (`paused`, `credential_switch_settling` then
   `credential_switch_unsettled`) and nothing is released until you choose
   Resume or Cancel; see [Credential-switch holds](run-recovery.md#credential-switch-holds).
-  Three cases keep the older behaviour, where the worker stops without
+  Three cases still stop the flight without
   reporting a terminal state and the run stays non-terminal: an API without
   the `credential_switch_hold` protocol feature (mixed-version rollout), a
   hold report the API refuses or that stays unconfirmed after one retry and
   an ownership read, and a retained flight whose ownership read shows the run
-  at an `awaiting_*` gate. In each, the next claim's predecessor proof still
+  at an `awaiting_*` gate. An unconfirmed report may already have applied; the
+  worker still acknowledges it after its own operations join, as described in
+  [Credential-switch holds](run-recovery.md#credential-switch-holds).
+  In each case, the next claim's predecessor proof still
   fails closed. In a narrow race a refused `set-token` can still save the
   token you chose.
 

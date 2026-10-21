@@ -111,6 +111,14 @@ evidence-verification allowance. Two outcomes:
   `unverified` / `settle unconfirmed` / `deadline`; never pids). The worker log keeps the
   sanitized detail, which can include pids.
 
+A hold report can apply before its acknowledgement is lost or the worker's verification
+deadline expires. Before sending the report, the worker records that a post-join
+acknowledgement may be owed; only a definitive refusal clears that obligation. After its
+owned operations join, it sends the same fenced `credential_switch_hold_settled` report,
+using the existing bounded heartbeat retry when delivery is uncertain. If no hold applied,
+that acknowledgement is a server no-op. The owner feed and the flight's `parked` flag
+still require a confirmed hold.
+
 **The settling fence.** While the hold is `credential_switch_settling`, Resume and
 set-token are refused with a 409 (`ErrRunHoldSettling`) only while the holding worker is live
 and the same registration; Cancel always works. The fence
@@ -126,8 +134,8 @@ refuse a paused credential-switch hold for that reason.
 proof, and a survivor that stays unverified still ends the run `worker_residue_blocked`
 with custody kept ([ADR-2213](2213-worker-residue-quarantine.md)).
 
-**Named residuals**, each leaving the previous behaviour (the worker stops non-terminal,
-the next claim's proof stays fail-closed):
+**Named residuals**, each stopping the flight non-terminally while the next claim's
+proof stays fail-closed:
 
 1. An API without the `credential_switch_hold` protocol feature (rollout skew): the worker
    sends neither hold report.

@@ -160,12 +160,17 @@ lifts it. Resuming after a lift does not skip any check: the next claim still
 runs its fail-closed predecessor quiescence proof, and a survivor that stays
 unverified still ends the run `worker_residue_blocked` with custody kept.
 
-This does not cover every switch on a retained run. In three cases the worker
-stops non-terminal as before, without a hold: the API lacks the
-`credential_switch_hold` protocol feature, the hold report is refused or stays
-unconfirmed after one retry and an ownership read, or the retained flight's
-ownership reads `awaiting_*`. The next claim's proof stays fail-closed, so the
-worst case is the previous behaviour. In a narrow race, a refused `set-token`
+This does not cover every switch on a retained run. The worker stops non-terminal
+without requesting a hold when the API lacks the `credential_switch_hold` protocol
+feature or the retained flight's ownership reads `awaiting_*`. A refused hold report
+also stops the flight without a hold.
+
+If a hold report stays unconfirmed after one retry and an ownership read, the hold
+may already exist on the server. After its own operations join, the worker still
+sends the fenced settlement acknowledgement, with bounded heartbeat retries if
+delivery is uncertain. If the hold never applied, that acknowledgement changes
+nothing. The owner feed does not claim a confirmed hold without proof. The next
+claim's quiescence check stays fail-closed. In a narrow race, a refused `set-token`
 can still save the token you chose. Design rationale:
 [ADR-1247](../adr/1247-per-run-token-selection.md).
 
