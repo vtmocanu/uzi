@@ -22,6 +22,7 @@ import (
 )
 
 func TestSemanticWorkerProposalEnvelope(t *testing.T) {
+	h, _ := semanticBodyHandler(true)
 	// The existing compiler admits a complete raw proposal up to 48 MiB.
 	// Generation zero stops before storage, after the real route's strict decode.
 	proposal := `{"criteria":[]}`
@@ -47,7 +48,7 @@ func TestSemanticWorkerProposalEnvelope(t *testing.T) {
 			route.URLParams.Add("id", uuid.NewString())
 			req = req.WithContext(mw.ContextWithWorker(context.WithValue(req.Context(), chi.RouteCtxKey, route), store.Worker{ID: uuid.New()}))
 			rec := httptest.NewRecorder()
-			(&Handler{}).WorkerSemanticCandidate(rec, req)
+			h.WorkerSemanticCandidate(rec, req)
 			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {
 				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 			}
@@ -103,6 +104,7 @@ func semanticEscapedRequest(t *testing.T) semanticCandidateRequest {
 }
 
 func TestSemanticWorkerMandatoryEscapedAdmission(t *testing.T) {
+	h, _ := semanticBodyHandler(true)
 	body := semanticEscapedRequest(t)
 	// Generation zero exits after actual handler admission, before storage.
 	*body.ClaimGeneration = 0
@@ -118,7 +120,7 @@ func TestSemanticWorkerMandatoryEscapedAdmission(t *testing.T) {
 	route.URLParams.Add("id", uuid.NewString())
 	req = req.WithContext(mw.ContextWithWorker(context.WithValue(req.Context(), chi.RouteCtxKey, route), store.Worker{ID: uuid.New()}))
 	rec := httptest.NewRecorder()
-	(&Handler{}).WorkerSemanticCandidate(rec, req)
+	h.WorkerSemanticCandidate(rec, req)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid semantic candidate") {
 		t.Fatalf("valid escaped envelope refused before generation validation: %d %s", rec.Code, rec.Body.String())
 	}
@@ -162,7 +164,7 @@ func TestSemanticWorkerAuthentication(t *testing.T) {
 }
 
 func TestSemanticWorkerStrictEnvelope(t *testing.T) {
-	h := &Handler{}
+	h, _ := semanticBodyHandler(true)
 	for _, call := range []func(http.ResponseWriter, *http.Request){
 		h.WorkerSemanticCandidate, h.WorkerSemanticCoverageReserve, h.WorkerSemanticCoverageSettle, h.WorkerSemanticCoveragePublish,
 	} {

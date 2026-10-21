@@ -106,20 +106,27 @@ func (s *Service) currentSemanticIssue(ctx context.Context, wkr store.Worker, ru
 	return cur, nil
 }
 
-// requireObservable is the cheap pre-check that spares a stale, foreign or unenrolled
-// request the forge read. The authoritative fence is re-checked under the run lock.
-func (s *Service) requireObservable(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) error {
+// semanticWorkerClaim checks live ownership before any semantic body or forge read.
+// The authoritative generation fence is re-checked under the operation's run lock.
+func (s *Service) semanticWorkerClaim(ctx context.Context, wkr store.Worker, runID uuid.UUID) (store.Run, error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return err
+		return store.Run{}, err
 	}
 	switch {
-	case run.ClaimGeneration != generation || run.ClaimReleasedAt.Valid:
-		return ErrStaleClaim
+	case run.ClaimGeneration < 1 || run.ClaimReleasedAt.Valid:
+		return store.Run{}, ErrStaleClaim
 	case terminalStatuses[run.Status]:
-		return ErrRunTerminal
+		return store.Run{}, ErrRunTerminal
 	case run.Status != "running" && run.Status != "awaiting_approval":
-		return ErrInvalidState
+		return store.Run{}, ErrInvalidState
+	}
+	return run, nil
+}
+
+func (s *Service) requireSemanticEnrollment(ctx context.Context, runID uuid.UUID) error {
+	if s.txBeginner == nil {
+		return errCoverageUnavailable
 	}
 	tx, err := s.beginReadCommitted(ctx)
 	if err != nil {
@@ -132,6 +139,27 @@ func (s *Service) requireObservable(ctx context.Context, wkr store.Worker, runID
 		return err
 	}
 	return nil
+}
+
+// RequireSemanticWorkerAdmission rejects foreign, inactive and unenrolled writes
+// before the handler reads their body. It grants no mutation authority: the body
+// generation and enrollment are still checked under the operation's run lock.
+func (s *Service) RequireSemanticWorkerAdmission(ctx context.Context, wkr store.Worker, runID uuid.UUID) error {
+	if _, err := s.semanticWorkerClaim(ctx, wkr, runID); err != nil {
+		return err
+	}
+	return s.requireSemanticEnrollment(ctx, runID)
+}
+
+func (s *Service) requireObservable(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) error {
+	run, err := s.semanticWorkerClaim(ctx, wkr, runID)
+	if err != nil {
+		return err
+	}
+	if run.ClaimGeneration != generation {
+		return ErrStaleClaim
+	}
+	return s.requireSemanticEnrollment(ctx, runID)
 }
 
 // validateSemanticObservationRequest checks everything that needs no stored state.

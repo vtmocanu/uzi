@@ -49,6 +49,9 @@ func (h *Handler) WorkerSemanticCandidate(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
+	if !h.semanticWorkerWriteAdmission(w, r, run) {
+		return
+	}
 	var req semanticCandidateRequest
 	// The 48 MiB proposal plus <7 MiB of escaped bounded structural fields,
 	// <1 MiB of base64 source captures/metadata and wrapper fit within 64 MiB.
@@ -71,6 +74,15 @@ func (h *Handler) WorkerSemanticCandidate(w http.ResponseWriter, r *http.Request
 		return
 	}
 	httpx.JSON(w, http.StatusOK, payload)
+}
+
+func (h *Handler) semanticWorkerWriteAdmission(w http.ResponseWriter, r *http.Request, run uuid.UUID) bool {
+	worker, _ := mw.WorkerFromContext(r.Context()) // Already authenticated by semanticWorkerRun.
+	if h.wsvc == nil || h.wsvc.RequireSemanticWorkerAdmission(r.Context(), worker, run) != nil {
+		httpx.Error(w, http.StatusConflict, "semantic worker admission refused")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) WorkerSemanticCoverageStatus(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +109,9 @@ func (h *Handler) WorkerSemanticCoverageStatus(w http.ResponseWriter, r *http.Re
 func (h *Handler) workerSemanticCoverageWrite(w http.ResponseWriter, r *http.Request, operation string) {
 	worker, run, ok := semanticWorkerRun(w, r)
 	if !ok {
+		return
+	}
+	if !h.semanticWorkerWriteAdmission(w, r, run) {
 		return
 	}
 	var fields map[string]json.RawMessage
