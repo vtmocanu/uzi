@@ -6867,7 +6867,8 @@ export class GitCache {
       const m = coverageMessage.exec(commit.message);
       if (!m) {
         // A readable commit that claims the coverage subject without its exact shape is a look-alike:
-        // walk through it so a marker it buries is still found, and refuse below if one is.
+        // walk through it so a marker it buries is still found. Once any look-alike was walked, any
+        // marker involvement refuses below (defence in depth: the fingerprint/pin checks would too).
         if (commit.message.startsWith("uzi recovery coverage ")) {
           lookalike = true;
           if (++lookalikes > MAX_AGGREGATES) return fail();
