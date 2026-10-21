@@ -43,11 +43,32 @@ export async function routeCompletionHold(
   ctx: RunContext,
   reason: string,
   attempted: boolean,
+  options?: { allowDegradedCapture?: boolean },
 ): Promise<boolean> {
   if (attempted && ctx.enterCompletionHold) {
-    return await ctx.enterCompletionHold(reason);
+    return await ctx.enterCompletionHold(reason, options);
   }
   return false;
+}
+
+/**
+ * Server evidence survives zero/missing ACKs and provider epoch recreation.
+ * It applies to wall/budget routing only; the flight attempt latch owns idle/iteration/stall.
+ */
+export class CompletionHistory {
+  priorAttempt = false;
+
+  observe(count: number | undefined): void {
+    if (typeof count === "number" && Number.isSafeInteger(count) && count > 0)
+      this.priorAttempt = true;
+  }
+
+  wallSpent(budget: { totalWallSeconds?: number; usedWallSeconds?: number } | void): boolean {
+    const total = budget?.totalWallSeconds;
+    const used = budget?.usedWallSeconds;
+    return this.priorAttempt && typeof total === "number" && Number.isFinite(total) && total >= 0 &&
+      typeof used === "number" && Number.isFinite(used) && used >= 0 && used >= total;
+  }
 }
 
 /** Worker-authored rework; an answered question requires a fresh server check, even without prose. */

@@ -380,3 +380,162 @@ describe("SdkExecutor wall park (PRD #1497 M2)", () => {
     assert.strictEqual(result.branch, "agent/issue-5", "the run continued and finished");
   });
 });
+
+describe("3282 Claude historical completion wall routing", () => {
+  for (const route of ["spent", "pending", "budget", "trip", "refusal", "refusal-extension", "extension", "iteration"] as const) {
+    for (const accepted of (route === "extension" || route === "iteration" ? [true] : [true, false])) it(`3282 ${route} history without a flight attempt; hold ${accepted}`, async () => {
+      let dispatches = 0, parks = 0, takes = 0, holds = 0;
+      const cancelled = { value: false };
+      const { ctx } = makeCtx({
+        planApproved: true, approvedPlan: "approved", sessionId: "sess-1", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }),
+        config: { max_iterations: 1, run_timeout_seconds: 0.02 },
+        cancelRequested: () => cancelled.value,
+        reportIteration: async () => route.startsWith("refusal") ? undefined : ({
+          completionAttempts: 1, totalWallSeconds: route === "trip" ? 0.02 : 60,
+          usedWallSeconds: route === "spent" ? 60 : 0,
+          pauseRequested: route === "pending", budgetExhausted: route === "budget",
+        }),
+        pauseModeRequested: () => route === "pending" ? "wall" : null,
+        enterCompletionHold: async (_reason, options) => {
+          holds++;
+          assert.equal(options?.allowDegradedCapture, true);
+          return accepted;
+        },
+        parkForWall: async () => {
+          assert.equal(++parks, 1, "3282 historical wall must not retry wall parking");
+          return "refused";
+        },
+        takeWallParkRefresh: () => {
+          takes++;
+          return { completionAttempts: 1, totalSeconds: route === "refusal-extension" ? 120 : 60, usedSeconds: 60 };
+        },
+      });
+      const queryFn: SdkQueryFn = params => {
+        dispatches++;
+        assert.ok(dispatches <= 1, "no model redrive after a historical wall");
+        return (async function* () {
+          for await (const _ of params.prompt) { /* drain */ }
+          if (["trip", "refusal", "refusal-extension"].includes(route))
+            yield* hangUntilAbort(params.options.abortController!.signal) as AsyncIterable<SDKMessage>;
+          else if (route === "extension") yield signalDone();
+          yield resultSuccess();
+        })();
+      };
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+      if (route === "iteration") {
+        await assert.rejects(running, /iteration/);
+        assert.equal(holds, 0, "history alone must not change iteration routing");
+      } else {
+        const result = await running;
+        if (route === "extension") {
+          assert.equal(holds, 0); assert.equal(result.completionHeld, undefined);
+        } else {
+          assert.ok(accepted ? result.completionHeld : result.walled);
+          assert.equal(holds, 1);
+        }
+      }
+      assert.equal(dispatches, ["spent", "pending", "budget"].includes(route) ? 0 : 1);
+      assert.equal(parks, route.startsWith("refusal") ? 1 : 0);
+      assert.equal(takes, parks, "refusal evidence is consumed once");
+    });
+  }
+
+  it("3282 history survives zero and missing ACKs before a pending wall", async () => {
+    let reports = 0, dispatches = 0, holds = 0;
+    const { ctx } = makeCtx({
+      planApproved: true, approvedPlan: "approved", sessionId: "sess-1", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }),
+      config: { max_iterations: 5 },
+      reportIteration: async () => {
+        reports++;
+        return reports === 1 ? { completionAttempts: 1 }
+          : reports === 2 ? { completionAttempts: 0 } : { pauseRequested: true };
+      },
+      pauseModeRequested: () => reports >= 3 ? "wall" : null,
+      enterCompletionHold: async () => { holds++; return true; },
+    });
+    const { queryFn } = fakeTurns([() => {
+      dispatches++;
+      return (async function* () { yield resultSuccess(); })();
+    }]);
+    assert.ok((await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx)).completionHeld);
+    assert.equal(dispatches, 2); assert.equal(holds, 1);
+  });
+
+  it("3282 cancellation racing a resumed historical hold wins", async () => {
+    let cancelled = false, holds = 0;
+    let release!: () => void, entered!: () => void;
+    const admitted = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    const { ctx } = makeCtx({
+      planApproved: true, approvedPlan: "approved", sessionId: "sess-1", completionInterlock: true, recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 2 }),
+      reportIteration: async () => ({ completionAttempts: 1, budgetExhausted: true }),
+      cancelRequested: () => cancelled,
+      enterCompletionHold: async () => { holds++; entered(); await barrier; return true; },
+    });
+    const { queryFn } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const running = new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    let watchdog: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([admitted, running.then(() => {
+        throw new Error("3282 run ended before historical hold admission");
+      }), new Promise<never>((_, reject) => {
+        watchdog = setTimeout(() => reject(new Error("3282 hold admission timed out")), 2000);
+      })]);
+      cancelled = true;
+    } finally { clearTimeout(watchdog); release(); }
+    await assert.rejects(running, /cancel/);
+    assert.equal(holds, 1);
+  });
+});
+
+
+describe("3282 Claude historical interruption regressions", () => {
+  it("3282 historical-only idle remains an idle error without hold or wall park", async () => {
+    const { ctx, spies } = makeCtx({ planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      completionInterlock: true, config: { idle_timeout_seconds: 0.02, run_timeout_seconds: 5 },
+      reportIteration: async () => ({ completionAttempts: 1 }),
+    });
+    const { queryFn } = fakeTurns([hangUntilAbort]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /run stalled: no agent activity within the idle timeout/);
+    assert.deepEqual(spies.enterCompletionHoldCalls, []);
+    assert.equal(spies.parkForWallCalls, 0);
+  });
+
+  for (const accepted of [true, false]) it(`3282 wall PauseNowSignal during first implement turn uses history; hold ${accepted}`, async () => {
+    const controller = new AbortController();
+    let mode: "wall" | null = null;
+    let dispatches = 0, holds = 0;
+    const { ctx, spies } = makeCtx({ planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      completionInterlock: true, signal: controller.signal,
+      reportIteration: async () => ({ completionAttempts: 1 }),
+      pauseModeRequested: () => mode,
+      enterCompletionHold: async (_reason, options) => { holds++; assert.equal(options?.allowDegradedCapture, true); return accepted; },
+    });
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      dispatches++;
+      assert.equal(dispatches, 1);
+      mode = "wall";
+      controller.abort(new PauseNowSignal());
+      yield* hangUntilAbort(params.options.abortController!.signal) as AsyncIterable<SDKMessage>;
+    })();
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.ok(accepted ? result.completionHeld : result.walled);
+    assert.equal(holds, 1); assert.equal(dispatches, 1);
+    assert.equal(spies.parkForWallCalls, 0);
+  });
+
+  it("3282 owner now pause precedes historical budget exhaustion", async () => {
+    let pauses = 0, dispatches = 0;
+    const { ctx, spies } = makeCtx({ planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      completionInterlock: true,
+      reportIteration: async () => ({ completionAttempts: 1, budgetExhausted: true, pauseRequested: true }),
+      pauseModeRequested: () => "now",
+      parkForPause: async () => { pauses++; return true; },
+    });
+    const queryFn: SdkQueryFn = () => { dispatches++; throw new Error("owner pause must precede dispatch"); };
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
+    assert.ok(result.pausedAt); assert.equal(pauses, 1); assert.equal(dispatches, 0);
+    assert.deepEqual(spies.enterCompletionHoldCalls, []); assert.equal(spies.parkForWallCalls, 0);
+  });
+});

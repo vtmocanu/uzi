@@ -4646,10 +4646,11 @@ export class RunRunner {
         flight.result?.pausedAt ||
         flight.result?.completionHeld ||
         (flight.result?.walled && flight.holdOrWallParkConfirmed) ||
-        (flight.result?.walled && flight.uncertainWallPark)
+        (flight.result?.walled && flight.uncertainWallPark) ||
+        (flight.result?.walled && flight.completionHoldOutcome === "refused")
       ) {
         // Issues #1764/#1784/#2816: owner pauses, completionHeld results (confirmed or
-        // unresolved), and confirmed wall parks take phasePublish's nonterminal early return.
+        // unresolved), confirmed wall parks, and refused wall holds take the nonterminal early return.
         // Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
         // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
         // `paused` (not an actively-claimed status), which would fail a durably parked run. An
@@ -7000,7 +7001,7 @@ export class RunRunner {
         await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
-        runLog.info("run parked at its wall-clock limit; skipping finalization", {
+        runLog.info("flight stopped at its time limit; skipping finalization", {
           run_id: runId,
           reason: result.walled.reason,
         });
@@ -12715,6 +12716,8 @@ export class RunRunner {
           // completion hold (the loop-top budget-steer branch reads it off `served`).
           if (typeof ack.budgetExhausted === "boolean")
             b.budgetExhausted = ack.budgetExhausted;
+          if (ack.completionAttempts !== undefined) b.completionAttempts = ack.completionAttempts;
+          if (ack.budgetUsedSeconds !== undefined) b.usedWallSeconds = ack.budgetUsedSeconds;
           // Without the scope/completed fields in this return guard, a non-budget-scaled
           // run's ACK (no budget fields) would return `undefined` and m3's loop-top gate at
           // `if (served)` would never see the ceiling. This is behavior-preserving for the
@@ -12728,7 +12731,9 @@ export class RunRunner {
             b.completedCount !== undefined ||
             b.completedIds !== undefined ||
             b.pauseRequested !== undefined ||
-            b.budgetExhausted !== undefined
+            b.budgetExhausted !== undefined ||
+            b.completionAttempts !== undefined ||
+            b.usedWallSeconds !== undefined
             ? b
             : undefined;
         } catch (e) {
@@ -13058,7 +13063,7 @@ export class RunRunner {
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
       parkForWall: async () => {
         const outcome = await this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog));
-        if (outcome === "refused") steering.rearmLifecycle();
+        if (outcome === "refused" && !(flight.wallParkRefresh?.completionAttempts && flight.wallParkRefresh.completionAttempts > 0)) steering.rearmLifecycle();
         return outcome;
       },
       // Issue #1600: hand the executor the budget a refused wall park carried, once.
@@ -13107,8 +13112,8 @@ export class RunRunner {
       // Claude or Codex issue run carries completion_contract_version and completionInterlock
       // above is true; a legacy or seeded run leaves it false and never reaches this seam.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
-      enterCompletionHold: (reason) =>
-        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog)),
+      enterCompletionHold: (reason, options) =>
+        this.runGatedSink(flight, () => this.enterCompletionHold(flight, claim, reason, runLog, options)),
       // PRD #1226 M5 (D6): the completion-question LIVE window, wired as a SIBLING to
       // enterCompletionHold. The executor calls this on a completion stall or an eligible lead
       // request with authoritative unmet milestones, before parking — it authors an
@@ -17973,13 +17978,24 @@ export class RunRunner {
     await flight.executor.closeAndSettlePlanSummary?.();
     await this.settleGuardedCommands(flight.executor);
     flight.executor.killAgentTree?.();
+    // Cancellation only releases this hold's provisional retention. Existing custody and stale
+    // generation guards in the outer runner still decide the final artifact disposition.
+    const previousClone = flight.preserveRecoveryClone;
+    const previousSession = flight.preserveSession;
+    const checkCancellation = (): void => {
+      if (!flight.steering.isCancelled()) return;
+      flight.preserveRecoveryClone = previousClone;
+      flight.preserveSession = previousSession;
+      throw new Error("run cancelled");
+    };
+    checkCancellation();
     // Retain clone and session throughout capture and ambiguous delivery.
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
     //    and-retry, but bounded — this runs inside the executor's completion loop). DURING the retries
     //    an unverified capture retains the live clone and does NOT request a hold. Ordinary callers
-    //    clear the flags on exhaustion; prepush callers instead request the degraded empty-head hold.
+    //    clear the flags on exhaustion; prepush and wall/budget callers request an empty-head hold.
     let captured:
       | { verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null }
       | undefined;
@@ -17992,6 +18008,7 @@ export class RunRunner {
     // lives on this worker only. The capture's own re-proof after its wip marker (captureHoldContext
     // `residueBlocked`) takes the same path.
     const holdQuiescence = await this.quiesceRun(flight, flight.executor, { mode: "own", site: "completion_hold" });
+    checkCancellation();
     const residueHold = (state: string | undefined): typeof captured => {
       runLog.warn("completion hold: clone not provably quiescent; skipping the capture and holding with an empty head", {
         run_id: flight.runId,
@@ -18002,9 +18019,11 @@ export class RunRunner {
     if (holdQuiescence.blocked) captured = residueHold(holdQuiescence.outcome.process?.state);
     for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
       options.signal?.throwIfAborted();
-      if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
+      checkCancellation();
+      if (flight.active?.shuttingDown) break;
       try {
         const result = await this.captureHoldContext(claim, flight, runLog, options);
+        checkCancellation();
         if (result.residueBlocked) {
           captured = residueHold("after_runner_git");
           break;
@@ -18014,14 +18033,19 @@ export class RunRunner {
           break;
         }
       } catch (captureError) {
+        checkCancellation();
         runLog.warn("completion hold capture failed; retaining live work for retry", {
           error: errMessage(captureError),
         });
       }
       if (attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS - 1) await this.waitRecoveryRetry(flight);
     }
+    checkCancellation();
+    if (flight.active?.shuttingDown) {
+      throw new DataVolumeWaitShutdown("completion hold");
+    }
     if ((!captured || captured.head === null) && options.allowDegradedCapture) {
-      runLog.warn("prepush completion hold: capture exhausted; retaining live clone and requesting an empty-head hold", { run_id: flight.runId });
+      runLog.warn("completion hold: capture exhausted; retaining live clone and requesting an empty-head hold", { run_id: flight.runId });
       captured = { verified: false, published: false, mode: "same_worker_only", head: "" };
     }
     if (!captured || captured.head === null) {
@@ -18036,6 +18060,7 @@ export class RunRunner {
       return false;
     }
     options.signal?.throwIfAborted();
+    checkCancellation();
     const head = captured.head;
     flight.completionHoldOutcome = "unresolved";
     flight.parked = false;
@@ -18363,6 +18388,7 @@ export class RunRunner {
     const refresh: WallParkRefresh = {};
     if (ack.budgetTotalSeconds !== undefined) refresh.totalSeconds = ack.budgetTotalSeconds;
     if (ack.budgetUsedSeconds !== undefined) refresh.usedSeconds = ack.budgetUsedSeconds;
+    if (ack.completionAttempts !== undefined) refresh.completionAttempts = ack.completionAttempts;
     if (confirmedPark) {
       // 7. Durably parked. Mark the flight parked so the finally's carve-out preserves the HOME +
       //    plugin dir; preserveRecoveryClone (set above) keeps the clone. phasePublish's walled branch
@@ -18400,7 +18426,7 @@ export class RunRunner {
     // Issue #1600: keep the refusal's budget for the executor, which re-drives the turn without
     // passing reportIteration and would otherwise re-arm an exhausted wall.
     flight.wallParkRefresh = refresh;
-    runLog.info("wall park refused (the owner extended in the window); the run continues", {
+    runLog.info("wall park refused; executor will evaluate completion history before resuming", {
       run_id: flight.runId,
       server_status: status || "unknown",
     });

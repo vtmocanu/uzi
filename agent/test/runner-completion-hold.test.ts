@@ -1,3 +1,5 @@
+import { codexRig, FakeCodexExecutor } from "./runner-codex-sinks-fixture.js";
+import type { SteeringChannel } from "../src/steering.js";
 import { mockCommittedTracking } from "./runner-tracking-fixture.js";
 import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -543,3 +545,111 @@ for (const route of ["POST", "ownership probe"] as const) {
     assert.ok(!statuses(claim.run_id).includes("completed"));
   });
 }
+
+describe("3282 degraded wall completion hold", () => {
+  for (const status of ["paused", "running", ""] as const) it(`3282 empty-head capture exhaustion with ${status || "ambiguous"} ACK`, async t => {
+    const home = seedHome();
+    const claim = { ...gitlabClaim(328203), claim_generation: 7 };
+    const { gitlab, calls } = fakeGitlab();
+    let attempts = 0, held: boolean | undefined;
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected publication"); });
+    api.setCompletionHoldResponse(status, status === "running" ? 409 : 200);
+    api.parkRunOwnership = { status: "running", claim_generation: 7, hold_reason: null, claim_released: false };
+    const exec: Executor = { run: async ctx => {
+      git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+      mockCommittedTracking(git, CAPTURED_HEAD);
+      git.verifyRunnerTrackingCovers = (async () => { attempts++; return false; }) as typeof git.verifyRunnerTrackingCovers;
+      held = await ctx.enterCompletionHold!("wall", { allowDegradedCapture: true });
+      return { branch: ctx.branch, ...(held ? { completionHeld: { reason: "wall" } } : { walled: { reason: "wall" } }) };
+    } };
+    try {
+      await runnerWith(() => ({ executor: exec, homeDir: home.homeDir }), gitlab, undefined, undefined,
+        { recoveryRetryMs: 1 }).execute(claim);
+      assert.equal(attempts, 3);
+      assert.equal(api.completionHoldRequests.length, 1);
+      assert.equal(api.completionHoldRequests[0]!.body.head, "");
+      assert.equal(held, status !== "running");
+      assert.equal(fs.existsSync(worktreeDirFor(328203)), status !== "running");
+      assert.equal(fs.existsSync(home.sentinel), status !== "running");
+      assert.equal(push.mock.callCount(), 0); assert.equal(calls.length, 0);
+      assert.equal(statuses(claim.run_id).some(s => ["completed", "failed", "cancelled"].includes(s)), false);
+    } finally { fs.rmSync(home.root, { recursive: true, force: true }); }
+  });
+
+  it("3282 declined Codex hold bypasses real FINALIZE boundary and credential reconcile", async t => {
+    const claim = { ...gitlabClaim(328204), claim_generation: 7 };
+    const home = seedHome();
+    const rig = codexRig();
+    const { gitlab, calls } = fakeGitlab();
+    let afterHoldRefresh = 0, afterHoldRelease = 0;
+    api.setCompletionHoldResponse("running", 409);
+    const push = t.mock.method(git, "pushBranch", async () => { throw new Error("unexpected publication"); });
+    const executor = new FakeCodexExecutor(rig.safety, async ctx => {
+      git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+      mockCommittedTracking(git, CAPTURED_HEAD);
+      git.verifyRunnerTrackingCovers = (async () => false) as typeof git.verifyRunnerTrackingCovers;
+      const held = await ctx.enterCompletionHold!("wall", { allowDegradedCapture: true });
+      assert.equal(held, false);
+      afterHoldRefresh = rig.refreshCalls(); afterHoldRelease = rig.releaseCalls();
+      return { branch: ctx.branch, walled: { reason: "wall" } };
+    });
+    try {
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined,
+        { recoveryRetryMs: 1 }).execute(claim);
+      assert.equal(rig.boundaries.includes("finalize"), false);
+      assert.equal(rig.refreshCalls(), afterHoldRefresh);
+      assert.equal(rig.releaseCalls(), afterHoldRelease);
+      assert.equal(push.mock.callCount(), 0); assert.equal(calls.length, 0);
+      assert.equal(api.completionPermitRequests.length, 0);
+      assert.equal(statuses(claim.run_id).some(s => ["completed", "failed", "cancelled"].includes(s)), false);
+      assert.equal(fs.existsSync(worktreeDirFor(328204)), false);
+      assert.equal(fs.existsSync(home.sentinel), false);
+    } finally { fs.rmSync(home.root, { recursive: true, force: true }); }
+  });
+
+  for (const boundary of ["admission", "capture", "retry", "before POST"] as const) it(`3282 cancel at ${boundary} never posts a completion hold`, async () => {
+    const claim = { ...gitlabClaim(328205), claim_generation: 7 };
+    const { gitlab } = fakeGitlab();
+    let attempts = 0;
+    const ready = deferred(), release = deferred();
+    let runner: ReturnType<typeof runnerWith>;
+    const cancel = () => {
+      const active = (runner as unknown as { activeRuns: Map<string, { steering: SteeringChannel }> }).activeRuns.get(claim.run_id)!;
+      active.steering.markCancelled();
+    };
+    const exec: Executor = {
+      closeAndSettlePlanSummary: async () => {
+        if (boundary === "admission") { ready.resolve(); await release.promise; }
+      },
+      run: async ctx => {
+        git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+        mockCommittedTracking(git, CAPTURED_HEAD);
+        git.verifyRunnerTrackingCovers = (async () => {
+          attempts++;
+          if (boundary !== "admission" && (boundary !== "retry" || attempts === 2)) {
+            ready.resolve(); await release.promise;
+          }
+          return boundary === "before POST";
+        }) as typeof git.verifyRunnerTrackingCovers;
+        await ctx.enterCompletionHold!("wall", { allowDegradedCapture: true });
+        throw new Error("hold should propagate cancellation");
+      },
+    };
+    runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, { recoveryRetryMs: 1 });
+    const running = runner.execute(claim);
+    try {
+      let watchdog: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([ready.promise, running.then(() => { throw new Error("run ended before barrier"); }),
+          new Promise<never>((_, reject) => { watchdog = setTimeout(() => reject(new Error("3282 cancellation barrier timed out")), 2000); })]);
+      } finally { clearTimeout(watchdog); }
+      cancel(); release.resolve();
+      await running;
+      assert.equal(api.completionHoldRequests.length, 0, "cancel known before POST must not request a hold");
+      const terminal = api.states.filter(s => s.runId === claim.run_id).at(-1)!.body;
+      assert.equal(terminal.status, "failed");
+      assert.equal(terminal.failure_reason, "run cancelled", "API maps this wire report to cancellation");
+      assert.equal(attempts, boundary === "admission" ? 0 : boundary === "retry" ? 2 : 1);
+    } finally { release.resolve(); await running; }
+  });
+});
