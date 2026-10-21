@@ -241,15 +241,20 @@ func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 		codex     string
 		want      string
 		wantExist bool
+		author    bool // seed the codex row with a non-NULL updated_by
 	}{
-		{"absent Claude row receives the Codex value", nil, "gpt-6-sol", "gpt-6-sol", true},
-		{"reset Claude row is updated", ptrStr(""), "gpt-6-sol", "gpt-6-sol", true},
-		{"non-empty Claude value is not overwritten", ptrStr("sonnet"), "gpt-6-sol", "sonnet", true},
-		{"empty Codex row writes nothing", nil, "", "", false},
+		{"absent Claude row receives the Codex value", nil, "gpt-6-sol", "gpt-6-sol", true, true},
+		{"reset Claude row is updated", ptrStr(""), "gpt-6-sol", "gpt-6-sol", true, false},
+		{"non-empty Claude value is not overwritten", ptrStr("sonnet"), "gpt-6-sol", "sonnet", true, false},
+		{"empty Codex row writes nothing", nil, "", "", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool, dsn := codexJudgeMigrationDB(t, v)
-			cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('codex_judge_model', $1)`, tc.codex)
+			var authorID any
+			if tc.author {
+				authorID = cjSeedUser(t, pool, nil)
+			}
+			cjExec(t, pool, `INSERT INTO app_settings (key, value, updated_by) VALUES ('codex_judge_model', $1, $2)`, tc.codex, authorID)
 			if tc.claude != nil {
 				cjExec(t, pool, `INSERT INTO app_settings (key, value) VALUES ('judge_model', $1)`, *tc.claude)
 			}
@@ -262,6 +267,15 @@ func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 			got, ok := cjAppValue(t, pool, "judge_model")
 			if ok != tc.wantExist || got != tc.want {
 				t.Errorf("judge_model = %q (exists %v), want %q (exists %v)", got, ok, tc.want, tc.wantExist)
+			}
+			if tc.author {
+				var by *uuid.UUID
+				if err := pool.QueryRow(ctx, `SELECT updated_by FROM app_settings WHERE key = 'judge_model'`).Scan(&by); err != nil {
+					t.Fatalf("read judge_model updated_by: %v", err)
+				}
+				if by == nil || authorID == nil || *by != authorID.(uuid.UUID) {
+					t.Errorf("judge_model updated_by = %v, want %v", by, authorID)
+				}
 			}
 			if _, ok := cjAppValue(t, pool, "codex_judge_model"); ok {
 				t.Errorf("codex_judge_model row survived Down")
@@ -276,6 +290,11 @@ func TestCodexJudgeModelMigrationDownLiveDB(t *testing.T) {
 			}
 			if cjCodexColumns(t, pool) != 1 {
 				t.Errorf("users.codex_judge_model missing after Up")
+			}
+			if tc.wantExist && tc.want == tc.codex {
+				if got, _ := cjAppValue(t, pool, "codex_judge_model"); got != tc.codex {
+					t.Errorf("codex_judge_model after re-Up = %q, want %q", got, tc.codex)
+				}
 			}
 		})
 	}

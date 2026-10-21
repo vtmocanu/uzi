@@ -13,7 +13,8 @@ const (
 // both (and settings.Defaults) to the same values.
 const (
 	DefaultClaudeJudgeModel = "opus"
-	DefaultCodexJudgeModel  = DefaultCodexModel
+	// Literal, not DefaultCodexModel: a later worker-default change must not move judges (PRD #3245 D1).
+	DefaultCodexJudgeModel = "gpt-6.1-sol"
 )
 
 // ModelResolution is the result of walking the user, instance and built-in

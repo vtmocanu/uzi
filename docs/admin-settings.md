@@ -82,7 +82,8 @@ like `haiku` or `sonnet` to spend less). **Judge model** is a model picker
 for the Claude judge model (the Claude lane). Its **Default · opus (built-in)** option resets the
 instance value to the built-in, so it follows future changes to uzi's built-in
 default; saving an empty or whitespace-only `judge_model` through the admin API
-does the same (the judge model keys store values trimmed, and a whitespace-only value stores
+does the same (a blank instance value falls through to the built-in; a user's
+blank personal value instead inherits the instance value) (the judge model keys store values trimmed, and a whitespace-only value stores
 empty and is reported as source `default`). This switch
 only arms the feature instance-wide; each user still opts in under their own
 Settings, and the judge always spends that user's own Anthropic token, never
@@ -111,13 +112,14 @@ own run's harness (user lane, then instance lane, then built-in):
 | Setting | Default | Controls |
 |---|---|---|
 | `judge_model` | empty (built-in `opus`) | The instance Claude judge model. Claude aliases and ids only; Codex ids are rejected. |
-| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated ids `gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`; no custom ids. An empty or whitespace-only value resets it to the built-in. |
+| `codex_judge_model` | empty (built-in `gpt-6.1-sol`) | The instance Codex judge model. Must be one of the curated Codex models (the ones the Codex worker model picker offers); no custom ids. An empty or whitespace-only value resets it to the built-in. Users set their own value through the user settings API; a blank personal value inherits this one. |
 
 A value not valid for the run's harness is skipped with a
 `harness_model_fallback` note and resolution falls through. A Codex id
 previously stored in `judge_model` is copied into `codex_judge_model` on
-upgrade; the Claude key is left unchanged. Picking the Codex judge model in
-the admin UI is not part of this change; set it through the admin settings API.
+upgrade; the Claude key is left unchanged. The instance Codex judge
+model is set through the admin settings API (`codex_judge_model`); the admin UI
+picker covers the Claude lane only.
 
 ### Judge mode: off, optional, enforced
 
@@ -147,7 +149,7 @@ console keys, remember that an enforced `opus` judge spends their
 plan/rate-limit **quota**, not dollars — a busy judge can eat into the quota
 their real runs need. Pin **Judge model** to `haiku`/`sonnet` before
 enforcing, or leave enforcement off and let users opt in with their own
-per-user model choice (**Settings → Run judge → Judge model**).
+per-user model choice (**Settings → Run defaults → Run judge → Judge model**).
 
 ### Spend guards
 

@@ -28,6 +28,8 @@ SELECT 'codex_judge_model', btrim(value, E' \t\n\r\f\v'), updated_by, updated_at
 ON CONFLICT (key) DO NOTHING;
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
+
 -- Lossy by design: one field cannot hold both lanes. A non-empty Codex instance value is
 -- written to judge_model only when that key is absent or reset to ''; a non-empty Claude
 -- value is never overwritten. The per-user Codex lane is dropped with the column.

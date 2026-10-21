@@ -23,7 +23,7 @@ that run, with no fallback to another harness.
 ## 1. Enable it
 
 Your admin enables the feature globally under **Admin → Instance →
-Run judge**. Once that's on, open **Settings → Run judge** and check
+Run judge**. Once that's on, open **Settings → Run defaults → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
 judge for any individual user from **Admin → Users**. See
 [Admin settings](./admin-settings.md#run-judge) for the full set of
@@ -73,7 +73,7 @@ credential or harness.
 
 By default the judge auto-selects from your Anthropic [token
 pool](./anthropic-token.md#letting-uzi-pick-the-token-auto-selection). If you
-hold more than one token, **Settings → Run judge** offers a **Token the judge
+hold more than one token, **Settings → Run defaults → Run judge** offers a **Token the judge
 spends** picker — your default one, a token you name for the judge lane
 specifically, or **Auto-select from the pool** — so retrospectives can bill a
 different account from the work they review (a cheaper console key for the
@@ -111,25 +111,37 @@ A value that is not valid for the run's harness is skipped (one
 next step. Your Codex worker-model default does **not** reach a Codex judge.
 
 **Codex judge models are curated.** `codex_judge_model` accepts only
-`gpt-5.6-sol`, `gpt-6-astra`, `gpt-6-sol` or `gpt-6.1-sol`; custom Codex model
-ids are not accepted for the judge. The Claude lane rejects Codex ids
+the curated Codex models (the ones the Codex worker model picker offers);
+custom Codex model ids are not accepted for the judge. The Claude lane rejects Codex ids
 (including `gpt-6-luna`), so a Claude judge can never be handed a Codex model
 and a Codex judge can never be handed a Claude alias. Because a Codex judge
-model is always one of the curated ids, a Codex judge never needs the custom
-Codex model exemption that other Codex runs can claim; this invariant is pinned
-by the resolver test.
+model is always curated, a judge never needs a worker with custom Codex model
+support (the `codex_custom_model_v1` capability that other Codex runs with a
+custom model require), which keeps the judge's exemption from that claim
+requirement sound; this invariant is pinned by the resolver test.
 
-Setting a judge model to an empty or whitespace-only value resets it to the
-built-in default for that lane. Values are stored trimmed.
+A blank or whitespace-only value counts as unset at every step. A blank
+personal value inherits the instance value (for example, a blank personal
+Codex lane with the instance set to `gpt-6-sol` resolves to `gpt-6-sol`); only
+a blank instance value falls through to the built-in default for that lane.
+Values are stored trimmed.
 
 The Claude built-in is **opus** — the strongest model, since the judge's
 recommendations feed the [self-improvement job](./scheduling.md#default-jobs)
 and a shallow retrospective produces shallow self-improvement work. Your
 admin can pin a cheaper instance-wide Claude default (`haiku` or `sonnet`)
 from **Admin → Instance → Run judge**; your own value only changes your runs,
-while the admin's is the fallback for everyone who hasn't set one. The Codex
-lane is set through the `codex_judge_model` settings key (user and instance).
-Choosing the Codex judge model in the web UI is not part of this change.
+while the admin's is the fallback for everyone who hasn't set one.
+
+Where to set each lane:
+
+- **Your Claude judge model:** **Settings → Run defaults → Run judge → Judge
+  model**; leave it on **Inherit** to use the instance value.
+- **Your Codex judge model:** the `codex_judge_model` key of the user settings
+  API.
+- **Instance Claude judge model:** **Admin → Instance → Run judge**.
+- **Instance Codex judge model:** the `codex_judge_model` key of the admin
+  settings API.
 
 `uzi settings get` prints a **Model settings** table showing, per lane, what
 is stored, the default, what a judge run would resolve to, and where that came

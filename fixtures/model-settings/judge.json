@@ -137,8 +137,8 @@
     {
       "name": "claude instance reset to empty falls to builtin",
       "harness": "claude",
-      "user": "  ",
-      "instance": "",
+      "user": "",
+      "instance": "  ",
       "want": {
         "model": "opus",
         "source": "builtin",

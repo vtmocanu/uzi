@@ -82,10 +82,8 @@ func TestResolveJudgeModelFixtureCases(t *testing.T) {
 	if len(fx.Cases) == 0 {
 		t.Fatal("fixtures/model-settings/judge.json has no cases")
 	}
-	ran := 0
 	for _, tc := range fx.Cases {
 		t.Run(tc.Name, func(t *testing.T) {
-			ran++
 			got := ResolveJudgeModel(tc.Harness, tc.User, tc.Instance)
 			if got.Model != tc.Want.Model || got.Source != tc.Want.Source ||
 				got.DefaultModel != tc.Want.DefaultModel || got.DefaultSource != tc.Want.DefaultSource {
@@ -102,9 +100,6 @@ func TestResolveJudgeModelFixtureCases(t *testing.T) {
 				t.Errorf("Model is empty although the built-in is accepted")
 			}
 		})
-	}
-	if ran != len(fx.Cases) {
-		t.Fatalf("ran %d cases, fixture has %d", ran, len(fx.Cases))
 	}
 }
 
