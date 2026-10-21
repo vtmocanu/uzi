@@ -585,6 +585,18 @@ func TestEmptyDeclarationAttemptThenHoldLiveDB(t *testing.T) {
 	if n, _ := e.runCompletionAttempts(t, runID); n != 1 {
 		t.Fatalf("runs.completion_attempts = %d, want 1", n)
 	}
+	if n := e.attemptRowCount(t, runID); n != 1 {
+		t.Fatalf("run_completion_attempts rows = %d, want exactly 1", n)
+	}
+	var storedUnmet []string
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT ARRAY(SELECT jsonb_array_elements_text(latest_completion_attempt->'unmet')) FROM runs WHERE id = $1`, runID).
+		Scan(&storedUnmet); err != nil {
+		t.Fatalf("read latest_completion_attempt unmet: %v", err)
+	}
+	if len(storedUnmet) != 2 || storedUnmet[0] != "m2" || storedUnmet[1] != "m3" {
+		t.Fatalf("stored latest_completion_attempt unmet = %v, want [m2 m3]", storedUnmet)
+	}
 	// milestonesCompletedIDs sorts, so this compares as a set: an empty declaration adds nothing.
 	got := e.milestonesCompletedIDs(t, runID)
 	if len(got) != 1 || got[0] != "m1" {
