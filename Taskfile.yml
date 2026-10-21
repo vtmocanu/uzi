@@ -443,6 +443,10 @@ tasks:
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
       - task: test:semgrep-parity
       - task: check:semgrep-parity
+      # Likewise for the workflow linters (#2288): CI installs the worker lock's zizmor
+      # and its pinned actionlint must equal the lock's.
+      - task: test:actions-tool-parity
+      - task: check:actions-tool-parity
       - task: test:semgrep-gate
       # Hermetic fixture tests only; aging real prices is advisory and never gates.
       - task: test:pricing-freshness
@@ -1024,6 +1028,16 @@ tasks:
     cmds:
       - ./scripts/check-semgrep-parity.sh
 
+  test:actions-tool-parity:
+    desc: hermetic CI and worker actionlint/zizmor parity fixtures, including fail-closed inputs
+    cmds:
+      - ./scripts/check-actions-tool-parity.test.sh
+
+  check:actions-tool-parity:
+    desc: CI installs the worker lock's zizmor and pins the worker lock's actionlint
+    cmds:
+      - ./scripts/check-actions-tool-parity.sh
+
   test:scan-secrets:
     desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
     cmds:
@@ -1211,7 +1225,7 @@ tasks:
       - ./scripts/govulncheck-toolchain.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, orphan run-PR claims, and Go test failure attribution
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, land-prep merge mode, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, orphan run-PR claims, and Go test failure attribution
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
@@ -1224,6 +1238,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh
+      - ./.agents/skills/uzi-lander/scripts/land-prep-merge.test.sh
       - ./.agents/skills/uzi-lander/scripts/changelog-union.test.sh
       - ./.agents/skills/uzi-lander/scripts/changelog-union-fold.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-changelog-placement.test.sh
@@ -3422,6 +3437,15 @@ tasks:
     cmds:
       - mkdir -p api/internal/codexprice
       - cp agent/src/codex/codex-pricing.json api/internal/codexprice/codex-pricing.json
+
+  # codex-pins:sync rewrites every registered Codex pin site (agent/test/codex-pins.ts)
+  # from agent/codex/codex-package.lock (#1565). NOT a gate target: it WRITES the tree.
+  # The coordination and parity tests in test:agent are what gate a stale pin.
+  codex-pins:sync:
+    desc: rewrite every Codex version and digest pin from agent/codex/codex-package.lock
+    dir: agent
+    cmds:
+      - node --import tsx test/codex-pins-sync.cli.ts
 
   # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
   # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.

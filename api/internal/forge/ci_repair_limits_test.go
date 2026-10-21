@@ -22,6 +22,13 @@ var ciProviders = []Type{TypeGitHub, TypeGitLab, TypeForgejo}
 // ciWireDriver exercises the real SDK, auth, guarded transport and redaction.
 func ciWireDriver(t *testing.T, provider Type, handler http.HandlerFunc) Forge {
 	t.Helper()
+	return ciWireDriverTimeout(t, provider, 5*time.Second, handler)
+}
+
+// ciWireDriverTimeout is ciWireDriver with an explicit client timeout, for tables whose
+// multi-MiB fixtures can outlast the 5s default under -race (#3190).
+func ciWireDriverTimeout(t *testing.T, provider Type, timeout time.Duration, handler http.HandlerFunc) Forge {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/repositories/7") {
 			_, _ = io.WriteString(w, `{"id":7,"name":"widgets","owner":{"login":"acme"}}`)
@@ -30,7 +37,7 @@ func ciWireDriver(t *testing.T, provider Type, handler http.HandlerFunc) Forge {
 		handler(w, r)
 	}))
 	t.Cleanup(srv.Close)
-	d, err := NewWithGitLabBackoff(provider, srv.URL, "ci-fixture-credential", 5*time.Second,
+	d, err := NewWithGitLabBackoff(provider, srv.URL, "ci-fixture-credential", timeout,
 		func(_, _ time.Duration, _ int, _ *http.Response) time.Duration { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -205,13 +212,19 @@ func TestCIWorkflowHTTPBodyBudgets(t *testing.T) {
 	for _, provider := range ciProviders {
 		for _, mode := range []string{"exact", "plus-one", "gzip", "gzip-overflow", "unsupported", "error-overflow", "huge-item", "stream"} {
 			t.Run(string(provider)+"/"+mode, func(t *testing.T) {
-				d := ciWireDriver(t, provider, func(w http.ResponseWriter, _ *http.Request) {
-					body := ciBody(provider, ciRepairJSONBytes)
+				// Build the multi-MiB body before the timed request, not inside the handler.
+				var body string
+				switch mode {
+				case "huge-item":
+					body = ciRunsJSON(provider, `{"id":1,"name":"`+strings.Repeat("x", ciRepairJSONBytes)+`"}`)
+				case "plus-one", "gzip-overflow", "error-overflow":
+					body = ciBody(provider, ciRepairJSONBytes) + " "
+				case "stream":
+				default:
+					body = ciBody(provider, ciRepairJSONBytes)
+				}
+				d := ciWireDriverTimeout(t, provider, 30*time.Second, func(w http.ResponseWriter, _ *http.Request) {
 					switch mode {
-					case "plus-one", "gzip-overflow", "error-overflow":
-						body += " "
-					case "huge-item":
-						body = ciRunsJSON(provider, `{"id":1,"name":"`+strings.Repeat("x", ciRepairJSONBytes)+`"}`)
 					case "unsupported":
 						w.Header().Set("Content-Encoding", "br")
 					case "stream":

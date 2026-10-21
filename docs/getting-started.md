@@ -48,7 +48,9 @@ Register a worker and start a run from a board card: see
   thing across your runs, so a backgrounded tab still tells you: rose once
   one of your runs has freshly failed, amber once one is awaiting your
   approval, an answer, or your next follow-up, ember while any run is
-  queued, claimed, or running, and no dot otherwise.
+  queued, claimed, or running, and no dot otherwise. Human stops and typed
+  [required-base rejections](./run-activity.md#when-a-required-base-has-changed)
+  do not trigger the failure dot.
 - [Agent templates](./agent-templates.md): the roles (`coder`, `reviewer`,
   ...) your agents play, and how an admin edits them.
 - [Admin settings](./admin-settings.md): the two forge labels an admin can

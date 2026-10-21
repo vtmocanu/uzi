@@ -554,6 +554,7 @@ export const RUN_STATUS_TONES: Record<
    *  revising/recovery_wait), so no RUN_STATUS_LABELS override is needed. */
   needs_landing: { tone: "danger" },
   failed: { tone: "danger" },
+  rejected: { tone: "neutral" },
   cancelled: { tone: "neutral" },
 };
 

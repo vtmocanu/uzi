@@ -3554,6 +3554,12 @@ var errCredentialUnavailable = errors.New("credential unavailable")
 // assembled (a cascading delete of the forge connection).
 var errRunVanished = errors.New("run vanished before claim assembly")
 
+// errRunRepoOwnerMismatch marks a claim whose run still exists but whose repository is not
+// owned by the run's user, so GetRunClaimContext's owner predicate (#1688) returned no rows
+// (issue #1691). Its message carries no IDs. It is wrapped in errCredentialUnavailable so
+// finishRunClaim fails the run terminally through the fenced FailClaimAssemblyExact path.
+var errRunRepoOwnerMismatch = errors.New("the run's repository is not owned by the run's user")
+
 // errCustomModelCapabilityMissing marks a Codex claim whose effective worker-root model is a
 // CUSTOM (non-curated) id that the claiming worker cannot run — it does not advertise
 // codex_custom_model_v1 (PRD #1551 M4, D6). finishRunClaim treats it as a TRANSIENT

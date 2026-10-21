@@ -4569,3 +4569,408 @@ for (const entry of ["frozen", "capture"] as const) {
     } finally { budget.dispose(); await f.close(); }
   });
 }
+
+// ---- issue3152: "recovery: re-drive exit" diagnostics -------------------------------------------------
+
+type Issue3152Fixture = Awaited<ReturnType<typeof fixture>>;
+type ExitLine = { path: string; reason: string; field?: string; run_id: string; generation: number; capture_id: string };
+const ISSUE3152_MESSAGE = "recovery: re-drive exit";
+const ISSUE3152_NEVER = 3_600_000;
+
+function issue3152Lines(f: Issue3152Fixture): ExitLine[] {
+  const lines: ExitLine[] = [];
+  const info = f.log.info;
+  f.log.info = (message, fields) => {
+    if (message === ISSUE3152_MESSAGE) lines.push(structuredClone(fields) as unknown as ExitLine);
+    else info.call(f.log, message, fields);
+  };
+  return lines;
+}
+
+async function issue3152LivePasses(f: Issue3152Fixture, c: RecoveryCoordinator, passes: number, isExecuting: () => boolean = () => false) {
+  for (let i = 0; i < passes; i++) {
+    f.state.now += ISSUE3152_NEVER;
+    await c.resumeLive({ isExecuting, authenticatedAtMs: f.state.now });
+  }
+}
+
+function issue3152Assert(lines: ExitLine[], from: number, expected: { path: string; reason: string; field?: string }, rec: RecoveryRecord) {
+  const fresh = lines.slice(from);
+  assert.equal(fresh.length, 1, `exactly one line, got ${JSON.stringify(fresh)}`);
+  const line = fresh[0]!;
+  assert.deepEqual(Object.keys(line).sort(), [...(expected.field ? ["field"] : []), "capture_id", "generation", "path", "reason", "run_id"].sort());
+  assert.deepEqual(line, { ...expected, run_id: rec.runId, generation: rec.generation, capture_id: rec.captureId });
+}
+
+const issue3152Frozen = async (f: Issue3152Fixture, c: RecoveryCoordinator = f.coordinator) => {
+  const rec = await c.freezeInventory({ context: f.context, currentSha: H, defaultBranch: "main" });
+  assert.ok(rec);
+  return rec;
+};
+
+/** Make `rec` carry a saved (unaccepted) FINAL by letting the release fail once, then restore the fake. */
+async function issue3152SaveFinal(f: Issue3152Fixture, rec: RecoveryRecord): Promise<RecoveryRecord> {
+  f.state.finalError = new Error("FINAL rejected before acceptance");
+  await f.capture(rec);
+  f.state.finalError = undefined;
+  const saved = (await f.coordinator.inspect(rec.runId)).find(r => r.captureId === rec.captureId)!;
+  assert.ok(saved.finalRequest);
+  return saved;
+}
+
+function issue3152Backoff(c: RecoveryCoordinator, saved: RecoveryRecord) {
+  (c as any).finalRetry.set(saved.captureId, { identity: (c as any).finalRetryIdentity(saved), failures: 1, nextAt: Number.MAX_SAFE_INTEGER });
+}
+
+{
+  type Arrange = (f: Issue3152Fixture, c: RecoveryCoordinator, rec: RecoveryRecord, world: { executing: boolean }) => Promise<void> | void;
+  const cases: Array<{ name: string; reason: string; field?: string; arrange: Arrange; pending?: boolean }> = [
+    { name: "executing", reason: "executing", arrange: (_f, _c, _r, w) => { w.executing = true; } },
+    { name: "not_live_candidate", reason: "not_live_candidate",
+      arrange: (f, _c, r) => patchAuthenticated(f, r, { reason: "inventory_snapshot_changed", state: "needs_action" }) },
+    { name: "final_retry_backoff", reason: "final_retry_backoff", arrange: async (f, c, r) => {
+      issue3152Backoff(c, await issue3152SaveFinal(f, r));
+    } },
+    { name: "credentials_blocked", reason: "credentials_blocked", arrange: (_f, c) => { (c as any).credentialBlockedAt = Number.MAX_SAFE_INTEGER; } },
+    { name: "inventory_feature", reason: "inventory_not_inactive", field: "inventory_feature", arrange: f => { f.state.feature = false; } },
+    { name: "ownership_unsupported", reason: "inventory_not_inactive", field: "ownership_unsupported",
+      arrange: f => { delete (f.client as { getRunOwnership?: unknown }).getRunOwnership; } },
+    { name: "ownership_lookup_failed", reason: "inventory_not_inactive", field: "ownership_lookup_failed",
+      arrange: f => { f.state.ownershipError = new Error("ownership unavailable"); } },
+    { name: "ownership_lost_no_hold", reason: "inventory_not_inactive", field: "ownership_lost_no_hold", arrange: f => {
+      const body = JSON.stringify({ error: "run not found for this worker" });
+      f.state.ownershipError = new RequestError("GET", "/api/worker/runs/run-1/ownership", 404, body, undefined,
+        { complete: true, bytes: Buffer.byteLength(body) });
+      f.state.open = false;
+    } },
+    { name: "claim_generation", reason: "inventory_not_inactive", field: "claim_generation", arrange: f => { f.state.ownGeneration = 6; } },
+    { name: "inventory_guarded", reason: "inventory_not_inactive", field: "inventory_guarded", arrange: f => { f.state.ownGuarded = false; } },
+    { name: "status", reason: "inventory_not_inactive", field: "status", arrange: f => { f.state.status = "running"; } },
+    { name: "bare_unresolved", reason: "bare_unresolved", arrange: f => { f.git.resolveRecoveryBareDir = async () => undefined as never; } },
+  ];
+  for (const c of cases) {
+    it(`issue3152 live re-drive exit ${c.name} is logged once per change with a fixed field set`, async () => {
+      const f = await fixture();
+      try {
+        const lines = issue3152Lines(f);
+        const rec = await issue3152Frozen(f);
+        const world = { executing: false };
+        const live = (n: number) => issue3152LivePasses(f, f.coordinator, n, () => world.executing);
+        // A first, different reason so this case is also a reason change.
+        const first = c.name === "executing" ? "credentials_blocked" : "executing";
+        if (first === "executing") world.executing = true; else (f.coordinator as any).credentialBlockedAt = Number.MAX_SAFE_INTEGER;
+        await live(3);
+        issue3152Assert(lines, 0, { path: "live", reason: first }, rec);
+        world.executing = false; (f.coordinator as any).credentialBlockedAt = undefined;
+        const before = lines.length;
+        await c.arrange(f, f.coordinator, rec, world);
+        const finalsBefore = f.finals.length;
+        await live(3);
+        issue3152Assert(lines, before, { path: "live", reason: c.reason, ...(c.field ? { field: c.field } : {}) }, rec);
+        assert.equal(f.finals.length, finalsBefore, "an exit never reaches FINAL");
+      } finally { await f.close(); }
+    });
+  }
+}
+
+it("issue3152 pending_generation_report is logged once for an ACKed guarded record", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const c = f.make(false, () => true);
+    const rec = await issue3152Frozen(f, c);
+    await c.captureAndUpload({ record: rec, barePath: f.context.barePath, defaultBranch: "main" });
+    const acked = (await c.inspect(rec.runId))[0];
+    assert.equal(acked?.finalAcknowledged, true, "the ACKed record is retained while its report is pending");
+    await issue3152LivePasses(f, c, 3);
+    issue3152Assert(lines, 0, { path: "live", reason: "pending_generation_report" }, rec);
+  } finally { await f.close(); }
+});
+
+it("issue3152 credentials_blocked is logged once for a guarded record skipped after a credential failure in the pass", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.status = "completed";
+    const lines = issue3152Lines(f);
+    const first = await issue3152Frozen(f);
+    const second = await f.coordinator.freezeInventory({
+      context: { ...f.context, runId: "run-2" }, currentSha: H, defaultBranch: "main",
+    });
+    assert.ok(second);
+    f.state.finalError = new RequestError("POST", "/api/worker/runs/run-1/recovery/release", 401, "unauthorized");
+    await issue3152LivePasses(f, f.coordinator, 1);
+    const skipped = lines.filter(l => l.reason === "credentials_blocked");
+    assert.equal(skipped.length, 1, JSON.stringify(lines));
+    assert.equal(skipped[0]!.path, "live");
+    assert.ok([first.captureId, second.captureId].includes(skipped[0]!.capture_id));
+    assert.equal(f.finals.length, 1, "the second record never reached FINAL");
+  } finally { await f.close(); }
+});
+
+it("issue3152 live_pass_cap is logged once per dropped record across passes", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.status = "completed";
+    const lines = issue3152Lines(f);
+    const a = await issue3152Frozen(f);
+    const b = await f.coordinator.freezeInventory({ context: { ...f.context, runId: "run-2" }, currentSha: H, defaultBranch: "main" });
+    assert.ok(b);
+    (f.coordinator as any).liveMaxPerPass = 1;
+    (f.coordinator as any).liveStep = async () => "ok";
+    await issue3152LivePasses(f, f.coordinator, 4);
+    const capped = lines.filter(l => l.reason === "live_pass_cap");
+    assert.equal(capped.length, 1, JSON.stringify(lines));
+    assert.ok([a.captureId, b.captureId].includes(capped[0]!.capture_id));
+    assert.equal(capped[0]!.path, "live");
+  } finally { await f.close(); }
+});
+
+it("issue3152 cycle_busy is logged once while another capture holds the record cycle", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    let release!: () => void;
+    f.state.produceWait = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { f.state.onProduce = resolve; });
+    const held = f.capture(rec);
+    await entered;
+    f.git.discoverOwedCandidates = undefined as never;
+    await issue3152LivePasses(f, f.coordinator, 3);
+    issue3152Assert(lines, 0, { path: "live", reason: "cycle_busy" }, rec);
+    release();
+    await held;
+  } finally { await f.close(); }
+});
+
+it("issue3152 boot path logs record_unavailable and final_retry_backoff with the boot label", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    // Snapshot still ready, current record in retry backoff: the pendingStep re-check.
+    const saved = await issue3152SaveFinal(f, rec);
+    const c = f.make();
+    // The snapshot check clears a retry whose identity differs, so the backoff lands between the
+    // snapshot check and pendingStep's re-read of the record.
+    const read = (c as any).readRecord.bind(c);
+    (c as any).readRecord = async (...args: unknown[]) => { issue3152Backoff(c, saved); return read(...args); };
+    const stale = { ...saved, finalRequest: undefined } as RecoveryRecord;
+    for (let i = 0; i < 3; i++) await c.resumePending(undefined, [stale]);
+    issue3152Assert(lines, 0, { path: "boot", reason: "final_retry_backoff" }, rec);
+    // Boot snapshot check: the snapshot itself is in backoff.
+    const before = lines.length;
+    const c4 = f.make();
+    const read4 = (c4 as any).readRecord.bind(c4);
+    (c4 as any).readRecord = async (...args: unknown[]) => { issue3152Backoff(c4, saved); return read4(...args); };
+    await (c4 as any).pendingStep(stale, undefined, "terminal_source");
+    assert.equal(lines.length, before + 1);
+    assert.equal(lines[before]!.path, "terminal_source");
+    const c2 = f.make();
+    issue3152Backoff(c2, saved);
+    const mark = lines.length;
+    for (let i = 0; i < 3; i++) await c2.resumePending(undefined, [saved]);
+    issue3152Assert(lines, mark, { path: "boot", reason: "final_retry_backoff" }, rec);
+    // The record vanishes between the snapshot and the re-read.
+    await fs.rm(path.join(f.root, "journal", rec.runId, rec.captureId + ".json"));
+    const c3 = f.make();
+    const gone = lines.length;
+    for (let i = 0; i < 3; i++) await c3.resumePending(undefined, [stale]);
+    issue3152Assert(lines, gone, { path: "boot", reason: "record_unavailable" }, rec);
+  } finally { await f.close(); }
+});
+
+{
+  const early: Array<{ name: string; reason: string; field?: string;
+    arrange: (f: Issue3152Fixture, c: RecoveryCoordinator, rec: RecoveryRecord) => Promise<RecoveryRecord> | RecoveryRecord }> = [
+    { name: "executing", reason: "executing", arrange: (_f, c, r) => { (c as any).isExecuting = () => true; return r; } },
+    { name: "not_live_candidate", reason: "not_live_candidate",
+      arrange: (_f, _c, r) => ({ ...r, state: "needs_action", reason: "inventory_snapshot_changed" } as RecoveryRecord) },
+    // Only a record that is no longer guarded can be a live candidate without a coverage digest; the
+    // guard is the caller's, so this code is a defensive exit reached by calling resumeInventory directly.
+    { name: "no_coverage_digest", reason: "no_coverage_digest", arrange: (_f, _c, r) => ({ ...r, inventoryGuarded: false, state: "bundled",
+      bundlePath: "bundle", byteSize: 1, checksum: "c", chunkCount: 1, coverageDigest: undefined } as RecoveryRecord) },
+    { name: "final_retry_backoff", reason: "final_retry_backoff", arrange: async (f, c, r) => {
+      const saved = await issue3152SaveFinal(f, r); issue3152Backoff(c, saved); return saved;
+    } },
+    { name: "generation", reason: "inventory_not_inactive", field: "generation", arrange: (_f, _c, r) => ({ ...r, generation: 0 }) },
+    { name: "bare_dir_missing", reason: "bare_dir_missing", arrange: (_f, _c, r) => ({ ...r, bareDir: undefined }) },
+  ];
+  for (const e of early) {
+    // These exits are unreachable through livePass (its filter takes them first) and through the boot
+    // sweep (pendingStep re-checks first); resumeInventory is the smallest seam that reaches them.
+    it(`issue3152 resumeInventory early exit ${e.name} is logged once across repeated calls`, async () => {
+      const f = await fixture();
+      try {
+        const lines = issue3152Lines(f);
+        const rec = await issue3152Frozen(f);
+        const record = await e.arrange(f, f.coordinator, rec);
+        const finalsBefore = f.finals.length;
+        const from = lines.length;
+        for (let i = 0; i < 3; i++) await (f.coordinator as any).resumeInventory(record, undefined, undefined, "live");
+        issue3152Assert(lines, from, { path: "live", reason: e.reason, ...(e.field ? { field: e.field } : {}) }, record);
+        assert.equal(f.finals.length, finalsBefore);
+      } finally { await f.close(); }
+    });
+  }
+}
+
+it("issue3152 inventory_not_inactive reports field executing when the run starts executing after the early check", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    let calls = 0;
+    (f.coordinator as any).isExecuting = () => ++calls > 1;
+    for (let i = 0; i < 3; i++) { calls = 0; await (f.coordinator as any).resumeInventory(rec, undefined, undefined, "live"); }
+    issue3152Assert(lines, 0, { path: "live", reason: "inventory_not_inactive", field: "executing" }, rec);
+  } finally { await f.close(); }
+});
+
+it("issue3152 a pass that reaches frozenOperationCycle logs no re-drive exit and a later exit is a new transition", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    const world = { executing: true };
+    await issue3152LivePasses(f, f.coordinator, 2, () => world.executing);
+    assert.equal(lines.length, 1);
+    world.executing = false;
+    let cycles = 0;
+    const real = (f.coordinator as any).frozenOperationCycle.bind(f.coordinator);
+    (f.coordinator as any).frozenOperationCycle = async (...args: unknown[]) => { cycles++; return real(...args); };
+    await issue3152LivePasses(f, f.coordinator, 1, () => world.executing);
+    assert.equal(cycles, 1, "the pass reached frozenOperationCycle");
+    assert.equal(lines.length, 1, "no exit line on the progressing pass");
+    assert.equal((f.coordinator as any).redriveExitLogged.size, 0, "progress clears the stored reason");
+    void rec;
+  } finally { await f.close(); }
+});
+
+it("issue3152 the dedup map is bounded, evicts the oldest and prunes removed captures", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    const c = f.coordinator as any;
+    const note = (n: number) => c.noteRedriveExit("live", { ...rec, captureId: `cap-${n}` }, "executing");
+    for (let n = 0; n < 300; n++) note(n);
+    assert.equal(c.redriveExitLogged.size, 256);
+    assert.equal(lines.length, 300);
+    note(299);
+    assert.equal(lines.length, 300, "a retained key does not re-emit");
+    note(0);
+    assert.equal(lines.length, 301, "an evicted key re-emits");
+    assert.equal(c.redriveExitLogged.size, 256);
+    // A live pass drops entries whose capture left the journal; the real record's entry survives.
+    c.noteRedriveExit("live", rec, "executing");
+    await issue3152LivePasses(f, f.coordinator, 1, () => true);
+    assert.deepEqual([...c.redriveExitLogged.values()].map((e: { captureId: string }) => e.captureId), [rec.captureId]);
+  } finally { await f.close(); }
+});
+
+it("issue3152 two guarded records sharing a run and generation each log at most once", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const pinned = await issue3152Frozen(f);
+    const sibling = { ...pinned, captureId: "sibling-capture" } as RecoveryRecord;
+    const file = path.join(f.root, "journal", pinned.runId, sibling.captureId + ".json");
+    const key = createHmac("sha256", "local-worker-fixture").update("uzi-recovery-journal-v1").digest();
+    const { mac: _m, ...payload } = JSON.parse(await fs.readFile(path.join(f.root, "journal", pinned.runId, pinned.captureId + ".json"), "utf8"));
+    const body = { ...payload, captureId: sibling.captureId };
+    await fs.writeFile(file, JSON.stringify({ ...body, mac: createHmac("sha256", key).update(canonicalJson(body)).digest("hex") }));
+    (f.coordinator as any).isExecuting = () => true;
+    await issue3152LivePasses(f, f.coordinator, 4, () => true);
+    const byCapture = new Map<string, number>();
+    for (const l of lines) byCapture.set(l.capture_id, (byCapture.get(l.capture_id) ?? 0) + 1);
+    assert.deepEqual([...byCapture.keys()].sort(), [pinned.captureId, sibling.captureId].sort());
+    for (const [capture, count] of byCapture) assert.equal(count, 1, `capture ${capture} logged ${count} times`);
+  } finally { await f.close(); }
+});
+
+it("issue3152 boot sweep reports a resumeInventory outcome through the restart sweep line", async () => {
+  const f = await fixture();
+  try {
+    const rec = await issue3152Frozen(f);
+    const sweeps: Array<Record<string, unknown>> = [];
+    const info = f.log.info;
+    f.log.info = (message, fields) => {
+      if (message === "recovery restart sweep") sweeps.push(structuredClone(fields) as Record<string, unknown>);
+      else info.call(f.log, message, fields);
+    };
+    const c = f.make();
+    (c as any).resumeInventory = async () => ({ state: "needs_action", reason: "upload_transient" });
+    await c.resumePending(undefined, [rec]);
+    assert.deepEqual(sweeps, [{ run_id: rec.runId, generation: rec.generation, outcome: "needs_action", reason: "upload_transient" }]);
+  } finally { await f.close(); }
+});
+
+it("issue3152 the in-lock liveStep re-check logs its exit once on the live path", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    // Not executing when the pass filters, executing by the time liveStep re-checks under the lock.
+    const c = f.coordinator as any;
+    const realStep = c.liveStep.bind(c);
+    let inLock = false;
+    c.liveStep = async (...args: unknown[]) => { inLock = true; try { return await realStep(...args); } finally { inLock = false; } };
+    await issue3152LivePasses(f, c, 3, () => inLock);
+    issue3152Assert(lines, 0, { path: "live", reason: "executing" }, rec);
+  } finally { await f.close(); }
+});
+
+it("issue3152 a saved FINAL replay clears the logged exit so the same exit logs again", async () => {
+  const f = await fixture();
+  try {
+    const lines = issue3152Lines(f);
+    const rec = await issue3152Frozen(f);
+    const saved = await issue3152SaveFinal(f, rec);
+    const c = f.coordinator as any;
+    c.isExecuting = () => true;
+    for (let i = 0; i < 3; i++) await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.equal(lines.length, 1);
+    // A pass that replays the saved FINAL (and fails again, keeping the saved request).
+    c.isExecuting = () => false;
+    f.state.finalError = new Error("FINAL rejected again");
+    const finalsBefore = f.finals.length;
+    await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.ok(f.finals.length > finalsBefore, "the pass replayed the saved FINAL");
+    assert.equal(lines.length, 1, "the replay itself logs no exit");
+    f.state.finalError = undefined;
+    c.finalRetry.clear();
+    c.isExecuting = () => true;
+    for (let i = 0; i < 3; i++) await c.resumeInventory(saved, undefined, undefined, "live");
+    assert.equal(lines.length, 2, "the same exit after a FINAL replay is a new transition");
+    assert.deepEqual(lines[1], lines[0]);
+  } finally { await f.close(); }
+});
+
+it("issue3152 live_pass_cap is not logged for dropped records that are not inventory-guarded", async () => {
+  const f = await fixture();
+  try {
+    f.state.candidates = [];
+    f.state.status = "completed";
+    const lines = issue3152Lines(f);
+    const a = await issue3152Frozen(f);
+    const b = await f.coordinator.freezeInventory({ context: { ...f.context, runId: "run-2" }, currentSha: H, defaultBranch: "main" });
+    assert.ok(b);
+    // Legacy (unguarded) bundled records, served from memory: a journaled unguarded record cannot keep the guarded-only fields.
+    const legacy = [a, b].map(r => ({ ...r, inventoryGuarded: false, coverageDigest: undefined, state: "bundled",
+      bundlePath: "bundle", byteSize: 1, checksum: "c", chunkCount: 1 }) as RecoveryRecord);
+    // Unguarded records that FAIL the live filter: one whose run is executing, one that is already uploaded.
+    legacy.push({ ...legacy[0]!, runId: "run-exec", captureId: "cap-exec" } as RecoveryRecord);
+    legacy.push({ ...legacy[0]!, captureId: "cap-uploaded", state: "uploaded" } as RecoveryRecord);
+    const c = f.coordinator as any;
+    c.liveMaxPerPass = 1;
+    c.snapshotBootRecords = async () => legacy;
+    let steps = 0;
+    c.liveStep = async () => { steps++; return "ok"; };
+    await issue3152LivePasses(f, c, 3, (runId?: string) => runId === "run-exec");
+    assert.equal(steps, 3, "the cap admitted exactly one record per pass, so the other was dropped");
+    assert.deepEqual(lines, []);
+  } finally { await f.close(); }
+});

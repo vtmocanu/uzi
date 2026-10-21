@@ -1134,11 +1134,12 @@ chain in the diagram above, with no intervening `running`.
   autopilot run) rather than never freezing, so it passes
   the check vacuously instead of never being able to complete. A seeded-plan
   run (`--plan-file`) never sends a plan-bearing report at all, so it is never
-  stamped interlocked in the first place and this freeze does not apply to it. A run's resolved
-  harness gates the stamp too: only a `claude` run is stamped, since the Codex
-  executor does not yet run the completion-attempt nudge loop this hold depends on
-  (#1627) — a Codex run is created unstamped and this whole mechanism stays inert
-  for it. The owner has three decisions (`uzi run decide <id>`):
+  stamped interlocked in the first place and this freeze does not apply to it. The
+  stamp applies to both harnesses: a `claude` or `codex` run is stamped alike, with
+  no harness filter at create. A stamped run is claimable only by a worker
+  advertising `completion_interlock_v1`, and a Codex run also needs
+  `codex_completion_interlock_v1`, the worker's Codex completion-attempt loop
+  (#1627). The owner has three decisions (`uzi run decide <id>`):
   continue-with-guidance (`--continue`), reduce scope to a kept milestone set
   (`--partial`), or waive named unmet criteria (`--accept`), the latter two each
   requiring a reason and fencing the run's current `contract_revision`;

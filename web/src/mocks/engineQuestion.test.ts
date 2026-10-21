@@ -362,3 +362,22 @@ describe("the unreadable-question fixture (PRD #88 enhancement 2)", () => {
     expect(parseQuestionPayload(payload)).toBeNull();
   });
 });
+
+it("syncs base rejection origin to the board alongside raw failed status", () => {
+  patchRun(RUN_ID, { status: "failed", fail_origin: "base_diverged" });
+  const card = [...state.boards.values()].flatMap((b) => b.cards).find((c) => c.latest_run?.id === RUN_ID);
+  expect(card?.latest_run).toMatchObject({ status: "failed", fail_origin: "base_diverged" });
+});
+
+it("seeds a distinct rejection card with a matching full run", () => {
+  const board = state.boards.get("repo-atlas")!;
+  expect(new Set(board.cards.map((c) => c.iid)).size).toBe(board.cards.length);
+  const card = board.cards.find((c) => c.latest_run?.id === "run-rejected")!;
+  const run = state.runs.get("run-rejected")!;
+  expect(card.iid).toBe(10);
+  expect(card.web_url).toMatch(/\/10$/);
+  expect(board.cards.find((c) => c.iid === 9)?.title).toBe("Rate-limit the public search endpoint");
+  expect(run.branch).toBe("agent/issue-10");
+  expect(card.latest_run).toMatchObject({ id: run.id, status: "failed", fail_origin: "base_diverged" });
+  expect(run).toMatchObject({ repo_id: board.repo_id, issue_iid: card.iid, status: "failed", fail_origin: "base_diverged", failure_reason: card.latest_run!.failure_reason });
+});

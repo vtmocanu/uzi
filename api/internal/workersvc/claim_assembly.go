@@ -193,7 +193,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 	// Judge lane (PRD #46 Decision 1): a judge run has no repo and no forge
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
-	// repos → forge_connections and would treat a repo-less judge run as vanished)
+	// repos → forge_connections and returns no rows for a repo-less judge run, which
+	// the no-rows branch below would then fail as an owner mismatch, #1691)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
 	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
 	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
@@ -239,7 +240,18 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, errRunVanished
+			// No rows is two different things. A repo or connection delete cascades to the
+			// run, and every kind that reaches here has a repo, so a run row that still
+			// exists means the owner predicate (#1688) refused it: the run's repo belongs
+			// to another user. Failing that terminally (#1691) beats the silent drop,
+			// which left the run cycling claimed -> queued.
+			if _, gerr := s.q.GetRunByID(ctx, run.ID); gerr != nil {
+				if errors.Is(gerr, pgx.ErrNoRows) {
+					return nil, errRunVanished
+				}
+				return nil, fmt.Errorf("claim context: %w", gerr)
+			}
+			return nil, fmt.Errorf("%w: %w", errCredentialUnavailable, errRunRepoOwnerMismatch)
 		}
 		return nil, fmt.Errorf("claim context: %w", err)
 	}

@@ -786,6 +786,7 @@ export interface ToolAllowlistWriteInput {
 // issue has never run. Display-only: no secrets. is_mine gates the in-app run-view
 // link (a non-owner would 403 on the run); run_count drives the "×N" retry hint.
 export interface LatestRun {
+  fail_origin?: string | null;
   /** Stored creation history; [] on a current API. Optional for older payloads. */
   auto_approve_blocked_reasons?: string[];
   id: string;
@@ -3907,8 +3908,8 @@ export type RunSummaryItem = Omit<
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
 // spending a token has no usage row but must still count. All counts are always
-// present (zeros, never null). Invariants the API guarantees (asserted server-side):
-//   - finished === completed + cancelled + plan_rejected + failed
+// present (zeros, never null); older APIs omit base_diverged. Invariants the API guarantees (asserted server-side):
+//   - finished === completed + cancelled + plan_rejected + (base_diverged ?? 0) + failed
 //   - sum(fail_origins) === failed
 // plan_rejected is split out of failed (rejecting a plan is the owner's decision, not a
 // factory failure; D4). The rate the UI shows is client-computed (failed / finished),
@@ -3932,6 +3933,8 @@ export interface RunOutcomes {
   completed: number;
   cancelled: number;
   plan_rejected: number;
+  /** Absent on older APIs; treat as zero. */
+  base_diverged?: number;
   failed: number;
   needs_landing: number;
   fail_origins: Record<string, number>;

@@ -826,6 +826,11 @@ interface DriveState {
   approvedPlan?: string;
   /** Checked canonical instructions replace the local plan carried by the planning session. */
   checkedPlan?: boolean;
+  /** Issue #3178: the plan gate approved (non-cross_check) while NO session exists to carry the
+   *  plan (post-gate `resumeId` undefined), e.g. a re-presented stored plan after the SDK
+   *  session was dropped. The first implement turn then opens a fresh session, so the approved
+   *  plan body must ride its prompt. Absent/false on every other path. */
+  gateApprovedWithoutSession?: boolean;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
   /** Issue #2083: the decisions memo block was already placed in this execution's plan or
@@ -2646,6 +2651,9 @@ export class SdkExecutor implements Executor {
           candidateMilestones = canonical.milestones;
           drive.checkedPlan = true;
         }
+        // Issue #3178: keyed on the post-gate resumeId (a revise turn may have produced a
+        // session), never ctx.sessionId. Cross-check approvals carry the canonical contract.
+        drive.gateApprovedWithoutSession = verdict.approval !== "cross_check" && resumeId === undefined;
         approvedSelection = verdict.selection;
         // PRD #122 M6: freeze the APPROVED milestone breakdown for the implement loop.
         // `candidateMilestones` is block-scoped and REPLACED across revision rounds
@@ -2855,6 +2863,8 @@ export class SdkExecutor implements Executor {
         // PRD #759 M4: a provably-reviewed cross-worker resume has no session carrying the
         // plan either, so the plan body must ride the implement prompt (FLAG C / R3).
         reviewedResume: ctx.reviewedPlanResume === true,
+        // Issue #3178: a plan approved at the gate with no session to carry it.
+        gateApprovedWithoutSession: drive.gateApprovedWithoutSession === true,
         hasSession: !!ctx.sessionId,
       })
         ? approvedPlan
@@ -3261,6 +3271,8 @@ export class SdkExecutor implements Executor {
             // NOT treated as first. Non-interactive runs never park → identical to before.
             first: firstImplementTurn,
             reviewedPlanResume: ctx.reviewedPlanResume === true && !ctx.sessionId,
+            // Issue #3178: gate-approved plan on a session-less first implement turn.
+            gateApprovedWithoutSession: drive.gateApprovedWithoutSession === true,
             priorDecisionsMemo,
             // issue #222: warn the lead on the first implement turn that this resume's
             // reseed destroyed any local-only prior-attempt work, so a queued follow-up
@@ -3309,7 +3321,7 @@ export class SdkExecutor implements Executor {
             // Preserve legacy first-turn rendering without a snapshot; with a snapshot,
             // only the first ordinary owner receives this context, including when a
             // clarification reuses iteration 1.
-            priorWork: preApproved && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
+            priorWork: (preApproved || drive.gateApprovedWithoutSession === true) && (!ctx.interruptedSnapshot || firstOrdinaryOwner) ? ctx.priorWork : undefined,
             interruptedSnapshot: firstOrdinaryOwner ? ctx.interruptedSnapshot : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
             // can see the boundaries and checkpoint at each one. A pre-approved resume
@@ -5477,16 +5489,23 @@ export function resolveLeadModel(
  * silently falls back to the issue (the #209 M2 gap, FLAG C). The `!hasSession` guard is
  * UNCHANGED: a seeded/reviewed RESUME that still has a session already has the plan in it.
  * `reviewedResume` is optional (absent ⇒ false) so existing callers are byte-identical.
+ *
+ * Issue #3178 adds `gateApprovedWithoutSession`: the plan gate approved a (re-presented)
+ * plan while no session exists to carry it (the SDK session was dropped), so the fresh first
+ * implement session needs the body too. It is independent of `preApproved` (the gate ran) and
+ * keeps the `!hasSession` guard; absent ⇒ false, so the existing truth table is unchanged.
  */
 export function embedSeededPlan(args: {
   preApproved: boolean;
   seeded: boolean;
   hasSession: boolean;
   reviewedResume?: boolean;
+  gateApprovedWithoutSession?: boolean;
 }): boolean {
   return (
-    args.preApproved &&
-    (args.seeded || args.reviewedResume === true) &&
-    !args.hasSession
+    (args.preApproved &&
+      (args.seeded || args.reviewedResume === true) &&
+      !args.hasSession) ||
+    (args.gateApprovedWithoutSession === true && !args.hasSession)
   );
 }

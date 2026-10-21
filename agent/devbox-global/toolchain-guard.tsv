@@ -50,3 +50,6 @@ yamllint	yamllint	yamllint --version
 semgrep	semgrep	semgrep --version
 lsof	lsof	lsof -v
 procps.out	pgrep	pgrep -V
+actionlint	actionlint	actionlint -version
+zizmor	zizmor	zizmor --version
+zsh	zsh	zsh --version

@@ -85,17 +85,28 @@ new version can break uzi or ship capabilities uzi should adopt.
   - Claude: `@anthropic-ai/claude-agent-sdk`, `anthropics/claude-agent-sdk-typescript`
     `CHANGELOG.md`.
   - Codex: the native runtime in `agent/codex/codex-package.lock` (not an npm SDK; uzi
-    drives `codex app-server`, ADR-1106), `openai/codex` `rust-v*` GitHub release notes.
+    drives `codex app-server`, ADR-1106), `openai/codex` stable `rust-v*` GitHub release
+    notes (skip `-alpha`); when they are thin, read the stable-to-stable compare.
 - Scan for breaking changes and for new capabilities, then cross-check against the four
   guardrail layers and the run lifecycle in `ARCHITECTURE.md`:
   - Claude: hooks (the `PreToolUse` deny-hook), tool-runner/permission APIs,
     `settingSources`, session/streaming features and options.
-  - Codex: app-server protocol, approval and dynamic-callback (`item/tool/call`) changes,
-    hook trust, sandbox and feature defaults that could re-enable effectful native
-    execution or extensions (ADR-1106 *Execution policy*), session/resume and streaming.
-- The Codex bump arrives red by design: runtime probe/launcher parity blocks a lock-only
-  bump until `CODEX_PROBE_EXPECTATION` and `CODEX_BIN` are reconciled (PR-body note). That
-  fix goes on your own branch (below), with the Codex guardrail/conformance checks green.
+  - Codex: app-server protocol (RPCs, notifications), approval and dynamic-callback
+    (`item/tool/call`) changes, hook trust, sandbox and feature defaults that could
+    re-enable effectful native execution or extensions (ADR-1106 *Execution policy*),
+    model catalog metadata (`shell_type`, `default_service_tier`, experimental tools,
+    `minimal_client_version`), auth/refresh, config keys, session/rollout layout,
+    resume and streaming.
+  - A breaking behaviour against uzi's call sites, or a failed required check, blocks the
+    merge.
+- The Codex bump arrives red by design: the pin coordination and parity tests block a
+  lock-only bump. On your own branch (below), take the lock and run `task codex-pins:sync`,
+  which rewrites every registered Codex version and digest pin from it; keep the Codex
+  guardrail/conformance checks green.
+- Required PR CI covers the agent suite, the real-binary `test:codex-m4` on amd64 and the
+  worker-uid lane. The amd64 image builds and `codex-packaged-proof.yml` run but are not
+  required; arm64, `check:codex-m4-receipts` and live provider entitlement are not covered
+  by any PR check. Name in the merge note which of these ran.
 - Merging the bump implements none of it. Propose anything useful to the user and offer an
   `enhancement` issue, separate from the bump; never implement it in the bump PR. Report
   what you found, or "nothing actionable", at batch end.

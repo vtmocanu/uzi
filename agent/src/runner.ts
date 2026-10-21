@@ -5769,6 +5769,8 @@ export class RunRunner {
     const failOrigin =
       err instanceof ProviderPolicyRefusal
         ? "provider_policy_refusal"
+        : err instanceof BaseCommitDivergedError
+        ? "base_diverged"
         : err instanceof TerminalReportError || (err instanceof CodexTurnFailedError && err.failOrigin !== undefined)
         ? err.failOrigin
         : failOriginForReason(rawReason);

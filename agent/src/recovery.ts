@@ -557,6 +557,11 @@ function archiveProvesPin(r: RecoveryRecord): boolean {
 }
 
 const LIVE_MAX_PER_PASS = 4;
+/** Cap on the deduplication map behind the "recovery: re-drive exit" diagnostic. */
+const REDRIVE_EXIT_LOG_MAX = 256;
+type RedrivePath = "boot" | "live" | "terminal_source";
+type InactiveField = "executing" | "inventory_feature" | "ownership_unsupported" | "generation" | "ownership_lookup_failed" |
+  "ownership_lost_no_hold" | "claim_generation" | "inventory_guarded" | "status";
 const LIVE_BACKOFF_BASE_MS = 30_000;
 const LIVE_BACKOFF_CAP_MS = 15 * 60_000;
 const LIVE_PIN_SETTLE_MS = 6 * 60 * 60_000;
@@ -1019,6 +1024,47 @@ export class RecoveryCoordinator {
   private readonly pendingReportLogged = new Set<string>();
   /** serverCaptureIds whose redundancy claim got a final answer (expired, or a non-transient retained). */
   private readonly redundancySettled = new Set<string>();
+  /** Last logged re-drive exit per run/generation/capture (bounded; pruned with the live journal snapshot). */
+  private readonly redriveExitLogged = new Map<string, { captureId: string; value: string }>();
+
+  private redriveExitKey(record: RecoveryRecord): string {
+    return canonicalJson([record.runId, record.generation ?? null, record.captureId]);
+  }
+
+  /** One info line per change of a guarded record's re-drive exit; diagnostics only, never throws. */
+  private noteRedriveExit(path: RedrivePath, record: RecoveryRecord, reason: string, field?: string): void {
+    try {
+      const key = this.redriveExitKey(record);
+      const value = field ? `${reason}:${field}` : reason;
+      if (this.redriveExitLogged.get(key)?.value === value) return;
+      this.redriveExitLogged.delete(key);
+      this.redriveExitLogged.set(key, { captureId: record.captureId, value });
+      while (this.redriveExitLogged.size > REDRIVE_EXIT_LOG_MAX) {
+        const oldest = this.redriveExitLogged.keys().next();
+        if (oldest.done) break;
+        this.redriveExitLogged.delete(oldest.value);
+      }
+      this.log.info("recovery: re-drive exit", {
+        path, reason, ...(field ? { field } : {}),
+        run_id: record.runId, generation: record.generation, capture_id: record.captureId,
+      });
+    } catch { /* diagnostics must not change control flow */ }
+  }
+
+  private clearRedriveExit(record: RecoveryRecord): void {
+    try { this.redriveExitLogged.delete(this.redriveExitKey(record)); } catch { /* diagnostics only */ }
+  }
+
+  /** First failing clause of the live-pass candidate filter, in its original short-circuit order. */
+  private liveFilterDisqualifier(r: RecoveryRecord, opts: ResumeLiveOptions, credentialsBlocked: boolean): string | undefined {
+    if (!isLiveCandidate(r)) return "not_live_candidate";
+    if (!this.finalRetryReady(r)) return "final_retry_backoff";
+    if (opts.isExecuting(r.runId)) return "executing";
+    if (r.inventoryGuarded && r.finalAcknowledged && typeof r.generation === "number" &&
+        this.pendingGenerationReport?.(r.runId, r.generation)) return "pending_generation_report";
+    if (credentialsBlocked && !(r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))) return "credentials_blocked";
+    return undefined;
+  }
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.withTerminalSourceBoundary = opts.withTerminalSourceBoundary;
@@ -1331,25 +1377,35 @@ export class RecoveryCoordinator {
   }
 
   private async inactiveInventory(record: RecoveryRecord): Promise<boolean> {
+    return (await this.inactiveInventoryDisqualifier(record)) === undefined;
+  }
+
+  /** The first reason the run is not provably inactive, or undefined when it is. Throws exactly as
+   *  `inactiveInventory` always has; the field is a fixed code for the re-drive exit diagnostic. */
+  private async inactiveInventoryDisqualifier(record: RecoveryRecord): Promise<InactiveField | undefined> {
     const generation = record.generation;
-    if (this.isExecuting(record.runId) || !this.client.hasFeature?.("recovery_inventory_v1") ||
-        !this.client.getRunOwnership || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return false;
+    if (this.isExecuting(record.runId)) return "executing";
+    if (!this.client.hasFeature?.("recovery_inventory_v1")) return "inventory_feature";
+    if (!this.client.getRunOwnership) return "ownership_unsupported";
+    if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return "generation";
     let own;
     try { own = await this.recoveryRPC(() => this.client.getRunOwnership!(record.runId)); }
     catch (err) { MaintenanceBudget.current()?.check();
-      if (!isRunOwnershipLost(err, record.runId)) return false;
+      if (!isRunOwnershipLost(err, record.runId)) return "ownership_lookup_failed";
       // A MAC-authenticated immutable FINAL may only replay; new work needs the exact open hold.
-      return !!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record);
+      return (!!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record))
+        ? undefined : "ownership_lost_no_hold";
     }
-    if (!Number.isSafeInteger(own.claim_generation) || own.claim_generation! < generation) return false;
+    if (!Number.isSafeInteger(own.claim_generation) || own.claim_generation! < generation) return "claim_generation";
     if (own.status === "cancelled" && own.inventory_guarded === true) {
       MaintenanceBudget.observeCancellation();
     }
     // A later claim ends this exact generation, even while the successor is active or unguarded.
     // The MAC-covered original guard and exact hold checks remain the custody authority.
-    return own.claim_generation! > generation ||
-      (own.inventory_guarded === true &&
-       ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status));
+    if (own.claim_generation! > generation) return undefined;
+    if (own.inventory_guarded !== true) return "inventory_guarded";
+    return ["completed", "failed", "cancelled", "paused", "recovery_wait", "limit_wait"].includes(own.status)
+      ? undefined : "status";
   }
 
   /** The run's open guarded holds, strictly validated: only a boolean false flag may exclude a hold, so a
@@ -2442,7 +2498,8 @@ export class RecoveryCoordinator {
     return archived ?? this.captureCycle({ ...input, record: await this.requireRecord(record) });
   }
 
-  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
+  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting,
+    path: RedrivePath = "live"): Promise<RecoveryOutcome | void> {
     if (record.holdSettlement && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt) return this.heldStopped(record, "settled");
     if (record.completionReceipt) {
       await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
@@ -2452,8 +2509,12 @@ export class RecoveryCoordinator {
       await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal);
       return;
     }
-    if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged ||
-        !this.finalRetryReady(record)) return;
+    const exit = (reason: string, field?: string): void => this.noteRedriveExit(path, record, reason, field);
+    if (this.isExecuting(record.runId)) return exit("executing");
+    if (!isLiveCandidate(record)) return exit("not_live_candidate");
+    if (!record.coverageDigest) return exit("no_coverage_digest");
+    if (record.finalAcknowledged) return exit("not_live_candidate");
+    if (!this.finalRetryReady(record)) return exit("final_retry_backoff");
     if (record.finalRequest && record.holdSettlement && !await this.finalHoldAllowsReplay(record, "settled")) {
       return this.heldStopped(record, "settled");
     }
@@ -2461,6 +2522,7 @@ export class RecoveryCoordinator {
     // In particular, a verified empty inventory has no bundle or bare to rebuild.
     let archiveFallback = false;
     if (record.finalRequest) {
+      this.clearRedriveExit(record);
       const outcome = await this.finalizeInventory(record);
       await this.paceFinalRetry(record, outcome);
       const latest = await this.readLatest(record);
@@ -2468,15 +2530,18 @@ export class RecoveryCoordinator {
       archiveFallback = outcome?.held === "fallback";
       record = latest.record;
     }
-    if (!await this.inactiveInventory(record)) return;
+    const disqualifier = await this.inactiveInventoryDisqualifier(record);
+    if (disqualifier !== undefined) return this.noteRedriveExit(path, record, "inventory_not_inactive", disqualifier);
     const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
-    if (!barePath) return;
+    if (!barePath) return this.noteRedriveExit(path, record, record.bareDir ? "bare_unresolved" : "bare_dir_missing");
     const input = { record, barePath, defaultBranch: record.defaultBranch ?? "main", signal };
     if (archiveFallback) {
       const hold = await this.heldOperationState(record, signal);
       if (hold !== "open") return this.heldStopped(record, hold);
+      this.clearRedriveExit(record);
       return this.captureCycle(input);
     }
+    this.clearRedriveExit(record);
     return this.frozenOperationCycle(input);
   }
 
@@ -3266,7 +3331,7 @@ export class RecoveryCoordinator {
                   if (passSignal.aborted || residueQuarantine() !== undefined || this.isExecuting(runId)) return;
                   const current = await this.readRecord(this.recordPath(snap));
                   if (!current || !this.savedSourceCandidate(current) || !this.finalRetryReady(current)) return;
-                  await this.pendingStep(current, passSignal);
+                  await this.pendingStep(current, passSignal, "terminal_source");
                 }), attempts);
             } catch {
               this.log.warn("recovery: terminal saved evidence retained");
@@ -3697,7 +3762,10 @@ export class RecoveryCoordinator {
       // Visit each snapshot once; a failed generation retains custody while siblings continue.
       for (const snap of records) {
         if (signal?.aborted) break;
-        if (!this.finalRetryReady(snap)) continue;
+        if (!this.finalRetryReady(snap)) {
+          if (snap.inventoryGuarded) this.noteRedriveExit("boot", snap, "final_retry_backoff");
+          continue;
+        }
         if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
         try {
           await this.withCancellationAttempt(snap, async () =>
@@ -3744,10 +3812,17 @@ export class RecoveryCoordinator {
   }
 
   /** One boot-sweep record step; the caller holds the record's capture-cycle lock. */
-  private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal): Promise<void> {
+  private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal, path: RedrivePath = "boot"): Promise<void> {
     // Re-read the current, authenticated state of exactly this snapshotted record.
     const record = await this.readRecord(this.recordPath(snap));
-    if (!record || !this.finalRetryReady(record)) return;
+    if (!record) {
+      if (snap.inventoryGuarded) this.noteRedriveExit(path, snap, "record_unavailable");
+      return;
+    }
+    if (!this.finalRetryReady(record)) {
+      if (record.inventoryGuarded) this.noteRedriveExit(path, record, "final_retry_backoff");
+      return;
+    }
 
     const done = (outcome: string, reason?: string): void => {
       this.log.info("recovery restart sweep", {
@@ -3758,7 +3833,11 @@ export class RecoveryCoordinator {
       });
     };
     try {
-      if (record.inventoryGuarded) { await this.resumeInventory(record, signal, this.isExecuting); return; }
+      if (record.inventoryGuarded) {
+        const out = await this.resumeInventory(record, signal, this.isExecuting, path);
+        if (out) done(out.state, out.reason);
+        return;
+      }
       if (record.state === "uploaded") return;
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
         // A disposition the api or the local bytes made final: never retried (issue #1995).
@@ -3971,15 +4050,18 @@ export class RecoveryCoordinator {
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
       for (const id of this.pinCleanupBackoff.keys()) if (!seen.has(id)) this.pinCleanupBackoff.delete(id);
       for (const id of this.pendingReportLogged) if (!seen.has(id)) this.pendingReportLogged.delete(id);
+      for (const [key, entry] of this.redriveExitLogged) if (!seen.has(entry.captureId)) this.redriveExitLogged.delete(key);
       // Executing runs and ACKs whose reports still need them are filtered BEFORE
       // the cap. Deferred local cleanup must not displace a fresh upload or FINAL.
-      const candidates = all
-        .filter((r) => isLiveCandidate(r) && this.finalRetryReady(r) && !opts.isExecuting(r.runId) &&
-          !(r.inventoryGuarded && r.finalAcknowledged && typeof r.generation === "number" &&
-            this.pendingGenerationReport?.(r.runId, r.generation)) &&
-          (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
-        .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
-        .slice(0, this.liveMaxPerPass);
+      const eligible = all
+        .filter((r) => {
+          const why = this.liveFilterDisqualifier(r, opts, credentialsBlocked);
+          if (why !== undefined && r.inventoryGuarded) this.noteRedriveExit("live", r, why);
+          return why === undefined;
+        })
+        .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0));
+      const candidates = eligible.slice(0, this.liveMaxPerPass);
+      for (const dropped of eligible.slice(this.liveMaxPerPass)) if (dropped.inventoryGuarded) this.noteRedriveExit("live", dropped, "live_pass_cap");
       // Archived-pin cleanups are local (no credential), so they run while credentials are blocked.
       // They take only the slots the upload candidates leave, and back off per record.
       const cleanupCandidates = !this.git.cleanupArchivedRecoveryPin ? [] : all
@@ -3992,7 +4074,10 @@ export class RecoveryCoordinator {
       pinOnlyBlocked = credentialsBlocked && candidates.length === 0;
       let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
-        if (uploadsStopped && !(snap.inventoryGuarded && (snap.finalAcknowledged || snap.completionReceipt))) continue;
+        if (uploadsStopped && !(snap.inventoryGuarded && (snap.finalAcknowledged || snap.completionReceipt))) {
+          if (snap.inventoryGuarded) this.noteRedriveExit("live", snap, "credentials_blocked");
+          continue;
+        }
         if (opts.signal?.aborted) break;
         let res;
         try {
@@ -4008,6 +4093,7 @@ export class RecoveryCoordinator {
           // Cycle busy (a foreground capture or sweep step owns it): rotate it behind its peers so it
           // does not hold a per-pass slot forever.
           this.lastAttemptAt.set(snap.captureId, this.now());
+          if (snap.inventoryGuarded) this.noteRedriveExit("live", snap, "cycle_busy");
           continue;
         }
         if (res.value === "transient") transient = true;
@@ -4073,9 +4159,16 @@ export class RecoveryCoordinator {
     }
     const record = res.record;
     // Re-checked inside the lock: the record may have moved on, or the run started executing.
-    if (!isLiveCandidate(record) || !this.finalRetryReady(record) || opts.isExecuting(record.runId) ||
-        (!(record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) && this.credentialBlockedAt !== undefined &&
-         opts.authenticatedAtMs <= this.credentialBlockedAt)) return "ok";
+    const recheck = !isLiveCandidate(record) ? "not_live_candidate"
+      : !this.finalRetryReady(record) ? "final_retry_backoff"
+      : opts.isExecuting(record.runId) ? "executing"
+      : (!(record.inventoryGuarded && (record.finalAcknowledged || record.completionReceipt)) && this.credentialBlockedAt !== undefined &&
+         opts.authenticatedAtMs <= this.credentialBlockedAt) ? "credentials_blocked"
+      : undefined;
+    if (recheck !== undefined) {
+      if (record.inventoryGuarded) this.noteRedriveExit("live", record, recheck);
+      return "ok";
+    }
     this.lastAttemptAt.set(record.captureId, this.now());
     try {
       const out = record.inventoryGuarded

@@ -21,6 +21,11 @@ import { Outbox } from "../src/outbox.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
+// The stopped-source process proof (src/runner.ts) refuses off Linux (#1912).
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only stopped-source process proof (src/runner.ts refuses off Linux)"
+  : false;
+
 installHarness();
 
 /** Preserve the persisted clock and drive only the already armed deadline timer. */
@@ -457,7 +462,7 @@ for (const mismatch of ["pending", "ownership"] as const) {
     await retainedSwitchRegression("capture", true, { mismatch });
   });
 }
-it("a retained-recovery flight fenced after adoption still runs the stopped-source process proof and keeps predecessor and successor", async () => {
+it("a retained-recovery flight fenced after adoption still runs the stopped-source process proof and keeps predecessor and successor", { skip: LINUX_ONLY }, async () => {
   const requests: import("../src/run-quiescence.js").QuiesceRunRequest[] = [];
   await retainedSwitchRegression("adoption", true, { terminal: "fence", quiesceRequests: requests });
   const proof = requests.filter(r => r.site === "stopped_source");

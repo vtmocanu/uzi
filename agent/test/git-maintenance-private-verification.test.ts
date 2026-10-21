@@ -13,6 +13,12 @@ import { MaintenanceResources, RecoveryMaintenance, type MaintenanceResource } f
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { nullLogger } from "./helpers.js";
 
+// The private verification pipeline runs on the Linux-only object snapshot (src/git.ts
+// snapshotMaintenanceObjects refuses off Linux with maintenance_object_snapshot_refused), so these
+// scenarios cannot complete on macOS (#1912). Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only descriptor-pinned object snapshot (src/git.ts snapshotMaintenanceObjects refuses off Linux)"
+  : false;
 const exec = promisify(execFile);
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 const latch = () => {
@@ -163,7 +169,7 @@ async function fixture(t: test.TestContext, decoded?: number | ((total: number) 
     run, seam, charge, fingerprint, original, physical, callbacks: () => callbacks, joined: () => joined, cancelled: () => cancelled };
 }
 
-test("real shared-base private proof survives unavailable originals and ignores poisoned config", async t => {
+test("real shared-base private proof survives unavailable originals and ignores poisoned config", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   let detached = false;
   f.hooks.spawn = async request => {
@@ -208,7 +214,7 @@ test("real shared-base private proof survives unavailable originals and ignores 
 });
 
 for (const kind of ["missing", "corrupt"] as const) {
-  test(`pack-only proof refuses ${kind} before consumer`, async t => {
+  test(`pack-only proof refuses ${kind} before consumer`, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t); let changed = false;
     f.hooks.spawn = async request => {
       if (!changed && request.cwd.endsWith("/proof")) {
@@ -229,7 +235,7 @@ for (const kind of ["missing", "corrupt"] as const) {
   });
 }
 
-test("genuine below-C limit refuses before decoded producer or consumer", async t => {
+test("genuine below-C limit refuses before decoded producer or consumer", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t, 1);
   assert.ok(f.total > 1);
   await assert.rejects(f.run(() => f.seam()), RecoveryClosureLimitError);
@@ -237,7 +243,7 @@ test("genuine below-C limit refuses before decoded producer or consumer", async 
   assert.equal(f.callbacks(), 0);
 });
 
-test("ordinary and nested private verification share cumulative original C", async t => {
+test("ordinary and nested private verification share cumulative original C", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t, total => total + 1);
   const baseTip = (await exec("/usr/bin/git", ["-C", f.seed, "rev-parse", "HEAD"])).stdout.trim();
   await f.run(async () => {
@@ -248,7 +254,7 @@ test("ordinary and nested private verification share cumulative original C", asy
   assert.equal(f.callbacks(), 0);
 });
 
-test("all pipeline work remains in the original charged reservation", async t => {
+test("all pipeline work remains in the original charged reservation", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   const used = new Map<MaintenanceResource, number>();
   const consume = MaintenanceResources.consume.bind(MaintenanceResources);
@@ -281,14 +287,14 @@ for (const [resource, limit] of Object.entries({
   });
 }
 
-test("fresh callback is awaited again at a later helper launch", async t => {
+test("fresh callback is awaited again at a later helper launch", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t);
   f.hooks.effect = async () => { if (f.requests.length === 1) throw Error("fresh custody lost"); };
   await assert.rejects(f.run(() => f.seam()));
   assert.equal(f.requests.length, 1); assert.equal(f.joined(), 1); assert.equal(f.callbacks(), 0);
 });
 
-test("consumer rejection is awaited, cleaned and propagated without touching originals", async t => {
+test("consumer rejection is awaited, cleaned and propagated without touching originals", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), entered = latch(), release = latch();
   let settled = false;
   const work = f.run(() => f.seam("unit", async () => { entered.release(); await release.promise; throw Error("consumer"); }))
@@ -299,7 +305,7 @@ test("consumer rejection is awaited, cleaned and propagated without touching ori
   assert.equal(await fs.readFile(path.join(f.clone, ".git", "config"), "utf8"), f.poison);
 });
 
-test("cancellation during consumer waits for callback settlement", async t => {
+test("cancellation during consumer waits for callback settlement", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), entered = latch(), release = latch();
   let settled = false;
   const work = f.run(() => f.seam("unit", async () => { entered.release(); await release.promise; }))
@@ -317,7 +323,7 @@ test("custody callback refusal before helper launch never calls consumer", async
   assert.equal(f.requests.length, 0); assert.equal(f.callbacks(), 0);
 });
 
-test("owned completion and raw stderr disposal both settle before continuation", async t => {
+test("owned completion and raw stderr disposal both settle before continuation", { skip: LINUX_ONLY }, async t => {
   const f = await fixture(t), completed = latch(), release = latch(), disposal = latch();
   let settled = false, exitBeforeClose = false, cleanupBeforeClose = false;
   f.hooks.holdStderr = true;
@@ -361,7 +367,7 @@ test("owned completion and raw stderr disposal both settle before continuation",
 });
 
 for (const failure of ["write failure", "cancel", "callback rejection"]) {
-  test("composed snapshot sole cleanup follows all handle closes: " + failure, async t => {
+  test("composed snapshot sole cleanup follows all handle closes: " + failure, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t), closing = latch(), release = latch();
     const removals = new Map<string, number>();
     let opened = 0, closed = 0, injected = false, outputReady = false, earlyCleanup = false;
@@ -429,7 +435,7 @@ for (const failure of ["write failure", "cancel", "callback rejection"]) {
 }
 
 for (const mutation of ["earlier source sibling", "earlier output sibling", "source control", "output control"]) {
-  test("snapshot final proof blocks every Git launch after " + mutation, async t => {
+  test("snapshot final proof blocks every Git launch after " + mutation, { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t);
     let previous: string | undefined, changed = false;
     const objects = path.join(f.clone, ".git", "objects");
@@ -467,7 +473,7 @@ for (const mutation of ["earlier source sibling", "earlier output sibling", "sou
 // Pin both orders so a source control change is refused whether the walk reaches objects/info
 // before or after the change, not only in the order a given test filesystem happens to list.
 for (const order of ["info first", "info last"] as const) {
-  test("snapshot final proof refuses a source control change with " + order + " in the listing", async t => {
+  test("snapshot final proof refuses a source control change with " + order + " in the listing", { skip: LINUX_ONLY }, async t => {
     const f = await fixture(t);
     const opendir = fs.opendir.bind(fs);
     t.mock.method(fs, "opendir", async (...args: Parameters<typeof fs.opendir>) => {

@@ -8,7 +8,7 @@
 // but white-labels to the branded app logo when one is set (issue #688), with the
 // PRD #70 status dot still overlaid on top.
 
-import { effectiveRunStatus, isStoppedRun, needsHumanAttention } from "./runBadge";
+import { effectiveRunStatus, isStoppedRun, isRejectedRun, needsHumanAttention } from "./runBadge";
 import type { StopKind } from "./api";
 
 // FaviconState is the derived tab signal, most-urgent first in the priority ladder.
@@ -24,6 +24,7 @@ export type FaviconRun = {
   id: string;
   status: string;
   stop_kind: StopKind | null;
+  fail_origin?: string | null;
   is_revising?: boolean;
 };
 
@@ -40,6 +41,7 @@ function isFreshFailure(run: FaviconRun, baselineFailedIds: Set<string>): boolea
   return (
     run.status === "failed" &&
     !isStoppedRun(run.status, run.stop_kind) &&
+    !isRejectedRun(run.status, run.fail_origin) &&
     !baselineFailedIds.has(run.id)
   );
 }

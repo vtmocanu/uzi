@@ -130,6 +130,8 @@ type latestRunDTO struct {
 	// The non-sensitive StopKind enum below stays visible to everyone for the
 	// stopped-vs-failed badge, so classification never depends on this field.
 	FailureReason *string `json:"failure_reason"`
+	// FailOrigin is the non-sensitive failure classification, shared like StopKind.
+	FailOrigin *string `json:"fail_origin"`
 	// StopKind is the server-stamped stop or scope disposition. A branch_moved
 	// cancellation is a proven concurrent advance of an mr_rework or ci_fix branch.
 	// The board badge reads the status and stop_kind, not failure_reason.
@@ -195,7 +197,7 @@ type latestRunDTO struct {
 // the email (PRD #33 Decision 5): a shared board must not leak another user's email
 // on a card, and the web already renders a no-owner badge for empty. The query no
 // longer even selects the email, so there is nothing to fall back to here.
-func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, holdReason pgtype.Text, startedAt, firstStartedAt, finishedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds, budgetExtensionSeconds, budgetFinalizeSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration) *latestRunDTO {
+func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iterationCount int32, hasPlanMd bool, mrIID pgtype.Int8, mrWebURL, mrState, failureReason, stopKind, stopReason pgtype.Text, health string, healthReason pgtype.Text, healthSince pgtype.Timestamptz, holdReason pgtype.Text, startedAt, firstStartedAt, finishedAt pgtype.Timestamptz, budgetWallSeconds pgtype.Int4, budgetPausedSeconds, budgetExtensionSeconds, budgetFinalizeSeconds int32, interactive bool, ownerName, workerName pgtype.Text, runCount int64, createdAt, updatedAt pgtype.Timestamptz, viewerID uuid.UUID, globalTimeout time.Duration, failOrigin pgtype.Text) *latestRunDTO {
 	dto := &latestRunDTO{
 		ID:          runID.String(),
 		Status:      status,
@@ -220,6 +222,7 @@ func mapLatestRun(runID, ownerID uuid.UUID, status string, kind string, iteratio
 		FirstStartedAt: timePtr(firstStartedAt.Valid, firstStartedAt.Time),
 		FinishedAt:     timePtr(finishedAt.Valid, finishedAt.Time),
 	}
+	dto.FailOrigin = textPtrValue(failOrigin.Valid, failOrigin.String)
 	// failure_reason and health_reason are owner-only (Decisions 5 & 6): both can carry
 	// text about the owner (a verbatim reject reason, a raw agent error, "your vault is
 	// locked"), so a non-owner viewer of a shared board gets null. stop_kind, health, and
@@ -641,7 +644,7 @@ func assembleCards(issues []store.Issue, runRows []store.ListLatestRunsForRepoRo
 		dto := mapLatestRun(rr.ID, rr.UserID, rr.Status, rr.Kind, rr.IterationCount, rr.HasPlanMd.Bool, rr.MrIid, rr.MrWebUrl,
 			rr.MrState, rr.FailureReason, rr.StopKind, rr.StopReason, rr.Health, rr.HealthReason, rr.HealthSince, rr.HoldReason,
 			rr.StartedAt, rr.FirstStartedAt, rr.FinishedAt, rr.BudgetWallSeconds, rr.BudgetPausedSeconds, rr.BudgetExtensionSeconds, rr.BudgetFinalizeSeconds, rr.Interactive,
-			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout)
+			rr.OwnerName, rr.WorkerName, rr.RunCount, rr.CreatedAt, rr.UpdatedAt, viewerID, globalTimeout, rr.FailOrigin)
 		dto.AutoApproveBlockedReasons = nonNilStrings(rr.AutoApproveBlockedReasons)
 		dto.IsRevising = revising[rr.ID] // nil map ⇒ false (issue #750)
 		latestByIID[rr.IssueIid.Int64] = dto
@@ -1045,7 +1048,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
 			lr.StartedAt, lr.FirstStartedAt, lr.FinishedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
-			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout, lr.FailOrigin)
 		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -1154,7 +1157,7 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,
 			lr.StartedAt, lr.FirstStartedAt, lr.FinishedAt, lr.BudgetWallSeconds, lr.BudgetPausedSeconds, lr.BudgetExtensionSeconds, lr.BudgetFinalizeSeconds, lr.Interactive,
-			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout)
+			lr.OwnerName, lr.WorkerName, lr.RunCount, lr.CreatedAt, lr.UpdatedAt, repo.UserID, h.cfg.RunTimeout, lr.FailOrigin)
 		card.LatestRun.AutoApproveBlockedReasons = nonNilStrings(lr.AutoApproveBlockedReasons)
 		h.setLatestRunRevising(r.Context(), card.LatestRun, lr.ID) // issue #750
 	} else if !errors.Is(err, pgx.ErrNoRows) {

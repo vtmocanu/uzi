@@ -19,6 +19,11 @@ import type { StatsCollector } from "../src/stats.js";
 import { makeFixture } from "./fixture-repo.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
+// The boot sweep deletes snapshot refs through rmTreePinned (src/rmtree.ts), which refuses off Linux (#1912).
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only descriptor-pinned tree removal (src/rmtree.ts rmTreePinned refuses off Linux)"
+  : false;
+
 for (const failure of ["none", "snapshot", "cleanup"] as const) {
   it(`Worker.run awaits CODE boot cleanup before all claim lanes: ${failure}`, async () => {
     const events: string[] = [];
@@ -173,7 +178,7 @@ const retained = ["live", "rowless-live", "pending-no-reader", "running-child-no
   "malformed", "moved", "child-generation", "child-id", "lead-generation", "head", "lead-id", "local-child-server-none",
   "decided-pending-outcome", "missing-metadata", "malformed-metadata", "rowless-lead-id", "rowless-child-terminal", "rowless-child-foreign"];
 
-it("real Git CODE boot sweep deletes only on fenced positive proof and retains everything else", async () => {
+it("real Git CODE boot sweep deletes only on fenced positive proof and retains everything else", { skip: LINUX_ONLY }, async () => {
   const fx = makeFixture({ "source.txt": "code\n" });
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   try {
@@ -278,7 +283,7 @@ it("real Git CODE boot sweep deletes only on fenced positive proof and retains e
   } finally { fx.cleanup(); }
 });
 
-it("boot sweep keeps the ref when the server's lead claim generation differs from the pin, even if every other field matches", async () => {
+it("boot sweep keeps the ref when the server's lead claim generation differs from the pin, even if every other field matches", { skip: LINUX_ONLY }, async () => {
   const fx = makeFixture({ "source.txt": "code\n" });
   const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
   try {

@@ -80,7 +80,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   named failures are compared on the base.
 - **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
-  land-prep rebases that tree in place, so a check still running there tests a mixed tree.
+  land-prep rebases or merges that tree in place, so a check still running there tests a mixed tree.
 - **CI timing is advisory.** Run `S/ci-timing-report.py OWNER/REPO [RUN_ID]` for
   per-attempt execution, activation/queue delays, reported required-context completion
   and up to five ordinary successful main comparisons (median needs three).
@@ -384,14 +384,16 @@ locally in step 4. The advisory still prints until the window expires.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
-   S/land-prep.sh OWNER/REPO PR            # sibling worktree, rebase onto base, task migration:renumber
-                                           # on a collision, --force-with-lease push; no local gate
+   S/land-prep.sh OWNER/REPO PR            # sibling worktree, rebase onto base (or merge it in),
+                                           # task migration:renumber on a collision, lease push; no local gate
    ```
 
-   A many-commit branch conflicting with `main` gets `origin/main` merged in by hand (one
-   resolution pass; the PR is squash-merged), then `task migration:renumber`, sqlc regenerated
-   (a renumber reorders generated columns) and the full gate on CI: a clean merge can still break a
-   signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
+   A branch already holding merge commits (an uzi rework merges `main` in) gets `origin/main`
+   merged in, not rebased (`INTEGRATION=merge`): one resolution pass, a plain fast-forward
+   push, nothing rewritten (the PR is squash-merged). Pass `--merge` for a many-commit linear
+   branch that re-conflicts per commit. The mode is fixed for the landing; change it with
+   `--fresh`. After a merge or renumber, regenerate sqlc (a renumber reorders generated
+   columns) and run the full gate on CI: a clean merge can still break a signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
    after its `queries/*.sql`, never by hand. When either side adds a migration, require the
    `test-api-store-it` job's `LiveDB: N passed, 0 skipped` line on the exact head, since a test
    pinned to an older schema can break on the other side's new columns.
@@ -413,7 +415,8 @@ locally in step 4. The advisory still prints until the window expires.
    Union preserves existing entry gaps; only new joins choose a separator.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
-   CHANGELOG stop needs the diff3 base to auto-union), re-run with `--skip-rebase`. Exit 6 = the
+   CHANGELOG stop needs the diff3 base to auto-union), re-run with `--skip-rebase`; in merge
+   mode the worktree is left mid-merge: resolve, `git commit`, `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a `--gate auto|<list>` gate failed (log path
    printed; a missing or lockfile-stale `node_modules` is reinstalled first with
    `npm ci --ignore-scripts`). On macOS, treat Codex session-store failures as platform limitations only
@@ -684,7 +687,7 @@ unattributed process. Tell dependent peers which obligation remains.
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +
   wait; `scripts/review-quota.sh` who else consumes reviews; `scripts/wait-mrrework.sh`
   defer to uzi's rework.
-- `scripts/land-prep.sh` rebase / renumber / optional gate / lease push (`scripts/changelog-union.sh`
+- `scripts/land-prep.sh` rebase or merge / renumber / optional gate / lease push (`scripts/changelog-union.sh`
   unions a legacy CHANGELOG-only conflict or refuses; ordinary PRs use independent UUID fragments); `scripts/merge.sh` the
   guarded admin merge; `scripts/watch-run-ci.sh` job-level CI for a run, a branch, or a
   merge SHA; `scripts/watch-prs-ci.sh` CI-only for a batch of PRs (shared

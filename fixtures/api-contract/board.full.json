@@ -38,6 +38,7 @@
         "mr_web_url": "x",
         "mr_state": "x",
         "failure_reason": "x",
+        "fail_origin": "x",
         "stop_kind": "x",
         "stop_reason": "x",
         "health": "x",

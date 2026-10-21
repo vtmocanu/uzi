@@ -1850,3 +1850,13 @@ it("finding requests record true and omit the default send_to_uzi field", () => 
     expect(full.send_to_uzi).toBe(true);
   }
 });
+
+
+it("records base divergence separately and carries the nullable board origin", () => {
+  expect(runOutcomesZero.base_diverged).toBe(0);
+  expect(typeof runOutcomesFull.base_diverged).toBe("number");
+  expect(cardZero.latest_run).toBeNull();
+  expect(cardFull.latest_run).toHaveProperty("fail_origin");
+  const nullableOrigin: LatestRun["fail_origin"] = null;
+  expect(nullableOrigin).toBeNull();
+});

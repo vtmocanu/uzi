@@ -8,6 +8,13 @@ import {
   api, client, deferred, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith,
 } from "./runner-harness.js";
 
+// A fresh source is observed only through the Linux-only quiescence / stopped-source proofs
+// (src/runner.ts "non_linux_host" refusal, src/run-quiescence.ts), so it never qualifies on macOS (#1912).
+// Linux runs every assertion.
+const LINUX_ONLY = process.platform !== "linux"
+  ? "needs the Linux-only run-quiescence / stopped-source proof (src/run-quiescence.ts, src/runner.ts refuse off Linux)"
+  : false;
+
 installHarness();
 
 // Read the actual pending tail, without injecting provenance or replacing execution.
@@ -15,7 +22,7 @@ installHarness();
 type TailView = { executionTails: ReadonlyMap<string, Promise<unknown>> };
 
 for (const mode of ["normal", "latched-pause", "failed-stop", "late-shutdown", "late-fence", "failed-reap", "failed-cache", "failed-skills", "failed-retire", "failed-retired-append", "failed-holding-dispose", "failed-scratch-dispose", "failed-owed", "retention-failure", "canonical", "adopted-source"] as const) {
-  it(`#3031 owner pause ${mode}: exact fresh source is observed only after cleanup`, async (t) => {
+  it(`#3031 owner pause ${mode}: exact fresh source is observed only after cleanup`, { skip: ["normal", "latched-pause", "retention-failure"].includes(mode) ? LINUX_ONLY : false }, async (t) => {
     const claim = gitlabClaim(3033, { claim_generation: 1 });
     const started = deferred(), finish = deferred(), cleaning = deferred(), finishCleanup = deferred();
     let expected: unknown;

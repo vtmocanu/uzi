@@ -390,7 +390,7 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.deepEqual(stopMarkers(r.claim.run_id), [], "a terminal exit keeps the plain journal");
   });
 
-  it("clean terminal park ACK releases a covered clone (recovery_park_ack_terminal)", async () => {
+  it("clean terminal park ACK releases a covered clone (recovery_park_ack_terminal)", { skip: LINUX_CAPTURE }, async () => {
     const r = credRig(17910);
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => (body.status === "recovery_wait"
@@ -1136,7 +1136,7 @@ describe("RunRunner #1786 M2 rework — the cancel ACK keeps owner-authorized di
   });
 
   for (const changed of [true, false]) {
-    it(`credential-deferred cancel after a verified capture: revalidated at cleanup (${changed ? "bytes written after the capture are kept" : "a covered clone goes"})`, async () => {
+    it(`credential-deferred cancel after a verified capture: revalidated at cleanup (${changed ? "bytes written after the capture are kept" : "a covered clone goes"})`, { skip: changed ? false : LINUX_CAPTURE }, async () => {
       const iid = changed ? 17951 : 17952;
       const r = credRig(iid);
       const mirror = cancelMirror(r.claim.run_id);

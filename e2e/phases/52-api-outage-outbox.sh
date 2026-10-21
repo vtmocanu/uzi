@@ -8,7 +8,7 @@
 # provides: -
 # handoff:  -
 # mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: placeholder removed; api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
+# restores: placeholder removed; cleanup evidence saved under artifacts/52-api-outage-outbox (agent logs + allowlisted recovery-record projections, before API restore and before agent recreation); api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
 # PRD #1391 M5 (Run A) — the worker message OUTBOX survives an api outage. When the api
@@ -344,11 +344,40 @@ api_back() {
   wait_http || fail "outbox phase: API HTTP recovery failed"
   login || fail "outbox phase: API recovery login failed"
 }
+# save_outbox_agent_evidence LABEL — best-effort cleanup evidence: the agent log plus an
+# allowlisted projection of this phase's worker recovery records (e2e/recovery-record-projection.mjs,
+# fed on stdin so the image needs no copy). Never fails: every step is guarded and a failure
+# only prints a warning to stderr. Runs are the phase's own; empty or non-UUID ones are skipped.
+save_outbox_agent_evidence() {
+  local label="$1" dir="$RUNROOT/artifacts/52-api-outage-outbox" run limiter
+  local -a runs=()
+  mkdir -p "$dir" 2>/dev/null || true
+  "${COMPOSE[@]}" logs --no-color agent > "$dir/agent-$label.log" 2>/dev/null || true
+  for run in ${RUN1:-} ${RUN2:-} ${RUN_B1:-} ${RUN_B2:-} ${RUN_B3:-} ${RUN_B4:-} ${RUN_F1:-} ${RUN_F2:-}; do
+    [[ "$run" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]] && runs+=("$run")
+  done
+  if [ "${#runs[@]}" = 0 ]; then
+    echo '{"error":"no_phase_runs"}' > "$dir/recovery-records-$label.jsonl" 2>/dev/null || true
+    return 0
+  fi
+  # Host-side bound like storage_diagnostic_snapshot: never run the exec unbounded.
+  limiter="$(command -v timeout || command -v gtimeout || true)"
+  if [ -z "$limiter" ]; then
+    echo '{"error":"no_host_timeout"}' > "$dir/recovery-records-$label.jsonl" 2>/dev/null || true
+    echo "outbox cleanup: recovery record projection skipped, no timeout command ($label)" >&2
+    return 0
+  fi
+  # pipefail inside the subshell only: a failing exec or an early-closing head is a warning.
+  ( set -o pipefail
+    "$limiter" 20 "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data "${runs[@]}" \
+      < "$ROOT/e2e/recovery-record-projection.mjs" 2>/dev/null | head -c 262144 > "$dir/recovery-records-$label.jsonl"
+  ) || echo "outbox cleanup: recovery record projection failed ($label)" >&2
+  return 0
+}
 restore_outbox_resolution() {
   [ "$OUTBOX_RESTORE_NEEDED" = 1 ] || return 0
   storage_diagnostic_snapshot outbox-before-restore
-  mkdir -p "$RUNROOT/artifacts/52-api-outage-outbox"
-  "${COMPOSE[@]}" logs --no-color agent > "$RUNROOT/artifacts/52-api-outage-outbox/agent-before-api-restore.log" 2>/dev/null || true
+  save_outbox_agent_evidence before-api-restore
   unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS UZI_E2E_RECOVERY_FAST_REDRIVE
   "${COMPOSE[@]}" up -d --wait --no-deps outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder startup failed' >&2; return 1; }
   "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || { echo 'outbox cleanup: API recreation failed' >&2; return 1; }
@@ -356,6 +385,7 @@ restore_outbox_resolution() {
   COMPOSE=("${OUTBOX_BASE_COMPOSE[@]}")
   wait_http || { echo 'outbox cleanup: API HTTP recovery failed' >&2; return 1; }
   login || { echo 'outbox cleanup: API login failed' >&2; return 1; }
+  save_outbox_agent_evidence before-agent-recreate
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || { echo 'outbox cleanup: agent recreation failed' >&2; return 1; }
   wait_worker_online || { echo 'outbox cleanup: agent registration failed' >&2; return 1; }
   storage_diagnostic_snapshot outbox-after-restore
