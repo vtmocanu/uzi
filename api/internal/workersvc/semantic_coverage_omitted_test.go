@@ -12,6 +12,10 @@ import (
 // gate projection requires a human; the fixed (represented) report is complete and needs
 // none. Removing the represented comparison from evaluateSemanticCoverage admits the
 // omitted plan and turns the first case red.
+//
+// Scope: a requirement the report EXPLICITLY marks missing or uncertain. A requirement that
+// is absent from the report altogether is out of scope here: the server cannot know a
+// requirement the reviewer never listed.
 func TestSemanticCoverageOmittedRequirementIsNotComplete(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

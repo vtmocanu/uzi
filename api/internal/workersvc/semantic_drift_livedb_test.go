@@ -103,6 +103,29 @@ func TestSemanticDriftObservationLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("stale, foreign and unenrolled requests cost no forge call", func(t *testing.T) {
+		calls := d.forge.calls
+		if _, err := d.observe(t, 6, d.publication(sha40(4))); !errors.Is(err, ErrStaleClaim) {
+			t.Fatalf("stale generation: %v", err)
+		}
+		other := d.e.seedWorker(t, nil)
+		if _, err := d.svc.ObserveSemanticDrift(d.e.ctx, store.Worker{ID: other, UserID: d.e.userID}, d.run, 7, d.publication(sha40(4))); !errors.Is(err, ErrRunNotOwned) {
+			t.Fatalf("foreign worker: %v", err)
+		}
+		bare := d.e.seedActiveRunOwnedBy(t, d.worker)
+		d.e.exec(t, `UPDATE runs SET claim_generation=7,completion_contract_version=1 WHERE id=$1`, bare)
+		if _, err := d.svc.ObserveSemanticDrift(d.e.ctx, d.wkr, bare, 7, d.publication(sha40(4))); !errors.Is(err, errCoverageUnavailable) {
+			t.Fatalf("run without a semantic row: %v", err)
+		}
+		d.e.exec(t, `UPDATE runs SET status='completed' WHERE id=$1`, bare)
+		if _, err := d.svc.ObserveSemanticDrift(d.e.ctx, d.wkr, bare, 7, d.publication(sha40(4))); err == nil {
+			t.Fatal("terminal run accepted")
+		}
+		if d.forge.calls != calls {
+			t.Fatalf("a request refused by the pre-check read the forge %d time(s)", d.forge.calls-calls)
+		}
+	})
+
 	t.Run("validation refusals store nothing", func(t *testing.T) {
 		before, _ := d.stored(t)
 		foreign := d.publication(sha40(5))
@@ -184,4 +207,60 @@ func TestSemanticDriftObservationLiveDB(t *testing.T) {
 			t.Fatalf("a non-owner must be refused: %v", err)
 		}
 	})
+}
+
+// One changed observation followed by 32 unchanged ones pushes the changed record out of the
+// kept list; the sticky flag must still project a contradiction.
+func TestSemanticDriftStickyContradictionLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	// No PRD source: every kept record is clean once the changed one is dropped, so only the
+	// sticky flag can carry the contradiction.
+	d.sources = d.sources[:1]
+	d.submit(t)
+	publish := func(n int) apitypes.SemanticObservationRequest {
+		return apitypes.SemanticObservationRequest{Phase: "publication", PushedSHA: sha40(n), PRDSources: []apitypes.SemanticObservedSource{}}
+	}
+	d.forge.issue.Description = "frozen issue requirement edited"
+	if rec, err := d.observe(t, 7, publish(1)); err != nil || rec.Issue.Outcome != "changed" {
+		t.Fatalf("changed: %+v err=%v", rec, err)
+	}
+	d.forge.issue.Description = "frozen issue requirement"
+	for i := range 32 {
+		if rec, err := d.observe(t, 7, publish(100+i)); err != nil || rec.Issue.Outcome != "unchanged" {
+			t.Fatalf("append %d: %+v err=%v", i, rec, err)
+		}
+	}
+	stored, _ := d.stored(t)
+	if len(stored.Items) != 32 || stored.Dropped != 1 || !stored.Contradicted {
+		t.Fatalf("items=%d dropped=%d contradicted=%v", len(stored.Items), stored.Dropped, stored.Contradicted)
+	}
+	for _, o := range stored.Items {
+		if o.Issue.Outcome != "unchanged" {
+			t.Fatal("the changed record should have been dropped from the kept list")
+		}
+	}
+	run, err := d.e.q.GetRunByID(d.e.ctx, d.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dto, err := d.svc.SemanticDriftForOwner(d.e.ctx, d.e.userID, run)
+	if err != nil || dto == nil || !dto.Contradiction || dto.Dropped != 1 {
+		t.Fatalf("dto=%+v err=%v", dto, err)
+	}
+}
+
+// A composed (scheduled guidance) frozen text compares the current raw body against the
+// saved raw body: no edit is unchanged, an edit is changed.
+func TestSemanticDriftComposedRunLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	d.e.exec(t, `UPDATE runs SET issue_saved_body=$2 WHERE id=$1`, d.run, "raw forge body")
+	d.forge.issue.Description = "raw forge body"
+	rec, err := d.observe(t, 7, d.publication(sha40(1)))
+	if err != nil || rec.Issue.Outcome != "unchanged" || rec.Issue.ObservedHash != driftHash("raw forge body") {
+		t.Fatalf("unedited composed run: %+v err=%v", rec, err)
+	}
+	d.forge.issue.Description = "raw forge body, edited"
+	if rec, err = d.observe(t, 7, d.publication(sha40(2))); err != nil || rec.Issue.Outcome != "changed" {
+		t.Fatalf("edited composed run: %+v err=%v", rec, err)
+	}
 }

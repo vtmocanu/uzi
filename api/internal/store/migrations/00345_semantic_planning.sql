@@ -10,15 +10,19 @@ CREATE TABLE semantic_planning (
  candidate jsonb,
  review_state jsonb,
  -- PRD #1230 D5: bounded source-drift detector observations, kept apart from
- -- review_state (the coverage budget ledger). Shape {"dropped":n,"items":[...]};
+ -- review_state (the coverage budget ledger). Shape {"dropped":n,"contradicted":bool,"items":[...]};
+ -- contradicted is sticky: once any appended record had a changed or unknown source it
+ -- stays true after that record is dropped from the bounded item list;
  -- NOT NULL with an empty default so readers never branch on SQL NULL, and free
  -- because the table is created in this same migration. The CHECK is a backstop for
  -- the single bounded append statement (AppendSemanticObservation).
- observations jsonb NOT NULL DEFAULT '{"dropped":0,"items":[]}'::jsonb
+ observations jsonb NOT NULL DEFAULT '{"dropped":0,"contradicted":false,"items":[]}'::jsonb
   CHECK (jsonb_typeof(observations) = 'object'
    AND jsonb_typeof(observations->'items') = 'array'
    AND jsonb_array_length(observations->'items') <= 32
-   AND jsonb_typeof(observations->'dropped') = 'number')
+   AND jsonb_typeof(observations->'dropped') = 'number'
+   AND (observations->>'dropped') ~ '^[0-9]+$'
+   AND jsonb_typeof(observations->'contradicted') = 'boolean')
 );
 CREATE TABLE semantic_snapshots (
  run_id uuid NOT NULL REFERENCES runs(id) ON DELETE CASCADE,

@@ -16,7 +16,7 @@ const (
 // SemanticObservationRequest is the worker's POST /worker/runs/{id}/semantic/observation
 // body. The worker reads each PRD source at the exact commit through trusted bare git;
 // the server cannot. Presentation requires candidate_digest and gate_revision;
-// publication requires pushed_sha (40 lowercase hex). Every frozen PRD source of the
+// publication requires pushed_sha (40 or 64 lowercase hex). Every frozen PRD source of the
 // current candidate must appear exactly once (at most 8).
 type SemanticObservationRequest struct {
 	ClaimGeneration *int64                   `json:"claim_generation"`
@@ -53,8 +53,9 @@ type SemanticDriftSource struct {
 }
 
 // SemanticDriftObservation is the stored and returned record. Link fields carry
-// clone-relative PRD paths only. LinksTruncated is set when paths were omitted to
-// stay inside the fixed bounds (count or unsafe/oversize path).
+// clone-relative PRD paths that pass the PRD path validator. LinksTruncated is set when
+// paths were omitted to stay inside the fixed bounds: more than eight, an oversize path,
+// or a candidate that fails validation (traversal, absolute, dotfile, control byte).
 type SemanticDriftObservation struct {
 	Phase           string                `json:"phase"`
 	CandidateDigest string                `json:"candidate_digest,omitempty"`

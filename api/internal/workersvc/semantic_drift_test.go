@@ -67,6 +67,8 @@ func TestSemanticObservationRequestValidation(t *testing.T) {
 		{"short ref", presentation(mutate(func(s *apitypes.SemanticObservedSource) { s.Ref = "abc123" })), false},
 		{"publication needs the pushed sha", publication("", ok), false},
 		{"publication uppercase sha", publication(strings.ToUpper(driftSHA), ok), false},
+		{"publication sha256 object id", publication(strings.Repeat("a", 64), mutate(func(s *apitypes.SemanticObservedSource) { s.Ref = strings.Repeat("a", 64) })), true},
+		{"publication 41 hex", publication(driftSHA+"0", ok), false},
 		{"publication ref differs from pushed sha", publication(driftSHA, mutate(func(s *apitypes.SemanticObservedSource) { s.Ref = strings.Repeat("f", 40) })), false},
 		{"presentation without digest", apitypes.SemanticObservationRequest{Phase: "presentation"}, false},
 		{"unknown phase", apitypes.SemanticObservationRequest{Phase: "later"}, false},
@@ -133,6 +135,8 @@ func TestDriftIssueSource(t *testing.T) {
 		{"checkbox flips only", frozenText, currentIssue{Text: "- [x] one\n- [X] two\n"}, "changed", "", true, true},
 		{"checkbox flip plus an edit is not checkbox only", frozenText, currentIssue{Text: "- [x] one\n- [ ] 2\n"}, "changed", "", false, true},
 		{"brackets inside prose are not a checkbox", "see [ ] here", currentIssue{Text: "see [x] here"}, "changed", "", false, true},
+		{"composed run, raw body unedited", frozenText + "\nscheduler guidance", currentIssue{Text: frozenText, Saved: frozenText}, "unchanged", "", false, true},
+		{"composed run, raw body edited", frozenText + "\nscheduler guidance", currentIssue{Text: frozenText + "- [ ] three\n", Saved: frozenText}, "changed", "", false, true},
 		{"forge error", frozenText, currentIssue{Reason: "unreadable"}, "unknown", "unreadable", false, false},
 		{"forge timeout", frozenText, currentIssue{Reason: "timeout"}, "unknown", "timeout", false, false},
 		{"oversize", frozenText, currentIssue{Reason: "truncated"}, "unknown", "truncated", false, false},
@@ -141,7 +145,7 @@ func TestDriftIssueSource(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := ref
-			if tc.name == "brackets inside prose are not a checkbox" {
+			if tc.name == "brackets inside prose are not a checkbox" || strings.HasPrefix(tc.name, "composed run") {
 				r.Hash = driftHash(tc.frozen)
 			}
 			got := driftIssueSource(r, tc.frozen, tc.cur)
@@ -160,9 +164,11 @@ type driftFakeForge struct {
 	issue forge.Issue
 	err   error
 	block bool
+	calls int
 }
 
 func (f *driftFakeForge) GetIssue(ctx context.Context, _, _ int64) (forge.Issue, error) {
+	f.calls++
 	if f.block {
 		<-ctx.Done()
 		return forge.Issue{}, ctx.Err()
@@ -202,6 +208,15 @@ func TestDriftLinks(t *testing.T) {
 	if len(added) != 0 || len(removed) != 0 || added == nil || removed == nil {
 		t.Fatalf("an unchanged link set must report empty non-nil lists: %q %q", added, removed)
 	}
+	// A candidate failing the PRD path validator is rejected and flagged, never reported.
+	added, removed, truncated = driftLinks(frozen, "prds/7-x.md prds/8-y.md ../prds/x.md prds/.git/c.md")
+	if len(added) != 0 || len(removed) != 0 || !truncated {
+		t.Fatalf("invalid candidates must be flagged, not reported: %q %q %v", added, removed, truncated)
+	}
+	badFrozen := append(append([]apitypes.SemanticSourceRef(nil), frozen...), apitypes.SemanticSourceRef{ID: "prd:prds/../x.md", Kind: "prd", Completeness: "unknown"})
+	if _, removed, truncated = driftLinks(badFrozen, "prds/7-x.md prds/8-y.md"); len(removed) != 0 || !truncated {
+		t.Fatalf("an invalid frozen path is flagged, not reported as removed: %q %v", removed, truncated)
+	}
 	text := ""
 	for i := range 10 {
 		text += " prds/" + string(rune('a'+i)) + ".md"
@@ -215,14 +230,14 @@ func TestSemanticDriftDTO(t *testing.T) {
 	obs := func(issue, prd string) apitypes.SemanticDriftObservation {
 		return apitypes.SemanticDriftObservation{Phase: "publication", Issue: apitypes.SemanticDriftSource{Outcome: issue}, PRDs: []apitypes.SemanticDriftSource{{Outcome: prd}}}
 	}
-	marshal := func(dropped int64, items ...apitypes.SemanticDriftObservation) []byte {
-		raw, err := json.Marshal(storedSemanticObservations{Dropped: dropped, Items: items})
+	marshal := func(dropped int64, contradicted bool, items ...apitypes.SemanticDriftObservation) []byte {
+		raw, err := json.Marshal(storedSemanticObservations{Dropped: dropped, Contradicted: contradicted, Items: items})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return raw
 	}
-	if dto, err := semanticDriftDTO(marshal(0)); err != nil || dto != nil {
+	if dto, err := semanticDriftDTO(marshal(0, false)); err != nil || dto != nil {
 		t.Fatalf("no observations must project to nothing: %+v %v", dto, err)
 	}
 	for _, tc := range []struct {
@@ -230,10 +245,15 @@ func TestSemanticDriftDTO(t *testing.T) {
 		raw           []byte
 		contradiction bool
 	}{
-		{"all unchanged", marshal(0, obs("unchanged", "unchanged")), false},
-		{"issue changed", marshal(0, obs("changed", "unchanged")), true},
-		{"prd unknown", marshal(0, obs("unchanged", "unknown")), true},
-		{"an older contradiction is not silenced by a later clean one", marshal(0, obs("changed", "unchanged"), obs("unchanged", "unchanged")), true},
+		{"all unchanged", marshal(0, false, obs("unchanged", "unchanged")), false},
+		{"issue changed", marshal(0, false, obs("changed", "unchanged")), true},
+		{"issue unknown is a contradiction", marshal(0, false, obs("unknown", "unchanged")), true},
+		{"prd unknown", marshal(0, false, obs("unchanged", "unknown")), true},
+		{"prd changed", marshal(0, false, obs("unchanged", "changed")), true},
+		{"an older contradiction is not silenced by a later clean one", marshal(0, false, obs("changed", "unchanged"), obs("unchanged", "unchanged")), true},
+		{"sticky flag survives a clean kept list", marshal(1, true, obs("unchanged", "unchanged")), true},
+		{"sticky flag with only a dropped count", marshal(5, true), true},
+		{"dropped count alone is not a contradiction", marshal(5, false), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dto, err := semanticDriftDTO(tc.raw)
@@ -242,8 +262,28 @@ func TestSemanticDriftDTO(t *testing.T) {
 			}
 		})
 	}
-	if dto, _ := semanticDriftDTO(marshal(5)); dto == nil || dto.Dropped != 5 || dto.Observations == nil {
+	if dto, _ := semanticDriftDTO(marshal(5, false)); dto == nil || dto.Dropped != 5 || dto.Observations == nil {
 		t.Fatalf("a dropped count alone is still reported with a non-nil list: %+v", dto)
+	}
+}
+
+func TestDriftRecordContradicts(t *testing.T) {
+	clean := apitypes.SemanticDriftObservation{Issue: apitypes.SemanticDriftSource{Outcome: "unchanged"}, PRDs: []apitypes.SemanticDriftSource{{Outcome: "unchanged"}}}
+	if driftRecordContradicts(clean) {
+		t.Fatal("an all-unchanged record is not a contradiction")
+	}
+	for name, mutate := range map[string]func(*apitypes.SemanticDriftObservation){
+		"issue changed": func(o *apitypes.SemanticDriftObservation) { o.Issue.Outcome = "changed" },
+		"issue unknown": func(o *apitypes.SemanticDriftObservation) { o.Issue.Outcome = "unknown" },
+		"prd changed":   func(o *apitypes.SemanticDriftObservation) { o.PRDs[0].Outcome = "changed" },
+		"prd unknown":   func(o *apitypes.SemanticDriftObservation) { o.PRDs[0].Outcome = "unknown" },
+	} {
+		o := clean
+		o.PRDs = append([]apitypes.SemanticDriftSource(nil), clean.PRDs...)
+		mutate(&o)
+		if !driftRecordContradicts(o) {
+			t.Errorf("%s must contradict", name)
+		}
 	}
 }
 

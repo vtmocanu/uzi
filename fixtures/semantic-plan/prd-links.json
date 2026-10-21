@@ -220,6 +220,13 @@
       "paths": [
         "prds/t.md.md"
       ]
+    },
+    {
+      "name": "dot dot slash prefix stays whole",
+      "text": "see ../prds/x.md now",
+      "paths": [
+        "../prds/x.md"
+      ]
     }
   ],
   "validate": [

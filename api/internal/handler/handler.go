@@ -1200,7 +1200,10 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Post("/runs/{id}/memory/reserve", h.WorkerMemoryReserve)
 		r.Post("/runs/{id}/memory/outcome", h.WorkerMemoryOutcome)
 		r.Post("/runs/{id}/semantic/candidate", h.WorkerSemanticCandidate)
-		r.Post("/runs/{id}/semantic/observation", h.WorkerSemanticObservation)
+		// PRD #1230 D5: each call reads the run's issue from the forge (best effort), so it rides
+		// the per-worker limiter like the other forge-touching worker writes. The service
+		// pre-checks ownership, generation and enrolment before that read.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/semantic/observation", h.WorkerSemanticObservation)
 		r.Get("/runs/{id}/semantic/coverage", h.WorkerSemanticCoverageStatus)
 		r.Post("/runs/{id}/semantic/coverage/reserve", h.WorkerSemanticCoverageReserve)
 		r.Post("/runs/{id}/semantic/coverage/settle", h.WorkerSemanticCoverageSettle)

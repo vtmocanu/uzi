@@ -36,7 +36,6 @@ const (
 
 var (
 	semanticHashRe        = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	semanticPushedSHARe   = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	semanticObsRefRe      = regexp.MustCompile(semanticObservationRefPattern)
 	semanticCheckboxRe    = regexp.MustCompile(`(?m)^([ \t]*(?:[-*+]|\d+[.)])[ \t]+)\[[ xX]\]`)
 	semanticDriftReasonOK = map[string]bool{"missing": true, "truncated": true, "unreadable": true, "denied": true, "invalid": true, "timeout": true}
@@ -47,6 +46,9 @@ var (
 type currentIssue struct {
 	Text   string
 	Reason string
+	// Saved is the raw body captured at run creation (ForgeConn.SavedBody). It differs
+	// from the frozen issue text only for a composed (scheduled guidance) description.
+	Saved string
 }
 
 // readCurrentSemanticIssue reads the run's own issue with a bounded deadline. A
@@ -83,7 +85,37 @@ func (s *Service) currentSemanticIssue(ctx context.Context, wkr store.Worker, ru
 	if err != nil {
 		return currentIssue{Reason: "unreadable"}, nil
 	}
-	return readCurrentSemanticIssue(ctx, f, conn.ForgeProjectID, *conn.IssueIID), nil
+	cur := readCurrentSemanticIssue(ctx, f, conn.ForgeProjectID, *conn.IssueIID)
+	cur.Saved = conn.SavedBody
+	return cur, nil
+}
+
+// requireObservable is the cheap pre-check that spares a stale, foreign or unenrolled
+// request the forge read. The authoritative fence is re-checked under the run lock.
+func (s *Service) requireObservable(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64) error {
+	run, err := s.runOwnedByWorker(ctx, runID, wkr)
+	if err != nil {
+		return err
+	}
+	switch {
+	case run.ClaimGeneration != generation || run.ClaimReleasedAt.Valid:
+		return ErrStaleClaim
+	case terminalStatuses[run.Status]:
+		return ErrRunTerminal
+	case run.Status != "running" && run.Status != "awaiting_approval":
+		return ErrInvalidState
+	}
+	tx, err := s.beginReadCommitted(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = store.New(tx).GetSemanticObservations(ctx, runID); errors.Is(err, pgx.ErrNoRows) {
+		return errCoverageUnavailable
+	} else if err != nil {
+		return err
+	}
+	return nil
 }
 
 // validateSemanticObservationRequest checks everything that needs no stored state.
@@ -97,7 +129,7 @@ func validateSemanticObservationRequest(req apitypes.SemanticObservationRequest)
 			return bad("presentation requires candidate_digest and gate_revision only")
 		}
 	case apitypes.SemanticDriftPhasePublication:
-		if !semanticPushedSHARe.MatchString(req.PushedSHA) || req.CandidateDigest != "" || req.GateRevision != nil {
+		if !semanticObsRefRe.MatchString(req.PushedSHA) || req.CandidateDigest != "" || req.GateRevision != nil {
 			return bad("publication requires pushed_sha only")
 		}
 	default:
@@ -150,10 +182,16 @@ func driftIssueSource(ref apitypes.SemanticSourceRef, frozenText string, cur cur
 		out.Outcome, out.Reason = apitypes.SemanticDriftUnknown, "invalid"
 	default:
 		out.ObservedHash = semanticHash([]byte(cur.Text))
+		// A composed (scheduled guidance) frozen text is not the raw forge body; compare the
+		// current raw body against the saved raw body instead, as WorkerForgeGetIssue does.
+		baseline, baselineHash := frozenText, ref.Hash
+		if cur.Saved != "" && cur.Saved != frozenText {
+			baseline, baselineHash = cur.Saved, semanticHash([]byte(cur.Saved))
+		}
 		out.Outcome = apitypes.SemanticDriftUnchanged
-		if out.ObservedHash != ref.Hash {
+		if out.ObservedHash != baselineHash {
 			out.Outcome = apitypes.SemanticDriftChanged
-			out.CheckboxOnly = normalizeSemanticCheckboxes(frozenText) == normalizeSemanticCheckboxes(cur.Text)
+			out.CheckboxOnly = normalizeSemanticCheckboxes(baseline) == normalizeSemanticCheckboxes(cur.Text)
 		}
 	}
 	return out
@@ -177,7 +215,7 @@ func driftLinks(frozen []apitypes.SemanticSourceRef, text string) (added, remove
 		paths, truncated = paths[:semanticObservationMaxPRDs], true
 	}
 	for _, p := range paths {
-		if !semanticIdentifier("prd:"+p, 512) {
+		if !ValidSemanticPrdPath(p) || !semanticIdentifier("prd:"+p, 512) {
 			truncated = true
 			continue
 		}
@@ -188,7 +226,12 @@ func driftLinks(frozen []apitypes.SemanticSourceRef, text string) (added, remove
 	}
 	for _, ref := range frozen {
 		p := strings.TrimPrefix(ref.ID, "prd:")
-		if ref.Kind == "prd" && ref.ID != p && !strings.HasPrefix(ref.ID, "prd:unknown:") && !currentSet[p] && len(removed) < semanticObservationMaxLinks {
+		if ref.Kind != "prd" || ref.ID == p || strings.HasPrefix(ref.ID, "prd:unknown:") || currentSet[p] {
+			continue
+		}
+		if !ValidSemanticPrdPath(p) {
+			truncated = true
+		} else if len(removed) < semanticObservationMaxLinks {
 			removed = append(removed, p)
 		}
 	}
@@ -239,6 +282,12 @@ func (s *Service) ObserveSemanticDrift(ctx context.Context, wkr store.Worker, ru
 	if err := validateSemanticObservationRequest(req); err != nil {
 		return out, err
 	}
+	if s.txBeginner == nil {
+		return out, fmt.Errorf("semantic observation requires transaction")
+	}
+	if err := s.requireObservable(ctx, wkr, runID, generation); err != nil {
+		return out, err
+	}
 	cur, err := s.currentSemanticIssue(ctx, wkr, runID)
 	if err != nil {
 		return out, err
@@ -281,7 +330,7 @@ func (s *Service) ObserveSemanticDrift(ctx context.Context, wkr store.Worker, ru
 		if len(raw) > semanticObservationMaxRecord {
 			return fmt.Errorf("%w: record exceeds bound", ErrSemanticObservationInvalid)
 		}
-		if _, err = c.q.AppendSemanticObservation(ctx, store.AppendSemanticObservationParams{RunID: runID, Observation: raw}); err != nil {
+		if _, err = c.q.AppendSemanticObservation(ctx, store.AppendSemanticObservationParams{RunID: runID, Observation: raw, Contradicted: driftRecordContradicts(rec)}); err != nil {
 			return err
 		}
 		out = rec
@@ -291,14 +340,28 @@ func (s *Service) ObserveSemanticDrift(ctx context.Context, wkr store.Worker, ru
 }
 
 type storedSemanticObservations struct {
-	Dropped int64                               `json:"dropped"`
-	Items   []apitypes.SemanticDriftObservation `json:"items"`
+	Dropped      int64                               `json:"dropped"`
+	Contradicted bool                                `json:"contradicted"`
+	Items        []apitypes.SemanticDriftObservation `json:"items"`
+}
+
+// driftRecordContradicts is true when any source of the record is changed or unknown.
+func driftRecordContradicts(o apitypes.SemanticDriftObservation) bool {
+	if o.Issue.Outcome != apitypes.SemanticDriftUnchanged {
+		return true
+	}
+	for _, p := range o.PRDs {
+		if p.Outcome != apitypes.SemanticDriftUnchanged {
+			return true
+		}
+	}
+	return false
 }
 
 // SemanticDriftForOwner projects the stored observations for the run owner. It
 // returns nil when the run has no semantic planning row or no observation yet.
-// Contradiction is true when any stored source is changed or unknown, so a later
-// benign observation cannot silence an earlier one.
+// Contradiction is the sticky stored flag or any kept source being changed or unknown, so
+// neither a later benign observation nor the 32-item bound can silence an earlier one.
 func (s *Service) SemanticDriftForOwner(ctx context.Context, owner uuid.UUID, run store.Run) (*apitypes.SemanticDriftDTO, error) {
 	if run.UserID != owner {
 		return nil, ErrRunNotFound
@@ -333,15 +396,10 @@ func semanticDriftDTO(raw []byte) (*apitypes.SemanticDriftDTO, error) {
 	if dto.Observations == nil {
 		dto.Observations = []apitypes.SemanticDriftObservation{}
 	}
+	// Sticky: a contradiction recorded in a since-dropped observation still counts.
+	dto.Contradiction = stored.Contradicted
 	for _, o := range stored.Items {
-		if o.Issue.Outcome != apitypes.SemanticDriftUnchanged {
-			dto.Contradiction = true
-		}
-		for _, p := range o.PRDs {
-			if p.Outcome != apitypes.SemanticDriftUnchanged {
-				dto.Contradiction = true
-			}
-		}
+		dto.Contradiction = dto.Contradiction || driftRecordContradicts(o)
 	}
 	return dto, nil
 }

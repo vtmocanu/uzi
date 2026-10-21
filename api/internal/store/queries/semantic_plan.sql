@@ -58,12 +58,14 @@ SELECT observations FROM semantic_planning WHERE run_id = $1;
 
 -- PRD #1230 D5. Appends one drift observation under the caller's run lock and
 -- enforces the bound in this same statement: at most 32 items are kept, the oldest
--- are dropped and `dropped` counts them. Items are fixed-size records built by the
+-- are dropped and `dropped` counts them; `contradicted` is sticky (set by the caller from
+-- the record, never cleared by dropping the record). Items are fixed-size records built by the
 -- caller; this statement never reads or writes review_state, candidates or history.
 -- name: AppendSemanticObservation :one
 UPDATE semantic_planning SET observations = jsonb_build_object(
     'dropped', (observations->>'dropped')::bigint
         + GREATEST(jsonb_array_length(observations->'items') + 1 - 32, 0),
+    'contradicted', (observations->>'contradicted')::boolean OR @contradicted::boolean,
     'items', (
         SELECT COALESCE(jsonb_agg(t.e ORDER BY t.ord), '[]'::jsonb)
         FROM jsonb_array_elements((observations->'items') || jsonb_build_array(@observation::jsonb))
@@ -71,5 +73,5 @@ UPDATE semantic_planning SET observations = jsonb_build_object(
         WHERE t.ord > jsonb_array_length(observations->'items') + 1 - 32
     )
 )
-WHERE run_id = @run_id
+WHERE run_id = @run_id AND jsonb_typeof(@observation::jsonb) = 'object'
 RETURNING observations;
