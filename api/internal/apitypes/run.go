@@ -205,11 +205,14 @@ type MemoryHoldDTO struct {
 
 // RunDTO is the web view of a run; worker-internal session_id and last_seq are omitted.
 type RunDTO struct {
-	ResetStateDigest                               string             `json:"reset_state_digest,omitempty"`
-	MilestoneReconciliations                       []json.RawMessage  `json:"milestone_reconciliations,omitempty"`
-	MilestoneReconciliationsNextBeforeGateRevision *int64             `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
-	WorkerRecovery                                 *WorkerRecoveryDTO `json:"worker_recovery,omitempty"`
-	MemoryHold                                     *MemoryHoldDTO     `json:"memory_hold,omitempty"`
+	CompletionPending                              *CompletionPendingDTO `json:"completion_pending,omitempty"`
+	SemanticGate                                   *SemanticGateDTO      `json:"semantic_gate,omitempty"`
+	SemanticDrift                                  *SemanticDriftDTO     `json:"semantic_drift,omitempty"`
+	ResetStateDigest                               string                `json:"reset_state_digest,omitempty"`
+	MilestoneReconciliations                       []json.RawMessage     `json:"milestone_reconciliations,omitempty"`
+	MilestoneReconciliationsNextBeforeGateRevision *int64                `json:"milestone_reconciliations_next_before_gate_revision,omitempty"`
+	WorkerRecovery                                 *WorkerRecoveryDTO    `json:"worker_recovery,omitempty"`
+	MemoryHold                                     *MemoryHoldDTO        `json:"memory_hold,omitempty"`
 
 	ID string `json:"id"`
 	// RepoID is null for a chat run (PRD #39): a chat has no repo. Non-null for
@@ -419,8 +422,11 @@ type RunDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
-	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
-	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
+	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
+	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
@@ -1264,8 +1270,11 @@ type RunSummaryItemDTO struct {
 	CompletionUnmet []string `json:"completion_unmet"`
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
-	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14), and
-	// null otherwise (not held, or an owner pause). Read-only surfacing of the column.
+	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
+	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
+	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
 	// "unavailable(same_worker_only)" when the run is in a completion hold (HoldReason ==
@@ -2254,6 +2263,7 @@ type RunInputRequest struct {
 	// untyped "run has already finished" 409. A revise_plan at the revision cap whose revision
 	// still matches keeps the cap's own answer. Omitted when absent, so a newer client stays
 	// compatible with an older strict-decoding api.
+	SemanticApproval         *SemanticGateApproval    `json:"semantic_approval,omitempty"`
 	ExpectedGateRevision     *int64                   `json:"expected_gate_revision,omitempty"`
 	Reconciliation           *MilestoneReconciliation `json:"reconciliation,omitempty"`
 	ExpectedResetStateDigest string                   `json:"expected_reset_state_digest,omitempty"`

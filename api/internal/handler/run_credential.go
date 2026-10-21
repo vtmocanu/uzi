@@ -92,6 +92,9 @@ func (h *Handler) writeSetRunCredentialError(w http.ResponseWriter, err error) {
 		httpx.Error(w, http.StatusConflict, "the claim is being assembled; retry in a moment")
 	case errors.Is(err, workersvc.ErrCredentialSwitchRunTerminal):
 		httpx.Error(w, http.StatusConflict, "run has already finished")
+	case errors.Is(err, workersvc.ErrRunHoldSettling):
+		// Issue #3181: the run's credential-switch hold is still being settled by its worker.
+		httpx.Error(w, http.StatusConflict, workersvc.ErrRunHoldSettling.Error())
 	case errors.Is(err, workersvc.ErrBaseAttestationHeld):
 		httpx.Error(w, http.StatusConflict, err.Error())
 	case errors.Is(err, workersvc.ErrCredentialSwitchRaced):

@@ -9,9 +9,11 @@ import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { PauseNowSignal } from "../src/steering.js";
+import { RunRunner, StaleClaimError } from "../src/runner.js";
 import { MessageBatcher } from "../src/batcher.js";
 import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
+import { commitInTree } from "./codex-reap-fixture.js";
 import { api, client, git, homeDir, fakeGitlab, gitlabClaim, input, installHarness,
   runnerWith, worktreeDirFor } from "./runner-harness.js";
 
@@ -1715,4 +1717,214 @@ test("terminal observation stays on the exact tail through owned memory and queu
   assert.equal(registered, 1);
   assert.equal(registrationState, "pending at registration", "recovery registration precedes promise resolution");
   assert.equal(runner.isExecuting(claim.run_id), false);
+});
+
+// Issue #3240: a pause that cannot publish (nothing durable yet) reports pause_failed and the run
+// KEEPS RUNNING (Decision 8). pause_failed is a diagnostic, not a lifecycle change: the context the
+// Codex broker captured before the pause must stay exactly as it was, immediately after the failed
+// pause and after the next Running ACK, with monitoring, latches and accounting untouched.
+type MemorySnapshot = { current: boolean; admits: boolean; held: boolean; remaining: number | undefined };
+function snapshot(c: NonNullable<ReturnType<NonNullable<RunContext["capturedMemory"]>>>): MemorySnapshot {
+  return {
+    current: c.commands.isCurrent(c.context, c.flight, c.lifecycleRevision),
+    admits: c.commands.admitsCommands(c.context),
+    held: c.commands.pressureHeld(c.context),
+    remaining: c.commands.remaining(c.context),
+  };
+}
+async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunContext) => Promise<void>) {
+  const monitoring = f.memory.run();
+  let executorError: unknown, proof = false;
+  const executor: Executor = { run: async ctx => {
+    try { await body(ctx); proof = true; } catch (error) { executorError = error; throw error; }
+    throw new Error("fixture proof complete");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+  } catch (error) {
+    // A body assertion failure wins over the runner's own rejection (e.g. a tolerated StaleClaimError).
+    throw executorError ?? error;
+  } finally { api.stateAckWire = undefined; await f.memory.stop(); await monitoring; }
+  if (executorError) throw executorError;
+  assert.equal(proof, true);
+}
+const failedPause = (ctx: RunContext) => ctx.parkForPause!({ completedCount: 0, total: 1 });
+
+for (const variant of ["admitting", "pressure-latched", "intervention-spent"] as const) {
+  test(`a failed pause leaves the captured memory context unchanged (${variant})`, async () => {
+    const f = await setup();
+    let before: NonNullable<ReturnType<NonNullable<RunContext["capturedMemory"]>>> | undefined;
+    await memoryRun(f, async ctx => {
+      await ctx.reportIteration!(1);
+      if (variant !== "admitting") {
+        // One intervention: the latch holds (pressure-latched). For intervention-spent, sustained low
+        // pressure then rearms it with one of two left. (An exhausted allowance is an owner hold that
+        // stops the flight before any pause, so it has no pause_failed to survive.)
+        const first = enroll(ctx);
+        f.pressure(950);
+        const result = await first.captured.commands.watchOutcome(first.entry);
+        ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+        assert.equal(first.captured.commands.admitsCommands(first.captured.context), false, "the latch holds");
+        if (variant === "intervention-spent") {
+          f.pressure(100);
+          await until(() => first.captured.commands.admitsCommands(first.captured.context));
+          await until(() => f.memory.sinkReceipts.length === 0);
+          assert.equal(first.captured.commands.remaining(first.captured.context), 1, "one intervention spent");
+        }
+      }
+      before = ctx.capturedMemory!()!;
+      const was = snapshot(before);
+      const spent = f.reservations.length;
+      assert.equal(await failedPause(ctx), false, "an unpublishable pause does not park");
+      assert.ok(api.states.some(s => s.runId === f.claim.run_id && s.body.status === "pause_failed"));
+      assert.deepEqual(snapshot(before), was, "immediately after pause_failed, before any running report");
+      assert.equal(ctx.capturedMemory!()!.context, before.context, "the continuing run keeps its context");
+      await ctx.reportIteration!(2);
+      assert.deepEqual(snapshot(before), was, "after the next Running ACK");
+      assert.equal(ctx.capturedMemory!()!.context, before.context);
+      assert.equal(f.reservations.length, spent, "accounting unchanged");
+      if (variant === "admitting") {
+        // Monitoring is still live on the same context: a new pressure episode latches it.
+        const next = enroll(ctx, "after-pause");
+        f.pressure(950);
+        const result = await next.captured.commands.watchOutcome(next.entry);
+        ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+        assert.equal(next.captured.context, before.context);
+        assert.equal(before.commands.admitsCommands(before.context), false, "the guard still latches after pause_failed");
+        assert.equal(f.reservations.length, spent + 1);
+      }
+    });
+    assert.ok(before);
+    assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
+      "the terminal exit still retires the context");
+  });
+}
+
+test("a pause that parks still retires the captured memory context", async () => {
+  const f = await setup();
+  const publish = client.publishCheckpoint.bind(client);
+  (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (_runId: string, _tip: string, pack: NodeJS.ReadableStream) => {
+    for await (const _chunk of pack) { /* drain */ }
+    return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-2396" } };
+  };
+  try {
+    await memoryRun(f, async ctx => {
+      await ctx.reportIteration!(1);
+      const before = ctx.capturedMemory!()!;
+      commitInTree(ctx.worktreePath, "WORK.txt", "work before the pause\n");
+      await ctx.checkpoint!({ reap: false });
+      assert.equal(await ctx.parkForPause!({ completedCount: 0, total: 1 }), true, "a publishable pause parks");
+      assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
+        "a real park retires the context");
+    });
+  } finally {
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = publish;
+  }
+});
+
+for (const ackKind of ["declined", "stale_claim"] as const) {
+  test(`a ${ackKind} pause_failed ACK does not keep the captured context's authority`, async () => {
+    const f = await setup();
+    let before: NonNullable<ReturnType<NonNullable<RunContext["capturedMemory"]>>> | undefined;
+    api.stateAckWire = (body, run) => {
+      if (body.status !== "pause_failed") return undefined;
+      return ackKind === "declined"
+        // A state ACK is applied only on a 200 (client reportStateOnce); a plain 409 is a declined report.
+        ? { status: 409, body: { run: { ...run, status: "running" } } }
+        : { status: 409, body: { run: { ...run, status: "running" }, disposition: "stale_claim" } };
+    };
+    await memoryRun(f, async ctx => {
+      await ctx.reportIteration!(1);
+      before = ctx.capturedMemory!()!;
+      assert.equal(before.commands.admitsCommands(before.context), true);
+      let pauseError: unknown;
+      const parked = await failedPause(ctx).catch((error: unknown) => { pauseError = error; return false; });
+      assert.equal(parked, false);
+      assert.equal(api.states.at(-1)?.body.status, "pause_failed");
+      // handlePausePark keeps a park best-effort: a refused report surfaces as a declined pause, not a throw.
+      assert.equal(pauseError, undefined);
+      // Inside the still-running flight, right after the ACK: no shell authority survives.
+      assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
+        `a ${ackKind} pause_failed ACK retires the context`);
+      assert.equal(before.commands.admitsCommands(before.context), false, "the captured context admits no command");
+    }).catch((error: unknown) => {
+      // Only the expected end of a superseded claim is tolerated; assertion failures propagate.
+      if (!(ackKind === "stale_claim" && error instanceof StaleClaimError)) throw error;
+    });
+    assert.ok(before);
+    assert.equal(before.commands.isCurrent(before.context, before.flight, before.lifecycleRevision), false,
+      "no ACK path leaves the flight's authority alive past its end");
+  });
+}
+
+// memoryRun must not let a runner rejection hide a body assertion failure: the stale_claim variant
+// above tolerates StaleClaimError, so a lost body failure would read as a pass there. Today
+// execute() handles a stale claim and resolves, so the probe injects the rejection after it.
+test("memoryRun keeps a body assertion failure when execute() rejects with StaleClaimError", async () => {
+  const f = await setup();
+  const bodyFailure = new assert.AssertionError({ message: "probe: body assertion failed" });
+  const execute = RunRunner.prototype.execute;
+  RunRunner.prototype.execute = async function (this: RunRunner, claim) {
+    await execute.call(this, claim);
+    throw new StaleClaimError();
+  };
+  try {
+    const outcome = await memoryRun(f, async ctx => {
+      await ctx.reportIteration!(1);
+      throw bodyFailure;
+    }).catch((error: unknown) => {
+      if (!(error instanceof StaleClaimError)) throw error;
+    }).then(() => "passed", (error: unknown) => error);
+    assert.equal(outcome, bodyFailure, "the body's assertion failure survives the stale-claim tolerance");
+  } finally { RunRunner.prototype.execute = execute; }
+});
+
+test("after a failed pause, an answered completion question still releases its hold on the Running ACK", async () => {
+  const f = await setup();
+  let questionWork: Promise<unknown> | undefined;
+  const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+  try {
+    await memoryRun(f, async ctx => {
+      try {
+        await ctx.reportIteration!(1);
+        const before = ctx.capturedMemory!()!;
+        assert.equal(await failedPause(ctx), false);
+        questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: "fixture" });
+        await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+        assert.equal(before.commands.phaseAdmits(before.context), false, "the question holds the phase");
+        const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+        api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers: ["continue"] }))]);
+        assert.deepEqual(await questionWork, { outcome: "continue", guidance: undefined });
+        await ctx.reportIteration!(2);
+        assert.equal(ctx.capturedMemory!()!.context, before.context);
+        assert.deepEqual(snapshot(before), { current: true, admits: true, held: false, remaining: 2 },
+          "the broker's capture admits shell commands again, as in 81c950c7's answered question");
+      } finally { await questionWork?.catch(() => {}); }
+    });
+  } finally { clearTimeout(rescue); }
+});
+
+test("a delayed declined pause_failed ACK cannot retire the context a newer Running report kept", async () => {
+  const f = await setup();
+  const hold = releaseGate();
+  api.afterPersistState(f.claim.run_id, body => body.status === "pause_failed", hold.promise);
+  // A plain 409 is a declined state report (client reportStateOnce: applied only on a 200).
+  api.stateAckWire = (body, run) =>
+    body.status === "pause_failed" ? { status: 409, body: { run: { ...run, status: "running" } } } : undefined;
+  await memoryRun(f, async ctx => {
+    await ctx.reportIteration!(1);
+    const before = ctx.capturedMemory!()!;
+    const was = snapshot(before);
+    const pausing = failedPause(ctx);
+    await until(() => api.states.some(s => s.runId === f.claim.run_id && s.body.status === "pause_failed"));
+    // A newer Running report lands while the pause_failed answer is still held.
+    await ctx.reportIteration!(2);
+    assert.deepEqual(snapshot(before), was, "the newer Running ACK keeps the context");
+    hold.resolve();
+    assert.equal(await pausing, false);
+    assert.deepEqual(snapshot(before), was, "the late declined ACK must not retire the current context");
+    assert.equal(ctx.capturedMemory!()!.context, before.context);
+    assert.equal(f.reservations.length, 0, "accounting unchanged");
+  });
 });

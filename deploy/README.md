@@ -742,10 +742,13 @@ full reasoning.
 - Soft anti-affinity — keeps the api pod (holding `UZI_SECRET_KEY`) and CNPG off
   docker-worker nodes, so wherever node root lands it reads no crown-jewel secret.
 
-**Shared run workdir.** Both postures mount a no-secrets `emptyDir` (`/data/runner`,
-the M-workdir Decision-3 amendment) into both the worker and the dind sidecar at
+**Shared run workdir.** Both postures mount the `runner-shared` subPath of the
+`data` PVC (`/data/runner`, the M-workdir Decision-3 amendment as amended by #3153,
+see [adr/3153-runner-shared-pvc-subpath.md](../adr/3153-runner-shared-pvc-subpath.md))
+into both the worker and the dind sidecar at
 the same path, so `docker run -v`/compose bind mounts under the run's checkout
 (uzi's own e2e included) resolve in the daemon instead of hitting an empty dir.
+Only that subPath is shared with dind, never the whole `data` volume.
 The path mirrors `agent/src/git.ts`'s `runnerRoot` — if that root ever moves,
 `controller/internal/kube/render_dind.go`'s `dindWorkdirDir` (mounted by `render.go`'s `podTemplate`) must move with it.
 
@@ -780,11 +783,14 @@ recorded in `specs/ai.md`; this stays a pointer, not a duplicate.
    (`run-e2e.sh`'s sanitized-env allowlist already passes `TMPDIR`/
    `E2E_RUN_DIR` through). The concrete M4/M5 gate: e2e green **and** no secret
    transits the now-dind-visible tmp.
-3. **Runner-clone durability.** M-workdir moves the runner clone from the
-   persistent `/data` PVC to an ephemeral `emptyDir`, so a run's working tree no
-   longer survives a pod restart. Expected, not a regression: committed work is
-   safe (the persistent bare repo at `/data/repos` re-clones on resume);
-   uncommitted-across-a-crash was never durable either way.
+3. **Runner-clone durability.** Since #3153 the runner clone lives on the
+   `runner-shared` subPath of the persistent `/data` PVC, so on a migrated worker
+   a run's working tree survives a pod restart (a data-PVC recycle or delete still
+   removes it). A pod still on the old layout (an `emptyDir`, e.g. one held by
+   recovery custody until it releases) still loses the working tree on restart.
+   Work fetched back to the bare repo at `/data/repos` or checkpointed is safe
+   either way (it re-clones on resume); see
+   [adr/3153-runner-shared-pvc-subpath.md](../adr/3153-runner-shared-pvc-subpath.md).
 4. **Rootless fsGroup workdir read (M4 runtime check).** The workdir is
    `fsGroup: 10001`; whether a future *rootless* cluster's uid-1000 dind sidecar
    can read worker-written bind sources via the fsGroup supplemental group is

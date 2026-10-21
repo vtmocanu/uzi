@@ -2999,6 +2999,19 @@ A run's raw `status` (in `run get --json`, `run list --json` and
   Settings, or `uzi run set-token` where the run accepts a token switch),
   `run list` shows `paused (credential disabled)`, and the TUI draws it as
   `⊘ cred disabled` in NEEDS YOU.
+  A `paused` run can also be held after an owner token switch on a run with
+  retained recovery work (`hold_reason: credential_switch_settling`, then
+  `credential_switch_unsettled`). `run get` prints a `HOLD` row reading
+  `credential switch settling` or `credential switch unsettled` with the next
+  step, `run list` shows `paused (credential switch settling)` or `paused
+  (credential switch unsettled)`, the TUI draws `⊘ settling` or `⊘ unsettled`
+  in NEEDS YOU, and `run wait` with its default targets stops on either (a
+  re-run `run wait` on a held run returns immediately). While settling, the
+  worker is finishing its own operations; `run resume` and `run set-token` are
+  refused with a 409 only while the holding worker is live and the same
+  registration (the refusal lifts on the worker's acknowledgement, a stale
+  heartbeat, worker removal or re-registration), and `run cancel` always works; see
+  [Credential-switch holds](run-recovery.md#credential-switch-holds).
   A `paused` run created with `--require-base` can also be **held because
   its kept work is not attested** (`hold_reason: base_attestation_missing`):
   it continued its own work, but no checkpoint proves that work was produced

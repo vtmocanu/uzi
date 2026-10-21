@@ -869,6 +869,12 @@ export class Worker {
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
           "cross_check_codex_lead_v1",
+          // PRD #1230 M4 (dormant): this image runs the semantic plan checker child and
+          // publishes maintainer-pending (completion_pending) delivery non-closing. Advertised
+          // UNCONDITIONALLY: the api makes each a hard claim clause of its semantic runs only,
+          // so structural/legacy claims are unaffected.
+          "cross_check_semantic_plan_v1",
+          "completion_semantic_publication_v1",
           // Default-branch CI repair (issue #2865): this image enforces claim.config.ci_config_guard
           // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
           // the api offers a guarded repair run only to a worker advertising it.
@@ -1066,6 +1072,13 @@ export class Worker {
         void this.sweepPendingFinalizes(signal).catch((err) => {
           this.log.warn("outbox finalize sweep failed", { error: errMessage(err) });
         });
+        // issue #3181: re-deliver a credential-switch hold-settled acknowledgement that failed at the
+        // end of its flight. Fire-and-forget and single-flight inside the runner.
+        if (typeof this.runner.retryPendingHoldSettled === "function") {
+          void this.runner.retryPendingHoldSettled().catch((err) => {
+            this.log.warn("credential switch hold acknowledgement retry failed", { error: errMessage(err) });
+          });
+        }
         // Issue #1995: re-drive a journaled recovery bundle whose upload failed while this worker
         // stayed alive (it was retried only at the next boot before). Fire-and-forget like the
         // drain above: a pass uploads bundles and must never delay the next heartbeat. The

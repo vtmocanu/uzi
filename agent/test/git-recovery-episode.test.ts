@@ -9,6 +9,7 @@ import { deflateSync } from "node:zlib";
 import { loadConfig } from "../src/config.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { GitCache, RetainedRecoveryBlockedError, type PositiveOwedCandidateContext, type RunnerClone } from "../src/git.js";
+import { formatResidueName } from "../src/attempt-path.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
 import { BaseAttestationMissingError, evaluateRequiredBase } from "../src/runner.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -1696,6 +1697,66 @@ test("successor config trusted worker global filter really executes with exact b
     assert.equal(git(successor.path, ["write-tree"]), git(bare, ["rev-parse", tip + "^{tree}"]));
     assert.equal(git(successor.path, ["rev-parse", "HEAD"]), tip);
   });
+});
+
+// Issue #3153 PIN tests: `<dataDir>/runner` persists across a pod replacement on the Docker lane,
+// so a journaled clone that survived must be discovered by a fresh worker process. These pass on
+// the pre-fix agent code too (the pre-fix loss came from the emptyDir mount, not agent code); they
+// pin that nothing in the agent gates discovery of surviving bytes.
+test("pin: a journaled clone that survives a simulated restart under runnerRoot is discovered without source_missing (#3153)", async () => {
+  const restarted = recreate(); // fresh GitCache over the same dataDir, as after a pod replacement
+  const found = await restarted.discoverRetainedRecovery(fx.originPath, branch, key, runId);
+  assert.equal(found?.journal.clonePath, source.clonePath);
+  assert.ok(fs.statSync(path.join(source.clonePath, ".git")).isDirectory());
+  // checkedRecovery (reached through a reservation) also passes: no RetainedRecoveryBlockedError.
+  const reservation = await restarted.reserveRecoveryIteration(bare, branch, key, source);
+  assert.equal(reservation.attempts, 1);
+  assert.notEqual(journal().recovery?.stage, "blocked");
+  // a persistent TMPDIR carve-out beside the clones is not a recovery source and changes nothing
+  fs.mkdirSync(path.join(fx.dataDir, "runner", ".tmp", "uzi-worker"), { recursive: true });
+  assert.equal((await recreate().discoverRetainedRecovery(fx.originPath, branch, key, runId))?.journal.clonePath, source.clonePath);
+});
+
+test("pin: retained predecessor residue survives a simulated restart and is still inventoried (#3153)", async () => {
+  const { tip, successor } = await ready();
+  const restarted = recreate();
+  const inventory = await restarted.readInventoryCloneHeads(bare, runId);
+  assert.equal(inventory.kind, "verified");
+  if (inventory.kind === "verified") {
+    assert.ok(inventory.clones.some(clone => clone.clonePath === source.clonePath), "predecessor discovered");
+  }
+  assert.ok(fs.existsSync(source.clonePath), "predecessor clone untouched by the restart");
+  assert.ok(fs.existsSync(successor.path));
+  assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+});
+
+// Issue #3153 (section 3a): the attempt ledger (the `uzi-attempts.<branch>.entry` values in the bare
+// repository) and a quarantined residue directory both live on the persistent runner volume, so a
+// fresh worker process must find them exactly as the predecessor left them. A restart reads and
+// reports them; it never rewrites a ledger entry or removes residue.
+test("pin: the attempt ledger and quarantined residue survive a simulated restart unchanged (#3153)", async () => {
+  const { successor } = await ready();
+  const ledgerKey = `uzi-attempts.${branch}.entry`;
+  const ledgerBefore = git(bare, ["config", "--get-all", ledgerKey]);
+  const entries = ledgerBefore.split("\n").map((line) => JSON.parse(line) as { attemptId: string; state: string; clonePath: string });
+  const live = entries.filter((e) => e.attemptId === aid(2));
+  assert.equal(live.at(-1)?.state, "live", "the successor attempt is journaled live before the restart");
+  assert.equal(live.at(-1)?.clonePath, successor.path);
+
+  const repoDir = path.dirname(source.clonePath);
+  const residue = path.join(repoDir, formatResidueName(key, "11111111-1111-4111-8111-111111111111"));
+  fs.mkdirSync(path.join(residue, "nested"), { recursive: true });
+  fs.writeFileSync(path.join(residue, "nested", "PRECIOUS"), "quarantined bytes\n");
+
+  for (let restart = 1; restart <= 2; restart++) {
+    const restarted = recreate();
+    const inventory = await restarted.readInventoryCloneHeads(bare, runId);
+    assert.equal(inventory.kind, "verified", `restart ${restart}`);
+    assert.equal(git(bare, ["config", "--get-all", ledgerKey]), ledgerBefore, `ledger untouched by restart ${restart}`);
+    assert.equal(fs.readFileSync(path.join(residue, "nested", "PRECIOUS"), "utf8"), "quarantined bytes\n", `residue survives restart ${restart}`);
+    assert.ok(fs.existsSync(source.clonePath), "predecessor clone untouched");
+    assert.ok(fs.existsSync(successor.path), "successor clone untouched");
+  }
 });
 
 // ── issue #3194: the episode journal binds a restore tip to the content it stands for ─────────

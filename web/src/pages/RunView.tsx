@@ -34,6 +34,7 @@ import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
+import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import {
   effectiveRunStatus,
   parkLabel,
@@ -71,6 +72,7 @@ import {
   SwitchTokenAction,
 } from "../components/RunCredentialOverride";
 import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components/CredentialDisabledPanel";
+import { CredentialSwitchHoldPanel } from "../components/CredentialSwitchHoldPanel";
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel, RunUsageTailBlock } from "../components/RunUsage";
@@ -90,6 +92,8 @@ import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
 import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { FullPlanPanel } from "./runView/FullPlanPanel";
+import { CompletionPending } from "./runView/CompletionPending";
+import { SemanticDrift } from "./runView/SemanticDrift";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 import { DeliveredCard, hasDeliveredSection } from "./runView/DeliveredCard";
@@ -393,8 +397,9 @@ export function CompletionStatePanel({ run }: { run: Run }) {
   if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  // Issue #3194: a base_attestation_missing hold has its own panel too.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" && run.hold_reason !== "base_attestation_missing";
+  // Issue #3181/#3194: token-switch and base-attestation holds have their own panels.
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable" &&
+    run.hold_reason !== "base_attestation_missing" && credentialSwitchHold(run) === null;
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -850,6 +855,8 @@ export function PausedPanel({
     run.hold_reason === "completion_blocked" ||
     run.hold_reason === "credential_disabled" ||
     run.hold_reason === "provider_unavailable" ||
+    // Issue #3181: the token-switch holds have their own panel and Resume gating.
+    credentialSwitchHold(run) !== null ||
     run.hold_reason === "base_attestation_missing"
   )
     return null;
@@ -1738,7 +1745,9 @@ export function RunView() {
   // retain their optimistic canSteer semantics.
   const providerHeld = run?.status === "paused" && run.hold_reason === "provider_unavailable";
   const memoryHeld = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_memory_pressure";
-  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld;
+  // Issue #3181: the token-switch holds are owner decisions too (Resume / Cancel).
+  const switchHeld = run != null && credentialSwitchHold(run) !== null;
+  const ownerDecisionHold = workerExhausted || memoryHeld || providerHeld || switchHeld;
   const canSteer = optimisticCanSteer && (!ownerDecisionHold || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
@@ -1809,6 +1818,15 @@ export function RunView() {
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
+  // Issue #3181: the server's refusal of a Resume on a settling token-switch hold, bound to the
+  // run that earned it. The panel shows it only while that run is still settling.
+  const [switchRefusal, setSwitchRefusal] = useState<{ runId: string; message: string } | null>(null);
+  useEffect(() => { setSwitchRefusal(null); }, [id]);
+  // Any move of the hold (to unsettled, a resume, a cancel, or a later fresh settling hold)
+  // retires the stored refusal: it answered one Resume on one settling hold, and must not
+  // reappear beside a later one. A refetch that leaves the run settling keeps it.
+  const switchHoldKey = run ? `${run.status}|${run.hold_reason ?? ""}` : "";
+  useEffect(() => { setSwitchRefusal(null); }, [switchHoldKey]);
   const [busy, setBusy] = useState(false);
   const currentAction = useRef<{ runId: string } | null>(null);
   useEffect(() => {
@@ -2140,6 +2158,10 @@ export function RunView() {
               ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
+            : run?.status === "paused" && run.hold_reason === "credential_switch_settling"
+              ? "credential_switch_settling"
+            : run?.status === "paused" && run.hold_reason === "credential_switch_unsettled"
+              ? "credential_switch_unsettled"
             : run?.status === "paused" && run.hold_reason === "base_attestation_missing"
               ? "base_attestation_missing"
             : run?.status === "paused"
@@ -2176,6 +2198,10 @@ export function RunView() {
               ? "The run is held because its retained work is not attested to the planned base commit. The agent was not started. Recover the work or start a successor run."
             : parkKey === "provider_unavailable"
               ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
+            : parkKey === "credential_switch_settling"
+              ? "After a token switch, the worker is finishing its own operations for this run. Resume may be refused until the worker finishes its own operations; then try again, or Cancel the run."
+            : parkKey === "credential_switch_unsettled"
+              ? "Held after a token switch. Processes could not be proven stopped; work is kept on its worker. Resume to continue on the new token, or Cancel."
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",
@@ -2366,6 +2392,9 @@ export function RunView() {
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
                 run.hold_reason !== "provider_unavailable" &&
+                // Issue #3181: the token-switch holds offer Resume in their own panel, which
+                // shows the server's settling refusal inline.
+                credentialSwitchHold(run) === null &&
                 // Issue #3194: Resume is refused by the server for a base-attestation hold.
                 run.hold_reason !== "base_attestation_missing" &&
                 (canSteer ? (
@@ -2565,6 +2594,8 @@ export function RunView() {
       />
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      <CompletionPending run={run} />
+      <SemanticDrift run={run} />
       {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
           The panel that would word it has unmounted, so the page says it instead. */}
       {revisionMismatch && run.status !== "awaiting_approval" && (
@@ -2582,9 +2613,11 @@ export function RunView() {
           busy={busy}
           canSteer={canSteer}
           revisionMismatch={revisionMismatch}
-          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+          onApprove={(selection, overrideCapabilities, expectedGateRevision, semanticApproval) =>
             void gateAct(expectedGateRevision, () =>
-              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+              semanticApproval !== undefined
+                ? submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision, undefined, semanticApproval)
+                : submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
             )
           }
           onResetApprove={(selection, overrideCapabilities, expectedGateRevision, reset) =>
@@ -2705,6 +2738,30 @@ export function RunView() {
           }
           if (isCurrent()) await refreshRun();
         })}
+      />
+      <CredentialSwitchHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        refusal={switchRefusal?.runId === run.id ? switchRefusal.message : ""}
+        onResume={() => act(async (isCurrent) => {
+          const requestRunId = run.id;
+          const wasSettling = credentialSwitchHold(run) === "settling";
+          setSwitchRefusal(null);
+          try {
+            await api.resumeRun(requestRunId);
+          } catch (e) {
+            // Issue #3181: the server refuses Resume on a settling hold (409) while the worker
+            // is live and finishing. Word it in the panel beside Resume, not the page banner,
+            // and refetch: the hold may have moved on to unsettled meanwhile. Only a Resume
+            // clicked on a settling hold is that refusal; any other 409 (an unsettled hold that
+            // is no longer paused, say) is ordinary feedback for the page banner.
+            if (!(wasSettling && e instanceof ApiError && e.status === 409)) throw e;
+            if (!isCurrent()) return;
+            setSwitchRefusal({ runId: requestRunId, message: errorMessage(e, "Resume refused") });
+            await refreshRun();
+            return;
+          }
+          if (isCurrent()) await refreshRun();
+        })}
+        onCancel={() => cancelRun()}
       />
       <BaseAttestationHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy} onCancel={() => cancelRun()} />
       <PausedPanel

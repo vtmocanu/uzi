@@ -110,6 +110,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO, origin ...string) err
 	if len(r.AutoApproveBlockedReasons) > 0 {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
 	}
+	rows = append(rows, semanticGateRows(r)...)
+	rows = append(rows, completionPendingRows(r)...)
+	rows = append(rows, semanticDriftRows(r)...)
 	rows = append(rows, planCrossCheckRows(r)...)
 	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
@@ -517,6 +520,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialDisabledAction(r))
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
+	case holdCredentialSwitchSettling, holdCredentialSwitchUnsettled:
+		clauses = append(clauses, credentialSwitchAction(r))
 	case holdBaseAttestation:
 		clauses = append(clauses, baseAttestationAction(r))
 	}
@@ -535,6 +540,10 @@ func holdReasonLabel(reason string) string {
 		return "credential disabled"
 	case holdProviderUnavailable:
 		return "provider unavailable"
+	case holdCredentialSwitchSettling:
+		return "credential switch settling"
+	case holdCredentialSwitchUnsettled:
+		return "credential switch unsettled"
 	case holdBaseAttestation:
 		return "base not attested"
 	default:
@@ -608,6 +617,10 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
+	case holdCredentialSwitchSettling:
+		return "held, credential switch settling; " + credentialSwitchAction(r)
+	case holdCredentialSwitchUnsettled:
+		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	case holdBaseAttestation:
 		return "held, its kept work is not attested against the planned base (--require-base); " + baseAttestationAction(r)
 	default:
@@ -2314,6 +2327,12 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
 		s += " (credential disabled)"
+	}
+	switch {
+	case isCredentialSwitchSettlingHold(r.RunDTO):
+		s += " (credential switch settling)"
+	case isCredentialSwitchUnsettledHold(r.RunDTO):
+		s += " (credential switch unsettled)"
 	}
 	return s
 }

@@ -3,6 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-10-12
 **Issue**: [vtmocanu/uzi#1786](https://github.com/vtmocanu/uzi/issues/1786)
+**Amended by**: [ADR-3153](3153-runner-shared-pvc-subpath.md) (Docker-lane `/data/runner` is a data-PVC subPath; pod replacement no longer loses a kept clone on migrated workers)
 **Related**: ADR-1197 (`adr/1197-transient-recovery-park.md`), ADR-1783 (`adr/1783-run-quiescence-and-attempt-clone-paths.md`); spec `prds/1786-preserve-worker-only-work.md`
 
 ## Context
@@ -409,7 +410,7 @@ Every case keeps the source. What a later run sees depends on where the failure 
 - **Durable-before-park retry loop and archive attempts.** Out of scope (#1790); ADR-1197 park
   semantics are kept.
 - **An admin API discard delivered by heartbeat, or stopping or replacing the pod to get an
-  idle point.** Larger contract surface, and replacing the pod destroys the `emptyDir` source.
+  idle point.** Larger contract surface, and replacing the pod destroyed the `emptyDir` source (before ADR-3153; on a migrated worker the source survives pod replacement).
 
 ## Consequences
 
@@ -423,8 +424,8 @@ Every case keeps the source. What a later run sees depends on where the failure 
 - Retention raises ephemeral-storage pressure; existing disk admission still sees the real
   bytes, and there is no TTL or automatic reclaim.
 - Local retention is not a checkpoint, archive or server hold. Same-pod process restart keeps
-  the clone; pod replacement loses an `emptyDir` clone while the ledger or marker survives
-  (reported missing, never empty); PVC teardown loses both.
+  the clone; pod replacement lost an `emptyDir` clone while the ledger or marker survived
+  (reported missing, never empty; this is the pre-ADR-3153 layout, and on a migrated worker the clone survives pod replacement); PVC teardown loses both.
 - A key whose canonical clone was kept stays in attempt mode on that worker permanently, so
   later claims of the issue start a fresh model session; the work carries over through the
   tracking ref and checkpoints. A dirty kept clone keeps the run's hold, so its route is

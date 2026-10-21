@@ -144,6 +144,7 @@ export function assertClosedReaperRequest(request: BoundaryProcessRequest, signa
 import { MaintenanceBudget } from "./maintenance-budget.js";
 import { MaintenanceResources } from "./recovery-maintenance.js";
 import type { Readable } from "node:stream";
+import type { LeftReason } from "./run-procs.js";
 
 /** Reserve raw bytes before removing them from a scoped readable. No short-read refunds.
  * Each callback retains the admitting scope even for injected emitters outside ALS.
@@ -2308,6 +2309,10 @@ export interface QuiesceRunRequest {
 export interface QuiesceRunOutcome {
   process: ProcessQuiescence | undefined;
   docker: DockerTeardown;
+  /** issue #3181: the distinct left-reason classes of every survivor the HOME-attributed reap named
+   *  (all of them, not the few the human-readable detail lists). Set by the runner's fold of that
+   *  reap only. */
+  leftClasses?: readonly LeftReason[];
 }
 
 /** Injectable seams for {@link quiesceRunAttempt}. */

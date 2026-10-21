@@ -2,7 +2,8 @@
 import type { ActivityOp, CheckActivityRecorder } from "../cross-check-activity.js";
 import path from "node:path";
 import { SCRATCH_PLACEMENT_FACT } from "../scratch-guidance.js";
-import { decodeCodeFindings } from "../code-cross-check-contract.js";
+import { SEMANTIC_ENVELOPE_MAX_BYTES } from "../semantic-plan.js";
+import { decodeCodeFindings, decodeCrossCheckClaim } from "../code-cross-check-contract.js";
 import { buildRepoInstructionsContext } from "../prompt.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { WorkerClient } from "../client.js";
@@ -177,6 +178,8 @@ export function crossCheckPrompt(claim: ClaimResponse): string {
   if (typeof text !== "string" || Buffer.byteLength(text) > cap) throw new Error("cross-check issue input exceeds UTF-8 cap");
  }
  const c = claim.cross_check;
+ if (c && ("semantic_identity" in c || c.candidate_identity_version !== undefined || c.semantic_candidate !== undefined))
+  decodeCrossCheckClaim(c);
  if (c?.stage === "code") {
   if (c.round !== 1 || !/^[a-f0-9]{40}$/.test(c.head_commit) || !/^[a-f0-9]{40}$/.test(c.base_commit)
    || typeof c.code_diff !== "string" || Buffer.byteLength(c.code_diff) > 1024 * 1024
@@ -197,7 +200,8 @@ export function crossCheckPrompt(claim: ClaimResponse): string {
   throw new Error("cross-check candidate input exceeds cap");
  }
  const candidate = JSON.stringify({ ...c, planning_diff: undefined });
- if (Buffer.byteLength(candidate) > 2 * 1024 * 1024) throw new Error("cross-check candidate input exceeds cap");
+ const candidateCap = c.candidate_identity_version === "semantic_v1" ? SEMANTIC_ENVELOPE_MAX_BYTES : 2 * 1024 * 1024;
+ if (Buffer.byteLength(candidate) > candidateCap) throw new Error("cross-check candidate input exceeds cap");
  return [fence("issue_title", claim.issue_title), fence("issue_body", claim.issue_description),
   fence("candidate", candidate),
   fence("planning_diff", c.planning_diff)].join("\n\n");

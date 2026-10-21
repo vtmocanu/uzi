@@ -152,7 +152,7 @@ What the gauges mean:
   the worker on its own heartbeat. On eligible persistent hosted workers,
   fresh sustained byte or inode pressure also drives gated DinD maintenance;
   this is separate from the legacy `/nix`+`/data` recycle. **DinD state,
-  including named volumes, and the shared run-workdir can be lost.** See
+  including named volumes, can be lost; the shared run directory `/data/runner` is on the data PVC and is kept on pod replacement.** See
   [Docker inside a worker](./worker-docker.md#dind-data-metering-and-automatic-pruning).
 - A dropped or malformed sample self-clears the gauge for that one tick (by
   design: stale-but-plausible is worse than briefly blank) rather than holding a

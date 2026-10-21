@@ -22651,6 +22651,41 @@ it("A normal run binding refuses foreign capture and restores omitted fallback a
   }
 });
 
+it("M2 Codex executor forwards semantic proposals through initial and revised gates, clearing omission", async () => {
+  const { enrollment, proposal } = await import("./semantic-coverage-fixture.js");
+  for (const semanticPlanning of [enrollment, undefined]) {
+    const submissions = [proposal(), { criteria: [] }, undefined];
+    const responder: Responder = c => {
+      if (c.method === "thread/start") return { thread: { id: "m2-plan" } };
+      if (c.method === "turn/start") {
+        const n = c.turnStartCount - 1;
+        assert.ok(n < 3, "bounded planning turns");
+        const tn = "turn-" + n;
+        if (n === 0) c.transport.push(threadStarted("m2-plan"));
+        const semantic_proposal = submissions[n];
+        c.transport.push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "candidate " + n,
+          ...(semantic_proposal === undefined ? {} : { semantic_proposal }) }, "m2-plan", tn, "call-" + n))
+          .push(turnCompleted("completed", "m2-plan", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([responder, epochResponder("m2-impl", "impl", (t, th, tn) =>
+      t.push(toolCall(99, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn)))]);
+    const captured: unknown[] = [];
+    const { ctx } = makeCtx({ semanticPlanning, planApproved: false, approvedPlan: undefined,
+      gatePlan: async (_plan, _milestones, _hook, settles, semantic) => {
+        assert.equal(settles, undefined);
+        captured.push(semantic);
+        return captured.length < 3 ? { kind: "revise", automatic: true, round: captured.length, feedback: "revise" }
+          : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 8000, "M2 semantic proposals");
+    assert.deepEqual(captured, semanticPlanning ? [proposal(), { invalid: true }, undefined] : [undefined, undefined, undefined]);
+  }
+});
+
 describe("M3 Codex interrupted recovery delivery", () => {
   const turnTexts = (transport: FakeTransport): string[] => transport.requests
     .filter(r => r.method === "turn/start")

@@ -11,6 +11,7 @@
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 // Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
 import type { SanitizedPrDescriptionFields } from "./client.js";
+import type { SemanticGateAck } from "./semantic-gate-wire.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -60,6 +61,15 @@ export type RunState =
    *  release. Reported by enterCredentialSwitch's give-up path (runner.ts); the server clears the
    *  pending switch stamp on it. */
   | "credential_switch_failed"
+  /** issue #3181: a retained successor could not prove its run processes stopped before a
+   *  credential switch. Reported with `claim_generation` and the current `register_nonce` (the
+   *  client stamps it); the server pauses the run (hold_reason credential_switch_settling) and
+   *  keeps it from resuming until the worker acknowledges below. Requires the
+   *  `credential_switch_hold` feature. */
+  | "credential_switch_held"
+  /** issue #3181: the worker's acknowledgement that the held flight's owned operations have
+   *  joined (hold_reason credential_switch_unsettled). Same fences as the hold report. */
+  | "credential_switch_hold_settled"
   | "completed"
   | "failed";
 
@@ -1005,6 +1015,9 @@ export interface ClaimConfig {
     deferred?: { milestone_id: string; title: string; reason: string }[];
     accepted?: { id: string; milestone_id: string; text: string; reason: string }[];
   };
+  /** PRD #1230 M4 (dormant): the frozen, human-authorized maintainer-pending projection, decoded
+   *  strictly by the claim parser (a malformed value fails the claim). Never completion evidence. */
+  completion_pending?: import("./completion-pending.js").CompletionPending;
 }
 
 /**
@@ -1266,6 +1279,8 @@ export interface ClaimJob {
  */
 /** Server-stored, bounded plan candidate for one live read-only child claim. */
 export interface ClaimPlanCrossCheck {
+  candidate_identity_version?: "semantic_v1";
+  semantic_candidate?: ReturnType<typeof import("./semantic-plan.js").parseSemanticCandidate>;
   /** Independent provenance from the captured server snapshot; absent on legacy claims. */
   model_source?: "pin" | "worker default";
   effort_source?: "pin" | "worker default";
@@ -1364,6 +1379,8 @@ export interface ClaimMemoryState {
 }
 
 export interface ClaimResponse extends ClaimMemoryState {
+  /** Server row only; no production enrollment writer in M2. */
+  semantic_planning?: import("./semantic-plan.js").SemanticPlanning;
   /** Guarded prompt repair inputs; metadata is untrusted. */
   ci_repair?: ClaimCIRepair;
   /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
@@ -2018,6 +2035,8 @@ export interface CompletionPermitResponse {
     issued_at: string;
     finding_ids: string[];
     completion_scope?: ClaimConfig["completion_scope"];
+    /** Raw wire value; WorkerClient decodes it strictly before the runner sees it. */
+    completion_pending?: unknown;
   };
 }
 
@@ -2509,6 +2528,10 @@ export interface StateRequest {
   completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
   candidate_digest?: string;
+  /** PRD #1230 M4 (dormant): the autopilot coverage-park reason on a semantic awaiting_approval
+   *  report. The api requires exactly its own projection's reason on an auto_approve report and
+   *  refuses it on a manual one; omitted when the checker verdict is the only reason. */
+  semantic_park?: import("./semantic-park.js").SemanticPark;
   status: RunState;
   /** PRD #1392 M2 (#1247 generation fence): the exact claim generation THIS report is made
    *  against, so the api's park transaction settles only the hold that generation opened. Sent on
@@ -2865,6 +2888,13 @@ export interface StateAck {
   workerIdentityMatches?: boolean;
   /** The actual request generation, after feature and strict-decode fallback selection. */
   sentClaimGeneration?: number;
+  /** Exact server presentation; malformed presence never becomes legacy absence. */
+  semanticGate?: SemanticGateAck;
+  semanticGateMalformed?: true;
+  /** PRD #1230 M4: the run's frozen maintainer-pending projection; absent is legacy. Presence that
+   *  fails the strict bounded decode sets completionPendingMalformed and never degrades to absence. */
+  completionPending?: import("./completion-pending.js").CompletionPending;
+  completionPendingMalformed?: true;
   revisionInputId?: number;
   supersededRevisionInputIds?: number[];
   staleRevisionSource?: boolean;
@@ -2974,6 +3004,10 @@ export interface StateAck {
    *  so enterCredentialSwitch treats the release as done off this flag, not off status === 'queued'
    *  (which missed the idempotent-after-reclaim success and gave up on a server-confirmed release). */
   credentialSwitchReleased?: boolean;
+  /** issue #3181: true when the 200 ack carried `disposition: "held"` (the hold report applied). */
+  credentialSwitchHeld?: boolean;
+  /** issue #3181: true when the 200 ack carried `disposition: "hold_settled"`. */
+  credentialSwitchHoldSettled?: boolean;
   /** PRD #1795 M1 (decision 5): the TOP-LEVEL `gate_revision` of an `awaiting_approval` ACK — the
    *  revision the report was answered with, allocated or returned inside the report's transaction.
    *  The gate confirms THIS revision for bound-verdict matching. A positive integer only; absent

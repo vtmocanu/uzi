@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -15,9 +16,20 @@ import tool_image
 
 HARNESS = Path(__file__).resolve().parent
 SCRATCH = HARNESS.parents[1] / ".uzi/scratch"
+# Hang guard for one fake-docker run.sh invocation, not a performance budget. It is the ONLY bound
+# on a stuck token script, check_test.py, inventory.mjs/pattern.mjs or check.py call: those carry no
+# deadline of their own and the timeout stub does not enforce seconds. Only the docker calls are
+# bounded by run.sh's own phase deadlines, which the tests assert.
+RUN_SH_LIMIT = 20
+# Test-only: when WUID_LANE_TIMING names a file, each run.sh wall time is recorded and the max and
+# p95 are written there at the end of the module. Off by default.
+LANE_TIMES = []
 EXPECTED = [{"file": "agent/test/example.test.ts", "names": ["suite", "leaf"]}]
 COMMAND_EXPECTED = [{"file": "e2e/worker-uid/memory-command-real.test.mts", "names": ["command leaf"]}]
 SINGLE_EXPECTED = [{"file": "e2e/worker-uid/single-uid-preflight.test.mts", "names": ["single leaf"]}]
+SHARED_EXPECTED = [{"file": "e2e/worker-uid/runner-shared-real.test.mts", "names": ["shared leaf"]}]
+SHARED_PASS = ('<testsuites><testcase name="shared leaf" '
+               'file="/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts"/></testsuites>')
 SINGLE_PASS = ('<testsuites><testcase name="single leaf" '
                'file="/app/uzi-worker-uid-proof/e2e/worker-uid/single-uid-preflight.test.mts"/></testsuites>')
 COMMAND_PASS = ('<testsuites><testcase name="command leaf" '
@@ -175,23 +187,29 @@ class RunnerTest(unittest.TestCase):
         self.repo = Path(self.temp.name)
         harness = self.repo / "e2e/worker-uid"
         harness.mkdir(parents=True)
-        for name in ("run.sh", "bounded.py", "check.py", "check_test.py", "tool_image.py", "tool-image.Dockerfile"):
+        for name in ("run.sh", "bounded.py", "check.py", "tool_image.py", "tool-image.Dockerfile"):
             shutil.copyfile(HARNESS / name, harness / name)
+        # run.sh starts with the checker's own self-test (~0.8 s of real CPU); check_test.py and the
+        # gate recipe already run it, and no lane test depends on its result, so the fake tree
+        # carries an inert stand-in that exits 0.
+        (harness / "check_test.py").write_text("")
         self.bin = self.repo / "bin"
         self.bin.mkdir()
         (self.bin / "python3").symlink_to(sys.executable)
         self.calls = self.repo / "calls.jsonl"
         self.stub("node", """
+from pathlib import Path
 if args[0] == "e2e/worker-uid/inventory.mjs":
-    print(os.environ[{"command": "COMMAND_EXPECTED", "single": "SINGLE_EXPECTED"}.get(args[1] if args[1:] else "", "EXPECTED")])
+    print(os.environ[{"command": "COMMAND_EXPECTED", "single": "SINGLE_EXPECTED", "shared": "SHARED_EXPECTED"}.get(args[1] if args[1:] else "", "EXPECTED")])
 elif args[0] == "e2e/worker-uid/pattern.mjs":
-    key = {"command-expected.json": "COMMAND_EXPECTED", "single-expected.json": "SINGLE_EXPECTED"}.get(Path(args[1]).name, "EXPECTED")
+    key = {"command-expected.json": "COMMAND_EXPECTED", "single-expected.json": "SINGLE_EXPECTED", "shared-expected.json": "SHARED_EXPECTED"}.get(Path(args[1]).name, "EXPECTED")
     assert json.loads(Path(args[1]).read_text()) == json.loads(os.environ[key])
-    print({"COMMAND_EXPECTED": "^command leaf$", "SINGLE_EXPECTED": "^single leaf$"}.get(key, "^suite leaf$"))
+    print({"COMMAND_EXPECTED": "^command leaf$", "SINGLE_EXPECTED": "^single leaf$", "SHARED_EXPECTED": "^shared leaf$"}.get(key, "^suite leaf$"))
 else:
     raise AssertionError(args)
 """)
         self.stub("docker", """
+from pathlib import Path
 state_path = Path("resources.json")
 state = json.loads(state_path.read_text()) if state_path.exists() else {}
 if args[:2] == ["volume", "ls"]:
@@ -234,6 +252,13 @@ if args[0] == "run" or args[:2] == ["volume", "create"]:
     command = name.endswith("-command")
     prefix = "COMMAND_" if command else ""
     print("container stderr fixture", file=sys.stderr)
+    if name.endswith("-shared"):
+        if os.environ["SHARED_XML_MODE"] == "missing":
+            reports = list(Path(".uzi/scratch").glob("worker-uid.*/shared-results.xml"))
+            max(reports, key=lambda path: path.stat().st_mtime_ns).unlink()
+        else:
+            print(os.environ["SHARED_XML"], flush=True)
+        sys.exit(int(os.environ["SHARED_CONTAINER_RC"]))
     if "-single-" in name:
         number = name.rsplit("-", 1)[1]
         cfg = json.loads(os.environ["SINGLE"]).get(number, {})
@@ -293,6 +318,7 @@ if args[0] == "rm":
     sys.exit(int(os.environ["CLEANUP_RC"]))
 """)
         self.stub("timeout", """
+import subprocess
 assert args[0] == "--kill-after=5s", args
 seconds = float(args[1].removesuffix("s"))
 if args[2] == "python3":
@@ -303,7 +329,7 @@ operation = args[3]
 if operation == "run":
     name = args[args.index("--name") + 1]
     if name.endswith("-provision"): assert 0 < seconds <= 5, args
-    else: assert seconds == (115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
+    else: assert seconds == (415 if name.endswith("-shared") else 115 if name.endswith("-command") else 65 if "-single-" in name else 7), args
 elif operation == "build":
     assert (0 < seconds < 20) if "--builder" in args else seconds == 60, args
 else:
@@ -313,7 +339,8 @@ proc = subprocess.Popen(args[2:])
 signal.signal(signal.SIGTERM, lambda *_: proc.terminate())
 rc = proc.wait(timeout=5)
 key = "TIMEOUT_RC" if operation == "run" and seconds == 7 else (
-    "COMMAND_TIMEOUT_RC" if operation == "run" and seconds == 115 else "")
+    "COMMAND_TIMEOUT_RC" if operation == "run" and seconds == 115 else (
+    "SHARED_TIMEOUT_RC" if operation == "run" and seconds == 415 else ""))
 if operation == "run" and seconds == 65:
     cfg = json.loads(os.environ["SINGLE"]).get(args[args.index("--name") + 1].rsplit("-", 1)[1], {})
     if cfg.get("timeout"):
@@ -328,8 +355,10 @@ sys.exit(rc)
     def stub(self, name, body):
         script = self.bin / name
         script.write_text(
-            f"#!{sys.executable}\n"
-            "import json, os, subprocess, sys\nfrom pathlib import Path\n"
+            # -S skips site import; each fake costs one interpreter start and a lane spawns ~90 of them,
+            # so a fake imports only what its body needs (stdlib only, no site packages).
+            f"#!{sys.executable} -S\n"
+            "import json, os, sys\n"
             "args = sys.argv[1:]\n"
             "with open(os.environ['CALLS'], 'a', encoding='utf-8') as log:\n"
             f"    log.write(json.dumps([{name!r}, *args]) + '\\n')\n"
@@ -340,13 +369,16 @@ sys.exit(rc)
     def run_lane(self, xml=PASS, container_rc=0, timeout_rc="", xml_mode="", skip_build="1",
                  command_xml=COMMAND_PASS, command_rc=0, command_timeout="", command_mode="",
                  metadata_rc=0, provision_rc=0, build_rc=0, cleanup_rc=0,
-                 volume_rc=0, ownership_mismatch="", single=None):
+                 volume_rc=0, ownership_mismatch="", single=None,
+                 shared_xml=SHARED_PASS, shared_rc=0, shared_timeout="", shared_mode=""):
         (self.repo / "resources.json").unlink(missing_ok=True)
         env = {
             "PATH": str(self.bin) + os.pathsep + os.defpath,
             "CALLS": str(self.calls), "EXPECTED": json.dumps(EXPECTED),
             "COMMAND_EXPECTED": json.dumps(COMMAND_EXPECTED),
             "SINGLE_EXPECTED": json.dumps(SINGLE_EXPECTED), "SINGLE_PASS": SINGLE_PASS,
+            "SHARED_EXPECTED": json.dumps(SHARED_EXPECTED), "SHARED_XML": shared_xml, "SHARED_XML_MODE": shared_mode,
+            "SHARED_CONTAINER_RC": str(shared_rc), "SHARED_TIMEOUT_RC": str(shared_timeout),
             "SINGLE": json.dumps(single or {}),
             "COMMAND_XML": command_xml, "COMMAND_XML_MODE": command_mode,
             "COMMAND_CONTAINER_RC": str(command_rc), "COMMAND_TIMEOUT_RC": str(command_timeout),
@@ -358,8 +390,12 @@ sys.exit(rc)
             "WORKER_UID_SKIP_BUILD": skip_build, "WORKER_UID_IMAGE": "fixture-image",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
-        result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
-                                env=env, capture_output=True, text=True, timeout=20, check=False)
+        started = time.monotonic()
+        try:
+            result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
+                                    env=env, capture_output=True, text=True, timeout=RUN_SH_LIMIT, check=False)
+        finally:
+            LANE_TIMES.append(time.monotonic() - started)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         runs = [call for call in calls if call[:2] == ["docker", "run"]]
         # Every Docker operation, including failures before either lane, is bounded.
@@ -378,17 +414,17 @@ sys.exit(rc)
                 self.assertTrue(removals)
             return result, calls
         self.assertNotIn("must not set ReadOnly mode when using anonymous volumes", result.stderr)
-        self.assertEqual(len(runs), 6, result.stderr)
-        provision, run, command, *singles = runs
+        self.assertEqual(len(runs), 7, result.stderr)
+        provision, run, command, *singles, shared = runs
         name = run[run.index("--name") + 1]
         self.assertTrue(name.startswith("wuid-2134-"), name)
         state = json.loads((self.repo / "resources.json").read_text())
         self.assertEqual([call for call in calls if call[:2] == ["docker", "rm"]],
                          [["docker", "rm", "-f", "--volumes", state[n]["Id"]]
-                          for n in (name + "-single-3", name + "-single-2", name + "-single-1",
+                          for n in (name + "-shared", name + "-single-3", name + "-single-2", name + "-single-1",
                                    name + "-command", name, name + "-provision")])
         self.assertRegex(name, r"^wuid-2134-[0-9a-f]{32}$")
-        for n in (name, name + "-command", name + "-provision", *(f"{name}-single-{i}" for i in (1, 2, 3))):
+        for n in (name, name + "-command", name + "-provision", name + "-shared", *(f"{name}-single-{i}" for i in (1, 2, 3))):
             self.assertEqual(state[n]["Labels"]["io.uzi.worker-uid.invocation"], name.removeprefix("wuid-2134-"))
         self.assertEqual([call for call in calls if call[:3] == ["docker", "volume", "rm"]],
                          [["docker", "volume", "rm", name + suffix] for suffix in ("-task", "-go")])
@@ -398,7 +434,7 @@ sys.exit(rc)
         self.assertNotIn("--cap-add", command)
         self.assertEqual(command[command.index("--security-opt") + 1], "no-new-privileges")
         self.assertEqual(command[command.index("--network") + 1], "none")
-        for invocation in (provision, run, command, *singles):
+        for invocation in (provision, run, command, *singles, shared):
             self.assertNotIn("--rm", invocation)  # Retain exact owned names until the cleanup trap.
             self.assertEqual(invocation[invocation.index("--pull") + 1], "never")
         self.assertEqual(command[command.index("--entrypoint") + 1], "/usr/local/bin/node")
@@ -436,6 +472,8 @@ sys.exit(rc)
         self.assertTrue(Path(report, "command-expected.json").is_file())
         self.assertTrue(Path(report, "single-expected.json").is_file())
         self.assert_single_containers(name, singles, calls)
+        self.assertTrue(Path(report, "shared-expected.json").is_file())
+        self.assert_shared_container(name, shared)
         for i in (1, 2, 3):
             if (single or {}).get(str(i), {}).get("mode") != "missing":
                 self.assertTrue(Path(report, f"single-{i}-results.xml").is_file())
@@ -475,7 +513,7 @@ sys.exit(rc)
         run_index = next(i for i, c in enumerate(calls) if c[:2] == ["docker", "run"] and
                          c[c.index("--name") + 1] == name + "-command")
         order = [c[c.index("--name") + 1] for c in calls[run_index:] if c[:2] == ["docker", "run"]]
-        self.assertEqual(order, [name + "-command", *(f"{name}-single-{i}" for i in (1, 2, 3))])
+        self.assertEqual(order, [name + "-command", *(f"{name}-single-{i}" for i in (1, 2, 3)), name + "-shared"])
         for call, (posture, no_new_privs, caps) in zip(singles, postures):
             self.assertEqual(call[call.index("--user") + 1], "10001:10001")
             self.assertEqual(call[call.index("--cap-drop") + 1], "ALL")
@@ -500,6 +538,33 @@ sys.exit(rc)
             mounts = [call[i + 1] for i, a in enumerate(call) if a == "--mount"]
             for source in ("e2e/worker-uid", "agent/src", "agent/tsconfig.json", "agent/package.json"):
                 self.assertIn(f"type=bind,src={self.repo}/{source},dst=/app/uzi-worker-uid-proof/{source},readonly", mounts)
+
+    def assert_shared_container(self, name, call):
+        self.assertEqual(call[call.index("--name") + 1], name + "-shared")
+        # Root with exactly the entrypoint's startup capability set; no CAP_FOWNER, no CAP_FSETID.
+        self.assertEqual(call[call.index("--user") + 1], "0:0")
+        self.assertEqual(call[call.index("--cap-drop") + 1], "ALL")
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--cap-add"],
+                         ["CHOWN", "DAC_OVERRIDE", "SETPCAP", "SETUID", "SETGID"])
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--security-opt"], ["no-new-privileges"])
+        self.assertEqual(call[call.index("--network") + 1], "none")
+        self.assertEqual(call[call.index("--label") + 1], "io.uzi.worker-uid.invocation=" + name.removeprefix("wuid-2134-"))
+        self.assertEqual(call[call.index("--workdir") + 1], "/proof")
+        self.assertEqual([call[i + 1] for i, a in enumerate(call) if a == "--tmpfs"],
+                         ["/data", "/nix", "/proof/.uzi/scratch:exec,uid=0,gid=0,mode=0700",
+                          "/app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755"])
+        self.assertEqual(call[call.index("--entrypoint") + 1], "/usr/local/bin/node")
+        self.assertEqual(call[call.index("--entrypoint") + 2], "sha256:" + "a" * 64)
+        self.assertNotIn("/usr/local/sbin/uzi-entrypoint", call)
+        self.assertNotIn("UZI_UID_SPLIT", " ".join(call))
+        self.assertIn("--test-timeout=120000", call)
+        self.assertIn("--test-reporter=junit", call)
+        self.assertEqual(call[call.index("--test-name-pattern") + 1], "^shared leaf$")
+        self.assertEqual(call[-1], "/app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts")
+        mounts = [call[i + 1] for i, a in enumerate(call) if a == "--mount"]
+        for source in ("e2e/worker-uid", "agent/src", "agent/test", "agent/templates",
+                       "controller/internal/kube/testdata/runner-shared-init.sh"):
+            self.assertIn(f"type=bind,src={self.repo}/{source},dst=/app/uzi-worker-uid-proof/{source},readonly", mounts)
 
     def test_ownership_failure_and_ambiguous_create(self):
         for options in ({"ownership_mismatch": "-command"}, {"ownership_mismatch": "-go"}, {"provision_rc": 23}):
@@ -604,6 +669,39 @@ sys.exit(rc)
                 else:
                     self.assertIn("worker UID lane FAIL", result.stderr)
 
+    def test_shared_outcomes(self):
+        failing = SHARED_PASS.replace("/>", '><failure message="shared fixture"/></testcase>')
+        for mode in ("failure", "skip", "missing", "timeout", "status", "malformed", "empty"):
+            with self.subTest(mode=mode):
+                self.calls.unlink(missing_ok=True)
+                kwargs = {}
+                if mode == "failure":
+                    kwargs["shared_xml"] = failing
+                elif mode == "skip":
+                    kwargs["shared_xml"] = SHARED_PASS.replace("/>", "><skipped/></testcase>")
+                elif mode == "missing":
+                    kwargs.update(shared_mode="missing", shared_rc=1)
+                elif mode == "timeout":
+                    kwargs.update(shared_xml="", shared_timeout=124)
+                elif mode == "status":
+                    kwargs["shared_rc"] = 23
+                elif mode == "malformed":
+                    kwargs["shared_xml"] = "<testsuites>"
+                else:
+                    kwargs["shared_xml"] = "<testsuites/>"
+                result, calls = self.run_lane(**kwargs)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                # Every earlier proof still ran and passed; the shared container is individually fatal.
+                self.assertGreaterEqual(result.stdout.count("1 required leaves passed"), 5)
+                if mode in ("status", "timeout", "missing"):
+                    code = {"status": 23, "timeout": 124, "missing": 1}[mode]
+                    self.assertIn(f"worker UID shared node/container exit: {code}", result.stderr)
+                    if mode == "timeout":
+                        self.assertIn("deadline: phase=shared-proof command=capture", result.stderr)
+                else:
+                    self.assertIn("worker UID lane FAIL", result.stderr)
+                self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 7)
+
     def test_single_uid_outcomes(self):
         failing = SINGLE_PASS.replace("/>", '><failure message="single fixture"/></testcase>')
         cases = {
@@ -628,7 +726,7 @@ sys.exit(rc)
                             self.assertIn("deadline: phase=single-", result.stderr)
                     else:
                         self.assertIn("worker UID lane FAIL", result.stderr)
-                    self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 6)
+                    self.assertEqual(len([c for c in calls if c[:2] == ["docker", "run"]]), 7)
 
     def test_single_uid_checker_failure_with_clean_container(self):
         result, _ = self.run_lane(single={"2": {"xml": "<testsuites/>"}})
@@ -639,11 +737,11 @@ sys.exit(rc)
     def test_single_uid_passing_runs_succeed_and_failure_keeps_going(self):
         result, _ = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
         self.calls.unlink(missing_ok=True)
         result, _ = self.run_lane(single={"1": {"rc": 9}, "3": {"rc": 8}})
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.count("1 required leaves passed"), 5)
+        self.assertEqual(result.stdout.count("1 required leaves passed"), 6)
         for number, code in (("1", 9), ("3", 8)):
             self.assertIn(f"worker UID single-{number} node/container exit: {code}", result.stderr)
         self.assertNotIn("single-2 node/container exit", result.stderr)
@@ -712,6 +810,14 @@ sys.exit(rc)
         for detail in ("worker UID lane FAIL", "worker UID node/container exit: 124",
                        "watchdog stderr fixture"):
             self.assertIn(detail, result.stderr)
+
+
+def tearDownModule():
+    path = os.environ.get("WUID_LANE_TIMING")
+    if path and LANE_TIMES:
+        ordered = sorted(LANE_TIMES)
+        p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+        Path(path).write_text(f"lanes={len(ordered)} max={ordered[-1]:.2f}s p95={p95:.2f}s\n")
 
 
 if __name__ == "__main__":

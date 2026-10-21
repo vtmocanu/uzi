@@ -227,7 +227,7 @@ func runBand(status string, isRevising bool) int {
 // holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isOwnerRequiredWorkerHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -247,6 +247,12 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
+	}
+	if isCredentialSwitchSettlingHold(r.RunDTO) {
+		return credSwitchSettlingWord
+	}
+	if isCredentialSwitchUnsettledHold(r.RunDTO) {
+		return credSwitchUnsettledWord
 	}
 	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
@@ -1184,7 +1190,7 @@ func (m tuiModel) boardSummary() string {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) || isCredentialSwitchHold(r.RunDTO) {
 			ownerHolds++
 		}
 		switch r.Status {

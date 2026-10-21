@@ -843,7 +843,9 @@ export interface LatestRun {
   // hold_reason (PRD #1226/#1497/#1732): why a `paused` run is server-held, null for an owner
   // pause or a non-paused run. Non-sensitive, so the board projection sends it on every card
   // (api/internal/handler/board.go latestRunDTO.HoldReason). effectiveRunStatus overlays
-  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused".
+  // 'credential_disabled' so the card reads "waiting: credential disabled", not "paused", and
+  // the issue #3181 token-switch holds ('credential_switch_settling' / 'credential_switch_unsettled')
+  // so they read "settling: token switch" / "held: token switch".
   // 'base_attestation_missing' (issue #3194) reads "base unverified: owner hold" likewise.
   // Optional for api/web rollout skew: an absent key reads as no hold.
   hold_reason?: string | null;
@@ -2872,7 +2874,62 @@ export interface RunPrDescription {
   diagram_published: boolean;
 }
 
+/** Frozen maintainer obligations; authorization does not verify completion. */
+export interface CompletionPendingDTO {
+  version: number;
+  contract_revision: number;
+  criteria: {
+    criterion_id: string;
+    milestone_id: string;
+    kind: "maintainer";
+    text: string;
+    reason: string;
+    conditions: string[];
+    verification_steps: string[];
+    authorization_revision: number;
+    status: "unverified";
+  }[];
+}
+
+/** One source comparison inside a drift observation (Go SemanticDriftSource): hashes, refs
+ *  and enums only, never source text. `checkbox_only` marks an issue whose text differs only
+ *  in task-list checkbox state; it is still a contradiction. */
+export interface SemanticDriftSource {
+  source_id: string;
+  frozen_hash: string;
+  observed_hash?: string;
+  ref?: string;
+  outcome: "unchanged" | "changed" | "unknown";
+  reason?: "missing" | "truncated" | "unreadable" | "denied" | "invalid" | "timeout";
+  checkbox_only?: boolean;
+}
+
+/** A stored PRD #1230 D5 drift observation (Go SemanticDriftObservation). Detection only. */
+export interface SemanticDriftObservation {
+  phase: "presentation" | "publication";
+  candidate_digest?: string;
+  gate_revision?: number;
+  pushed_sha?: string;
+  observed_at: string;
+  issue: SemanticDriftSource;
+  prds: SemanticDriftSource[];
+  links_added: string[];
+  links_removed: string[];
+  links_truncated?: boolean;
+}
+
+/** Owner-only drift projection (Go SemanticDriftDTO). `contradiction` is true when any stored
+ *  source is changed or unknown; it never marks a criterion satisfied. */
+export interface SemanticDriftDTO {
+  observations: SemanticDriftObservation[];
+  dropped: number;
+  contradiction: boolean;
+}
+
 export interface Run {
+  completion_pending?: CompletionPendingDTO;
+  semantic_gate?: import("./semanticGate").SemanticGateDTO;
+  semantic_drift?: SemanticDriftDTO;
   id: string;
   /** Nullable since PRD #39: a chat run has no repo (issue/ci_fix runs always do). */
   repo_id: string | null;
@@ -3453,8 +3510,16 @@ export interface Run {
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
    *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
-   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel), and
-   *  'base_attestation_missing' for a --require-base run that adopted retained work no
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Issue #3181: 'credential_switch_settling' when an owner token switch on a retained-recovery
+   *  run could not prove the run's processes stopped and the worker is still finishing its own
+   *  operations for the run (the server refuses Resume and another token switch with a 409 while
+   *  that worker is live and finishing, and lifts the fence when it is lost, goes stale or
+   *  re-registers, with this value unchanged; Cancel always works), and
+   *  'credential_switch_unsettled' once the worker acknowledged it finished. That acknowledgement
+   *  does not prove the processes stopped: held for the owner, work and custody kept on that
+   *  worker; Resume requeues on the newly chosen token.
+   *  Issue #3194: 'base_attestation_missing' for a --require-base run that adopted retained work no
    *  checkpoint attests to the planned base (issue #3194; the agent was not started, nothing
    *  automatic leaves the hold, Resume and extend are refused; recover or start a successor).
    *  Render an unrecognised value honestly.
@@ -3777,6 +3842,7 @@ export type RunSummaryItem = Omit<
   RunListItem,
   "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
+  | "semantic_gate" | "completion_pending" | "semantic_drift"
 >;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).

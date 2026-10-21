@@ -238,3 +238,60 @@ test("single-uid inventory requires the one literal top-level preflight leaf", (
     rmSync(scratch, { recursive: true, force: true });
   }
 });
+
+const sharedFile = "e2e/worker-uid/runner-shared-real.test.mts";
+const sharedTitles = [
+  "runner-init refuses a missing, wrong or symlinked layout marker before any write",
+  "runner-init as root builds worker:runner 3775 with a worker:worker 0755 .tmp and leaves old and sibling data untouched",
+  "runner-init refuses a hostile runner-shared or .tmp symlink or file without following or re-owning anything",
+  "runner-init as the worker uid requires ownership by the current uid and fails closed on anything else",
+  "the runner, runner-cmd and dind uids cannot replace .tmp or runner-shared entries, and their groups exclude 10001",
+  "a fresh .tmp is created by the entrypoint and by ensureRunnerTmpdir in both uid modes, and a planted symlink or file is refused",
+  "per-uid scratch under a live writer: a mismatched owner is refused untouched, an expected owner is adopted with writer exclusion not established",
+  "old-layout and new-layout entrypoints overlap on one data directory without re-owning, wiping or following into each other's tree",
+  "foreign-owned run-directory content is retained, counted and logged by the production retention delete in split and single-uid modes",
+];
+test("runner-shared inventory requires the nine literal top-level real-uid leaves", () => {
+  mkdirSync(path.join(repo, ".uzi/scratch"), { recursive: true });
+  const scratch = mkdtempSync(path.join(repo, ".uzi/scratch/shared-inventory."));
+  const api = new API({ cwd: scratch });
+  const declarations = sharedTitles.map(name => `test(${JSON.stringify(name)}, { timeout: 100000 }, async () => {});`);
+  try {
+    const fixtures: { name: string; source: string; error?: RegExp }[] = [
+      { name: "literal", source: declarations.join("\n") },
+      { name: "actual", source: readFileSync(path.join(repo, sharedFile), "utf8") },
+      { name: "duplicate", source: [...declarations, declarations[0]!].join("\n"), error: /duplicate source leaf/ },
+      { name: "nested", source: `describe("nested", () => { ${declarations.join("\n")} });`, error: /missing required literal runner-shared proof/ },
+    ];
+    for (let index = 0; index < declarations.length; index++) {
+      for (const mutation of ["missing", "renamed", "nonliteral"] as const) {
+        const changed = [...declarations];
+        if (mutation === "missing") changed.splice(index, 1);
+        else changed[index] = `test(${JSON.stringify(sharedTitles[index]! + (mutation === "renamed" ? " changed" : ""))}${mutation === "nonliteral" ? ' + ""' : ""}, { timeout: 100000 }, async () => {});`;
+        fixtures.push({ name: `${mutation}-${index}`, source: changed.join("\n"),
+          error: mutation === "nonliteral" ? /nonliteral targeted/ : /missing required literal runner-shared proof/ });
+      }
+    }
+    writeFileSync(path.join(scratch, "tsconfig.json"), JSON.stringify({ files: fixtures.map(f => f.name + ".mts") }));
+    for (const fixture of fixtures) writeFileSync(path.join(scratch, fixture.name + ".mts"), fixture.source);
+    const program = api.updateSnapshot({ openProjects: [path.join(scratch, "tsconfig.json")] }).getProjects()[0].program;
+    const wanted = sharedTitles.map(name => ({ file: sharedFile, names: [name] }));
+    for (const fixture of fixtures) {
+      const filename = path.join(scratch, fixture.name + ".mts");
+      assert.equal(program.getSyntacticDiagnostics(filename).length, 0, fixture.name);
+      const collect = () => inventoryForSource(program.getSourceFile(filename), "runner-shared-real");
+      if (fixture.error) assert.throws(collect, fixture.error, fixture.name);
+      else assert.deepEqual(collect(), wanted, fixture.name);
+    }
+    const run = (lane: string) => JSON.parse(execFileSync(process.execPath,
+      [path.join(repo, "e2e/worker-uid/inventory.mjs"), lane], { cwd: repo, encoding: "utf8" }));
+    assert.deepEqual(run("shared"), wanted);
+    // The root-started leaves stay out of the other lanes.
+    for (const lane of ["worker", "command", "single"]) {
+      assert.equal(run(lane).some((item: { file: string }) => item.file === sharedFile), false, lane);
+    }
+  } finally {
+    api.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});

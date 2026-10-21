@@ -49,6 +49,7 @@ import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launche
 import { SECRET_PATH_PREFIXES, workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
+import { ensureRunnerTmpdir } from "./runner-tmpdir.js";
 
 export function buildWorkerGitCache(
   config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
@@ -349,6 +350,12 @@ async function main(): Promise<void> {
   const bootstrap = maintenanceBootstrapRoots();
   log.info("terminal maintenance bootstrap posture", { ...readMaintenancePosture(),
     bootstrap: bootstrap === undefined ? "refused" : bootstrap.length });
+
+  // Issue #3153: when TMPDIR lives under the (now persistent) `<dataDir>/runner`, confirm it is a
+  // real, worker-owned, writable directory BEFORE anything uses a temp path. A symlink or
+  // non-directory there refuses startup (fatal handler); nothing is deleted.
+  const runnerTmp = ensureRunnerTmpdir({ dataDir: config.dataDir });
+  if (runnerTmp.created) log.info("runner tmpdir created", { path: runnerTmp.path });
 
   // Docker wiring keystone (PRD #83 M1): resolve ONCE at startup with a bounded liveness
   // probe (loadConfig can't — it's sync). The single result feeds the register capability
@@ -947,6 +954,13 @@ async function main(): Promise<void> {
   // and holds a wall-clock deadline: when the api is unreachable nothing can be
   // reclaimed anyway, and a worker restarting while the api is unhealthy is a
   // CORRELATED failure, not an exotic one — they roll together.
+  // Issue #3153: `<dataDir>/runner` persists across pod replacements, so inspect `.retire-*`
+  // scratch parents a previous process left behind. Strictly before worker.run() (the claim loop
+  // and every retire/recovery path). Removes nothing: every parent, empty ones included, is retained
+  // and counted in one warning. Never throws, never recursive. Parents newer than this process are skipped.
+  await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000)
+    .catch((err) => log.warn("runner retire scratch inspection threw", { error: errMessage(err) }));
+
   if (config.homeReclaimEnabled) {
     await reclaimStrandedRunHomes(
       sdkHomeRoot,

@@ -16,6 +16,7 @@ import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
 import type { LastFireStarted, LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { api, type Run } from "../lib/api";
+import { credentialSwitchHold } from "../lib/credentialSwitchHold";
 import { parkLabel } from "../lib/runBadge";
 
 // Outcomes use the fire-time snapshot, including after the selector has been edited.
@@ -161,7 +162,9 @@ function CurrentStartedRun({ runId }: { runId: string }) {
   const current = state?.id === runId ? state : null;
   return <span className="text-[11.5px] text-muted">
     {current?.run ? `Current: ${parkLabel(current.run)}` : current?.unavailable ? "Current state unavailable" : "Loading current state…"}
-    {current?.run?.status === "paused" && current.run.hold_reason === "provider_unavailable" &&
+    {current?.run && (
+      (current.run.status === "paused" && current.run.hold_reason === "provider_unavailable") ||
+      credentialSwitchHold(current.run) !== null) &&
       <Link className="ml-2 underline" to={`/runs/${runId}`}>View owner actions</Link>}
   </span>;
 }

@@ -543,7 +543,11 @@ any time — queued, parked, at the plan gate, or mid-run — and a mid-run
 switch never rewrites a live claim in place: it reuses the same custody
 `runs.claim_generation` (below) plus a new `claim_released_at` fence to force
 the switch to cross an actual claim boundary, so the run always resumes with
-the new token rather than swapping it out from under a running turn; see
+the new token rather than swapping it out from under a running turn. For a
+run carrying retained recovery authority the worker first proves the run's
+processes stopped; if it cannot, the run is held `paused` for the owner
+(`credential_switch_settling`, then `credential_switch_unsettled`) instead of
+releasing the claim; see
 [adr/1247-per-run-token-selection.md](adr/1247-per-run-token-selection.md).
 
 Since PRD #111 the bind mode is three-valued — `default`, `pinned` or `auto`
@@ -2209,7 +2213,12 @@ RBAC verb-by-verb reasoning, the namespace/NetworkPolicy split, and the sizing
 presets — is `prds/done/58-hosted-k8s-workers.md` (its Decision Log especially). The
 docker tier's own privileged-namespace ruling (Q-B) and Decision 3's
 separate-mount-namespace invariant are recorded in
-`prds/done/83-docker-capable-worker.md`.
+`prds/done/83-docker-capable-worker.md`. Decision 3 is amended by
+[ADR-3153](adr/3153-runner-shared-pvc-subpath.md): the dind sidecar still
+mounts none of the join token or `/nix`, and from #3153 it mounts only the
+`runner-shared` subPath of the worker `data` volume (the run working directory
+at `/data/runner`), never the whole volume. That is a mount-view property; it
+does not bound rootful dind device reach.
 
 New persistent workers preselect the large preset; new ephemeral workers default
 to medium via `workers.ephemeralDefaultSize`. The decision, partial supersession,
@@ -2255,8 +2264,9 @@ binary (not `os.RemoveAll`, which cannot delete a Go module cache's read-only
 directories as their non-root owner) creates, liveness-locks, and removes
 that tmp through a dedicated fd-relative, no-follow tree-removal primitive
 (`internal/safetree`) once a confirmed drain proves it is safe. A worker-only
-emptyDir (in addition to any the docker lane adds), `codex-cmd-cache`
-(`/var/cache/uzi-codex-cmd`), gives each run's Codex commands a real
+emptyDir, `codex-cmd-cache`
+(`/var/cache/uzi-codex-cmd`; the docker lane's run working directory is no longer
+an emptyDir, see [ADR-3153](adr/3153-runner-shared-pvc-subpath.md)), gives each run's Codex commands a real
 `GOMODCACHE`/`GOCACHE`/npm cache instead of re-downloading every command, held
 by a uid-10003 holder process for the run and released only on an attested
 drain; a startup orphan reaper (`--reap-orphans`) sweeps anything a crash or an
@@ -2264,7 +2274,7 @@ unconfirmed drain left behind, gated on a kernel process-table proof that fails
 closed. The cache is a storage/performance boundary, not a trust boundary; see
 [ADR-1598](adr/1598-codex-command-storage.md) for the full mechanism, the
 supersession of `specs/ai.md`'s "only remaining emptyDir" sentence (the
-cache is a worker-only emptyDir in addition to any the docker lane adds),
+cache is a worker-only emptyDir; since #3153 the docker lane no longer adds the run-workdir emptyDir),
 and the pending hosted-worker ephemeral-request
 measurement, which is issue #1598's own post-deploy check (issue #225 is
 unrelated node image accumulation).
@@ -2494,10 +2504,20 @@ claims while owned runs and pinned plan checkers may finish; only an atomic term
 custody clearance permit gated anonymous-volume prune and stop authorization.
 The controller observes the old Deployment and pods gone before deleting only
 `dind-data`, then publishes replacement readiness before reopening claims.
-DinD is scratch, including named volumes; replacing the Deployment also loses
-run-workdir. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
+DinD is scratch, including named volumes; this DinD maintenance recycle loses
+DinD state only. Since #3153 the run working directory `/data/runner` is the
+`runner-shared` subPath of the `data` PVC, so a replacement keeps it, while a
+legacy `{nix, data}` recycle deletes it (and any Docker-lane clones) as on the
+plain lane. DinD never uses ForceRoll or the drain deadline. Simultaneous pressure
 runs legacy first, DinD on a later tick; legacy busy deadlines now apply only to
 independent nondrifted maintenance, while global ForceRoll retains custody guards.
+A custody-held Docker worker whose pod still has the old layout (an emptyDir at
+`/data/runner`) is held on it, ForceRoll included, until custody releases; a
+`runner-init` init container refuses a worker image without the
+`runner-shared-v1` layout marker. Kubelet eviction, node drain and manual pod
+deletion are not guarded. See
+[ADR-3153](adr/3153-runner-shared-pvc-subpath.md) for the migration guard,
+rollback and availability residuals.
 Admins see cleanup pending; ephemeral and unsupported workers report pressure only.
 See [ADR-1759](adr/1759-dind-data-metering-and-prune.md) for the safe gate,
 Docker-only ReplicaSet-list permission, bounded observations and upgrade policy.

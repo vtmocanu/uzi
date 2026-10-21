@@ -21,6 +21,9 @@ func writeWorkerRunClaim(w http.ResponseWriter, payload *workersvc.ClaimPayload)
 		httpx.Error(w, http.StatusInternalServerError, "checker claim refused")
 		return
 	}
+	if payload.CrossCheck.CandidateIdentityVersion == "semantic_v1" {
+		w.Header().Set("X-Uzi-Candidate-Identity-Version", "semantic_v1")
+	}
 	w.Header().Set("X-Uzi-Claim-Kind", "cross_check")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

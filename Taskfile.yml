@@ -318,6 +318,7 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      - task: test:ci-postgres
       - task: test:cosign-sign-retry
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
@@ -330,6 +331,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:renovate-postgres
       - task: test:forge-fake
       - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
@@ -1072,6 +1074,16 @@ tasks:
     cmds:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
+  test:ci-postgres:
+    desc: hermetic workflow Postgres startup, fallback and readiness failure
+    cmds:
+      - node ./scripts/ci-postgres.test.mjs
+
+  test:renovate-postgres:
+    desc: hermetic CI Postgres pin extraction, digest updates and grouping
+    cmds:
+      - node ./scripts/renovate-postgres.test.mjs
+
   test:renovate-codex-runtime:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
@@ -1424,7 +1436,7 @@ tasks:
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
 
   check:postgres-pin-parity:
-    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    desc: docker-compose.yml and ci.yml's Postgres env pin use the same tag and digest, with hermetic 0/1/2 fixtures
     cmds:
       # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
       # renovate.json groups them (#2622) and this fails the gate if they still drift.
