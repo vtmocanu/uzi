@@ -458,33 +458,286 @@ func TestGitLabGetMergeRequestBodyShapes(t *testing.T) {
 	})
 }
 
-func TestGitLabGetMergeRequestGzipBoundsDecodedBytes(t *testing.T) {
+// The limit counts transfer-decoded wire bytes: the request asks for identity
+// encoding, and a response that still declares a content encoding is refused
+// without a body, so a tiny compressed body can never inflate past the limit.
+func TestGitLabGetMergeRequestRefusesContentEncoding(t *testing.T) {
 	const limit = 8192
 	lowerGitLabLimit(t, limit)
-	gz := func(decoded int) http.HandlerFunc {
-		return func(rw http.ResponseWriter, _ *http.Request) {
-			var buf bytes.Buffer
-			zw := gzip.NewWriter(&buf)
-			_, _ = zw.Write(mrJSON(9, decoded))
-			_ = zw.Close()
-			rw.Header().Set("Content-Encoding", "gzip")
-			_, _ = rw.Write(buf.Bytes())
-		}
-	}
-	t.Run("decodes_below_limit", func(t *testing.T) {
-		w := newWireMR(t, gz(limit/2), 5*time.Second)
+	gzBody := func() []byte {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, _ = zw.Write(mrJSON(9, limit*50))
+		_ = zw.Close()
+		return buf.Bytes()
+	}()
+	t.Run("requests_identity_and_decodes_plain", func(t *testing.T) {
+		var seen atomic.Value
+		w := newWireMR(t, func(rw http.ResponseWriter, r *http.Request) {
+			seen.Store(r.Header.Get("Accept-Encoding"))
+			_, _ = rw.Write(mrJSON(9, limit/2))
+		}, 5*time.Second)
 		if mr, err := w.get(context.Background()); err != nil || mr.IID != 9 {
 			t.Fatalf("mr=%+v err=%v", mr, err)
 		}
-	})
-	t.Run("tiny_compressed_decodes_past_limit", func(t *testing.T) {
-		w := newWireMR(t, gz(limit*50), 5*time.Second)
-		mr, err := w.get(context.Background())
-		wantRefusal(t, mr, err)
-		if w.rt.maxRead() > limit+1 {
-			t.Fatalf("read %d decoded bytes, want at most limit+1", w.rt.maxRead())
+		if got, _ := seen.Load().(string); got != "identity" {
+			t.Fatalf("server saw Accept-Encoding %q, want identity", got)
 		}
 	})
+	t.Run("forced_gzip_success_is_a_fixed_error", func(t *testing.T) {
+		w := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+			rw.Header().Set("Content-Encoding", "gzip")
+			_, _ = rw.Write(gzBody)
+		}, 5*time.Second)
+		mr, err := w.get(context.Background())
+		if err == nil || isTooLarge(err) {
+			t.Fatalf("err = %v, want the content-encoding error, not the size refusal", err)
+		}
+		if !strings.Contains(err.Error(), "unsupported content encoding") {
+			t.Fatalf("err = %q, want the fixed content-encoding text", err.Error())
+		}
+		if mr != (MergeRequest{}) {
+			t.Fatalf("mr = %+v, want zero", mr)
+		}
+		if w.rt.reqs.Load() != 1 {
+			t.Fatalf("requests = %d, want 1 (not retried)", w.rt.reqs.Load())
+		}
+		if w.rt.totalRead() != 0 {
+			t.Fatalf("read %d body bytes of a refused encoding, want 0", w.rt.totalRead())
+		}
+	})
+	// Forced gzip on a non-success status keeps the status outcome of an empty body.
+	norm := func(w *wireMR, err error) string {
+		return strings.ReplaceAll(err.Error(), w.srv.URL, "SRV")
+	}
+	for _, c := range []struct {
+		code     int
+		class    ErrorClass
+		attempts int64
+	}{{404, ErrorClassOther, 1}, {401, ErrorClassAuth, 1}, {500, ErrorClassServerError, 6}} {
+		t.Run(fmt.Sprintf("forced_gzip_%d_matches_empty_body", c.code), func(t *testing.T) {
+			plain := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(c.code) }, 5*time.Second)
+			_, plainErr := plain.get(context.Background())
+			enc := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+				rw.Header().Set("Content-Encoding", "gzip")
+				rw.WriteHeader(c.code)
+				_, _ = rw.Write(gzBody)
+			}, 5*time.Second)
+			mr, err := enc.get(context.Background())
+			if err == nil || plainErr == nil || isTooLarge(err) {
+				t.Fatalf("err = %v, plain err = %v", err, plainErr)
+			}
+			if norm(enc, err) != norm(plain, plainErr) {
+				t.Fatalf("message = %q, want the empty-body message %q", norm(enc, err), norm(plain, plainErr))
+			}
+			if Class(err) != c.class {
+				t.Fatalf("class = %q, want %q", Class(err), c.class)
+			}
+			if enc.rt.reqs.Load() != c.attempts {
+				t.Fatalf("attempts = %d, want %d", enc.rt.reqs.Load(), c.attempts)
+			}
+			if strings.ContainsRune(err.Error(), '\x1f') || strings.ContainsRune(err.Error(), '\ufffd') {
+				t.Fatalf("binary body in the message: %q", err.Error())
+			}
+			if mr != (MergeRequest{}) {
+				t.Fatalf("mr = %+v, want zero", mr)
+			}
+			if enc.rt.totalRead() != 0 {
+				t.Fatalf("read %d body bytes of a refused encoding, want 0", enc.rt.totalRead())
+			}
+		})
+	}
+}
+
+// countingConn counts the bytes the client reads off the socket, headers and
+// framing included.
+type countingConn struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+// Wire probe: a server that streams forever (endless empty stored deflate
+// blocks under Content-Encoding: gzip, or endless plain bytes) must cost the
+// client at most the limit plus headers, and must end the call event-driven, far
+// before the 30 s client timeout.
+func TestGitLabGetMergeRequestWireByteBound(t *testing.T) {
+	const limit = 64 << 10
+	lowerGitLabLimit(t, limit)
+	gzHeader := []byte{0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff}
+	cases := []struct {
+		name string
+		gzip bool
+	}{{"zero_yield_deflate_blocks_gzip", true}, {"endless_plain_stream", false}}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var wire, dials atomic.Int64
+			tr := newHTTP1Transport(forgeHTTPTransport)
+			dial := tr.DialContext
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dials.Add(1)
+				conn, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return countingConn{Conn: conn, n: &wire}, nil
+			}
+			t.Cleanup(tr.CloseIdleConnections)
+			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				if c.gzip {
+					rw.Header().Set("Content-Encoding", "gzip")
+				}
+				rw.WriteHeader(200)
+				chunk := bytes.Repeat([]byte(" "), 16<<10)
+				if c.gzip {
+					_, _ = rw.Write(gzHeader)
+					chunk = bytes.Repeat([]byte{0, 0, 0, 0xff, 0xff}, 3000)
+				}
+				fl, _ := rw.(http.Flusher)
+				for r.Context().Err() == nil {
+					if _, err := rw.Write(chunk); err != nil {
+						return
+					}
+					if fl != nil {
+						fl.Flush()
+					}
+				}
+			}))
+			t.Cleanup(srv.Close)
+			d := newDriverOver(t, tr, srv.URL, 30*time.Second)
+			start := time.Now()
+			mr, err := d.GetMergeRequest(context.Background(), 7, 9)
+			elapsed := time.Since(start)
+			if err == nil || mr != (MergeRequest{}) {
+				t.Fatalf("mr=%+v err=%v, want a refusal and the zero MR", mr, err)
+			}
+			if !c.gzip {
+				wantRefusal(t, mr, err)
+			}
+			// limit+1, headers and read-ahead slack, plus the bounded drain net/http
+			// itself runs in the background when a body is closed early (it reads up
+			// to 256 KiB+1 more so the connection could be reused; the connection is
+			// then closed). That drain is the only wire cost past the limit.
+			const stdlibEarlyCloseDrain = 256<<10 + 1
+			if got, max := wire.Load(), int64(limit+1+2048+4096+stdlibEarlyCloseDrain); got > max {
+				t.Fatalf("client read %d wire bytes, want at most %d (dials %d, err %v)", got, max, dials.Load(), err)
+			}
+			if elapsed > 10*time.Second {
+				t.Fatalf("took %v, want far below the 30 s client timeout", elapsed)
+			}
+			t.Logf("%s: wire=%d elapsed=%v dials=%d err=%v", c.name, wire.Load(), elapsed, dials.Load(), err)
+		})
+	}
+}
+
+func TestResponseLimitedRequestsUseHTTP1Route(t *testing.T) {
+	var hit string
+	mk := func(name string) func() http.RoundTripper {
+		return func() http.RoundTripper {
+			return ciRoundTripper(func(*http.Request) (*http.Response, error) {
+				hit = name
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: http.NoBody}, nil
+			})
+		}
+	}
+	r := &ciRouteTransport{general: mk("general"), ciJSON: mk("http1")}
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		want string
+	}{
+		"unmarked":       {context.Background(), "general"},
+		"limit marked":   {withResponseLimit(context.Background(), &responseLimitState{}), "http1"},
+		"ci json (kept)": {markCIJSON(WithCIRepairReadLimits(context.Background())), "http1"},
+	} {
+		req, _ := http.NewRequestWithContext(tc.ctx, http.MethodGet, "https://example.test", nil)
+		if _, err := r.RoundTrip(req); err != nil || hit != tc.want {
+			t.Fatalf("%s: routed to %q (err %v), want %q", name, hit, err, tc.want)
+		}
+	}
+}
+
+// Only the SDK success statuses (200, 201, 202, 204) take the 32 MiB eager path;
+// another 2xx is an error to the SDK and takes the lazy 4 KiB path.
+func TestGitLabGetMergeRequestNonSuccess2xxIsLazy(t *testing.T) {
+	t.Run("oversized_206_typed_refusal", func(t *testing.T) {
+		w := newWireMR(t, oversizedHandler(206, ""), 5*time.Second)
+		mr, err := w.get(context.Background())
+		wantRefusal(t, mr, err)
+		if w.rt.reqs.Load() != 1 {
+			t.Fatalf("requests = %d, want 1", w.rt.reqs.Load())
+		}
+		if w.rt.maxRead() > gitLabMaxErrorResponseBytes+1 {
+			t.Fatalf("read %d bytes, want at most 4 KiB+1", w.rt.maxRead())
+		}
+	})
+	t.Run("small_206_is_the_sdk_error", func(t *testing.T) {
+		w := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+			rw.WriteHeader(206)
+			_, _ = rw.Write([]byte(`{"message":"partial"}`))
+		}, 5*time.Second)
+		mr, err := w.get(context.Background())
+		if err == nil || isTooLarge(err) {
+			t.Fatalf("err = %v, want the status error", err)
+		}
+		want := fmt.Sprintf("%sGET %s/api/v4/projects/7/merge_requests/9: 206 {message: partial}", fabMRMsg, w.srv.URL)
+		if err.Error() != want {
+			t.Fatalf("message = %q, want %q", err.Error(), want)
+		}
+		if w.rt.reqs.Load() != 1 || mr != (MergeRequest{}) {
+			t.Fatalf("requests = %d, mr = %+v", w.rt.reqs.Load(), mr)
+		}
+	})
+	t.Run("mid_body_failure_206_is_the_sdk_error", func(t *testing.T) {
+		f := &fabRT{}
+		f.fn = func(_ int, req *http.Request) (*http.Response, error) {
+			return f.resp(req, 206, &errAfter{data: []byte(`{"message":"` + patPrefix()), err: io.ErrUnexpectedEOF}), nil
+		}
+		d := newDriverOver(t, f, fabBase, 5*time.Second)
+		mr, err := d.GetMergeRequest(context.Background(), 7, 9)
+		want := fmt.Sprintf("%sGET %s: 206", fabMRMsg, fabMRURL)
+		if err == nil || err.Error() != want {
+			t.Fatalf("err = %v, want %q (not the body-read error)", err, want)
+		}
+		if f.calls.Load() != 1 || mr != (MergeRequest{}) {
+			t.Fatalf("attempts = %d, mr = %+v", f.calls.Load(), mr)
+		}
+	})
+}
+
+// lazyCappedBody hands on exactly the limit, then fails with the typed refusal and
+// records the overflow. The loop is bounded so a regressed cap fails by assertion.
+func TestLazyCappedBodyYieldsExactlyLimit(t *testing.T) {
+	const limit = 100
+	for _, bufSize := range []int{7, 100, 101, 4096} {
+		state := &responseLimitState{}
+		b := &lazyCappedBody{rc: io.NopCloser(fillReader{'x'}), remaining: limit, state: state}
+		var total int
+		var err error
+		buf := make([]byte, bufSize)
+		for i := 0; i < 1000 && err == nil; i++ {
+			var n int
+			n, err = b.Read(buf)
+			total += n
+			if total > limit {
+				t.Fatalf("buf %d: returned %d bytes, past the limit %d", bufSize, total, limit)
+			}
+		}
+		var tooLarge *ResponseTooLargeError
+		if !errors.As(err, &tooLarge) {
+			t.Fatalf("buf %d: err = %v after %d bytes, want *ResponseTooLargeError", bufSize, err, total)
+		}
+		if total != limit {
+			t.Fatalf("buf %d: returned %d bytes, want exactly %d", bufSize, total, limit)
+		}
+		if !state.overflow.Load() {
+			t.Fatalf("buf %d: overflow not recorded", bufSize)
+		}
+	}
 }
 
 func TestGitLabGetMergeRequestCancellation(t *testing.T) {
@@ -1021,11 +1274,18 @@ func TestGitLabGetMergeRequestNon2xxSizeBoundary(t *testing.T) {
 				if want := fabMRMsg + "404 Not Found"; err.Error() != want {
 					t.Fatalf("404: err = %q, want %q", err.Error(), want)
 				}
-			} else if c.code != 500 && !strings.Contains(err.Error(), redactPlaceholder) {
+			} else if !strings.Contains(err.Error(), redactPlaceholder) {
 				t.Fatalf("%d: want the token redacted in %q", c.code, err.Error())
 			}
 			if mr != (MergeRequest{}) {
 				t.Fatalf("%d: mr = %+v", c.code, mr)
+			}
+			wantAttempts := int64(1)
+			if c.code == 500 {
+				wantAttempts = 6
+			}
+			if w.rt.reqs.Load() != wantAttempts {
+				t.Fatalf("%d: attempts = %d, want %d", c.code, w.rt.reqs.Load(), wantAttempts)
 			}
 		}
 	})
@@ -1048,12 +1308,17 @@ func TestGitLabGetMergeRequestNon2xxSizeBoundary(t *testing.T) {
 // Scope: only GetMergeRequest is marked; another method keeps today's behaviour.
 func TestGitLabLimitDoesNotApplyToUnmarkedMethods(t *testing.T) {
 	lowerGitLabLimit(t, 4096)
-	w := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+	var seenEnc atomic.Value
+	w := newWireMR(t, func(rw http.ResponseWriter, r *http.Request) {
+		seenEnc.Store(r.Header.Get("Accept-Encoding"))
 		b := []byte(`{"id":1,"iid":3,"title":"t","state":"opened","labels":[],"updated_at":"2026-07-03T10:00:00Z"}`)
 		b = append(b, bytes.Repeat([]byte(" "), 20000)...)
 		_, _ = rw.Write(b)
 	}, 5*time.Second)
 	issue, err := w.d.GetIssue(context.Background(), 7, 3)
+	if got, _ := seenEnc.Load().(string); got == "identity" {
+		t.Fatalf("an unmarked request got Accept-Encoding %q", got)
+	}
 	if err != nil || issue.IID != 3 {
 		t.Fatalf("GetIssue over the lowered limit: issue=%+v err=%v", issue, err)
 	}

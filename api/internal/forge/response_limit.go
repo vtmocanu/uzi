@@ -6,17 +6,18 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"syscall"
 )
 
-// gitLabMaxResponseBytes caps the decoded body of a successful (2xx) GitLab
-// response on a marked call. A package var so tests can lower it, like
-// forgejoMaxResponseBytes.
+// gitLabMaxResponseBytes caps the body of a successful (SDK success status, see
+// statusSDKSuccess) GitLab response on a marked call. A package var so tests can
+// lower it, like forgejoMaxResponseBytes.
 var gitLabMaxResponseBytes int64 = 32 << 20
 
-// gitLabMaxErrorResponseBytes caps the decoded body of a non-2xx response on a
-// marked call. An overflow discards the body so a token split at the boundary
+// gitLabMaxErrorResponseBytes caps the body of every other response on a marked
+// call. An overflow discards the body so a token split at the boundary
 // cannot reach an error message.
 const gitLabMaxErrorResponseBytes int64 = 4 << 10
 
@@ -92,7 +93,7 @@ func (b *lazyCappedBody) Read(p []byte) (int, error) {
 
 func (b *lazyCappedBody) Close() error { return b.rc.Close() }
 
-// bodyReadError wraps a mid-body read failure of a 2xx response that the
+// bodyReadError wraps a mid-body read failure of an SDK-success response that the
 // transport now observes before the SDK's retry policy runs. It has no Unwrap:
 // the SDK's errors.As switch must not reach an inner *net.OpError, *net.DNSError
 // or "connection refused" text, so a body already partly delivered is never
@@ -141,6 +142,18 @@ func (e *bodyReadError) Is(target error) bool {
 	return (target == context.Canceled && e.canceled) || (target == context.DeadlineExceeded && e.deadline)
 }
 
+// statusSDKSuccess is the set of statuses for which the GitLab SDK's
+// CheckResponse (gitlab.com/gitlab-org/api/client-go/v3@v3.16.0 gitlab.go, the
+// 200/201/202/204 range check) returns nil and the body is decoded. Other 2xx
+// statuses (203, 205, 206, ...) are errors to the SDK, and 304 is handled lazily.
+func statusSDKSuccess(code int) bool {
+	switch code {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
+		return true
+	}
+	return false
+}
+
 // statusRetriedBySDK mirrors the GitLab SDK's status-only retry set: 0, 429 and
 // every 5xx but 501 (including 600-999).
 func statusRetriedBySDK(code int) bool {
@@ -149,13 +162,17 @@ func statusRetriedBySDK(code int) bool {
 
 // responseLimitTransport bounds response bodies of requests marked with
 // withResponseLimit, before the SDK decodes or classifies them:
-//   - 2xx bodies and bodies of statuses the SDK retries on status alone are read
-//     eagerly (32 MiB / 4 KiB). An overflow is a transport error with no
-//     response, which the SDK does not retry.
-//   - every other non-2xx body is streamed through a lazy 4 KiB+1 window so the
-//     SDK and net/http read it exactly when they would without a limit.
+//   - bodies of SDK success statuses and of statuses the SDK retries on status
+//     alone are read eagerly (32 MiB / 4 KiB). An overflow is a transport error
+//     with no response, which the SDK does not retry.
+//   - every other body is streamed through a lazy 4 KiB+1 window so the SDK and
+//     net/http read it exactly when they would without a limit.
 //
-// The limit counts decoded bytes. Content-Length is never consulted.
+// Every counted byte is a transfer-decoded wire body byte: the request carries
+// Accept-Encoding: identity so net/http neither asks for nor inflates gzip, and a
+// response that still declares a content encoding is refused without being read.
+// The route transport sends marked requests over HTTP/1.1, where every body byte
+// reaches the reader. Content-Length is never consulted.
 type responseLimitTransport struct{ base http.RoundTripper }
 
 func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -163,12 +180,24 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if state == nil || isCIJSON(req.Context()) {
 		return t.base.RoundTrip(req)
 	}
+	req = req.Clone(req.Context())
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err
 	}
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+		// Forced compression: the wire bytes are not the content. Read nothing; keep
+		// the status so classification survives, but never hand a body on.
+		_ = resp.Body.Close()
+		if statusSDKSuccess(resp.StatusCode) {
+			return nil, &bodyReadError{category: "unsupported content encoding"}
+		}
+		setBuffered(resp, nil)
+		return resp, nil
+	}
 	switch code := resp.StatusCode; {
-	case code/100 == 2:
+	case statusSDKSuccess(code):
 		data, err := readBoundedBody(resp.Body, gitLabMaxResponseBytes)
 		if err != nil {
 			var tooLarge *ResponseTooLargeError
@@ -187,7 +216,6 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 				state.overflow.Store(true)
 				return nil, err
 			}
-			data = nil
 		}
 		setBuffered(resp, data)
 	default:

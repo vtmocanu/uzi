@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestGitLabGetMergeRequestOversizedBodyRegression is the red/green regression for
@@ -30,7 +31,13 @@ func TestGitLabGetMergeRequestOversizedBodyRegression(t *testing.T) {
 			_, _ = w.Write([]byte(`"}`))
 		},
 	})
-	d := newTestDriver(t, m, "glpat-"+"Zq7xKm"+"Wp3NrT"+"5vBc9Y"+"dLh2")
+	// A long client timeout keeps the base failure on the intended "accepted
+	// oversized" signature when -race slows the 33 MiB transfer.
+	d, err := NewWithGitLabBackoff(TypeGitLab, m.srv.URL, "glpat-"+"Zq7xKm"+"Wp3NrT"+"5vBc9Y"+"dLh2", 60*time.Second,
+		func(_, _ time.Duration, _ int, _ *http.Response) time.Duration { return 0 })
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
 
 	mr, err := d.GetMergeRequest(context.Background(), 7, 9)
 	if err == nil {
