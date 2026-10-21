@@ -36,8 +36,14 @@ func newDriftLive(t *testing.T) *driftLive {
 }
 
 func (d *driftLive) publication(sha string) apitypes.SemanticObservationRequest {
-	return apitypes.SemanticObservationRequest{Phase: "publication", PushedSHA: sha, PRDSources: []apitypes.SemanticObservedSource{
-		{SourceID: "missing-prd", Ref: sha, Outcome: "unknown", Reason: "missing"}}}
+	// Every frozen PRD source is reported once, as the agent does.
+	prds := []apitypes.SemanticObservedSource{}
+	for _, ref := range d.candidate.Sources {
+		if ref.Kind == "prd" {
+			prds = append(prds, apitypes.SemanticObservedSource{SourceID: ref.ID, Ref: sha, Outcome: "unknown", Reason: "missing"})
+		}
+	}
+	return apitypes.SemanticObservationRequest{Phase: "publication", PushedSHA: sha, PRDSources: prds}
 }
 
 func (d *driftLive) observe(t *testing.T, generation int64, req apitypes.SemanticObservationRequest) (apitypes.SemanticDriftObservation, error) {
@@ -308,6 +314,16 @@ func TestSemanticCoverageStatusPRDSourcesLiveDB(t *testing.T) {
 // text carried a PRD path the raw body never had (the frozen PRD source came from the guidance).
 func TestSemanticDriftComposedLinksLiveDB(t *testing.T) {
 	d := newDriftLive(t)
+	// Freeze a PRD source whose path exists only in the composed text, never in the raw bodies.
+	d.sources = append(d.sources, apitypes.SemanticSourceCapture{ID: "prd:prds/7-x.md", Kind: "prd", Provenance: "repo:prds/7-x.md", Completeness: "complete", Bytes: []byte("composed-only prd")})
+	d.submit(t)
+	frozenPRD := false
+	for _, ref := range d.candidate.Sources {
+		frozenPRD = frozenPRD || ref.ID == "prd:prds/7-x.md"
+	}
+	if !frozenPRD {
+		t.Fatalf("fixture did not freeze prd:prds/7-x.md: %+v", d.candidate.Sources)
+	}
 	d.e.exec(t, `UPDATE runs SET issue_saved_body=$2 WHERE id=$1`, d.run, "raw forge body")
 	d.forge.issue.Description = "raw forge body"
 	rec, err := d.observe(t, 7, d.publication(sha40(11)))
@@ -329,5 +345,21 @@ func TestSemanticDriftEmptySavedBodyLiveDB(t *testing.T) {
 	rec, err := d.observe(t, 7, d.publication(sha40(13)))
 	if err != nil || rec.Issue.Outcome != "unchanged" {
 		t.Fatalf("empty saved body: %+v err=%v", rec, err)
+	}
+}
+
+// A candidate with only the issue source sends an explicit empty PRDSources (not absent): the
+// resumed process then knows there is nothing to observe, rather than that the field is missing.
+func TestSemanticCoverageStatusNoPRDSourceLiveDB(t *testing.T) {
+	d := newDriftLive(t)
+	d.sources = d.sources[:1]
+	d.submit(t)
+	got := d.status(t)
+	if got.PRDSources == nil || len(*got.PRDSources) != 0 {
+		t.Fatalf("PRDSources=%+v want explicit empty", got.PRDSources)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil || !strings.Contains(string(raw), `"prd_sources":[]`) {
+		t.Fatalf("worker status JSON lacks an explicit empty prd_sources: %s err=%v", raw, err)
 	}
 }

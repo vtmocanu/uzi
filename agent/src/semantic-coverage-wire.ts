@@ -15,7 +15,8 @@ export const semanticCandidateResponseSchema = z.strictObject({
   candidate, binding: semanticBindingSchema,
   plan: base64, sources: z.array(semanticSourceCaptureSchema).max(9),
 }).refine(v => v.candidate.digest === v.binding.candidate_digest);
-export const semanticCoverageStatusSchema = z.strictObject({
+// The status the gate presentation also embeds: no PRD source refs, so a run page can never carry them.
+export const semanticCoverageBaseSchema = z.strictObject({
   outcome: z.enum(["unavailable", "complete", "incomplete", "uncertain"]),
   // Unavailable before enrollment can carry empty bindings and a zero Go timestamp.
   candidate_digest: z.union([digest, z.literal("")]),
@@ -25,8 +26,11 @@ export const semanticCoverageStatusSchema = z.strictObject({
   charged_tokens: natural, remaining_tokens: natural,
   deadline: z.string().datetime({ offset: true }),
   report: coverageReportSchema.optional(),
-  // PRD #1230 D5: the frozen PRD source refs, filled by the worker status endpoint only. A resumed
-  // process reads them to observe drift at publication; the gate presentation never carries them.
+});
+// PRD #1230 D5: the worker status, settle and publish responses also carry the frozen PRD source
+// refs (explicit [] when the candidate has none), which a resumed process reads to observe drift at
+// publication. The gate presentation uses semanticCoverageBaseSchema and never carries them.
+export const semanticCoverageStatusSchema = semanticCoverageBaseSchema.extend({
   prd_sources: z.array(z.strictObject({
     id: z.string().min(1).max(512), kind: z.literal("prd"), provenance: z.string().min(1).max(2048), hash: digest, completeness: z.enum(["complete", "unknown"]),
   })).max(8).optional(),

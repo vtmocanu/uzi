@@ -64,7 +64,7 @@ func (f *coverageLiveFixture) settle(t *testing.T, r apitypes.SemanticCoverageRe
 	}
 	return raw
 }
-func (f *coverageLiveFixture) status(t *testing.T) apitypes.SemanticCoverageStatus {
+func (f *coverageLiveFixture) status(t *testing.T) apitypes.SemanticCoverageWorkerStatus {
 	t.Helper()
 	out, err := f.svc.SemanticCoverageStatus(f.e.ctx, f.worker, f.run, 7)
 	if err != nil {

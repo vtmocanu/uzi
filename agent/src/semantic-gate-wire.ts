@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { parseSemanticCandidate } from "./semantic-plan.js";
-import { semanticBindingSchema, semanticCoverageStatusSchema } from "./semantic-coverage-wire.js";
+import { semanticBindingSchema, semanticCoverageBaseSchema } from "./semantic-coverage-wire.js";
 
 // Match api/internal/apitypes/semantic_transport.go: 80 MiB for candidate,
 // presentation and approval (including three maintainer copies with sixfold Go
@@ -23,7 +23,7 @@ const reviewFields = {
 const presentation = z.strictObject({
   candidate: z.unknown().transform(value => parseSemanticCandidate(value)),
   binding: semanticBindingSchema, claim_generation: positive,
-  coverage: semanticCoverageStatusSchema.extend({
+  coverage: semanticCoverageBaseSchema.extend({
     // Gate projections include budget exhaustion for a newly revised candidate.
     outcome: z.enum(["unavailable", "complete", "incomplete", "uncertain", "exhausted"]),
   }), ...reviewFields,

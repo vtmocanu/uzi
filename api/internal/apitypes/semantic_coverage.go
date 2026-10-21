@@ -26,9 +26,14 @@ type SemanticCoverageStatus struct {
 	RemainingTokens int                     `json:"remaining_tokens"`
 	Deadline        time.Time               `json:"deadline"`
 	Report          *SemanticCoverageReport `json:"report,omitempty"`
-	// PRDSources lists the candidate's frozen PRD source refs. Only the worker status endpoint
-	// fills it (the D5 drift detector needs them after a resume); the gate presentation never does.
-	// A pointer so a candidate with no PRD source still sends [] (absent means unavailable).
+}
+
+// SemanticCoverageWorkerStatus is the worker-only coverage response (status, settle and publish).
+// It adds the candidate's frozen PRD source refs, which the D5 drift detector needs after a resume;
+// the gate presentation embeds SemanticCoverageStatus and never carries them. PRDSources is a
+// pointer so a candidate with no PRD source sends [] (absent means unavailable).
+type SemanticCoverageWorkerStatus struct {
+	SemanticCoverageStatus
 	PRDSources *[]SemanticSourceRef `json:"prd_sources,omitempty"`
 }
 

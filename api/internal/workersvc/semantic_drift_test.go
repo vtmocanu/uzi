@@ -379,9 +379,6 @@ func TestGateProjectionOmitsPRDSources(t *testing.T) {
 	if strings.Contains(string(raw), "prd_sources") {
 		t.Fatalf("gate projection carries prd_sources: %s", raw)
 	}
-	if p.Coverage.PRDSources != nil {
-		t.Fatalf("PRDSources=%+v", p.Coverage.PRDSources)
-	}
 }
 
 // The forge read must expire well inside the agent's whole 10 s observation budget (up to 5 s of

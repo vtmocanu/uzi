@@ -274,9 +274,9 @@ it("semantic-drift.in-process-publication-makes-no-status-read", { skip: LINUX_C
 it("semantic-drift.presentation-observation-does-not-delay-the-verdict-wait", { skip: LINUX_CAPTURE }, async () => {
   let release!: () => void;
   const held = new Promise<void>(r => { release = r; });
-  // Released once the run has completed; the 8 s fallback only bounds a regression where the verdict wait is held.
+  // Released once the run has completed; the 60 s fallback (well past a sibling drive under load) only bounds a regression where the verdict wait is held.
   const poll = setInterval(() => { if (api.states.some(x => x.body.status === "completed")) release(); }, 5);
-  const fallback = setTimeout(release, 8000);
+  const fallback = setTimeout(release, 60000);
   let completedWhenReleased: boolean | undefined;
   const result = await drive({
     arrange: s => {

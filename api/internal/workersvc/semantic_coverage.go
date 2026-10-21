@@ -348,10 +348,10 @@ func (c *semanticCoverageTx) reserve(ctx context.Context, runID, workerID uuid.U
 
 // SemanticCoverageStatus returns current-candidate evidence and run-wide charges.
 // Historical reports never authorize a replacement candidate.
-func (s *Service) SemanticCoverageStatus(ctx context.Context, workerID, runID uuid.UUID, generation int64) (apitypes.SemanticCoverageStatus, error) {
-	out := apitypes.SemanticCoverageStatus{Outcome: "unavailable"}
+func (s *Service) SemanticCoverageStatus(ctx context.Context, workerID, runID uuid.UUID, generation int64) (apitypes.SemanticCoverageWorkerStatus, error) {
+	out := apitypes.SemanticCoverageWorkerStatus{SemanticCoverageStatus: apitypes.SemanticCoverageStatus{Outcome: "unavailable"}}
 	err := s.withSemanticCoverage(ctx, workerID, runID, generation, func(c *semanticCoverageTx) error {
-		out = evaluateSemanticCoverage(c, c.run).Status
+		out.SemanticCoverageStatus = evaluateSemanticCoverage(c, c.run).Status
 		// A status deadline describes the latest review; it is never a run wall clock.
 		out.Deadline = time.Time{}
 		if len(c.ledger.Reviews) > 0 {

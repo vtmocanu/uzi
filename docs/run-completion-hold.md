@@ -435,8 +435,8 @@ the branch is pushed:
   paths (for such a run, between the saved raw body and the current raw body);
   an added or removed link counts as a contradiction, like a changed or unknown
   source. A run resumed after a worker restart or reclaim still records the
-  publication observation: the worker fetches the frozen PRD source refs (ids
-  and hashes only) from the server's coverage status.
+  publication observation: the worker fetches the frozen PRD source refs
+  (source identities and hashes, no source text) from the server's coverage status.
 - Each source comes out **unchanged**, **changed** or **unknown** with a reason
   (for example the forge was unreadable or timed out). Unknown counts as a
   contradiction, and a flip of only a task-list checkbox is recorded as
@@ -444,8 +444,9 @@ the branch is pushed:
 - At most 32 observations are kept; the number dropped is counted.
 - It is shown as the owner-only `semantic_drift` field on the run, a
   `SEMANTIC_DRIFT` row in `uzi run get`, and a short note in the pull request
-  body when the publication-time observation recorded a contradiction. An
-  observation the run page cannot load is omitted rather than failing the page.
+  body when the publication-time observation recorded a contradiction. If
+  the drift observations cannot be loaded, the run page (and `uzi run get`)
+  omits the drift section rather than failing.
 
 Drift never holds, refuses, revises or satisfies anything, and it never
 replaces the approved contract; it asks you to look. A scheduled run whose
