@@ -119,7 +119,7 @@ it("keeps canonical metadata and supports optional promo dates and own model key
       "https://developers.openai.com/api/docs/pricing",
       `https://developers.openai.com/api/docs/models/${model}`,
     ]);
-    assert.equal(data.verified_at, model === "gpt-6-sol" ? "2026-09-23" : model === "gpt-6.1-sol" ? "2026-10-01" : model === "gpt-6-luna" ? "2026-10-09" : "2026-09-13");
+    assert.equal(data.verified_at, model === "gpt-6-sol" ? "2026-09-23" : model === "gpt-6.1-sol" ? "2026-10-01" : model === "gpt-6-luna" ? "2026-10-09" : "2026-10-21");
     assert.equal(Object.hasOwn(data, "promo_review_date"), model === "gpt-5.6-sol");
   }
   assert.doesNotThrow(() => validateCodexPricing(changed([...row, "promo_review_date"], undefined, true)));
