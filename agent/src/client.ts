@@ -4499,6 +4499,12 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; cross-check methods, strict gate and terminal RunDTO ACKs opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+/** PRD #1230 M4: a maximally escaped completion_pending projection stays below 20 MiB
+ * (api TestSemanticCompletionPendingWireBound). The server's header grants that bounded
+ * allowance on top of a state ACK's own cap; the projection must still decode strictly,
+ * and a header without a projection is malformed. Mirrors apitypes.CompletionPending*. */
+const COMPLETION_PENDING_HEADER = "X-Uzi-Completion-Pending";
+const COMPLETION_PENDING_ACK_ALLOWANCE_BYTES = 20 * 1024 * 1024;
 const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
@@ -4712,7 +4718,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
 }> {
-  const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
+  const pendingMarker = res.headers.get(COMPLETION_PENDING_HEADER);
+  const ackCap = maxAckBytes === undefined ? undefined
+    : maxAckBytes + (pendingMarker === "v1" ? COMPLETION_PENDING_ACK_ALLOWANCE_BYTES : 0);
+  const boundedText = ackCap === undefined ? undefined : await readBoundedText(res, ackCap, true);
   try {
     const text = boundedText ?? await readResponseText(res);
     MaintenanceBudget.current()?.check();
@@ -4858,6 +4867,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       if (pending.kind === "ok") out.completionPending = pending.pending;
       else out.completionPendingMalformed = true;
     }
+    if (pendingMarker !== null && (pendingMarker !== "v1" || out.completionPending === undefined))
+      out.completionPendingMalformed = true;
     if (typeof run?.completion_attempts === "number" && Number.isSafeInteger(run.completion_attempts) && run.completion_attempts >= 0)
       out.completionAttempts = run.completion_attempts;
     // PRD #1189 M1 (D6): the served TOTAL wall (frozen budget + extension). null (a run with no

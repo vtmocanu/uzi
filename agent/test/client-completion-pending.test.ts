@@ -98,6 +98,31 @@ describe("state ACK completion_pending", () => {
     body = { run: { ...run, completion_pending: { version: 9 } } };
     assert.equal((await client.reportState("run", { status: "running" })).completionPendingMalformed, true);
   });
+  it("a maximally escaped projection fits a running ACK only under the server's pending header", async t => {
+    // Every text byte escapes to six wire bytes, as in api TestSemanticCompletionPendingWireBound.
+    const text = "\u0001".repeat(2048), step = "\u0001".repeat(512);
+    const max = pending({}, Array.from({ length: 256 }, (_, i) => criterion({
+      criterion_id: `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, milestone_id: "m".repeat(64),
+      text, reason: text, conditions: Array(8).fill(step), verification_steps: Array(8).fill(step),
+    })));
+    const wire = JSON.stringify({ run: { ...run, completion_pending: max } });
+    assert.ok(wire.length > 18 * 1024 * 1024 && wire.length < 6 * 1024 * 1024 + 20 * 1024 * 1024);
+    let respond = () => new Response(wire, { headers: { "X-Uzi-Completion-Pending": "v1" } });
+    t.mock.method(globalThis, "fetch", async () => respond());
+    const client = new WorkerClient("http://example.com", "fake-worker-token", "test", nullLogger(), { terminalRetrySchedule: [], sleep: async () => {} });
+    assert.equal((await client.reportState("run", { status: "running" })).completionPending?.criteria.length, 256);
+    // Without the header the structural 6 MiB cap still applies.
+    respond = () => new Response(wire);
+    await assert.rejects(client.reportState("run", { status: "running" }), /exceeds/);
+    // The header grants a bounded allowance, not an unbounded read.
+    respond = () => new Response(wire + " ".repeat(8 * 1024 * 1024), { headers: { "X-Uzi-Completion-Pending": "v1" } });
+    await assert.rejects(client.reportState("run", { status: "running" }), /exceeds/);
+    // A header without a projection, or an unknown version, fails closed.
+    for (const [version, payload] of [["v1", { run }], ["v2", { run: { ...run, completion_pending: pending() } }]] as const) {
+      respond = () => new Response(JSON.stringify(payload), { headers: { "X-Uzi-Completion-Pending": version } });
+      assert.equal((await client.reportState("run", { status: "running" })).completionPendingMalformed, true, version);
+    }
+  });
 });
 
 describe("completion permit completion_pending", () => {

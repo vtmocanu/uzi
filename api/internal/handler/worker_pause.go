@@ -30,7 +30,7 @@ func (h *Handler) WorkerRunPause(w http.ResponseWriter, r *http.Request) {
 	}
 	run, applied, err := h.wsvc.RequestWorkerPause(r.Context(), wkr, id, body.ClaimGeneration)
 	if errors.Is(err, workersvc.ErrRunWallExpired) {
-		ack, ackErr := h.workerStateAck(r, run)
+		ack, ackErr := h.workerStateAck(w, r, run)
 		if ackErr != nil {
 			httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
 			return
@@ -53,7 +53,7 @@ func (h *Handler) WorkerRunPause(w http.ResponseWriter, r *http.Request) {
 	if !applied {
 		code = http.StatusConflict
 	}
-	ack, ackErr := h.workerStateAck(r, run)
+	ack, ackErr := h.workerStateAck(w, r, run)
 	if ackErr != nil {
 		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")
 		return

@@ -22,3 +22,13 @@ const (
 	RunInputLegacyMaxBytes   = 1 << 20
 	SemanticRunInputMaxBytes = SemanticApprovalMaxBytes + RunInputLegacyMaxBytes
 )
+
+// A worker state ACK carrying run.completion_pending sets this header. A maximally
+// escaped projection stays below CompletionPendingMaxBytes
+// (TestSemanticCompletionPendingWireBound), which the worker adds to the ACK's
+// ordinary cap only when the header is present. The projection still decodes strictly.
+const (
+	CompletionPendingHeader   = "X-Uzi-Completion-Pending"
+	CompletionPendingVersion  = "v1"
+	CompletionPendingMaxBytes = 20 << 20
+)
