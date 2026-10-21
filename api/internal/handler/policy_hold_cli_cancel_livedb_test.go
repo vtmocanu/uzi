@@ -53,15 +53,22 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 		reason  string
 		pending bool
 		foreign bool
+		resume  bool
+		live    bool
 	}{
 		{name: "paused_held_plain_cancel"},
 		{name: "paused_held_cancel_with_reason", reason: "owner aborts this run"},
 		{name: "pending_outcome_refusal_then_explicit_discard_preserves_custody", pending: true},
 		{name: "foreign_owner_refused", foreign: true},
+		{name: "preserving_resume_queued_cancel", resume: true},
+		{name: "preserving_resume_seeded_active_claim_worker_delivery_cancel", resume: true, live: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newSettleEnv(t)
 			e.wsvc.SetTxBeginner(e.pool)
+			if tc.resume {
+				policyCancelConfigureResume(t, e)
+			}
 			// A well-shaped frozen source without a primary revision, using the V1
 			// shape in newPolicyStopConfirmNoFeedbackEnv. No Stop receipt is seeded.
 			presentation := uuid.New()
@@ -184,10 +191,18 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 					t.Fatalf("HTTP status=%d want=%d response=%s", o.status, wantStatus, o.response)
 				}
 				if wantStatus == http.StatusAccepted {
-					if strings.TrimSpace(o.response) != `{"server_side":true}` {
+					wantReceipt := `{"server_side":true}`
+					if tc.live {
+						wantReceipt = `{"server_side":false}`
+					}
+					if strings.TrimSpace(o.response) != wantReceipt {
 						t.Fatalf("Cancel receipt fabricated extra state: %s", o.response)
 					}
-					if strings.TrimSpace(output) != e.run.String()+": run cancelled" {
+					wantOutput := e.run.String() + ": run cancelled"
+					if tc.live {
+						wantOutput = e.run.String() + ": cancellation sent"
+					}
+					if strings.TrimSpace(output) != wantOutput {
 						t.Fatalf("CLI did not report committed cancellation: %s", output)
 					}
 				} else if strings.Contains(output, "run cancelled") || strings.Contains(output, "cancellation sent") {
@@ -205,6 +220,12 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 					}
 				}
 			}
+			if tc.resume {
+				policyCancelPreserveResume(t, e, token, snapshot)
+			}
+			if tc.live {
+				policyCancelActiveSnapshot(t, e, snapshot)
+			}
 			before := snapshot(t)
 			if tc.foreign {
 				invoke(t, false, http.StatusNotFound)
@@ -220,8 +241,14 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 				}
 			}
 			invoke(t, tc.pending, http.StatusAccepted)
+			if tc.live {
+				policyCancelDeliverAndTerminate(t, e, before, snapshot)
+			}
 			after := snapshot(t)
 			for _, key := range []string{"custody", "inputs", "leases"} {
+				if tc.live && key == "inputs" {
+					continue // Exact delivery/consumption changes checked by policyCancelDeliverAndTerminate.
+				}
 				policyCancelEqualJSON(t, key, before[key], after[key])
 			}
 			var prior, current map[string]json.RawMessage
@@ -272,6 +299,9 @@ func TestPolicyHoldCLICancelLiveDB(t *testing.T) {
 				invoke(t, tc.pending, http.StatusConflict)
 				policyCancelEqualJSON(t, "terminal retry", after, snapshot(t))
 			})
+			if tc.resume {
+				policyCancelLateResumeRejected(t, e, after, snapshot)
+			}
 			if head, compare := e.fake.calls(); head != 0 || compare != 0 {
 				t.Fatal("Cancel attempted forge ancestry resolution")
 			}
