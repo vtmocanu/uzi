@@ -65,7 +65,10 @@ type rollTick struct {
 	outcomes  map[string]*protocol.Pacing
 	start     time.Time
 	uncertain map[string]bool
-	errors    []error
+	// layoutUncertain names, per coverage key, the held worker whose own reservation
+	// could not be shown withdrawn (see holdForLayoutMigration).
+	layoutUncertain map[string]string
+	errors          []error
 }
 type rollTickKey struct{}
 
@@ -81,13 +84,16 @@ func (m *Materializer) PacingOutcomes() map[string]*protocol.Pacing {
 }
 
 func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredWorker, observed map[string]reconcile.ObservedWorker) (*rollTick, []protocol.DesiredWorker) {
-	t := &rollTick{entries: map[string]*rollEntry{}, outcomes: map[string]*protocol.Pacing{}, start: m.now(), uncertain: map[string]bool{}}
+	t := &rollTick{entries: map[string]*rollEntry{}, outcomes: map[string]*protocol.Pacing{}, start: m.now(), uncertain: map[string]bool{}, layoutUncertain: map[string]string{}}
 	if start, ok := reconcile.PollStart(ctx); ok {
 		t.start = start
 	}
 	namespaces := map[string][]*rollEntry{}
 	for _, w := range desired {
 		if w.Ephemeral {
+			// Ephemeral workers are outside the roll pools and slots; only the layout
+			// migration hold is surfaced for them (pacing entry, no roll entry).
+			m.surfaceEphemeralLayoutHold(t, w, observed[w.ID])
 			continue
 		}
 		ns, err := m.cfg.Placement(w)
@@ -170,6 +176,17 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 		}
 		e.coverage = coverage
+		// Layout migration guard (issue #3153), BEFORE the ForceRoll override below: a
+		// held worker's template replacement would destroy custody-held run state, so
+		// it is never admitted, never a canary and never takes a roll slot. Not
+		// adding it to a pool is what keeps it out of all three. A failed roll
+		// snapshot leaves e.dep nil, so drift is then judged from the observation.
+		drifted := e.drift || (e.dep == nil && e.o.HasDeployment &&
+			(e.o.SpecHash != e.target.Spec.Template.Annotations[AnnotationSpecHash] || e.o.Generation != e.w.Generation))
+		if drifted && migrationHeld(e.w, e.o.RunnerLayout) {
+			m.holdForLayoutMigration(ctx, t, e)
+			continue
+		}
 		if !ok && e.blocked == "" {
 			e.blocked = "API coverage evidence unavailable; explicit recovery required"
 		}
@@ -230,6 +247,69 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	m.pacing = t.outcomes
 	return t, order
 }
+
+// holdForLayoutMigration reports the worker held and withdraws its own incomplete
+// roll reservation. The reservation must go because the held worker is outside the
+// pool: planPool's in-flight, promotion and pending accounting never sees it, so a
+// cohort could otherwise complete without it and wedge it (and every later drift in
+// the pool) behind a stale incomplete marker once custody releases. Cancelling is
+// metadata-only (no template or replicas change, no pod replaced) and is the same
+// cancellation planPool already applies to an obsolete marker; the worker simply
+// re-enters admission as a fresh drifted participant after the hold lifts.
+//
+// Whenever an open reservation could not be shown withdrawn (the cancel failed, or
+// the snapshot already left the worker blocked with one still present), the pool is
+// marked uncertain and planPool skips completing its cohort this tick.
+//
+// Invariant relied on: a held canary never has in-flight participants. Participants
+// get roll budget only after the canary is promoted, and a promoted canary is on the
+// target template, so it is not drifted and cannot be held. This holds while the
+// pool's roll target is unchanged. A mid-cohort target change can re-drift a
+// promoted canary, which is then held only if it is custody-held and its observed
+// layout is old or unknown (a leftover old-layout pod, or a failed pod list); that
+// case is not specially guarded. With no decodable marker the fence keys on the
+// worker's current coverage, which can differ from a cohort reserved under older
+// capabilities.
+func (m *Materializer) holdForLayoutMigration(ctx context.Context, t *rollTick, e *rollEntry) {
+	t.outcomes[e.w.ID].State = "held"
+	t.outcomes[e.w.ID].BlockingReason = pacingText(layoutMigrationReason)
+	fence := func() {
+		key := coverageKey(e.coverage)
+		t.uncertain[key] = true
+		t.layoutUncertain[key] = e.w.ID
+	}
+	if e.blocked != "" {
+		if hasOpenReservation(e) {
+			fence()
+		}
+		return
+	}
+	if e.dep == nil || e.marker == nil || e.marker.Completed {
+		return
+	}
+	if e.claim != nil && e.claim.Annotations[annotationRoll] != "" {
+		if err := m.mirrorRoll(ctx, e, nil); err != nil {
+			e.blocked = "held reservation mirror cancellation unconfirmed"
+			fence()
+			return
+		}
+	}
+	if err := m.reserveRoll(ctx, e, nil); err != nil {
+		e.blocked = "held reservation cancellation unconfirmed"
+		fence()
+	}
+}
+
+// hasOpenReservation reports any reservation metadata that is not a Completed
+// marker: an incomplete decoded marker, an undecodable or unrestored Deployment
+// annotation, or a retained claim mirror.
+func hasOpenReservation(e *rollEntry) bool {
+	if e.marker != nil {
+		return !e.marker.Completed
+	}
+	return (e.dep != nil && e.dep.Annotations[annotationRoll] != "") || (e.claim != nil && e.claim.Annotations[annotationRoll] != "")
+}
+
 func pacingText(s string) *string {
 	if s == "" {
 		return nil
@@ -433,6 +513,20 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 		}
 	}
 	if allPromoted && blocker == "" {
+		// A held worker whose own reservation could not be withdrawn marked this pool
+		// uncertain earlier in the tick: completing the canary now would pair a
+		// Completed cohort with that worker's still-incomplete marker.
+		if key := coverageKey(pool[0].coverage); t.uncertain[key] {
+			if id := t.layoutUncertain[key]; id != "" {
+				for _, e := range pool {
+					p := t.outcomes[e.w.ID]
+					p.State = "held"
+					p.BlockingWorkerID = pacingText(id)
+					p.BlockingReason = pacingText("cohort completion suspended: layout-held worker " + id + " reservation unresolved")
+				}
+			}
+			return
+		}
 		for _, e := range pool {
 			if e.w.ID == canary {
 				r := *e.marker
@@ -801,6 +895,11 @@ func independentRebuild(e *rollEntry) bool {
 // Independent maintenance creates no image-roll participant. Existing image-roll
 // reservations are retained by the caller through the retained data claim.
 func (m *Materializer) reserveMaintenanceRoll(e *rollEntry) error {
+	// Defense in depth: its callers (recycleWorkerVolumes, fenced DinD stopping)
+	// already return for a held worker before reaching here.
+	if migrationHeld(e.w, e.o.RunnerLayout) {
+		return fmt.Errorf("layout migration custody hold; maintenance roll refused")
+	}
 	if e.marker == nil && e.drift && !m.drain.ForceRoll {
 		return fmt.Errorf("maintenance image admission unavailable; explicit recovery required")
 	}
@@ -1317,6 +1416,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		if e.dep != nil {
 			failure = replicaFailureReason(e.dep)
 		}
+		e.o.RunnerLayout = observeRunnerLayout(e.w.ID, e.pods)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health

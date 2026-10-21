@@ -30,8 +30,9 @@ installHarness();
 // already-committed milestones. The park path (runner.ts catch/park block) now calls
 // publishCheckpointBestEffort AFTER the fetch-back (so the tracking ref is current),
 // one-shot and unconditional — the mid-run time-gate does not reach here. checkpointPack
-// no-ops to null when there is no tracking ref / no work beyond the floor, so an empty
-// park brokers nothing. The publish stays on the join-token seam (client.publishCheckpoint),
+// no-ops to null when there is no tracking ref. A park with no work beyond the floor re-sends
+// only the run's own base commit (issue #3242: a bounded retransmission so the broker holds the
+// declared tip even after the default branch moves), never content beyond origin's history. The publish stays on the join-token seam (client.publishCheckpoint),
 // never a git push / PAT.
 
 const GIT_ENV = {
@@ -62,6 +63,8 @@ interface PublishCall {
   runId: string;
   tipOid: string;
   objectCount: number;
+  /** The buffered pack bytes, for object-level assertions. */
+  pack: Buffer;
 }
 
 /** Fully buffer a Readable and return the concatenated bytes. */
@@ -90,7 +93,7 @@ function spyPublish(opts: { throws?: boolean } = {}): {
     const bytes = await drain(pack);
     // Packfile: "PACK" (4) + version (4) + object count (4, big-endian).
     const objectCount = bytes.length >= 12 ? bytes.readUInt32BE(8) : -1;
-    calls.push({ runId, tipOid, objectCount });
+    calls.push({ runId, tipOid, objectCount, pack: bytes });
     if (opts.throws) throw new Error("boom publish");
     return { ok: true, body: { published: true, ref: `refs/uzi-checkpoints/agent/issue-x` } };
   };
@@ -122,12 +125,14 @@ function runnerWithGit(
 function parkFactory(
   homeRoot: string,
   file: string | null,
-): { factory: ExecutorFactory; sha: () => string } {
-  let sha = "";
+): { factory: ExecutorFactory; sha: () => string; startHead: () => string } {
+  let sha = "", startHead = "";
   const factory: ExecutorFactory = (runId) => ({
     homeDir: path.join(homeRoot, runId),
     executor: {
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
+        // The clone's starting commit, read before the executor changes anything.
+        startHead = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim();
         if (file) sha = commitInTree(ctx.worktreePath, file, "work before the park\n");
         fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
         throw new LimitReachedError({
@@ -137,7 +142,7 @@ function parkFactory(
       },
     },
   });
-  return { factory, sha: () => sha };
+  return { factory, sha: () => sha, startHead: () => startHead };
 }
 
 const parked = (runId: string) =>
@@ -237,30 +242,43 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
     }
   });
 
-  // Verified 2026-08-23: with a tracking ref present but unmoved past the floor,
-  // checkpointPack does NOT return null (it only nulls on a MISSING tracking ref, git.ts:749-750)
-  // — it returns a non-null but EMPTY (zero-object) pack, so the one-shot park publish fires an
-  // RPC carrying nothing. That is harmless (origin gains no objects); the invariant the tree-loss
-  // fix needs is only that no SPURIOUS non-empty checkpoint is brokered on an empty park.
-  it("brokers no non-empty delta on a park with no new work beyond the floor (checkpointPack empty-pack no-op)", async () => {
+  // With a tracking ref present but unmoved past the floor, checkpointPack does NOT return null
+  // (it only nulls on a MISSING tracking ref). Since issue #3242 the zero range packs the run's base
+  // commit over its parents, so the broker holds the declared tip even after the default branch
+  // moves: a bounded retransmission of what origin already has. The invariant the #628 tree-loss
+  // fix needs is that an empty park never brokers a SPURIOUS checkpoint: no tip but the run's own
+  // starting commit, and no object beyond that commit's history.
+  it("brokers only the run's own base on a park with no new work beyond the floor", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-628-noop-"));
     const { calls, restore } = spyPublish();
     try {
-      const { factory } = parkFactory(homeRoot, null); // parks WITHOUT committing
+      const { factory, startHead } = parkFactory(homeRoot, null); // parks WITHOUT committing
       const claim = gitlabClaim(602, { wait_on_limit: true });
       await runnerWithGit(factory, gitlab).execute(claim);
 
       assert.ok(parked(claim.run_id), "the run must have parked (else this is vacuous)");
-      // No new work beyond origin/default: checkpointPack yields no delta, so either no RPC
-      // fires (null pack) or an empty pack (zero objects) is brokered — never a spurious
-      // non-empty checkpoint.
-      const nonEmpty = calls.filter((c) => c.objectCount > 0);
-      assert.strictEqual(
-        nonEmpty.length,
-        0,
-        `an empty park must broker no delta, got ${JSON.stringify(calls)}`,
+      const base = startHead();
+      assert.match(base, /^[0-9a-f]{40}$/, "the clone's starting commit was captured");
+      const ours = calls.filter((c) => c.runId === claim.run_id);
+      assert.ok(ours.length > 0, `the park published for this run (else this is vacuous), got ${JSON.stringify(calls.map((c) => ({ runId: c.runId, tipOid: c.tipOid, objectCount: c.objectCount })))}`);
+      const defaultTip = execFileSync("git", ["-C", fx.originPath, "rev-parse", "HEAD"], { env: GIT_ENV, encoding: "utf8" }).trim();
+      const reachable = new Set(
+        execFileSync("git", ["-C", fx.originPath, "rev-list", "--objects", base], { env: GIT_ENV, encoding: "utf8" })
+          .split("\n").filter(Boolean).map((line) => line.split(" ")[0]),
       );
+      for (const call of ours) {
+        assert.equal(call.tipOid, base, "an empty park declares only the run's starting commit");
+        execFileSync("git", ["-C", fx.originPath, "merge-base", "--is-ancestor", call.tipOid, defaultTip], { env: GIT_ENV });
+        const probe = fs.mkdtempSync(path.join(homeRoot, "pack-"));
+        execFileSync("git", ["init", "-q", "--bare", probe], { env: GIT_ENV });
+        execFileSync("git", ["-C", probe, "unpack-objects", "-q"], { env: GIT_ENV, input: call.pack });
+        const objects = execFileSync("git", ["-C", probe, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)"],
+          { env: GIT_ENV, encoding: "utf8" }).split("\n").filter(Boolean);
+        assert.ok(objects.includes(base), "the pack carries the declared commit (#3242), so an empty pack cannot pass");
+        const foreign = objects.filter((o) => !reachable.has(o));
+        assert.deepEqual(foreign, [], "the pack carries nothing beyond the starting commit's history");
+      }
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });

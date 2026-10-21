@@ -203,6 +203,26 @@ func TestWorkerRenderRailNameAndFoldBudget(t *testing.T) {
 	}
 }
 
+// TestWorkerMemoryAuthorityLostRenders (issue #3142): a gated worker shows the state in the
+// detail view and the list.
+func TestWorkerMemoryAuthorityLostRenders(t *testing.T) {
+	for _, dark := range []bool{true, false} {
+		m := workerRenderModel(dark)
+		w := &m.workers.rows[0].w
+		at := time.Now().Add(-12 * time.Minute)
+		w.MemoryAuthorityLostAt = &at
+		m = step(m, tea.ColorProfileMsg{Profile: colorprofile.Ascii})
+		detail := m.View().Content
+		assertNoRawControls(t, "worker detail", detail)
+		requireWorkerText(t, stripANSI(detail), "memory authority lost", "guard-bound runs withheld")
+		m.view = viewWorkers
+		m.workers.cursor = 0
+		list := m.renderWorkers()
+		assertNoRawControls(t, "worker list", list)
+		requireWorkerText(t, stripANSI(list), "memory authority lost")
+	}
+}
+
 // TestWorkerQuarantineRendersCauseThroughPlain (issue #2213): a quarantined worker shows the
 // state in the list and the detail view, and a hostile worker-reported cause (ESC sequences, a
 // bidi override, newlines, an oversized body) reaches the screen only through renderer.Plain.

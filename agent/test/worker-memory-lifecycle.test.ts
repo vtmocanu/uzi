@@ -331,6 +331,7 @@ for (const memoryGuard of [undefined, { enabled: false as const }, settings]) {
       else await done;
       assert.equal(registrations, 1);
       assert.equal(advertised.includes("worker_memory_pressure_v1"), memoryGuard?.enabled ?? false);
+      assert.equal(advertised.includes("worker_memory_authority_claim_v1"), memoryGuard?.enabled ?? false);
     } finally { controller.abort(); await f.memory.stop(); }
   });
 }

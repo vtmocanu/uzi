@@ -131,11 +131,31 @@ type ObservedWorker struct {
 	// server to release the fence. Zero value means "no pod information",
 	// which RollHealth.Phase renders as the rolling gap.
 	Roll RollHealth
+	// RunnerLayout is the run-workdir layout of this worker's pods, read from the
+	// pod specs in Observe (and refreshed from the roll snapshot). The zero value is
+	// RunnerLayoutUnknown, so an unobserved worker is treated as not-yet-migrated.
+	RunnerLayout RunnerLayout `json:"-"`
 	// Scheduler evidence is tick-local, including for young rolling pods. It is never serialized.
 	SchedulerCapacityReason string                  `json:"-"`
 	SchedulerMountedClaims  map[string]bool         `json:"-"` // namespace/name keys
 	SchedulerPendingClaims  []SchedulerPendingClaim `json:"-"`
 }
+
+// RunnerLayout classifies where a Docker worker's pods keep the run workdir
+// (/data/runner). The zero value is deliberately Unknown: a layout nobody observed
+// must never read as already migrated.
+type RunnerLayout int
+
+const (
+	// RunnerLayoutUnknown: the pod list was unavailable or never read.
+	RunnerLayoutUnknown RunnerLayout = iota
+	// RunnerLayoutNone: pods were read and there are none, so nothing is in-pod to lose.
+	RunnerLayoutNone
+	// RunnerLayoutNew: every pod mounts the data-PVC runner-shared subPath.
+	RunnerLayoutNew
+	// RunnerLayoutOld: at least one pod still keeps the workdir off the PVC.
+	RunnerLayoutOld
+)
 
 // SchedulerPendingClaim retains namespace identity independently of legacy PVC folds.
 type SchedulerPendingClaim struct {
@@ -366,7 +386,10 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 	// cannot add workers outside the poll, and each worker contributes at most one row.
 	for _, w := range desired {
 		pacing := outcomes[w.ID]
-		if reported[w.ID] || pacing == nil {
+		// An ephemeral worker never rolls (a held one carries a layout-migration
+		// pacing entry only), so it must not get a synthetic rolling row: the api
+		// stamps the upgrading_since ceiling anchor on the first non-terminal phase.
+		if reported[w.ID] || pacing == nil || w.Ephemeral {
 			continue
 		}
 		reported[w.ID] = true

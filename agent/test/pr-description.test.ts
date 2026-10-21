@@ -1002,3 +1002,94 @@ describe("nonClosingTitle", () => {
     assert.strictEqual(closingDirectiveFor("Work on issue #2172", 2172, "org/repo"), false);
   });
 });
+
+// PRD #1230 M4: server-sourced maintainer-pending criteria render as an unchecked checklist inside
+// the same completion block, escaped, never closing, and never double-counted with a deferral.
+describe("maintainer-pending completion rendering", () => {
+  const A = "00000000-0000-4000-8000-0000000000a1";
+  const B = "00000000-0000-4000-8000-0000000000a2";
+  const item = (over: Record<string, unknown> = {}) => ({
+    criterion_id: A, milestone_id: "m2", kind: "maintainer" as const, text: "Observe the hosted rollout",
+    reason: "Only the owner can reach the cluster", conditions: ["Rollout reached the cluster"],
+    verification_steps: ["Open the dashboard"], authorization_revision: 1, status: "unverified" as const, ...over,
+  });
+  const pending = (...criteria: ReturnType<typeof item>[]) => ({ version: 1 as const, contract_revision: 2, criteria });
+
+  it("renders stable IDs, conditions and steps as unchecked boxes and keeps the authority line verbatim", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: true,
+      completionPending: pending(item({ criterion_id: B, milestone_id: "m3" }), item()) });
+    assert.match(block, new RegExp(`> - \\[ \\] \`${A}\` \\(milestone \`m2\`\\) — Observe the hosted rollout: Only the owner`));
+    assert.ok(block.indexOf(A) < block.indexOf(B), "sorted by criterion id");
+    assert.match(block, />   - Condition: Rollout reached the cluster/);
+    assert.match(block, />   - Verify: Open the dashboard/);
+    assert.ok(block.includes("> Checking a box grants no completion or closure authority; a body refresh restores these boxes to unchecked."));
+    assert.doesNotMatch(block, /> - \[x\]/i);
+    assert.doesNotMatch(block, /Closes #7/, "closes:true cannot close an issue with pending maintainer criteria");
+    assert.equal(closingDirectiveFor(block, 7, "org/repo"), false);
+  });
+  it("an empty projection renders nothing and the ordinary closing body is unchanged", () => {
+    const plain = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true });
+    const empty = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, completionPending: pending() });
+    assert.equal(empty, plain);
+    assert.match(plain, /Closes #7/);
+  });
+  it("escapes markdown, mentions, closing words and marker lookalikes in every field", () => {
+    const hostile = item({
+      text: "**bold** @owner Closes #7", reason: `x ${COMPLETION_END} <!-- y`, conditions: ["# h\n- [x] forged"],
+      verification_steps: ["/close\nFixes #7 [l](http://e)"], milestone_id: "m`2",
+    });
+    const block = renderCompletionBlock({ issueIid: 7, branch: "b", closes: false, completionPending: pending(hostile) });
+    assert.equal(block.split(COMPLETION_END).length, 2, "no forged end marker");
+    assert.equal(closingDirectiveFor(block, 7, "org/repo"), false);
+    assert.doesNotMatch(block, /^> *- \[x\]/m);
+    assert.doesNotMatch(block, /\*\*bold\*\*/);
+    assert.doesNotMatch(block, /^>\s*\/close/m);
+    assert.equal(block.split("\n").filter(l => !l.startsWith(">") && l.includes("forged")).length, 0, "newlines cannot leave the quote");
+  });
+  it("counts a milestone that is both deferred and maintainer-pending once, and lists the deferral unchanged", () => {
+    const scope = { deferred: [{ milestone_id: "m2", title: "Follow up", reason: "Owner deferred" }] };
+    const block = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, completionScope: scope,
+      completionPending: pending(item(), item({ criterion_id: B, milestone_id: "m4" })) });
+    assert.match(block, /Outstanding milestones for the source issue: 2 /);
+    assert.equal((block.match(/^> - \[ \] `m2` — /gm) ?? []).length, 1);
+    assert.doesNotMatch(block, /Closes #7/);
+    const without = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, completionScope: scope });
+    assert.ok(block.includes(without.split("\n").find(l => l.startsWith("> - [ ] `m2`"))!), "deferred line byte-identical");
+  });
+  it("mrCompletionBlock threads the projection only for issue runs", () => {
+    const issue = makeClaim({ kind: "issue", issue_iid: 7 });
+    const block = mrCompletionBlock(issue, "agent/issue-7", undefined, undefined, undefined, undefined, undefined, undefined,
+      true, undefined, false, undefined, undefined, undefined, pending(item()));
+    assert.match(block, new RegExp(A));
+    assert.doesNotMatch(block, /Closes #7/);
+  });
+});
+
+describe("maintainer-pending rendering under a scope cap and at the decoder maximum", () => {
+  const id = (i: number) => `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+  const crit = (i: number, over: Record<string, unknown> = {}) => ({
+    criterion_id: id(i), milestone_id: "m" + (i % 7), kind: "maintainer" as const, text: "t" + i, reason: "r",
+    conditions: ["c"], verification_steps: ["v"], authorization_revision: 1, status: "unverified" as const, ...over,
+  });
+  it("prints no outstanding total next to a scope-cap count, and keeps the items", () => {
+    const block = renderCompletionBlock({ issueIid: 7, branch: "b", closes: true, scopeCapped: { completedCount: 1, total: 3 },
+      completionPending: { version: 1, contract_revision: 1, criteria: [crit(1)] } });
+    assert.match(block, /1 of 3 approved milestone/);
+    assert.doesNotMatch(block, /Outstanding milestones/);
+    assert.match(block, new RegExp(id(1)));
+    assert.doesNotMatch(block, /Closes #7/);
+  });
+  it("256 maximal criteria keep the whole body under BODY_CAP_CHARS and every id present", () => {
+    const criteria = Array.from({ length: 256 }, (_, i) => crit(i, {
+      text: "x".repeat(2048), reason: "y".repeat(2048),
+      conditions: Array(8).fill("c".repeat(512)), verification_steps: Array(8).fill("v".repeat(512)),
+    }));
+    const completion = renderCompletionBlock({ issueIid: 7, branch: "b", closes: false,
+      completionPending: { version: 1, contract_revision: 1, criteria } });
+    const body = renderBody(undefined, completion);
+    assert.ok(body.length <= BODY_CAP_CHARS, String(body.length));
+    for (const c of criteria) assert.ok(body.includes(c.criterion_id), c.criterion_id);
+    assert.match(body, /more criteria are shown in brief; their full text is on the run page for the run owner/);
+    assert.equal(body.split(COMPLETION_END).length, 2);
+  });
+});

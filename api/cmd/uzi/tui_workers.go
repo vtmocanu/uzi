@@ -319,6 +319,11 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	if w.ResidueQuarantinedAt != nil {
 		add(0, "✕ quarantined", "✕ quarantined "+workerAge(w.ResidueQuarantinedAt, now)+" ago · claims nothing until the worker container restarts · cause: "+renderer.Plain(t.quarantineText, 200))
 	}
+	// Memory authority (issue #3142): the api withholds guard-bound runs from this worker
+	// until its container restarts. The timestamp is control-plane-owned; no worker text.
+	if w.MemoryAuthorityLostAt != nil {
+		add(0, "✕ memory authority lost", "✕ memory authority lost "+workerAge(w.MemoryAuthorityLostAt, now)+" ago · guard-bound runs withheld until the worker container restarts")
+	}
 	for _, volume := range t.pressureText {
 		text := "✕ pressure: " + renderer.Plain(volume, 200)
 		if volume == "dind" {

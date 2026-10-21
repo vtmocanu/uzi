@@ -930,6 +930,10 @@ func isLoopbackURL(u *url.URL) bool {
 // HTTP-status classification, since some callers (the poll loop) branch on
 // non-error statuses like 202/410 that others treat as failures.
 func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBody any) (*http.Response, []byte, error) {
+	return c.doJSONReadOwner(ctx, method, path, reqBody, false)
+}
+
+func (c *HTTPClient) doJSONReadOwner(ctx context.Context, method, path string, reqBody any, ownerRun bool) (*http.Response, []byte, error) {
 	var body io.Reader
 	if reqBody != nil {
 		b, err := json.Marshal(reqBody)
@@ -942,6 +946,9 @@ func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBod
 	if err != nil {
 		return nil, nil, err
 	}
+	if input, ok := reqBody.(apitypes.RunInputRequest); ok && input.SemanticApproval != nil {
+		req.Header.Set(apitypes.SemanticIdentityHeader, apitypes.SemanticIdentityVersion)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		// Any error from Do is a transport failure (dial refused, DNS, TLS,
@@ -951,7 +958,16 @@ func (c *HTTPClient) doJSONRead(ctx context.Context, method, path string, reqBod
 		return nil, nil, transportExit(c.BaseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
+	limit := int64(maxRespBytes)
+	if ownerRun && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(apitypes.SemanticIdentityHeader) == apitypes.SemanticIdentityVersion {
+		limit = apitypes.OwnerRunMaxBytes
+	}
+	var respBody []byte
+	if ownerRun && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		respBody, err = readOwnerResponse(resp.Body, limit)
+	} else {
+		respBody, err = io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
+	}
 	if err != nil {
 		return nil, nil, Exitf(ExitUnreachable, "reading response from uzi: %v", err)
 	}

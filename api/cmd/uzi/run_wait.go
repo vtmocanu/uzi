@@ -111,6 +111,9 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			if isProviderUnavailableHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
 			}
+			if isCredentialSwitchHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			}
 			if isCredentialDisabledHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
@@ -139,7 +142,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 				runID, cellText(run.Status))
 		}
 
-		if targets[run.Status] || (defaultUntil && (isOwnerRequiredWorkerHold(run) || isBaseAttestationHold(run))) {
+		if targets[run.Status] || (defaultUntil && (isOwnerRequiredWorkerHold(run) || isCredentialSwitchHold(run) || isBaseAttestationHold(run))) {
 			// PRD #603: `--min-plan-seq N` (N >= 0) gates ONLY the awaiting_approval
 			// stop so a wait after `run revise` returns on the REVISED plan, not the
 			// stale gate left by the pre-revise plan. Every other target — terminals,

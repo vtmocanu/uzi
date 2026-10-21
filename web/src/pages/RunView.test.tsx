@@ -6077,6 +6077,21 @@ describe("CompletionStatePanel — honest completion-interlock detail (PRD #1226
     expect(container.textContent).toBe("");
   });
 
+  // Issue #3181: a token-switch hold has its own panel; it is not a completion hold, so this
+  // panel stays empty for it. The control shows an unknown hold_reason does render here.
+  it.each([
+    ["credential_switch_settling", false],
+    ["credential_switch_unsettled", false],
+    ["some_future_hold", true],
+  ] as const)("hold_reason %s on a paused run with no completion phase renders: %s", (hold, renders) => {
+    const { container } = render(
+      <CompletionStatePanel
+        run={run({ status: "paused", completion_phase: "", hold_reason: hold, completion_unmet: [], completion_attempts: 0 })}
+      />,
+    );
+    expect(container.textContent !== "").toBe(renders);
+  });
+
   it("renders NOTHING for a run that carries none of the completion fields (rollout skew / non-interlocked)", () => {
     // The default run() builder sets no completion fields — a non-interlocked run (or an
     // old api pod omitting them) must look exactly as today.

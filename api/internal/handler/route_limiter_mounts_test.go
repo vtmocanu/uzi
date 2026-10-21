@@ -911,6 +911,16 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
+	// Semantic planning uses worker authentication and claim-generation fences.
+	// Writes ride proposalLimiter.PerWorkerMiddleware; this per-USER table reads
+	// them as noLimiter. TestSemanticWorkerWritesUseWorkerLimiter proves their worker buckets.
+	{"POST", "/api/worker/runs/{id}/semantic/candidate", noLimiter},
+	// Rides proposalLimiter.PerWorkerMiddleware, which this per-USER probe reads as noLimiter.
+	{"POST", "/api/worker/runs/{id}/semantic/observation", noLimiter},
+	{"GET", "/api/worker/runs/{id}/semantic/coverage", noLimiter},
+	{"POST", "/api/worker/runs/{id}/semantic/coverage/reserve", noLimiter},
+	{"POST", "/api/worker/runs/{id}/semantic/coverage/settle", noLimiter},
+	{"POST", "/api/worker/runs/{id}/semantic/coverage/publish", noLimiter},
 	// Worker-authenticated, generation-fenced, stage-dispatched cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
 	// Owned-worker dispositions are bounded and write-once, like the verdict callback.

@@ -22,6 +22,9 @@ func resetApprovalOptions(cmd *cobra.Command, sel *apitypes.AgentSelection) (*uz
 		}
 		return nil, nil
 	}
+	if cmd.Flags().Changed("semantic-approval") {
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "semantic milestone reset is not supported")
+	}
 	if cmd.Flags().Changed("token") {
 		return nil, uzicli.Exitf(uzicli.ExitUsage, "--reset-milestones cannot be combined with --token")
 	}

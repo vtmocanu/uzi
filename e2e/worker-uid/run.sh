@@ -45,6 +45,8 @@ node e2e/worker-uid/inventory.mjs command > "$REPORT_DIR/command-expected.json"
 COMMAND_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/command-expected.json")"
 node e2e/worker-uid/inventory.mjs single > "$REPORT_DIR/single-expected.json"
 SINGLE_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/single-expected.json")"
+node e2e/worker-uid/inventory.mjs shared > "$REPORT_DIR/shared-expected.json"
+SHARED_PATTERN="$(node e2e/worker-uid/pattern.mjs "$REPORT_DIR/shared-expected.json")"
 if [ "${WORKER_UID_SKIP_BUILD:-}" != 1 ]; then
   phase image-build timeout --kill-after=5s 60s docker build -f agent/templates/base/Dockerfile -t "$IMAGE" .
 fi
@@ -159,6 +161,36 @@ run_single() {
 run_single 1 ok ok --security-opt no-new-privileges
 run_single 2 profile:noNewPrivs noNewPrivs
 run_single 3 profile:capBnd capBnd --security-opt no-new-privileges --cap-add CHOWN
-if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ] || [ "$single_failed" -ne 0 ]; then
+# Issue #3153: the runner-shared volume layout under real uids. One container started as root with
+# exactly the entrypoint's startup capability set (no FOWNER, no FSETID), no network, on tmpfs
+# /data and /nix. The working-tree entrypoint and the controller's golden runner-init script run
+# unmodified inside it; every other identity (worker split/single, runner, runner-cmd, the dind
+# uid, foreign daemon uids) is created with setpriv using agent/src/runner-uid.ts's argv (spawned
+# from root, which holds SETPCAP, so CapBnd differs from production; no DAC outcome depends on it).
+shared_rc=0
+shared_checker_rc=0
+shared_name="$NAME-shared"
+owned_request container "$shared_name"
+phase shared-proof capture "$REPORT_DIR/shared-results.xml" 420 \
+  timeout --kill-after=5s 415s docker run --pull never --network none \
+  --label "io.uzi.worker-uid.invocation=$TOKEN" --name "$shared_name" --user 0:0 --cap-drop ALL \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
+  --security-opt no-new-privileges --workdir /proof --tmpfs /data --tmpfs /nix \
+  --tmpfs /proof/.uzi/scratch:exec,uid=0,gid=0,mode=0700 \
+  --tmpfs /app/uzi-worker-uid-proof:exec,uid=10001,gid=10001,mode=0755 \
+  --mount "type=bind,src=$REPO/e2e/worker-uid,dst=/app/uzi-worker-uid-proof/e2e/worker-uid,readonly" \
+  --mount "type=bind,src=$REPO/agent/src,dst=/app/uzi-worker-uid-proof/agent/src,readonly" \
+  --mount "type=bind,src=$REPO/agent/test,dst=/app/uzi-worker-uid-proof/agent/test,readonly" \
+  --mount "type=bind,src=$REPO/agent/templates,dst=/app/uzi-worker-uid-proof/agent/templates,readonly" \
+  --mount "type=bind,src=$REPO/controller/internal/kube/testdata/runner-shared-init.sh,dst=/app/uzi-worker-uid-proof/controller/internal/kube/testdata/runner-shared-init.sh,readonly" \
+  --entrypoint /usr/local/bin/node "$IMAGE" \
+  --import /app/node_modules/tsx/dist/loader.mjs --import /app/uzi-worker-uid-proof/e2e/worker-uid/image-layout.mjs \
+  --test --test-concurrency=1 --test-timeout=120000 --test-reporter=junit \
+  --test-name-pattern "$SHARED_PATTERN" /app/uzi-worker-uid-proof/e2e/worker-uid/runner-shared-real.test.mts || shared_rc=$?
+python3 e2e/worker-uid/check.py "$REPORT_DIR/shared-expected.json" "$REPORT_DIR/shared-results.xml" || shared_checker_rc=$?
+if [ "$shared_rc" -ne 0 ]; then
+  printf 'worker UID shared node/container exit: %s\n' "$shared_rc" >&2
+fi
+if [ "$rc" -ne 0 ] || [ "$checker_rc" -ne 0 ] || [ "$command_rc" -ne 0 ] || [ "$command_checker_rc" -ne 0 ] || [ "$single_failed" -ne 0 ] || [ "$shared_rc" -ne 0 ] || [ "$shared_checker_rc" -ne 0 ]; then
   exit 1
 fi
