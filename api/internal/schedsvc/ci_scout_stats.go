@@ -498,9 +498,10 @@ func scoutAggregate(runs []scoutRun, now time.Time) scoutStats {
 
 // crossRunFlakes pairs runs of the same population and workflow on the same full SHA: a
 // job identity whose final execution failed in an earlier run and passed in a later one
-// is a suspected flake. The pair keeps both executions; the failed one's duration is the
-// failed execution and the passing one's the rerun. Different workflows, populations or
-// SHAs never pair.
+// is a suspected flake. Every failed final execution since the first failure counts as
+// failed execution, and every execution after the first failure (later failures and the
+// pass) as rerun execution, each charged once per metric. The pair records the first
+// failure and the pass. Different workflows, populations or SHAs never pair.
 func crossRunFlakes(runs []scoutRun, rowFor func(scoutRun, string) *jobRow) {
 	type lane struct{ pop, workflow, sha string }
 	byLane := map[lane][]scoutRun{}
@@ -522,22 +523,29 @@ func crossRunFlakes(runs []scoutRun, rowFor func(scoutRun, string) *jobRow) {
 			run int64
 			job forge.Job
 		}
-		failedIn := map[string]failed{}
+		// failedIn holds, per identity, the failed final executions since its first
+		// failure on this commit, oldest first.
+		failedIn := map[string][]failed{}
 		for _, r := range rs {
 			groups := executions(r.Jobs)
 			for _, name := range sortedNames(groups) {
 				final := groups[name][len(groups[name])-1]
 				switch {
 				case jobFailed(final):
-					failedIn[name] = failed{r.Run.ID, final}
+					failedIn[name] = append(failedIn[name], failed{r.Run.ID, final})
 				case jobPassed(final):
-					fl, ok := failedIn[name]
-					if !ok {
+					fails := failedIn[name]
+					if len(fails) == 0 {
 						continue
 					}
 					row := rowFor(r, name)
-					row.Flakes = append(row.Flakes, flakePair{jobRef{fl.run, fl.job.ID}, jobRef{r.Run.ID, final.ID}})
-					row.charge(&row.FlakeFailed, fl.run, fl.job)
+					row.Flakes = append(row.Flakes, flakePair{jobRef{fails[0].run, fails[0].job.ID}, jobRef{r.Run.ID, final.ID}})
+					for i, fl := range fails {
+						row.charge(&row.FlakeFailed, fl.run, fl.job)
+						if i > 0 {
+							row.charge(&row.FlakeRerun, fl.run, fl.job)
+						}
+					}
 					row.charge(&row.FlakeRerun, r.Run.ID, final)
 					delete(failedIn, name)
 				}

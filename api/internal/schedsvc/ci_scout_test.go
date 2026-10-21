@@ -718,3 +718,20 @@ func TestScoutFailedRetryCountsAsBothFailedAndRerunExecution(t *testing.T) {
 		t.Fatalf("failed=%v rerun=%v, want 5m and 12m", row.FlakeFailed, row.FlakeRerun)
 	}
 }
+
+func TestScoutCrossRunFlakeChargesEveryFailureSinceTheFirst(t *testing.T) {
+	// Review finding (#3233): three runs on one commit fail 2m, fail 3m, pass 9m. Failed
+	// execution is 2m + 3m; rerun execution is everything after the first failure, 3m + 9m.
+	runs := []scoutRun{
+		{Pop: scoutPopMain, Run: ghRun(1, "ci", "same", at(0)), HistoryKnown: true, Jobs: []forge.Job{job(11, "e2e", "failure", attempt(1), at(1), at(3))}},
+		{Pop: scoutPopMain, Run: ghRun(2, "ci", "same", at(10)), HistoryKnown: true, Jobs: []forge.Job{job(21, "e2e", "failure", attempt(1), at(11), at(14))}},
+		{Pop: scoutPopMain, Run: ghRun(3, "ci", "same", at(20)), HistoryKnown: true, Jobs: []forge.Job{job(31, "e2e", "success", attempt(1), at(21), at(30))}},
+	}
+	row := scoutAggregate(runs, at(60)).Jobs[0]
+	if row.FlakeFailed != (costSum{Known: 5 * time.Minute}) || row.FlakeRerun != (costSum{Known: 12 * time.Minute}) {
+		t.Fatalf("failed=%v rerun=%v, want 5m and 12m", row.FlakeFailed, row.FlakeRerun)
+	}
+	if len(row.Flakes) != 1 || row.Flakes[0] != (flakePair{jobRef{1, 11}, jobRef{3, 31}}) {
+		t.Fatalf("pairs = %+v, want first failure #1 -> pass #3", row.Flakes)
+	}
+}
