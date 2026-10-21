@@ -240,35 +240,27 @@ jobs:
       (github.event_name != 'pull_request' || needs.changes.result != 'success' ||
       needs.changes.outputs.skip_components != '1')
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        # Same digest docker-compose.yml pins, so CI tests the engine the stack
-        # runs. GitHub service containers cannot override the image command, so the
-        # GitLab job's fsync=off/full_page_writes=off/synchronous_commit=off perf
-        # tuning is dropped -- those are crash-recovery knobs, behaviour-identical.
-        # Pulled through mirror.gcr.io (Google's Docker Hub cache): runners share Docker
-        # Hub's anonymous per-IP quota (toomanyrequests, 2026-10-09). Same digest, so the
-        # same image; a service container cannot use the daemon mirror (it starts before
-        # any step), hence the explicit host. For the same reason it has no Docker Hub
-        # fallback (scripts/docker-pull-fallback.sh needs a step): a mirror eviction of
-        # this digest fails the job until the image is cached again.
-        image: mirror.gcr.io/library/postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
-        env:
-          POSTGRES_USER: uzi
-          POSTGRES_DB: uzi
-          # Throwaway per-job database, reachable only from this job -- never a credential.
-          POSTGRES_PASSWORD: uzi-ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U uzi -d uzi"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
+      # Same engine as docker-compose.yml. Pull in a step so mirror quota errors
+      # get bounded retries and Docker Hub fallback before the database starts.
+      UZI_CI_PG_IMAGE: mirror.gcr.io/library/postgres:17@sha256:5c855ad7b85e68e48a62f34662853f38b57c1c1d80f3a927ab58034fd6d31c5e
       UZI_TEST_DATABASE_URL: postgres://uzi:uzi-ci@localhost:5432/uzi?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Start pinned Postgres (mirror first, Docker Hub fallback)
+        run: |
+          ref=$(./scripts/docker-pull-fallback.sh --print-ref "${UZI_CI_PG_IMAGE#mirror.gcr.io/}")
+          docker run -d --pull=never --name ci-pg -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=uzi -e POSTGRES_DB=uzi -e POSTGRES_PASSWORD=uzi-ci "$ref"
+          for ((attempt=1; attempt<=10; attempt++)); do
+            if docker exec ci-pg pg_isready -h 127.0.0.1 -U uzi -d uzi; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs ci-pg
+          echo "Postgres did not become ready after 10 checks" >&2
+          exit 1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
           # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release
