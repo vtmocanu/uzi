@@ -125,6 +125,7 @@ export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_g
 export type PlanCrossCheckDiffRefusal = "base_unavailable" | "diff_failed" | "diff_too_large"
   | "too_many_untracked" | "secret_detected" | "scan_failed" | "unsupported_entry";
 import { parseSemanticEnrollment, parseSemanticCandidate, SEMANTIC_ENVELOPE_MAX_BYTES } from "./semantic-plan.js";
+import { semanticObservationRecordSchema, SEMANTIC_OBSERVATION_RESPONSE_MAX_BYTES, type SemanticObservationRequest } from "./semantic-drift.js";
 import { semanticCandidateResponseSchema, semanticCoverageStatusSchema, semanticReservationSchema,
   type SemanticReserveRequest, type SemanticSettleRequest, type SemanticPublishRequest } from "./semantic-coverage-wire.js";
 
@@ -2041,6 +2042,14 @@ export class WorkerClient {
     return semanticCoverageStatusSchema.parse(await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/coverage/publish`,
       { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, 128 * 1024, true));
+  }
+
+  /** PRD #1230 D5: record one drift observation. Detection only; the caller treats any throw as "not observed". */
+  async postSemanticObservation(runId: string, generation: number, request: SemanticObservationRequest, signal?: AbortSignal) {
+    const owned = this.semanticRequestSignal(generation, signal);
+    return semanticObservationRecordSchema.parse(await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/semantic/observation`,
+      { claim_generation: generation, ...request }, this.httpTimeoutMs, owned, SEMANTIC_OBSERVATION_RESPONSE_MAX_BYTES, true));
   }
 
   async planCrossCheckStatus(runId: string, claimGeneration: number, round = 1, signal?: AbortSignal): Promise<PlanCrossCheckResponse> {

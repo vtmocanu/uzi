@@ -13,6 +13,8 @@ export const SEMANTIC_ENVELOPE_MAX_BYTES = 64 * 1024 * KiB;
 // 41,794,560 bytes; bounded keys, numbers and punctuation fit below 48 MiB.
 const SEMANTIC_PROPOSAL_MAX_BYTES = 48 * 1024 * KiB;
 const limits = { issue: 64 * KiB, prd: 256 * KiB, plan: 256 * KiB, total: 576 * KiB };
+/** The per-PRD read ceiling shared with the drift observation (semantic-drift.ts). */
+export const SEMANTIC_PRD_MAX_BYTES = limits.prd;
 const validString = (s: string): boolean => Buffer.from(s).toString("utf8") === s;
 const text = (max: number) => z.string().refine(
   s => validString(s) && /[^\p{White_Space}]/u.test(s) && Buffer.byteLength(s) <= max,

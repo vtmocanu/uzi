@@ -52,6 +52,7 @@ import { PLAN_REVISION_RETRY_FEATURE, PlanRevisionRecovery, PlanRevisionRecovery
 import { checkPlan, type CheckedHumanGate, type PlanCrossCheckTiming } from "./plan-cross-check-gate.js";
 import { captureSemanticSources, parseSemanticEnrollment } from "./semantic-plan.js";
 import { SemanticPlanningGate } from "./semantic-planning-gate.js";
+import { observePrdSources, hasDriftContradiction, type FrozenSource, type SemanticObservationRecord, type SemanticObservationRequest } from "./semantic-drift.js";
 import { expectedSemanticPark, type SemanticPark } from "./semantic-park.js";
 import { sameCompletionPending, type CompletionPending } from "./completion-pending.js";
 import type { BoundedCoverageTestTransport } from "./plan-contract-review.js";
@@ -2143,6 +2144,9 @@ interface RunFlight {
   publishedRealTips?: string[];
   /** Exact candidate of the successful finalize push, retained for completion bookkeeping. */
   successfulPushedSha?: string;
+  /** PRD #1230 D5: the frozen sources of the latest compiled semantic candidate and where they were
+   *  captured, so a drift observation reads each PRD at the same commit. Detection input only. */
+  semanticDrift?: { barePath: string; headSha: string; sources: FrozenSource[] };
   inventoryGuarded?: boolean;
   /** Transient ambiguity guard; conveys neither durable evidence nor deletion authority. */
   completionSendAttempted?: boolean;
@@ -8826,6 +8830,19 @@ export class RunRunner {
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
     // PRD #1230 M4: every server-sourced string is redacted BEFORE the renderer escapes it, so a
     // registered secret cannot be split by inline escaping. The permit-verified projection only.
+    // PRD #1230 D5: one publication-phase drift observation of the exact pushed SHA, before any
+    // description is rendered. Detection only: it never throws and changes nothing about delivery.
+    const publicationDrift = claim.semantic_planning !== undefined
+      ? await this.observeSemanticDrift(flight,
+        { phase: "publication", pushed_sha: flight.successfulPushedSha ?? "" }, boundarySignal)
+      : undefined;
+    const driftForRender: SemanticObservationRecord | undefined = publicationDrift && hasDriftContradiction(publicationDrift) ? {
+      ...publicationDrift,
+      issue: redactDriftSource(publicationDrift.issue, redactText),
+      prds: publicationDrift.prds.map(x => redactDriftSource(x, redactText)),
+      links_added: publicationDrift.links_added.map(x => redactText(x)),
+      links_removed: publicationDrift.links_removed.map(x => redactText(x)),
+    } : undefined;
     const pendingForRender: CompletionPending | undefined = publicationPending && publicationPending.criteria.length > 0
       ? { ...publicationPending, criteria: publicationPending.criteria.map(c => ({
         ...c, milestone_id: redactText(c.milestone_id), text: redactText(c.text), reason: redactText(c.reason),
@@ -8857,6 +8874,7 @@ export class RunRunner {
         result.codeCrossCheckSummary,
         effectiveNonClosing,
         pendingForRender,
+        driftForRender,
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
     // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
@@ -12115,6 +12133,8 @@ export class RunRunner {
             size_class: toolchainDetection?.size_class ?? "s", base_commit: runnerClone.baseCommit,
             planning_diff: semanticDiff.diff,
           }, semanticSubmission, semanticSources.sources);
+          flight.semanticDrift = { barePath, headSha: runnerClone.baseCommit,
+            sources: semanticCompiled.candidate.sources.map(({ id, kind, hash, completeness }) => ({ id, kind, hash, completeness })) };
         }
         // Issue #3149: a resume whose earlier owner follow-ups could not be restored needs a human
         // approval, even on autopilot (no cross-check, no auto-approve), for the whole claim.
@@ -12334,6 +12354,11 @@ export class RunRunner {
           (candidate) => this.prepareGateCheckpoint(claim, flight, steering.lifecycleSignal(), candidate),
           revisionRecovery,
           semanticPark,
+          semanticCompiled ? async (ack) => {
+            if (ack.applied !== true || ack.status !== "awaiting_approval" || !Number.isSafeInteger(ack.gateRevision) || (ack.gateRevision ?? 0) <= 0) return;
+            await this.observeSemanticDrift(flight, { phase: "presentation",
+              candidate_digest: semanticCompiled!.candidate.digest, gate_revision: ack.gateRevision! }, steering.lifecycleSignal());
+          } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -19518,6 +19543,40 @@ export class RunRunner {
     }
   }
 
+  /**
+   * PRD #1230 D5: one source drift observation, detection only. Reads each frozen PRD source at the
+   * exact commit (the capture commit for a presentation, the pushed SHA for a publication) from the
+   * bare, posts the hashes, and returns the server's stored record. Every failure (a missing capture,
+   * a read error, a network error, a 4xx or a 409 fence) is logged and emitted as a status event and
+   * resolves undefined: an observation never blocks, fails, holds or changes the run.
+   */
+  private async observeSemanticDrift(
+    flight: RunFlight,
+    target: { phase: "presentation"; candidate_digest: string; gate_revision: number } | { phase: "publication"; pushed_sha: string },
+    signal?: AbortSignal,
+  ): Promise<SemanticObservationRecord | undefined> {
+    const note = (text: string): void => {
+      flight.runLog.warn("semantic drift observation failed", { phase: target.phase, detail: flight.redactText(text) });
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { text: `source drift observation (${target.phase}) not recorded: ${flight.redactText(text)}` } });
+    };
+    try {
+      const captured = flight.semanticDrift;
+      const sha = target.phase === "presentation" ? captured?.headSha : target.pushed_sha;
+      if (!captured) return void note("no frozen semantic candidate in this process");
+      if (sha === undefined || !/^[0-9a-f]{40}$/.test(sha)) return void note("no exact commit to read the sources at");
+      const owned = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(10_000)]);
+      const prd_sources = await observePrdSources(this.git, { barePath: captured.barePath, sha, sources: captured.sources, timeoutMs: 5000, signal: owned });
+      const request: SemanticObservationRequest = { ...target, prd_sources };
+      const record = await this.client.postSemanticObservation(flight.runId, flight.claimGeneration, request, owned);
+      flight.batcher.emit({ kind: "status", agent: "worker", payload: { event: "semantic_source_drift", phase: record.phase,
+        contradiction: hasDriftContradiction(record) } });
+      return record;
+    } catch (error) {
+      note(errMessage(error));
+      return undefined;
+    }
+  }
+
   /** Post awaiting_approval with the plan and await the steering verdict, bounded.
    *  For an autopilot run, the plan is still recorded but the gate resolves with an
    *  approve verdict immediately — no awaiting_approval report, no /inputs wait. It
@@ -19627,6 +19686,7 @@ export class RunRunner {
     prepareCheckpoint?: (candidate: Milestone[] | undefined) => Promise<StateRequest["gate_checkpoint_witness"]>,
     revisionRecovery?: PlanRevisionRecovery,
     semanticPark?: SemanticPark,
+    onSemanticPresented?: (ack: StateAck) => Promise<void>,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -19872,6 +19932,9 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
+    // PRD #1230 D5: record the source drift of the presentation just accepted. Detection only; it
+    // swallows every failure, so it can neither hold nor fail the gate.
+    await onSemanticPresented?.(ack);
     // Human gates start advisory work only after a positive storage acknowledgement, and do
     // not await it: the verdict wait must not be delayed by the summary model or its POST.
     if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
@@ -20585,6 +20648,8 @@ export function mrCompletionBlock(
   nonClosing?: ExecutorResult["nonClosing"],
   // PRD #1230 M4: the strictly decoded, caller-redacted maintainer-pending projection.
   completionPending?: CompletionPending,
+  // PRD #1230 D5: the redacted publication drift observation; rendered only on a contradiction.
+  semanticDrift?: SemanticObservationRecord,
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
   // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
@@ -20604,6 +20669,7 @@ export function mrCompletionBlock(
     scopeCapped,
     nonClosing: resolveRunKind(claim.kind) === "issue" ? nonClosing : undefined,
     completionPending: resolveRunKind(claim.kind) === "issue" ? completionPending : undefined,
+    semanticDrift: resolveRunKind(claim.kind) === "issue" ? semanticDrift : undefined,
     repoAgents: agentSelection?.source === "repo",
     gatesUnverified,
     gatesDiscoveryTruncated,
@@ -20611,6 +20677,10 @@ export function mrCompletionBlock(
     banner: opts?.banner,
     staleness: opts?.staleness,
   });
+}
+
+function redactDriftSource(x: SemanticObservationRecord["issue"], redact: (text: string) => string): SemanticObservationRecord["issue"] {
+  return { ...x, source_id: redact(x.source_id) };
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

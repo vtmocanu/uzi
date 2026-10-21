@@ -1,4 +1,4 @@
-import type { CompletionPendingDTO } from "./apiTypes";
+import type { CompletionPendingDTO, SemanticDriftDTO } from "./apiTypes";
 
 // Owner transport mirrors api/internal/apitypes/semantic_{gate,plan,coverage}.go.
 // Display validation never rewrites the approval object or grants authority.
@@ -149,4 +149,24 @@ const pendingCriterion = object({
 const pendingSchema = object({ version: integer, contract_revision: integer, criteria: array(pendingCriterion) });
 export function isCompletionPending(value: unknown): value is CompletionPendingDTO {
   return pendingSchema(value);
+}
+
+// semantic_drift is a detector's record (PRD #1230 D5): hashes, refs and enums, never source text and never
+// evidence that a criterion is met. Anything outside the shape is "could not be read", not partially shown.
+const oneOf = (...values: string[]): Check => v => typeof v === "string" && values.includes(v);
+const driftSource = object({
+  source_id: string, frozen_hash: string, outcome: oneOf("unchanged", "changed", "unknown"),
+}, {
+  observed_hash: string, ref: string, checkbox_only: v => typeof v === "boolean",
+  reason: oneOf("missing", "truncated", "unreadable", "denied", "invalid", "timeout"),
+});
+const driftObservation = object({
+  phase: oneOf("presentation", "publication"), observed_at: string, issue: driftSource,
+  prds: array(driftSource), links_added: array(string), links_removed: array(string),
+}, { candidate_digest: string, gate_revision: integer, pushed_sha: string, links_truncated: v => typeof v === "boolean" });
+const driftSchema = object({
+  observations: array(driftObservation), dropped: integer, contradiction: v => typeof v === "boolean",
+});
+export function isSemanticDrift(value: unknown): value is SemanticDriftDTO {
+  return driftSchema(value);
 }

@@ -5,6 +5,7 @@ import { parseSemanticCandidate, parseSemanticProposal, semanticSourceCaptureSch
 import type { Report } from "../src/plan-contract-report.js";
 import type { SemanticBinding, SemanticCoverageStatus, SemanticReservation } from "../src/semantic-coverage-wire.js";
 import { criterionId, hash } from "./semantic-coverage-fixture.js";
+import type { SemanticObservationRecord, SemanticObservationRequest } from "../src/semantic-drift.js";
 
 /** In-memory server fixture only: fake canonicalization is not production digest authority. */
 export function semanticServer(client: WorkerClient, events: string[]) {
@@ -25,6 +26,13 @@ export function semanticServer(client: WorkerClient, events: string[]) {
   let statusFailure: unknown;
   let publishFailure: unknown;
   const requests: unknown[] = [];
+  // PRD #1230 D5: in-memory observation endpoint. Like the server it recomputes outcomes from the frozen hashes
+  // and requires every frozen PRD source exactly once; the current issue's drift is test-controlled.
+  const observations: SemanticObservationRequest[] = [];
+  const stored: SemanticObservationRecord[] = [];
+  let observationFailure: unknown;
+  let issueDrift: Pick<SemanticObservationRecord["issue"], "outcome" | "reason" | "checkbox_only"> = { outcome: "unchanged" };
+  let linksAdded: string[] = [];
   const deadline = new Date(Date.now() + 900000).toISOString();
   const status = (): SemanticCoverageStatus => {
     const outcome = forced ?? (persisted ? "complete" : "unavailable");
@@ -90,6 +98,28 @@ export function semanticServer(client: WorkerClient, events: string[]) {
     if (publishFailure !== undefined) throw publishFailure;
     persisted = request.report; return status();
   };
+  client.postSemanticObservation = async (_id, _gen, request) => {
+    events.push("observe:" + request.phase);
+    observations.push(structuredClone(request));
+    if (observationFailure !== undefined) throw observationFailure;
+    const frozen = compiled!.candidate.sources;
+    const prds = frozen.filter(x => x.kind === "prd");
+    assert.deepEqual(request.prd_sources.map(x => x.source_id).sort(), prds.map(x => x.id).sort(), "every frozen PRD source exactly once");
+    if (request.phase === "presentation") assert.equal(request.candidate_digest, compiled!.candidate.digest);
+    const issue = frozen.find(x => x.kind === "issue")!;
+    const record: SemanticObservationRecord = {
+      phase: request.phase, observed_at: new Date().toISOString(),
+      ...(request.phase === "presentation" ? { candidate_digest: request.candidate_digest, gate_revision: request.gate_revision }
+        : { pushed_sha: request.pushed_sha }),
+      issue: { source_id: issue.id, frozen_hash: issue.hash, ...issueDrift,
+        ...(issueDrift.outcome === "changed" ? { observed_hash: hash("changed issue") } : issueDrift.outcome === "unchanged" ? { observed_hash: issue.hash } : {}) },
+      prds: request.prd_sources.map(r => ({ source_id: r.source_id, frozen_hash: prds.find(x => x.id === r.source_id)!.hash,
+        ...(r.observed_hash ? { observed_hash: r.observed_hash } : {}), ref: r.ref, outcome: r.outcome, ...(r.reason ? { reason: r.reason } : {}) })),
+      links_added: linksAdded, links_removed: [],
+    };
+    stored.push(record);
+    return record;
+  };
   const gateAck = (generation: number, revision: number, park?: string) => {
     const evidence = status();
     const maintainers = compiled!.candidate.criteria.filter(c => c.kind === "maintainer")
@@ -114,5 +144,8 @@ export function semanticServer(client: WorkerClient, events: string[]) {
     failStatus: (error: unknown) => { statusFailure = error; },
     failPublish: (error: unknown) => { publishFailure = error; },
     reserveCount: () => requests.length,
+    observations, stored,
+    failObservation: (error: unknown) => { observationFailure = error; },
+    driftIssue: (drift: typeof issueDrift, added: string[] = []) => { issueDrift = drift; linksAdded = added; },
     persisted: () => persisted };
 }

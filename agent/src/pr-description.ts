@@ -59,6 +59,7 @@ import { createHash } from "node:crypto";
 import { SanitizedPrDescriptionFields } from "./client.js";
 import type { ClaimConfig, PrDescriptionSource } from "./protocol.js";
 import type { CompletionPending } from "./completion-pending.js";
+import { hasDriftContradiction, type SemanticObservationRecord } from "./semantic-drift.js";
 
 // ── Markers ─────────────────────────────────────────────────────────────────────────────────
 
@@ -1322,6 +1323,10 @@ export interface CompletionBlockInput {
    *  The caller redacts every string field first; this renderer escapes them. Rendering never
    *  marks anything satisfied and always suppresses `Closes`. */
   completionPending?: CompletionPending;
+  /** PRD #1230 D5: the publication-phase drift observation the server stored. The caller redacts every
+   *  string field first; this renderer escapes them. Detection only: it renders one note when the record
+   *  reports a contradiction, never marks anything satisfied and never touches `Closes`. */
+  semanticDrift?: SemanticObservationRecord;
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1400,6 +1405,25 @@ function pendingBlock(pending: CompletionPending, deferredMilestones: readonly s
   ];
 }
 
+/** Display bound for one drift value: ids and paths can be long, and capBody never trims this block. */
+const DRIFT_VALUE_CHARS = 160;
+const clipDrift = (s: string): string => s.length > DRIFT_VALUE_CHARS ? s.slice(0, DRIFT_VALUE_CHARS) + "..." : s;
+
+/** The source drift note (PRD #1230 D5), or [] when the record reports no contradiction. At most nine
+ *  sources and eight links each way, each value clipped, so the block stays bounded. */
+function driftBlock(record: SemanticObservationRecord): string[] {
+  if (!hasDriftContradiction(record)) return [];
+  const sources = [record.issue, ...record.prds].filter((x) => x.outcome !== "unchanged");
+  return [
+    "> ⚠️ **Source drift detected (PRD #1230).** The issue or a linked PRD changed after approval or could not be checked.",
+    "> The approved contract is unchanged and needs owner review. This note is a detector only: it records no criterion as met.",
+    ...sources.map((x) => `> - ${codeSpan(clipDrift(x.source_id))}: ${escapeInline(x.outcome)}${x.reason ? ` (${escapeInline(x.reason)})` : ""}${x.checkbox_only ? " (checkbox state only)" : ""}`),
+    ...record.links_added.map((l) => `> - PRD link added to the issue: ${codeSpan(clipDrift(l))}`),
+    ...record.links_removed.map((l) => `> - PRD link removed from the issue: ${codeSpan(clipDrift(l))}`),
+    ...(record.links_truncated ? ["> - Some PRD links were not compared."] : []),
+  ];
+}
+
 function issueArm(input: CompletionBlockInput): string[] {
   const iid = input.issueIid;
   const deferred = input.completionScope?.deferred ?? [];
@@ -1439,6 +1463,8 @@ function issueArm(input: CompletionBlockInput): string[] {
     lines.push("", `> **Issue remains open.** ${reason}`);
   }
   if (pending) lines.push("", ...pendingBlock(pending, deferred.map((d) => d.milestone_id), !!input.scopeCapped));
+  const drift = input.semanticDrift ? driftBlock(input.semanticDrift) : [];
+  if (drift.length > 0) lines.push("", ...drift);
   if (accepted.length > 0) {
     lines.push(
       "",

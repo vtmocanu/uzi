@@ -312,3 +312,76 @@ it("shows no park line when semantic_park is absent", async () => {
   await mountPending();
   expect(screen.queryByText(/Autopilot stopped for a human/)).toBeNull();
 });
+
+// PRD #1230 D5: source drift observations (semantic_drift). A detector's record, never an approval or a
+// satisfaction, so the panel is plain text with no control in it.
+function driftFixture() {
+  const ref = "0123456789abcdef0123456789abcdef01234567";
+  return {
+    observations: [
+      { phase: "presentation" as const, candidate_digest: "d".repeat(64), gate_revision: 4, observed_at: "2026-02-03T04:05:06Z",
+        issue: { source_id: "issue:7", frozen_hash: "a".repeat(64), observed_hash: "a".repeat(64), outcome: "unchanged" as const },
+        prds: [], links_added: [], links_removed: [] },
+      { phase: "publication" as const, pushed_sha: ref, observed_at: "2026-02-03T05:06:07Z",
+        issue: { source_id: "issue:7", frozen_hash: "a".repeat(64), observed_hash: "b".repeat(64), outcome: "changed" as const, checkbox_only: true },
+        prds: [
+          { source_id: "prd:prds/<b>9-x</b>\u202e.md", frozen_hash: "c".repeat(64), outcome: "unknown" as const, reason: "timeout" as const, ref },
+          { source_id: "prd:prds/8-y.md", frozen_hash: "e".repeat(64), observed_hash: "f".repeat(64), outcome: "changed" as const, ref },
+        ],
+        links_added: ["prds/10-new.md"], links_removed: ["prds/2-old.md"], links_truncated: true },
+    ],
+    dropped: 3, contradiction: true,
+  };
+}
+
+it("renders semantic_drift as a plain-text record with a contradiction note", async () => {
+  current.semantic_drift = driftFixture();
+  const { container } = await mountPending();
+  const region = within(screen.getByRole("region", { name: /^Source drift observations/ }));
+  expect(region.getByText(/Contradiction: owner review needed/)).toBeTruthy();
+  expect(region.getByText(/3 older observations no longer kept/)).toBeTruthy();
+  expect(region.getByText(/When the plan was presented for approval/)).toBeTruthy();
+  expect(region.getByText(/When the work was published/)).toBeTruthy();
+  expect(region.getByText("Issue issue:7: unchanged")).toBeTruthy();
+  expect(region.getByText("Issue issue:7: changed, checkbox state only")).toBeTruthy();
+  expect(region.getByText("prd:prds/<b>9-x</b>.md: unknown, timeout")).toBeTruthy();
+  expect(region.getByText("prd:prds/8-y.md: changed")).toBeTruthy();
+  expect(region.getByText("prds/10-new.md")).toBeTruthy();
+  expect(region.getByText("prds/2-old.md")).toBeTruthy();
+  expect(region.getByText(/Some PRD links were not compared/)).toBeTruthy();
+  expect(region.getByText(/nothing here marks a criterion as met/)).toBeTruthy();
+  expect(region.queryAllByRole("checkbox")).toHaveLength(0);
+  expect(region.queryAllByRole("button")).toHaveLength(0);
+  const section = container.querySelector('section[aria-labelledby="semantic-drift-heading"]')!;
+  expect(section.querySelector("b, script, img, input")).toBeNull();
+  expect(section.textContent).not.toContain("\u202e");
+});
+
+it("shows no contradiction note when the server reports none", async () => {
+  const clean = driftFixture();
+  current.semantic_drift = { observations: clean.observations.slice(0, 1), dropped: 0, contradiction: false };
+  await mountPending();
+  const region = screen.getByRole("region", { name: /^Source drift observations/ });
+  expect(region.textContent).not.toMatch(/Contradiction/);
+  expect(region.textContent).not.toMatch(/no longer kept/);
+});
+
+it.each([undefined, null, { observations: [], dropped: 0, contradiction: false }])("renders nothing for absent or empty semantic_drift: %j", async value => {
+  if (value !== undefined) (current as unknown as Record<string, unknown>).semantic_drift = value;
+  await mountPending();
+  expect(screen.queryByRole("region", { name: /^Source drift observations/ })).toBeNull();
+});
+
+it.each([
+  "text", 7, [], {}, { observations: "x", dropped: 0, contradiction: true },
+  { observations: [], dropped: -1, contradiction: true }, { observations: [], dropped: 0 },
+  { observations: [{ ...driftFixture().observations[0], phase: "later" }], dropped: 0, contradiction: false },
+  { observations: [{ ...driftFixture().observations[0], issue: { source_id: "i", frozen_hash: "a", outcome: "satisfied" } }], dropped: 0, contradiction: false },
+  { observations: [{ ...driftFixture().observations[0], links_added: [3] }], dropped: 0, contradiction: false },
+])("shows a neutral note for malformed semantic_drift: %j", async value => {
+  (current as unknown as Record<string, unknown>).semantic_drift = value;
+  await mountPending();
+  const region = screen.getByRole("region", { name: /^Source drift observations/ });
+  expect(region.textContent).toMatch(/could not be read/);
+  expect(region.textContent).not.toMatch(/Contradiction/);
+});
