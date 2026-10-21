@@ -8,12 +8,14 @@ import (
 // in (issue #3181). Both are status paused. They are VOCABULARY values of hold_reason (the
 // server enum), not credentials.
 //
-//   - credential_switch_settling: the switch could not prove the run's processes stopped and
-//     the worker is still stopping them. Owner Resume and `run set-token` are refused (409)
-//     until the worker acknowledges, is lost, or re-registers. Cancel always works.
-//   - credential_switch_unsettled: held for the owner; processes are not proven stopped, and
-//     the work and custody stay on that worker. Owner Resume (requeues on the newly chosen
-//     token, same worker preferred) or Cancel.
+//   - credential_switch_settling: settlement could not be proven at switch time and the worker
+//     is still finishing its own operations (lane disposal, deps install). Owner Resume and
+//     `run set-token` are refused (409) until the worker acknowledges, is lost, or
+//     re-registers. Cancel always works.
+//   - credential_switch_unsettled: the worker finished its own operations, but the run's
+//     processes were not proven stopped; the work and custody stay on that worker. Owner
+//     Resume (requeues on the newly chosen token; the next claim re-proves quiescence fail
+//     closed) or Cancel.
 const (
 	holdCredentialSwitchSettling  = "credential_switch_settling"  //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 	holdCredentialSwitchUnsettled = "credential_switch_unsettled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
@@ -45,7 +47,7 @@ func credentialSwitchAction(r apitypes.RunDTO) string {
 	id := cellText(r.ID)
 	switch {
 	case isCredentialSwitchSettlingHold(r):
-		return "worker is stopping the run's processes; Cancel is available: uzi run cancel " + id
+		return "worker is finishing its own operations; Resume opens when it finishes (or if the worker is lost); Cancel now: uzi run cancel " + id
 	case isCredentialSwitchUnsettledHold(r):
 		return "Resume or Cancel: uzi run resume " + id + " / uzi run cancel " + id
 	}
@@ -59,7 +61,7 @@ func credentialSwitchHoldLine(r apitypes.RunDTO) string {
 	case isCredentialSwitchSettlingHold(r):
 		return "waiting: credential switch settling · " + credentialSwitchAction(r)
 	case isCredentialSwitchUnsettledHold(r):
-		return "held: credential switch, processes not proven stopped · " + credentialSwitchAction(r)
+		return "held: credential switch; processes were not proven stopped; work kept on that worker · " + credentialSwitchAction(r)
 	}
 	return ""
 }

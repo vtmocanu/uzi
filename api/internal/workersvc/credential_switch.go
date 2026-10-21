@@ -317,8 +317,10 @@ func (s *Service) holdCredentialSwitch(ctx context.Context, owned store.Run, wkr
 }
 
 // settleCredentialSwitchHold applies the credential_switch_hold_settled acknowledgement (issue
-// #3181): the worker proved every process of the held run stopped, so
-// credential_switch_settling becomes credential_switch_unsettled. SettleCredentialSwitchHold fences
+// #3181): the worker finished joining its own operations (lane disposal, deps install). That does
+// NOT prove the run's processes stopped, so credential_switch_settling becomes
+// credential_switch_unsettled (settlement unproven, work and custody kept on the worker; the next
+// claim re-proves quiescence fail closed). SettleCredentialSwitchHold fences
 // on the worker, the generation and the incarnation (the worker must not have re-registered since
 // the hold was written). A 0-row result converges only when the hold is already unsettled at this
 // generation and worker; otherwise applied=false.

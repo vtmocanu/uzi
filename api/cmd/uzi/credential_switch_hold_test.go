@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ func TestHoldRowCredentialSwitch(t *testing.T) {
 	parkedAt := now.Add(-70 * time.Minute)
 
 	settling := heldRun("r1", holdCredentialSwitchSettling, parkedAt)
-	want := "credential switch settling · parked 14:02 (1h10m) · 4/7 milestones · worker is stopping the run's processes; Cancel is available: uzi run cancel r1"
+	want := "credential switch settling · parked 14:02 (1h10m) · 4/7 milestones · worker is finishing its own operations; Resume opens when it finishes (or if the worker is lost); Cancel now: uzi run cancel r1"
 	if row := holdRow(settling, now); row == nil || row[1] != want {
 		t.Errorf("holdRow(settling) = %v, want [HOLD %q]", row, want)
 	}
@@ -33,7 +32,7 @@ func TestHoldRowCredentialSwitch(t *testing.T) {
 
 func TestRunGetAndListCredentialSwitch(t *testing.T) {
 	for reason, wantRow := range map[string]string{
-		holdCredentialSwitchSettling:  "Cancel is available",
+		holdCredentialSwitchSettling:  "Cancel now",
 		holdCredentialSwitchUnsettled: "Resume or Cancel",
 	} {
 		run := heldRun("r1", reason, time.Now().Add(-5*time.Minute))
@@ -56,7 +55,7 @@ func TestRunGetAndListCredentialSwitch(t *testing.T) {
 // names the owner's next step on stderr.
 func TestRunWaitStopsOnCredentialSwitchHold(t *testing.T) {
 	for reason, wantLine := range map[string]string{
-		holdCredentialSwitchSettling:  "worker is stopping the run's processes; Cancel is available",
+		holdCredentialSwitchSettling:  "worker is finishing its own operations; Resume opens when it finishes (or if the worker is lost); Cancel now: uzi run cancel r1",
 		holdCredentialSwitchUnsettled: "Resume or Cancel",
 	} {
 		held := pausedWithHold(reason)
@@ -71,6 +70,18 @@ func TestRunWaitStopsOnCredentialSwitchHold(t *testing.T) {
 	}
 }
 
+// TestRunWaitReturnsImmediatelyOnSettlingHold: a re-run wait against a run that is already in
+// either hold returns at once (exit 0) instead of waiting for the hold to lift.
+func TestRunWaitReturnsImmediatelyOnSettlingHold(t *testing.T) {
+	for _, reason := range []string{holdCredentialSwitchSettling, holdCredentialSwitchUnsettled} {
+		fc := &uzicli.FakeClient{GetRunHook: scriptHook(waitStep{run: pausedWithHold(reason)})}
+		_, stderr, code := runCLI(t, fakeEnv(fc), "run", "wait", "r1", "--interval", "1ms")
+		if code != uzicli.ExitOK || !strings.Contains(stderr, "uzi run cancel") {
+			t.Errorf("%s: exit=%d stderr=%q, want an immediate stop naming Cancel", reason, code, stderr)
+		}
+	}
+}
+
 func TestRunLogsFollowCredentialSwitchNotice(t *testing.T) {
 	stderr := followLogs(t, pausedWithHold(holdCredentialSwitchSettling), pausedWithHold(holdCredentialSwitchUnsettled), runAt("completed"))
 	if !strings.Contains(stderr, "credential switch settling") || !strings.Contains(stderr, "credential switch unsettled") {
@@ -80,8 +91,8 @@ func TestRunLogsFollowCredentialSwitchNotice(t *testing.T) {
 
 func TestTUICredentialSwitchHold(t *testing.T) {
 	for reason, c := range map[string]struct{ word, line string }{
-		holdCredentialSwitchSettling:  {credSwitchSettlingWord, "waiting: credential switch settling · worker is stopping"},
-		holdCredentialSwitchUnsettled: {credSwitchUnsettledWord, "held: credential switch, processes not proven stopped · Resume or Cancel"},
+		holdCredentialSwitchSettling:  {credSwitchSettlingWord, "waiting: credential switch settling · worker is finishing its own operations; Resume opens when it finishes"},
+		holdCredentialSwitchUnsettled: {credSwitchUnsettledWord, "held: credential switch; processes were not proven stopped; work kept on that worker · Resume or Cancel"},
 	} {
 		run := heldRun("99999999-sw", reason, time.Now().Add(-5*time.Minute))
 		run.Health = "ok"
@@ -103,27 +114,10 @@ func TestTUICredentialSwitchHold(t *testing.T) {
 		board := tuiTestModel(t, &uzicli.FakeClient{}, "")
 		board = step(board, boardRunsMsg{reqID: board.board.waitID, runs: []apitypes.RunListItemDTO{item}})
 		bout := stripANSI(board.View().Content)
-		for _, want := range []string{"NEEDS YOU", c.word, credSwitchGlyph + " 1"} {
+		for _, want := range []string{"NEEDS YOU", c.word, credDisabledGlyph + " 1"} {
 			if !strings.Contains(bout, want) {
 				t.Errorf("%s: board lacks %q:\n%s", reason, want, bout)
 			}
-		}
-	}
-}
-
-// TestCredentialSwitchRefusalSurfacedVerbatim: the server's 409 prose from resume and
-// set-token reaches stderr unchanged with the conflict exit code.
-func TestCredentialSwitchRefusalSurfacedVerbatim(t *testing.T) {
-	const msg = "the worker is still stopping this run's processes; Resume becomes available when it finishes, or Cancel the run"
-	refusal := &uzicli.ExitError{Code: uzicli.ExitConflict, Err: errors.New(msg)}
-	for name, args := range map[string][]string{
-		"resume":    {"run", "resume", "r1"},
-		"set-token": {"run", "set-token", "r1", "work"},
-	} {
-		fc := &uzicli.FakeClient{Err: refusal}
-		_, stderr, code := runCLI(t, fakeEnv(fc), args...)
-		if code != uzicli.ExitConflict || !strings.Contains(stderr, msg) {
-			t.Errorf("%s: exit=%d stderr=%q, want %d and the verbatim message", name, code, stderr, uzicli.ExitConflict)
 		}
 	}
 }

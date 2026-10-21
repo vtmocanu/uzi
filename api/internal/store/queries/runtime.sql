@@ -3704,7 +3704,7 @@ RETURNING runs.*;
 --     released_worker_* pair ParkRunsAtWall captured is PRESERVED (never re-read here — the park
 --     has no expiry, so the worker may be a new safe incarnation by now). A worker-side park
 --     (claim_released_at IS NULL) KEEPS worker_id for the same-worker resume, as PRD #1190.
--- Issue #3181: a 'credential_switch_unsettled' hold (the worker confirmed its processes stopped)
+-- Issue #3181: a 'credential_switch_unsettled' hold (the worker finished its own operations; processes were not proven stopped)
 -- resumes like an owner pause and keeps worker_id for the same-worker resume. A
 -- 'credential_switch_settling' hold is REFUSED (0 rows) while the settling fence holds
 -- (CredentialSwitchHoldSettling is the same predicate as a read); both reasons are cleared on resume.
@@ -4042,7 +4042,8 @@ WHERE runs.id = @id AND runs.worker_id = @worker_id
               WHERE w.id = runs.worker_id AND w.snapshot_register_nonce = @register_nonce::text);
 
 -- name: SettleCredentialSwitchHold :execrows
--- Issue #3181: the worker's acknowledgement that every process of the held run has stopped.
+-- Issue #3181: the worker's acknowledgement that it finished joining its own operations (lane
+-- disposal, deps install). It does NOT prove the run's processes stopped.
 -- credential_switch_settling -> credential_switch_unsettled; status and status_since are NOT
 -- touched (status_since anchors the incarnation fence and the banked paused gap). The incarnation
 -- fence: the acknowledging worker must not have re-registered since the hold was written

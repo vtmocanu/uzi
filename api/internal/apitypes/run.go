@@ -420,9 +420,9 @@ type RunDTO struct {
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
-	// 'credential_switch_settling' while the worker is still stopping the processes of a run whose
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
-	// 'credential_switch_unsettled' once the worker confirmed they stopped (Resume is open) (issue
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
 	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
@@ -1260,9 +1260,9 @@ type RunSummaryItemDTO struct {
 	// HoldReason is why a paused run is HELD (mapped from run.HoldReason): 'completion_blocked'
 	// for a completion hold (PRD #1226), 'budget_exhausted' for a wall-clock park (PRD #1497),
 	// 'credential_disabled' while a credential the run needs is disabled (PRD #1732 D14),
-	// 'credential_switch_settling' while the worker is still stopping the processes of a run whose
+	// 'credential_switch_settling' while the worker is still finishing its own operations on a run whose
 	// token switch could not be proven settled (Resume is refused until it finishes; Cancel works),
-	// 'credential_switch_unsettled' once the worker confirmed they stopped (Resume is open) (issue
+	// 'credential_switch_unsettled' once it finished them, processes not proven stopped (Resume is open) (issue
 	// #3181), and null otherwise (not held, or an owner pause). Read-only surfacing of the column.
 	HoldReason *string `json:"hold_reason"`
 	// HoldContext is the D8 provider-context string a completion hold states: the constant
