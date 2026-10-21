@@ -10576,7 +10576,12 @@ export class RunRunner {
     // executor or agent starts in a seeded attempt path before this write, so a ledger `live`
     // entry that no journal names, is not live here and holds no custody is a seed interrupted
     // before this line, with no agent work in it.
-    await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId);
+    // issue #3239: a seed that peeled a `wip(park):` marker with `reset --soft` (not the diverged
+    // cherry-pick leg, which has no single adopted marker) journals it as this attempt's lineage.
+    const peeledMarker = flight.runnerClone?.wipRecovered === true && flight.runnerClone.wipCherryPicked !== true &&
+      /^[0-9a-f]{40}$/.test(flight.runnerClone.adoptedSource) ? flight.runnerClone.adoptedSource : undefined;
+    await this.git.markRecoveryCapture(barePath, flight.worktreePath!, flight.branch!, runId, flight.runnerClone?.attemptId,
+      peeledMarker);
     batcher.emit({
       kind: "status",
       agent: "worker",

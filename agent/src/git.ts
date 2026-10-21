@@ -1302,6 +1302,20 @@ export class RetainedRecoveryBlockedError extends Error {
 export interface RecoveryJournalEntry extends RecoverySource {
   recovery?: RecoveryProgress;
   retainedSources?: RecoverySource[];
+  /** issue #3239: `wip(park):` markers whose content this attempt's clone was seeded from by an
+   *  adopt-time `reset --soft` (so they are no longer in its history). It is lineage evidence only:
+   *  a coverage wrapper may leave such a superseded marker as a leaf. Lost lineage can only cause a
+   *  refusal, never an acceptance. */
+  peeledMarkers?: string[];
+}
+
+/** issue #3239: at most this many peeled markers are journaled (SHA-40, unique). */
+const MAX_PEELED_MARKERS = 64;
+
+/** Union of marker lists, deduplicated, bounded to the newest {@link MAX_PEELED_MARKERS}. */
+function unionPeeledMarkers(...lists: Array<readonly string[] | undefined>): string[] {
+  const all = [...new Set(lists.flatMap(l => l ?? []))];
+  return all.slice(-MAX_PEELED_MARKERS);
 }
 
 // issue #1783 M2 — the per-branch ATTEMPT LEDGER, a MULTI-VALUED `config --local` key in the
@@ -1349,7 +1363,7 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
     throw new Error("invalid retained recovery clone journal");
   }
   const o = parsed as Record<string, unknown>;
-  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources"].includes(k))) {
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources", "peeledMarkers"].includes(k))) {
     throw new Error("invalid retained recovery clone journal");
   }
   // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
@@ -1376,7 +1390,15 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   if (recovery && (recovery.source.runId !== source.runId ||
       (recovery.successor && recovery.successor.runId !== source.runId))) throw new Error("recovery run identity mismatch");
   if (retainedSources?.some(s => s.runId !== source.runId)) throw new Error("retained run identity mismatch");
-  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}) };
+  let peeledMarkers: string[] | undefined;
+  if (o.peeledMarkers !== undefined) {
+    if (!Array.isArray(o.peeledMarkers) || o.peeledMarkers.length > MAX_PEELED_MARKERS ||
+        !o.peeledMarkers.every((m): m is string => typeof m === "string" && SHA40_RE.test(m)) ||
+        new Set(o.peeledMarkers).size !== o.peeledMarkers.length) throw new Error("invalid peeled markers");
+    peeledMarkers = [...o.peeledMarkers];
+  }
+  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}),
+    ...(peeledMarkers?.length ? { peeledMarkers } : {}) };
 }
 
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
@@ -5800,7 +5822,9 @@ export class GitCache {
    * later capture cannot prevent the restart guard from knowing whose work it is.
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
-  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string): Promise<void> {
+  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string,
+    peeledMarker?: string): Promise<void> {
+    if (peeledMarker !== undefined && !SHA40_RE.test(peeledMarker)) throw new Error("invalid peeled marker");
     await this.withLock(barePath, async () => {
       // issue #1783 M2: an attempt-path seed also journals the id its path and marker carry,
       // including recovery-enabled unwired workers. Canonical sources omit the attempt id.
@@ -5808,7 +5832,10 @@ export class GitCache {
       const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
       const pending = await this.readRecoveryCapture(barePath, branch);
       if (pending && !sameRecoverySource(pending, source)) throw new Error("recovery attribution cannot be overwritten");
-      const value: RecoveryJournalEntry = { ...pending, ...source };
+      // issue #3239: the seed's adopt-time `reset --soft` leg peeled this marker out of the clone's
+      // history; journal it as lineage for a later coverage wrapper over this attempt's successor marker.
+      const peeled = peeledMarker === undefined ? pending?.peeledMarkers : unionPeeledMarkers(pending?.peeledMarkers, [peeledMarker]);
+      const value: RecoveryJournalEntry = { ...pending, ...source, ...(peeled?.length ? { peeledMarkers: peeled } : {}) };
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(value)]);
     });
   }
@@ -6765,6 +6792,96 @@ export class GitCache {
     });
   }
 
+  /**
+   * issue #3239: decide what a retained-recovery successor may adopt when the episode restore tip is a
+   * recovery-coverage wrapper that may carry a `wip(park):` marker. Returns undefined for the
+   * unchanged shapes (the tip itself is a marker, or neither the source nor any wrapper leaf is one),
+   * which keep the plain adoption of the tip. Otherwise the wrapper must be provably the worker's own
+   * coverage of the journaled source, and the successor adopts the SOURCE (a marker is then peeled by
+   * the seed's `reset --soft`, so neither marker nor wrapper enters history); any failed proof throws
+   * `successor recovery verification failed`, before a ledger entry or clone exists.
+   *
+   * The caller holds the bare lock: this helper must never take it (the lock is not reentrant), which is
+   * why it reads commits through {@link readBoundedCommit} and not {@link readRecoveryCoverageClaim}.
+   */
+  private async resolveMarkerWrapperAdoption(
+    barePath: string, journal: RecoveryJournalEntry, tip: string, src: string | undefined,
+  ): Promise<{ seedTip: string; expectedHead: string; expectedTree: string; peeledMarkers: string[] } | undefined> {
+    const MAX_HEADS = 64, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    const fail = (): never => { throw new Error("successor recovery verification failed"); };
+    if (await this.isWipParkMarker(barePath, tip)) return undefined;
+    const srcMarker = src !== undefined && await this.isWipParkMarker(barePath, src);
+    const subject = await this.tryGitStdout(barePath, ["log", "-1", "--format=%s", `${tip}^{commit}`]);
+    if (!subject.startsWith("uzi recovery coverage ") && !srcMarker) return undefined;
+    // A wrapper that cannot be walked cannot be shown to bury a marker. With a clean source that keeps
+    // the pre-#3239 adoption; with a marker source it is refused.
+    const unwalkable = (): undefined => srcMarker ? fail() : undefined;
+    const coverageMessage = /^uzi recovery coverage ([0-9a-f]{64}) round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\n$/;
+    const aggregates: Array<{ fp: string; tree: string; author: string | undefined; committer: string | undefined }> = [];
+    const leaves = new Set<string>();
+    const seen = new Set<string>();
+    const queue = [tip];
+    while (queue.length) {
+      const sha = queue.shift()!;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
+      if (seen.size > MAX_AGGREGATES + MAX_HEADS) return unwalkable();
+      let commit;
+      try { commit = await this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES); } catch { return unwalkable(); }
+      if (!commit) return unwalkable();
+      const m = coverageMessage.exec(commit.message);
+      if (!m) { leaves.add(sha); continue; }
+      aggregates.push({ fp: m[1]!, tree: commit.tree, author: commit.author, committer: commit.committer });
+      if (aggregates.length > MAX_AGGREGATES) return unwalkable();
+      queue.push(...commit.parents);
+    }
+    if (leaves.size > MAX_HEADS) return unwalkable();
+    const markerLeaves = new Set<string>();
+    for (const leaf of leaves) if (await this.isWipParkMarker(barePath, leaf)) markerLeaves.add(leaf);
+    if (!srcMarker && markerLeaves.size === 0) return undefined;
+
+    // From here the shape involves a marker: everything below is a hard requirement.
+    if (!src || !aggregates.length) return fail();
+    const fp = aggregates[0]!.fp;
+    if (aggregates.some(a => a.fp !== fp)) return fail();
+    const source = await this.readBoundedCommit(barePath, src, MAX_OBJECT_BYTES);
+    if (!source) return fail();
+    const identity = (kind: string) => `${kind} ${AGENT_GIT_IDENTITY.name} <${AGENT_GIT_IDENTITY.email}> 946684800 +0000`;
+    for (const a of aggregates) {
+      if (a.tree !== source.tree || a.author !== identity("author") || a.committer !== identity("committer")) return fail();
+    }
+    const sortedLeaves = [...leaves].sort();
+    if (!leaves.has(src)) return fail();
+    // The roots are the leaves, with or without the current source (the producer passes both forms).
+    const fingerprints = [sortedLeaves, sortedLeaves.filter(l => l !== src)].filter(r => r.length > 0)
+      .map(roots => createHash("sha256").update(JSON.stringify({ roots, currentSha: src, tree: source.tree })).digest("hex"));
+    if (!fingerprints.includes(fp)) return fail();
+    // Provenance: only the worker's own pin of this very wrapper, for this run, proves it is genuine.
+    const pins = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)",
+      `refs/uzi-coverage/${journal.runId}/`]);
+    const pinned = pins.split("\n").some(line => {
+      const [ref, oid] = line.split(" ");
+      return oid === tip && ref !== undefined && new RegExp(`^refs/uzi-coverage/[^/]+/[^/]+/${fp}$`).test(ref);
+    });
+    if (!pinned) return fail();
+    // Leaves: the source, history of the source, or a marker this attempt's lineage proves superseded.
+    const lineage = new Set(journal.peeledMarkers ?? []);
+    const accepted: string[] = [];
+    for (const leaf of sortedLeaves) {
+      if (leaf === src || await this.isAncestor(barePath, leaf, src)) continue;
+      if (!markerLeaves.has(leaf) || !lineage.has(leaf)) return fail();
+      const marker = await this.readBoundedCommit(barePath, leaf, MAX_OBJECT_BYTES);
+      if (!marker || marker.parents.length === 0 || !await this.isAncestor(barePath, marker.parents[0]!, src)) return fail();
+      accepted.push(leaf);
+    }
+    if (srcMarker) {
+      if (source.parents.length === 0) return fail();
+      return { seedTip: src, expectedHead: source.parents[0]!, expectedTree: source.tree,
+        peeledMarkers: unionPeeledMarkers(accepted, [src]) };
+    }
+    return { seedTip: src, expectedHead: src, expectedTree: source.tree, peeledMarkers: unionPeeledMarkers(accepted) };
+  }
+
   /** Fresh successor, local-only under one bare lock. Never executes in a predecessor.
    * Adopting + successor identity land before clone creation; failure leaves that evidence.
    * Ready and attribution handoff land in ONE config write only after tip/tree/history checks.
@@ -6782,6 +6899,8 @@ export class GitCache {
       const tip = recovery.restoreTip;
       const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
       if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
+      // issue #3239: before any write, so a refusal leaves no ledger entry, journal change or clone.
+      const wrapped = await this.resolveMarkerWrapperAdoption(barePath, journal, tip, recovery.restoreSource);
       const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
       if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
       const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
@@ -6797,18 +6916,19 @@ export class GitCache {
       await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } });
       const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
-        { ...opts, recoveryTip: tip });
+        { ...opts, recoveryTip: wrapped?.seedTip ?? tip });
       const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
       const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
-      const expectedTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
-      const marker = await this.isWipParkMarker(barePath, tip);
-      const expectedHead = marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip;
-      if (head !== expectedHead || tree !== expectedTree ||
+      const expectedTree = wrapped?.expectedTree ?? (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      const marker = wrapped ? wrapped.expectedHead !== wrapped.seedTip : await this.isWipParkMarker(barePath, tip);
+      const expectedHead = wrapped?.expectedHead ?? (marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip);
+      if (head !== expectedHead || tree !== expectedTree || (wrapped && marker && seeded.wipRecovered !== true) ||
           (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ||
           !await this.isAncestor(barePath, expectedHead, tip)) throw new Error("successor recovery verification failed");
       if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
         recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
       await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
+        ...(wrapped?.peeledMarkers.length ? { peeledMarkers: wrapped.peeledMarkers } : {}),
         recovery: { ...recovery, successor, stage: "ready-for-model" } });
       // issue #3194: hand the guard the content source this wrapper verifiably stands for.
       return { ...seeded, attemptId, ...(recovery.restoreSource ? { adoptedContentSource: recovery.restoreSource } : {}) };
@@ -16500,6 +16620,34 @@ try {
   }
 
   /**
+   * Unlocked bounded commit read shared by {@link readRecoveryCoverageClaim} and the marker-wrapper
+   * check in {@link prepareRecoverySuccessor}; the caller holds the bare lock. `git cat-file` output is
+   * decoded as UTF-8 by the exec plumbing, so a body that does not survive the round trip back to its
+   * own object id (or exceeds `maxBytes`) is refused rather than trusted or sent corrupted.
+   */
+  private async readBoundedCommit(barePath: string, sha: string, maxBytes: number): Promise<{
+    body: Buffer; tree: string; parents: string[]; author: string | undefined; committer: string | undefined; message: string;
+  } | undefined> {
+    const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
+    const id = createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
+    if (body.length > maxBytes || id !== sha) return undefined;
+    const text = body.toString("utf8");
+    const split = text.indexOf("\n\n");
+    if (split < 0) return undefined;
+    const header = text.slice(0, split).split("\n");
+    const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
+    if (!tree) return undefined;
+    const parents: string[] = [];
+    for (let i = 1; i < header.length; i++) {
+      const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
+      if (!parent) break;
+      parents.push(parent);
+    }
+    return { body, tree, parents, author: header[1 + parents.length], committer: header[2 + parents.length],
+      message: text.slice(split + 2) };
+  }
+
+  /**
    * Issue #2625: read, never write, the claim that a coverage aggregate built by
    * {@link buildRecoveryCoverage} is redundant with a published branch. Returns undefined (no claim)
    * for anything that does not verify locally, so a caller can only ever send a claim the api's
@@ -16520,29 +16668,9 @@ try {
         !roots.length || !roots.every(r => OWED_OID.test(r)) || !strictlySorted ||
         (witnessHead !== undefined && !OWED_OID.test(witnessHead)) || heads.length > MAX_HEADS) return undefined;
     const coverageMessage = new RegExp(`^uzi recovery coverage ${fingerprint} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\\n$`);
-    const gitObjectId = (body: Buffer): string =>
-      createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
     try {
       return await this.withLock(barePath, async () => {
-        // `git cat-file` output is decoded as UTF-8 by the exec plumbing; a body that does not survive
-        // the round trip back to its own object id is refused rather than sent corrupted.
-        const readCommit = async (sha: string): Promise<{ body: Buffer; tree: string; parents: string[]; message: string } | undefined> => {
-          const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
-          if (body.length > MAX_OBJECT_BYTES || gitObjectId(body) !== sha) return undefined;
-          const text = body.toString("utf8");
-          const split = text.indexOf("\n\n");
-          if (split < 0) return undefined;
-          const header = text.slice(0, split).split("\n");
-          const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
-          if (!tree) return undefined;
-          const parents: string[] = [];
-          for (let i = 1; i < header.length; i++) {
-            const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
-            if (!parent) break;
-            parents.push(parent);
-          }
-          return { body, tree, parents, message: text.slice(split + 2) };
-        };
+        const readCommit = (sha: string) => this.readBoundedCommit(barePath, sha, MAX_OBJECT_BYTES);
         const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
         if (!OWED_OID.test(tree) ||
             createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex") !== fingerprint) return undefined;

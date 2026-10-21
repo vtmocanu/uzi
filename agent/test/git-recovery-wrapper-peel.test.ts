@@ -1,0 +1,225 @@
+import { beforeEach, afterEach, test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { GitCache, type PositiveOwedCandidateContext } from "../src/git.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { nullLogger, noProofReseed, testGitCacheOptions } from "./helpers.js";
+import { fixtureFetchTracking, fixtureTrackingOptions } from "./runner-tracking-fixture.js";
+
+// issue #3239 M3: a retained-recovery successor must never adopt a `wip(park):` marker that is buried
+// under a recovery-coverage wrapper. Real git fixtures; genuine wrappers come from buildRecoveryCoverage.
+
+const branch = "agent/issue-2512";
+const key = "issue-2512";
+const runId = "run-2512";
+const aid = (n: number) => `20261008T171401Z-g${n}-0123456789abcdef`;
+const IDENT = ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false"];
+let fx: Fixture;
+let cache: GitCache;
+let bare: string;
+let source: { runId: string; clonePath: string };
+
+function git(dir: string, args: string[], env: NodeJS.ProcessEnv = {}, input?: string): string {
+  return execFileSync("git", ["-C", dir, ...args], {
+    encoding: "utf8", input, env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", ...env },
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+}
+function journal(): any { return JSON.parse(git(bare, ["config", `uzi-recovery.${branch}.clone`])); }
+function writeJournal(value: unknown): void { git(bare, ["config", `uzi-recovery.${branch}.clone`, JSON.stringify(value)]); }
+function ledger(): string {
+  try { return git(bare, ["config", "--get-all", `uzi-attempts.${branch}.entry`]); } catch { return ""; }
+}
+const sha = (rev: string, dir = bare) => git(dir, ["rev-parse", rev]);
+function ctx(): Promise<PositiveOwedCandidateContext> {
+  return fixtureTrackingOptions(cache, bare, branch, runId).then(o => o.context as PositiveOwedCandidateContext);
+}
+async function genuine(roots: string[], current: string) {
+  return cache.buildRecoveryCoverage(bare, await ctx(), roots, current);
+}
+/** A WIP marker made by the real commitWipMarker in `dir`, then mirrored into the tracking ref. */
+async function wipMarker(dir: string, file: string): Promise<string> {
+  fs.writeFileSync(path.join(dir, file), `${file}\n`);
+  git(dir, ["add", file]);
+  assert.equal(await cache.commitWipMarker(dir), true);
+  await fixtureFetchTracking(cache, bare, dir, branch, runId);
+  return sha("HEAD", dir);
+}
+function sibling(parent: string, message: string): string {
+  return git(bare, [...IDENT, "commit-tree", `${parent}^{tree}`, "-p", parent, "-m", message]);
+}
+function lookalike(marker: string, o: { author?: string; date?: string; fp?: string; pin: boolean }): string {
+  const tree = sha(`${marker}^{tree}`);
+  const real = createHash("sha256").update(JSON.stringify({ roots: [marker], currentSha: marker, tree })).digest("hex");
+  const fp = o.fp ?? real;
+  const date = o.date ?? "2000-01-01T00:00:00Z";
+  const author = o.author ?? "uzi-agent";
+  const wrapper = git(bare, ["--no-replace-objects", "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", marker,
+    "-m", `uzi recovery coverage ${fp} round 0 batch 0`], {
+    GIT_AUTHOR_NAME: author, GIT_AUTHOR_EMAIL: "uzi-agent@uzi.local", GIT_COMMITTER_NAME: author,
+    GIT_COMMITTER_EMAIL: "uzi-agent@uzi.local", GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date,
+  });
+  if (o.pin) git(bare, ["update-ref", `refs/uzi-coverage/${runId}/1/${fp}`, wrapper]);
+  return wrapper;
+}
+/** Assert a refused successor: nothing written, no clone, source untouched. */
+async function assertRefused(attempts: number, attempt: string): Promise<void> {
+  const head = sha("HEAD", source.clonePath);
+  const before = journal();
+  const ledgerBefore = ledger();
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, source, attempts, attempt),
+    /successor recovery verification failed/);
+  assert.equal(journal().recovery.stage, "captured");
+  assert.deepEqual(journal(), before, "the journal is unchanged");
+  assert.equal(ledger(), ledgerBefore, "no attempt ledger entry");
+  assert.ok(!ledger().includes(attempt));
+  assert.ok(!fs.readdirSync(path.dirname(source.clonePath)).some(n => n.includes(attempt)), "no successor clone dir");
+  assert.equal(sha("HEAD", source.clonePath), head, "the source clone is unchanged");
+}
+
+beforeEach(async () => {
+  fx = makeFixture();
+  cache = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  bare = await cache.ensureClone(fx.originPath);
+  fs.chmodSync(path.dirname(bare), 0o700);
+  fs.chmodSync(bare, 0o700);
+  const clone = await cache.createOrAttachRunnerClone(bare, 2512, noProofReseed, runId);
+  source = { runId, clonePath: clone.path };
+  await cache.markRecoveryCapture(bare, clone.path, branch, runId);
+});
+afterEach(() => fx.cleanup());
+
+test("issue #3239 (a): a genuine wrapper over a WIP marker adopts the marker's content uncommitted, with neither in history", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const c = (await genuine([m], m)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(sha("HEAD", successor.path), sha(`${m}^`));
+  assert.equal(git(successor.path, ["status", "--porcelain"]), "A  work.txt");
+  const history = git(successor.path, ["rev-list", "HEAD"]).split("\n");
+  assert.ok(!history.includes(m) && !history.includes(c), "neither the marker nor the wrapper is in history");
+  assert.equal(successor.wipRecovered, true);
+  assert.equal(successor.adoptedSource, m);
+  assert.equal(successor.adoptedContentSource, m);
+  assert.deepEqual(journal().peeledMarkers, [m]);
+  assert.equal(journal().recovery.stage, "ready-for-model");
+});
+
+for (const [name, opts] of [
+  ["no pin", { pin: false }],
+  ["wrong author", { pin: true, author: "mallory" }],
+  ["wrong date", { pin: true, date: "2000-01-02T00:00:00Z" }],
+  ["wrong fingerprint", { pin: true, fp: createHash("sha256").update("other").digest("hex") }],
+] as const) {
+  test(`issue #3239 (b): a look-alike wrapper (${name}) over a marker is refused and keeps the source`, async () => {
+    const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+    const m = await wipMarker(source.clonePath, "work.txt");
+    const c = lookalike(m, opts);
+    await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
+    await assertRefused(r.attempts, aid(2));
+  });
+}
+
+test("issue #3239 (c): a leaf of committed work outside the marker's history is refused", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m = await wipMarker(source.clonePath, "work.txt");
+  const outside = sibling(sha(`${m}^`), "committed work elsewhere");
+  const c = (await genuine([m, outside], m)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m);
+  await assertRefused(r.attempts, aid(2));
+});
+
+test("issue #3239 (d): a genuine wrapper over a clean milestone still adopts the wrapper and keeps the content source", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  fs.writeFileSync(path.join(source.clonePath, "work.txt"), "milestone\n");
+  git(source.clonePath, ["add", "work.txt"]);
+  git(source.clonePath, [...IDENT, "commit", "-m", "milestone"]);
+  await fixtureFetchTracking(cache, bare, source.clonePath, branch, runId);
+  const t = sha("HEAD", source.clonePath);
+  const c = (await genuine([t], t)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, t);
+  const successor = await cache.prepareRecoverySuccessor(bare, branch, key, source, r.attempts, aid(2));
+  assert.equal(successor.adoptedSource, c);
+  assert.equal(successor.adoptedContentSource, t);
+  assert.equal(sha("HEAD", successor.path), c);
+  assert.equal(journal().peeledMarkers, undefined);
+});
+
+/** Episode 1 peels M1 into the attempt A2, whose own WIP marker M2 sits on M1's parent. */
+async function secondEpisode() {
+  const r1 = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m1 = await wipMarker(source.clonePath, "one.txt");
+  await cache.recordRecoveryCapture(bare, branch, key, source, r1.attempts, (await genuine([m1], m1)).sha, m1);
+  const a2 = await cache.prepareRecoverySuccessor(bare, branch, key, source, r1.attempts, aid(2));
+  const expected = { runId, clonePath: a2.path, attemptId: aid(2) };
+  const r2 = await cache.reserveRecoveryIteration(bare, branch, key, expected);
+  const m2 = await wipMarker(a2.path, "two.txt");
+  assert.equal(sha(`${m2}^`), sha(`${m1}^`), "sanity: the second marker sits on the first marker's parent");
+  const c2 = (await genuine([m1, m2], m2)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, expected, r2.attempts, c2, m2);
+  return { m1, m2, c2, expected, attempts: r2.attempts };
+}
+
+test("issue #3239 (e): a lineage-proven superseded marker leaf is accepted and the lineage carries forward", async () => {
+  const { m1, m2, c2, expected, attempts } = await secondEpisode();
+  assert.deepEqual(journal().peeledMarkers, [m1], "sanity: episode 1 journaled the peeled marker on A2");
+  const a3 = await cache.prepareRecoverySuccessor(bare, branch, key, expected, attempts, aid(3));
+  assert.equal(sha("HEAD", a3.path), sha(`${m1}^`));
+  const history = git(a3.path, ["rev-list", "HEAD"]).split("\n");
+  for (const x of [m1, m2, c2]) assert.ok(!history.includes(x));
+  assert.equal(git(a3.path, ["status", "--porcelain"]).split("\n").sort().join("|"), "A  one.txt|A  two.txt");
+  assert.deepEqual([...journal().peeledMarkers].sort(), [m1, m2].sort());
+});
+
+test("issue #3239 (f): sibling markers on one parent with no lineage for the first are refused", async () => {
+  const r = await cache.reserveRecoveryIteration(bare, branch, key, source);
+  const m1 = await wipMarker(source.clonePath, "one.txt");
+  const blob = git(bare, ["hash-object", "-w", "--stdin"], {}, "other content\n");
+  const entries = git(bare, ["ls-tree", `${m1}^{tree}`]);
+  const tree = git(bare, ["mktree"], {}, `${entries}\n100644 blob ${blob}\tother.txt\n`);
+  const m2 = git(bare, [...IDENT, "commit-tree", tree, "-p", sha(`${m1}^`), "-m", "wip(park): second sibling"]);
+  assert.notEqual(sha(`${m2}^{tree}`), sha(`${m1}^{tree}`));
+  const c = (await genuine([m1, m2], m2)).sha;
+  await cache.recordRecoveryCapture(bare, branch, key, source, r.attempts, c, m2);
+  await assertRefused(r.attempts, aid(2));
+});
+
+test("issue #3239 (g): lineage that is not on the producing attempt's own journal is refused", async () => {
+  const { expected, attempts } = await secondEpisode();
+  // The marker is only known to a predecessor, never to the attempt that produced M2.
+  const j = journal();
+  delete j.peeledMarkers;
+  writeJournal(j);
+  const head = sha("HEAD", expected.clonePath);
+  await assert.rejects(cache.prepareRecoverySuccessor(bare, branch, key, expected, attempts, aid(3)),
+    /successor recovery verification failed/);
+  assert.equal(journal().recovery.stage, "captured");
+  assert.ok(!ledger().includes(aid(3)));
+  assert.equal(sha("HEAD", expected.clonePath), head);
+});
+
+test("issue #3239: the journal parser validates peeledMarkers", async () => {
+  const ok = ["a".repeat(40), "b".repeat(40)];
+  const base = journal();
+  writeJournal({ ...base, peeledMarkers: ok });
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+  assert.deepEqual(journal().peeledMarkers, ok, "a well-formed list round-trips");
+  const stored = journal();
+  const bad: Record<string, unknown> = {
+    "a non-sha entry": ["not-a-sha"],
+    "an uppercase sha": [ok[0]!.toUpperCase()],
+    "a non-array": ok[0],
+    "duplicates": [ok[0], ok[0]],
+    "more than 64 entries": Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(40, "0")),
+  };
+  for (const [name, value] of Object.entries(bad)) {
+    writeJournal({ ...stored, peeledMarkers: value });
+    await assert.rejects(cache.reserveRecoveryIteration(bare, branch, key, source), /./, name);
+  }
+  writeJournal({ ...stored, peeledMarkers: Array.from({ length: 64 }, (_, i) => i.toString(16).padStart(40, "0")) });
+  await cache.reserveRecoveryIteration(bare, branch, key, source);
+});
