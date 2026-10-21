@@ -164,6 +164,75 @@ func TestObserveRecordsRunnerLayout(t *testing.T) {
 	})
 }
 
+// lmBackedPod is a new-layout pod whose runner-shared volume is replaced by mutate.
+func lmBackedPod(t *testing.T, name string, mutate func(v *corev1.Volume)) *corev1.Pod {
+	t.Helper()
+	p := lmPod(t, name, "new", false)
+	want := runnerWorkdirMount().Name
+	for i := range p.Spec.Volumes {
+		if p.Spec.Volumes[i].Name == want {
+			mutate(&p.Spec.Volumes[i])
+			return p
+		}
+	}
+	t.Fatalf("rendered pod has no %q volume", want)
+	return nil
+}
+
+func lmEmptyDir(v *corev1.Volume) {
+	v.VolumeSource = corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}
+}
+
+func lmOtherClaim(v *corev1.Volume) {
+	v.VolumeSource = corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: dataPVCName("someone-else")}}
+}
+
+// The runner-shared mount names prove nothing unless the volume behind them is this
+// worker's data PVC.
+func TestObserveRunnerLayoutVerifiesBackingVolume(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(v *corev1.Volume)
+		want   reconcile.RunnerLayout
+	}{
+		{"correct data PVC is new (positive control)", func(*corev1.Volume) {}, reconcile.RunnerLayoutNew},
+		{"emptyDir behind the shared mounts is old", lmEmptyDir, reconcile.RunnerLayoutOld},
+		{"a different claim behind the shared mounts is old", lmOtherClaim, reconcile.RunnerLayoutOld},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := lmSetup(t, "none", false, "20Gi", lmBackedPod(t, "p-backed", c.mutate))
+			obs, err := f.m.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(obs) != 1 || obs[0].RunnerLayout != c.want {
+				t.Fatalf("observed layout = %+v, want %v", obs, c.want)
+			}
+		})
+	}
+}
+
+// A custody-held worker whose pod only LOOKS migrated (emptyDir behind the shared
+// mounts) stays held under ForceRoll; the correct-PVC control rolls.
+func TestLayoutMigrationEmptyDirBackedPodStaysHeldUnderForceRoll(t *testing.T) {
+	control := lmSetup(t, "none", true, "20Gi", lmBackedPod(t, "p-ctl", func(*corev1.Volume) {}))
+	control.tick(t, lmWorker(true))
+	if !wasPatched(control.client) {
+		t.Fatal("positive control failed: a held worker with a correct data PVC was not rolled")
+	}
+	for _, mutate := range []func(*corev1.Volume){lmEmptyDir, lmOtherClaim} {
+		f := lmSetup(t, "none", true, "20Gi", lmBackedPod(t, "p-fake", mutate))
+		f.tick(t, lmWorker(true))
+		if wasPatched(f.client) {
+			t.Fatal("a custody-held worker with a non-PVC data volume was rolled")
+		}
+		if del := deletedSet(f.client); len(del) != 0 {
+			t.Fatalf("a held worker had objects deleted: %v", keysOf(del))
+		}
+	}
+}
+
 // The headline matrix. The expected outcome of a custody-held worker is derived from
 // the SAME scenario run for a non-custody worker (positive control): the hold removes
 // the roll for old, mixed and unknown layouts and changes nothing else.

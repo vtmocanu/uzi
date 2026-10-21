@@ -95,7 +95,7 @@ describe("a separate process keeps writing across a simulated worker restart (#3
 
     const restarted = recreate(); // the fresh worker process: same dataDir, no memory of the predecessor
     const swept = await restarted.inspectRetireScratchAtStartup(LATER);
-    assert.deepEqual(swept, { removed: 0, retained: 1 }, "the parent holding a live writer is retained, not removed");
+    assert.deepEqual(swept, { retained: 1 }, "the parent holding a live writer is retained, not removed");
     const diagnostic = lines.find((l) => (l as { msg?: string }).msg === "runner retire scratch retained") as
       { count: number; paths: string[]; incomplete: boolean } | undefined;
     assert.ok(diagnostic, "the retention diagnostic is emitted");

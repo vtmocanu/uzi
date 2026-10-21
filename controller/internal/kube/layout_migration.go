@@ -38,28 +38,34 @@ const (
 	layoutOld     = reconcile.RunnerLayoutOld
 )
 
-// observeRunnerLayout classifies a worker's pods, terminating ones included. Callers
+// observeRunnerLayout classifies the pods of workerID, terminating ones included. Callers
 // invoke it only after a successful pod list; a failed list leaves the observed
 // layout at its zero value, layoutUnknown. New requires EVERY pod's worker and dind containers to mount the runner-shared
-// subPath and NO pod to carry the legacy volume; any other non-empty set, mixed
+// subPath, that mount's volume to be workerID's data PVC, and NO pod to carry the legacy volume; any other non-empty set, mixed
 // ones included, is old.
-func observeRunnerLayout(pods []corev1.Pod) runnerLayout {
+func observeRunnerLayout(workerID string, pods []corev1.Pod) runnerLayout {
 	if len(pods) == 0 {
 		return layoutNone
 	}
 	for i := range pods {
-		if !podHasNewLayout(&pods[i]) {
+		if !podHasNewLayout(workerID, &pods[i]) {
 			return layoutOld
 		}
 	}
 	return layoutNew
 }
 
-func podHasNewLayout(p *corev1.Pod) bool {
+func podHasNewLayout(workerID string, p *corev1.Pod) bool {
 	for _, v := range p.Spec.Volumes {
 		if v.Name == legacyRunWorkdirVolume {
 			return false
 		}
+	}
+	// The mount names alone prove nothing: the volume behind the runner-shared mount must
+	// be this worker's data PVC, else the pod's /data/runner is not the persistent one
+	// (an emptyDir or another claim) and replacing it would still destroy held state.
+	if !backedByDataPVC(workerID, p) {
+		return false
 	}
 	// dind is a native sidecar (an init container with restartPolicy Always), so both
 	// lists are searched.
@@ -80,6 +86,16 @@ func podHasNewLayout(p *corev1.Pod) bool {
 		}
 	}
 	return true
+}
+
+func backedByDataPVC(workerID string, p *corev1.Pod) bool {
+	want := runnerWorkdirMount().Name
+	for _, v := range p.Spec.Volumes {
+		if v.Name == want {
+			return v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == dataPVCName(workerID)
+		}
+	}
+	return false
 }
 
 func mountsRunnerShared(mounts []corev1.VolumeMount) bool {

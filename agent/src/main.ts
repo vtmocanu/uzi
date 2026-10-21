@@ -956,8 +956,8 @@ async function main(): Promise<void> {
   // CORRELATED failure, not an exotic one — they roll together.
   // Issue #3153: `<dataDir>/runner` persists across pod replacements, so inspect `.retire-*`
   // scratch parents a previous process left behind. Strictly before worker.run() (the claim loop
-  // and every retire/recovery path). Empty ones are rmdir'ed; everything else is retained and
-  // counted in one warning. Never throws, never recursive. Parents newer than this process are skipped.
+  // and every retire/recovery path). Removes nothing: every parent, empty ones included, is retained
+  // and counted in one warning. Never throws, never recursive. Parents newer than this process are skipped.
   await git.inspectRetireScratchAtStartup(Date.now() - process.uptime() * 1000)
     .catch((err) => log.warn("runner retire scratch inspection threw", { error: errMessage(err) }));
 

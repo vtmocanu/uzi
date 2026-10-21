@@ -10371,24 +10371,25 @@ export class GitCache {
    *  rename targets of {@link createRetireScratchParent}). `<runnerRoot>` persists across pod
    *  replacements now, so a crash between the rename and the disposal leaves one behind that no
    *  retire context remembers. It runs ONCE at worker startup, strictly before the claim loop and
-   *  before any retire or recovery path is reachable, and confers no new deletion authority:
+   *  before any retire or recovery path is reachable, and REMOVES NOTHING: reclaim needs the
+   *  retirement/custody/writer-exclusion proofs, and a surviving daemon container can still bind-mount
+   *  or hold its cwd in even an EMPTY parent, so emptiness is no evidence it is unused.
    *    - a parent whose mtime is at or after `processStartMs` is skipped (this process made it);
-   *    - an EMPTY real directory is removed with a non-recursive rmdir (atomic: it fails if a writer
-   *      populated it since the listing);
-   *    - anything else (non-empty, symlink, non-directory, unreadable, rmdir failure) is retained.
-   *      Entries inside a parent are only counted, never stat'ed or followed.
+   *    - every other parent (empty, non-empty, symlink, non-directory, unreadable) is retained and
+   *      counted; `empty` counts the retained parents that held no entries. Entries inside a parent
+   *      are only probed for emptiness, never stat'ed or followed.
    *  Retained parents, parents skipped as recent, and an enumeration cut short by
    *  RETIRE_SCRATCH_ENUMERATION_BUDGET (charged on every entry read) are reported by ONE counted
    *  warning `runner retire scratch retained` (bounded path list). Never recursive; never throws. */
-  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ removed: number; retained: number }> {
+  async inspectRetireScratchAtStartup(processStartMs: number): Promise<{ retained: number }> {
     const root = path.resolve(this.runnerRoot);
     const retained: string[] = [];
-    let removed = 0;
+    let empty = 0;
     let skippedRecent = 0;
     let incomplete = false;
     try {
       const rst = await fs.lstat(root);
-      if (rst.isSymbolicLink() || !rst.isDirectory()) return { removed, retained: 0 };
+      if (rst.isSymbolicLink() || !rst.isDirectory()) return { retained: 0 };
       const names: string[] = [];
       // The budget is charged on EVERY entry read (the runner can fill the persistent root with
       // arbitrary names), and the directory handle is iterated, never slurped.
@@ -10408,36 +10409,40 @@ export class GitCache {
         try {
           const st = await fs.lstat(p);
           if (!st.isSymbolicLink() && st.mtimeMs >= processStartMs) { skippedRecent++; continue; }
-          if (st.isSymbolicLink() || !st.isDirectory()) { retained.push(p); continue; }
-          let empty = true;
-          for await (const _entry of await fs.opendir(p)) { empty = false; break; }
-          if (!empty) { retained.push(p); continue; }
-          await fs.rmdir(p);
-          removed++;
+          retained.push(p);
+          if (st.isSymbolicLink() || !st.isDirectory()) continue;
+          let isEmpty = true;
+          const pd = await fs.opendir(p);
+          try {
+            for await (const _entry of pd) { isEmpty = false; break; }
+          } finally {
+            await pd.close().catch(() => undefined);
+          }
+          if (isEmpty) empty++;
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
-          retained.push(p);
+          if (!retained.includes(p)) retained.push(p);
         }
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
         this.log.warn("runner retire scratch inspection failed", { error: sanitizeForLog(gitErrorMessage(err), 157) });
       }
-      return { removed, retained: retained.length };
+      return { retained: retained.length };
     }
     if (retained.length > 0 || skippedRecent > 0 || incomplete) {
       this.log.warn("runner retire scratch retained", {
         count: retained.length,
+        empty,
         skippedRecent,
         incomplete,
         // Names relative to the runner root: a long root would otherwise truncate away the
         // distinguishing leaf.
         root: sanitizeForLog(root, 157),
         paths: retained.slice(0, RETIRE_SCRATCH_REPORTED_PATHS).map((p) => sanitizeForLog(path.relative(root, p), 157)),
-        removedEmpty: removed,
       });
     }
-    return { removed, retained: retained.length };
+    return { retained: retained.length };
   }
 
   /** issue #3153 — the ONE best-effort removal helper for scratch the worker created under the

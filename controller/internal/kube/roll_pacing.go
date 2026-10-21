@@ -1416,7 +1416,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		if e.dep != nil {
 			failure = replicaFailureReason(e.dep)
 		}
-		e.o.RunnerLayout = observeRunnerLayout(e.pods)
+		e.o.RunnerLayout = observeRunnerLayout(e.w.ID, e.pods)
 		health := deriveRollHealth(current, e.target.Spec.Template.Annotations[AnnotationSpecHash], failure, m.now())
 		if e.o.Roll.Phase != protocol.PhaseStuck || e.o.Roll.PodPhase != string(corev1.ClaimPending) {
 			e.o.Roll = health

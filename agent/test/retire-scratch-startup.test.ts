@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { GitCache, retainedUndeletableCount } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
@@ -27,16 +28,45 @@ beforeEach(() => {
 });
 afterEach(() => { mock.restoreAll(); fx.cleanup(); });
 
-type Diag = { count: number; root: string; paths: string[]; skippedRecent: number; incomplete: boolean };
+type Diag = { count: number; empty: number; root: string; paths: string[]; skippedRecent: number; incomplete: boolean };
 const warnings = (): Diag[] => lines.filter((l) => (l as { msg?: string }).msg === WARNING) as Diag[];
 
 describe("inspectRetireScratchAtStartup (#3153)", () => {
-  it("removes an empty parent non-recursively and reports nothing", async () => {
+  it("retains an empty parent, removes nothing, and reports it in the counted warning", async () => {
     const p = path.join(root, ".retire-aaaa");
     fs.mkdirSync(p);
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 1, retained: 0 });
-    assert.equal(fs.existsSync(p), false);
-    assert.equal(warnings().length, 0);
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 1 });
+    assert.equal(fs.existsSync(p), true);
+    const w = warnings();
+    assert.equal(w.length, 1);
+    assert.equal(w[0]!.count, 1);
+    assert.equal(w[0]!.empty, 1);
+    assert.deepEqual(w[0]!.paths, [".retire-aaaa"]);
+  });
+
+  it("retains an empty parent whose cwd a separate live process holds", async () => {
+    const p = path.join(root, ".retire-held");
+    fs.mkdirSync(p);
+    // A separate process idling with its cwd inside the empty parent; it announces itself once running.
+    const child = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000)"], {
+      cwd: p, stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", () => reject(new Error("holder exited early")));
+        child.stdout!.once("data", () => resolve());
+      });
+      assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 1 });
+      assert.equal(fs.existsSync(p), true, "the parent a live process holds is not removed");
+      assert.equal(child.exitCode, null, "the holder is still running");
+      const w = warnings();
+      assert.equal(w.length, 1);
+      assert.equal(w[0]!.count, 1);
+      assert.equal(w[0]!.empty, 1);
+    } finally {
+      child.kill("SIGKILL");
+    }
   });
 
   it("retains a non-empty parent with its contents and emits one counted warning", async () => {
@@ -48,14 +78,15 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     fs.writeFileSync(path.join(full2, "f"), "y");
     const empty = path.join(root, ".retire-empty");
     fs.mkdirSync(empty);
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 1, retained: 2 });
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 3 });
     assert.equal(fs.readFileSync(path.join(full, "clone", "PRECIOUS"), "utf8"), "x");
     assert.equal(fs.readFileSync(path.join(full2, "f"), "utf8"), "y");
-    assert.equal(fs.existsSync(empty), false);
+    assert.equal(fs.existsSync(empty), true);
     const w = warnings();
     assert.equal(w.length, 1, "exactly one warning");
-    assert.equal(w[0]!.count, 2);
-    assert.deepEqual([...w[0]!.paths].sort(), [".retire-full", ".retire-full2"]);
+    assert.equal(w[0]!.count, 3);
+    assert.equal(w[0]!.empty, 1);
+    assert.deepEqual([...w[0]!.paths].sort(), [".retire-empty", ".retire-full", ".retire-full2"]);
     assert.equal(w[0]!.root, path.resolve(root));
   });
 
@@ -64,7 +95,7 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     fs.mkdirSync(fresh);
     const freshFull = path.join(root, ".retire-freshfull");
     fs.mkdirSync(path.join(freshFull, "clone"), { recursive: true });
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(0), { removed: 0, retained: 0 });
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(0), { retained: 0 });
     assert.equal(fs.existsSync(fresh), true);
     assert.equal(fs.existsSync(freshFull), true);
     const w = warnings();
@@ -83,7 +114,7 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     const withLink = path.join(root, ".retire-entry");
     fs.mkdirSync(withLink);
     fs.symlinkSync(outside, path.join(withLink, "clone"));
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 0, retained: 2 });
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 2 });
     assert.ok(fs.lstatSync(linkParent).isSymbolicLink());
     assert.ok(fs.lstatSync(path.join(withLink, "clone")).isSymbolicLink());
     assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "k");
@@ -93,10 +124,10 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
   it("ignores entries that are not .retire-* and tolerates a missing runner root", async () => {
     const other = path.join(root, "repo-dir");
     fs.mkdirSync(other);
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 0, retained: 0 });
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 0 });
     assert.equal(fs.existsSync(other), true);
     fs.rmSync(root, { recursive: true });
-    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { removed: 0, retained: 0 });
+    assert.deepEqual(await git.inspectRetireScratchAtStartup(OLD), { retained: 0 });
   });
 
   it("charges the budget on every entry: a flood of non-matching names stops the scan and reports it incomplete", async () => {
@@ -105,9 +136,9 @@ describe("inspectRetireScratchAtStartup (#3153)", () => {
     const empty = path.join(root, ".retire-empty");
     fs.mkdirSync(empty);
     const res = await git.inspectRetireScratchAtStartup(OLD);
-    assert.ok(res.removed <= 1 && res.retained === 0, JSON.stringify(res));
+    assert.ok(res.retained <= 1, JSON.stringify(res));
     assert.equal(fs.readdirSync(root).filter((n) => n.startsWith("junk-")).length, flood, "nothing else deleted");
-    assert.equal(fs.existsSync(empty), res.removed === 0, "the empty parent is removed only if the scan reached it");
+    assert.equal(fs.existsSync(empty), true, "nothing is removed, whether or not the scan reached it");
     const w = warnings();
     assert.equal(w.length, 1);
     assert.equal(w[0]!.incomplete, true);
