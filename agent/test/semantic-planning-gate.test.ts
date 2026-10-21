@@ -1,6 +1,6 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
-import type { WorkerClient, PlanCrossCheckCandidate } from "../src/client.js";
+import { RequestError, type WorkerClient, type PlanCrossCheckCandidate } from "../src/client.js";
 import { SemanticPlanningGate } from "../src/semantic-planning-gate.js";
 import { boundedTransport, proposal } from "./semantic-coverage-fixture.js";
 import { semanticServer } from "./semantic-server-fixture.js";
@@ -86,4 +86,34 @@ it("M4 an owner abort during coverage is never classified as an unavailable-cove
   assert.equal((await gate.reviewForGate(c, structural.plan_md, sources)).outcome, "unavailable");
   owner.abort(new Error("owner cancelled"));
   await assert.rejects(gate.reviewForGate(c, structural.plan_md, sources), error => error === abort || /owner cancelled|aborted/.test(String(error)));
+});
+
+it("M3 a foreign reservation or an explicit server refusal stays fail-closed through reviewForGate", async () => {
+  for (const [name, wrap, expected] of [
+    ["foreign binding", (r: Awaited<ReturnType<WorkerClient["reserveSemanticCoverage"]>>) => ({ ...r, candidate_digest: "f".repeat(64) }), /Foreign semantic reservation/],
+    ["server refusal", () => { throw new RequestError("POST", "/semantic/coverage/reserve", 409, "stale claim"); }, /409|stale claim/],
+  ] as const) {
+    const client = {} as WorkerClient;
+    const events: string[] = [];
+    const server = semanticServer(client, events);
+    const transport = await boundedTransport("claude", server.report, events);
+    const gate = new SemanticPlanningGate(client, "run", 1, new AbortController().signal, transport);
+    const c = await gate.compile(structural, proposal(), sources);
+    const reserve = client.reserveSemanticCoverage.bind(client);
+    client.reserveSemanticCoverage = async (...args) => wrap(await reserve(...args));
+    await assert.rejects(gate.reviewForGate(c, structural.plan_md, sources), expected, name);
+    assert.equal(events.includes("invoke"), false, name + ": no model call");
+    assert.equal(events.includes("publish"), false, name + ": nothing published");
+  }
+  // A transport failure of the reservation is still unavailable coverage, never a refusal.
+  const client = {} as WorkerClient;
+  const events: string[] = [];
+  const server = semanticServer(client, events);
+  const transport = await boundedTransport("claude", server.report, events);
+  const gate = new SemanticPlanningGate(client, "run", 1, new AbortController().signal, transport);
+  const c = await gate.compile(structural, proposal(), sources);
+  client.reserveSemanticCoverage = async () => { throw new RequestError("POST", "/semantic/coverage/reserve", 503, "down"); };
+  const result = await gate.reviewForGate(c, structural.plan_md, sources);
+  assert.equal(result.outcome, "unavailable");
+  assert.equal(result.review.reason, "coverage_unavailable");
 });

@@ -3,7 +3,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { WorkerClient, PlanCrossCheckCandidate } from "./client.js";
 import { parseSemanticCandidate, semanticSourceCaptureSchema, type SemanticSubmission } from "./semantic-plan.js";
-import { reviewPlanContract, type BoundedCoverageTestTransport,
+import { reviewPlanContract, CoverageRefusal, type BoundedCoverageTestTransport,
   type CoverageReservation, type PlanContractReviewResult } from "./plan-contract-review.js";
 import type { SemanticBinding, SemanticReservation } from "./semantic-coverage-wire.js";
 import { isCoverageTransportFailure, type SemanticCoverageOutcome } from "./semantic-park.js";
@@ -80,7 +80,9 @@ export class SemanticPlanningGate {
     const result = await reviewPlanContract({
       candidate, sources, plan, binding, testTransport: this.testTransport,
       budget: {
-        reserve: async request => {
+        // Only a transport failure reads as unavailable coverage; a foreign identity or an explicit
+        // server refusal is a CoverageRefusal, which stays fail-closed through reviewForGate.
+        reserve: async request => { try {
           // One UUID per invocation, retained if an HTTP layer retries the request.
           const body = { ...binding, request_id: randomUUID(), ...(reviewId ? { review_id: reviewId } : {}),
             supported: this.testTransport?.kind === "bounded-test" };
@@ -102,7 +104,10 @@ export class SemanticPlanningGate {
           return { id: reserved.invocation_id, model: reserved.model,
             tokens: reserved.max_tokens,
             deadlineMs: Math.min(Date.parse(reserved.deadline), request.deadlineMs) };
-        },
+        } catch (error) {
+          if (error instanceof CoverageRefusal || isCoverageTransportFailure(error, this.signal)) throw error;
+          throw new CoverageRefusal(error instanceof Error ? error.message : "coverage reservation refused", { cause: error });
+        } },
         settle: async (reservation: CoverageReservation, usage) => {
           const admitted = admissions.get(reservation.id);
           if (!admitted) throw new Error("Missing semantic admission");

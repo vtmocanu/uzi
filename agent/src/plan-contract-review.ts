@@ -49,6 +49,11 @@ export interface BoundedCoverageTestTransport {
   usageComplete(snapshot: AdviceUsageSnapshot): boolean;
   isSafetyRefusal(error: unknown): boolean;
 }
+/** A reservation refusal that must stay fail-closed (a foreign identity or an explicit server
+ * refusal): {@link reviewPlanContract} rethrows it instead of reading it as unavailable coverage. */
+export class CoverageRefusal extends Error {
+  constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = "CoverageRefusal"; }
+}
 export interface CoverageClock {
   now(): number;
   schedule(callback: () => void, delayMs: number): () => void;
@@ -161,7 +166,10 @@ export async function reviewPlanContract(input: PlanContractReviewInput): Promis
     if (clock.now() >= deadline || remaining <= inputBound) return result("uncertain", "coverage_exhausted");
     let reservation: CoverageReservation | null;
     try { reservation = await input.budget.reserve({ candidate_digest: candidate.digest, invocation: attempt, maxTokens: remaining, deadlineMs: deadline }); }
-    catch { return result("uncertain", "coverage_unavailable"); }
+    catch (error) {
+      if (error instanceof CoverageRefusal) throw error;
+      return result("uncertain", "coverage_unavailable");
+    }
     if (!reservation) return result("uncertain", "coverage_exhausted");
     const valid = Number.isSafeInteger(reservation.tokens) && reservation.tokens > inputBound &&
       reservation.tokens <= remaining && Number.isFinite(reservation.deadlineMs) &&
