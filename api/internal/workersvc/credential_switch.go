@@ -231,8 +231,8 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 
 // Credential-switch hold hold-reason values (issue #3181). A held-state switch whose local release
 // cannot be proven settled is reported as credential_switch_held: the run PAUSES (the claim is not
-// released) with hold_reason holdReasonCredentialSwitchSettling while the worker stops the run's
-// processes. The worker's credential_switch_hold_settled acknowledgement flips it to
+// released) with hold_reason holdReasonCredentialSwitchSettling while the worker finishes its own
+// operations (it does not prove the run's processes stopped). The worker's credential_switch_hold_settled acknowledgement flips it to
 // holdReasonCredentialSwitchUnsettled, from which only the owner's resume (or set-token) moves the
 // run on.
 const (

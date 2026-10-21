@@ -132,7 +132,9 @@ not, the run is held for you. The hold is `paused` and keeps the run's work
 and custody on that worker:
 
 - **`credential_switch_settling`**: the worker is still finishing its own
-  operations (lane disposal, deps install); it stops and kills nothing now.
+  operations: on a Claude run the guarded-lane disposal and dependency
+  install, joined without starting or killing anything; on a Codex run its
+  normal terminal tool disposal.
   While the holding worker is live and still the same registration, **Resume**
   and `uzi run set-token` are refused with a 409 ("the worker is still
   finishing its own operations for this run; try Resume again shortly, or

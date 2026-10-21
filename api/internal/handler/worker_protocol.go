@@ -1507,7 +1507,7 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 	switch req.State {
 	case "credential_switch_held":
 		// Issue #3181: the hold applied (or replayed idempotently): the run is paused with its
-		// claim kept and the worker now stops the run's processes. The worker keys on this.
+		// claim kept while the worker finishes its own operations. The worker keys on this.
 		ack["disposition"] = "held"
 	case "credential_switch_hold_settled":
 		// Issue #3181: the settlement acknowledgement applied (or replayed): the hold is now
