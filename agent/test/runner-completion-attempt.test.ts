@@ -576,15 +576,14 @@ describe("issue3089 m1 integrated SDK completion admission", () => {
 
 describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
   for (const answered of [false, true]) {
-    for (const restart of ["credential gave_up", "pause refused", "wall refused"] as const) {
+    for (const restart of ["credential gave_up", "pause refused"] as const) {
       it(`issue3089 landing Claude retains ${answered ? "answered" : "autonomous"} rework after ${restart}`, async () => {
         const { queryFn, turns } = fakeTurns([
           [signalDone(answered ? { owner_decision_requested: { reason: "Need owner input" } } : {}), resultSuccess()],
           async function* () {
             yield assistantText("Interrupted recheck");
             if (restart === "credential gave_up") throw new CredentialSwitchSignal();
-            if (restart === "pause refused") throw new PauseNowSignal();
-            throw new Error("run exceeded its wall-clock timeout");
+            throw new PauseNowSignal();
           },
           [assistantText("Recheck completed"), resultSuccess()],
           [signalDone(), resultSuccess()],
@@ -615,62 +614,84 @@ describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
     }
   }
 
-  for (const outcome of ["parked", "undeliverable", "refused"] as const) {
-    it(`issue3089 landing Claude numeric wall exhaustion falls back to wall park ${outcome}`, async t => {
-      let now = Date.now();
-      t.mock.method(Date, "now", () => now);
-      const { queryFn } = fakeTurns([
+  for (const answered of [false, true]) {
+    it(`Claude stops ${answered ? "answered" : "autonomous"} rework after a post-attempt wall when the hold is declined`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [signalDone(answered ? { owner_decision_requested: { reason: "Need owner input" } } : {}), resultSuccess()],
         async function* () {
-          try {
-            yield signalDone({ owner_decision_requested: { reason: "Owner input" } });
-            yield resultSuccess();
-          } finally {
-            // Existing SDK cleanup-time fixture pattern: disarmWall debits this
-            // without yielding to a timer or setting a wall pause mode.
-            now += 20_000;
-          }
+          yield assistantText("Interrupted recheck");
+          throw new Error("run exceeded its wall-clock timeout");
         },
-        [signalDone(), resultSuccess()],
+        () => { assert.fail("post-attempt wall must not re-drive the provider"); },
       ]);
-      const probe = makeCompletionCtx({ unmetScript: [["m2"], []], holdReturns: false,
-        config: { max_iterations: 10, run_timeout_seconds: 10 },
-        askQuestionScript: [{ outcome: "continue" }] });
-      let parks = 0;
+      const probe = makeCompletionCtx({ unmetScript: [["m2"]], holdReturns: false,
+        ...(answered ? { askQuestionScript: [{ outcome: "continue" as const }] } : {}) });
       Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
-        approvedPlan: "plan", sessionId: "sess-1", pauseModeRequested: () => null,
-        // A refused wall park represents an owner extension; the next ACK applies it.
-        reportIteration: async () => parks ? { totalWallSeconds: 30 } : undefined,
-        parkForWall: async () => { parks++; return outcome; } });
+        approvedPlan: "plan", sessionId: "sess-1",
+        frozenMilestones: [{ id: "m2", title: "Remaining work" }],
+        parkForWall: async () => { assert.fail("post-attempt wall must not park"); } });
       const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
-      assert.equal(parks, 1);
+      assert.equal(turns.length, 2, "no provider turn after the wall");
+      assert.match(turns[1]!.promptText!, answered
+        ? /Worker instruction: call `signal_done` again/
+        : /Completion check \(structural interlock\)/,
+      "the interrupted turn still receives its completion rework");
+      assert.equal(probe.attemptCalls.length, 1, "no completion attempt after the wall");
+      assert.deepEqual(probe.askQuestionCalls, answered ? [["m2"]] : []);
+      assert.equal(probe.holdReasons.length, 1);
+      assert.ok(result.walled);
       assert.equal(result.completionHeld, undefined);
-      assert.equal(Boolean(result.walled), outcome !== "refused");
-      assert.equal(probe.attemptCalls.length, outcome === "refused" ? 2 : 1);
     });
   }
 
-  for (const outcome of ["parked", "undeliverable", "refused"] as const) {
-    it(`issue3089 landing Claude refused completion hold falls back to wall park ${outcome}`, async () => {
-      const { queryFn } = fakeTurns([
-        [signalDone({ owner_decision_requested: { reason: "Owner input" } }), resultSuccess()],
-        [signalDone(), resultSuccess()],
-      ]);
-      const probe = makeCompletionCtx({ unmetScript: [["m2"], []], holdReturns: false,
-        askQuestionScript: [{ outcome: "continue" }] });
-      let wallPending = true;
-      let parks = 0;
-      Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
-        approvedPlan: "plan", sessionId: "sess-1",
-        pauseModeRequested: () => probe.attemptCalls.length && wallPending ? "wall" : null,
-        clearWallMode: () => { wallPending = false; },
-        parkForWall: async () => { parks++; return outcome; } });
-      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
-      assert.equal(parks, 1);
-      assert.equal(result.completionHeld, undefined);
-      assert.equal(Boolean(result.walled), outcome !== "refused");
-      assert.equal(probe.attemptCalls.length, outcome === "refused" ? 2 : 1);
-    });
-  }
+  it("Claude stops at numeric post-attempt wall exhaustion when the hold is declined", async t => {
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const { queryFn, turns } = fakeTurns([
+      async function* () {
+        try {
+          yield signalDone({ owner_decision_requested: { reason: "Owner input" } });
+          yield resultSuccess();
+        } finally {
+          // Existing SDK cleanup-time fixture pattern: disarmWall debits this
+          // without yielding to a timer or setting a wall pause mode.
+          now += 20_000;
+        }
+      },
+      () => { assert.fail("numeric post-attempt wall must not re-drive the provider"); },
+    ]);
+    const probe = makeCompletionCtx({ unmetScript: [["m2"]], holdReturns: false,
+      config: { max_iterations: 10, run_timeout_seconds: 10 },
+      askQuestionScript: [{ outcome: "continue" }] });
+    Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "plan", sessionId: "sess-1", pauseModeRequested: () => null,
+      parkForWall: async () => { assert.fail("numeric post-attempt wall must not park"); } });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(turns.length, 1, "no provider turn after the wall");
+    assert.equal(probe.attemptCalls.length, 1, "no completion attempt after the wall");
+    assert.equal(probe.holdReasons.length, 1);
+    assert.ok(result.walled);
+    assert.equal(result.completionHeld, undefined);
+  });
+
+  it("Claude stops at a pending post-attempt wall when the hold is declined", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [signalDone({ owner_decision_requested: { reason: "Owner input" } }), resultSuccess()],
+      () => { assert.fail("pending post-attempt wall must not re-drive the provider"); },
+    ]);
+    const probe = makeCompletionCtx({ unmetScript: [["m2"]], holdReturns: false,
+      askQuestionScript: [{ outcome: "continue" }] });
+    Object.assign(probe.ctx, { kind: "issue", interactive: false, planApproved: true,
+      approvedPlan: "plan", sessionId: "sess-1",
+      pauseModeRequested: () => probe.attemptCalls.length ? "wall" : null,
+      parkForWall: async () => { assert.fail("pending post-attempt wall must not park"); } });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(turns.length, 1, "no provider turn after the wall");
+    assert.equal(probe.attemptCalls.length, 1, "no completion attempt after the wall");
+    assert.equal(probe.holdReasons.length, 1);
+    assert.ok(result.walled);
+    assert.equal(result.completionHeld, undefined);
+  });
 
   it("issue3089 completion recheck retains queued owner input until an ordinary turn", async () => {
     const { queryFn, turns } = fakeTurns([
