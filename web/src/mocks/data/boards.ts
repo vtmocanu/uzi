@@ -23,6 +23,7 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
     mr_web_url: null,
     mr_state: null,
     failure_reason: null,
+    fail_origin: null,
     stop_kind: null,
     stop_reason: null,
     health: "ok",
@@ -643,6 +644,17 @@ const boardFixtures: Record<string, Board> = {
     bot_forge_user_id: 5107,
   },
 };
+
+boardFixtures["repo-atlas"].cards.push({
+  ...boardFixtures["repo-atlas"].cards.find((c) => c.iid === 7)!,
+  iid: 10,
+  title: "Refresh pool metrics after base update",
+  web_url: atlasUrl(10),
+  latest_run: latestRun({
+    id: "run-rejected", status: "failed", fail_origin: "base_diverged",
+    failure_reason: "The base branch changed; start a fresh run.",
+  }),
+});
 
 // The demo board renders in ASCENDING issue number, which is what the real server
 // serves for a board nobody has dragged: `ORDER BY board_position ASC NULLS LAST,

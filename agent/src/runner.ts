@@ -5640,6 +5640,8 @@ export class RunRunner {
     const failOrigin =
       err instanceof ProviderPolicyRefusal
         ? "provider_policy_refusal"
+        : err instanceof BaseCommitDivergedError
+        ? "base_diverged"
         : err instanceof TerminalReportError || (err instanceof CodexTurnFailedError && err.failOrigin !== undefined)
         ? err.failOrigin
         : failOriginForReason(rawReason);
@@ -12988,8 +12990,11 @@ export class RunRunner {
       // routes to enterCompletionHold (M4) — it NEVER throws a timeout. Reached only on an
       // interlocked run (completionInterlock above true; a legacy run never hits the stall path).
       // Sources its window from claim.config, exactly like askUser sources its deadline.
-      askCompletionQuestion: (unmet, trigger) =>
-        this.askCompletionQuestion(
+      // The awaiting_input report above takes the worker-memory phase hold. Unlike askUser, the
+      // helper sends no Running report after an answer, so mark the resume ready on a continue:
+      // the executor's next Running ACK then releases the hold, as it does after askUser.
+      askCompletionQuestion: async (unmet, trigger) => {
+        const result = await this.askCompletionQuestion(
           runId,
           unmet,
           batcher,
@@ -12998,7 +13003,10 @@ export class RunRunner {
           runLog,
           claim.config ?? null,
           trigger,
-        ),
+        );
+        if (result.outcome === "continue" && flight.workerMemory) flight.workerMemory.resumeReady = true;
+        return result;
+      },
     };
     // PRD #2603: no summary call starts, and a result is discarded, while any of these is pending.
     if (nowSummary) holdContextCallbacks(ctx, nowSummary);

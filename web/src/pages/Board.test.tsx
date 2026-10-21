@@ -3362,3 +3362,14 @@ describe("Board — per-card harness picker gate (PRD #1429 M4a)", () => {
     expect(screen.queryByLabelText("Anthropic token for #1")).toBeNull();
   });
 });
+
+describe("IssueCard rejection presentation", () => {
+  it.each([
+    ["base_diverged", null, "rejected", "neutral"],
+    ["base_diverged", "plan_rejected", "stopped", "neutral"],
+    ["agent_failure", null, "failed", "danger"],
+  ] as const)("renders %s / %s as %s", (fail_origin, stop_kind, label, tone) => {
+    renderCard({ latest_run: { id: "r-rejection", status: "failed", fail_origin, stop_kind, health: "ok", is_mine: true } as LatestRun });
+    expect(screen.getByText(label).classList.contains(tone === "neutral" ? "text-neutral-fg" : "text-danger")).toBe(true);
+  });
+});

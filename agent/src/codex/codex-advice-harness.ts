@@ -1,5 +1,5 @@
 // PRD #1171 (M3, milestone 3) — the Codex isolated advice pass with no worker callbacks.
-// #1566: native async questions and read-only UTC remain reachable in pinned 0.160.1.
+// #1566: native async questions and read-only UTC were characterized at 0.160.1.
 //
 // This is the `AdviceHarness` for `kind:"codex"`: it runs ONE isolated judge/review/
 // summary turn against an isolated Codex provider root and returns the accumulated

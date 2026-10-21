@@ -881,6 +881,36 @@ continues. The worker rebuilds the plugin each time the run starts or
 resumes, so the warning is posted once per start or resume, not once per
 turn. Codex runs are unaffected.
 
+## When a required base has changed
+
+A [seeded plan](./seeded-plans.md#2-note-your-base-commit-optional) with
+`--planned-commit` and `--require-base` is rejected before implementation if
+the worker's checked-out base does not match. The stored status stays `failed`,
+with `fail_origin = base_diverged`. Web run and board badges show neutral
+**rejected**; the cause label is exactly **rejected: base changed**. CLI
+status labels also show **rejected**. Human cancellation and plan rejection
+take precedence; a rejected plan still shows **stopped**.
+
+This origin is never judged, including a resumed run with earlier iterations.
+It stays in the finished-run denominator but has its own `base_diverged`
+count, excluded from failure totals, `fail_origins` maps and failure recency.
+The usage bar's **rejected** segment sums it with `plan_rejected`; see
+[usage accounting](./run-cost.md#rejected-runs-and-failure-accounting).
+Review the plan against the new base and start a new run. Without
+`--require-base`, a mismatch remains a warning and execution continues.
+
+Deploy the API allowlist and database schema supporting `base_diverged` before
+rolling workers that report this origin. An older API treats an unknown
+worker origin as absent and defaults the failed report to `agent_failure`;
+an older worker omits the new origin, so the updated API still records an
+ordinary failure. Historical failures are not backfilled or reclassified
+from their free-text reasons.
+
+During version skew, the web client accepts an omitted `base_diverged` usage
+count as zero. Run and board payloads may omit `fail_origin` or carry null;
+without the typed origin, the client cannot infer a base-change rejection
+from the failure reason and retains the ordinary presentation.
+
 ## When Codex reports a provider safety-policy refusal
 
 A failed Codex turn classified as exactly `cyberPolicy` or

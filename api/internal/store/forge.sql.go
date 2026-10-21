@@ -451,7 +451,7 @@ func (q *Queries) GetIssueByIID(ctx context.Context, arg GetIssueByIIDParams) (I
 }
 
 const getLatestRunForIssue = `-- name: GetLatestRunForIssue :one
-SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind, r.stop_reason,
+SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.fail_origin, r.stop_kind, r.stop_reason,
        -- has_plan_md: full-Unicode-whitespace-trimmed presence flag matching runToDTO's
        -- strings.TrimSpace (Go's unicode.IsSpace set) so the board card and run read agree
        -- on is_planning for all whitespace, not just ASCII (issue #321, #342).
@@ -491,6 +491,7 @@ type GetLatestRunForIssueRow struct {
 	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
 	MrState                   pgtype.Text        `json:"mr_state"`
 	FailureReason             pgtype.Text        `json:"failure_reason"`
+	FailOrigin                pgtype.Text        `json:"fail_origin"`
 	StopKind                  pgtype.Text        `json:"stop_kind"`
 	StopReason                pgtype.Text        `json:"stop_reason"`
 	Kind                      string             `json:"kind"`
@@ -534,6 +535,7 @@ func (q *Queries) GetLatestRunForIssue(ctx context.Context, arg GetLatestRunForI
 		&i.MrWebUrl,
 		&i.MrState,
 		&i.FailureReason,
+		&i.FailOrigin,
 		&i.StopKind,
 		&i.StopReason,
 		&i.Kind,
@@ -1100,7 +1102,7 @@ func (q *Queries) ListIssuesByRepo(ctx context.Context, repoID uuid.UUID) ([]Iss
 
 const listLatestRunsForRepo = `-- name: ListLatestRunsForRepo :many
 SELECT DISTINCT ON (r.issue_iid)
-       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.stop_kind, r.stop_reason,
+       r.issue_iid, r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_reason, r.fail_origin, r.stop_kind, r.stop_reason,
        -- has_plan_md is the presence flag feeding is_planning (issue #321). It trims the
        -- FULL Unicode whitespace set — the code points for which Go's unicode.IsSpace is
        -- true (what strings.TrimSpace trims) — so it agrees with the Go path's TrimSpace in
@@ -1141,6 +1143,7 @@ type ListLatestRunsForRepoRow struct {
 	MrWebUrl                  pgtype.Text        `json:"mr_web_url"`
 	MrState                   pgtype.Text        `json:"mr_state"`
 	FailureReason             pgtype.Text        `json:"failure_reason"`
+	FailOrigin                pgtype.Text        `json:"fail_origin"`
 	StopKind                  pgtype.Text        `json:"stop_kind"`
 	StopReason                pgtype.Text        `json:"stop_reason"`
 	Kind                      string             `json:"kind"`
@@ -1201,6 +1204,7 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 			&i.MrWebUrl,
 			&i.MrState,
 			&i.FailureReason,
+			&i.FailOrigin,
 			&i.StopKind,
 			&i.StopReason,
 			&i.Kind,

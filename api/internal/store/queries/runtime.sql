@@ -8116,9 +8116,11 @@ ORDER BY cost_usd DESC, output_tokens DESC, u.id;
 -- axis as the usage 7-day figures, so the two 7-day numbers on one card describe the
 -- same set of runs. plan_rejected is split out of failed (D4): rejecting a plan is the
 -- owner's decision, kept in the denominator and its own bar segment but out of the
--- numerator. Every computed column carries an explicit ::bigint cast (the file's
+-- numerator. base_diverged is likewise a separate denominator bucket: the worker
+-- refused a divergent base, rather than reporting an agent defect.
+-- Every computed column carries an explicit ::bigint cast (the file's
 -- convention). Invariants the handler/live-DB tests assert:
--- finished == completed + cancelled + plan_rejected + failed, and
+-- finished == completed + cancelled + plan_rejected + base_diverged + failed, and
 -- sum(fail_origins) == failed. The per-origin breakdown is a jsonb_object_agg scalar
 -- subquery INSIDE each outcome query (issue #1451), not a second query per scope: one
 -- statement reads one snapshot, so the breakdown and the `failed` count always describe
@@ -8135,7 +8137,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE user_id = @user_id AND status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8151,12 +8153,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): the SUB-CUT of the `failed` count whose per-run
     -- landing_state derives to needs_landing (workersvc.DeriveLandingState) — a human-landable
     -- fail_origin (@landable_origins, the Go-owned set, never spelled here) whose committed work
@@ -8187,14 +8191,14 @@ SELECT
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = @user_id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8212,7 +8216,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT  id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY COALESCE(finished_at, status_since) DESC, id DESC LIMIT 1
 )
@@ -8229,12 +8233,14 @@ SELECT
     count(*) FILTER (WHERE status = 'completed')::bigint                                   AS lifetime_completed,
     count(*) FILTER (WHERE status = 'cancelled')::bigint                                   AS lifetime_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected')::bigint    AS lifetime_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS lifetime_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged')::bigint    AS lifetime_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS lifetime_failed,
     count(*) FILTER (WHERE runs.created_at >= now() - interval '7 days')::bigint           AS last7_finished,
     count(*) FILTER (WHERE status = 'completed' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_completed,
     count(*) FILTER (WHERE status = 'cancelled' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_cancelled,
     count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin = 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged' AND runs.created_at >= now() - interval '7 days')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- @landable_origins is the Go-owned human-landable set; the correlated EXISTS resolves to
     -- the OUTER `runs` row (no JOIN, which would corrupt the sibling counts).
@@ -8257,13 +8263,13 @@ SELECT
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS lifetime_fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
-              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              WHERE r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               AND r2.created_at >= now() - interval '7 days'
               GROUP BY 1) o) AS last7_fail_origins
@@ -8280,7 +8286,7 @@ WITH last_failure AS MATERIALIZED (
     SELECT DISTINCT ON (user_id) id, user_id, COALESCE(finished_at, status_since) AS ended_at,
            COALESCE(fail_origin, 'unknown') AS origin
     FROM runs
-    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected'
+    WHERE status = 'failed' AND fail_origin IS DISTINCT FROM 'plan_rejected' AND fail_origin IS DISTINCT FROM 'base_diverged'
       AND kind NOT IN ('chat', 'judge', 'cross_check')
     ORDER BY user_id, COALESCE(finished_at, status_since) DESC, id DESC
 )
@@ -8296,12 +8302,14 @@ SELECT u.id AS user_id, u.email,
     count(*) FILTER (WHERE r.status = 'completed')::bigint                                 AS completed,
     count(*) FILTER (WHERE r.status = 'cancelled')::bigint                                 AS cancelled,
     count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS plan_rejected,
-    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS failed,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS lifetime_base_diverged,
+    count(*) FILTER (WHERE r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS failed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days')::bigint                                                                       AS last7_finished,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'completed')::bigint                                 AS last7_completed,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'cancelled')::bigint                                 AS last7_cancelled,
     count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'plan_rejected')::bigint AS last7_plan_rejected,
-    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected')::bigint AS last7_failed,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin = 'base_diverged')::bigint AS last7_base_diverged,
+    count(*) FILTER (WHERE r.created_at >= now() - interval '7 days' AND r.status = 'failed' AND r.fail_origin IS DISTINCT FROM 'plan_rejected' AND r.fail_origin IS DISTINCT FROM 'base_diverged')::bigint AS last7_failed,
     -- needs_landing (issue #1418): SUB-CUT of `failed`; see SelfRunOutcomes for the shape.
     -- The alias here is `r`,
     -- so the correlated EXISTS resolves to the OUTER `r` row (no JOIN — that would corrupt the
@@ -8327,14 +8335,14 @@ SELECT u.id AS user_id, u.email,
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS fail_origins,
     (SELECT COALESCE(jsonb_object_agg(o.origin, o.cnt), '{}')::jsonb
         FROM (SELECT COALESCE(r2.fail_origin, 'unknown') AS origin, count(*) AS cnt
               FROM runs r2
               WHERE r2.user_id = u.id AND r2.created_at >= now() - interval '7 days'
-              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected'
+              AND r2.status = 'failed' AND r2.fail_origin IS DISTINCT FROM 'plan_rejected' AND r2.fail_origin IS DISTINCT FROM 'base_diverged'
               AND r2.kind NOT IN ('chat', 'judge', 'cross_check')
               GROUP BY 1) o) AS last7_fail_origins
 FROM runs r

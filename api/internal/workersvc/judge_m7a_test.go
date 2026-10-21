@@ -192,7 +192,7 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 func TestNeverJudgeFailOriginsExact(t *testing.T) {
 	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins,
 		"forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full",
-		"worker_residue_blocked", "skills_plugin_load_failed")
+		"worker_residue_blocked", "skills_plugin_load_failed", "base_diverged")
 }
 
 // TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:

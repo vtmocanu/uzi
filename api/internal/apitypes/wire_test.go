@@ -1051,7 +1051,7 @@ func TestAdminUsageDTOTags(t *testing.T) {
 // server-computed sub-cut of `failed` (needs_landing <= failed), also always present.
 func TestRunOutcomesDTOTags(t *testing.T) {
 	assertTags(t, "RunOutcomesDTO", RunOutcomesDTO{},
-		"finished", "completed", "cancelled", "plan_rejected", "failed", "needs_landing", "fail_origins",
+		"finished", "completed", "cancelled", "plan_rejected", "base_diverged", "failed", "needs_landing", "fail_origins",
 		"last_failed_at", "last_failed_run_id", "last_failed_origin", "last_failed_user_id", "completed_since_last_failure")
 }
 

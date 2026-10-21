@@ -49,7 +49,9 @@
 # lint-repo job ON THE TASK LINE) and CI each turn the skip into exit 2. The CI job
 # installs the PINNED versions; a local run uses whatever is on PATH and the
 # authoritative verdict is CI's (the lint-yaml.sh precedent -- no in-wrapper version
-# pin, because the gate that counts installs a known one).
+# pin, because the gate that counts installs a known one). The worker image bakes
+# both from agent/devbox-global/devbox.lock, and check:actions-tool-parity holds CI
+# to the same versions (#2288), so a hosted run's verdict matches CI's.
 #
 # EXIT CODES (the convention fmt-check:api, lint:api, lint-yaml.sh set):
 #     2 = the instrument is broken (or a REQUIRED run found a tool missing)

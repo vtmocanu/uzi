@@ -962,6 +962,174 @@ test("M3 late mocked historical outcome resolves only the original ticket after 
   }
 });
 
+for (const [label, answers, guidance] of [
+  ["a plain continue", ["continue"], undefined],
+  ["a continue with guidance", ["finish M2"], "finish M2"],
+] as const) {
+  test(`completion question answered with ${label}: the next Running ACK releases its input phase hold`, async () => {
+    const f = await setup();
+    const monitoring = f.memory.run();
+    let executorError: unknown, proof = false;
+    let questionWork: Promise<unknown> | undefined;
+    const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+    const executor: Executor = { run: async ctx => {
+      try {
+        await ctx.reportIteration!(1);
+        const before = ctx.capturedMemory!()!;
+        assert.equal(before.commands.admitsCommands(before.context), true);
+        questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: "fixture" });
+        await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+        const waiting = ctx.capturedMemory!()!;
+        assert.equal(waiting.context, before.context);
+        assert.equal(waiting.commands.phaseAdmits(waiting.context), false, "the completion question holds the phase");
+        const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+        api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers }))]);
+        assert.deepEqual(await questionWork, { outcome: "continue", guidance });
+        const resumed = ctx.capturedMemory!()!;
+        assert.equal(resumed.context, waiting.context, "the continue keeps the execution's context");
+        assert.equal(resumed.commands.phaseAdmits(resumed.context), false, "the hold stays until the Running ACK");
+        await ctx.reportIteration!(2);
+        assert.equal(resumed.commands.isCurrent(resumed.context), true);
+        assert.equal(resumed.commands.phaseAdmits(resumed.context), true, "the Running ACK releases the completion hold");
+        assert.equal(resumed.commands.admitsCommands(resumed.context), true, "shell commands are admitted again");
+        assert.equal(resumed.commands.remaining(resumed.context), 2, "the intervention allowance is untouched");
+        assert.equal(f.reservations.length, 0);
+        proof = true;
+      } catch (error) { executorError = error; throw error; }
+      finally { await questionWork?.catch(() => {}); }
+      throw new Error("completion continue proof complete");
+    } };
+    try {
+      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+      if (executorError) throw executorError;
+      assert.equal(proof, true);
+    } finally {
+      clearTimeout(rescue);
+      await f.memory.stop(); await monitoring;
+    }
+  });
+}
+
+test("two consecutive completion questions, each continued, each release their own hold after their Running ACK", async () => {
+  const f = await setup();
+  const monitoring = f.memory.run();
+  let executorError: unknown, proof = false;
+  let questionWork: Promise<unknown> | undefined;
+  const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+  const executor: Executor = { run: async ctx => {
+    try {
+      await ctx.reportIteration!(1);
+      const captured = ctx.capturedMemory!()!;
+      for (const round of [2, 3]) {
+        questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: `round ${round}` });
+        await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+        assert.equal(captured.commands.phaseAdmits(captured.context), false, `round ${round} holds the phase`);
+        const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+        api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers: ["continue"] }))]);
+        assert.deepEqual(await questionWork, { outcome: "continue", guidance: undefined });
+        assert.equal(captured.commands.phaseAdmits(captured.context), false, `round ${round} holds until its ACK`);
+        await ctx.reportIteration!(round);
+        assert.equal(ctx.capturedMemory!()!.context, captured.context);
+        assert.equal(captured.commands.admitsCommands(captured.context), true, `round ${round} releases its own hold`);
+      }
+      proof = true;
+    } catch (error) { executorError = error; throw error; }
+    finally { await questionWork?.catch(() => {}); }
+    throw new Error("repeated completion continue proof complete");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    assert.equal(proof, true);
+  } finally {
+    clearTimeout(rescue);
+    await f.memory.stop(); await monitoring;
+  }
+});
+
+for (const [label, tamper] of [
+  ["a rejected (applied: false)", (ack: StateAck) => ({ ...ack, applied: false })],
+  ["a stale-claim", (ack: StateAck) => ({ ...ack, staleClaim: true })],
+] as const) {
+  test(`after a completion continue, ${label} Running ACK releases nothing`, async () => {
+    const f = await setup();
+    const monitoring = f.memory.run();
+    let executorError: unknown, proof = false;
+    let questionWork: Promise<unknown> | undefined;
+    const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+    const report = client.reportState.bind(client);
+    const executor: Executor = { run: async ctx => {
+      try {
+        await ctx.reportIteration!(1);
+        const captured = ctx.capturedMemory!()!;
+        questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: "fixture" });
+        await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+        const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+        api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers: ["continue"] }))]);
+        assert.deepEqual(await questionWork, { outcome: "continue", guidance: undefined });
+        let tampered = false;
+        client.reportState = async (...args) => {
+          const ack = await report(...args);
+          if (!tampered && args[1].status === "running") { tampered = true; return tamper(ack); }
+          return ack;
+        };
+        await Promise.resolve(ctx.reportIteration!(2)).catch(() => {});
+        assert.equal(tampered, true);
+        assert.equal(captured.commands.phaseAdmits(captured.context), false, "the completion hold remains");
+        assert.equal(captured.commands.admitsCommands(captured.context), false);
+        proof = true;
+      } catch (error) { executorError = error; throw error; }
+      finally { client.reportState = report; await questionWork?.catch(() => {}); }
+      throw new Error("completion ACK control proof complete");
+    } };
+    try {
+      await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+        { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim).catch(() => {});
+      if (executorError) throw executorError;
+      assert.equal(proof, true);
+    } finally {
+      clearTimeout(rescue);
+      await f.memory.stop(); await monitoring;
+    }
+  });
+}
+
+test("an expired completion question releases nothing on a later Running ACK", async () => {
+  const f = await setup();
+  f.claim.config = { ...f.claim.config, completion_hold_window_seconds: 1 } as typeof f.claim.config;
+  const monitoring = f.memory.run();
+  let executorError: unknown, proof = false;
+  const rescue = setTimeout(() => api.setInputs(f.claim.run_id, [input("cancel")]), 15000);
+  const executor: Executor = { run: async ctx => {
+    try {
+      await ctx.reportIteration!(1);
+      const waiting = ctx.capturedMemory!()!;
+      const questionWork = ctx.askCompletionQuestion!(["m1"], { kind: "lead_request", reason: "fixture" });
+      await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+      assert.equal(waiting.commands.phaseAdmits(waiting.context), false);
+      assert.deepEqual(await questionWork, { outcome: "expired" });
+      assert.equal(waiting.commands.phaseAdmits(waiting.context), false, "an expired question releases nothing");
+      assert.equal(waiting.commands.admitsCommands(waiting.context), false);
+      await ctx.reportIteration!(2);
+      assert.equal(waiting.commands.phaseAdmits(waiting.context), false, "a later Running ACK releases nothing either");
+      assert.equal(waiting.commands.admitsCommands(waiting.context), false);
+      proof = true;
+    } catch (error) { executorError = error; throw error; }
+    throw new Error("completion expiry proof complete");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    assert.equal(proof, true);
+  } finally {
+    clearTimeout(rescue);
+    await f.memory.stop(); await monitoring;
+  }
+});
+
 test("M3 reordered Running ACK cannot release the input phase token or clear pressure", async () => {
   const f = await setup();
   const monitoring = f.memory.run();

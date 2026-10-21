@@ -116,13 +116,16 @@ Constraints, so nobody simplifies that block back into something broken:
 ## CI
 
 CI is GitHub Actions; there is no `.gitlab-ci.yml`. The workflows are
-`.github/workflows/{ci,e2e,kind-smoke,release}.yml` plus `brew.yml` and `main-guard.yml`.
+`.github/workflows/{ci,e2e,kind-smoke,release,codex-packaged-proof}.yml` plus `brew.yml`,
+`main-guard.yml` and the weekly `devbox-update.yml`, `pricing-freshness.yml` and
+`roles-manifest-refresh.yml`.
 
 | workflow | triggers | runs |
 |---|---|---|
 | `ci.yml` | every PR and `main` | component validate/test gates skip only on successfully classified PRs containing exclusively added/modified files under `.agents/skills/uzi-lander/`; repo lint and Helm checks always run. Main runs full component gates; image validation builds are path-filtered on PRs |
 | `kind-smoke.yml` | push to `main`, `v*` tags, manual dispatch, path-filtered on `pull_request` (`deploy/**`, `scripts/smoke.sh`, `.github/workflows/kind-smoke.yml`) | ephemeral KinD cluster, `helm install`, `scripts/smoke.sh` through the web→api reverse proxy. The always-reporting `kind-smoke-gate` job is the stable required check, so a non-chart PR never wedges Pending |
 | `e2e.yml` | nightly schedule + manual dispatch, never PR or push | the compose harness `./e2e/run-e2e.sh` |
+| `codex-packaged-proof.yml` | nightly schedule, manual dispatch, path-filtered `pull_request` (Codex runtime, packaging and harnesses; `api/` and other worker source only nightly) | `e2e/codex-proof/run-proof.sh` per template: the strict packaged Codex O proof (#3148). Not a required check; a scheduled failure opens or updates one `codex-packaged-proof` issue |
 | `release.yml` | `v*` tags only | publishes the images + the OCI Helm chart to GHCR |
 
 k8s deploy is GitOps via ArgoCD — see `deploy/` (the chart plus the `deploy/README.md` release runbook).

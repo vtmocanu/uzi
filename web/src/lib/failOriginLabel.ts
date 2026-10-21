@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
   agent_failure: "agent failure",
   provider_policy_refusal: "provider safety-policy refusal",
   plan_rejected: "plan rejected",
+  base_diverged: "rejected: base changed",
   auto_stopped: "auto stopped",
   workflow_scope_missing: "workflow scope missing",
   finalize_base_align_conflict: "finalize base-align conflict",

@@ -1,0 +1,133 @@
+name: Codex packaged proof
+
+# The packaged Codex O proof (#3148): the M3b packaged lifecycle, the M3a profile controls and
+# the four M3a confinement suites, run strict (no skipped, todo or missing test passes) on one
+# real worker image per template, on native linux/amd64 with Landlock. These harnesses only ran
+# when a maintainer started them and rotted for about six weeks before PR #3114 found it.
+# Everything runs through e2e/codex-proof/run-proof.sh, which a maintainer can run by hand
+# (`task test:codex-proof`).
+#
+# Never gates a merge: no ruleset requires these checks. A scheduled failure opens or updates
+# one tracking issue.
+
+"on":
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    # Codex runtime, packaging and harness changes only. The traced full input set (all of
+    # agent/src, the M3b-mounted agent test, api/ non-test sources) matched ~56% of main commits
+    # over two weeks; this set matched ~15% (measured 2026-10-20) and still covers both rot
+    # classes seen so far: harness edits (#3114) and template/entrypoint changes (#1619). API and
+    # other worker-source changes get the full proof from the nightly run instead.
+    paths:
+      - ".github/workflows/codex-packaged-proof.yml"
+      - "agent/codex/**"
+      - "agent/src/codex/**"
+      - "agent/templates/**"
+      - "agent/devbox-global/**"
+      - "agent/package.json"
+      - "agent/package-lock.json"
+      - "agent/tsconfig.json"
+      - "e2e/codex-m0/**"
+      - "e2e/codex-m3a/**"
+      - "e2e/codex-m3b/**"
+      - "e2e/codex-proof/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-packaged-proof-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packaged-proof:
+    name: packaged-proof (${{ matrix.template }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [base, jvm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      # Host toolchains: go builds the M3a static stub child, node runs the strict TAP checker and
+      # the M3b contract/count parsers.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.27"
+          cache: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: "24"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4
+      # One image per template; every leg reuses it. The agent-<t> packages are public, so the
+      # release buildcache is read anonymously (no login, no packages permission), as in ci.yml.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
+        env:
+          # No .dockerbuild record artifact: the run's artifacts are the proof verdicts only, so
+          # `gh run download` needs no per-artifact selection.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: agent/templates/${{ matrix.template }}/Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          cache-from: |
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache
+            type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${{ matrix.template }}:buildcache-release
+          build-args: |
+            UZI_SRC_SHA=${{ github.sha }}
+          tags: cdr-codex-proof-${{ matrix.template }}:${{ github.run_id }}
+      # github.sha is the checked-out commit (the merge commit on a pull_request); the PR head is
+      # recorded beside it.
+      - name: Run the strict packaged proof
+        env:
+          TEMPLATE: ${{ matrix.template }}
+          UZI_CODEX_PROOF_IMAGE: cdr-codex-proof-${{ matrix.template }}:${{ github.run_id }}
+          UZI_CODEX_PROOF_SKIP_BUILD: "1"
+          UZI_CODEX_PROOF_OUT: ${{ runner.temp }}/codex-proof-${{ matrix.template }}
+          UZI_CODEX_PROOF_COMMIT: ${{ github.sha }}
+          UZI_CODEX_PROOF_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./e2e/codex-proof/run-proof.sh "$TEMPLATE"
+      - name: Upload proof logs and verdict
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: codex-packaged-proof-${{ matrix.template }}
+          path: ${{ runner.temp }}/codex-proof-${{ matrix.template }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # A scheduled failure (not a cancellation, e.g. one superseded by a manual run) keeps exactly one open tracking issue: comment on it, else open it. The
+  # label is upserted first so the lookup cannot error on a missing label (e2e.yml pattern).
+  report-failure:
+    needs: packaged-proof
+    if: ${{ github.event_name == 'schedule' && failure() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LABEL="codex-packaged-proof"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create "$LABEL" \
+            --description "Scheduled Codex packaged proof (e2e/codex-proof) failures" \
+            --color B60205 --force
+          body="$(printf 'The scheduled Codex packaged proof failed at `%s`.\n\nRun: %s\n\nEach template uploads `codex-packaged-proof-<template>` with `status.json` (which check failed: Landlock probe, m3b, m3a profile, m3a lifecycle, image identity) and the leg logs and TAP streams.\n' "$GITHUB_SHA" "$RUN_URL")"
+          existing="$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Scheduled Codex packaged proof failing" --label "$LABEL" --body "$body"
+          fi

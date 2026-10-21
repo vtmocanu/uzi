@@ -40,3 +40,7 @@ describe("failOriginLabel", () => {
     expect(failOriginLabel("some_future_origin")).toBe("some_future_origin");
   });
 });
+
+it("labels base divergence as a rejection", () => {
+  expect(failOriginLabel("base_diverged")).toBe("rejected: base changed");
+});
