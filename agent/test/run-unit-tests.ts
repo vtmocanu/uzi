@@ -256,9 +256,12 @@ function main(): void {
   child.on("close", (code, signal) => {
     void (async () => {
       let cleanup: Summary["cleanup"] = "not-needed";
-      if (termination !== "none" && child.pid !== undefined) {
+      // Also when the runner itself died from a signal nobody here sent (OOM killer, kill -9): its
+      // per-file children are then orphans in a detached group that nothing else will reap.
+      if ((termination !== "none" || signal !== null) && child.pid !== undefined) {
         // The runner exiting does not prove its group did: a descendant may ignore SIGTERM.
         try {
+          if (termination === "none") signalGroup(child.pid, "SIGTERM");
           let gone = await waitGroupGone(child.pid, 2_000);
           if (!gone) {
             signalGroup(child.pid, "SIGKILL");

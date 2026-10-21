@@ -211,6 +211,7 @@ const leaking = [
   'test("passes, then leaks", () => {',
   '  const child = spawn(process.execPath, ["-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000);"], { stdio: "ignore" });',
   '  writeFileSync(process.env.FIXTURE_ROOT + "/leak.pid", String(process.pid));',
+  '  writeFileSync(process.env.FIXTURE_ROOT + "/runner.pid", String(process.ppid));',
   '  writeFileSync(process.env.FIXTURE_ROOT + "/grandchild.pid", String(child.pid));',
   '  setInterval(() => {}, 1000);',
   '});',
@@ -265,6 +266,32 @@ test("a caller's signal after the watchdog fired is still re-raised", { timeout:
     const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
     assert.equal(summary.termination, "watchdog");
     assert.equal(summary.state, "incomplete");
+  } finally {
+    for (const name of ["leak.pid", "grandchild.pid"]) {
+      const pid = Number(readJson<number>(path.join(root, name)));
+      if (pid > 1 && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill("SIGKILL");
+    await run.closed.catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a runner killed from outside still has its process group reaped", { timeout: 60_000 }, async () => {
+  const root = fixture({ "a-leak.test.ts": leaking });
+  const run = launch(root);
+  try {
+    await until(() => existsSync(path.join(root, "grandchild.pid")), 20_000, "the leaking test");
+    process.kill(Number(readFileSync(path.join(root, "runner.pid"), "utf8")), "SIGKILL");
+    const result = await run.closed;
+    assert.equal(result.signal, "SIGKILL", run.output.join(""));
+    const summary = readJson<Summary>(path.join(latestDir(root), "summary.json"))!;
+    assert.equal(summary.state, "incomplete");
+    assert.equal(summary.termination, "none");
+    assert.equal(summary.cleanup, "verified");
+    for (const name of ["leak.pid", "grandchild.pid"]) {
+      assert.equal(alive(Number(readFileSync(path.join(root, name), "utf8"))), false, `${name} is reaped`);
+    }
   } finally {
     for (const name of ["leak.pid", "grandchild.pid"]) {
       const pid = Number(readJson<number>(path.join(root, name)));
