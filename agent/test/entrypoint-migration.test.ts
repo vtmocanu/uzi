@@ -161,13 +161,11 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
   // Resolve symlinks: the worker-uid lane makes the fixture root a symlinked path, and the op-log
   // snippet records physical paths, so assertions on logged paths need the physical root.
   const root = fs.realpathSync(allocateFixture());
-  if (opts.realChmod) {
-    // BSD directories inherit the parent's group, and a BSD kernel may EPERM a setgid chmod (the
-    // entrypoint's `chmod 3775` on the legacy roots) on a dir whose group the caller is not in; the
-    // real-chmod stub propagates that failure. Put the root in the effective group first.
-    const rootSt = fs.statSync(root);
-    fs.chownSync(root, rootSt.uid, process.getegid!());
-  }
+  // BSD directories inherit the parent's group, and a BSD kernel may EPERM a setgid chmod (the
+  // entrypoint's `chmod 3775` on the legacy roots, or a test's own setgid fixture) on a dir whose
+  // group the caller is not in. Put the root in the effective group first, for every fixture.
+  const rootSt = fs.statSync(root);
+  fs.chownSync(root, rootSt.uid, process.getegid!());
   const data = path.join(root, "data");
   const nix = path.join(root, "nix");
   const token = path.join(root, "token");
@@ -262,7 +260,10 @@ function makeHarness(opts: { mutate?: (patched: string) => string; tokenViaEnv?:
       '        ino=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %i "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %i "$3" 2>/dev/null)\n' +
       '        if [ -n "$ino" ] && [ -f "$(dirname "$OPLOG")/fresh-ids" ] && grep -qx "$ino" "$(dirname "$OPLOG")/fresh-ids"; then o=root; fi\n' +
       "      fi\n" +
-      '      m=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %a "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %Lp "$3" 2>/dev/null) || exit 1\n' +
+      // BSD `%Lp` drops the special bits; `%Mp%Lp` keeps them (`2770`, `0755`), so strip the leading
+      // zero to match GNU `%a`.
+      '      m=$(STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -c %a "$3" 2>/dev/null || STUB_STAT_FROM=busybox ${STUB_STAT:-stat} -f %Mp%Lp "$3" 2>/dev/null) || exit 1\n' +
+      '      case "$m" in 0?*) m=${m#0} ;; esac\n' +
       '      case "$2" in\n' +
       '        "%U %a %d:%i") printf "%s %s %s\\n" "$o" "$m" "$di" ;;\n' +
       '        *) printf "%s %s\\n" "$o" "$di" ;;\n' +
