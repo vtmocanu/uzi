@@ -1075,12 +1075,21 @@ tasks:
       - node ./scripts/renovate-codex-runtime.test.mjs
 
   test:codex-proof-harness:
-    desc: hermetic regressions for the strict Codex packaged-proof verdict (TAP checker + run-proof.sh, no docker)
+    desc: hermetic regressions for the strict Codex packaged-proof verdict (TAP checker, run-proof.sh and the gate, no docker)
     cmds:
       # Real `node --test --test-reporter=tap` fixtures, so a reporter format change fails here.
       - node --test e2e/codex-proof/check-node-tap.test.mjs
       # Fake docker/timeout and fake legs; prints a mandatory `cases=N passed=N` tally.
       - bash e2e/codex-proof/run-proof.test.sh
+      # The required codex-packaged-proof-gate verdict per leg (#3212); same tally contract.
+      - bash e2e/codex-proof/gate.test.sh
+
+  test:codex-package-exec:
+    desc: Native arm64 Codex package check (install-codex.sh + assert-codex.sh in the runtime base), as CI runs it
+    # The codex-packaged-proof.yml arm64-package-exec leg (#3212). Needs a native linux/arm64
+    # docker daemon (e.g. Apple silicon) and egress; refuses an emulated run. NOT wired into gate.
+    cmds:
+      - ./e2e/codex-proof/package-exec.sh arm64
 
   test:codex-proof:
     desc: Opt-in strict packaged Codex O proof (M3b lifecycle, M3a profile + confinement suites) on base and jvm

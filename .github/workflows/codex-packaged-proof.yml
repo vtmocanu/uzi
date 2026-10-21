@@ -7,32 +7,21 @@ name: Codex packaged proof
 # Everything runs through e2e/codex-proof/run-proof.sh, which a maintainer can run by hand
 # (`task test:codex-proof`).
 #
-# Never gates a merge: no ruleset requires these checks. A scheduled failure opens or updates
-# one tracking issue.
+# A second leg, arm64-package-exec, runs e2e/codex-proof/package-exec.sh on a native arm64 runner:
+# the arm64 artifact's SHA256, members and manifest, and `codex --version` as the runner uid. Only
+# amd64 images ship, so it guards the lock's arm64 entry, not an arm64 image (#3212).
+#
+# The `codex-packaged-proof-gate` job is the stable REQUIRED context (kind-smoke-gate precedent):
+# every PR runs this workflow, a `changes` job decides which legs the PR needs, and the gate
+# (e2e/codex-proof/gate.sh) is red unless each leg passed or was legitimately not needed. Require
+# THAT context in the ruleset, never a leg (absent on unrelated PRs, it would wedge Pending).
+# A scheduled failure opens or updates one tracking issue.
 
 "on":
   schedule:
     - cron: "41 2 * * *"
   workflow_dispatch:
-  pull_request:
-    # Codex runtime, packaging and harness changes only. The traced full input set (all of
-    # agent/src, the M3b-mounted agent test, api/ non-test sources) matched ~56% of main commits
-    # over two weeks; this set matched ~15% (measured 2026-10-20) and still covers both rot
-    # classes seen so far: harness edits (#3114) and template/entrypoint changes (#1619). API and
-    # other worker-source changes get the full proof from the nightly run instead.
-    paths:
-      - ".github/workflows/codex-packaged-proof.yml"
-      - "agent/codex/**"
-      - "agent/src/codex/**"
-      - "agent/templates/**"
-      - "agent/devbox-global/**"
-      - "agent/package.json"
-      - "agent/package-lock.json"
-      - "agent/tsconfig.json"
-      - "e2e/codex-m0/**"
-      - "e2e/codex-m3a/**"
-      - "e2e/codex-m3b/**"
-      - "e2e/codex-proof/**"
+  pull_request: {}
 
 permissions:
   contents: read
@@ -42,8 +31,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Path filter (PR only). On schedule/dispatch this job is skipped and both legs run.
+  changes:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      amd64: ${{ steps.filter.outputs.amd64 }}
+      arm64: ${{ steps.filter.outputs.arm64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4
+        id: filter
+        with:
+          # amd64: Codex runtime, packaging and harness changes only. The traced full input set
+          # (all of agent/src, the M3b-mounted agent test, api/ non-test sources) matched ~56% of
+          # main commits over two weeks; this set matched ~15% (measured 2026-10-20) and still
+          # covers both rot classes seen so far: harness edits (#3114) and template/entrypoint
+          # changes (#1619). API and other worker-source changes get the full proof nightly.
+          # arm64: the package lock and scripts, the runtime base pin the check runs in, its
+          # harness, and this workflow.
+          filters: |
+            amd64:
+              - '.github/workflows/codex-packaged-proof.yml'
+              - 'agent/codex/**'
+              - 'agent/src/codex/**'
+              - 'agent/templates/**'
+              - 'agent/devbox-global/**'
+              - 'agent/package.json'
+              - 'agent/package-lock.json'
+              - 'agent/tsconfig.json'
+              - 'e2e/codex-m0/**'
+              - 'e2e/codex-m3a/**'
+              - 'e2e/codex-m3b/**'
+              - 'e2e/codex-proof/**'
+            arm64:
+              - '.github/workflows/codex-packaged-proof.yml'
+              - 'agent/codex/**'
+              - 'agent/templates/*/Dockerfile'
+              - 'e2e/codex-proof/package-exec.sh'
+
   packaged-proof:
     name: packaged-proof (${{ matrix.template }})
+    needs: changes
+    # !cancelled() ignores `changes` being skipped off pull_request and, unlike always(), lets a
+    # superseded run cancel the proof.
+    if: |
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.amd64 == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     strategy:
@@ -103,10 +143,48 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  # Native arm64 package execution (#3212): install-codex.sh + assert-codex.sh for arm64 in the
+  # templates' pinned runtime base. No image build, no push.
+  arm64-package-exec:
+    needs: changes
+    if: |
+      !cancelled() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.arm64 == 'true')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Install and execute the arm64 Codex package
+        run: ./e2e/codex-proof/package-exec.sh arm64
+
+  # Stable REQUIRED status context. Always reports, so a required check never wedges a PR whose
+  # legs were legitimately skipped; the verdict is per leg (e2e/codex-proof/gate.sh). The matrix
+  # result is failure when either template failed.
+  codex-packaged-proof-gate:
+    needs: [changes, packaged-proof, arm64-package-exec]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
+      - name: Gate on the packaged-proof and arm64 results
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          NEED_AMD64: ${{ needs.changes.outputs.amd64 }}
+          NEED_ARM64: ${{ needs.changes.outputs.arm64 }}
+          AMD64_RESULT: ${{ needs.packaged-proof.result }}
+          ARM64_RESULT: ${{ needs.arm64-package-exec.result }}
+        run: ./e2e/codex-proof/gate.sh
+
   # A scheduled failure (not a cancellation, e.g. one superseded by a manual run) keeps exactly one open tracking issue: comment on it, else open it. The
   # label is upserted first so the lookup cannot error on a missing label (e2e.yml pattern).
   report-failure:
-    needs: packaged-proof
+    needs: [packaged-proof, arm64-package-exec]
     if: ${{ github.event_name == 'schedule' && failure() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -124,7 +202,7 @@ jobs:
           gh label create "$LABEL" \
             --description "Scheduled Codex packaged proof (e2e/codex-proof) failures" \
             --color B60205 --force
-          body="$(printf 'The scheduled Codex packaged proof failed at `%s`.\n\nRun: %s\n\nEach template uploads `codex-packaged-proof-<template>` with `status.json` (which check failed: Landlock probe, m3b, m3a profile, m3a lifecycle, image identity) and the leg logs and TAP streams.\n' "$GITHUB_SHA" "$RUN_URL")"
+          body="$(printf 'The scheduled Codex packaged proof failed at `%s`.\n\nRun: %s\n\nEach template uploads `codex-packaged-proof-<template>` with `status.json` (which check failed: Landlock probe, m3b, m3a profile, m3a lifecycle, image identity) and the leg logs and TAP streams. An `arm64-package-exec` failure is in that job'\''s log.\n' "$GITHUB_SHA" "$RUN_URL")"
           existing="$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
