@@ -2,6 +2,9 @@
 # Hermetic regression: land-prep must not push after the PR base moves during gates in a way
 # that touches the branch's own files (a disjoint move is tolerated: land-prep-basemove.test.sh).
 set -eu
+# Fixture repos must not read host git config: a global core.fsmonitor=true
+# leaves a detached fsmonitor daemon per repo on macOS.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/land-prep.sh"

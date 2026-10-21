@@ -15,7 +15,7 @@ task lint:agent        # lint slot alone (oxlint; NOT ratcheted)
 task deadcode:agent    # dead-code slot alone (knip)
 task test:agent        # node --test via tsx
 task typecheck:agent
-cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts   # single file — no Task target
+cd agent && env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --import tsx --test --test-timeout=120000 test/worker.test.ts   # single file — no Task target
 ```
 
 - knip gates every rule at `error`, including the unused-export/type family (#597): a new unused export reddens `task deadcode:agent`. A missing knip loud-SKIPs (exit 0) locally, exits 2 in CI (`UZI_DEADCODE_AGENT_REQUIRED=1`).

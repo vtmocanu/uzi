@@ -11,6 +11,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+# Fixture repos and the release scripts they launch must not read host git config: a
+# global core.fsmonitor=true leaves a detached fsmonitor daemon per repo on macOS.
+os.environ.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_SYSTEM='/dev/null')
+
 SOURCE = Path(os.environ.get('UZI_COVERAGE_MODULE', Path(__file__).with_name('release-ci-coverage.py')))
 spec = importlib.util.spec_from_file_location('coverage_policy', SOURCE)
 policy = importlib.util.module_from_spec(spec)
