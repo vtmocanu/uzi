@@ -87,12 +87,37 @@ func (s *Service) submitSemanticCandidate(ctx context.Context, workerID, runID u
 			return empty, err
 		}
 	}
+	// An absent proposal is an exact replay request: a gate re-presented after a
+	// release/reclaim no longer holds the lead's proposal. Rebuild it from the
+	// persisted candidate, whose criteria embed the proposed ones verbatim, and
+	// accept only the identical fingerprint below. A replay returns the current
+	// candidate and can never create a new one or restore a historical revision.
+	replay := len(proposal) == 0
+	if replay {
+		if !fingerprint.Valid {
+			return empty, fmt.Errorf("semantic proposal required")
+		}
+		var prior apitypes.SemanticCandidate
+		if err = strictSemanticJSON(priorRaw, &prior); err != nil {
+			return empty, err
+		}
+		criteria := make([]apitypes.ProposedSemanticCriterion, len(prior.Criteria))
+		for i, c := range prior.Criteria {
+			criteria[i] = c.ProposedSemanticCriterion
+		}
+		if proposal, err = json.Marshal(apitypes.SemanticProposal{Criteria: criteria}); err != nil {
+			return empty, err
+		}
+	}
 	// The compiler validates and canonicalizes a copy for checker identity.
 	// Keep the raw plan here for its fingerprint, exact snapshot and byte budget.
 	structural.CandidateIdentityVersion, structural.SemanticCandidate = "", nil
 	candidate, fp, err := compileSemanticProposal(structural, proposal, captures)
 	if err != nil {
 		return empty, err
+	}
+	if replay && fingerprint.String != fp {
+		return empty, fmt.Errorf("semantic proposal required: plan, milestones or sources differ from the saved candidate")
 	}
 	if fingerprint.Valid && fingerprint.String == fp {
 		if err = strictSemanticJSON(priorRaw, &candidate); err != nil {

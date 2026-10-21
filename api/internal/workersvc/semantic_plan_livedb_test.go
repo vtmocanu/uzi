@@ -108,6 +108,26 @@ func TestSemanticCandidateLiveDB(t *testing.T) {
 	if third.Revision != 3 || third.Criteria[0].ID == first.Criteria[0].ID || third.Digest == first.Digest {
 		t.Fatal("A-B-A restored old authorization identity")
 	}
+	// A gate re-presented after release/reclaim submits no proposal: it replays the
+	// CURRENT candidate exactly, mints nothing, and never stands in for a changed plan.
+	replayed, err := svc.submitSemanticCandidate(e.ctx, worker, run, 7, c, nil, s)
+	if err != nil {
+		t.Fatalf("saved candidate did not replay: %v", err)
+	}
+	if replayed.Digest != third.Digest || replayed.Revision != 3 || replayed.Criteria[0].ID != third.Criteria[0].ID {
+		t.Fatal("replay returned a different candidate")
+	}
+	changed := c
+	changed.PlanMd = "a different plan"
+	if _, err = svc.submitSemanticCandidate(e.ctx, worker, run, 7, changed, nil, s); err == nil {
+		t.Fatal("proposal-less submission compiled a changed plan")
+	}
+	fresh := e.seedActiveRunOwnedBy(t, worker)
+	e.exec(t, `UPDATE runs SET claim_generation=7, completion_contract_version=1 WHERE id=$1`, fresh)
+	e.exec(t, `INSERT INTO semantic_planning(run_id,enrollment) VALUES($1,'{"profile":"semantic","policy":{"version":1,"model":"reserved","max_reviews":3,"max_invocations":2,"max_tokens":120000,"max_seconds":900}}')`, fresh)
+	if _, err = svc.submitSemanticCandidate(e.ctx, worker, fresh, 7, c, nil, s); err == nil {
+		t.Fatal("proposal-less submission minted a first candidate")
+	}
 	var blobCount, historyCount int
 	if err = e.pool.QueryRow(e.ctx, `SELECT count(*) FROM semantic_snapshots WHERE run_id=$1`, run).Scan(&blobCount); err != nil {
 		t.Fatal(err)
