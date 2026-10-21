@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -732,12 +732,12 @@ describe("dead CLI group confirmed gone before a resume (issue #1656)", () => {
 
 describe("SDK process-exit error shape (issue #1656 pin)", () => {
   it("the self-ending child runs with a soft core limit of 0 and its inherited hard limit", async (t) => {
-    const parentSoft = execSync("ulimit -S -c").toString().trim();
-    const parentHard = execSync("ulimit -H -c").toString().trim();
+    const parentSoft = execFileSync("/bin/sh", ["-c", "ulimit -S -c"]).toString().trim();
+    const parentHard = execFileSync("/bin/sh", ["-c", "ulimit -H -c"]).toString().trim();
     if (parentSoft === "0") t.diagnostic("the ambient soft core limit is already 0: this host cannot tell the fix from its absence");
     const children: ChildProcess[] = [];
     selfEndingSpawn(
-      'process.stdout.write(require("node:child_process").execSync("ulimit -S -c; ulimit -H -c").toString(), () => process.exit(0));',
+      'process.stdout.write(require("node:child_process").execFileSync("/bin/sh", ["-c", "ulimit -S -c; ulimit -H -c"]).toString(), () => process.exit(0));',
       children,
     )({} as Parameters<NonNullable<SdkExecutorOptions["spawn"]>>[0]);
     const child = children[0]!;
