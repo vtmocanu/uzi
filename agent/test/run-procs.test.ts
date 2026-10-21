@@ -345,7 +345,21 @@ process.kill = function (pid, sig) {
     assert.strictEqual(c.signalCode, null);
   });
 
-  it("a helper that cannot run reaps with an empty reason map", async () => {
+  it("a survivor class the helper does not define is dropped from the reason map", async () => {
+    const script = path.join(root, "bogus-class.cjs");
+    fs.writeFileSync(
+      script,
+      'process.stdout.write("A\\t4242\\tbogus\\nA\\t4243\\trestarted\\nH\\t" + JSON.stringify({ scanned: 2, truncated: false, unresolved: 0, procMount: "ok" }) + "\\n");\n',
+    );
+    const r = await reapRunProcesses(runHome, worktree, [], {
+      procRoot,
+      wrappers: [() => ({ command: process.execPath, args: [script] })],
+    });
+    assert.deepStrictEqual(r.left.sort(), [4242, 4243]);
+    assert.deepStrictEqual(r.leftReasons, { 4243: "restarted" });
+  });
+
+  it("a helper that cannot be started reads as incomplete with an empty reason map", async () => {
     const r = await reapRunProcesses(runHome, worktree, [], {
       procRoot,
       wrappers: [() => ({ command: path.join(root, "no-such-binary"), args: [] })],

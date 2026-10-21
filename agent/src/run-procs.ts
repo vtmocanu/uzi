@@ -77,7 +77,9 @@ const MAX_SPAWNED = 64;
  * whose linking parent was just killed stays linked): immediately before each kill it re-reads
  * `stat` and requires the same start time (a recycled pid has another), and re-reads
  * `environ`/`cwd` and requires the attribution again; it prints `K\t<pid>\t<why>` per kill, then the
- * last round's survivors as `A` lines. Both modes end with ONE `H\t<json>` summary (`scanned`,
+ * last round's survivors as `A` lines whose third field is the survivor class (`unreadable`,
+ * `worker_child`, `restarted` or `kill_failed`; see {@link LeftReason}), and the caller keeps only those four
+ * values. When a pid appears under two uid passes (two wrappers) the last wrapper's class wins. Both modes end with ONE `H\t<json>` summary (`scanned`,
  * `truncated`: the pid or time budget ran out, `unresolved`: pids whose uid could not be read,
  * `procMount`). Exit 0; 6 on bad arguments; 7 when `<procRoot>` cannot be read.
  */
@@ -343,7 +345,7 @@ export interface RunProcessReap {
   left: number[];
   /** Why each pid in `left` survived (diagnostics only; absent from fakes that do not classify).
    *  A pid the helper did not classify is simply missing from the map. */
-  leftReasons?: Record<number, string>;
+  leftReasons?: Record<number, LeftReason>;
   complete: boolean;
 }
 
@@ -377,20 +379,24 @@ export function defaultRunProcessOps(): RunProcessOps {
 /** The `/proc` of this host; a constant so no caller spells the path. */
 const PROC_ROOT = "/proc";
 
+function isLeftReason(v: string | undefined): v is LeftReason {
+  return v === "unreadable" || v === "worker_child" || v === "restarted" || v === "kill_failed";
+}
+
 async function passes(
   mode: "scan" | "kill",
   home: string,
   worktree: string | undefined,
   spawnedPids: readonly number[],
   opts: RunProcsOptions,
-): Promise<{ attributed: number[]; killed: number[]; complete: boolean; reasons: Record<number, string> }> {
+): Promise<{ attributed: number[]; killed: number[]; complete: boolean; reasons: Record<number, LeftReason> }> {
   const budget = MaintenanceBudget.current();
   const wrappers = opts.wrappers ?? [runnerCommand];
   const budgetMs = opts.budgetMs ?? (mode === "scan" ? SCAN_BUDGET_MS : REAP_BUDGET_MS);
   const spawned = spawnedPids.filter((p) => Number.isSafeInteger(p) && p > 0).slice(0, MAX_SPAWNED);
   const attributed = new Set<number>();
   const killed = new Set<number>();
-  const reasons: Record<number, string> = {};
+  const reasons: Record<number, LeftReason> = {};
   let complete = true;
   for (const wrap of wrappers) {
     budget?.check();
@@ -437,7 +443,7 @@ async function passes(
       }
       if (f[0] === "A") {
         attributed.add(pid);
-        if (mode === "kill" && f[2] !== undefined && f[2] !== "") reasons[pid] = f[2];
+        if (mode === "kill" && isLeftReason(f[2])) reasons[pid] = f[2];
       }
       else if (f[0] === "K") killed.add(pid);
       else complete = false;
