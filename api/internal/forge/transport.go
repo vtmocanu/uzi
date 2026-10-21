@@ -21,7 +21,8 @@ func forgeTransport() http.RoundTripper {
 	return forgeHTTPTransport
 }
 
-// forgeHTTP1Transport carries budgeted CI discovery requests. Over HTTP/2,
+// forgeHTTP1Transport carries budgeted CI discovery requests and response-limited
+// requests (withResponseLimit). Over HTTP/2,
 // DATA-frame padding and empty DATA frames never reach the response body, so
 // the compressed-byte counter in ciCompressedReader would not see them. HTTP/1.1
 // delivers every transfer-decoded body byte through the body reader; its framing

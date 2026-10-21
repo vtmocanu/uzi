@@ -142,10 +142,11 @@ func (e *bodyReadError) Is(target error) bool {
 	return (target == context.Canceled && e.canceled) || (target == context.DeadlineExceeded && e.deadline)
 }
 
-// statusSDKSuccess is the set of statuses for which the GitLab SDK's
-// CheckResponse (gitlab.com/gitlab-org/api/client-go/v3@v3.16.0 gitlab.go, the
-// 200/201/202/204 range check) returns nil and the body is decoded. Other 2xx
-// statuses (203, 205, 206, ...) are errors to the SDK, and 304 is handled lazily.
+// statusSDKSuccess is the set of statuses the GitLab SDK's CheckResponse
+// (gitlab.com/gitlab-org/api/client-go/v3@v3.16.0 gitlab.go) accepts and whose
+// body can be non-empty, so it is decoded. CheckResponse also accepts 304, which
+// carries no body and stays lazy; other 2xx statuses (203, 205, 206, ...) are
+// errors to the SDK.
 func statusSDKSuccess(code int) bool {
 	switch code {
 	case http.StatusOK, http.StatusCreated, http.StatusAccepted, http.StatusNoContent:
@@ -158,6 +159,17 @@ func statusSDKSuccess(code int) bool {
 // every 5xx but 501 (including 600-999).
 func statusRetriedBySDK(code int) bool {
 	return code == 0 || code == http.StatusTooManyRequests || (code >= 500 && code != http.StatusNotImplemented)
+}
+
+// declaresContentEncoding reports whether any Content-Encoding header line names
+// an encoding other than identity; a second line must not hide behind a first.
+func declaresContentEncoding(h http.Header) bool {
+	for _, enc := range h.Values("Content-Encoding") {
+		if enc != "" && !strings.EqualFold(enc, "identity") {
+			return true
+		}
+	}
+	return false
 }
 
 // responseLimitTransport bounds response bodies of requests marked with
@@ -186,7 +198,7 @@ func (t responseLimitTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err
 	}
-	if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+	if declaresContentEncoding(resp.Header) {
 		// Forced compression: the wire bytes are not the content. Read nothing; keep
 		// the status so classification survives, but never hand a body on.
 		_ = resp.Body.Close()

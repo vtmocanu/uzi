@@ -506,6 +506,19 @@ func TestGitLabGetMergeRequestRefusesContentEncoding(t *testing.T) {
 			t.Fatalf("read %d body bytes of a refused encoding, want 0", w.rt.totalRead())
 		}
 	})
+	t.Run("second_content_encoding_line_is_refused", func(t *testing.T) {
+		w := newWireMR(t, func(rw http.ResponseWriter, _ *http.Request) {
+			rw.Header()["Content-Encoding"] = []string{"identity", "gzip"}
+			_, _ = rw.Write(gzBody)
+		}, 5*time.Second)
+		mr, err := w.get(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "unsupported content encoding") {
+			t.Fatalf("err = %v, want the content-encoding error", err)
+		}
+		if mr != (MergeRequest{}) || w.rt.totalRead() != 0 {
+			t.Fatalf("mr = %+v, read %d bytes; want zero MR and nothing read", mr, w.rt.totalRead())
+		}
+	})
 	// Forced gzip on a non-success status keeps the status outcome of an empty body.
 	norm := func(w *wireMR, err error) string {
 		return strings.ReplaceAll(err.Error(), w.srv.URL, "SRV")
