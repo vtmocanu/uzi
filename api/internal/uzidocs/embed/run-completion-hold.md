@@ -152,12 +152,13 @@ making progress without signalling done. If every milestone is already met, it
 says the contract is satisfied but the lead has not signalled done, and offers
 only **Continue**. If the window passes, the run is held and shows as **Completion blocked**,
 like any other completion hold; the hold does not carry stall-specific wording
-in the UI. The activity feed shows a worker status line when the stall is
-caught (Codex: "no progress: the lead ended 3 consecutive turns with no tool
-call, no worktree change and no milestone progress without signalling done —
-running a completion check for an owner decision"; Claude: "completion
-blocked: the lead stopped making progress without signalling done (N unmet
-frozen milestone(s)) — holding for an owner decision"). The run is held for an
+in the UI. On both Claude and Codex the activity feed shows a worker status
+line when the stall is caught: "no progress: the lead ended 3 consecutive
+turns with no tool call, no worktree change and no milestone progress without
+signalling done — running a completion check for an owner decision". When the
+window passes, Claude also shows "completion blocked: the lead stopped making
+progress without signalling done (N unmet frozen milestone(s)) — holding for
+an owner decision" as it enters the hold. The run is held for an
 owner decision rather than failing on the iteration budget. The attempt count
 includes the worker's stall attempt, so a run can show one attempt that the
 lead never made. If the stall is caught on the run's last iteration,

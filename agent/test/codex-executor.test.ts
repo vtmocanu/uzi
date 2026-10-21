@@ -21001,6 +21001,16 @@ describe("CodexExecutor no-progress stall owner decision (issue #3139)", () => {
     assert.equal(r.fixture.questions.length, 1);
   });
 
+  it("an unresolvable (null) worktree fingerprint on every turn is never a stall turn", async () => {
+    let fp: string | null = "SAME";
+    const r = await drive((c, th, tn) => { fp = c >= 3 ? null : "SAME"; return script({})(c, th, tn); },
+      { config: { max_iterations: 8 }, worktreeFingerprint: async () => fp });
+    assert.equal(r.fixture.questions.length, 0, "no stall question");
+    assert.equal(r.fixture.attempts.length, 0, "no worker completion attempt");
+    assert.equal(r.calls(), 8, "every provider call up to the iteration budget ran");
+    assert.equal(r.error, ITER_REASON);
+  });
+
   it("a turn whose ACK serves no completionAttempts (ineligible) restarts the streak", async () => {
     const r = await drive(script({}), {
       reportIteration: async (n) => (n === 3 ? undefined : { completionAttempts: 0 }),
