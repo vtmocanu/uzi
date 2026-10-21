@@ -102,8 +102,16 @@ else bad "repo-creating test scripts without global+system isolation:$missing"; 
 # 4b. Each prefixed Task command keeps the pair directly in front of it. A per-target
 # count is not enough: test:agent echoes two prefixed commands, so losing one passes.
 PAIR='GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null'
+# `task --dry` still evaluates preconditions; where one is unmet on this host (CI's
+# lint-repo job lacks a target's toolchain), read the target's own Taskfile block.
+own_block() { awk -v t="  $1:" '$0 == t { f = 1; next } f && /^  [a-z][a-z0-9:-]+:$/ { exit } f' Taskfile.yml; }
 while IFS='|' read -r t cmd; do
-  if ! dry="$(task --dry "$t" 2>&1)"; then bad "task --dry $t failed: $(printf '%s\n' "$dry" | tail -2)"; continue; fi
+  if ! dry="$(task --dry "$t" 2>&1)"; then
+    case "$dry" in
+      *"precondition not met"*) dry="$(own_block "$t")" ;;
+      *) bad "task --dry $t failed: $(printf '%s\n' "$dry" | tail -2)"; continue ;;
+    esac
+  fi
   # Capture first: `grep -q` closing the pipe early would SIGPIPE under pipefail.
   if printf '%s\n' "$dry" | grep -F "$PAIR $cmd" > /dev/null; then ok "$t: $cmd"
   else bad "$t: '$cmd' lost its $PAIR prefix"; fi
