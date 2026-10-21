@@ -9,7 +9,7 @@ import type { Executor, RunContext } from "../src/executor.js";
 import type { ClaimResponse, MemoryReservationRequest, StateAck } from "../src/protocol.js";
 import { WorkerMemoryRuntime } from "../src/worker-memory-runtime.js";
 import { PauseNowSignal } from "../src/steering.js";
-import { StaleClaimError } from "../src/runner.js";
+import { RunRunner, StaleClaimError } from "../src/runner.js";
 import { MessageBatcher } from "../src/batcher.js";
 import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
@@ -1559,9 +1559,12 @@ async function memoryRun(f: Awaited<ReturnType<typeof setup>>, body: (ctx: RunCo
   try {
     await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
-    if (executorError) throw executorError;
-    assert.equal(proof, true);
+  } catch (error) {
+    // A body assertion failure wins over the runner's own rejection (e.g. a tolerated StaleClaimError).
+    throw executorError ?? error;
   } finally { api.stateAckWire = undefined; await f.memory.stop(); await monitoring; }
+  if (executorError) throw executorError;
+  assert.equal(proof, true);
 }
 const failedPause = (ctx: RunContext) => ctx.parkForPause!({ completedCount: 0, total: 1 });
 
@@ -1671,6 +1674,28 @@ for (const ackKind of ["declined", "stale_claim"] as const) {
       "no ACK path leaves the flight's authority alive past its end");
   });
 }
+
+// memoryRun must not let a runner rejection hide a body assertion failure: the stale_claim variant
+// above tolerates StaleClaimError, so a lost body failure would read as a pass there. Today
+// execute() handles a stale claim and resolves, so the probe injects the rejection after it.
+test("memoryRun keeps a body assertion failure when execute() rejects with StaleClaimError", async () => {
+  const f = await setup();
+  const bodyFailure = new assert.AssertionError({ message: "probe: body assertion failed" });
+  const execute = RunRunner.prototype.execute;
+  RunRunner.prototype.execute = async function (this: RunRunner, claim) {
+    await execute.call(this, claim);
+    throw new StaleClaimError();
+  };
+  try {
+    const outcome = await memoryRun(f, async ctx => {
+      await ctx.reportIteration!(1);
+      throw bodyFailure;
+    }).catch((error: unknown) => {
+      if (!(error instanceof StaleClaimError)) throw error;
+    }).then(() => "passed", (error: unknown) => error);
+    assert.equal(outcome, bodyFailure, "the body's assertion failure survives the stale-claim tolerance");
+  } finally { RunRunner.prototype.execute = execute; }
+});
 
 test("after a failed pause, an answered completion question still releases its hold on the Running ACK", async () => {
   const f = await setup();
