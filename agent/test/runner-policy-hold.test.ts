@@ -448,6 +448,7 @@ for (const variant of m1Cases) {
     let flight: Parameters<PolicyHoldBoundaries["enterPolicyHold"]>[1] | undefined;
     let clonePath = "";
     let calls = 0, settlements = 0, retries = 0, sends = 0;
+    let settlementArgs: Parameters<PolicyHoldBoundaries["settleGuardedInventory"]> | undefined;
     let callbackError: unknown;
     let journalBytes: Buffer | undefined;
     let finalizeBytes: Buffer | undefined;
@@ -635,10 +636,7 @@ for (const variant of m1Cases) {
     t.mock.method(observed, "settleGuardedInventory", async (...args: Parameters<PolicyHoldBoundaries["settleGuardedInventory"]>) => {
       boundary("settle");
       settlements++;
-      assert.equal(args.length, 6);
-      assert.ok(args[0] === claim, "settlement uses the exact claim");
-      assert.ok(args[1] === flight, "settlement uses the exact flight");
-      assert.deepEqual(args.slice(2), [undefined, undefined, undefined, true]);
+      settlementArgs = args; // Assert outside the production catch after execute settles.
     });
     // Policy capture and delivery retries are finite in enterPolicyHold (three/two).
     // This barrier yields immediately; it does not poll readiness or alter production timers.
@@ -651,6 +649,13 @@ for (const variant of m1Cases) {
       !options.unguarded && !options.disposition;
     assert.equal(calls, 1, "no executor retry");
     assert.equal(settlements, shouldSettle ? 1 : 0);
+    if (shouldSettle) {
+      assert.ok(settlementArgs, "settlement arguments were observed");
+      assert.equal(settlementArgs.length, 6);
+      assert.ok(settlementArgs[0] === claim, "settlement uses the exact claim");
+      assert.ok(settlementArgs[1] === flight, "settlement uses the exact flight");
+      assert.deepEqual(settlementArgs.slice(2), [undefined, undefined, undefined, true]);
+    } else assert.equal(settlementArgs, undefined);
     assert.equal(sends, unresolved ? 2 : 1);
     assert.equal(retries, options.noHead ? 2 : unresolved ? 1 : 0);
     assert.deepEqual(trace, [
