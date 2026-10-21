@@ -2570,6 +2570,13 @@ never put in the table; read `residue_quarantined_at` and
 `residue_quarantine_cause` in `uzi admin workers --json`, or the worker view in
 `uzi tui`.
 
+A worker that lost memory authority shows `(memory authority lost)` after its
+status in the same two lists: the api withholds guard-bound runs from it until
+its container restarts, see
+[Lost memory authority](worker-setup.md#lost-memory-authority). Read
+`memory_authority_lost_at` in `uzi admin workers --json`, or the worker view in
+`uzi tui`.
+
 `uzi run get` gains four rows, each emitted only when the server has
 something to say:
 

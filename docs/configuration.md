@@ -553,13 +553,26 @@ startup, and a worker that fails it refuses to register, including a
 Codex-only worker. If a Claude run loses memory authority mid-turn (for
 example, the API stops advertising `worker_memory_pressure_v1`, or the worker shuts
 down), the turn is aborted and continues through the existing recovery/requeue
-policy. Restart the worker to regain authority, as for Codex: registration
-runs once at startup, and until then each new run claim on that worker, including a
-requeued run that lands back on it, fails with "Worker memory enrollment
-requires the full worker claim and registration" and is reported as a run
-failure. This now applies to Claude claims too. A server-side check that sends
-Claude guard-bound work only to capable workers is not built; it is tracked as
-[#3142](https://github.com/vtmocanu/uzi/issues/3142).
+policy.
+A guard-enabled worker that loses memory authority this way is gated at
+claim time: the api withholds every run-lane kind that reaches the memory
+runtime (all except judge, job, cross-check, review and isolated-fetch runs)
+so those runs stay queued instead of failing in "Worker memory enrollment
+requires the full worker claim and registration". Chat and the cross-check
+lane are unaffected. Restart the worker to regain authority, as for Codex:
+registration runs once at startup, and only a fresh registration restores it.
+Known limits, which apply until that restart: runs the worker aborted and
+requeued stay pinned to it while its heartbeat is fresh (up to
+`WORKER_AFFINITY_CEILING`, default 2h); the ephemeral provisioner and the
+capacity and queued-reason counts still count the worker as able to take
+guard-bound runs, which is not time-bounded; and a busy worker may defer a run
+to it for up to `WORKER_SPREAD_GRACE`. The gate prevents failing admissions; it
+does not promise automatic rerouting. A claim already in flight when authority
+is lost still fails in `bindWorkerMemory`. See
+[Lost memory authority](./worker-setup.md#lost-memory-authority) and
+[ADR-2396](../adr/2396-worker-memory-guard.md). Workers that fail the launcher
+preflight still refuse startup; a broader check that sends Claude work only to
+capable workers is not built.
 
 After an intervention, another intervention/retry requires confirmed drain,
 a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
