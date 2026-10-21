@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import { RequestError, type WorkerClient, type PlanCrossCheckCandidate } from "../src/client.js";
 import { SemanticPlanningGate } from "../src/semantic-planning-gate.js";
+import { PauseNowSignal, CredentialSwitchSignal } from "../src/steering.js";
 import { boundedTransport, proposal } from "./semantic-coverage-fixture.js";
 import { semanticServer } from "./semantic-server-fixture.js";
 const structural: PlanCrossCheckCandidate = { plan_md: "Implement A", milestones: [{ id: "m1", title: "A" }],
@@ -116,4 +117,19 @@ it("M3 a foreign reservation or an explicit server refusal stays fail-closed thr
   const result = await gate.reviewForGate(c, structural.plan_md, sources);
   assert.equal(result.outcome, "unavailable");
   assert.equal(result.review.reason, "coverage_unavailable");
+});
+
+it("M3 a pause or credential switch during reservation keeps its identity for the runner", async () => {
+  for (const make of [() => new PauseNowSignal(), () => new CredentialSwitchSignal()]) {
+    const client = {} as WorkerClient;
+    const events: string[] = [];
+    const server = semanticServer(client, events);
+    const transport = await boundedTransport("claude", server.report, events);
+    const owner = new AbortController();
+    const gate = new SemanticPlanningGate(client, "run", 1, owner.signal, transport);
+    const c = await gate.compile(structural, proposal(), sources);
+    const signal = make();
+    client.reserveSemanticCoverage = async () => { owner.abort(signal); server.failStatus(signal); throw signal; };
+    await assert.rejects(gate.reviewForGate(c, structural.plan_md, sources), error => error === signal, signal.name);
+  }
 });

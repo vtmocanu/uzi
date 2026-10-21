@@ -80,8 +80,9 @@ export class SemanticPlanningGate {
     const result = await reviewPlanContract({
       candidate, sources, plan, binding, testTransport: this.testTransport,
       budget: {
-        // Only a transport failure reads as unavailable coverage; a foreign identity or an explicit
-        // server refusal is a CoverageRefusal, which stays fail-closed through reviewForGate.
+        // Only a transport failure reads as unavailable coverage. Any other reservation error (a
+        // foreign identity, an explicit server refusal, a malformed response) is a CoverageRefusal,
+        // which stays fail-closed through reviewForGate; an owner abort passes through unwrapped.
         reserve: async request => { try {
           // One UUID per invocation, retained if an HTTP layer retries the request.
           const body = { ...binding, request_id: randomUUID(), ...(reviewId ? { review_id: reviewId } : {}),
@@ -105,7 +106,8 @@ export class SemanticPlanningGate {
             tokens: reserved.max_tokens,
             deadlineMs: Math.min(Date.parse(reserved.deadline), request.deadlineMs) };
         } catch (error) {
-          if (error instanceof CoverageRefusal || isCoverageTransportFailure(error, this.signal)) throw error;
+          // An owner pause, credential switch or cancellation keeps its identity for the runner.
+          if (this.signal.aborted || error instanceof CoverageRefusal || isCoverageTransportFailure(error, this.signal)) throw error;
           throw new CoverageRefusal(error instanceof Error ? error.message : "coverage reservation refused", { cause: error });
         } },
         settle: async (reservation: CoverageReservation, usage) => {

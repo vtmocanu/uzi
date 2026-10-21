@@ -49,8 +49,9 @@ export interface BoundedCoverageTestTransport {
   usageComplete(snapshot: AdviceUsageSnapshot): boolean;
   isSafetyRefusal(error: unknown): boolean;
 }
-/** A reservation refusal that must stay fail-closed (a foreign identity or an explicit server
- * refusal): {@link reviewPlanContract} rethrows it instead of reading it as unavailable coverage. */
+/** A reservation error that must stay fail-closed (a foreign identity, an explicit server refusal
+ * or a malformed response; never a transport failure or an owner abort): {@link reviewPlanContract}
+ * rethrows it instead of reading it as unavailable coverage. */
 export class CoverageRefusal extends Error {
   constructor(message: string, options?: { cause?: unknown }) { super(message, options); this.name = "CoverageRefusal"; }
 }
