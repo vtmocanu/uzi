@@ -514,6 +514,8 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, credentialDisabledAction(r))
 	case holdProviderUnavailable:
 		clauses = append(clauses, providerHoldAction(r))
+	case holdCredentialSwitchSettling, holdCredentialSwitchUnsettled:
+		clauses = append(clauses, credentialSwitchAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
@@ -530,6 +532,10 @@ func holdReasonLabel(reason string) string {
 		return "credential disabled"
 	case holdProviderUnavailable:
 		return "provider unavailable"
+	case holdCredentialSwitchSettling:
+		return "credential switch settling"
+	case holdCredentialSwitchUnsettled:
+		return "credential switch unsettled"
 	default:
 		return cellText(reason)
 	}
@@ -587,6 +593,10 @@ func pausedHoldNotice(r apitypes.RunDTO, origin ...string) string {
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
 	case holdProviderUnavailable:
 		return "held, provider unavailable; " + providerHoldAction(r)
+	case holdCredentialSwitchSettling:
+		return "held, credential switch settling; " + credentialSwitchAction(r)
+	case holdCredentialSwitchUnsettled:
+		return "held, credential switch unsettled; " + credentialSwitchAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -2284,6 +2294,12 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.
 		s += " (credential disabled)"
+	}
+	switch {
+	case isCredentialSwitchSettlingHold(r.RunDTO):
+		s += " (credential switch settling)"
+	case isCredentialSwitchUnsettledHold(r.RunDTO):
+		s += " (credential switch unsettled)"
 	}
 	return s
 }

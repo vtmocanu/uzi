@@ -563,7 +563,7 @@ func providerBoardLine(r apitypes.RunDTO) string {
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) ||
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || credentialSwitchHoldLine(r.RunDTO) != "" || isOwnerRequiredWorkerHold(r.RunDTO) ||
 		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
@@ -612,6 +612,9 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 		// PRD #1732 D14: a run held on credential_disabled has no live activity either; its
 		// second line is what the owner can do about it.
 		line = credentialDisabledLine(r.RunDTO)
+	}
+	if line == "" {
+		line = credentialSwitchHoldLine(r.RunDTO)
 	}
 	if line != "" {
 		out := prefix + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 120))

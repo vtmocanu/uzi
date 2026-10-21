@@ -441,6 +441,12 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isCredentialDisabledHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
 	}
+	if isCredentialSwitchSettlingHold(r) {
+		return runToken{glyph: credSwitchGlyph, word: credSwitchSettlingWord, color: p.amber}
+	}
+	if isCredentialSwitchUnsettledHold(r) {
+		return runToken{glyph: credSwitchGlyph, word: credSwitchUnsettledWord, color: p.amber}
+	}
 	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 }
 

@@ -402,6 +402,11 @@ uzi version
   `recovery_retry_not_before` remains the fallback and a worker still claims the run), and `paused`
   (an ordinary owner-requested pause via `uzi run pause` or `/park`, or a
   lead-requested pause via `park_run`, resumed on demand with `uzi run resume <id>`;
+  or a credential-switch hold, `hold_reason` `credential_switch_settling` (the worker is
+  still stopping the run's processes; owner Resume and `run set-token` are refused with a
+  409 until it finishes, Cancel always works) or `credential_switch_unsettled` (processes
+  not proven stopped, work kept on that worker; Resume requeues on the newly chosen token,
+  or Cancel);
   ordinary pauses do not auto-resume). System holds also use `paused`; follow
   their hold-specific remedy. Human `run get` may distinguish execution paths
   using current pause evidence, otherwise it says `paused`. `park_run` and
@@ -438,7 +443,8 @@ uzi version
   bare wait stops there too), `completed`, `failed`, `cancelled` — and keeps
   waiting through `queued`/`claimed`/`running`/`limit_wait`/`pool_wait`/
   `recovery_wait`/`paused`, except a default wait stops on recovery cause
-  `worker_requeue_exhausted`: timed limit and recovery waits retry on a timer, pool waits
+  `worker_requeue_exhausted` or a paused credential-switch hold (`credential_switch_settling` /
+  `credential_switch_unsettled`; it prints the next step on stderr): timed limit and recovery waits retry on a timer, pool waits
   need an available pooled token, and ordinary owner or lead pauses need `uzi run resume`. A
   `vault_locked` recovery park still waits: a bare wait keeps waiting through it
   until the run owner's explicit unlock queues it and a worker resumes it, or the
