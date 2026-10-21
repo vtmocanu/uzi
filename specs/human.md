@@ -59,6 +59,7 @@ Tracked as GitLab issue vtmocanu/uzi#2; PRD at `prds/done/2-forge-integration-ka
 - Per-repo kanban board, columns = GitLab labels, kept in two-way sync between uzi and GitLab.
   - Reference: an internal board (label-as-column example); kan.bn (UI style).
 - Board/agents work only issues carrying the `PRD` label, sanity-checked to contain a link to the PRD file. [superseded — see Feature #22: run-eligibility is now the single `uzi` label and the PRD link is optional (PRD #764) (AI-synced 2026-08-29)]
+- GitLab `GetMergeRequest` bounds the response body before decoding: 32 MiB for a 2xx and 4 KiB for any other status. An oversized response is refused with a fixed error and is unverified evidence, never a partial or merged answer (#3038). (AI-synced 2026-10-21)
 
 ## Feature #3 — Agent templates & per-user Anthropic token
 
