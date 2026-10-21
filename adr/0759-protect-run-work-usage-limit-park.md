@@ -66,6 +66,7 @@ D4 let a reviewed plan skip the re-gate but said nothing about what the fresh se
 - **Incomplete history forces a human gate.** If the reload failed, returned 4xx or was unavailable, or the snapshot exceeded either bound, the run is ineligible for the reviewed resume: it re-plans, and its gate is forced human even on autopilot (no cross-check, no auto-approve) for every gate of the claim. A worker status line says the earlier follow-ups could not be restored (unavailable or over the bound). The server's existing park clears `auto_approve`, which is run-wide and permanent, so later lost-tree recovery also re-gates. Rationale: an owner constraint the model cannot see is exactly what a human gate exists to catch.
 - **Rollout.** An API without `GET /worker/runs/{id}/follow-ups` (#1660) makes every reviewed resume a permanent human re-gate. Upgrade the API first.
 - **Delivery failure.** A reviewed resume with non-empty history now fails the run on a definitive `/inputs` delivery failure and parks on a transient one, with plan-gate wording in the feed.
+- **Seeded runs (clarification, [#3272](https://github.com/vtmocanu/uzi/issues/3272)).** Unchanged by this amendment. #3272 later gave seeded runs their own owner-supplied framing (a seeded lead system-prompt variant on both harnesses, and a framed `<plan>` fence on the Codex implement turn); the #3149 approval statement still does not apply to them, and D4's eligibility and history guarantees are unchanged.
 
 Known residuals, accepted:
 
