@@ -27,7 +27,7 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 ### D2. `runner-init` prepares the subPath before dind
 
 - A new init container (`render.go` `runnerInitScript`; golden `controller/internal/kube/testdata/runner-shared-init.sh`) runs before dind.
-- **Image gate.** `/etc/uzi-runner-layout` must equal `runner-shared-v1` (baked in `agent/templates/{base,jvm}/Dockerfile`). Otherwise it refuses before any write: "worker image lacks runner-shared layout support ... upgrade the worker image or roll back the controller".
+- **Image gate.** `/etc/uzi-runner-layout` must equal `runner-shared-v1` (baked in `agent/templates/{base,jvm}/Dockerfile`). Otherwise it refuses before any write of its own: "worker image lacks runner-shared layout support ... upgrade the worker image or roll back the controller". The gate covers `runner-init` and the containers after it only: the existing `seed-nix` init container runs earlier and, when it reseeds, already writes the nix volume and clears its provisioning state on the data volume.
 - **Real-dir checks.** It refuses a symlink or non-directory at `runner-shared` or `.tmp`.
 - **Ownership.** It creates `runner-shared` (`3775`, `worker:runner` under uid-split) and `.tmp` (`worker:worker` `0755` under uid-split; in single-uid mode both are owned by the worker uid, mode `3775`).
 
@@ -39,7 +39,7 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 ### D4. Scratch adopt-or-refuse; `.retire-*` inspection; no new cleanup authority
 
 - **Docker lane.** A per-uid scratch directory is adopted (expected-owner `0700` leaf; the entrypoint prints "writer exclusion not established") or refused, never wiped. The non-Docker wipe is unchanged.
-- **`.retire-*` leftovers** are inspected at startup: empty parents are `rmdir`ed, everything else is retained with one counted warning. The EXDEV fallback is kept.
+- **`.retire-*` leftovers** are inspected at startup and always retained, empty ones included (an old mtime and emptiness prove neither retirement nor writer exclusion: a surviving daemon container may still hold one as a bind source or cwd). One counted warning reports them. The EXDEV fallback is kept.
 - Nothing here adds a deletion path that bypasses custody or writer exclusion.
 
 ### D5. Retention cleanup retains what it cannot remove
@@ -88,7 +88,7 @@ On Docker-lane hosted workers, the run's working clones and `$TMPDIR` (`/data/ru
 ### D10. Image skew and rollback ordering
 
 - **Upgrade.** A worker image carrying the marker must be available before or with the controller. The chart's controller follows `appVersion`; the worker image is pinned by `workers.image.tag`, which `scripts/worker-tag-autobump.sh` bumps at release cut when `agent/templates` or `agent/src` changed.
-- **New controller, old image.** `runner-init` refuses; the pod sits in `Init:CrashLoopBackOff` and roll health reports the blocking init container. Nothing is written to the PVC.
+- **New controller, old image.** `runner-init` refuses; the pod sits in `Init:CrashLoopBackOff` and roll health reports the blocking init container. `runner-init`, dind and the worker write nothing; `seed-nix`, which runs first, behaves as it did before #3153 (it may reseed `/nix` and clear its provisioning state on the data volume). Nothing touches `/data/runner` or `runner-shared`.
 - **Old controller, new image.** Works (reverse-skew path: the entrypoint keeps its old root handling and never wipes; test "reverse skew").
 - **Controller rollback after migration.** The old controller mounts an emptyDir at `/data/runner` again. The PVC keeps `runner-shared/` untouched (the worker sees it as `/data/runner-shared`). Recovery journals and ledgers in `/data/repos` record clone paths under `/data/runner/...`, which now resolve into the fresh emptyDir and read as missing until roll-forward restores them. The old controller has no migration guard.
 - **Not the same as resuming a run across the layout change.** Custody-held work stays on its old-layout pod until custody releases; it is not migrated. A non-custody run whose clone was on an old-layout emptyDir finds that clone missing when it is resumed after migration, because the journal paths resolve into the new `runner-shared` (consistent with `docs/run-recovery.md`, "Retained sources with no open hold").

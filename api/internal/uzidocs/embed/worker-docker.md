@@ -237,7 +237,8 @@ per-pod `emptyDir`.
   bumps that pin when the agent changed. A new controller with an old image
   fails closed: the `runner-init` init container refuses the pod (it stays
   in `Init:CrashLoopBackOff` and the roll health names the init container)
-  before touching any data. An old controller with a new image works.
+  before it, dind or the worker touch the run directory. The `seed-nix`
+  init container runs earlier and behaves as before. An old controller with a new image works.
 - **Custody-held workers migrate later.** A Docker worker that holds
   recovery custody for a run stays on its old pod layout (the `emptyDir`)
   until custody releases, so its unpublished clone is not lost by the
