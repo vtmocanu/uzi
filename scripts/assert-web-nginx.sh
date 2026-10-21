@@ -18,7 +18,7 @@
 # HOW. The image pinned in web/Dockerfile runs, by its exact digest, once per config
 # (compose, chart, mock) next to a stub upstream that answers as the api. The digest is
 # fetched from mirror.gcr.io first, then Docker Hub (anonymous per-IP pull quota, #2621);
-# docker-pull-fallback.sh cannot be reused because it rejects @digest refs. Fixtures are
+# This loop also checks both registries' local images before any pull. Fixtures are
 # generated here, deterministically,
 # and compared byte for byte (curl never decodes; gzip -dc and cmp do). Nothing is
 # bind-mounted (the daemon may not see this host's paths): files are docker cp'd in. Every
