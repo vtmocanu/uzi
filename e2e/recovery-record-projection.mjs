@@ -8,7 +8,10 @@ import path from 'node:path';
 import { constants } from 'node:fs';
 const root = process.argv[2] ?? '/data';
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
-const MAX_RUNS = 16, MAX_FILES = 64, MAX_BYTES = 4 * 1024 * 1024;
+const MAX_RUNS = 16, MAX_FILES = 64, MAX_SCAN = 1024, MAX_BYTES = 4 * 1024 * 1024;
+// Capture ids are randomUUID() (agent/src/recovery.ts UUID_V4); anything else, a hash-shaped name
+// included, is never echoed.
+const captureId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const deadline = Date.now() + 5000;
 const runs = [...new Set(process.argv.slice(3).filter(id => uuid.test(id)))].slice(0, MAX_RUNS);
 const integer = v => Number.isSafeInteger(v) && v >= 0 ? v : null;
@@ -34,22 +37,35 @@ async function read(file) {
 const emit = row => console.log(JSON.stringify(row));
 for (const run of runs) {
   const dir = path.join(root, 'recovery', run);
-  let names;
+  const names = [];
+  let truncated = null;
   try {
     const s = await fs.lstat(dir);
     if (!s.isDirectory() || s.isSymbolicLink()) { emit({ run_id: run, error: 'unreadable_or_malformed' }); continue; }
-    names = (await fs.readdir(dir)).filter(n => n.endsWith('.json')).sort();
+    // Bounded enumeration: never list the whole directory. Stop at MAX_SCAN entries, at the
+    // deadline, or once one record beyond MAX_FILES is seen.
+    const handle = await fs.opendir(dir, { bufferSize: 64 });
+    let scanned = 0;
+    try {
+      for await (const entry of handle) {
+        if (Date.now() >= deadline) { truncated = 'deadline'; break; }
+        if (++scanned > MAX_SCAN) { truncated = 'scan_limit'; break; }
+        if (!entry.name.endsWith('.json')) continue;
+        if (names.length === MAX_FILES) { truncated = 'file_limit'; break; }
+        names.push(entry.name);
+      }
+    } finally { await handle.close().catch(() => {}); }
+    names.sort();
   } catch (e) { emit({ run_id: run, error: e?.code === 'ENOENT' ? 'absent' : 'unreadable_or_malformed' }); continue; }
-  const truncated = names.length > MAX_FILES;
-  for (const name of names.slice(0, MAX_FILES)) {
+  for (const name of names) {
     const stem = name.slice(0, -5);
     const r = await read(path.join(dir, name));
     const v = r.value && typeof r.value === 'object' ? r.value : undefined;
-    emit({ run_id: run, capture_id: /^[A-Za-z0-9-]{1,64}$/.test(stem) ? stem : null,
+    emit({ run_id: run, capture_id: captureId.test(stem) ? stem : null,
       generation: integer(v?.generation), state: state(v?.state), reason: reason(v?.reason),
       inventory_guarded: bool(v?.inventoryGuarded), final_request_present: present(v?.finalRequest),
       final_acknowledged: bool(v?.finalAcknowledged), completion_receipt_present: present(v?.completionReceipt),
       authenticated: false, error: r.error ?? (v ? null : 'unreadable_or_malformed') });
   }
-  if (truncated) emit({ run_id: run, truncated: true });
+  if (truncated) emit({ run_id: run, truncated: true, truncated_reason: truncated });
 }

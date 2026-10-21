@@ -53,13 +53,39 @@ test('at most 16 run ids are read', () => withRoot(async root => {
   assert.ok(rows.every(r => r.error === 'absent'));
 }));
 
+const capN = i => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+
 test('at most 64 files per run with a truncated marker', () => withRoot(async root => {
   await mk(root, RUN);
-  for (let i = 0; i < 70; i++) await fs.writeFile(path.join(root, 'recovery', RUN, `c${String(i).padStart(3, '0')}.json`), '{"generation":1}');
+  for (let i = 0; i < 70; i++) await fs.writeFile(path.join(root, 'recovery', RUN, `${capN(i)}.json`), '{"generation":1}');
   const { rows } = await projectViaStdin(root, [RUN]);
   assert.equal(rows.length, 65);
-  assert.deepEqual(rows[64], { run_id: RUN, truncated: true });
-  assert.equal(rows[0].capture_id, 'c000');
+  assert.deepEqual(rows[64], { run_id: RUN, truncated: true, truncated_reason: 'file_limit' });
+  const ids = rows.slice(0, 64).map(r => r.capture_id);
+  assert.deepEqual(ids, [...ids].sort());
+  assert.ok(ids.every(id => /^00000000-0000-4000-8000-\d{12}$/.test(id)));
+}));
+
+test('enumeration is bounded: non-record entries count toward the scan limit', () => withRoot(async root => {
+  await mk(root, RUN);
+  const dir = path.join(root, 'recovery', RUN);
+  for (let i = 0; i < 1100; i++) await fs.writeFile(path.join(dir, `junk-${i}.tmp`), '');
+  await fs.writeFile(path.join(dir, `${CAP}.json`), '{"generation":2}');
+  const { rows } = await projectViaStdin(root, [RUN]);
+  const marker = rows.at(-1);
+  assert.deepEqual(marker, { run_id: RUN, truncated: true, truncated_reason: 'scan_limit' });
+  assert.ok(rows.length <= 2);
+}));
+
+test('capture ids that are not lowercase UUID v4 are never echoed, hash-shaped names included', () => withRoot(async root => {
+  await mk(root, RUN);
+  const dir = path.join(root, 'recovery', RUN);
+  const names = ['a'.repeat(40), 'b'.repeat(64), 'c000', 'ABCDEF01-2345-4678-89AB-CDEF01234567', '22222222-2222-1222-8222-222222222222'];
+  for (const n of names) await fs.writeFile(path.join(dir, `${n}.json`), '{"generation":1}');
+  const { out, rows } = await projectViaStdin(root, [RUN]);
+  assert.equal(rows.length, names.length);
+  assert.ok(rows.every(r => r.capture_id === null));
+  for (const n of names) assert.ok(!out.includes(n), n);
 }));
 
 test('oversized file reports a bounded error', () => withRoot(async root => {
