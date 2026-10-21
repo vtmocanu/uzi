@@ -2921,6 +2921,9 @@ describe("seeded owner-supplied plan (issue #3272)", () => {
     const head = "of the turn before it can finish. Do not spawn any other agents.\n\n";
     const tail = "\n\nIf you learn a DURABLE operational fact";
     assert.ok(seeded.length > 0);
+    for (const anchor of [head, tail]) {
+      assert.ok(seeded.indexOf(anchor) >= 0 && LEAD_GUARDRAIL_APPEND.indexOf(anchor) >= 0, anchor);
+    }
     assert.equal(seeded.slice(0, seeded.indexOf(head) + head.length), LEAD_GUARDRAIL_APPEND.slice(0, LEAD_GUARDRAIL_APPEND.indexOf(head) + head.length));
     assert.ok(seeded.slice(seeded.indexOf(tail)).startsWith(LEAD_GUARDRAIL_APPEND.slice(LEAD_GUARDRAIL_APPEND.indexOf(tail))));
   });

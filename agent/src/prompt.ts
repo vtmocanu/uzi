@@ -282,7 +282,6 @@ const LEAD_GUARDRAIL_APPEND_SEEDED = [
   ...LEAD_GUARDRAIL_SUFFIX,
 ].join("\n");
 
-
 /**
  * Appended to the lead's system prompt on `issue` runs only (PRD #72 M3,
  * Decision 5 + Decision 13). The done-condition gains one short clause; the HOW
