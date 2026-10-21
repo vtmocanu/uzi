@@ -22,6 +22,7 @@ import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
+import { SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -4409,6 +4410,72 @@ describe("SdkExecutor — seeded plan body reaches the implement turn (PRD #209 
     assert.strictEqual(turns.length, 1, "only the implement turn runs (no planning turn)");
     assert.match(turns[0]!.promptText ?? "", /zqx42/, "the model must actually see the reviewed plan");
     assert.match(turns[0]!.promptText ?? "", /<plan>/, "delimited as the plan to implement");
+  });
+
+  // Issue #3272: an owner-supplied plan skips the gate, so the implement-phase lead system prompt
+  // swaps the plan-first lifecycle paragraphs for the seeded one. Only the implement turn is eligible.
+  describe("seeded owner-supplied plan system prompt (issue #3272)", () => {
+    const VARIANT = "This paragraph takes precedence over any plan-first";
+    const GATED = "This run has two phases";
+    const seededBase = { planApproved: true, seeded: true, approvedPlan: PLAN };
+
+    it("a seeded run's implement turn carries the variant and not the two-phase paragraph", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: "sess-parked" });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 1);
+      const append = appendOf(turns[0]!.options.systemPrompt);
+      assert.ok(append.length > 0);
+      assert.ok(append.includes(VARIANT));
+      assert.ok(append.includes(SEEDED_PLAN_RULES));
+      assert.ok(!append.includes(GATED));
+    });
+
+    it("a gated run's plan and implement prompts carry no variant", async () => {
+      const { queryFn, turns } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({ planApproved: false, approvedPlan: undefined });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.strictEqual(turns.length, 2);
+      for (const turn of turns) {
+        const append = appendOf(turn.options.systemPrompt);
+        assert.ok(append.length > 0);
+        assert.ok(append.includes(GATED));
+        assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+      }
+    });
+
+    for (const [name, over] of [
+      ["a blank plan", { approvedPlan: "  \n " }],
+      ["a missing plan", { approvedPlan: undefined }],
+      ["planApproved false", { planApproved: false }],
+    ] as [string, Partial<RunContext>][]) {
+      it(`seeded with ${name} is gated and gets no variant`, async () => {
+        const { queryFn, turns } = fakeTurns([
+          [submitPlan("# Plan"), resultSuccess()],
+          [signalDone(), resultSuccess()],
+        ]);
+        const probe = makeCtx({ ...seededBase, sessionId: null, ...over });
+        await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+        assert.strictEqual(probe.gated.length, 1, "the gate still runs");
+        for (const turn of turns) {
+          const append = appendOf(turn.options.systemPrompt);
+          assert.ok(append.length > 0);
+          assert.ok(!append.includes(VARIANT) && !append.includes(SEEDED_PLAN_RULES));
+        }
+      });
+    }
+
+    it("the session-less seeded first turn keeps its <plan> fence alongside the variant", async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCtx({ ...seededBase, sessionId: null });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.match(turns[0]!.promptText ?? "", /<plan>/);
+      assert.match(turns[0]!.promptText ?? "", /zqx42/);
+      assert.ok(appendOf(turns[0]!.options.systemPrompt).includes(VARIANT));
+    });
   });
 });
 

@@ -132,6 +132,7 @@ import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
+import { isSeededOwnerPlan } from "./seeded-plan.js";
 import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
@@ -2827,6 +2828,8 @@ export class SdkExecutor implements Executor {
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
           harness: "claude",
+          // Issue #3272: an owner-supplied plan skips the gate; the implement prompt says so.
+          seeded: isSeededOwnerPlan(ctx),
           ...(drive.lane ? { guardedCommand: { unavailable: implementUnavailable } } : {}),
         }),
         preToolUse: preToolUse(selectedNames, true, implementUnavailable),

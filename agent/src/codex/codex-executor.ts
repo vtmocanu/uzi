@@ -193,6 +193,7 @@ import type { CodexBinding } from "./select.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "./config.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { assertResidueQuarantineOpen } from "../residue-quarantine.js";
+import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../seeded-plan.js";
 import { CodexAdviceHarness, type LaunchAdviceRootSeam } from "./codex-advice-harness.js";
 import { makePrDescriptionEvalLaunch, type PrDescriptionEvalLaunchTestSeams } from "./pr-description-eval-launch.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../harness.js";
@@ -4911,7 +4912,13 @@ export class CodexExecutor implements Executor {
     if (ctx.config?.override_subagent_model) {
       for (const agent of Object.values(agents)) agent.model = undefined;
     }
-    const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
+    const systemPrompt = buildLeadSystemPrompt(leadBody, {
+      kind: ctx.kind,
+      harness: "codex",
+      repoSourced,
+      // Issue #3272: only an implement-phase request of an owner-supplied plan gets the seeded variant.
+      seeded: phase === "implement" && isSeededOwnerPlan(ctx),
+    }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
     if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
@@ -5016,6 +5023,20 @@ export class CodexExecutor implements Executor {
           "<approved_plan>",
           gatedPlan,
           "</approved_plan>",
+        ].join("\n")
+      : approved && isSeededOwnerPlan(ctx)
+      ? [
+          // Issue #3272: the owner supplied this plan at creation, so there was no gate to approve
+          // it. Framing first, then the raw plan in a fence; it rides every implement iteration,
+          // including a live-session resume. Deliberately no "approved" wording (PRD #209 Decision A).
+          "Implement it now on the current branch, delegating to your subagents and iterating until the review passes; do not re-plan or resubmit it.",
+          "",
+          SEEDED_PLAN_RULES,
+          "",
+          "The plan to implement is below, between the <plan> and </plan> tags. It is the plan this run's owner supplied \u2014 carry it out:",
+          "<plan>",
+          approved,
+          "</plan>",
         ].join("\n")
       : approved && ctx.reviewedPlanResume === true && !ctx.sessionId && ctx.seeded !== true
       ? [

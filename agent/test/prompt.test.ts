@@ -41,6 +41,7 @@ import {
   LEAD_GATE_SEQUENCING_APPEND,
   LEAD_FAST_CHECK_APPEND,
 } from "../src/prompt.js";
+import { isSeededOwnerPlan, SEEDED_PLAN_RULES } from "../src/seeded-plan.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { assembleAgents } from "../src/agents.js";
 import type {
@@ -2875,5 +2876,68 @@ describe("buildImplementPrompt — gate-approved plan on a fresh session (issue 
     assert.equal(flagged, plain);
     assert.ok(plain.includes(REVIEWED_RESUME_APPROVAL_GUIDANCE));
     assert.ok(!plain.includes(GATE_APPROVED_FRESH_SESSION_GUIDANCE));
+  });
+});
+
+// Issue #3272: the seeded lead system-prompt variant and its one trusted predicate.
+describe("seeded owner-supplied plan (issue #3272)", () => {
+  const PRECEDENCE = "This paragraph takes precedence over any plan-first, plan-approval or wait-for-approval wording";
+  const GATED = "This run has two phases";
+
+  it("a customized body saying to wait for approval is followed by the precedence statement and the shared rules", () => {
+    const body = "Always wait for approval before implementing.";
+    const { append } = buildLeadSystemPrompt(body, { seeded: true });
+    assert.ok(append.length > 0);
+    const at = (needle: string): number => append.indexOf(needle);
+    assert.ok(at(body) >= 0 && at(PRECEDENCE) > at(body), "precedence follows the template body");
+    assert.ok(at(SEEDED_PLAN_RULES) > at(PRECEDENCE));
+    assert.ok(!append.includes(GATED));
+    assert.ok(!append.includes("save_draft_plan({plan_md})"));
+    assert.ok(append.includes("`signal_done`"));
+  });
+
+  it("the rules state the owner supply, the inapplicable plan tools and the no-claim rule, and never say approved", () => {
+    assert.match(SEEDED_PLAN_RULES, /owner of this run supplied this plan/);
+    assert.match(SEEDED_PLAN_RULES, /no uzi plan gate/);
+    assert.match(SEEDED_PLAN_RULES, /`save_draft_plan`, plan-validator waves and `submit_plan` do not apply/);
+    assert.match(SEEDED_PLAN_RULES, /never a reason to call `park_run`/);
+    assert.match(SEEDED_PLAN_RULES, /not by itself a precondition/);
+    assert.match(SEEDED_PLAN_RULES, /`ask_user`, and never silently waive it/);
+    assert.match(SEEDED_PLAN_RULES, /Never claim that a review or approval happened/);
+    assert.doesNotMatch(SEEDED_PLAN_RULES, /approved (at|by)|was approved|gate approved/i);
+  });
+
+  it("the default output equals the seeded-absent output, and only seeded:true selects the variant", () => {
+    const base = buildLeadSystemPrompt("BODY", { harness: "codex", kind: "issue" }).append;
+    assert.ok(base.includes(GATED));
+    assert.equal(buildLeadSystemPrompt("BODY", { harness: "codex", kind: "issue", seeded: false }).append, base);
+    assert.equal(buildLeadSystemPrompt("BODY", { harness: "codex", kind: "issue", seeded: undefined }).append, base);
+    assert.equal(buildLeadSystemPrompt(undefined).append, buildLeadSystemPrompt(undefined, {}).append);
+    assert.ok(buildLeadSystemPrompt("BODY", { harness: "codex", kind: "issue", seeded: true }).append !== base);
+  });
+
+  it("the variant differs from the default only inside the lifecycle paragraph", () => {
+    const seeded = buildLeadSystemPrompt(undefined, { seeded: true }).append;
+    const head = "of the turn before it can finish. Do not spawn any other agents.\n\n";
+    const tail = "\n\nIf you learn a DURABLE operational fact";
+    assert.ok(seeded.length > 0);
+    assert.equal(seeded.slice(0, seeded.indexOf(head) + head.length), LEAD_GUARDRAIL_APPEND.slice(0, LEAD_GUARDRAIL_APPEND.indexOf(head) + head.length));
+    assert.ok(seeded.slice(seeded.indexOf(tail)).startsWith(LEAD_GUARDRAIL_APPEND.slice(LEAD_GUARDRAIL_APPEND.indexOf(tail))));
+  });
+
+  it("isSeededOwnerPlan truth table", () => {
+    const rows: [Parameters<typeof isSeededOwnerPlan>[0], boolean][] = [
+      [{ seeded: true, planApproved: true, approvedPlan: "plan" }, true],
+      [{ seeded: true, planApproved: true, approvedPlan: "  x  " }, true],
+      [{ seeded: true, planApproved: false, approvedPlan: "plan" }, false],
+      [{ seeded: true, planApproved: undefined, approvedPlan: "plan" }, false],
+      [{ seeded: true, planApproved: true, approvedPlan: "" }, false],
+      [{ seeded: true, planApproved: true, approvedPlan: " \n\t" }, false],
+      [{ seeded: true, planApproved: true, approvedPlan: undefined }, false],
+      [{ seeded: false, planApproved: true, approvedPlan: "plan" }, false],
+      [{ seeded: undefined, planApproved: true, approvedPlan: "plan" }, false],
+      [{}, false],
+    ];
+    for (const [ctx, want] of rows) assert.equal(isSeededOwnerPlan(ctx), want, JSON.stringify(ctx));
   });
 });
