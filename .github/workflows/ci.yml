@@ -681,7 +681,12 @@ jobs:
         with:
           # Preserve each attempt: a failed-only rerun may rerun just one shard.
           name: agent-tests-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
-          path: agent/shard-${{ matrix.shard }}.*
+          # The agent report (summary/progress JSON) rides along for agents reading a red run.
+          path: |
+            agent/shard-${{ matrix.shard }}.*
+            agent/.test-report/
+          # upload-artifact skips dot-paths unless asked; the checker reads only top-level *.xml.
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
 

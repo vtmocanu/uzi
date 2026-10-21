@@ -8,8 +8,8 @@
 # only carries the label is never edited), body rewritten only when the findings
 # change, closed with a comment when they clear, reopened when they recur.
 #
-# Advisory only: it never fails on findings and never changes a rate. A human
-# verifies against the official pages (docs/run-cost.md, "Updating prices").
+# Advisory only: it never fails on findings and never changes a rate. An agent
+# pair verifies against the official pages (docs/run-cost.md, "Updating prices").
 # The issue carries repository pricing metadata only.
 
 name: Pricing Freshness
