@@ -63,7 +63,7 @@ On a gated `signal_done`, the executor checkpoints the current work **before** a
 
 Additive routing (#3089): on an interlocked, noninteractive issue run on either harness, `signal_done({owner_decision_requested:{reason:string}})` can open that same question at the first authoritative unmet result without waiting for the stall threshold. The request object admits only `reason`, trimmed to 1–500 Unicode code points by validation (invalid or extra keys are refused, never truncated). It supplies no scope authority and does not block finalization when the authoritative unmet set is empty. The fingerprint, iteration/wall budgets, deadline, cancellation/pause/completion-budget bounds and I6 capture-before-park ordering remain unchanged; requesting the window resets none of them. The durable question labels and escapes the lead reason as untrusted display text and uses server-provided unmet IDs. Only the existing decision endpoints apply continue/partial/accept, within their existing live completion-question or paused completion-blocked windows; ordinary clarification and plain pause remain ineligible. Ordinary answers, repository docs and `non_closing` carry no scope authority. After any answer the worker asks for a fresh authoritative `signal_done` recheck, without enforcing the old unmet list or inferring a formal decision from prose.
 
-Before any completion attempt exists on a run, legacy stall/wall/budget outcomes remain unchanged. Wall and served completion-budget routing also recognize validated server history from an earlier flight (#3282); idle, iteration and stall routing still require this flight's completion attempt.
+Before any completion attempt exists on a run, legacy stall/wall/budget outcomes remain unchanged except for the eligible worker-initiated first attempt in the [#3139 stall addendum](#addendum--worker-initiated-stall-attempt-2026-10-21-3139). Wall and served completion-budget routing also recognize validated server history from an earlier flight (#3282); idle, iteration and stall routing still require this flight's completion attempt.
 
 ### I6 — `SetRunCompletionHold` is a dedicated sibling of `SetRunPaused`, not a widening of it, with a fixed capture-then-park order (D6)
 
@@ -306,6 +306,26 @@ pin change is required. Old workers retain the old loop until rollout via
 `workers.image.tag`. The pre-existing resumed-flight gap described in held
 PR #3279's #3139 addendum must be reconciled when that PR rebases onto this
 fix; neither change depends on the other landing first.
+## Addendum — worker-initiated stall attempt (2026-10-21, #3139)
+
+A third source of a completion attempt joins the lead's `signal_done` and the #3090 publication-start empty attempt (above, *Hold, attempts and capture*): a **worker-initiated stall attempt**. It exists so a lead that stops making progress without ever calling `signal_done` reaches the owner question and the hold instead of failing on the iteration budget.
+
+**Eligibility** (agent-only; both Claude and Codex): an interlocked, non-interactive issue run that has previously reported at least one completed milestone and whose server-reported `completion_attempts` is exactly 0. The trip is `STALL_LIMIT` (3) consecutive lead turns with no lead tool call, no subagent activity, an unchanged worktree and unchanged milestone progress sets. A `report_progress` with no change still counts as no progress; owner or system input resets the count; the lead's wording is ignored. Runs with no reported completed milestone, interactive and non-issue runs, and resumed runs with `completion_attempts` > 0 are unchanged.
+
+**What it records.** One worker-initiated attempt with an empty declaration (`declared: []`, not report-only, not non-closing), so it marks nothing complete. The worker then asks the existing **Completion blocked** owner question with stall-specific text; when no milestone is unmet, the text says the contract is satisfied but the lead has not signalled done, and offers only continue. If the live window expires, the run enters the completion hold (I6) with a stall-specific reason instead of failing on `max_iterations`. The stall path never publishes. A continue answer returns to the lead for a server-authoritative recheck. If the trip happened on the last iteration, a continue holds with the iteration-budget reason because no further turn exists.
+
+**Qualification of the pre-attempt invariant.** I6's statement that legacy stall/wall/budget outcomes are unchanged before any attempt exists is true only for runs that are not eligible above. For an eligible stalled run the worker creates that attempt itself, so the run is on the completion path from then on.
+
+**Consequences of the attempt existing.**
+
+- `completion_attempts` is never cleared, so `SetRunWallPark` and the `RequestWallParks` carve-out stop applying to the run. A later wall exhaustion goes through `StampCompletionBudgetExhausted` into a completion hold rather than a `budget_exhausted` wall park, so `CanStopAtWall` no longer applies.
+- Max-iterations and #281 no-progress stops on that run route to the completion hold.
+- `RunView`'s attempt count includes the worker's stall attempt.
+- The stall-time done checkpoint may capture the stall-time head. That state authorizes nothing: publication and the code cross-check always come from a later real done checkpoint, so the published head and the head the cross-check reviewed both come from it.
+
+**Accepted residual.** On an eligible run the older Claude #281 detector (identical-text based; it ignores tool calls) can still reach its streak first and fail the run before any attempt exists when its streak runs ahead of the stall counter, for example a tool-calling turn with identical text followed by two tool-free turns. This addendum does not close that gap.
+
+User-facing behavior is described in [Completion holds](../docs/run-completion-hold.md).
 
 ## Semantic default-on amendment (2026-10-17, #1230/#1231; status updated 2026-10-20)
 
